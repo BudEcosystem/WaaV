@@ -64,6 +64,19 @@ use crate::utils::req_manager::ReqManager;
 /// IBM Watson TTS API base URL (for documentation purposes).
 pub const IBM_WATSON_TTS_URL: &str = "https://api.us-south.text-to-speech.watson.cloud.ibm.com";
 
+fn ibm_tts_http_client(config: &IbmWatsonTTSConfig) -> Result<Client, reqwest::Error> {
+    crate::core::net::ssrf_protected_client_builder(crate::core::net::HTTP_URL_SCHEMES)
+        .timeout(Duration::from_secs(
+            config.base.request_timeout.unwrap_or(60),
+        ))
+        .connect_timeout(Duration::from_secs(
+            config.base.connection_timeout.unwrap_or(30),
+        ))
+        .pool_max_idle_per_host(config.base.request_pool_size.unwrap_or(4))
+        .pool_idle_timeout(Duration::from_secs(90))
+        .build()
+}
+
 // =============================================================================
 // IAM Token Management
 // =============================================================================
@@ -93,14 +106,15 @@ struct IamTokenResponse {
 }
 
 /// Fetch IAM token from IBM Cloud.
-async fn fetch_iam_token(api_key: &str) -> TTSResult<IamToken> {
-    let client = Client::new();
-
+///
+/// `iam_url` is the (possibly override-rewritten) IAM token endpoint; callers pass
+/// `IBM_IAM_URL` for production or a mock-rewritten URL via `override_rest_endpoint`.
+async fn fetch_iam_token(client: &Client, api_key: &str, iam_url: &str) -> TTSResult<IamToken> {
     // URL-encode the API key
     let encoded_api_key: String = form_urlencoded::byte_serialize(api_key.as_bytes()).collect();
 
     let response = client
-        .post(IBM_IAM_URL)
+        .post(iam_url)
         .header("Content-Type", "application/x-www-form-urlencoded")
         .body(format!(
             "grant_type=urn:ibm:params:oauth:grant-type:apikey&apikey={}",
@@ -206,7 +220,11 @@ impl IbmWatsonTTS {
             pitch_percentage: None,
             customization_ids: Vec::new(),
             spell_out_mode: None,
+            endpoint_override: None,
         };
+        ibm_config
+            .validate_sample_rate()
+            .map_err(TTSError::InvalidConfiguration)?;
 
         Ok(Self {
             config: ibm_config,
@@ -222,6 +240,10 @@ impl IbmWatsonTTS {
     ///
     /// Use this when you want full control over IBM-specific settings.
     pub fn new_from_ibm_config(config: IbmWatsonTTSConfig) -> TTSResult<Self> {
+        config
+            .validate_sample_rate()
+            .map_err(TTSError::InvalidConfiguration)?;
+
         Ok(Self {
             config,
             client: Arc::new(RwLock::new(None)),
@@ -230,6 +252,16 @@ impl IbmWatsonTTS {
             audio_callback: Arc::new(RwLock::new(None)),
             request_counter: Arc::new(AtomicU64::new(0)),
         })
+    }
+
+    /// Build from the standardized TTS config (W1 keystone), mirroring `DeepgramTTS::from_standard`.
+    /// Delegates feature mapping to [`IbmWatsonTTSConfig::from_standard`] (speed -> `rate_percentage`,
+    /// pitch -> `pitch_percentage`, sample_rate, voice, plus the `instance_id` extras passthrough)
+    /// so advanced prosody reaches the provider config the request builder reads.
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
+        let ibm_config =
+            IbmWatsonTTSConfig::from_standard(std).map_err(TTSError::InvalidConfiguration)?;
+        Self::new_from_ibm_config(ibm_config)
     }
 
     /// Set the instance ID (required before connecting).
@@ -290,7 +322,17 @@ impl IbmWatsonTTS {
 
         // Fetch new token
         debug!("Fetching new IAM token...");
-        let new_token = fetch_iam_token(&self.config.base.api_key).await?;
+        let iam_url = crate::core::tts::standard::override_rest_endpoint(
+            IBM_IAM_URL,
+            self.config.endpoint_override.as_deref(),
+        );
+        let client = self
+            .client
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| TTSError::ProviderNotReady("HTTP client not initialized".into()))?;
+        let new_token = fetch_iam_token(&client, &self.config.base.api_key, &iam_url).await?;
         let access_token = new_token.access_token.clone();
 
         // Cache the token
@@ -417,53 +459,14 @@ impl IbmWatsonTTS {
         Ok(audio_bytes)
     }
 
-    /// Prepare the request body with optional SSML prosody for rate/pitch.
+    /// Prepare the JSON request body.
+    ///
+    /// Rate/pitch prosody is applied via IBM Watson's **native** `rate_percentage`/`pitch_percentage`
+    /// `/v1/synthesize` query parameters (see [`IbmWatsonTTSConfig::build_query_params`]), NOT via an
+    /// SSML `<prosody>` wrapper. Wrapping here as well would double-apply the adjustment, so the body
+    /// carries the plain text and serde handles JSON-string escaping.
     pub(crate) fn prepare_request_body(&self, text: &str) -> String {
-        // Check if we need SSML for rate/pitch adjustment
-        let needs_ssml =
-            self.config.rate_percentage.is_some() || self.config.pitch_percentage.is_some();
-
-        if needs_ssml {
-            // Wrap text in SSML with prosody element
-            let mut prosody_attrs = String::new();
-
-            if let Some(rate) = self.config.rate_percentage {
-                let rate_str = if rate >= 0 {
-                    format!("+{}%", rate)
-                } else {
-                    format!("{}%", rate)
-                };
-                prosody_attrs.push_str(&format!(" rate=\"{}\"", rate_str));
-            }
-
-            if let Some(pitch) = self.config.pitch_percentage {
-                let pitch_str = if pitch >= 0 {
-                    format!("+{}%", pitch)
-                } else {
-                    format!("{}%", pitch)
-                };
-                prosody_attrs.push_str(&format!(" pitch=\"{}\"", pitch_str));
-            }
-
-            // Escape XML special characters in text
-            let escaped_text = text
-                .replace('&', "&amp;")
-                .replace('<', "&lt;")
-                .replace('>', "&gt;")
-                .replace('"', "&quot;")
-                .replace('\'', "&apos;");
-
-            // Build SSML with required namespace per W3C spec
-            let ssml = format!(
-                "<speak version=\"1.0\" xmlns=\"http://www.w3.org/2001/10/synthesis\"><prosody{}>{}</prosody></speak>",
-                prosody_attrs, escaped_text
-            );
-
-            serde_json::json!({ "text": ssml }).to_string()
-        } else {
-            // Plain text
-            serde_json::json!({ "text": text }).to_string()
-        }
+        serde_json::json!({ "text": text }).to_string()
     }
 
     /// Process audio and deliver to callback with proper chunking.
@@ -588,20 +591,9 @@ impl BaseTTS for IbmWatsonTTS {
             "Connecting to IBM Watson TTS"
         );
 
-        // Build HTTP client with timeouts
-        let client = Client::builder()
-            .timeout(Duration::from_secs(
-                self.config.base.request_timeout.unwrap_or(60),
-            ))
-            .connect_timeout(Duration::from_secs(
-                self.config.base.connection_timeout.unwrap_or(30),
-            ))
-            .pool_max_idle_per_host(self.config.base.request_pool_size.unwrap_or(4))
-            .pool_idle_timeout(Duration::from_secs(90)) // Close idle connections after 90s
-            .build()
-            .map_err(|e| {
-                TTSError::ConnectionFailed(format!("Failed to create HTTP client: {}", e))
-            })?;
+        let client = ibm_tts_http_client(&self.config).map_err(|e| {
+            TTSError::ConnectionFailed(format!("Failed to create HTTP client: {}", e))
+        })?;
 
         *self.client.write().await = Some(client);
 
@@ -771,6 +763,58 @@ impl BaseTTS for IbmWatsonTTS {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::ErrorKind;
+
+    #[tokio::test]
+    async fn ibm_watson_tts_redirect_policy_rejects_private_hop() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) => {
+                if err.kind() == ErrorKind::PermissionDenied {
+                    eprintln!("Skipping ibm_watson_tts_redirect_policy_rejects_private_hop: {err}");
+                    return;
+                }
+                panic!("Failed to bind redirect test server listener: {err}");
+            }
+        };
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 302 Found\r\n",
+                "Location: http://127.0.0.1:9/metadata\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n"
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+
+        let config = IbmWatsonTTSConfig::default();
+        let err = ibm_tts_http_client(&config)
+            .unwrap()
+            .get(format!("http://{addr}/start"))
+            .send()
+            .await
+            .expect_err("private redirect target must be rejected");
+        let mut error_chain = err.to_string();
+        let mut source = std::error::Error::source(&err);
+        while let Some(error) = source {
+            error_chain.push_str(": ");
+            error_chain.push_str(&error.to_string());
+            source = error.source();
+        }
+        assert!(
+            error_chain.contains("redirect URL rejected"),
+            "unexpected redirect error: {error_chain}"
+        );
+    }
 
     #[tokio::test]
     async fn test_ibm_watson_tts_creation() {
@@ -788,6 +832,24 @@ mod tests {
         assert_eq!(tts.get_connection_state(), ConnectionState::Disconnected);
         assert_eq!(tts.voice(), IbmVoice::EnUsAllisonV3Voice);
         assert_eq!(tts.output_format(), IbmOutputFormat::Wav);
+    }
+
+    #[tokio::test]
+    async fn test_ibm_watson_tts_creation_rejects_zero_sample_rate_before_chunking() {
+        let config = TTSConfig {
+            provider: "ibm-watson".to_string(),
+            api_key: "test_key".to_string(),
+            voice_id: Some("en-US_AllisonV3Voice".to_string()),
+            audio_format: Some("l16".to_string()),
+            sample_rate: Some(0),
+            ..Default::default()
+        };
+
+        let err = match IbmWatsonTTS::new(config) {
+            Ok(_) => panic!("constructor must reject zero sample_rate"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("Sample rate"), "{err}");
     }
 
     #[tokio::test]
@@ -859,35 +921,68 @@ mod tests {
         assert!(!body.contains("<speak"));
     }
 
+    // Prosody is now applied via native query params, NOT an SSML body wrapper, so even with
+    // rate/pitch set the body stays plain text (no `<speak>`/`<prosody>`). This is the regression
+    // tripwire against re-introducing the double-applying SSML path.
     #[test]
-    fn test_prepare_request_body_with_ssml() {
+    fn test_prepare_request_body_is_plain_text_even_with_prosody() {
         let mut config = IbmWatsonTTSConfig::default();
         config.rate_percentage = Some(50);
         config.pitch_percentage = Some(-25);
 
         let tts = IbmWatsonTTS::new_from_ibm_config(config).unwrap();
         let body = tts.prepare_request_body("Hello, world!");
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
 
-        // Note: JSON escapes quotes, so we check for escaped versions
-        assert!(body.contains("<speak"));
-        assert!(body.contains("xmlns=")); // SSML namespace
-        assert!(body.contains("<prosody"));
-        assert!(body.contains(r#"rate=\"+50%\""#));
-        assert!(body.contains(r#"pitch=\"-25%\""#));
-        assert!(body.contains("Hello, world!"));
+        assert_eq!(parsed["text"], "Hello, world!");
+        assert!(!body.contains("<speak"));
+        assert!(!body.contains("<prosody"));
     }
 
+    // WIRE-LEVEL: rate_percentage/pitch_percentage must reach the actual request URL as native
+    // query params on /v1/synthesize (not just sit on the config). We build the URL exactly as
+    // `synthesize()` does and assert the query string carries the params.
     #[test]
-    fn test_prepare_request_body_escapes_xml() {
+    fn rate_and_pitch_percentage_reach_synthesize_url_query() {
         let mut config = IbmWatsonTTSConfig::default();
-        config.rate_percentage = Some(10);
+        config.instance_id = "inst-1".to_string();
+        config.base.api_key = "k".to_string();
+        config.rate_percentage = Some(50);
+        config.pitch_percentage = Some(-25);
 
-        let tts = IbmWatsonTTS::new_from_ibm_config(config).unwrap();
-        let body = tts.prepare_request_body("Tom & Jerry <3 cats > dogs");
+        // Mirror provider.rs::synthesize URL construction.
+        let base_url = config.build_synthesis_url();
+        let query_params = config.build_query_params();
+        let url = reqwest::Url::parse_with_params(&base_url, &query_params).unwrap();
+        let pairs: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
 
-        assert!(body.contains("&amp;"));
-        assert!(body.contains("&lt;"));
-        assert!(body.contains("&gt;"));
+        assert_eq!(url.path(), "/instances/inst-1/v1/synthesize");
+        assert_eq!(
+            pairs.get("rate_percentage").map(String::as_str),
+            Some("50"),
+            "rate_percentage must reach the /v1/synthesize query string"
+        );
+        assert_eq!(
+            pairs.get("pitch_percentage").map(String::as_str),
+            Some("-25"),
+            "pitch_percentage must reach the /v1/synthesize query string"
+        );
+    }
+
+    // When prosody is unset, the params must be ABSENT from the URL (skip semantics) so default
+    // behavior is unchanged.
+    #[test]
+    fn prosody_query_params_absent_when_unset() {
+        let mut config = IbmWatsonTTSConfig::default();
+        config.instance_id = "inst-1".to_string();
+        let url = reqwest::Url::parse_with_params(
+            &config.build_synthesis_url(),
+            &config.build_query_params(),
+        )
+        .unwrap();
+        let pairs: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert!(!pairs.contains_key("rate_percentage"));
+        assert!(!pairs.contains_key("pitch_percentage"));
     }
 
     #[test]

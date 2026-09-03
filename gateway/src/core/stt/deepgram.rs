@@ -1,5 +1,6 @@
 use bytes::Bytes;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
 
@@ -7,11 +8,26 @@ use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::time::{Instant, interval, timeout};
-use tokio_tungstenite::tungstenite::handshake::client::generate_key;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tracing::{debug, error, info, warn};
 
 use super::base::{BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback};
+use crate::core::resilience::connect::{WS_CONNECT_TIMEOUT, with_timeout};
+use crate::core::resilience::{CircuitBreaker, ReconnectGovernor};
+use crate::core::websocket::{ReconnectionConfig, ReconnectionManager};
+
+/// Why the Deepgram inner event loop returned — drives the outer reconnect loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeepgramInnerOutcome {
+    /// Client-initiated close (shutdown/CloseStream). Stop; do not reconnect.
+    Intentional,
+    /// Transport-level failure (socket reset, idle timeout, server EOF). Reconnect to
+    /// preserve the session — finals after the drop are recovered on the new connection.
+    Reconnect,
+    /// A provider `Error` frame (bad config/auth). Stop; reconnecting would fail identically.
+    Fatal,
+}
 
 /// Type alias for the complex callback function type
 type AsyncSTTCallback = Box<
@@ -79,6 +95,48 @@ pub struct DeepgramSTTConfig {
     /// will be redacted from transcripts. Useful for HIPAA compliance.
     /// This adds `redact=phi` to the API request.
     pub redact_phi: bool,
+    /// Convert spoken numbers to numeric digits (`numerals=true`).
+    ///
+    /// Deepgram's `numerals` feature IS supported on the streaming endpoint
+    /// (confirmed in the live AsyncAPI query-parameter schema and the streaming
+    /// feature overview, June 2026), so we map it onto the request URL.
+    pub numerals: bool,
+    /// Transcribe each audio channel independently (`multichannel=true`).
+    ///
+    /// Deepgram's `multichannel` feature IS supported on the streaming endpoint
+    /// (listed under "Media Input Settings: All available" in the streaming
+    /// feature overview and present in the AsyncAPI streaming schema), so we map
+    /// it onto the request URL.
+    pub multichannel: bool,
+    /// Override the WebSocket base endpoint (scheme://host[:port]) — e.g. `ws://127.0.0.1:PORT`
+    /// for a local mock (W-T0 harness) or a proxy. When `None`, the production Deepgram
+    /// endpoint (or the EU endpoint if `use_eu_endpoint`) is used. Generalizes the OpenAI
+    /// `OPENAI_BASE_URL` pattern; required so reconnection chaos tests can drive a real mock.
+    pub endpoint_override: Option<String>,
+    /// Named-entity detection (`detect_entities=true`). Deepgram supports `detect_entities` on the
+    /// streaming endpoint (live AsyncAPI query-parameter schema, June 2026). Mapped from the typed
+    /// `SttFeatures::entity_detection`.
+    pub detect_entities: bool,
+    /// Find-and-replace pairs (`replace=FIND:REPLACE`). One `replace=` param per pair; each value is
+    /// percent-encoded. Streaming-supported.
+    pub replace: Vec<String>,
+    /// Search terms / keyword spotting (`search=TERM`). One `search=` param per term; each value is
+    /// percent-encoded. Streaming-supported.
+    pub search: Vec<String>,
+    /// Dictation mode (`dictation=true`) — convert spoken punctuation commands ("comma", "period")
+    /// into punctuation. Streaming-supported.
+    pub dictation: bool,
+    /// Callback URL (`callback=URL`) — Deepgram POSTs results to this URL. Streaming-supported.
+    pub callback: Option<String>,
+    /// HTTP method for the callback (`callback_method=POST|PUT`). Streaming-supported.
+    pub callback_method: Option<String>,
+    /// Model Improvement Program opt-out (`mip_opt_out=true`). Streaming-supported.
+    pub mip_opt_out: bool,
+    /// Arbitrary request metadata tags (`extra=KEY:VALUE`). One `extra=` param per entry; each value
+    /// is percent-encoded. Streaming-supported.
+    pub extra: Vec<String>,
+    /// Pin a specific model version (`version=ID`). Streaming-supported.
+    pub version: Option<String>,
 }
 
 impl Default for DeepgramSTTConfig {
@@ -98,6 +156,101 @@ impl Default for DeepgramSTTConfig {
             utterance_end_ms: Some(500),
             use_eu_endpoint: false,
             redact_phi: false,
+            numerals: false,
+            multichannel: false,
+            endpoint_override: None,
+            detect_entities: false,
+            replace: Vec::new(),
+            search: Vec::new(),
+            dictation: false,
+            callback: None,
+            callback_method: None,
+            mip_opt_out: false,
+            extra: Vec::new(),
+            version: None,
+        }
+    }
+}
+
+impl DeepgramSTTConfig {
+    /// Build from the standardized config (W1 keystone), honoring advanced features that the
+    /// flat factory path hardcodes off. Diarization, keyterms, redaction, VAD events, filler
+    /// words and endpointing are now reachable through `StandardSTTConfig`. Unmodeled fields
+    /// (EU endpoint, PHI redaction, tag) keep their defaults.
+    pub fn from_standard(std: &super::standard::StandardSTTConfig) -> Self {
+        let f = &std.features;
+        let ex = &std.extras.0;
+        // Helper: read a `Vec<String>` from an extras key that may be a JSON string or array.
+        let str_vec = |key: &str| -> Vec<String> {
+            match ex.get(key) {
+                Some(serde_json::Value::String(s)) => vec![s.clone()],
+                Some(serde_json::Value::Array(a)) => a
+                    .iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect(),
+                _ => Vec::new(),
+            }
+        };
+        Self {
+            base: std.base.clone(),
+            diarize: f.diarization.unwrap_or(false),
+            interim_results: f.interim_results.unwrap_or(true),
+            filler_words: f.filler_words.unwrap_or(false),
+            profanity_filter: f.profanity_filter.unwrap_or(false),
+            smart_format: f.smart_format.unwrap_or(true),
+            keywords: f.keyterms.clone().unwrap_or_default(),
+            redact: f.redaction.clone().unwrap_or_default(),
+            vad_events: f.vad_events.unwrap_or(false),
+            endpointing: f.endpointing_ms.or(Some(200)),
+            utterance_end_ms: f.utterance_end_ms.or(Some(500)),
+            // `numerals` and `multichannel` ARE supported on Deepgram's streaming endpoint
+            // (confirmed June 2026 against the AsyncAPI streaming query-parameter schema and the
+            // streaming feature overview), so map them straight through to the wire.
+            numerals: f.numerals.unwrap_or(false),
+            multichannel: f.multichannel.unwrap_or(false),
+            // Endpoint override (W-T0): carried via the standardized extras passthrough so the
+            // restored, *featured* session can be pointed at a mock/proxy without touching the
+            // ~80 StandardSTTConfig construction sites.
+            endpoint_override: std.endpoint_override().map(|s| s.to_string()),
+            // --- Newly-wired Deepgram streaming features ----------------------------------------
+            // Entity detection is a typed `SttFeatures` field; the rest are provider-specific knobs
+            // forwarded through the open `ProviderExtras` passthrough. All confirmed on the
+            // streaming endpoint (Deepgram live AsyncAPI query-parameter schema, June 2026).
+            detect_entities: f.entity_detection.unwrap_or(false),
+            replace: str_vec("replace"),
+            search: str_vec("search"),
+            dictation: ex
+                .get("dictation")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            callback: ex
+                .get("callback")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            callback_method: ex
+                .get("callback_method")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            mip_opt_out: ex
+                .get("mip_opt_out")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            extra: str_vec("extra"),
+            version: ex
+                .get("version")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            // CAPABILITY GAP — intentionally NOT mapped to the wire:
+            //   * `alternatives` (N-best): absent from Deepgram's streaming AsyncAPI
+            //     query-parameter schema and from the streaming feature overview — it is a
+            //     pre-recorded-only feature, so emitting `&alternatives=N` on the websocket would
+            //     be a no-op at best. Leave it unmapped until Deepgram documents streaming support.
+            //   * `language_detection` -> `detect_language`: Deepgram's docs state language
+            //     detection "is not currently supported for streaming"; multilingual nova-2/nova-3
+            //     models handle code-switching instead. Emitting `&detect_language=true` on the
+            //     live endpoint is unsupported, so it stays a gap. (`f.language_detection`,
+            //     `f.alternatives` are deliberately not read here.)
+            ..Default::default()
         }
     }
 }
@@ -111,6 +264,10 @@ pub struct DeepgramResponse {
     pub metadata: Option<DeepgramMetadata>,
     pub is_final: Option<bool>,
     pub speech_final: Option<bool>,
+    /// Set by Deepgram on results emitted in response to a `Finalize`
+    /// message — the provider has nothing more to send for this segment
+    /// (maps to [`STTResult::is_finalized`]).
+    pub from_finalize: Option<bool>,
     pub duration: Option<f64>,
     pub start: Option<f64>,
     pub channel_index: Option<Vec<u32>>,
@@ -194,41 +351,164 @@ pub struct DeepgramSTT {
     result_callback: Arc<Mutex<Option<AsyncSTTCallback>>>,
     /// Error callback storage for streaming errors
     error_callback: Arc<Mutex<Option<AsyncErrorCallback>>>,
+    /// Shared, process-global resilience handles (W-D2): the single reconnect governor + this
+    /// provider's shared circuit breaker, injected by the VoiceManager from CoreState. When
+    /// `None` (e.g. constructed directly in a unit test), the connect path falls back to its own
+    /// per-session governor/breaker so storm control degrades gracefully rather than panicking.
+    resilience: Option<crate::core::resilience::ResilienceHandles>,
+    /// Intentional-disconnect flag shared with the hand-rolled reconnect loop (W-D1). Cleared on
+    /// `start_connection`, set in `disconnect()` before firing `shutdown_tx`. The outer reconnect
+    /// loop checks it at the top and converts a racy `Reconnect` outcome into `Intentional`, so a
+    /// client close racing a server-side close can never trigger a spurious reconnect (the unbiased
+    /// inner select may pick the stream-ended arm over the shutdown arm).
+    intentional_disconnect: Arc<AtomicBool>,
+    /// D-G1 reconnect audio-replay: the un-finalized audio tail (cleared on
+    /// every `is_final`), replayed into the fresh socket after a reconnect so
+    /// words spoken around the drop aren't lost — Deepgram is stateless
+    /// across connections.
+    replay: Arc<crate::core::websocket::AudioReplayBuffer>,
 }
 
 /// Constants for Deepgram regional endpoints
 pub const DEEPGRAM_DEFAULT_ENDPOINT: &str = "wss://api.deepgram.com";
 pub const DEEPGRAM_EU_ENDPOINT: &str = "wss://api.eu.deepgram.com";
 
+/// Percent-encode a query-string value so phrases with spaces ("John Smith") or `word:intensifier`
+/// syntax don't produce a malformed Deepgram URL (which closes the stream). Spaces become `+`,
+/// reserved characters are escaped.
+fn encode_query_value(s: &str) -> String {
+    url::form_urlencoded::byte_serialize(s.as_bytes()).collect()
+}
+
+fn validate_deepgram_streaming_callback_url(callback: &str) -> Result<String, STTError> {
+    let callback = callback.trim();
+    if callback.is_empty() {
+        return Err(STTError::ConfigurationError(
+            "Deepgram callback rejected (SSRF protection): empty URL".to_string(),
+        ));
+    }
+
+    crate::core::net::validate_url_for_ssrf(callback, crate::core::net::HTTP_URL_SCHEMES).map_err(
+        |msg| {
+            STTError::ConfigurationError(format!(
+                "Deepgram callback rejected (SSRF protection): {msg}"
+            ))
+        },
+    )?;
+    Ok(callback.to_string())
+}
+
+fn normalize_deepgram_streaming_callback_method(method: &str) -> Result<String, STTError> {
+    let method = method.trim();
+    if method.is_empty() {
+        return Err(STTError::ConfigurationError(
+            "Deepgram callback_method rejected: empty method".to_string(),
+        ));
+    }
+
+    let method = method.to_ascii_uppercase();
+    match method.as_str() {
+        "POST" | "PUT" => Ok(method),
+        _ => Err(STTError::ConfigurationError(format!(
+            "Deepgram callback_method rejected: expected POST or PUT, got {method}"
+        ))),
+    }
+}
+
 impl DeepgramSTT {
+    /// Internal: construct the provider from an already-mapped Deepgram config.
+    fn from_deepgram_config(deepgram_config: DeepgramSTTConfig) -> Self {
+        Self {
+            config: Some(deepgram_config),
+            state: ConnectionState::Disconnected,
+            state_notify: Arc::new(Notify::new()),
+            ws_sender: None,
+            shutdown_tx: None,
+            result_tx: None,
+            error_tx: None,
+            connection_handle: None,
+            result_forward_handle: None,
+            error_forward_handle: None,
+            result_callback: Arc::new(Mutex::new(None)),
+            error_callback: Arc::new(Mutex::new(None)),
+            resilience: None,
+            intentional_disconnect: Arc::new(AtomicBool::new(false)),
+            replay: Arc::new(crate::core::websocket::AudioReplayBuffer::default()),
+        }
+    }
+
+    /// The shared circuit breaker this session will use on its connect path, if the
+    /// process-global resilience handles have been injected (W-D2). Two `DeepgramSTT` built from
+    /// the same [`crate::core::resilience::ResilienceRegistry`] return the *same* `Arc`, so a trip
+    /// in one is observed by the other. Returns `None` before `set_resilience` (per-session
+    /// fallback).
+    pub fn resilience_breaker(&self) -> Option<&Arc<CircuitBreaker>> {
+        self.resilience.as_ref().map(|r| &r.breaker)
+    }
+
+    /// W1 keystone — construct directly from the standardized config so advanced features
+    /// (diarization, keyterms, redaction, vad_events, …) are honored END-TO-END. The flat
+    /// `BaseSTT::new` path hardcodes those off; this is the reachable standardized path.
+    pub fn new_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        if std.base.api_key.is_empty() {
+            return Err(STTError::AuthenticationFailed(
+                "API key is required".to_string(),
+            ));
+        }
+        Ok(Self::from_deepgram_config(
+            DeepgramSTTConfig::from_standard(std),
+        ))
+    }
+
     /// Build the WebSocket URL with query parameters (optimized string building)
     fn build_websocket_url(&self, config: &DeepgramSTTConfig) -> Result<String, STTError> {
         let mut url = String::with_capacity(256); // Pre-allocate expected size
 
-        // Select endpoint based on EU residency setting
-        let endpoint = if config.use_eu_endpoint {
+        // Select endpoint. An explicit override (mock/proxy) wins; otherwise pick the EU or
+        // default production endpoint per the residency setting.
+        let endpoint: &str = if let Some(o) = &config.endpoint_override {
+            o.trim_end_matches('/')
+        } else if config.use_eu_endpoint {
             DEEPGRAM_EU_ENDPOINT
         } else {
             DEEPGRAM_DEFAULT_ENDPOINT
         };
 
         url.push_str(endpoint);
+        // An omitted/empty model maps to Deepgram's recommended default (the
+        // WS-config contract: "each provider maps an empty model to its
+        // recommended default"). Emitting a literal `model=` empty param makes
+        // Deepgram reject the handshake with a misleading 401.
         url.push_str("/v1/listen?model=");
-        url.push_str(&config.base.model);
+        if config.base.model.is_empty() {
+            url.push_str("nova-2");
+        } else {
+            url.push_str(&encode_query_value(&config.base.model));
+        }
         url.push_str("&language=");
-        url.push_str(&config.base.language);
+        url.push_str(&encode_query_value(&config.base.language));
         url.push_str("&sample_rate=");
         url.push_str(&config.base.sample_rate.to_string());
         url.push_str("&channels=");
         url.push_str(&config.base.channels.to_string());
         url.push_str("&punctuate=");
-        url.push_str(if config.base.punctuation { "true" } else { "false" });
+        url.push_str(if config.base.punctuation {
+            "true"
+        } else {
+            "false"
+        });
         url.push_str("&interim_results=");
-        url.push_str(if config.interim_results { "true" } else { "false" });
+        url.push_str(if config.interim_results {
+            "true"
+        } else {
+            "false"
+        });
         url.push_str("&smart_format=");
         url.push_str(if config.smart_format { "true" } else { "false" });
         url.push_str("&encoding=");
-        url.push_str(&config.base.encoding);
+        url.push_str(&encode_query_value(&config.base.encoding));
 
         // Add optional parameters only if they're set
         if let Some(endpointing) = config.endpointing {
@@ -238,12 +518,30 @@ impl DeepgramSTT {
 
         if let Some(tag) = &config.tag {
             url.push_str("&tag=");
-            url.push_str(tag);
+            url.push_str(&encode_query_value(tag));
         }
 
         if !config.keywords.is_empty() {
-            url.push_str("&keywords=");
-            url.push_str(&config.keywords.join(","));
+            // nova-3 replaced `keywords` with model-driven `keyterm` prompting: `keywords` is
+            // silently ineffective on nova-3, and `keyterm` is invalid on nova-2/earlier. Send
+            // one `keyterm=` per term for nova-3 (phrases allowed); comma-joined `keywords=` else.
+            // Each value MUST be percent-encoded — keyterms/keywords routinely contain spaces (e.g.
+            // "John Smith") or `word:intensifier` syntax, and an unencoded space produces a
+            // malformed URL that Deepgram rejects, closing the stream.
+            if config.base.model.starts_with("nova-3") {
+                for term in &config.keywords {
+                    url.push_str("&keyterm=");
+                    url.push_str(&encode_query_value(term));
+                }
+            } else {
+                url.push_str("&keywords=");
+                let encoded: Vec<String> = config
+                    .keywords
+                    .iter()
+                    .map(|k| encode_query_value(k))
+                    .collect();
+                url.push_str(&encoded.join(","));
+            }
         }
 
         // Add diarization (speaker identification)
@@ -266,11 +564,74 @@ impl DeepgramSTT {
             url.push_str("&vad_events=true");
         }
 
+        // Add numerals (spoken numbers -> digits). Supported on the streaming endpoint.
+        if config.numerals {
+            url.push_str("&numerals=true");
+        }
+
+        // Add multichannel (independent per-channel transcription). Supported on streaming.
+        if config.multichannel {
+            url.push_str("&multichannel=true");
+        }
+
+        // Add entity detection (`detect_entities`). Supported on streaming.
+        if config.detect_entities {
+            url.push_str("&detect_entities=true");
+        }
+
+        // Find-and-replace: one `replace=` per FIND:REPLACE pair (percent-encoded).
+        for pair in &config.replace {
+            url.push_str("&replace=");
+            url.push_str(&encode_query_value(pair));
+        }
+
+        // Search / keyword spotting: one `search=` per term (percent-encoded).
+        for term in &config.search {
+            url.push_str("&search=");
+            url.push_str(&encode_query_value(term));
+        }
+
+        // Dictation mode (spoken-punctuation commands → punctuation).
+        if config.dictation {
+            url.push_str("&dictation=true");
+        }
+
+        // Callback URL — Deepgram POSTs results to this URL (percent-encoded).
+        if let Some(callback) = &config.callback {
+            let callback = validate_deepgram_streaming_callback_url(callback)?;
+            url.push_str("&callback=");
+            url.push_str(&encode_query_value(&callback));
+        }
+
+        // Callback HTTP method (POST/PUT).
+        if let Some(method) = &config.callback_method {
+            let method = normalize_deepgram_streaming_callback_method(method)?;
+            url.push_str("&callback_method=");
+            url.push_str(&encode_query_value(&method));
+        }
+
+        // Model Improvement Program opt-out.
+        if config.mip_opt_out {
+            url.push_str("&mip_opt_out=true");
+        }
+
+        // Extra request metadata: one `extra=` per KEY:VALUE entry (percent-encoded).
+        for entry in &config.extra {
+            url.push_str("&extra=");
+            url.push_str(&encode_query_value(entry));
+        }
+
+        // Pin a specific model version.
+        if let Some(version) = &config.version {
+            url.push_str("&version=");
+            url.push_str(&encode_query_value(version));
+        }
+
         // Add redaction (PII, numbers, SSN, etc.)
         if !config.redact.is_empty() {
             for redact_item in &config.redact {
                 url.push_str("&redact=");
-                url.push_str(redact_item);
+                url.push_str(&encode_query_value(redact_item));
             }
         }
 
@@ -279,14 +640,19 @@ impl DeepgramSTT {
             url.push_str("&redact=phi");
         }
 
-        // Add utterance end timeout
-        // NOTE: utterance_end_ms is not a valid Deepgram WebSocket API parameter.
-        // Deepgram uses 'endpointing' for end-of-speech detection timing instead.
-        // Keeping the config field for potential future use or documentation.
-        // if let Some(utterance_end_ms) = config.utterance_end_ms {
-        //     url.push_str("&utterance_end_ms=");
-        //     url.push_str(&utterance_end_ms.to_string());
-        // }
+        // Add utterance-end timeout. `utterance_end_ms` IS a valid Deepgram streaming parameter —
+        // it makes Deepgram emit `UtteranceEnd` events after the given silence gap, which is the
+        // robust end-of-turn signal when interim results are flowing. Deepgram requires
+        // `interim_results=true` and a value of at least 1000 ms (it rejects smaller values with a
+        // 400), so we only emit it when those constraints hold. (The default config value of 500 is
+        // below Deepgram's minimum and is therefore intentionally not sent.)
+        if let Some(utterance_end_ms) = config.utterance_end_ms
+            && config.interim_results
+            && utterance_end_ms >= 1000
+        {
+            url.push_str("&utterance_end_ms=");
+            url.push_str(&utterance_end_ms.to_string());
+        }
 
         Ok(url)
     }
@@ -295,6 +661,7 @@ impl DeepgramSTT {
     fn handle_websocket_message(
         message: Message,
         result_tx: &mpsc::Sender<STTResult>,
+        replay: &crate::core::websocket::AudioReplayBuffer,
     ) -> Result<(), STTError> {
         match message {
             Message::Text(text) => {
@@ -308,12 +675,25 @@ impl DeepgramSTT {
                                 if let Some(channel) = response.channel
                                     && let Some(alternative) = channel.alternatives.first()
                                 {
-                                    let stt_result = STTResult::new(
+                                    let is_final = response.is_final.unwrap_or(false);
+                                    let mut stt_result = STTResult::new(
                                         alternative.transcript.clone(),
-                                        response.is_final.unwrap_or(false),
+                                        is_final,
                                         response.speech_final.unwrap_or(false),
                                         alternative.confidence,
                                     );
+                                    // A Finalize-ack means Deepgram has nothing
+                                    // more for this segment (A-G1): downstream
+                                    // EoT logic may stop waiting on STT.
+                                    if is_final && response.from_finalize == Some(true) {
+                                        stt_result = stt_result.finalized();
+                                    }
+
+                                    // D-G1: everything sent so far is durably
+                                    // transcribed — drop the replay tail.
+                                    if is_final {
+                                        replay.clear();
+                                    }
 
                                     // Send result (non-blocking with bounded channel)
                                     if let Err(e) = result_tx.try_send(stt_result) {
@@ -396,209 +776,374 @@ impl DeepgramSTT {
 
         // Clone necessary data for the connection task
         let api_key = config.base.api_key.clone();
-        let use_eu_endpoint = config.use_eu_endpoint;
+        // Per-connection reconnection policy (backoff/jitter is inherently per-connection). The
+        // STORM-CONTROL governor and the PROVIDER circuit breaker, however, are the single
+        // process-global handles injected from CoreState (W-D2) so every Deepgram session trips
+        // the same breaker and shares the one process-wide reconnect cap. When no handles were
+        // injected (a unit test constructing the provider directly), fall back to per-session
+        // ones so behaviour degrades gracefully instead of panicking.
+        let reconnection = ReconnectionConfig::aggressive();
+        let reset_after_ms = reconnection.reset_after_ms;
+        let (governor, breaker) = match &self.resilience {
+            Some(r) => ((*r.governor).clone(), std::sync::Arc::clone(&r.breaker)),
+            None => (
+                ReconnectGovernor::default(),
+                std::sync::Arc::new(CircuitBreaker::with_defaults()),
+            ),
+        };
+
+        // Fresh session: clear any intent left over from a prior disconnect so the reconnect loop
+        // does not stop immediately. The same flag is shared into the task so disconnect() can stop
+        // a reconnect that races a server-side close (W-D1).
+        self.intentional_disconnect.store(false, Ordering::SeqCst);
+        let intentional_disconnect = Arc::clone(&self.intentional_disconnect);
+        // D-G1: shared with the task so the send arm records, the parser
+        // clears on finals, and each reconnect iteration replays the tail.
+        let replay = Arc::clone(&self.replay);
 
         // Start the connection task
         let connection_handle = tokio::spawn(async move {
-            // Update state to connecting (this will be set by the main thread)
-            // state_notify.notify_waiters() - don't notify here, main thread handles connecting state
-
-            // Connect to Deepgram (use EU endpoint if configured)
-            let host = if use_eu_endpoint {
-                "api.eu.deepgram.com"
-            } else {
-                "api.deepgram.com"
-            };
-            let request = match tokio_tungstenite::tungstenite::http::Request::builder()
-                .method("GET")
-                .uri(&ws_url)
-                .header("Host", host)
-                .header("Upgrade", "websocket")
-                .header("Connection", "upgrade")
-                .header("Sec-WebSocket-Key", generate_key())
-                .header("Sec-WebSocket-Version", "13")
-                .header("Authorization", format!("Token {api_key}"))
-                .body(())
-            {
-                Ok(request) => request,
-                Err(e) => {
-                    let stt_error = STTError::ConnectionFailed(format!(
-                        "Failed to create WebSocket request: {e}"
-                    ));
-                    error!("{}", stt_error);
-                    let _ = error_tx.try_send(stt_error);
-                    return;
+            let manager = ReconnectionManager::new(reconnection);
+            // `connected_tx` is a oneshot: signal success exactly once (the first connect).
+            let mut connected_tx = Some(connected_tx);
+            // Outer reconnect loop. Each iteration establishes a *featured* connection (the
+            // URL carries diarize/keyterm/redaction/...) and runs the inner event loop until
+            // it yields an outcome. Reconnectable outcomes loop; intentional/exhausted stop.
+            'reconnect: loop {
+                // W-D1: an intentional disconnect (possibly set during the previous iteration's
+                // backoff) must stop the loop before dialing again.
+                if intentional_disconnect.load(Ordering::Acquire) {
+                    info!("Deepgram: intentional disconnect; not reconnecting");
+                    break 'reconnect;
                 }
-            };
-
-            let (ws_stream, _) = match connect_async(request).await {
-                Ok(result) => result,
-                Err(e) => {
-                    let stt_error =
-                        STTError::ConnectionFailed(format!("Failed to connect to Deepgram: {e}"));
-                    error!("{}", stt_error);
-                    let _ = error_tx.try_send(stt_error);
-                    return;
+                // Storm control + breaker gate before dialing.
+                if !breaker.allow_request() {
+                    crate::core::metrics::bridge::record_reconnect("deepgram", "circuit_open");
+                    if !manager.should_retry() {
+                        error!("Deepgram circuit open and reconnection budget exhausted");
+                        break 'reconnect;
+                    }
+                    let delay = manager.next_delay_duration();
+                    tokio::time::sleep(delay).await;
+                    continue 'reconnect;
                 }
-            };
+                let _permit = governor.acquire().await;
+                manager.start_attempt();
 
-            info!("Connected to Deepgram WebSocket");
+                // --- Dial + restore the featured session (re-send via the featured URL) ---
+                // Build the upgrade request via `into_client_request` (repo convention): it
+                // derives the 5 mandatory WS handshake headers (`Host`, `Connection`, `Upgrade`,
+                // `Sec-WebSocket-Version`, `Sec-WebSocket-Key`) from the dial URL; only
+                // Deepgram's auth header rides on top.
+                let built = ws_url
+                    .as_str()
+                    .into_client_request()
+                    .and_then(|mut request| {
+                        request
+                            .headers_mut()
+                            .insert("Authorization", format!("Token {api_key}").parse()?);
+                        Ok(request)
+                    });
+                let request = match built {
+                    Ok(request) => request,
+                    Err(e) => {
+                        // A malformed request is fatal — retrying is pointless.
+                        let stt_error = STTError::ConnectionFailed(format!(
+                            "Failed to create WebSocket request: {e}"
+                        ));
+                        error!("{}", stt_error);
+                        let _ = error_tx.try_send(stt_error);
+                        break 'reconnect;
+                    }
+                };
 
-            // Signal successful connection
-            let _ = connected_tx.send(());
-
-            let (mut ws_sink, mut ws_stream) = ws_stream.split();
-
-            // Keep-alive mechanism to prevent connection timeout
-            // Deepgram connections timeout after 10 seconds of inactivity
-            // Send keep-alive messages every 1 second when no audio is being sent
-            let mut keepalive_timer = interval(Duration::from_secs(1));
-            let mut last_activity = Instant::now();
-
-            // Main event loop
-            loop {
-                tokio::select! {
-                    // Handle outgoing audio data
-                    Some(audio_data) = ws_rx.recv() => {
-                        let message = Message::Binary(audio_data);
-                        if let Err(e) = ws_sink.send(message).await {
-                            let stt_error = STTError::NetworkError(format!(
-                                "Failed to send WebSocket message: {e}"
-                            ));
-                            error!("{}", stt_error);
+                // Deadline-bounded dial: flatten timeout + connect error into one
+                // message so both take the same reconnect-eligible path below.
+                let dial = match with_timeout(WS_CONNECT_TIMEOUT, connect_async(request)).await {
+                    Ok(res) => res.map_err(|e| format!("Failed to connect to Deepgram: {e}")),
+                    Err(_) => Err(format!(
+                        "connect to Deepgram timed out after {}s",
+                        WS_CONNECT_TIMEOUT.as_secs()
+                    )),
+                };
+                let ws_stream = match dial {
+                    Ok((s, _)) => s,
+                    Err(msg) => {
+                        // Eligible for reconnection: the upstream may just be flapping.
+                        let stt_error = STTError::ConnectionFailed(msg);
+                        error!("{}", stt_error);
+                        breaker.record_failure();
+                        crate::core::metrics::bridge::record_reconnect("deepgram", "failure");
+                        manager.record_attempt(false);
+                        drop(_permit);
+                        if connected_tx.is_some() {
+                            // Never connected yet and dialing failed — surface to the
+                            // waiting connect() and give up (matches prior behavior of not
+                            // hanging the initial connect on a dead endpoint).
                             let _ = error_tx.try_send(stt_error);
+                            break 'reconnect;
+                        }
+                        if !manager.should_retry() {
+                            let _ = error_tx.try_send(stt_error);
+                            break 'reconnect;
+                        }
+                        let delay = manager.next_delay_duration();
+                        tokio::time::sleep(delay).await;
+                        continue 'reconnect;
+                    }
+                };
+
+                info!("Connected to Deepgram WebSocket");
+                // The dial succeeded — tell the breaker. We do NOT zero the attempt counter
+                // here: a connect that immediately drops must still count against
+                // `max_attempts` (a fast connect→drop flap would otherwise retry forever). The
+                // counter is reset only after the connection proves *stable* (below).
+                breaker.record_success();
+                crate::core::metrics::bridge::record_reconnect("deepgram", "success");
+                drop(_permit);
+                let connected_since = Instant::now();
+
+                // Signal the waiting connect() exactly once.
+                if let Some(tx) = connected_tx.take() {
+                    let _ = tx.send(());
+                }
+
+                let (mut ws_sink, mut ws_stream) = ws_stream.split();
+
+                // D-G1: replay the un-finalized audio tail into the fresh
+                // connection (empty on the first connect). Without this,
+                // words spoken after the last final but before the drop are
+                // silently lost — the provider is stateless across sockets.
+                let tail = replay.snapshot();
+                if !tail.is_empty() {
+                    let tail_bytes: usize = tail.iter().map(|c| c.len()).sum();
+                    info!(
+                        chunks = tail.len(),
+                        bytes = tail_bytes,
+                        "Deepgram: replaying un-finalized audio tail after reconnect"
+                    );
+                    for chunk in tail {
+                        if let Err(e) = ws_sink.send(Message::Binary(chunk)).await {
+                            warn!("Deepgram: audio replay send failed: {e}");
                             break;
                         }
-                        // Update last activity time when audio is sent
-                        last_activity = Instant::now();
                     }
+                }
 
-                    // Handle incoming messages with idle timeout
-                    message = timeout(WS_MESSAGE_TIMEOUT, ws_stream.next()) => {
-                        match message {
-                            Ok(Some(Ok(msg))) => {
-                                if let Err(e) = Self::handle_websocket_message(msg, &result_tx) {
-                                    error!("Streaming error from Deepgram: {}", e);
-                                    let _ = error_tx.try_send(e);
+                // Keep-alive mechanism to prevent connection timeout
+                // Deepgram connections timeout after 10 seconds of inactivity
+                // Send keep-alive messages every 1 second when no audio is being sent
+                let mut keepalive_timer = interval(Duration::from_secs(1));
+                let mut last_activity = Instant::now();
+
+                // Outcome of the inner event loop: do we reconnect, or stop intentionally?
+                let mut outcome: DeepgramInnerOutcome;
+
+                // Main event loop
+                loop {
+                    tokio::select! {
+                        // Handle outgoing audio data
+                        Some(audio_data) = ws_rx.recv() => {
+                            // D-G1: record BEFORE the write — a chunk whose
+                            // write fails is precisely the audio the next
+                            // connection must replay (Bytes clone = refcount).
+                            replay.push(audio_data.clone());
+                            let message = Message::Binary(audio_data);
+                            if let Err(e) = ws_sink.send(message).await {
+                                let stt_error = STTError::NetworkError(format!(
+                                    "Failed to send WebSocket message: {e}"
+                                ));
+                                error!("{}", stt_error);
+                                let _ = error_tx.try_send(stt_error);
+                                outcome = DeepgramInnerOutcome::Reconnect;
+                                break;
+                            }
+                            // Update last activity time when audio is sent
+                            last_activity = Instant::now();
+                        }
+
+                        // Handle incoming messages with idle timeout
+                        message = timeout(WS_MESSAGE_TIMEOUT, ws_stream.next()) => {
+                            match message {
+                                Ok(Some(Ok(msg))) => {
+                                    if let Err(e) = Self::handle_websocket_message(msg, &result_tx, &replay) {
+                                        error!("Streaming error from Deepgram: {}", e);
+                                        let _ = error_tx.try_send(e);
+                                        // A provider `Error` frame is typically fatal (bad
+                                        // config / auth); do not hammer it with reconnects.
+                                        outcome = DeepgramInnerOutcome::Fatal;
+                                        break;
+                                    }
+                                }
+                                Ok(Some(Err(e))) => {
+                                    let stt_error = STTError::NetworkError(format!(
+                                        "WebSocket error: {e}"
+                                    ));
+                                    error!("{}", stt_error);
+                                    let _ = error_tx.try_send(stt_error);
+                                    outcome = DeepgramInnerOutcome::Reconnect;
+                                    break;
+                                }
+                                Ok(None) => {
+                                    info!("WebSocket stream ended");
+                                    // The server closed the socket mid-stream — reconnect to
+                                    // preserve the session (no finals lost across the gap).
+                                    outcome = DeepgramInnerOutcome::Reconnect;
+                                    break;
+                                }
+                                Err(_elapsed) => {
+                                    // Idle timeout - no message received for 60s
+                                    let stt_error = STTError::NetworkError(
+                                        "WebSocket idle timeout - no message for 60 seconds".into()
+                                    );
+                                    error!("Deepgram STT idle timeout: {}", stt_error);
+                                    let _ = error_tx.try_send(stt_error);
+                                    outcome = DeepgramInnerOutcome::Reconnect;
                                     break;
                                 }
                             }
-                            Ok(Some(Err(e))) => {
-                                let stt_error = STTError::NetworkError(format!(
-                                    "WebSocket error: {e}"
-                                ));
-                                error!("{}", stt_error);
-                                let _ = error_tx.try_send(stt_error);
-                                break;
-                            }
-                            Ok(None) => {
-                                info!("WebSocket stream ended");
-                                break;
-                            }
-                            Err(_elapsed) => {
-                                // Idle timeout - no message received for 60s
-                                let stt_error = STTError::NetworkError(
-                                    "WebSocket idle timeout - no message for 60 seconds".into()
-                                );
-                                error!("Deepgram STT idle timeout: {}", stt_error);
-                                let _ = error_tx.try_send(stt_error);
-                                break;
+                        }
+
+                        // Handle keep-alive timer
+                        _ = keepalive_timer.tick() => {
+                            // Check if we need to send a keep-alive message
+                            // Only send if no audio was sent in the last second
+                            if last_activity.elapsed() >= Duration::from_secs(1) {
+                                let keepalive_message = Message::Text(r#"{"type":"KeepAlive"}"#.into());
+                                if let Err(e) = ws_sink.send(keepalive_message).await {
+                                    let stt_error = STTError::NetworkError(format!(
+                                        "Failed to send keep-alive message: {e}"
+                                    ));
+                                    error!("{}", stt_error);
+                                    let _ = error_tx.try_send(stt_error);
+                                    outcome = DeepgramInnerOutcome::Reconnect;
+                                    break;
+                                }
+                                debug!("Sent keep-alive message to Deepgram");
                             }
                         }
-                    }
 
-                    // Handle keep-alive timer
-                    _ = keepalive_timer.tick() => {
-                        // Check if we need to send a keep-alive message
-                        // Only send if no audio was sent in the last second
-                        if last_activity.elapsed() >= Duration::from_secs(1) {
-                            let keepalive_message = Message::Text(r#"{"type":"KeepAlive"}"#.into());
-                            if let Err(e) = ws_sink.send(keepalive_message).await {
-                                let stt_error = STTError::NetworkError(format!(
-                                    "Failed to send keep-alive message: {e}"
-                                ));
-                                error!("{}", stt_error);
-                                let _ = error_tx.try_send(stt_error);
+                        // Handle shutdown signal
+                        _ = &mut shutdown_rx => {
+                            info!("Received shutdown signal, sending CloseStream to Deepgram");
+                            // CRITICAL: Send CloseStream message to signal end of audio
+                            // This tells Deepgram to finalize any pending transcripts and send speech_final
+                            let close_stream_message = Message::Text(r#"{"type":"CloseStream"}"#.into());
+                            if let Err(e) = ws_sink.send(close_stream_message).await {
+                                warn!("Failed to send CloseStream message: {}", e);
+                                outcome = DeepgramInnerOutcome::Intentional;
                                 break;
                             }
-                            debug!("Sent keep-alive message to Deepgram");
-                        }
-                    }
+                            debug!("Sent CloseStream message to Deepgram, waiting for final results");
 
-                    // Handle shutdown signal
-                    _ = &mut shutdown_rx => {
-                        info!("Received shutdown signal, sending CloseStream to Deepgram");
-                        // CRITICAL: Send CloseStream message to signal end of audio
-                        // This tells Deepgram to finalize any pending transcripts and send speech_final
-                        let close_stream_message = Message::Text(r#"{"type":"CloseStream"}"#.into());
-                        if let Err(e) = ws_sink.send(close_stream_message).await {
-                            warn!("Failed to send CloseStream message: {}", e);
-                            break;
-                        }
-                        debug!("Sent CloseStream message to Deepgram, waiting for final results");
+                            // CRITICAL: Continue receiving messages after CloseStream to capture speech_final
+                            // Don't just sleep - actively receive and process any final results
+                            let close_timeout = tokio::time::Instant::now() + Duration::from_millis(1000);
+                            let mut received_speech_final = false;
 
-                        // CRITICAL: Continue receiving messages after CloseStream to capture speech_final
-                        // Don't just sleep - actively receive and process any final results
-                        let close_timeout = tokio::time::Instant::now() + Duration::from_millis(1000);
-                        let mut received_speech_final = false;
+                            while tokio::time::Instant::now() < close_timeout {
+                                tokio::select! {
+                                    biased; // Prefer receiving messages over timeout
 
-                        while tokio::time::Instant::now() < close_timeout {
-                            tokio::select! {
-                                biased; // Prefer receiving messages over timeout
+                                    message = tokio::time::timeout(Duration::from_millis(200), ws_stream.next()) => {
+                                        match message {
+                                            Ok(Some(Ok(msg))) => {
+                                                // Check if this is a speech_final result before processing
+                                                if let Message::Text(ref text) = msg
+                                                    && (text.contains("\"speech_final\":true") || text.contains("\"speech_final\": true")) {
+                                                        info!("Received speech_final after CloseStream");
+                                                        received_speech_final = true;
+                                                    }
 
-                                message = tokio::time::timeout(Duration::from_millis(200), ws_stream.next()) => {
-                                    match message {
-                                        Ok(Some(Ok(msg))) => {
-                                            // Check if this is a speech_final result before processing
-                                            if let Message::Text(ref text) = msg {
-                                                if text.contains("\"speech_final\":true") || text.contains("\"speech_final\": true") {
-                                                    info!("Received speech_final after CloseStream");
-                                                    received_speech_final = true;
+                                                if let Err(e) = Self::handle_websocket_message(msg, &result_tx, &replay) {
+                                                    warn!("Error handling message after CloseStream: {}", e);
+                                                }
+
+                                                // If we got speech_final, we can exit sooner
+                                                if received_speech_final {
+                                                    debug!("Got speech_final, exiting early");
+                                                    break;
                                                 }
                                             }
-
-                                            if let Err(e) = Self::handle_websocket_message(msg, &result_tx) {
-                                                warn!("Error handling message after CloseStream: {}", e);
-                                            }
-
-                                            // If we got speech_final, we can exit sooner
-                                            if received_speech_final {
-                                                debug!("Got speech_final, exiting early");
+                                            Ok(Some(Err(e))) => {
+                                                debug!("WebSocket error after CloseStream: {}", e);
                                                 break;
                                             }
-                                        }
-                                        Ok(Some(Err(e))) => {
-                                            debug!("WebSocket error after CloseStream: {}", e);
-                                            break;
-                                        }
-                                        Ok(None) => {
-                                            info!("WebSocket stream ended after CloseStream");
-                                            break;
-                                        }
-                                        Err(_) => {
-                                            // 200ms timeout - continue waiting
-                                            debug!("Still waiting for final results after CloseStream...");
+                                            Ok(None) => {
+                                                info!("WebSocket stream ended after CloseStream");
+                                                break;
+                                            }
+                                            Err(_) => {
+                                                // 200ms timeout - continue waiting
+                                                debug!("Still waiting for final results after CloseStream...");
+                                            }
                                         }
                                     }
                                 }
                             }
-                        }
 
-                        if !received_speech_final {
-                            debug!("CloseStream timeout reached without receiving speech_final");
-                        }
+                            if !received_speech_final {
+                                debug!("CloseStream timeout reached without receiving speech_final");
+                            }
 
-                        break;
+                            outcome = DeepgramInnerOutcome::Intentional;
+                            break;
+                        }
+                    }
+                }
+
+                // Send graceful close frame before disconnecting from this socket.
+                if let Err(e) = ws_sink.close().await {
+                    debug!("Error closing WebSocket sink: {}", e);
+                }
+
+                // A connection that survived `reset_after_ms` is stable: clear backoff so a
+                // long, occasionally-flaky session never exhausts max_attempts over its life.
+                if reset_after_ms > 0
+                    && connected_since.elapsed().as_millis() as u64 >= reset_after_ms
+                {
+                    manager.reset();
+                }
+                // D-G2: feed the lifetime to the quick-fail detector; the
+                // breaker itself ignores intentional (clean) closes.
+                breaker.record_connection_closed(
+                    connected_since.elapsed(),
+                    intentional_disconnect.load(Ordering::Acquire),
+                );
+
+                // W-D1: if the client asked to disconnect while the inner loop was running, a
+                // server-close that won the unbiased select may have classified this as Reconnect.
+                // Honor the intent: convert it to Intentional so we neither reconnect nor record a
+                // spurious breaker failure.
+                if matches!(outcome, DeepgramInnerOutcome::Reconnect)
+                    && intentional_disconnect.load(Ordering::Acquire)
+                {
+                    outcome = DeepgramInnerOutcome::Intentional;
+                }
+
+                match outcome {
+                    DeepgramInnerOutcome::Intentional | DeepgramInnerOutcome::Fatal => {
+                        info!("Deepgram WebSocket connection closed");
+                        break 'reconnect;
+                    }
+                    DeepgramInnerOutcome::Reconnect => {
+                        breaker.record_failure();
+                        if !manager.should_retry() {
+                            crate::core::metrics::bridge::record_reconnect("deepgram", "exhausted");
+                            warn!("Deepgram reconnection budget exhausted; closing session");
+                            break 'reconnect;
+                        }
+                        let delay = manager.next_delay_duration();
+                        info!(
+                            "Deepgram transport dropped; reconnecting (attempt {}) in {:?}",
+                            manager.attempt_count() + 1,
+                            delay
+                        );
+                        tokio::time::sleep(delay).await;
+                        // loop -> re-dial the same featured URL (restore_session)
                     }
                 }
             }
-
-            // Send graceful close frame before disconnecting
-            if let Err(e) = ws_sink.close().await {
-                debug!("Error closing WebSocket sink: {}", e);
-            }
-
-            info!("Deepgram WebSocket connection closed");
         });
 
         self.connection_handle = Some(connection_handle);
@@ -681,6 +1226,9 @@ impl Default for DeepgramSTT {
             error_forward_handle: None,
             result_callback: Arc::new(Mutex::new(None)),
             error_callback: Arc::new(Mutex::new(None)),
+            resilience: None,
+            intentional_disconnect: Arc::new(AtomicBool::new(false)),
+            replay: Arc::new(crate::core::websocket::AudioReplayBuffer::default()),
         }
     }
 }
@@ -712,20 +1260,7 @@ impl BaseSTT for DeepgramSTT {
             ..Default::default()
         };
 
-        Ok(Self {
-            config: Some(deepgram_config),
-            state: ConnectionState::Disconnected,
-            state_notify: Arc::new(Notify::new()),
-            ws_sender: None,
-            shutdown_tx: None,
-            result_tx: None,
-            error_tx: None,
-            connection_handle: None,
-            result_forward_handle: None,
-            error_forward_handle: None,
-            result_callback: Arc::new(Mutex::new(None)),
-            error_callback: Arc::new(Mutex::new(None)),
-        })
+        Ok(Self::from_deepgram_config(deepgram_config))
     }
 
     async fn connect(&mut self) -> Result<(), STTError> {
@@ -739,6 +1274,9 @@ impl BaseSTT for DeepgramSTT {
     }
 
     async fn disconnect(&mut self) -> Result<(), STTError> {
+        // W-D1: record the intent BEFORE firing the shutdown signal so the reconnect loop never
+        // re-dials on a disconnect that races a server-side close.
+        self.intentional_disconnect.store(true, Ordering::SeqCst);
         // Send shutdown signal
         if let Some(shutdown_tx) = self.shutdown_tx.take() {
             let _ = shutdown_tx.send(());
@@ -746,7 +1284,12 @@ impl BaseSTT for DeepgramSTT {
 
         // Wait for connection task to finish (this now includes waiting for speech_final)
         if let Some(handle) = self.connection_handle.take() {
-            let _ = timeout(Duration::from_secs(5), handle).await;
+            crate::core::observability::await_task_shutdown(
+                "deepgram-stt-connection",
+                handle,
+                Duration::from_secs(5),
+            )
+            .await;
         }
 
         // CRITICAL: Give result forwarding task time to process any pending results
@@ -756,14 +1299,20 @@ impl BaseSTT for DeepgramSTT {
 
         // Clean up result forwarding task
         if let Some(handle) = self.result_forward_handle.take() {
-            handle.abort();
-            let _ = handle.await;
+            crate::core::observability::abort_and_await_task(
+                "deepgram-stt-result-forwarder",
+                handle,
+            )
+            .await;
         }
 
         // Clean up error forwarding task
         if let Some(handle) = self.error_forward_handle.take() {
-            handle.abort();
-            let _ = handle.await;
+            crate::core::observability::abort_and_await_task(
+                "deepgram-stt-error-forwarder",
+                handle,
+            )
+            .await;
         }
 
         // Clean up channels but PRESERVE callbacks
@@ -863,6 +1412,18 @@ impl BaseSTT for DeepgramSTT {
     fn get_provider_info(&self) -> &'static str {
         "Deepgram STT WebSocket"
     }
+
+    /// Measured speech-end→final p99 (Pipecat's benchmarked table: Deepgram
+    /// ≈0.35s; consistent with WaaV's live LATENCY_ANALYSIS stt stage).
+    fn ttfs_p99_ms(&self) -> Option<u64> {
+        Some(350)
+    }
+
+    fn set_resilience(&mut self, resilience: crate::core::resilience::ResilienceHandles) {
+        // Store the shared process-global handles; the next `start_connection` will use them so
+        // every Deepgram session trips the same breaker and shares the one reconnect cap (W-D2).
+        self.resilience = Some(resilience);
+    }
 }
 
 impl Drop for DeepgramSTT {
@@ -878,6 +1439,50 @@ impl Drop for DeepgramSTT {
 mod tests {
     use super::*;
     use tokio::time::Duration;
+
+    /// A-G1: a Finalize-ack result (`from_finalize: true`) maps to
+    /// `STTResult::is_finalized` through the real message handler; ordinary
+    /// finals stay un-finalized.
+    #[tokio::test]
+    async fn from_finalize_maps_to_is_finalized() {
+        let (tx, mut rx) = mpsc::channel::<STTResult>(4);
+
+        let finalize_ack = r#"{"type":"Results","is_final":true,"speech_final":true,"from_finalize":true,
+            "channel":{"alternatives":[{"transcript":"all done","confidence":0.98}]}}"#;
+        DeepgramSTT::handle_websocket_message(
+            Message::Text(finalize_ack.into()),
+            &tx,
+            &crate::core::websocket::AudioReplayBuffer::default(),
+        )
+        .unwrap();
+        let r = rx.recv().await.unwrap();
+        assert!(r.is_finalized, "Finalize ack must set is_finalized");
+        assert!(r.is_final);
+
+        let ordinary_final = r#"{"type":"Results","is_final":true,"speech_final":false,
+            "channel":{"alternatives":[{"transcript":"hello","confidence":0.9}]}}"#;
+        DeepgramSTT::handle_websocket_message(
+            Message::Text(ordinary_final.into()),
+            &tx,
+            &crate::core::websocket::AudioReplayBuffer::default(),
+        )
+        .unwrap();
+        let r = rx.recv().await.unwrap();
+        assert!(!r.is_finalized, "ordinary finals are not finalized");
+
+        // A malformed pairing (from_finalize on an interim) must NOT mark
+        // finalized — the invariant is enforced at the mapping site.
+        let weird_interim = r#"{"type":"Results","is_final":false,"from_finalize":true,
+            "channel":{"alternatives":[{"transcript":"par","confidence":0.5}]}}"#;
+        DeepgramSTT::handle_websocket_message(
+            Message::Text(weird_interim.into()),
+            &tx,
+            &crate::core::websocket::AudioReplayBuffer::default(),
+        )
+        .unwrap();
+        let r = rx.recv().await.unwrap();
+        assert!(!r.is_finalized, "interim can never be finalized");
+    }
 
     #[tokio::test]
     async fn test_deepgram_stt_creation() {
@@ -895,6 +1500,29 @@ mod tests {
         let stt = <DeepgramSTT as BaseSTT>::new(config).unwrap();
         assert!(!stt.is_ready());
         assert_eq!(stt.get_provider_info(), "Deepgram STT WebSocket");
+    }
+
+    // W-D1: disconnect() must record intent on the flag shared with the hand-rolled reconnect
+    // loop, so a client close racing a server-side close can never trigger a spurious reconnect.
+    #[tokio::test]
+    async fn disconnect_sets_intentional_flag_for_supervisor() {
+        let config = STTConfig {
+            model: "nova-3".to_string(),
+            provider: "deepgram".to_string(),
+            api_key: "test_key".to_string(),
+            language: "en-US".to_string(),
+            sample_rate: 16000,
+            channels: 1,
+            punctuation: true,
+            encoding: "linear16".to_string(),
+        };
+        let mut stt = <DeepgramSTT as BaseSTT>::new(config).unwrap();
+        assert!(!stt.intentional_disconnect.load(Ordering::SeqCst));
+        stt.disconnect().await.unwrap();
+        assert!(
+            stt.intentional_disconnect.load(Ordering::SeqCst),
+            "disconnect() must set the reconnect-loop intentional-disconnect flag",
+        );
     }
 
     #[tokio::test]
@@ -952,9 +1580,518 @@ mod tests {
         assert!(url.contains("punctuate=false"));
         assert!(url.contains("interim_results=true"));
         assert!(url.contains("smart_format=false"));
-        assert!(url.contains("keywords=hello,world"));
+        // nova-3 uses keyterm prompting (one param per term), NOT the legacy keywords= param.
+        assert!(url.contains("keyterm=hello"));
+        assert!(url.contains("keyterm=world"));
+        assert!(!url.contains("keywords="));
         assert!(url.contains("endpointing=300"));
         assert!(url.contains("tag=test-tag"));
+        // utterance_end_ms is a valid streaming param when interim_results=true and value >= 1000.
+        assert!(url.contains("utterance_end_ms=1000"));
+    }
+
+    #[tokio::test]
+    async fn test_deepgram_base_query_values_are_encoded() {
+        let stt = DeepgramSTT::default();
+        let config = DeepgramSTTConfig {
+            base: STTConfig {
+                model: "nova-3&sample_rate=8000".to_string(),
+                provider: "deepgram".to_string(),
+                api_key: "test_key".to_string(),
+                language: "en-US&channels=9".to_string(),
+                sample_rate: 16000,
+                channels: 1,
+                punctuation: true,
+                encoding: "linear16&punctuate=false".to_string(),
+            },
+            ..Default::default()
+        };
+
+        let url = stt.build_websocket_url(&config).unwrap();
+        let parsed = url::Url::parse(&url).unwrap();
+        let pairs: Vec<_> = parsed.query_pairs().collect();
+        assert!(pairs.contains(&("model".into(), "nova-3&sample_rate=8000".into())));
+        assert!(pairs.contains(&("language".into(), "en-US&channels=9".into())));
+        assert!(pairs.contains(&("encoding".into(), "linear16&punctuate=false".into())));
+        assert_eq!(
+            pairs
+                .iter()
+                .filter(|(key, value)| key == "sample_rate" && value == "16000")
+                .count(),
+            1,
+            "url: {url}"
+        );
+        assert_eq!(
+            pairs
+                .iter()
+                .filter(|(key, value)| key == "channels" && value == "1")
+                .count(),
+            1,
+            "url: {url}"
+        );
+        assert!(
+            !url.contains("model=nova-3&sample_rate=8000"),
+            "model must be encoded as one query value: {url}"
+        );
+        assert!(
+            !url.contains("language=en-US&channels=9"),
+            "language must be encoded as one query value: {url}"
+        );
+        assert!(
+            !url.contains("encoding=linear16&punctuate=false"),
+            "encoding must be encoded as one query value: {url}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_deepgram_url_encodes_keyterms_and_gates_utterance_end() {
+        let stt = DeepgramSTT::default();
+        let base = |model: &str| STTConfig {
+            model: model.to_string(),
+            api_key: "k".to_string(),
+            ..Default::default()
+        };
+
+        // Multi-word keyterms MUST be percent-encoded (space → `+`), else the URL is malformed and
+        // Deepgram closes the stream (regression guard for the live "John Smith" failure).
+        let cfg = DeepgramSTTConfig {
+            base: base("nova-3"),
+            keywords: vec!["John Smith".to_string()],
+            ..Default::default()
+        };
+        let url = stt.build_websocket_url(&cfg).unwrap();
+        assert!(
+            url.contains("keyterm=John+Smith"),
+            "keyterm not encoded: {url}"
+        );
+        assert!(
+            !url.contains("keyterm=John Smith"),
+            "raw space leaked into URL: {url}"
+        );
+
+        // Legacy keywords on nova-2 are encoded per-term and comma-joined.
+        let cfg2 = DeepgramSTTConfig {
+            base: base("nova-2"),
+            keywords: vec!["New York".to_string(), "L.A.".to_string()],
+            ..Default::default()
+        };
+        let url2 = stt.build_websocket_url(&cfg2).unwrap();
+        assert!(
+            url2.contains("keywords=New+York,L.A."),
+            "keywords not encoded: {url2}"
+        );
+
+        // utterance_end_ms gating: below 1000 OR interim_results=false ⇒ NOT emitted.
+        let below = DeepgramSTTConfig {
+            base: base("nova-3"),
+            interim_results: true,
+            utterance_end_ms: Some(500),
+            ..Default::default()
+        };
+        assert!(
+            !stt.build_websocket_url(&below)
+                .unwrap()
+                .contains("utterance_end_ms")
+        );
+
+        let no_interim = DeepgramSTTConfig {
+            base: base("nova-3"),
+            interim_results: false,
+            utterance_end_ms: Some(2000),
+            ..Default::default()
+        };
+        assert!(
+            !stt.build_websocket_url(&no_interim)
+                .unwrap()
+                .contains("utterance_end_ms")
+        );
+
+        // interim_results=true AND value >= 1000 ⇒ emitted.
+        let ok = DeepgramSTTConfig {
+            base: base("nova-3"),
+            interim_results: true,
+            utterance_end_ms: Some(1500),
+            ..Default::default()
+        };
+        assert!(
+            stt.build_websocket_url(&ok)
+                .unwrap()
+                .contains("utterance_end_ms=1500")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_deepgram_keywords_vs_keyterm_by_model() {
+        let stt = DeepgramSTT::default();
+        let mk = |model: &str| DeepgramSTTConfig {
+            base: STTConfig {
+                model: model.to_string(),
+                api_key: "k".to_string(),
+                ..Default::default()
+            },
+            keywords: vec!["foo".to_string(), "bar".to_string()],
+            ..Default::default()
+        };
+        // nova-2 (and earlier) -> legacy keyword boosting.
+        let url_n2 = stt.build_websocket_url(&mk("nova-2")).unwrap();
+        assert!(url_n2.contains("keywords=foo,bar"));
+        assert!(!url_n2.contains("keyterm="));
+        // nova-3 -> keyterm prompting.
+        let url_n3 = stt.build_websocket_url(&mk("nova-3")).unwrap();
+        assert!(url_n3.contains("keyterm=foo"));
+        assert!(url_n3.contains("keyterm=bar"));
+        assert!(!url_n3.contains("keywords="));
+    }
+
+    // W1 keystone: advanced features that the flat factory path hardcodes off are now reachable
+    // for Deepgram via StandardSTTConfig and actually reach the wire.
+    #[tokio::test]
+    async fn test_deepgram_from_standard_unlocks_advanced_features() {
+        use super::super::standard::{StandardSTTConfig, SttFeatures};
+        let stt = DeepgramSTT::default();
+        let std_cfg = StandardSTTConfig {
+            base: STTConfig {
+                model: "nova-3".into(),
+                api_key: "k".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                diarization: Some(true),
+                keyterms: Some(vec!["WaaV".into()]),
+                redaction: Some(vec!["pii".into()]),
+                vad_events: Some(true),
+                profanity_filter: Some(true),
+                ..Default::default()
+            },
+            extras: Default::default(),
+            translation: None,
+        };
+        let cfg = DeepgramSTTConfig::from_standard(&std_cfg);
+        // Config fields mapped from the standardized features.
+        assert!(cfg.diarize);
+        assert_eq!(cfg.keywords, vec!["WaaV".to_string()]);
+        assert_eq!(cfg.redact, vec!["pii".to_string()]);
+        assert!(cfg.vad_events);
+        assert!(cfg.profanity_filter);
+        // And they reach the actual request URL (previously impossible via the factory).
+        let url = stt.build_websocket_url(&cfg).unwrap();
+        assert!(url.contains("diarize=true"));
+        assert!(url.contains("keyterm=WaaV")); // nova-3 keyterm prompting
+        assert!(url.contains("vad_events=true"));
+        assert!(url.contains("profanity_filter=true"));
+    }
+
+    // WIRE-LEVEL guard for numerals + multichannel: assert the params land in the request URL
+    // (not merely on the config struct). This is the exact bug class the last review caught —
+    // a feature mapped onto the struct but never serialized to the wire.
+    #[tokio::test]
+    async fn test_deepgram_numerals_multichannel_reach_the_wire() {
+        let stt = DeepgramSTT::default();
+        let base = STTConfig {
+            model: "nova-3".to_string(),
+            api_key: "k".to_string(),
+            ..Default::default()
+        };
+
+        // Off by default => params MUST NOT appear.
+        let off = DeepgramSTTConfig {
+            base: base.clone(),
+            ..Default::default()
+        };
+        let url_off = stt.build_websocket_url(&off).unwrap();
+        assert!(
+            !url_off.contains("numerals="),
+            "numerals leaked when off: {url_off}"
+        );
+        assert!(
+            !url_off.contains("multichannel="),
+            "multichannel leaked when off: {url_off}"
+        );
+
+        // On => exact wire params MUST appear.
+        let on = DeepgramSTTConfig {
+            base,
+            numerals: true,
+            multichannel: true,
+            ..Default::default()
+        };
+        let url_on = stt.build_websocket_url(&on).unwrap();
+        assert!(
+            url_on.contains("&numerals=true"),
+            "numerals missing from URL: {url_on}"
+        );
+        assert!(
+            url_on.contains("&multichannel=true"),
+            "multichannel missing from URL: {url_on}"
+        );
+    }
+
+    // WIRE-LEVEL keystone test: the standardized SttFeatures -> from_standard -> URL path.
+    // numerals/multichannel must round-trip all the way to the request URL through the reachable
+    // standardized config. alternatives/language_detection are streaming capability gaps and must
+    // NOT appear on the wire even when requested in the standardized features.
+    #[tokio::test]
+    async fn test_deepgram_from_standard_numerals_multichannel_and_gaps() {
+        use super::super::standard::{StandardSTTConfig, SttFeatures};
+        let stt = DeepgramSTT::default();
+        let std_cfg = StandardSTTConfig {
+            base: STTConfig {
+                model: "nova-3".into(),
+                api_key: "k".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                numerals: Some(true),
+                multichannel: Some(true),
+                // Requested but NOT supported on Deepgram streaming -> must stay capability gaps.
+                alternatives: Some(3),
+                language_detection: Some(true),
+                ..Default::default()
+            },
+            extras: Default::default(),
+            translation: None,
+        };
+        let cfg = DeepgramSTTConfig::from_standard(&std_cfg);
+        // Supported features mapped onto the config...
+        assert!(cfg.numerals);
+        assert!(cfg.multichannel);
+        // ...and they reach the actual request URL.
+        let url = stt.build_websocket_url(&cfg).unwrap();
+        assert!(
+            url.contains("&numerals=true"),
+            "numerals not on wire: {url}"
+        );
+        assert!(
+            url.contains("&multichannel=true"),
+            "multichannel not on wire: {url}"
+        );
+        // Capability gaps: these params must NEVER appear on the streaming URL, even though the
+        // standardized features requested them (Deepgram does not support them on streaming).
+        assert!(
+            !url.contains("alternatives="),
+            "alternatives must be a streaming gap: {url}"
+        );
+        assert!(
+            !url.contains("detect_language="),
+            "detect_language must be a streaming gap: {url}"
+        );
+    }
+
+    // WIRE-LEVEL guard: entity detection + find/replace + search + dictation + callback +
+    // callback_method + mip_opt_out + extra + version must all land in the request URL with their
+    // exact Deepgram param names — NOT merely on the config struct (the recurring bug class).
+    #[tokio::test]
+    async fn test_deepgram_extended_features_reach_the_wire() {
+        let stt = DeepgramSTT::default();
+        let base = STTConfig {
+            model: "nova-3".to_string(),
+            api_key: "k".to_string(),
+            ..Default::default()
+        };
+
+        // Off by default => none of the params appear.
+        let off = DeepgramSTTConfig {
+            base: base.clone(),
+            ..Default::default()
+        };
+        let url_off = stt.build_websocket_url(&off).unwrap();
+        for p in [
+            "detect_entities=",
+            "replace=",
+            "search=",
+            "dictation=",
+            "callback=",
+            "callback_method=",
+            "mip_opt_out=",
+            "extra=",
+            "version=",
+        ] {
+            assert!(!url_off.contains(p), "{p} leaked when unset: {url_off}");
+        }
+
+        // On => exact wire params must appear, multi-valued ones repeated and percent-encoded.
+        let on = DeepgramSTTConfig {
+            base,
+            detect_entities: true,
+            replace: vec!["John Smith:Jon Smith".to_string()],
+            search: vec!["medication".to_string(), "blood pressure".to_string()],
+            dictation: true,
+            callback: Some("https://example.com/cb?x=1".to_string()),
+            callback_method: Some("PUT".to_string()),
+            mip_opt_out: true,
+            extra: vec!["session:abc 123".to_string()],
+            version: Some("2024-01-09.0".to_string()),
+            ..Default::default()
+        };
+        let url = stt.build_websocket_url(&on).unwrap();
+        assert!(
+            url.contains("&detect_entities=true"),
+            "detect_entities missing: {url}"
+        );
+        // find/replace + search values are percent-encoded (space -> +, ':' escaped).
+        assert!(
+            url.contains("&replace=John+Smith%3AJon+Smith"),
+            "replace not encoded: {url}"
+        );
+        assert!(
+            url.contains("&search=medication"),
+            "search[0] missing: {url}"
+        );
+        assert!(
+            url.contains("&search=blood+pressure"),
+            "search[1] not encoded: {url}"
+        );
+        assert!(url.contains("&dictation=true"), "dictation missing: {url}");
+        assert!(
+            url.contains("&callback=https%3A%2F%2Fexample.com%2Fcb%3Fx%3D1"),
+            "callback not encoded: {url}"
+        );
+        assert!(
+            url.contains("&callback_method=PUT"),
+            "callback_method missing: {url}"
+        );
+        assert!(
+            url.contains("&mip_opt_out=true"),
+            "mip_opt_out missing: {url}"
+        );
+        assert!(
+            url.contains("&extra=session%3Aabc+123"),
+            "extra not encoded: {url}"
+        );
+        assert!(
+            url.contains("&version=2024-01-09.0"),
+            "version missing: {url}"
+        );
+    }
+
+    // WIRE-LEVEL keystone: SttFeatures (typed entity_detection) + ProviderExtras passthrough ->
+    // from_standard -> URL. Proves the standardized config actually drives these params onto the
+    // wire, end-to-end through the reachable path.
+    #[tokio::test]
+    async fn test_deepgram_from_standard_extended_features_reach_the_wire() {
+        use super::super::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
+        let stt = DeepgramSTT::default();
+        let extras = ProviderExtras(
+            serde_json::json!({
+                "replace": ["color:colour"],
+                "search": "refund",
+                "dictation": true,
+                "callback": "https://example.com/hook",
+                "callback_method": "POST",
+                "mip_opt_out": true,
+                "extra": ["tenant:acme", "trace:42"],
+                "version": "beta"
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        );
+        let std_cfg = StandardSTTConfig {
+            base: STTConfig {
+                model: "nova-3".into(),
+                api_key: "k".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                entity_detection: Some(true),
+                ..Default::default()
+            },
+            extras,
+            translation: None,
+        };
+        let cfg = DeepgramSTTConfig::from_standard(&std_cfg);
+        // Mapped onto the config...
+        assert!(cfg.detect_entities);
+        assert_eq!(cfg.replace, vec!["color:colour".to_string()]);
+        assert_eq!(cfg.search, vec!["refund".to_string()]);
+        assert!(cfg.dictation);
+        assert_eq!(cfg.callback.as_deref(), Some("https://example.com/hook"));
+        assert_eq!(cfg.callback_method.as_deref(), Some("POST"));
+        assert!(cfg.mip_opt_out);
+        assert_eq!(
+            cfg.extra,
+            vec!["tenant:acme".to_string(), "trace:42".to_string()]
+        );
+        assert_eq!(cfg.version.as_deref(), Some("beta"));
+        // ...and reach the request URL.
+        let url = stt.build_websocket_url(&cfg).unwrap();
+        assert!(url.contains("&detect_entities=true"), "{url}");
+        assert!(url.contains("&replace=color%3Acolour"), "{url}");
+        assert!(url.contains("&search=refund"), "{url}");
+        assert!(url.contains("&dictation=true"), "{url}");
+        assert!(
+            url.contains("&callback=https%3A%2F%2Fexample.com%2Fhook"),
+            "{url}"
+        );
+        assert!(url.contains("&callback_method=POST"), "{url}");
+        assert!(url.contains("&mip_opt_out=true"), "{url}");
+        assert!(url.contains("&extra=tenant%3Aacme"), "{url}");
+        assert!(url.contains("&extra=trace%3A42"), "{url}");
+        assert!(url.contains("&version=beta"), "{url}");
+    }
+
+    #[tokio::test]
+    async fn test_deepgram_streaming_callback_validation() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let stt = DeepgramSTT::default();
+        let base = STTConfig {
+            model: "nova-3".to_string(),
+            api_key: "k".to_string(),
+            ..Default::default()
+        };
+
+        let ok = DeepgramSTTConfig {
+            base: base.clone(),
+            callback: Some(" https://example.com/cb?x=1&y=two words ".to_string()),
+            callback_method: Some("put".to_string()),
+            ..Default::default()
+        };
+        let url = stt.build_websocket_url(&ok).unwrap();
+        assert!(
+            url.contains("&callback=https%3A%2F%2Fexample.com%2Fcb%3Fx%3D1%26y%3Dtwo+words"),
+            "{url}"
+        );
+        assert!(url.contains("&callback_method=PUT"), "{url}");
+
+        let loopback = DeepgramSTTConfig {
+            base: base.clone(),
+            callback: Some("http://127.0.0.1:9000/cb".to_string()),
+            ..Default::default()
+        };
+        let err = stt
+            .build_websocket_url(&loopback)
+            .expect_err("loopback callback URL must be rejected");
+        assert!(err.to_string().contains("SSRF protection"), "{err}");
+
+        let file = DeepgramSTTConfig {
+            base: base.clone(),
+            callback: Some("file:///tmp/cb".to_string()),
+            ..Default::default()
+        };
+        let err = stt
+            .build_websocket_url(&file)
+            .expect_err("non-HTTP callback URL must be rejected");
+        assert!(err.to_string().contains("URL scheme"), "{err}");
+
+        let blank = DeepgramSTTConfig {
+            base: base.clone(),
+            callback: Some("   ".to_string()),
+            ..Default::default()
+        };
+        let err = stt
+            .build_websocket_url(&blank)
+            .expect_err("blank callback URL must be rejected");
+        assert!(err.to_string().contains("empty URL"), "{err}");
+
+        let invalid_method = DeepgramSTTConfig {
+            base,
+            callback_method: Some("DELETE".to_string()),
+            ..Default::default()
+        };
+        let err = stt
+            .build_websocket_url(&invalid_method)
+            .expect_err("invalid callback method must be rejected");
+        assert!(err.to_string().contains("expected POST or PUT"), "{err}");
     }
 
     #[tokio::test]
@@ -981,7 +2118,11 @@ mod tests {
         "#;
 
         let message = Message::Text(json_response.to_string().into());
-        let result = DeepgramSTT::handle_websocket_message(message, &result_tx);
+        let result = DeepgramSTT::handle_websocket_message(
+            message,
+            &result_tx,
+            &crate::core::websocket::AudioReplayBuffer::default(),
+        );
 
         assert!(result.is_ok());
 
@@ -1077,5 +2218,82 @@ mod tests {
         assert!(config.vad_events);
         assert_eq!(config.endpointing, Some(200));
         assert_eq!(config.utterance_end_ms, Some(500));
+    }
+
+    // --- W-D2 cross-session wiring: shared breaker + process-global governor ----------------
+
+    /// Build a `DeepgramSTT` the same way the VoiceManager does for a live session: construct
+    /// from a standardized config, then inject the shared resilience handles from the registry.
+    fn session_from_registry(reg: &crate::core::resilience::ResilienceRegistry) -> DeepgramSTT {
+        use crate::core::stt::base::BaseSTT;
+        let std = crate::core::stt::standard::StandardSTTConfig::from_base(STTConfig {
+            provider: "deepgram".to_string(),
+            api_key: "test-key".to_string(),
+            ..Default::default()
+        });
+        let mut stt = DeepgramSTT::new_standard(&std).expect("build deepgram session");
+        stt.set_resilience(reg.handles_for("deepgram"));
+        stt
+    }
+
+    #[tokio::test]
+    async fn two_deepgram_sessions_share_one_breaker_so_a_trip_is_cross_session_visible() {
+        // RED before wiring: each session created its OWN breaker, so a trip in session A was
+        // invisible to session B. With the shared registry breaker injected, the trip is visible.
+        let reg = crate::core::resilience::ResilienceRegistry::new(8);
+        let session_a = session_from_registry(&reg);
+        let session_b = session_from_registry(&reg);
+
+        let breaker_a = session_a
+            .resilience_breaker()
+            .expect("A has shared breaker");
+        let breaker_b = session_b
+            .resilience_breaker()
+            .expect("B has shared breaker");
+        assert!(
+            Arc::ptr_eq(breaker_a, breaker_b),
+            "both Deepgram sessions must share the one provider breaker"
+        );
+
+        // Session A trips its breaker (a burst of upstream failures).
+        for _ in 0..10 {
+            breaker_a.record_failure();
+        }
+        assert_eq!(
+            breaker_a.state(),
+            crate::core::resilience::CircuitState::Open
+        );
+        // Session B — a different session — sees the open breaker and is denied a reconnect.
+        assert!(
+            !breaker_b.allow_request(),
+            "a trip in session A must be visible to session B (provider-level tripping)"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_sessions_share_the_process_global_governor_cap() {
+        // The governor cap is process-global: both sessions draw from the SAME governor, so two
+        // sessions' reconnects share one cap (storm control across sessions).
+        let reg = crate::core::resilience::ResilienceRegistry::new(3);
+        let session_a = session_from_registry(&reg);
+        let session_b = session_from_registry(&reg);
+
+        let gov_a = &session_a.resilience.as_ref().unwrap().governor;
+        let gov_b = &session_b.resilience.as_ref().unwrap().governor;
+        assert!(
+            Arc::ptr_eq(gov_a, gov_b),
+            "both sessions must share one process-global governor"
+        );
+        assert_eq!(
+            gov_a.max_concurrent(),
+            3,
+            "the cap is the registry's, not a per-session default"
+        );
+
+        // A permit taken via session A's governor is visible as in-flight via session B's
+        // governor handle — proving the cap is shared, not per-session.
+        let _permit = gov_a.acquire().await;
+        assert_eq!(gov_b.in_flight(), 1, "in-flight is shared across sessions");
+        assert_eq!(gov_b.available_permits(), 2);
     }
 }

@@ -35,17 +35,21 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, mpsc, oneshot};
-use tokio::time::timeout;
 use tokio_tungstenite::{
     connect_async,
-    tungstenite::{http::Request, protocol::Message},
+    tungstenite::{
+        client::IntoClientRequest,
+        http::{HeaderValue, Request},
+        protocol::Message,
+    },
 };
 use tracing::{debug, error, info, warn};
 
 use super::config::DashScopeTtsConfig;
 use super::messages::{
-    CosyVoiceContinueTask, CosyVoiceFinishTask, CosyVoiceResponse, CosyVoiceRunTask,
-    QwenTtsServerMessage, QwenTtsSessionUpdate, QwenTtsTextAppend, QwenTtsTextCommit,
+    CosyVoiceContinueTask, CosyVoiceFinishTask, CosyVoiceParameters, CosyVoiceResponse,
+    CosyVoiceRunTask, QwenTtsServerMessage, QwenTtsSessionUpdate, QwenTtsTextAppend,
+    QwenTtsTextCommit,
 };
 use crate::core::tts::base::{
     AudioCallback, AudioData, BaseTTS, ConnectionState, TTSConfig, TTSError, TTSResult,
@@ -60,7 +64,6 @@ use crate::core::tts::base::{
 const PROVIDER_INFO: &str = "Alibaba Cloud DashScope TTS (阿里云)";
 
 /// WebSocket connection timeout.
-const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Channel buffer size for text messages.
 const TEXT_CHANNEL_BUFFER: usize = 32;
@@ -129,10 +132,18 @@ impl DashScopeTts {
     /// Create a new DashScope TTS provider (internal).
     fn create_internal(config: TTSConfig) -> TTSResult<Self> {
         let dashscope_config = DashScopeTtsConfig::from_base(config.clone())?;
+        Self::create_from_parts(config, dashscope_config)
+    }
+
+    /// Assemble the provider from a base config and a fully-resolved DashScope config.
+    fn create_from_parts(
+        base_config: TTSConfig,
+        dashscope_config: DashScopeTtsConfig,
+    ) -> TTSResult<Self> {
         dashscope_config.validate()?;
 
         Ok(Self {
-            base_config: config,
+            base_config,
             config: dashscope_config,
             connected: Arc::new(AtomicBool::new(false)),
             text_sender: None,
@@ -145,23 +156,44 @@ impl DashScopeTts {
         })
     }
 
-    /// Build WebSocket request with authentication headers.
+    /// Build the provider from the standardized config (W1 keystone), mirroring
+    /// `DeepgramTTS::from_standard`. Delegates feature mapping to
+    /// [`DashScopeTtsConfig::from_standard`] (speed→rate, pitch, volume, sample_rate + the
+    /// `region` extra) so advanced prosody reaches the WebSocket synthesis params through the
+    /// standardized dispatch instead of being dropped at the flat boundary.
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
+        let dashscope_config = DashScopeTtsConfig::from_standard(std)?;
+        Self::create_from_parts(std.base.clone(), dashscope_config)
+    }
+
+    /// Build the DashScope WebSocket upgrade request with authentication headers.
+    ///
+    /// CRITICAL: built via `into_client_request` so the 5 mandatory WS handshake headers (`Host`,
+    /// `Connection`, `Upgrade`, `Sec-WebSocket-Version`, `Sec-WebSocket-Key`) are present. A bare
+    /// `Request::builder().uri(url).header("Authorization", ...)` omits them all, so tungstenite's
+    /// `generate_request` rejects EVERY connect with `Protocol(InvalidHeader)` — surfacing only as a
+    /// connect timeout under the reconnect path. (This provider could not connect at all before this.)
     fn build_request(&self) -> Result<Request<()>, TTSError> {
         let url = self.config.get_websocket_url();
-
-        let mut request = Request::builder()
-            .uri(&url)
-            .header("Authorization", format!("Bearer {}", self.config.api_key))
-            .header("User-Agent", "WaaV-Gateway/1.0");
-
+        let mut request = url
+            .as_str()
+            .into_client_request()
+            .map_err(|e| TTSError::InternalError(format!("Failed to build request: {e}")))?;
+        let headers = request.headers_mut();
+        headers.insert(
+            "Authorization",
+            format!("Bearer {}", self.config.api_key)
+                .parse()
+                .map_err(|e| {
+                    TTSError::InternalError(format!("Invalid Authorization header: {e}"))
+                })?,
+        );
+        headers.insert("User-Agent", HeaderValue::from_static("WaaV-Gateway/1.0"));
         // Add OpenAI-Beta header for Qwen models
         if self.config.model.is_qwen_model() {
-            request = request.header("OpenAI-Beta", "realtime=v1");
+            headers.insert("OpenAI-Beta", HeaderValue::from_static("realtime=v1"));
         }
-
-        request
-            .body(())
-            .map_err(|e| TTSError::InternalError(format!("Failed to build request: {}", e)))
+        Ok(request)
     }
 
     /// Create session update message for Qwen TTS.
@@ -176,15 +208,32 @@ impl DashScopeTts {
     }
 
     /// Create run-task message for CosyVoice.
+    ///
+    /// Carries both the base prosody (`voice`/`format`/`sample_rate`/`volume`/`rate`/`pitch`) and
+    /// the advanced CosyVoice inference-protocol knobs (`enable_ssml`, `instruction`,
+    /// `word_timestamp_enabled`, `seed`, `language_hints`, `bit_rate`, `hot_fix`,
+    /// `enable_markdown_filter`, `enable_aigc_tag`) from the resolved config into the run-task
+    /// `payload.parameters`. Unset advanced knobs are omitted from the wire.
     fn create_cosyvoice_run_task(&self) -> (String, String) {
-        let msg = CosyVoiceRunTask::new(
+        let msg = CosyVoiceRunTask::with_parameters(
             self.config.model.as_model_id(),
-            &self.config.voice,
-            self.config.audio_format.as_format_str(),
-            self.config.sample_rate,
-            self.config.volume,
-            self.config.rate,
-            self.config.pitch,
+            CosyVoiceParameters {
+                voice: self.config.voice.clone(),
+                format: self.config.audio_format.as_format_str().to_string(),
+                sample_rate: self.config.sample_rate,
+                volume: self.config.volume,
+                rate: self.config.rate,
+                pitch: self.config.pitch,
+                enable_ssml: self.config.enable_ssml,
+                instruction: self.config.instruction.clone(),
+                word_timestamp_enabled: self.config.word_timestamp_enabled,
+                seed: self.config.seed,
+                language_hints: self.config.language_hints.clone(),
+                bit_rate: self.config.bit_rate,
+                hot_fix: self.config.hot_fix.clone(),
+                enable_markdown_filter: self.config.enable_markdown_filter,
+                enable_aigc_tag: self.config.enable_aigc_tag,
+            },
         );
         let task_id = msg.task_id().to_string();
         let json = msg.to_json().unwrap_or_default();
@@ -295,7 +344,14 @@ impl BaseTTS for DashScopeTts {
         let url = self.config.get_websocket_url();
 
         // Connect with timeout
-        let (ws_stream, _) = match timeout(WS_CONNECT_TIMEOUT, connect_async(request)).await {
+        // 10s dial bound (provider-historical; tighter than the canonical 15s in
+        // resilience::connect — kept to preserve behavior), via the shared helper.
+        let (ws_stream, _) = match crate::core::resilience::connect::with_timeout(
+            Duration::from_secs(10),
+            connect_async(request),
+        )
+        .await
+        {
             Ok(Ok(result)) => result,
             Ok(Err(e)) => {
                 return Err(TTSError::ConnectionFailed(format!(
@@ -381,26 +437,23 @@ impl BaseTTS for DashScopeTts {
 
                     // Send text message (may be multiple JSON for Qwen)
                     for line in msg.lines() {
-                        if !line.is_empty() {
-                            if write
+                        if !line.is_empty()
+                            && write
                                 .send(Message::Text(line.to_string().into()))
                                 .await
                                 .is_err()
-                            {
-                                break;
-                            }
+                        {
+                            break;
                         }
                     }
                 }
 
                 // Send finish message for CosyVoice
-                if !is_qwen {
-                    if let Some(tid) = &task_id_clone {
-                        let finish = CosyVoiceFinishTask::new(tid);
-                        let _ = write
-                            .send(Message::Text(finish.to_json().unwrap_or_default().into()))
-                            .await;
-                    }
+                if !is_qwen && let Some(tid) = &task_id_clone {
+                    let finish = CosyVoiceFinishTask::new(tid);
+                    let _ = write
+                        .send(Message::Text(finish.to_json().unwrap_or_default().into()))
+                        .await;
                 }
 
                 write
@@ -504,12 +557,21 @@ impl BaseTTS for DashScopeTts {
 
         // Wait for connection task to complete
         if let Some(handle) = self.connection_handle.take() {
-            let _ = timeout(Duration::from_secs(5), handle).await;
+            crate::core::observability::await_task_shutdown(
+                "alibaba-cloud-tts-connection",
+                handle,
+                Duration::from_secs(5),
+            )
+            .await;
         }
 
         // Abort audio forwarding task
         if let Some(handle) = self.audio_forward_handle.take() {
-            handle.abort();
+            crate::core::observability::abort_and_await_task(
+                "alibaba-cloud-tts-audio-forwarder",
+                handle,
+            )
+            .await;
         }
 
         // Clear task ID
@@ -619,6 +681,56 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    // W1 keystone: a StandardTTSConfig advanced feature DashScope supports (prosody speed/pitch/
+    // volume + sample_rate) reaches the provider's resolved `config` through the provider struct's
+    // `from_standard`, mirroring `DeepgramTTS::from_standard`.
+    #[test]
+    fn from_standard_reaches_provider_config() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "alibaba-cloud".into(),
+                api_key: "k".into(),
+                voice_id: Some("longxiaochun".into()),
+                model: "cosyvoice-v3-flash".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(1.25),
+                pitch: Some(0.9),
+                volume: Some(80.0),
+                sample_rate: Some(24000),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let tts = DashScopeTts::from_standard(&std).unwrap();
+        assert_eq!(tts.config.rate, 1.25);
+        assert_eq!(tts.config.pitch, 0.9);
+        assert_eq!(tts.config.volume, 80);
+        assert_eq!(tts.config.sample_rate, 24000);
+        assert_eq!(tts.base_config.api_key, "k");
+    }
+
+    #[test]
+    fn from_standard_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let std = crate::core::tts::standard::StandardTTSConfig::from_base(TTSConfig {
+            provider: "alibaba-cloud".into(),
+            api_key: "k".into(),
+            voice_id: Some("longxiaochun".into()),
+            ..Default::default()
+        })
+        .with_endpoint_override("ws://127.0.0.1:9000");
+
+        match DashScopeTts::from_standard(&std) {
+            Ok(_) => {
+                panic!("DashScope provider construction must reject unsafe endpoint_override")
+            }
+            Err(err) => assert!(err.to_string().contains("SSRF protection")),
+        }
+    }
+
     #[test]
     fn test_new_provider_empty_api_key() {
         let config = TTSConfig {
@@ -683,6 +795,91 @@ mod tests {
         assert!(!task_id.is_empty());
     }
 
+    // WIRE-LEVEL: the advanced CosyVoice features set through the standardized config must reach
+    // the actual run-task JSON sent over the WebSocket (under `payload.parameters`), not merely
+    // sit on the config struct. This guards the recurring "config set but never emitted" bug.
+    #[test]
+    fn cosyvoice_features_reach_run_task_payload_parameters() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("bit_rate".into(), serde_json::json!(48000));
+        extras.insert(
+            "hot_fix".into(),
+            serde_json::json!({"WaaV": "wave", "TTS": "tee tee ess"}),
+        );
+        extras.insert("enable_markdown_filter".into(), serde_json::json!(true));
+        extras.insert("enable_aigc_tag".into(), serde_json::json!(true));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "alibaba-cloud".into(),
+                api_key: "k".into(),
+                voice_id: Some("longxiaochun".into()),
+                model: "cosyvoice-v3-flash".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                ssml: Some(true),
+                instructions: Some("speak with a cheerful Sichuan dialect".into()),
+                word_timestamps: Some(true),
+                seed: Some(2024),
+                language: Some("zh".into()),
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+        let tts = DashScopeTts::from_standard(&std).unwrap();
+        let (json, _task_id) = tts.create_cosyvoice_run_task();
+
+        // Parse the emitted bytes and assert each knob landed under payload.parameters.
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let params = &v["payload"]["parameters"];
+        assert_eq!(params["enable_ssml"], serde_json::json!(true));
+        assert_eq!(
+            params["instruction"],
+            serde_json::json!("speak with a cheerful Sichuan dialect")
+        );
+        assert_eq!(params["word_timestamp_enabled"], serde_json::json!(true));
+        assert_eq!(params["seed"], serde_json::json!(2024));
+        assert_eq!(params["language_hints"], serde_json::json!(["zh"]));
+        assert_eq!(params["bit_rate"], serde_json::json!(48000));
+        assert_eq!(
+            params["hot_fix"],
+            serde_json::json!({"WaaV": "wave", "TTS": "tee tee ess"})
+        );
+        assert_eq!(params["enable_markdown_filter"], serde_json::json!(true));
+        assert_eq!(params["enable_aigc_tag"], serde_json::json!(true));
+    }
+
+    // The default (no advanced features) run-task must stay byte-compatible: the optional knobs
+    // are omitted from the wire entirely (skip_serializing_if), not emitted as null.
+    #[test]
+    fn cosyvoice_run_task_omits_unset_advanced_knobs() {
+        let config = create_test_config();
+        let tts = DashScopeTts::new(config).unwrap();
+        let (json, _) = tts.create_cosyvoice_run_task();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let params = &v["payload"]["parameters"];
+        for key in [
+            "enable_ssml",
+            "instruction",
+            "word_timestamp_enabled",
+            "seed",
+            "language_hints",
+            "bit_rate",
+            "hot_fix",
+            "enable_markdown_filter",
+            "enable_aigc_tag",
+        ] {
+            assert!(
+                params.get(key).is_none(),
+                "{key} must be omitted when unset"
+            );
+        }
+        // Base prosody still present.
+        assert!(params.get("voice").is_some());
+        assert!(params.get("rate").is_some());
+    }
+
     #[test]
     fn test_websocket_url_cosyvoice() {
         let config = create_test_config();
@@ -708,7 +905,42 @@ mod tests {
         let config = create_test_config();
         let tts = DashScopeTts::new(config).unwrap();
 
-        let request = tts.build_request();
-        assert!(request.is_ok());
+        let request = tts.build_request().expect("build_request");
+        let h = request.headers();
+        // The 5 mandatory WS upgrade headers MUST be present (else tungstenite rejects the connect
+        // with InvalidHeader — the connect-timeout bug), plus DashScope's Bearer auth.
+        for required in [
+            "host",
+            "connection",
+            "upgrade",
+            "sec-websocket-version",
+            "sec-websocket-key",
+        ] {
+            assert!(h.contains_key(required), "missing WS header: {required}");
+        }
+        assert!(
+            h.get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.starts_with("Bearer ")),
+            "missing Bearer Authorization header"
+        );
+    }
+
+    #[test]
+    fn qwen_build_request_sets_static_beta_header_without_parsing() {
+        let mut config = create_test_config();
+        config.model = "qwen3-tts-flash-realtime".to_string();
+        let tts = DashScopeTts::new(config).unwrap();
+
+        let request = tts.build_request().expect("build qwen request");
+        let h = request.headers();
+        assert_eq!(
+            h.get("user-agent").and_then(|v| v.to_str().ok()),
+            Some("WaaV-Gateway/1.0")
+        );
+        assert_eq!(
+            h.get("openai-beta").and_then(|v| v.to_str().ok()),
+            Some("realtime=v1")
+        );
     }
 }

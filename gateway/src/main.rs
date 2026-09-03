@@ -4,19 +4,19 @@ use std::path::PathBuf;
 #[cfg(feature = "openapi")]
 use std::fs;
 
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use axum::{Router, middleware};
 use axum_server::Handle;
 use axum_server::tls_rustls::RustlsConfig;
 use clap::{Parser, Subcommand};
 use http::{
-    HeaderName, Method,
+    HeaderName, HeaderValue, Method,
     header::{AUTHORIZATION, CONTENT_TYPE},
 };
 use tokio::net::TcpListener;
 use tower_governor::{
-    GovernorLayer, governor::GovernorConfigBuilder, key_extractor::SmartIpKeyExtractor,
+    GovernorLayer, governor::GovernorConfigBuilder, key_extractor::PeerIpKeyExtractor,
 };
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::set_header::SetResponseHeaderLayer;
@@ -25,13 +25,41 @@ use anyhow::anyhow;
 
 use waav_gateway::{
     ServerConfig, global_registry, init,
-    middleware::{auth_middleware, connection_limit_middleware},
+    middleware::{auth_middleware, connection_limit_middleware, request_id_middleware},
     routes,
     state::AppState,
 };
 
 #[cfg(feature = "plugins-dynamic")]
 use waav_gateway::plugin::DynamicPluginLoader;
+
+fn parse_cors_allowed_origins(origins: &str) -> anyhow::Result<Vec<HeaderValue>> {
+    let mut parsed = Vec::new();
+
+    for (index, origin) in origins.split(',').enumerate() {
+        let origin = origin.trim();
+        if origin.is_empty() {
+            anyhow::bail!(
+                "Invalid CORS allowed origin at position {}: empty origin",
+                index + 1
+            );
+        }
+
+        let value = HeaderValue::from_str(origin).map_err(|e| {
+            anyhow!(
+                "Invalid CORS allowed origin at position {} ({origin:?}): {e}",
+                index + 1
+            )
+        })?;
+        parsed.push(value);
+    }
+
+    if parsed.is_empty() {
+        anyhow::bail!("CORS allowed origins must contain at least one origin or '*'");
+    }
+
+    Ok(parsed)
+}
 
 /// WaaV Gateway - Real-time voice processing server
 #[derive(Parser, Debug)]
@@ -102,7 +130,7 @@ async fn main() -> anyhow::Result<()> {
                         .map_err(|e| anyhow!("Failed to generate OpenAPI YAML: {}", e))?,
                     "json" => waav_gateway::docs::openapi::spec_json()
                         .map_err(|e| anyhow!("Failed to generate OpenAPI JSON: {}", e))?,
-                    _ => unreachable!(),
+                    other => anyhow::bail!("Invalid format '{}'. Must be 'yaml' or 'json'", other),
                 };
 
                 // Write to file or stdout
@@ -127,6 +155,17 @@ async fn main() -> anyhow::Result<()> {
     } else {
         ServerConfig::from_env().map_err(|e| anyhow!(e.to_string()))?
     };
+
+    // P3: register the server-side alias registry from config (the `aliases:` section).
+    // Mirrors the DAG template registry initialization; definitions are server-config-
+    // only (SSRF-safe). A client may NAME an alias on its `config` message but never
+    // DEFINE one. Done before serving so the first connection resolves correctly.
+    {
+        let n = waav_gateway::core::alias::initialize_aliases(&config.aliases);
+        if n > 0 {
+            info!("Registered {} server-side config alias(es)", n);
+        }
+    }
 
     // Initialize the plugin registry (including built-in plugins)
     let registry = global_registry();
@@ -163,7 +202,9 @@ async fn main() -> anyhow::Result<()> {
     println!("Starting server on {address}");
 
     // Create application state
-    let app_state = AppState::new(config).await;
+    let app_state = AppState::try_new(config)
+        .await
+        .map_err(|e| anyhow!("invalid app state config: {e}"))?;
 
     // Create protected API routes with authentication middleware
     let protected_routes = routes::api::create_api_router().layer(middleware::from_fn_with_state(
@@ -197,27 +238,75 @@ async fn main() -> anyhow::Result<()> {
             connection_limit_middleware,
         ));
 
+    // Live latency-profile debug surface (`WAAV_DEBUG_PROFILE=1`): JSON snapshot
+    // + per-turn SSE. Auth-gated exactly like the protected API; without the env
+    // flag the routes are not mounted at all (double lock, never public).
+    let debug_profile_routes = if app_state.core_state.profiling.debug_routes {
+        Router::new()
+            .route(
+                "/debug/profile",
+                axum::routing::get(waav_gateway::handlers::debug_profile::profile_snapshot),
+            )
+            .route(
+                "/debug/profile/stream",
+                axum::routing::get(waav_gateway::handlers::debug_profile::profile_stream),
+            )
+            .layer(middleware::from_fn_with_state(
+                app_state.clone(),
+                auth_middleware,
+            ))
+    } else {
+        Router::new()
+    };
+
     // Create webhook routes (no auth - uses LiveKit signature verification)
     let webhook_routes = routes::webhooks::create_webhook_router();
 
-    // Create public health check route (no auth)
-    let public_routes = Router::new().route(
-        "/",
-        axum::routing::get(waav_gateway::handlers::api::health_check),
-    );
+    // Create public, no-auth operability routes (health/readiness/metrics).
+    // - `/` and `/livez`: liveness (process up); never touches upstreams.
+    // - `/readyz`: readiness (config + enabled-provider credentials + cached TCP reachability);
+    //   returns 503 + a per-provider JSON breakdown when an enabled provider is unreachable.
+    // - `/metrics`: Prometheus text exposition (waav_provider_* + waav_circuit_breaker_state).
+    let public_routes = Router::new()
+        .route(
+            "/",
+            axum::routing::get(waav_gateway::handlers::api::health_check),
+        )
+        .route(
+            "/livez",
+            axum::routing::get(waav_gateway::handlers::api::livez),
+        )
+        .route(
+            "/readyz",
+            axum::routing::get(waav_gateway::handlers::api::readyz),
+        )
+        .route(
+            "/metrics",
+            axum::routing::get(waav_gateway::handlers::api::metrics_handler),
+        );
 
-    // Configure rate limiting (disabled when rate >= 100000 for performance testing)
-    let governor_layer = if rate_limit_rps < 100000 {
+    // Configure rate limiting.
+    // SECURITY (S7): key on the real TCP peer IP (PeerIpKeyExtractor), NOT SmartIpKeyExtractor,
+    // which trusts client-supplied X-Forwarded-For / X-Real-IP and therefore lets an attacker
+    // mint a fresh token bucket per request by rotating the header. Behind a trusted reverse
+    // proxy, set up a dedicated trusted-proxy XFF extractor (tracked in W4) — do not re-enable
+    // SmartIpKeyExtractor on an internet-facing listener.
+    // Disable ONLY via an explicit `rate_limit_requests_per_second: 0` (no silent magic-number
+    // threshold that could ship a limiter-off build by accident).
+    let governor_layer = if rate_limit_rps == 0 {
+        tracing::warn!(
+            "Rate limiting EXPLICITLY DISABLED (rate_limit_requests_per_second = 0); \
+             do not run this configuration on an internet-facing deployment"
+        );
+        None
+    } else {
         let governor_config = GovernorConfigBuilder::default()
             .per_second(rate_limit_rps as u64)
             .burst_size(rate_limit_burst)
-            .key_extractor(SmartIpKeyExtractor)
+            .key_extractor(PeerIpKeyExtractor)
             .finish()
-            .expect("Failed to build rate limiter config");
+            .ok_or_else(|| anyhow!("Failed to build rate limiter config"))?;
         Some(GovernorLayer::new(governor_config))
-    } else {
-        println!("Rate limiting disabled (rate >= 100000/s)");
-        None
     };
 
     // Configure CORS
@@ -240,10 +329,7 @@ async fn main() -> anyhow::Result<()> {
                 .allow_credentials(false)
         } else {
             // Parse comma-separated origins
-            let origins: Vec<_> = origins
-                .split(',')
-                .filter_map(|s| s.trim().parse().ok())
-                .collect();
+            let origins = parse_cors_allowed_origins(origins)?;
             CorsLayer::new()
                 .allow_origin(origins)
                 .allow_methods([
@@ -290,16 +376,27 @@ async fn main() -> anyhow::Result<()> {
             http::HeaderValue::from_static("DENY"),
         ));
 
+    // RC6 SIGTERM session drain: clone the app-wide shutdown token before `app_state`
+    // moves into the router. On SIGTERM/SIGINT it is cancelled *before* axum's graceful
+    // drain begins, so every live WebSocket session loop (which selects on this token)
+    // can send a final protocol notice and tear down its providers within the drain window.
+    let shutdown_token = app_state.shutdown.clone();
+
     // Combine all routes: public + webhook + protected + websocket + realtime
     let app = public_routes
         .merge(webhook_routes)
         .merge(protected_routes)
         .merge(ws_routes)
         .merge(realtime_routes)
+        .merge(debug_profile_routes)
         .with_state(app_state)
         .layer(cors_layer)
         .layer(tower::util::option_layer(governor_layer))
-        .layer(security_headers);
+        .layer(security_headers)
+        // Request-id/trace-context correlation is the OUTERMOST layer so the id exists before
+        // auth, rate-limiting, or any handler logs — every nested `tracing` event inherits it,
+        // and it is echoed on the response `x-request-id` header (W-C1 / E13).
+        .layer(axum::middleware::from_fn(request_id_middleware));
 
     // Parse socket address
     let socket_addr: SocketAddr = address
@@ -308,7 +405,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Start server with or without TLS
     if is_tls_enabled {
-        let tls = tls_config.expect("TLS config must be present when TLS is enabled");
+        let Some(tls) = tls_config else {
+            anyhow::bail!("TLS is enabled but TLS config is missing");
+        };
 
         // Load TLS configuration from certificate and key files
         let rustls_config = RustlsConfig::from_pem_file(&tls.cert_path, &tls.key_path)
@@ -331,6 +430,10 @@ async fn main() -> anyhow::Result<()> {
         // Spawn a task to handle shutdown signals
         tokio::spawn(async move {
             shutdown_signal().await;
+            // RC6: signal in-flight WS sessions to drain BEFORE the HTTP-level drain
+            // begins, so each session sends its shutdown notice and closes providers
+            // within the 30-second window below.
+            shutdown_token.cancel();
             // Trigger graceful shutdown - wait up to 30 seconds for connections to drain
             handle_clone.graceful_shutdown(Some(std::time::Duration::from_secs(30)));
         });
@@ -351,7 +454,12 @@ async fn main() -> anyhow::Result<()> {
             listener,
             app.into_make_service_with_connect_info::<SocketAddr>(),
         )
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            // RC6: cancel the session-drain token BEFORE this future resolves (which is
+            // what starts axum's graceful drain), so WS sessions observe shutdown first.
+            shutdown_token.cancel();
+        })
         .await?;
     }
 
@@ -363,17 +471,23 @@ async fn main() -> anyhow::Result<()> {
 /// Returns when a shutdown signal is received.
 async fn shutdown_signal() {
     let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("Failed to install Ctrl+C handler");
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            error!(error = %e, "Failed to install Ctrl+C handler");
+            std::future::pending::<()>().await;
+        }
     };
 
     #[cfg(unix)]
     let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("Failed to install SIGTERM handler")
-            .recv()
-            .await;
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(e) => {
+                error!(error = %e, "Failed to install SIGTERM handler");
+                std::future::pending::<()>().await;
+            }
+        }
     };
 
     #[cfg(not(unix))]
@@ -389,4 +503,37 @@ async fn shutdown_signal() {
     }
 
     warn!("Shutdown signal received. Draining connections...");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_cors_allowed_origins_accepts_trimmed_origins() {
+        let origins = parse_cors_allowed_origins(" https://app.example , https://admin.example ")
+            .expect("valid CORS origins parse");
+
+        assert_eq!(origins.len(), 2);
+        assert_eq!(origins[0].to_str().unwrap(), "https://app.example");
+        assert_eq!(origins[1].to_str().unwrap(), "https://admin.example");
+    }
+
+    #[test]
+    fn parse_cors_allowed_origins_rejects_empty_entries() {
+        let err = parse_cors_allowed_origins("https://app.example,,https://admin.example")
+            .expect_err("empty CORS entries must fail startup");
+
+        assert!(err.to_string().contains("empty origin"), "{err}");
+    }
+
+    #[test]
+    fn parse_cors_allowed_origins_rejects_malformed_header_values() {
+        let err = parse_cors_allowed_origins("https://app.example,bad\norigin")
+            .expect_err("malformed CORS origins must fail startup");
+
+        let message = err.to_string();
+        assert!(message.contains("position 2"), "{message}");
+        assert!(message.contains("bad\\norigin"), "{message}");
+    }
 }

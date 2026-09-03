@@ -5,6 +5,15 @@
 use crate::core::stt::base::{STTConfig, STTError};
 use std::str::FromStr;
 
+fn validate_yandex_stt_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 // =============================================================================
 // Audio Format
 // =============================================================================
@@ -62,9 +71,10 @@ impl FromStr for YandexSTTAudioFormat {
 // =============================================================================
 
 /// Supported languages for Yandex STT
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum YandexSTTLanguage {
     /// Russian (default)
+    #[default]
     Russian,
     /// English
     English,
@@ -94,12 +104,6 @@ pub enum YandexSTTLanguage {
     Hebrew,
     /// Auto-detect language
     Auto,
-}
-
-impl Default for YandexSTTLanguage {
-    fn default() -> Self {
-        Self::Russian
-    }
 }
 
 impl YandexSTTLanguage {
@@ -229,6 +233,16 @@ pub struct YandexSTTConfig {
     pub max_alternatives: u32,
     /// Custom vocabulary words for improved recognition
     pub hints: Vec<String>,
+    /// Disable number normalization — write numbers as words instead of figures
+    /// (`rawResults` query param). `true` → words ("twenty-five"); `false`/default → figures
+    /// ("25"). Maps from the canonical `numerals` feature (which requests digits) as
+    /// `raw_results = !numerals`.
+    pub raw_results: bool,
+
+    /// Base endpoint override (scheme://host) from the standardized `endpoint_override` — points the
+    /// recognize POST at a mock/proxy host while preserving the `/speech/v1/stt:recognize` path
+    /// (credential-free e2e); `None` uses the production Yandex host.
+    pub endpoint_override: Option<String>,
 }
 
 impl YandexSTTConfig {
@@ -294,7 +308,60 @@ impl YandexSTTConfig {
             speaker_identification: false,
             max_alternatives: 1,
             hints: Vec::new(),
+            raw_results: false,
+            endpoint_override: None,
         })
+    }
+
+    /// Resolve the recognize endpoint URL, honoring `endpoint_override` (mock host swap; the
+    /// `/speech/v1/stt:recognize` path + query are preserved).
+    pub fn recognize_url(&self) -> String {
+        match &self.endpoint_override {
+            Some(ov) => format!("{}/speech/v1/stt:recognize", ov.trim_end_matches('/')),
+            None => crate::core::stt::yandex::YANDEX_STT_RECOGNIZE_URL.to_string(),
+        }
+    }
+
+    /// Build from the standardized config (W1 keystone). Yandex exposes a modest feature
+    /// surface, so this unlocks diarization, partials, profanity filtering and custom
+    /// vocabulary (hints) through the standardized API. Features Yandex cannot express
+    /// (word_timestamps, smart_format, redaction, entity_detection, …) are capability gaps
+    /// and left at their defaults.
+    pub fn from_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(&std.base)?;
+        cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
+        if let Some(d) = f.diarization {
+            cfg.speaker_identification = d;
+        }
+        if let Some(i) = f.interim_results {
+            cfg.partial_results = i;
+        }
+        if let Some(p) = f.profanity_filter {
+            cfg.profanity_filter = p;
+        }
+        if let Some(v) = &f.keyterms {
+            cfg.hints = v.clone();
+        }
+        // Number normalization (words vs figures). Canonical `numerals` requests digits/figures,
+        // which is Yandex's DEFAULT (rawResults=false). `rawResults=true` disables normalization,
+        // emitting numbers as words — so map `raw_results = !numerals`.
+        if let Some(n) = f.numerals {
+            cfg.raw_results = !n;
+        }
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Validate provider-specific URL surfaces.
+    pub fn validate(&self) -> Result<(), STTError> {
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_yandex_stt_endpoint("endpoint_override", endpoint)
+                .map_err(STTError::ConfigurationError)?;
+        }
+        Ok(())
     }
 
     /// Get the Authorization header value
@@ -339,6 +406,12 @@ impl YandexSTTConfig {
             params.push(("maxAlternatives", self.max_alternatives.to_string()));
         }
 
+        // Number normalization: only emit when disabling normalization (words). The API default
+        // (rawResults absent / false) already yields figures, so we keep the URL minimal.
+        if self.raw_results {
+            params.push(("rawResults", "true".to_string()));
+        }
+
         params
     }
 }
@@ -350,6 +423,121 @@ impl YandexSTTConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone: maps the standardized features Yandex can express (diarization +
+    // custom vocabulary hints) onto its own config fields.
+    #[test]
+    fn from_standard_maps_features() {
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "yandex".into(),
+                api_key: "test-key".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                diarization: Some(true),
+                keyterms: Some(vec!["WaaV".into(), "Yandex".into()]),
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+            translation: None,
+        };
+        let cfg = YandexSTTConfig::from_standard(&std).unwrap();
+        assert!(cfg.speaker_identification); // diarization
+        assert_eq!(cfg.hints, vec!["WaaV", "Yandex"]); // keyterms
+    }
+
+    // WIRE-LEVEL: the canonical `numerals` feature must reach the request URL as the Yandex
+    // `rawResults` query param (number normalization: figures vs words) — proving it lands on the
+    // wire, not merely on the config struct. We build the actual reqwest request and inspect its
+    // serialized URL (this is the same `.query(&build_query_params())` path the STT client uses).
+    #[test]
+    fn numerals_reaches_request_url_as_raw_results() {
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
+
+        // `numerals: Some(false)` = numbers as WORDS = rawResults=true.
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "yandex".into(),
+                api_key: "test-key".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                numerals: Some(false),
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+            translation: None,
+        };
+        let cfg = YandexSTTConfig::from_standard(&std).unwrap();
+        assert!(cfg.raw_results);
+
+        let params = cfg.build_query_params();
+        // Build the real request and assert the param is in the serialized URL.
+        let client = reqwest::Client::new();
+        let req = client
+            .post(crate::core::stt::yandex::YANDEX_STT_RECOGNIZE_URL)
+            .query(&params)
+            .build()
+            .unwrap();
+        let url = req.url().as_str();
+        assert!(
+            url.contains("rawResults=true"),
+            "rawResults not in request URL: {url}"
+        );
+
+        // `numerals: Some(true)` = figures = Yandex default = NO rawResults param (minimal URL).
+        let std_figures = StandardSTTConfig {
+            base: STTConfig {
+                provider: "yandex".into(),
+                api_key: "test-key".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                numerals: Some(true),
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+            translation: None,
+        };
+        let cfg2 = YandexSTTConfig::from_standard(&std_figures).unwrap();
+        assert!(!cfg2.raw_results);
+        let req2 = reqwest::Client::new()
+            .post(crate::core::stt::yandex::YANDEX_STT_RECOGNIZE_URL)
+            .query(&cfg2.build_query_params())
+            .build()
+            .unwrap();
+        assert!(
+            !req2.url().as_str().contains("rawResults"),
+            "rawResults must be absent for figures (default)"
+        );
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
+
+        let mk = |endpoint: &str| {
+            StandardSTTConfig {
+                base: STTConfig {
+                    provider: "yandex".into(),
+                    api_key: "test-key".into(),
+                    ..Default::default()
+                },
+                features: SttFeatures::default(),
+                extras: ProviderExtras::default(),
+                translation: None,
+            }
+            .with_endpoint_override(endpoint)
+        };
+
+        assert!(YandexSTTConfig::from_standard(&mk("https://stt-proxy.example.com")).is_ok());
+        assert!(YandexSTTConfig::from_standard(&mk("http://127.0.0.1:9000")).is_err());
+        assert!(YandexSTTConfig::from_standard(&mk("file:///tmp/socket")).is_err());
+        assert!(YandexSTTConfig::from_standard(&mk("wss://stt-proxy.example.com")).is_err());
+    }
 
     #[test]
     fn test_audio_format_from_str() {
@@ -481,6 +669,8 @@ mod tests {
             speaker_identification: false,
             max_alternatives: 1,
             hints: Vec::new(),
+            raw_results: false,
+            endpoint_override: None,
         };
 
         assert_eq!(config.auth_header_value(), "Api-Key test-key");
@@ -502,6 +692,8 @@ mod tests {
             speaker_identification: false,
             max_alternatives: 3,
             hints: Vec::new(),
+            raw_results: false,
+            endpoint_override: None,
         };
 
         let params = config.build_query_params();

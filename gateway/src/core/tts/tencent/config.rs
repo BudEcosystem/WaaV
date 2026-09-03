@@ -20,6 +20,17 @@
 use crate::core::tts::base::{TTSConfig, TTSError};
 use serde::{Deserialize, Serialize};
 
+fn validate_tencent_tts_endpoint(source: &str, endpoint: &str) -> Result<(), TTSError> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES).map_err(
+        |msg| TTSError::InvalidConfiguration(format!("{source} rejected (SSRF protection): {msg}")),
+    )
+}
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -449,6 +460,21 @@ pub struct TencentTtsConfig {
 
     /// Region (for domestic API).
     pub region: Option<String>,
+
+    /// Model type selection (`ModelType` in the TextToVoice request; 0 = standard, 1 = premium
+    /// per the Tencent Cloud TTS docs). `None` omits the field so the account default applies.
+    pub model_type: Option<i64>,
+
+    /// Fast voice clone selection (`FastVoiceType` in the TextToVoice request — the cloned
+    /// voice's identifier). `None` omits the field.
+    pub fast_voice_type: Option<String>,
+
+    /// Speech segmentation sensitivity (`SegmentRate` in the TextToVoice request; 0 = off,
+    /// 1 = light, 2 = aggressive per the docs). `None` omits the field.
+    pub segment_rate: Option<i64>,
+
+    /// Override base (scheme+host) for the synth HTTP POST; used by the mock e2e harness.
+    pub endpoint_override: Option<String>,
 }
 
 impl Default for TencentTtsConfig {
@@ -468,6 +494,10 @@ impl Default for TencentTtsConfig {
             emotion_category: None,
             emotion_intensity: None,
             region: None,
+            model_type: None,
+            fast_voice_type: None,
+            segment_rate: None,
+            endpoint_override: None,
         }
     }
 }
@@ -577,6 +607,10 @@ impl TencentTtsConfig {
             )));
         }
 
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_tencent_tts_endpoint("endpoint_override", endpoint)?;
+        }
+
         Ok(())
     }
 
@@ -667,6 +701,84 @@ impl TencentTtsConfig {
         tencent_config.validate()?;
         Ok(tencent_config)
     }
+
+    /// Build from the standardized TTS config. Tencent exposes a 0.5-2.0 `speed` and a 0-10
+    /// `volume`, so this maps `speed` -> `speed` (clamped to `MIN_SPEED..=MAX_SPEED`, matching
+    /// `with_speed`) and `volume` -> `volume` (clamped to `MIN_VOLUME..=MAX_VOLUME`, matching
+    /// `with_volume`). `word_timestamps` toggles `enable_subtitles` and `emotion` maps to the
+    /// emotional-voice `emotion_category` field. Tencent's non-standard knobs (`project_id`,
+    /// `use_intl_endpoint`, `emotion_intensity`, `primary_language`, `region`, plus the TextToVoice
+    /// `model_type` / `fast_voice_type` / `segment_rate` synthesis knobs) are read from the
+    /// `extras` passthrough. Features without a Tencent field (pitch, stability, similarity_boost,
+    /// style, use_speaker_boost, instructions, ssml, language, streaming, seed, sample_rate) are
+    /// skipped.
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> Result<Self, TTSError> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(std.base.clone())?;
+
+        if let Some(speed) = f.speed {
+            // Reuse with_speed's 0.5-2.0 clamp so the value stays in Tencent's range.
+            cfg.speed = speed.clamp(MIN_SPEED, MAX_SPEED);
+        }
+        if let Some(volume) = f.volume {
+            // Reuse with_volume's 0-10 clamp.
+            cfg.volume = volume.clamp(MIN_VOLUME, MAX_VOLUME);
+        }
+        if let Some(word_timestamps) = f.word_timestamps {
+            cfg.enable_subtitles = word_timestamps;
+        }
+        if let Some(emotion) = f.emotion.as_ref() {
+            cfg.emotion_category = Some(emotion.clone());
+        }
+
+        // Provider-specific passthrough.
+        if let Some(project_id) = std.extras.0.get("project_id").and_then(|v| v.as_i64()) {
+            cfg.project_id = project_id;
+        }
+        if let Some(use_intl) = std
+            .extras
+            .0
+            .get("use_intl_endpoint")
+            .and_then(|v| v.as_bool())
+        {
+            cfg.use_intl_endpoint = use_intl;
+        }
+        if let Some(intensity) = std
+            .extras
+            .0
+            .get("emotion_intensity")
+            .and_then(|v| v.as_i64())
+        {
+            cfg.emotion_intensity = Some(intensity.clamp(0, 200));
+        }
+        if let Some(lang) = std
+            .extras
+            .0
+            .get("primary_language")
+            .and_then(|v| v.as_i64())
+        {
+            cfg.primary_language = Some(lang);
+        }
+        if let Some(region) = std.extras.0.get("region").and_then(|v| v.as_str()) {
+            cfg.region = Some(region.to_string());
+        }
+        // TextToVoice synthesis knobs (audio-changing): model type, fast voice clone, segmentation.
+        if let Some(model_type) = std.extras.0.get("ModelType").and_then(|v| v.as_i64()) {
+            cfg.model_type = Some(model_type);
+        }
+        if let Some(fast_voice_type) = std.extras.0.get("FastVoiceType").and_then(|v| v.as_str()) {
+            cfg.fast_voice_type = Some(fast_voice_type.to_string());
+        }
+        if let Some(segment_rate) = std.extras.0.get("SegmentRate").and_then(|v| v.as_i64()) {
+            cfg.segment_rate = Some(segment_rate);
+        }
+
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
+
+        Ok(cfg)
+    }
 }
 
 // =============================================================================
@@ -676,6 +788,104 @@ impl TencentTtsConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Maps speed -> speed (0.5-2.0 clamp), volume -> volume (0-10 clamp), word_timestamps ->
+    // enable_subtitles and emotion -> emotion_category, plus the extras passthrough
+    // (project_id / use_intl_endpoint / emotion_intensity / region).
+    #[test]
+    fn from_standard_maps_prosody_emotion_and_extras() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("project_id".into(), serde_json::json!(42));
+        extras.insert("use_intl_endpoint".into(), serde_json::json!(false));
+        extras.insert("emotion_intensity".into(), serde_json::json!(150));
+        extras.insert("region".into(), serde_json::json!("ap-guangzhou"));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "tencent".into(),
+                api_key: "secret_id|secret_key".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(1.5),
+                volume: Some(8.0),
+                word_timestamps: Some(true),
+                emotion: Some("happy".into()),
+                ssml: Some(true), // capability gap: Tencent has no SSML, must be ignored
+                ..Default::default()
+            },
+            extras: crate::core::stt::standard::ProviderExtras(extras),
+        };
+        let cfg = TencentTtsConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.speed, 1.5); // 1.5 within 0.5-2.0
+        assert_eq!(cfg.volume, 8.0); // 8.0 within 0-10
+        assert!(cfg.enable_subtitles);
+        assert_eq!(cfg.emotion_category, Some("happy".to_string()));
+        assert_eq!(cfg.project_id, 42); // from extras passthrough
+        assert!(!cfg.use_intl_endpoint);
+        assert_eq!(cfg.emotion_intensity, Some(150));
+        assert_eq!(cfg.region, Some("ap-guangzhou".to_string()));
+    }
+
+    // The TextToVoice synthesis knobs (ModelType / FastVoiceType / SegmentRate) arrive via the
+    // `extras` passthrough using their exact wire names and reach the config fields.
+    #[test]
+    fn from_standard_maps_textovoice_synthesis_knobs_from_extras() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("ModelType".into(), serde_json::json!(1));
+        extras.insert("FastVoiceType".into(), serde_json::json!("clone-voice-42"));
+        extras.insert("SegmentRate".into(), serde_json::json!(2));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "tencent".into(),
+                api_key: "secret_id|secret_key".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures::default(),
+            extras: crate::core::stt::standard::ProviderExtras(extras),
+        };
+        let cfg = TencentTtsConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.model_type, Some(1));
+        assert_eq!(cfg.fast_voice_type, Some("clone-voice-42".to_string()));
+        assert_eq!(cfg.segment_rate, Some(2));
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = TencentTtsConfig::new("secret_id", "secret_key");
+
+        config.endpoint_override = Some("https://tencent-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.to_string().contains("SSRF protection"));
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("file endpoint_override must be rejected");
+        assert!(err.to_string().contains("URL scheme"));
+
+        config.endpoint_override = Some("ws://tencent-proxy.example.com".to_string());
+        let err = config
+            .validate()
+            .expect_err("WebSocket endpoint_override must be rejected for REST Tencent");
+        assert!(err.to_string().contains("URL scheme"));
+
+        let std = crate::core::tts::standard::StandardTTSConfig::from_base(TTSConfig {
+            provider: "tencent".into(),
+            api_key: "secret_id|secret_key".into(),
+            ..Default::default()
+        })
+        .with_endpoint_override("file:///tmp/socket");
+        let cfg = TencentTtsConfig::from_standard(&std).unwrap();
+        assert!(cfg.validate().is_err());
+    }
 
     // =========================================================================
     // Voice Tests

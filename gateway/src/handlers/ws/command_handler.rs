@@ -14,7 +14,7 @@ use livekit_protocol::participant_info;
 
 use super::{
     error::WebSocketError,
-    messages::{MessageRoute, OutgoingMessage},
+    messages::{MessageClass, MessageRoute, OutgoingMessage, send_with_policy},
     state::ConnectionState,
 };
 
@@ -26,11 +26,25 @@ use super::{
 
 /// Helper function to send SIP transfer error messages
 async fn send_sip_transfer_error(error: &WebSocketError, message_tx: &mpsc::Sender<MessageRoute>) {
-    let _ = message_tx
-        .send(MessageRoute::Outgoing(OutgoingMessage::SIPTransferError {
+    send_with_policy(
+        message_tx,
+        MessageRoute::Outgoing(OutgoingMessage::SIPTransferError {
             message: error.to_message(),
-        }))
-        .await;
+        }),
+        MessageClass::Critical,
+    )
+    .await;
+}
+
+async fn send_error(message_tx: &mpsc::Sender<MessageRoute>, message: impl Into<String>) {
+    send_with_policy(
+        message_tx,
+        MessageRoute::Outgoing(OutgoingMessage::Error {
+            message: message.into(),
+        }),
+        MessageClass::Critical,
+    )
+    .await;
 }
 
 /// Handle send_message command for LiveKit data channel
@@ -85,11 +99,11 @@ pub async fn handle_send_message(
             .await
         {
             error!("Failed to queue send message operation: {:?}", e);
-            let _ = message_tx
-                .send(MessageRoute::Outgoing(OutgoingMessage::Error {
-                    message: format!("Failed to queue send message operation: {e:?}"),
-                }))
-                .await;
+            send_error(
+                message_tx,
+                format!("Failed to queue send message operation: {e:?}"),
+            )
+            .await;
             return true;
         }
 
@@ -105,29 +119,24 @@ pub async fn handle_send_message(
             }
             Ok(Err(e)) => {
                 error!("Failed to send message via LiveKit: {:?}", e);
-                let _ = message_tx
-                    .send(MessageRoute::Outgoing(OutgoingMessage::Error {
-                        message: format!("Failed to send message via LiveKit: {e:?}"),
-                    }))
-                    .await;
+                send_error(
+                    message_tx,
+                    format!("Failed to send message via LiveKit: {e:?}"),
+                )
+                .await;
             }
             Err(_) => {
                 error!("Operation worker disconnected");
-                let _ = message_tx
-                    .send(MessageRoute::Outgoing(OutgoingMessage::Error {
-                        message: "Operation worker disconnected".to_string(),
-                    }))
-                    .await;
+                send_error(message_tx, "Operation worker disconnected").await;
             }
         }
     } else {
         // Fallback: no queue available
-        let _ = message_tx
-            .send(MessageRoute::Outgoing(OutgoingMessage::Error {
-                message: "LiveKit client not configured. Send config message with livekit configuration first."
-                    .to_string(),
-            }))
-            .await;
+        send_error(
+            message_tx,
+            "LiveKit client not configured. Send config message with livekit configuration first.",
+        )
+        .await;
     }
 
     true
@@ -271,7 +280,7 @@ pub async fn handle_sip_transfer(
     let participant_name_clone = participant_name.clone();
     let validated_phone_clone = validated_phone.clone();
 
-    tokio::spawn(async move {
+    crate::core::observability::spawn_observed_detached("livekit.sip-transfer", async move {
         match sip_handler
             .transfer_call(
                 &participant_identity,
@@ -301,11 +310,14 @@ pub async fn handle_sip_transfer(
                     "SIP transfer failed: room={}, participant_name={}, transfer_to={}, error={}",
                     room_name_clone, participant_name_clone, validated_phone_clone, e
                 );
-                let _ = message_tx
-                    .send(MessageRoute::Outgoing(OutgoingMessage::SIPTransferError {
+                send_with_policy(
+                    &message_tx,
+                    MessageRoute::Outgoing(OutgoingMessage::SIPTransferError {
                         message: format!("SIP transfer failed: {}", e),
-                    }))
-                    .await;
+                    }),
+                    MessageClass::Critical,
+                )
+                .await;
             }
         }
     });

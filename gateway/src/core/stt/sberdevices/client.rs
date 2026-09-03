@@ -5,23 +5,32 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use super::config::{
-    MAX_SYNC_AUDIO_SIZE, OAUTH_ENDPOINT, STT_RECOGNIZE_ENDPOINT, SberSTTConfig,
-    TOKEN_REFRESH_THRESHOLD_SECS,
-};
+use super::config::{MAX_SYNC_AUDIO_SIZE, SberSTTConfig, TOKEN_REFRESH_THRESHOLD_SECS};
 use super::messages::{
     OAuthTokenRequest, OAuthTokenResponse, SberApiError, SberRecognitionResponse, SberStatusCode,
 };
+use crate::core::stt::http_resilience::HttpBreaker;
+
 use crate::core::stt::base::{
     BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback,
 };
+
+fn sber_stt_http_client(
+    connection_timeout_secs: u64,
+    request_timeout_secs: u64,
+) -> Result<reqwest::Client, reqwest::Error> {
+    crate::core::net::ssrf_protected_client_builder(crate::core::net::HTTP_URL_SCHEMES)
+        .timeout(std::time::Duration::from_secs(request_timeout_secs))
+        .connect_timeout(std::time::Duration::from_secs(connection_timeout_secs))
+        .build()
+}
 
 // =============================================================================
 // Constants
@@ -32,6 +41,19 @@ const CHUNK_COLLECTION_INTERVAL_MS: u64 = 100;
 
 /// Minimum audio size to process (100ms at 16kHz 16-bit mono)
 const MIN_AUDIO_SIZE: usize = 3200;
+
+fn sber_stt_recognize_request(
+    client: &reqwest::Client,
+    sber_config: &SberSTTConfig,
+    access_token: String,
+    audio_data: Vec<u8>,
+) -> Result<reqwest::RequestBuilder, STTError> {
+    Ok(client
+        .post(sber_config.recognize_url()?)
+        .header(AUTHORIZATION, format!("Bearer {}", access_token))
+        .header(CONTENT_TYPE, sber_config.audio_content_type())
+        .body(audio_data))
+}
 
 // =============================================================================
 // Token Manager
@@ -47,20 +69,27 @@ struct TokenManager {
     credentials: String,
     /// OAuth scope
     scope: String,
+    /// Resolved OAuth token URL (production const or endpoint_override host).
+    oauth_url: String,
 }
 
 impl TokenManager {
-    fn new(credentials: String, scope: String) -> Self {
+    fn new(credentials: String, scope: String, oauth_url: String, client: reqwest::Client) -> Self {
         Self {
             token: None,
-            client: reqwest::Client::new(),
+            client,
             credentials,
             scope,
+            oauth_url,
         }
     }
 
-    /// Get a valid access token, refreshing if necessary
-    async fn get_token(&mut self) -> Result<String, STTError> {
+    /// Get a valid access token, refreshing if necessary. `resilience` records the outcome of
+    /// an actual refresh round-trip against the shared provider breaker (a cached token performs
+    /// no upstream call and records nothing). Callers consult the breaker ONCE at the start of
+    /// their flow; the token path only records, so a single half-open probe spans the whole
+    /// token+recognize flow.
+    async fn get_token(&mut self, resilience: &HttpBreaker) -> Result<String, STTError> {
         // Check if current token is valid
         if let Some(ref token) = self.token {
             if !token.is_expired(TOKEN_REFRESH_THRESHOLD_SECS) {
@@ -70,11 +99,11 @@ impl TokenManager {
         }
 
         // Fetch new token
-        self.refresh_token().await
+        self.refresh_token(resilience).await
     }
 
     /// Refresh the OAuth token
-    async fn refresh_token(&mut self) -> Result<String, STTError> {
+    async fn refresh_token(&mut self, resilience: &HttpBreaker) -> Result<String, STTError> {
         debug!("Requesting new OAuth token from SberDevices");
 
         // Generate unique request ID
@@ -83,7 +112,7 @@ impl TokenManager {
         // Build request
         let response = self
             .client
-            .post(OAUTH_ENDPOINT)
+            .post(&self.oauth_url)
             .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
             .header("Accept", "application/json")
             .header("RqUID", &rq_uid)
@@ -91,9 +120,13 @@ impl TokenManager {
             .form(&OAuthTokenRequest::new(&self.scope))
             .send()
             .await
-            .map_err(|e| STTError::NetworkError(format!("Token request failed: {}", e)))?;
+            .map_err(|e| {
+                resilience.record_send_error();
+                STTError::NetworkError(format!("Token request failed: {}", e))
+            })?;
 
         let status = response.status();
+        resilience.record_status(status);
         let status_code = SberStatusCode::from_http_status(status.as_u16());
 
         if status_code.is_success() {
@@ -156,36 +189,56 @@ pub struct SberDevicesSTT {
     processing_task: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
     /// Flag to stop processing
     stop_flag: Arc<AtomicBool>,
+    /// Shared per-provider circuit breaker for the REST transport (uniform with the WS fleet):
+    /// consulted once per token+recognize flow, fed by the unified HTTP status classification
+    /// (OAuth and recognize round-trips both record). Inert until `set_resilience` injects the
+    /// process-global handles (W-D2).
+    resilience: HttpBreaker,
 }
 
 impl SberDevicesSTT {
     /// Create a new SberDevices STT provider from STTConfig
     pub fn create(config: STTConfig) -> Result<Self, STTError> {
         let sber_config = SberSTTConfig::from_base(&config)?;
+        Self::from_sber_config(config, sber_config)
+    }
 
+    /// W1 keystone — construct directly from the standardized config so it is honored END-TO-END.
+    /// SberDevices SaluteSpeech is a minimal synchronous REST recognizer that exposes none of the
+    /// standardized advanced knobs, so `from_standard` is a pure `from_base` passthrough (capability
+    /// gaps stay at provider defaults); this keeps the standardized dispatch path reachable.
+    pub fn new_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        let sber_config = SberSTTConfig::from_standard(std)?;
+        Self::from_sber_config(std.base.clone(), sber_config)
+    }
+
+    /// Internal: construct the provider from an already-mapped SberDevices config.
+    fn from_sber_config(config: STTConfig, sber_config: SberSTTConfig) -> Result<Self, STTError> {
         info!(
             "Creating SberDevices STT provider: language={}, format={:?}",
             sber_config.language.as_code(),
             sber_config.audio_format.as_api_str()
         );
 
+        let client = sber_stt_http_client(
+            sber_config.connection_timeout_secs,
+            sber_config.request_timeout_secs,
+        )
+        .map_err(|e| STTError::ConnectionFailed(e.to_string()))?;
+
         let token_manager = TokenManager::new(
             sber_config.client_credentials.clone(),
             sber_config.scope.as_str().to_string(),
+            sber_config.oauth_url(),
+            client.clone(),
         );
 
         Ok(Self {
             config,
             sber_config: sber_config.clone(),
-            client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(
-                    sber_config.request_timeout_secs,
-                ))
-                .connect_timeout(std::time::Duration::from_secs(
-                    sber_config.connection_timeout_secs,
-                ))
-                .build()
-                .map_err(|e| STTError::ConnectionFailed(e.to_string()))?,
+            client,
             token_manager: Arc::new(RwLock::new(token_manager)),
             connected: AtomicBool::new(false),
             result_callback: Arc::new(RwLock::new(None)),
@@ -193,26 +246,30 @@ impl SberDevicesSTT {
             audio_buffer: Arc::new(RwLock::new(Vec::with_capacity(MAX_SYNC_AUDIO_SIZE))),
             processing_task: Arc::new(RwLock::new(None)),
             stop_flag: Arc::new(AtomicBool::new(false)),
+            resilience: HttpBreaker::new("sberdevices"),
         })
+    }
+
+    /// The shared circuit breaker this client feeds, if the process-global resilience handles
+    /// have been injected (W-D2). Two `SberDevicesSTT` built from the same
+    /// [`crate::core::resilience::ResilienceRegistry`] return the *same* `Arc`.
+    pub fn resilience_breaker(&self) -> Option<&Arc<crate::core::resilience::CircuitBreaker>> {
+        self.resilience.breaker()
     }
 
     /// Recognize audio using synchronous API
     async fn recognize_sync(&self, audio_data: &[u8]) -> Result<String, STTError> {
-        // Get access token
-        let access_token = self.token_manager.write().await.get_token().await?;
+        // Consult the shared per-provider breaker ONCE for the whole token+recognize flow: an
+        // open breaker fails fast with a typed classified refusal before either round-trip.
+        self.resilience.check()?;
 
-        // Build headers
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {}", access_token))
-                .map_err(|_| STTError::ConfigurationError("Invalid token".to_string()))?,
-        );
-        headers.insert(
-            CONTENT_TYPE,
-            HeaderValue::from_str(&self.sber_config.audio_content_type())
-                .map_err(|_| STTError::ConfigurationError("Invalid content type".to_string()))?,
-        );
+        // Get access token
+        let access_token = self
+            .token_manager
+            .write()
+            .await
+            .get_token(&self.resilience)
+            .await?;
 
         debug!(
             "SberDevices STT request: lang={}, format={}, audio_len={}",
@@ -221,17 +278,22 @@ impl SberDevicesSTT {
             audio_data.len()
         );
 
-        // Send request
-        let response = self
-            .client
-            .post(STT_RECOGNIZE_ENDPOINT)
-            .headers(headers)
-            .body(audio_data.to_vec())
-            .send()
-            .await
-            .map_err(|e| STTError::NetworkError(format!("Failed to send request: {}", e)))?;
+        // Send request (recognition options travel as query params on the recognize URL)
+        let response = sber_stt_recognize_request(
+            &self.client,
+            &self.sber_config,
+            access_token,
+            audio_data.to_vec(),
+        )?
+        .send()
+        .await
+        .map_err(|e| {
+            self.resilience.record_send_error();
+            STTError::NetworkError(format!("Failed to send request: {}", e))
+        })?;
 
         let status = response.status();
+        self.resilience.record_status(status);
         let status_code = SberStatusCode::from_http_status(status.as_u16());
 
         if status_code.is_success() {
@@ -283,6 +345,7 @@ impl SberDevicesSTT {
         let token_manager = Arc::clone(&self.token_manager);
         let client = self.client.clone();
         let sber_config = self.sber_config.clone();
+        let resilience = self.resilience.clone();
 
         let task = tokio::spawn(async move {
             let mut last_process_time = std::time::Instant::now();
@@ -321,8 +384,19 @@ impl SberDevicesSTT {
                 debug!("Processing {} bytes of accumulated audio", audio_data.len());
                 last_process_time = std::time::Instant::now();
 
+                // Consult the shared per-provider breaker ONCE per token+recognize iteration:
+                // while it is open the classified refusal reaches the session's error callback
+                // without paying a doomed upstream round-trip.
+                if let Err(e) = resilience.check() {
+                    debug!("SberDevices STT breaker refusal: {}", e);
+                    if let Some(callback) = error_callback.read().await.as_ref() {
+                        callback(e).await;
+                    }
+                    continue;
+                }
+
                 // Get access token
-                let access_token = match token_manager.write().await.get_token().await {
+                let access_token = match token_manager.write().await.get_token(&resilience).await {
                     Ok(token) => token,
                     Err(e) => {
                         error!("Failed to get access token: {}", e);
@@ -333,44 +407,43 @@ impl SberDevicesSTT {
                     }
                 };
 
-                // Build request
-                let mut headers = HeaderMap::new();
-                if let Ok(auth) = HeaderValue::from_str(&format!("Bearer {}", access_token)) {
-                    headers.insert(AUTHORIZATION, auth);
-                }
-                if let Ok(ct) = HeaderValue::from_str(&sber_config.audio_content_type()) {
-                    headers.insert(CONTENT_TYPE, ct);
-                }
-
-                // Send request
-                let result = client
-                    .post(STT_RECOGNIZE_ENDPOINT)
-                    .headers(headers)
-                    .body(audio_data)
-                    .send()
-                    .await;
+                // Send request (recognition options travel as query params on the recognize URL)
+                let request = match sber_stt_recognize_request(
+                    &client,
+                    &sber_config,
+                    access_token,
+                    audio_data,
+                ) {
+                    Ok(request) => request,
+                    Err(e) => {
+                        error!("Failed to build SberDevices recognize request: {}", e);
+                        if let Some(callback) = error_callback.read().await.as_ref() {
+                            callback(e).await;
+                        }
+                        continue;
+                    }
+                };
+                let result = request.send().await;
 
                 match result {
                     Ok(response) => {
                         let status = response.status();
+                        resilience.record_status(status);
                         if status.is_success() {
-                            if let Ok(text) = response.text().await {
-                                if let Ok(recognition_response) =
+                            if let Ok(text) = response.text().await
+                                && let Ok(recognition_response) =
                                     serde_json::from_str::<SberRecognitionResponse>(&text)
-                                {
-                                    let transcript = recognition_response.get_all_transcripts();
-                                    if !transcript.is_empty() {
-                                        let stt_result = STTResult::new(
-                                            transcript, true, // is_final
-                                            true, // is_speech_final
-                                            0.95, // confidence (Sber doesn't return this)
-                                        );
+                            {
+                                let transcript = recognition_response.get_all_transcripts();
+                                if !transcript.is_empty() {
+                                    let stt_result = STTResult::new(
+                                        transcript, true, // is_final
+                                        true, // is_speech_final
+                                        0.95, // confidence (Sber doesn't return this)
+                                    );
 
-                                        if let Some(callback) =
-                                            result_callback.read().await.as_ref()
-                                        {
-                                            callback(stt_result).await;
-                                        }
+                                    if let Some(callback) = result_callback.read().await.as_ref() {
+                                        callback(stt_result).await;
                                     }
                                 }
                             }
@@ -395,6 +468,7 @@ impl SberDevicesSTT {
                         }
                     }
                     Err(e) => {
+                        resilience.record_send_error();
                         error!("SberDevices STT request failed: {}", e);
                         if let Some(callback) = error_callback.read().await.as_ref() {
                             callback(STTError::NetworkError(e.to_string())).await;
@@ -435,8 +509,14 @@ impl BaseSTT for SberDevicesSTT {
     async fn connect(&mut self) -> Result<(), STTError> {
         debug!("Connecting to SberDevices SaluteSpeech STT API");
 
-        // Pre-fetch OAuth token to validate credentials
-        self.token_manager.write().await.get_token().await?;
+        // Consult the shared per-provider breaker before the credential-validating round-trip
+        // (uniform with the WS fleet's connect path), then pre-fetch the OAuth token.
+        self.resilience.check()?;
+        self.token_manager
+            .write()
+            .await
+            .get_token(&self.resilience)
+            .await?;
 
         // Reset state
         self.stop_flag.store(false, Ordering::Relaxed);
@@ -531,6 +611,11 @@ impl BaseSTT for SberDevicesSTT {
     async fn update_config(&mut self, config: STTConfig) -> Result<(), STTError> {
         // Validate new config
         let new_sber_config = SberSTTConfig::from_base(&config)?;
+        let new_client = sber_stt_http_client(
+            new_sber_config.connection_timeout_secs,
+            new_sber_config.request_timeout_secs,
+        )
+        .map_err(|e| STTError::ConnectionFailed(e.to_string()))?;
 
         // Update token manager if credentials changed
         if new_sber_config.client_credentials != self.sber_config.client_credentials
@@ -540,11 +625,14 @@ impl BaseSTT for SberDevicesSTT {
             *tm = TokenManager::new(
                 new_sber_config.client_credentials.clone(),
                 new_sber_config.scope.as_str().to_string(),
+                new_sber_config.oauth_url(),
+                new_client.clone(),
             );
         }
 
         // Update configs
         self.config = config;
+        self.client = new_client;
         self.sber_config = new_sber_config;
 
         debug!("SberDevices STT configuration updated");
@@ -553,6 +641,13 @@ impl BaseSTT for SberDevicesSTT {
 
     fn get_provider_info(&self) -> &'static str {
         "SberDevices SaluteSpeech v1"
+    }
+
+    /// W-D2: attach the shared per-provider circuit breaker so every SberDevices session trips
+    /// (and observes) the SAME breaker, uniform with the WS fleet. The REST transport consults
+    /// it once per token+recognize flow and feeds it the unified HTTP status classification.
+    fn set_resilience(&mut self, resilience: crate::core::resilience::ResilienceHandles) {
+        self.resilience.set_handles(resilience);
     }
 }
 
@@ -563,6 +658,7 @@ impl BaseSTT for SberDevicesSTT {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::ErrorKind;
 
     fn create_test_config() -> STTConfig {
         STTConfig {
@@ -582,6 +678,48 @@ mod tests {
         let config = create_test_config();
         let stt = SberDevicesSTT::new(config);
         assert!(stt.is_ok());
+    }
+
+    // W1 keystone: the standardized config must build the provider THROUGH `new_standard`, with
+    // the base (credentials/language/scope and the punctuation knob Sber supports) surviving into
+    // the provider's `sber_config`. Advanced streaming features are a capability gap (Sber is a
+    // minimal sync recognizer) and stay at default — they are set here but must be ignored.
+    #[test]
+    fn test_new_standard_carries_base_features() {
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "sberdevices".into(),
+                api_key: "test_client:test_secret".into(),
+                language: "ru-RU".into(),
+                punctuation: true,
+                model: "SALUTE_SPEECH_PERS".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                diarization: Some(true),
+                interim_results: Some(true),
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+            translation: None,
+        };
+        let stt = SberDevicesSTT::new_standard(&std).unwrap();
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        let expected = STANDARD.encode("test_client:test_secret".as_bytes());
+        use super::super::config::{SberSTTLanguage, SberScope};
+        assert_eq!(stt.sber_config.client_credentials, expected);
+        assert_eq!(stt.sber_config.language, SberSTTLanguage::Russian);
+        assert_eq!(stt.sber_config.scope, SberScope::Personal);
+        assert!(stt.sber_config.enable_punctuation); // base punctuation survived new_standard
+
+        // Empty credentials are rejected through the standardized path too.
+        let bad = StandardSTTConfig::from_base(STTConfig {
+            provider: "sberdevices".into(),
+            api_key: String::new(),
+            ..Default::default()
+        });
+        assert!(SberDevicesSTT::new_standard(&bad).is_err());
     }
 
     #[test]
@@ -639,6 +777,23 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    #[test]
+    fn invalid_sberdevices_stt_bearer_header_value_is_request_build_error() {
+        let config = create_test_config();
+        let sber_config = SberSTTConfig::from_base(&config).unwrap();
+        let err = sber_stt_recognize_request(
+            &reqwest::Client::new(),
+            &sber_config,
+            "bad\ntoken".to_string(),
+            vec![0u8; 3200],
+        )
+        .expect("valid SberDevices STT request")
+        .build()
+        .expect_err("malformed SberDevices STT bearer token must not omit Authorization");
+
+        assert!(err.is_builder(), "unexpected reqwest error: {err}");
+    }
+
     #[tokio::test]
     async fn test_sberdevices_stt_callback_registration() {
         use std::future::Future;
@@ -694,6 +849,58 @@ mod tests {
         let stored_config = stt.get_config().unwrap();
         assert_eq!(stored_config.language, "en-US");
         assert_eq!(stored_config.sample_rate, 8000);
+    }
+
+    #[tokio::test]
+    async fn sberdevices_stt_redirect_policy_rejects_private_hop() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) => {
+                if err.kind() == ErrorKind::PermissionDenied {
+                    eprintln!(
+                        "Skipping sberdevices_stt_redirect_policy_rejects_private_hop: {err}"
+                    );
+                    return;
+                }
+                panic!("Failed to bind redirect test server listener: {err}");
+            }
+        };
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 302 Found\r\n",
+                "Location: http://127.0.0.1:9/metadata\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n"
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+
+        let err = sber_stt_http_client(1, 1)
+            .unwrap()
+            .get(format!("http://{addr}/start"))
+            .send()
+            .await
+            .expect_err("private redirect target must be rejected");
+        let mut error_chain = err.to_string();
+        let mut source = std::error::Error::source(&err);
+        while let Some(error) = source {
+            error_chain.push_str(": ");
+            error_chain.push_str(&error.to_string());
+            source = error.source();
+        }
+        assert!(
+            error_chain.contains("redirect URL rejected"),
+            "unexpected redirect error: {error_chain}"
+        );
     }
 
     #[test]

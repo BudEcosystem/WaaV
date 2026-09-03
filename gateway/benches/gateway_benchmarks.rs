@@ -152,11 +152,15 @@ fn bench_message_serialization(c: &mut Criterion) {
 
     // Ready message
     let ready_msg = OutgoingMessage::Ready {
+        protocol_version: "1.0".to_string(),
         stream_id: "test-stream-123".to_string(),
         livekit_room_name: Some("test-room".to_string()),
         livekit_url: Some("ws://localhost:7880".to_string()),
         waav_participant_identity: Some("waav-ai".to_string()),
         waav_participant_name: Some("WaaV AI".to_string()),
+        resolved_alias: None,
+        audio_in_codec: None,
+        audio_out_codec: None,
     };
 
     // STT result
@@ -165,6 +169,8 @@ fn bench_message_serialization(c: &mut Criterion) {
         is_final: true,
         is_speech_final: true,
         confidence: 0.95,
+        segment_transcript: None,
+        translations: Vec::new(),
     };
 
     // Error message

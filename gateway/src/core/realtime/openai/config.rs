@@ -21,8 +21,17 @@ pub const OPENAI_REALTIME_SAMPLE_RATE: u32 = 24000;
 /// Supported OpenAI Realtime models.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum OpenAIRealtimeModel {
-    /// GPT-4o Realtime Preview model
+    /// gpt-realtime — the current GA realtime model (default).
     #[default]
+    #[serde(rename = "gpt-realtime")]
+    GptRealtime,
+    /// gpt-realtime-2 — reasoning-capable realtime model (honors `reasoning.effort`).
+    #[serde(rename = "gpt-realtime-2")]
+    GptRealtime2,
+    /// gpt-realtime-mini — smaller / lower-latency realtime model.
+    #[serde(rename = "gpt-realtime-mini")]
+    GptRealtimeMini,
+    /// GPT-4o Realtime Preview (DEPRECATED — retained for backward compatibility)
     #[serde(rename = "gpt-4o-realtime-preview")]
     Gpt4oRealtimePreview,
     /// GPT-4o Realtime Preview 2024-10-01
@@ -44,6 +53,9 @@ impl OpenAIRealtimeModel {
     #[inline]
     pub fn as_str(&self) -> &'static str {
         match self {
+            Self::GptRealtime => "gpt-realtime",
+            Self::GptRealtime2 => "gpt-realtime-2",
+            Self::GptRealtimeMini => "gpt-realtime-mini",
             Self::Gpt4oRealtimePreview => "gpt-4o-realtime-preview",
             Self::Gpt4oRealtimePreview20241001 => "gpt-4o-realtime-preview-2024-10-01",
             Self::Gpt4oRealtimePreview20241217 => "gpt-4o-realtime-preview-2024-12-17",
@@ -55,6 +67,9 @@ impl OpenAIRealtimeModel {
     /// Parse from string, with fallback to default.
     pub fn from_str_or_default(s: &str) -> Self {
         match s.to_lowercase().as_str() {
+            "gpt-realtime" => Self::GptRealtime,
+            "gpt-realtime-2" => Self::GptRealtime2,
+            "gpt-realtime-mini" => Self::GptRealtimeMini,
             "gpt-4o-realtime-preview" => Self::Gpt4oRealtimePreview,
             "gpt-4o-realtime-preview-2024-10-01" => Self::Gpt4oRealtimePreview20241001,
             "gpt-4o-realtime-preview-2024-12-17" => Self::Gpt4oRealtimePreview20241217,
@@ -98,6 +113,10 @@ pub enum OpenAIRealtimeVoice {
     Shimmer,
     /// Verse voice
     Verse,
+    /// Marin voice (newest; recommended for gpt-realtime)
+    Marin,
+    /// Cedar voice (newest; recommended for gpt-realtime)
+    Cedar,
 }
 
 impl OpenAIRealtimeVoice {
@@ -113,6 +132,8 @@ impl OpenAIRealtimeVoice {
             Self::Sage => "sage",
             Self::Shimmer => "shimmer",
             Self::Verse => "verse",
+            Self::Marin => "marin",
+            Self::Cedar => "cedar",
         }
     }
 
@@ -127,6 +148,8 @@ impl OpenAIRealtimeVoice {
             "sage" => Self::Sage,
             "shimmer" => Self::Shimmer,
             "verse" => Self::Verse,
+            "marin" => Self::Marin,
+            "cedar" => Self::Cedar,
             _ => Self::default(),
         }
     }
@@ -142,6 +165,8 @@ impl OpenAIRealtimeVoice {
             Self::Sage,
             Self::Shimmer,
             Self::Verse,
+            Self::Marin,
+            Self::Cedar,
         ]
     }
 }
@@ -188,6 +213,18 @@ impl OpenAIRealtimeAudioFormat {
         match self {
             Self::Pcm16 => 24000,
             Self::G711Ulaw | Self::G711Alaw => 8000,
+        }
+    }
+
+    /// Bytes per millisecond of audio (B-G2 truncate math, review
+    /// wf_d43814c3 #6): PCM16 = 2 bytes/sample @24kHz = 48 B/ms; G.711 =
+    /// 1 byte/sample @8kHz = 8 B/ms. Hardcoding 48 over-truncated telephony
+    /// sessions 6×.
+    #[inline]
+    pub fn bytes_per_ms(&self) -> u64 {
+        match self {
+            Self::Pcm16 => 48,
+            Self::G711Ulaw | Self::G711Alaw => 8,
         }
     }
 
@@ -256,12 +293,21 @@ mod tests {
     #[test]
     fn test_model_from_str() {
         assert_eq!(
+            OpenAIRealtimeModel::from_str_or_default("gpt-realtime"),
+            OpenAIRealtimeModel::GptRealtime
+        );
+        assert_eq!(
+            OpenAIRealtimeModel::from_str_or_default("gpt-realtime-2"),
+            OpenAIRealtimeModel::GptRealtime2
+        );
+        assert_eq!(
             OpenAIRealtimeModel::from_str_or_default("gpt-4o-realtime-preview"),
             OpenAIRealtimeModel::Gpt4oRealtimePreview
         );
+        // Default is now the GA gpt-realtime (the deprecated preview is retired).
         assert_eq!(
             OpenAIRealtimeModel::from_str_or_default("unknown"),
-            OpenAIRealtimeModel::Gpt4oRealtimePreview
+            OpenAIRealtimeModel::GptRealtime
         );
     }
 
@@ -290,9 +336,11 @@ mod tests {
     #[test]
     fn test_voice_all() {
         let voices = OpenAIRealtimeVoice::all();
-        assert_eq!(voices.len(), 8);
+        assert_eq!(voices.len(), 10);
         assert!(voices.contains(&OpenAIRealtimeVoice::Alloy));
         assert!(voices.contains(&OpenAIRealtimeVoice::Verse));
+        assert!(voices.contains(&OpenAIRealtimeVoice::Marin));
+        assert!(voices.contains(&OpenAIRealtimeVoice::Cedar));
     }
 
     #[test]

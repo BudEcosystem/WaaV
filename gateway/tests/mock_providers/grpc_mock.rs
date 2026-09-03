@@ -61,7 +61,7 @@ impl MockSttStream {
 
     /// Process audio chunk and return transcript
     pub async fn process_chunk(&mut self) -> Option<MockSttResult> {
-        let audio = self.rx.recv().await?;
+        let _audio = self.rx.recv().await?;
         let start = Instant::now();
 
         // Check chaos conditions

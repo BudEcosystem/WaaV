@@ -127,6 +127,7 @@ fn test_build_config_request() {
         speech_start_timeout: None,
         speech_end_timeout: None,
         single_utterance: false,
+        ..Default::default()
     };
 
     let request = build_config_request(&config);
@@ -165,6 +166,7 @@ fn test_build_config_request_with_timeouts() {
         speech_start_timeout: Some(Duration::from_secs(5)),
         speech_end_timeout: Some(Duration::from_millis(1500)),
         single_utterance: false,
+        ..Default::default()
     };
 
     let request = build_config_request(&config);
@@ -908,10 +910,14 @@ fn test_keepalive_constants() {
     assert_eq!(KEEPALIVE_SILENCE_DURATION_MS, 20);
 }
 
+fn silence(sample_rate: u32, channels: u32, duration_ms: u64) -> Bytes {
+    generate_silence_audio(sample_rate, channels, duration_ms).expect("valid silence geometry")
+}
+
 #[test]
 fn test_generate_silence_audio_16khz_mono() {
     // 16kHz, mono, 20ms = 16000 * 0.020 * 1 * 2 = 640 bytes
-    let silence = generate_silence_audio(16000, 1, 20);
+    let silence = silence(16000, 1, 20);
     assert_eq!(silence.len(), 640);
 
     // Verify all bytes are zero (silence for LINEAR16)
@@ -921,29 +927,50 @@ fn test_generate_silence_audio_16khz_mono() {
 #[test]
 fn test_generate_silence_audio_8khz_mono() {
     // 8kHz, mono, 20ms = 8000 * 0.020 * 1 * 2 = 320 bytes
-    let silence = generate_silence_audio(8000, 1, 20);
+    let silence = silence(8000, 1, 20);
     assert_eq!(silence.len(), 320);
 }
 
 #[test]
 fn test_generate_silence_audio_16khz_stereo() {
     // 16kHz, stereo, 20ms = 16000 * 0.020 * 2 * 2 = 1280 bytes
-    let silence = generate_silence_audio(16000, 2, 20);
+    let silence = silence(16000, 2, 20);
     assert_eq!(silence.len(), 1280);
 }
 
 #[test]
 fn test_generate_silence_audio_48khz_mono() {
     // 48kHz, mono, 20ms = 48000 * 0.020 * 1 * 2 = 1920 bytes
-    let silence = generate_silence_audio(48000, 1, 20);
+    let silence = silence(48000, 1, 20);
     assert_eq!(silence.len(), 1920);
 }
 
 #[test]
 fn test_generate_silence_audio_longer_duration() {
     // 16kHz, mono, 100ms = 16000 * 0.100 * 1 * 2 = 3200 bytes
-    let silence = generate_silence_audio(16000, 1, 100);
+    let silence = silence(16000, 1, 100);
     assert_eq!(silence.len(), 3200);
+}
+
+#[test]
+fn test_generate_silence_audio_rejects_invalid_geometry_without_allocating() {
+    let zero_rate =
+        generate_silence_audio(0, 1, 20).expect_err("zero sample rate must be rejected");
+    assert!(
+        zero_rate.to_string().contains("sample_rate"),
+        "got {zero_rate}"
+    );
+
+    let zero_channels =
+        generate_silence_audio(16_000, 0, 20).expect_err("zero channels must be rejected");
+    assert!(
+        zero_channels.to_string().contains("channels"),
+        "got {zero_channels}"
+    );
+
+    let huge = generate_silence_audio(u32::MAX, u32::MAX, u64::MAX)
+        .expect_err("overflowing geometry must be rejected");
+    assert!(huge.to_string().contains("overflow"), "got {huge}");
 }
 
 #[test]
@@ -976,7 +1003,7 @@ fn test_keepalive_tracker_touch_resets_timer() {
 #[test]
 fn test_keepalive_tracker_generate_keepalive() {
     let tracker = KeepaliveTracker::new(16000, 1);
-    let silence = tracker.generate_keepalive();
+    let silence = tracker.generate_keepalive().unwrap();
 
     // Should generate silence for the configured sample rate and duration
     // 16kHz, mono, 20ms = 640 bytes
@@ -987,7 +1014,7 @@ fn test_keepalive_tracker_generate_keepalive() {
 #[test]
 fn test_keepalive_tracker_generate_keepalive_stereo() {
     let tracker = KeepaliveTracker::new(16000, 2);
-    let silence = tracker.generate_keepalive();
+    let silence = tracker.generate_keepalive().unwrap();
 
     // 16kHz, stereo, 20ms = 1280 bytes
     assert_eq!(silence.len(), 1280);
@@ -1006,4 +1033,232 @@ async fn test_keepalive_tracker_needs_keepalive_after_interval() {
     ))
     .await;
     assert!(tracker.needs_keepalive());
+}
+
+// ======== WIRE-LEVEL feature tests (W2: standardized features -> StreamingRecognize body) ========
+//
+// These assert that each newly-wired feature actually reaches the gRPC request that
+// `build_config_request` produces (the real wire builder used by `start_connection`),
+// NOT just that the config struct holds the value — guarding the recurring "set on the
+// struct but never serialized" bug class.
+
+use google_api_proto::google::cloud::speech::v2::recognition_features::MultiChannelMode;
+use google_api_proto::google::cloud::speech::v2::speech_adaptation::adaptation_phrase_set::Value as PhraseSetValue;
+
+/// Helper: extract the inner RecognitionConfig + RecognitionFeatures from a built request.
+fn rec_config_of(
+    config: &GoogleSTTConfig,
+) -> google_api_proto::google::cloud::speech::v2::RecognitionConfig {
+    let request = build_config_request(config);
+    match request.streaming_request {
+        Some(StreamingRequest::StreamingConfig(sc)) => sc.config.unwrap(),
+        _ => panic!("Expected StreamingConfig variant"),
+    }
+}
+
+#[test]
+fn test_wire_profanity_filter_reaches_recognition_features() {
+    let config = GoogleSTTConfig {
+        profanity_filter: true,
+        project_id: "p".into(),
+        ..Default::default()
+    };
+    let features = rec_config_of(&config).features.unwrap();
+    assert!(
+        features.profanity_filter,
+        "profanity_filter must reach RecognitionFeatures on the wire"
+    );
+}
+
+#[test]
+fn test_wire_word_timestamps_reaches_recognition_features() {
+    let config = GoogleSTTConfig {
+        enable_word_time_offsets: true,
+        project_id: "p".into(),
+        ..Default::default()
+    };
+    let features = rec_config_of(&config).features.unwrap();
+    assert!(
+        features.enable_word_time_offsets,
+        "word_timestamps must reach features.enable_word_time_offsets"
+    );
+}
+
+#[test]
+fn test_wire_max_alternatives_reaches_recognition_features() {
+    let config = GoogleSTTConfig {
+        max_alternatives: 5,
+        project_id: "p".into(),
+        ..Default::default()
+    };
+    let features = rec_config_of(&config).features.unwrap();
+    assert_eq!(
+        features.max_alternatives, 5,
+        "max_alternatives must reach features.max_alternatives"
+    );
+}
+
+#[test]
+fn test_wire_multichannel_reaches_recognition_features() {
+    let config = GoogleSTTConfig {
+        multichannel: true,
+        project_id: "p".into(),
+        ..Default::default()
+    };
+    let features = rec_config_of(&config).features.unwrap();
+    assert_eq!(
+        features.multi_channel_mode,
+        MultiChannelMode::SeparateRecognitionPerChannel as i32,
+        "multichannel must map to multi_channel_mode=SEPARATE_RECOGNITION_PER_CHANNEL"
+    );
+}
+
+#[test]
+fn test_wire_diarization_reaches_recognition_features() {
+    let config = GoogleSTTConfig {
+        diarization: true,
+        project_id: "p".into(),
+        ..Default::default()
+    };
+    let features = rec_config_of(&config).features.unwrap();
+    let diar = features
+        .diarization_config
+        .expect("diarization_config must be present on the wire when enabled");
+    assert!(diar.min_speaker_count >= 1);
+    assert!(diar.max_speaker_count >= diar.min_speaker_count);
+}
+
+#[test]
+fn test_wire_adaptation_phrases_reach_recognition_config() {
+    let config = GoogleSTTConfig {
+        adaptation_phrases: vec!["WaaV".into(), "Gnani".into()],
+        project_id: "p".into(),
+        ..Default::default()
+    };
+    let rec = rec_config_of(&config);
+    let adaptation = rec
+        .adaptation
+        .expect("adaptation must be present on the wire when phrases set");
+    assert_eq!(adaptation.phrase_sets.len(), 1);
+    let inline = match adaptation.phrase_sets[0].value.as_ref().unwrap() {
+        PhraseSetValue::InlinePhraseSet(ps) => ps,
+        _ => panic!("expected inline phrase set"),
+    };
+    let phrases: Vec<&str> = inline.phrases.iter().map(|p| p.value.as_str()).collect();
+    assert_eq!(phrases, vec!["WaaV", "Gnani"]);
+}
+
+#[test]
+fn test_wire_spoken_punctuation_and_emojis_and_word_confidence() {
+    let config = GoogleSTTConfig {
+        enable_spoken_punctuation: true,
+        enable_spoken_emojis: true,
+        enable_word_confidence: true,
+        project_id: "p".into(),
+        ..Default::default()
+    };
+    let features = rec_config_of(&config).features.unwrap();
+    assert!(
+        features.enable_spoken_punctuation,
+        "spoken_punctuation on wire"
+    );
+    assert!(features.enable_spoken_emojis, "spoken_emojis on wire");
+    assert!(features.enable_word_confidence, "word_confidence on wire");
+}
+
+#[test]
+fn test_wire_transcript_normalization_reaches_recognition_config() {
+    let config = GoogleSTTConfig {
+        transcript_normalization: vec![crate::core::stt::google::config::TranscriptNormEntry {
+            search: "cat".into(),
+            replace: "dog".into(),
+            case_sensitive: true,
+        }],
+        project_id: "p".into(),
+        ..Default::default()
+    };
+    let rec = rec_config_of(&config);
+    let norm = rec
+        .transcript_normalization
+        .expect("transcript_normalization must be present on the wire");
+    assert_eq!(norm.entries.len(), 1);
+    assert_eq!(norm.entries[0].search, "cat");
+    assert_eq!(norm.entries[0].replace, "dog");
+    assert!(norm.entries[0].case_sensitive);
+}
+
+#[test]
+fn test_wire_features_default_off_when_unset() {
+    // Defaults must NOT request any of the new features (no accidental always-on wiring).
+    let config = GoogleSTTConfig {
+        project_id: "p".into(),
+        ..Default::default()
+    };
+    let rec = rec_config_of(&config);
+    let features = rec.features.clone().unwrap();
+    assert!(!features.profanity_filter);
+    assert!(!features.enable_word_time_offsets);
+    assert!(!features.enable_word_confidence);
+    assert!(!features.enable_spoken_punctuation);
+    assert!(!features.enable_spoken_emojis);
+    assert_eq!(features.max_alternatives, 0);
+    assert_eq!(
+        features.multi_channel_mode,
+        MultiChannelMode::Unspecified as i32
+    );
+    assert!(features.diarization_config.is_none());
+    assert!(rec.adaptation.is_none());
+    assert!(rec.transcript_normalization.is_none());
+}
+
+// from_standard mapping: typed SttFeatures + ProviderExtras -> GoogleSTTConfig -> wire.
+#[test]
+fn test_from_standard_maps_advanced_features_to_wire() {
+    use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
+    let mut extras = serde_json::Map::new();
+    extras.insert("project_id".into(), serde_json::json!("proj-xyz"));
+    extras.insert("enable_spoken_punctuation".into(), serde_json::json!(true));
+    extras.insert("enable_spoken_emojis".into(), serde_json::json!(true));
+    extras.insert("enable_word_confidence".into(), serde_json::json!(true));
+    extras.insert(
+        "transcript_normalization".into(),
+        serde_json::json!([{"search": "u r", "replace": "you are", "case_sensitive": false}]),
+    );
+    let std = StandardSTTConfig {
+        base: STTConfig {
+            provider: "google".into(),
+            ..Default::default()
+        },
+        features: SttFeatures {
+            profanity_filter: Some(true),
+            diarization: Some(true),
+            word_timestamps: Some(true),
+            alternatives: Some(3),
+            multichannel: Some(true),
+            keyterms: Some(vec!["alpha".into(), "beta".into()]),
+            ..Default::default()
+        },
+        extras: ProviderExtras(extras),
+        translation: None,
+    };
+    let cfg = GoogleSTTConfig::from_standard(&std);
+    // Confirm the standardized features survived into the wire request.
+    let rec = rec_config_of(&cfg);
+    let features = rec.features.clone().unwrap();
+    assert!(features.profanity_filter);
+    assert!(features.enable_word_time_offsets);
+    assert_eq!(features.max_alternatives, 3);
+    assert_eq!(
+        features.multi_channel_mode,
+        MultiChannelMode::SeparateRecognitionPerChannel as i32
+    );
+    assert!(features.diarization_config.is_some());
+    assert!(features.enable_spoken_punctuation);
+    assert!(features.enable_spoken_emojis);
+    assert!(features.enable_word_confidence);
+    assert!(rec.adaptation.is_some());
+    let norm = rec.transcript_normalization.unwrap();
+    assert_eq!(norm.entries[0].search, "u r");
+    assert_eq!(norm.entries[0].replace, "you are");
+    assert!(!norm.entries[0].case_sensitive);
 }

@@ -2,16 +2,241 @@
  * WebSocket connection handler for widget
  */
 
-import type { WidgetConfig, TranscriptResult, WidgetMetrics } from './types';
+import type {
+  WidgetConfig,
+  TranscriptResult,
+  WidgetMetrics,
+  ConfigWarning,
+  ConversationConfig,
+} from './types';
+
+/**
+ * Build the `/ws` `config` envelope from a WidgetConfig.
+ *
+ * This is the single source of truth for what the widget puts on the wire and is
+ * exported (pure, side-effect-free) so it can be unit-tested without a live socket.
+ *
+ * Wire contract (gateway handlers/ws/config.rs + messages.rs):
+ *  - The envelope is FLAT: stt_config / tts_config / conversation_config (no
+ *    top-level audio_features or realtime_config — those are NON-KEYS on /ws and
+ *    are silently dropped by the gateway).
+ *  - ML turn detection nests under `stt_config.turn_detection`
+ *    ({enabled, threshold?, eager?}); silence_ms/prefix_padding_ms are not /ws keys.
+ *  - The built-in LLM loop (so the bot talks back) is driven by `conversation_config`
+ *    ({base_url, model, ...}); without it the gateway only does raw STT/TTS.
+ *  - Realtime/S2S is a SEPARATE /realtime endpoint and is intentionally not sent here.
+ */
+export function buildConfigMessage(config: WidgetConfig): Record<string, unknown> {
+  const message: Record<string, unknown> = {
+    type: 'config',
+    audio: true,
+  };
+
+  // Proxy/alias name (P3): a single server-defined name the gateway resolves to a
+  // full {stt,tts,llm,dag} bundle. `<bud-widget data-alias="support-bot">` is a
+  // complete agent; ops re-point what "support-bot" means with zero client change.
+  // An explicit stt/tts/conversation below overrides the alias default.
+  if (config.alias) {
+    message.alias = config.alias;
+  }
+
+  // STT configuration (turn_detection nests HERE, per gateway config.rs:345).
+  if (config.stt) {
+    const sttConfig: Record<string, unknown> = {
+      provider: config.stt.provider,
+      language: config.stt.language || 'en-US',
+      sample_rate: config.stt.sampleRate || 16000,
+      channels: config.stt.channels || 1,
+      encoding: config.stt.encoding || 'linear16',
+      // Empty model => the gateway picks the provider's recommended default
+      // (gateway config.rs: "each provider maps an empty model to its
+      // recommended default"). Provider-agnostic: a hardcoded deepgram model
+      // like "nova-3" would be wrong for openai/google/etc.
+      model: config.stt.model ?? '',
+      punctuation: config.features?.punctuation ?? true,
+    };
+    // D8 uplink transport codec (linear16|opus). Opt-in: only set when the embedder explicitly asks
+    // for opus (the light widget does not yet WebCodecs-encode, so it isn't auto-enabled). The
+    // gateway echoes the effective codec in `ready` and degrades to linear16 if it can't.
+    if (config.stt.audioInCodec) sttConfig.audio_in_codec = config.stt.audioInCodec;
+
+    // ML turn detection -> stt_config.turn_detection (gateway TurnDetectionWsConfig:
+    // only enabled/threshold/eager are wire keys).
+    const td = config.audioFeatures?.turnDetection;
+    if (td) {
+      const turnDetection: Record<string, unknown> = { enabled: td.enabled };
+      if (td.threshold !== undefined) {
+        turnDetection.threshold = td.threshold;
+      }
+      if (td.eager !== undefined) {
+        turnDetection.eager = td.eager;
+      }
+      sttConfig.turn_detection = turnDetection;
+    }
+
+    // Canonical in-stream translation (P5) -> stt_config.translation. Canonical
+    // BCP-47 target tokens; the gateway maps to each provider's native code.
+    const tr = config.stt.translation;
+    if (tr && (tr.targetLanguages?.length || tr.translateToEnglish || tr.partials)) {
+      const trWire: Record<string, unknown> = {};
+      if (tr.targetLanguages?.length) trWire.target_languages = tr.targetLanguages;
+      if (tr.translateToEnglish !== undefined) trWire.translate_to_english = tr.translateToEnglish;
+      if (tr.partials !== undefined) trWire.partials = tr.partials;
+      sttConfig.translation = trWire;
+    }
+
+    message.stt_config = sttConfig;
+  }
+
+  // TTS configuration with emotion support.
+  if (config.tts) {
+    // The widget's AudioPlayer creates its AudioContext at this sample rate
+    // (widget.ts: `new AudioPlayer({ sampleRate: tts.sampleRate || 24000 })`),
+    // so it is also the audio SINK rate.
+    const sinkRate = config.tts.sampleRate || 24000;
+    const ttsConfig: Record<string, unknown> = {
+      provider: config.tts.provider,
+      voice_id: config.tts.voiceId || config.tts.voice,
+      sample_rate: sinkRate,
+      // `model` is REQUIRED on the wire (gateway TTSWebSocketConfig has no serde
+      // default). Omitting it makes the gateway HARD-REJECT the whole config
+      // message ("missing field `model`") — which would silently break the bare
+      // `data-tts-voice` flagship path. An empty string is the gateway-blessed
+      // "use the provider's recommended default model" (gateway config.rs).
+      model: config.tts.model ?? '',
+      // D2 gateway-leverage audio knobs (TTSWebSocketConfig, gateway config.rs:540/549):
+      //  - audio_out_chunk_ms=20: the gateway re-frames PCM egress into ~20ms
+      //    chunks, so a barge-in `clear` truncates within ONE server chunk AND the
+      //    chunks arrive pre-sized for the player's scheduled-chunk playout clock.
+      //  - client_playback_rate=<sink rate>: the gateway resamples downlink PCM to
+      //    EXACTLY the AudioContext rate with continuous filter state, so the player
+      //    does ZERO downlink resampling (no client resample stage / boundary clicks).
+      audio_out_chunk_ms: 20,
+      client_playback_rate: sinkRate,
+    };
+    // D8 downlink transport codec (linear16|opus). Opt-in (the light widget does not yet
+    // WebCodecs-decode, so it isn't auto-enabled); the gateway echoes the effective codec in `ready`.
+    if (config.tts.audioOutCodec) ttsConfig.audio_out_codec = config.tts.audioOutCodec;
+
+    // Abstract voice selection (P4): the gateway resolves a VoiceDescriptor to a
+    // concrete provider voice_id server-side. Sent under `voice_descriptor` as a
+    // snake_case object; a raw voice_id always wins, so the gateway only uses this
+    // when voice_id is absent. Only set fields are emitted.
+    const vd = config.tts.voiceDescriptor;
+    if (vd) {
+      const vdWire: Record<string, unknown> = {};
+      if (vd.gender !== undefined) vdWire.gender = vd.gender;
+      if (vd.locale !== undefined) vdWire.locale = vd.locale;
+      if (vd.accent !== undefined) vdWire.accent = vd.accent;
+      if (vd.age !== undefined) vdWire.age = vd.age;
+      if (vd.style !== undefined) vdWire.style = vd.style;
+      if (vd.nameHint !== undefined) vdWire.name_hint = vd.nameHint;
+      if (Object.keys(vdWire).length > 0) ttsConfig.voice_descriptor = vdWire;
+    }
+
+    if (config.tts.emotion) {
+      if (config.tts.emotion.emotion !== undefined) {
+        ttsConfig.emotion = config.tts.emotion.emotion;
+      }
+      if (config.tts.emotion.intensity !== undefined) {
+        ttsConfig.emotion_intensity = config.tts.emotion.intensity;
+      }
+      if (config.tts.emotion.deliveryStyle !== undefined) {
+        ttsConfig.delivery_style = config.tts.emotion.deliveryStyle;
+      }
+      if (config.tts.emotion.description !== undefined) {
+        ttsConfig.emotion_description = config.tts.emotion.description;
+      }
+    }
+
+    message.tts_config = ttsConfig;
+  }
+
+  // Conversation-loop (LLM) configuration -> conversation_config. This is what
+  // makes the bot TALK BACK (STT -> LLM -> TTS). base_url + model are required.
+  // Every optional field maps 1:1 to a gateway conversation_config key (snake
+  // case); the widget drift guard asserts this mapping stays complete.
+  if (config.conversation) {
+    message.conversation_config = buildConversationConfig(config.conversation);
+  }
+
+  return message;
+}
+
+/**
+ * Serialize a {@link ConversationConfig} to the gateway `conversation_config`
+ * envelope (camelCase -> snake_case). Pure; exported for unit tests.
+ *
+ * Only `base_url` + `model` are always present (gateway-required); every other
+ * field is emitted only when set, so an unspecified dial takes the gateway
+ * default. This is the 1:1 mirror of `ConversationWebSocketConfig`.
+ */
+export function buildConversationConfig(conv: ConversationConfig): Record<string, unknown> {
+  const out: Record<string, unknown> = {
+    base_url: conv.baseUrl,
+    model: conv.model,
+  };
+  // Core LLM
+  if (conv.systemPrompt !== undefined) out.system_prompt = conv.systemPrompt;
+  if (conv.apiKey !== undefined) out.api_key = conv.apiKey;
+  if (conv.temperature !== undefined) out.temperature = conv.temperature;
+  if (conv.maxTokens !== undefined) out.max_tokens = conv.maxTokens;
+  if (conv.streaming !== undefined) out.streaming = conv.streaming;
+  if (conv.maxHistory !== undefined) out.max_history = conv.maxHistory;
+  if (conv.allowInterruption !== undefined) out.allow_interruption = conv.allowInterruption;
+  if (conv.providerKind !== undefined) out.provider_kind = conv.providerKind;
+  if (conv.stripMarkdown !== undefined) out.strip_markdown = conv.stripMarkdown;
+  // Barge-in / mute
+  if (conv.eagerEot !== undefined) out.eager_eot = conv.eagerEot;
+  if (conv.bargeInMinWords !== undefined) out.barge_in_min_words = conv.bargeInMinWords;
+  if (conv.muteStrategy !== undefined) out.mute_strategy = conv.muteStrategy;
+  if (conv.userIdleTimeoutMs !== undefined) out.user_idle_timeout_ms = conv.userIdleTimeoutMs;
+  if (conv.summarizeTargetTokens !== undefined)
+    out.summarize_target_tokens = conv.summarizeTargetTokens;
+  // Latency filler
+  if (conv.latencyFiller !== undefined) out.latency_filler = conv.latencyFiller;
+  if (conv.latencyFillerAfterMs !== undefined)
+    out.latency_filler_after_ms = conv.latencyFillerAfterMs;
+  if (conv.latencyFillerPhrases !== undefined)
+    out.latency_filler_phrases = conv.latencyFillerPhrases;
+  // Reasoning tier
+  if (conv.reasoningEffort !== undefined) out.reasoning_effort = conv.reasoningEffort;
+  if (conv.reasoningModel !== undefined) out.reasoning_model = conv.reasoningModel;
+  if (conv.reasoningBaseUrl !== undefined) out.reasoning_base_url = conv.reasoningBaseUrl;
+  if (conv.reasoningApiKey !== undefined) out.reasoning_api_key = conv.reasoningApiKey;
+  if (conv.reasoningProviderKind !== undefined)
+    out.reasoning_provider_kind = conv.reasoningProviderKind;
+  if (conv.reasoningRoute !== undefined) out.reasoning_route = conv.reasoningRoute;
+  if (conv.reasoningBudgetMs !== undefined) out.reasoning_budget_ms = conv.reasoningBudgetMs;
+  if (conv.degradationMessage !== undefined) out.degradation_message = conv.degradationMessage;
+  if (conv.maxLlmCallsPerTurn !== undefined) out.max_llm_calls_per_turn = conv.maxLlmCallsPerTurn;
+  if (conv.maxReasoningTokens !== undefined) out.max_reasoning_tokens = conv.maxReasoningTokens;
+  return out;
+}
 
 export type MessageHandler = {
   onReady: (streamId: string) => void;
   onTranscript: (result: TranscriptResult) => void;
   onAudio: (audio: ArrayBuffer, format: string, sampleRate: number, isFinal: boolean) => void;
   onPlaybackComplete: () => void;
+  /** Non-fatal gateway advisory (config_warning): a key was ignored / a feature no-ops. */
+  onConfigWarning: (warning: ConfigWarning) => void;
   onError: (error: Error) => void;
   onClose: () => void;
 };
+
+/**
+ * D1 liveness: max ms with no inbound frame during an ACTIVE session before we
+ * declare the socket a zombie and reconnect. The gateway never pings clients and
+ * has no JSON ping op, so app-level stale-inbound detection is the only browser
+ * liveness signal. Must be FAR under the gateway's ~300s idle-close (handler.rs:265)
+ * yet above normal transcript/audio cadence; ~12s during an active call.
+ */
+const STALE_INBOUND_MS = 12000;
+/** How often the watchdog wakes to check the stale-inbound deadline. */
+const LIVENESS_CHECK_MS = 3000;
+/** On resume (online/foreground), reconnect immediately if no inbound this recently. */
+const RESUME_PROBE_STALE_MS = 2000;
 
 export class WidgetWebSocket {
   private ws: WebSocket | null = null;
@@ -27,6 +252,26 @@ export class WidgetWebSocket {
     messagesSent: 0,
   };
   private reconnectTimeoutId: ReturnType<typeof setTimeout> | null = null;
+
+  // D1/D4 session liveness state.
+  /**
+   * True from the first connect() until disconnect(). Distinguishes a network
+   * drop (reconnect) from a user-initiated close (do NOT reconnect). Survives
+   * across reconnect attempts, unlike the per-connect `settled` closure flag.
+   */
+  private active = false;
+  /** True once the gateway has sent `ready` at least once on the current attempt. */
+  private ready = false;
+  /** Monotonic timestamp (performance.now) of the most recent inbound frame. */
+  private lastInboundMonotonic = 0;
+  /** D1 stale-inbound watchdog interval. */
+  private livenessIntervalId: ReturnType<typeof setInterval> | null = null;
+  /** Whether the network-change listeners are currently installed. */
+  private networkListenersAttached = false;
+  // Bound network-change handlers (so add/removeEventListener pair correctly).
+  private boundOnline: (() => void) | null = null;
+  private boundOffline: (() => void) | null = null;
+  private boundVisibility: (() => void) | null = null;
 
   constructor(config: WidgetConfig, handlers: MessageHandler) {
     this.config = config;
@@ -47,7 +292,25 @@ export class WidgetWebSocket {
     };
   }
 
-  connect(timeout = 10000): Promise<void> {
+  /**
+   * Open the socket and resolve on the gateway `ready`.
+   *
+   * D6: the default timeout is 35s, NOT 10s. The dominant connect cost is the
+   * server-side PROVIDER_READY (gateway config_handler.rs:45) which, for an
+   * audio=true session, can take up to ~30s to bring up the STT+TTS upstreams —
+   * the widget ALWAYS sends `audio:true` (buildConfigMessage). A 10s timeout would
+   * spuriously abort a perfectly healthy slow-provider connect. The WS handshake
+   * itself is ~2ms, so this only loosens the PROVIDER_READY bound; a genuinely
+   * dead gateway is caught faster by the onerror/onclose paths and, post-connect,
+   * by the D1 stale-inbound watchdog.
+   */
+  connect(timeout = 35000): Promise<void> {
+    // The session is now meant to be alive: a drop should reconnect (D4) until
+    // the caller explicitly disconnect()s. Set BEFORE opening so a fast close
+    // still routes through the reconnect path.
+    this.active = true;
+    this.ready = false;
+    this.installNetworkListeners();
     return new Promise((resolve, reject) => {
       let settled = false;
       let timeoutId: ReturnType<typeof setTimeout> | null = null;
@@ -69,8 +332,11 @@ export class WidgetWebSocket {
       // Set connection timeout
       timeoutId = setTimeout(() => {
         if (!settled) {
-          // Close WebSocket if still connecting
+          // Close WebSocket if still connecting. Null the handler first so this
+          // deliberate close does NOT trigger the onclose reconnect path (the
+          // surfaced timeout error drives the caller's own recovery instead).
           if (this.ws) {
+            this.ws.onclose = null;
             this.ws.close();
             this.ws = null;
           }
@@ -90,13 +356,25 @@ export class WidgetWebSocket {
 
         this.ws.onopen = () => {
           this.reconnectAttempts = 0;
+          // Treat the open itself as inbound activity so the liveness watchdog
+          // has a fresh baseline before the first frame arrives.
+          this.lastInboundMonotonic = performance.now();
           this.sendConfig();
           // We'll resolve when we get the ready message
         };
 
         this.ws.onmessage = (event) => {
           this._metrics.messagesReceived++;
-          this.handleMessage(event, () => settle());
+          // D1: every inbound frame (binary audio, transcripts, keepalive, JSON)
+          // refreshes the liveness clock — the only browser zombie signal.
+          this.lastInboundMonotonic = performance.now();
+          this.handleMessage(event, () => {
+            // Resolve the connect promise AND arm the stale-inbound watchdog the
+            // first time the gateway says `ready`.
+            this.ready = true;
+            this.startLivenessWatchdog();
+            settle();
+          });
         };
 
         this.ws.onerror = () => {
@@ -104,9 +382,13 @@ export class WidgetWebSocket {
         };
 
         this.ws.onclose = () => {
+          this.stopLivenessWatchdog();
           this.handlers.onClose();
-          if (!settled) {
-            // Only attempt reconnect if we haven't settled yet (connection dropped before ready)
+          // D4: reconnect on ANY drop while the session is active — including a
+          // POST-ready drop (the old code gated on `!settled`, so a drop after
+          // ready left the widget dead). A user-initiated disconnect() clears
+          // `active` first, so it does NOT reconnect.
+          if (this.active) {
             this.attemptReconnect();
           }
         };
@@ -117,6 +399,12 @@ export class WidgetWebSocket {
   }
 
   disconnect(): void {
+    // User-initiated teardown: do NOT reconnect after this close.
+    this.active = false;
+    this.ready = false;
+    this.stopLivenessWatchdog();
+    this.removeNetworkListeners();
+
     // Cancel any pending reconnect attempt
     if (this.reconnectTimeoutId !== null) {
       clearTimeout(this.reconnectTimeoutId);
@@ -124,6 +412,9 @@ export class WidgetWebSocket {
     }
 
     if (this.ws) {
+      // Detach onclose so the deliberate close does not re-enter the reconnect
+      // path (active is already false, but this avoids a spurious onClose call).
+      this.ws.onclose = null;
       this.ws.close();
       this.ws = null;
     }
@@ -132,132 +423,133 @@ export class WidgetWebSocket {
     this.resetMetrics();
   }
 
+  // ===========================================================================
+  // D1 LIVENESS: browser stale-inbound watchdog + network-change probes
+  // ===========================================================================
+
+  /**
+   * Arm the stale-inbound watchdog. The gateway emits frequent inbound frames
+   * (transcripts/audio/keepalive) during any active session and never pings the
+   * client, so "no inbound for STALE_INBOUND_MS" is the browser zombie signal.
+   * On a stale deadline we close the socket; onclose then reconnects (D4).
+   */
+  private startLivenessWatchdog(): void {
+    if (this.livenessIntervalId !== null) return; // already armed
+    this.lastInboundMonotonic = performance.now();
+    this.livenessIntervalId = setInterval(() => {
+      if (!this.active || !this.ready) return;
+      const idle = performance.now() - this.lastInboundMonotonic;
+      if (idle >= STALE_INBOUND_MS) {
+        // Zombie: socket is OPEN but no data has arrived. Force a reconnect.
+        this.recycleSocket();
+      }
+    }, LIVENESS_CHECK_MS);
+  }
+
+  private stopLivenessWatchdog(): void {
+    if (this.livenessIntervalId !== null) {
+      clearInterval(this.livenessIntervalId);
+      this.livenessIntervalId = null;
+    }
+  }
+
+  /**
+   * Close the current (suspected-zombie) socket so the onclose handler routes
+   * into the reconnect path. Guarded so a missing/closed socket is a no-op.
+   */
+  private recycleSocket(): void {
+    this.ready = false;
+    this.stopLivenessWatchdog();
+    if (this.ws) {
+      // Keep onclose attached: we WANT it to fire so attemptReconnect runs (active).
+      try {
+        this.ws.close();
+      } catch (e) {
+        // ignore
+      }
+    }
+  }
+
+  /**
+   * Subscribe to network/visibility changes so a resumed tab or restored NIC
+   * heals immediately instead of waiting out the watchdog interval. Browser-only
+   * (guarded for non-DOM/test hosts).
+   */
+  private installNetworkListeners(): void {
+    if (this.networkListenersAttached) return;
+    if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') {
+      return;
+    }
+    this.boundOnline = () => this.onNetworkResume();
+    this.boundOffline = () => {
+      // NIC is down: stop retrying into a known-dead network (avoids a storm).
+      // The next 'online' event will probe + reconnect.
+      if (this.reconnectTimeoutId !== null) {
+        clearTimeout(this.reconnectTimeoutId);
+        this.reconnectTimeoutId = null;
+      }
+    };
+    this.boundVisibility = () => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'visible') {
+        this.onNetworkResume();
+      }
+    };
+    window.addEventListener('online', this.boundOnline);
+    window.addEventListener('offline', this.boundOffline);
+    if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+      document.addEventListener('visibilitychange', this.boundVisibility);
+    }
+    this.networkListenersAttached = true;
+  }
+
+  private removeNetworkListeners(): void {
+    if (!this.networkListenersAttached) return;
+    if (typeof window !== 'undefined' && typeof window.removeEventListener === 'function') {
+      if (this.boundOnline) window.removeEventListener('online', this.boundOnline);
+      if (this.boundOffline) window.removeEventListener('offline', this.boundOffline);
+      if (
+        this.boundVisibility &&
+        typeof document !== 'undefined' &&
+        typeof document.removeEventListener === 'function'
+      ) {
+        document.removeEventListener('visibilitychange', this.boundVisibility);
+      }
+    }
+    this.boundOnline = null;
+    this.boundOffline = null;
+    this.boundVisibility = null;
+    this.networkListenersAttached = false;
+  }
+
+  /**
+   * On tab-resume / NIC-restore during an active session: if the socket is gone,
+   * reconnect now; if it is open but has been quiet, proactively recycle it (a
+   * resumed tab often holds a half-open socket the OS hasn't reset yet).
+   */
+  private onNetworkResume(): void {
+    if (!this.active) return;
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      // Socket already gone — reconnect immediately (skip any pending backoff).
+      if (this.reconnectTimeoutId !== null) {
+        clearTimeout(this.reconnectTimeoutId);
+        this.reconnectTimeoutId = null;
+      }
+      this.attemptReconnect();
+      return;
+    }
+    // Socket OPEN: if nothing arrived very recently, assume it is half-open.
+    if (this.ready && performance.now() - this.lastInboundMonotonic > RESUME_PROBE_STALE_MS) {
+      this.recycleSocket();
+    }
+  }
+
   private sendConfig(): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
 
-    const config: Record<string, unknown> = {
-      type: 'config',
-      audio: true,
-    };
-
-    // STT configuration
-    if (this.config.stt) {
-      config.stt_config = {
-        provider: this.config.stt.provider,
-        language: this.config.stt.language || 'en-US',
-        sample_rate: this.config.stt.sampleRate || 16000,
-        channels: this.config.stt.channels || 1,
-        encoding: this.config.stt.encoding || 'linear16',
-        model: this.config.stt.model || 'nova-3',
-        punctuation: this.config.features?.punctuation ?? true,
-      };
-    }
-
-    // TTS configuration with emotion support
-    if (this.config.tts) {
-      const ttsConfig: Record<string, unknown> = {
-        provider: this.config.tts.provider,
-        voice_id: this.config.tts.voiceId || this.config.tts.voice,
-        sample_rate: this.config.tts.sampleRate || 24000,
-        model: this.config.tts.model,
-      };
-
-      // Add emotion settings if configured
-      if (this.config.tts.emotion) {
-        if (this.config.tts.emotion.emotion !== undefined) {
-          ttsConfig.emotion = this.config.tts.emotion.emotion;
-        }
-        if (this.config.tts.emotion.intensity !== undefined) {
-          ttsConfig.emotion_intensity = this.config.tts.emotion.intensity;
-        }
-        if (this.config.tts.emotion.deliveryStyle !== undefined) {
-          ttsConfig.delivery_style = this.config.tts.emotion.deliveryStyle;
-        }
-        if (this.config.tts.emotion.description !== undefined) {
-          ttsConfig.emotion_description = this.config.tts.emotion.description;
-        }
-      }
-
-      config.tts_config = ttsConfig;
-    }
-
-    // Audio features configuration
-    if (this.config.audioFeatures) {
-      const audioFeatures: Record<string, unknown> = {};
-
-      // Turn detection
-      if (this.config.audioFeatures.turnDetection) {
-        audioFeatures.turn_detection = {
-          enabled: this.config.audioFeatures.turnDetection.enabled,
-          threshold: this.config.audioFeatures.turnDetection.threshold,
-          silence_ms: this.config.audioFeatures.turnDetection.silenceMs,
-          prefix_padding_ms: this.config.audioFeatures.turnDetection.prefixPaddingMs,
-        };
-      }
-
-      // Noise filtering (matches Python SDK naming)
-      if (this.config.audioFeatures.noiseFilter) {
-        audioFeatures.noise_filtering = {
-          enabled: this.config.audioFeatures.noiseFilter.enabled,
-          strength: this.config.audioFeatures.noiseFilter.strength,
-        };
-      }
-
-      // VAD (Voice Activity Detection)
-      if (this.config.audioFeatures.vad) {
-        audioFeatures.vad = {
-          enabled: this.config.audioFeatures.vad.enabled,
-          threshold: this.config.audioFeatures.vad.threshold,
-          silence_ms: this.config.audioFeatures.vad.silenceMs,
-        };
-      }
-
-      if (Object.keys(audioFeatures).length > 0) {
-        config.audio_features = audioFeatures;
-      }
-    }
-
-    // Realtime configuration (OpenAI Realtime API / Hume EVI)
-    if (this.config.realtime) {
-      const realtimeConfig: Record<string, unknown> = {
-        provider: this.config.realtime.provider,
-        model: this.config.realtime.model,
-        system_prompt: this.config.realtime.systemPrompt,
-        voice_id: this.config.realtime.voiceId,
-        temperature: this.config.realtime.temperature,
-        max_tokens: this.config.realtime.maxTokens,
-      };
-
-      // Hume EVI specific fields
-      if (this.config.realtime.eviVersion !== undefined) {
-        realtimeConfig.evi_version = this.config.realtime.eviVersion;
-      }
-      if (this.config.realtime.verboseTranscription !== undefined) {
-        realtimeConfig.verbose_transcription = this.config.realtime.verboseTranscription;
-      }
-      if (this.config.realtime.resumedChatGroupId !== undefined) {
-        realtimeConfig.resumed_chat_group_id = this.config.realtime.resumedChatGroupId;
-      }
-
-      // OpenAI Realtime specific fields
-      if (this.config.realtime.inputAudioTranscription !== undefined) {
-        realtimeConfig.input_audio_transcription = {
-          model: this.config.realtime.inputAudioTranscription.model,
-        };
-      }
-
-      // Turn detection for realtime mode
-      if (this.config.realtime.turnDetection !== undefined) {
-        realtimeConfig.turn_detection = {
-          enabled: this.config.realtime.turnDetection.enabled,
-          threshold: this.config.realtime.turnDetection.threshold,
-          silence_ms: this.config.realtime.turnDetection.silenceMs,
-          prefix_padding_ms: this.config.realtime.turnDetection.prefixPaddingMs,
-        };
-      }
-
-      config.realtime_config = realtimeConfig;
-    }
+    // Single source of truth for the /ws config envelope (see buildConfigMessage).
+    // turn_detection nests in stt_config; conversation_config drives the LLM loop;
+    // NO top-level audio_features/realtime_config (non-keys, silently dropped).
+    const config = buildConfigMessage(this.config);
 
     this.configSentTime = performance.now();
     this.send(config);
@@ -294,6 +586,14 @@ export class WidgetWebSocket {
           if (resolveConnect) {
             resolveConnect();
           }
+          // D8: if we asked for opus but the gateway echoes linear16, it downgraded (e.g. built
+          // without opus). Surface it so the embedder knows audio is linear16 on the wire.
+          if (data.audio_in_codec && data.audio_in_codec !== (this.config.stt?.audioInCodec ?? 'linear16')) {
+            console.warn(`[bud-widget] uplink codec negotiated to '${data.audio_in_codec}' (requested '${this.config.stt?.audioInCodec}')`);
+          }
+          if (data.audio_out_codec && data.audio_out_codec !== (this.config.tts?.audioOutCodec ?? 'linear16')) {
+            console.warn(`[bud-widget] downlink codec negotiated to '${data.audio_out_codec}' (requested '${this.config.tts?.audioOutCodec}')`);
+          }
           this.handlers.onReady(data.stream_id);
           break;
 
@@ -329,12 +629,29 @@ export class WidgetWebSocket {
           this.handlers.onPlaybackComplete();
           break;
 
+        case 'config_warning': {
+          // Non-fatal gateway advisory (gateway handlers/ws/config_lint.rs):
+          // a config key was ignored (typo / wrong nesting) or a feature no-ops.
+          // Surface it so a developer learns the config was partially ignored
+          // instead of debugging a silent no-op. NEVER closes the session.
+          const warning: ConfigWarning = {
+            code: typeof data.code === 'string' ? data.code : 'unknown',
+            message: typeof data.message === 'string' ? data.message : '',
+            detail:
+              data.detail && typeof data.detail === 'object' ? data.detail : undefined,
+          };
+          // Loud-but-non-fatal: also log so it shows up in the console for the
+          // common case where no listener is attached.
+          console.warn(
+            `[bud-widget] gateway config_warning (${warning.code}): ${warning.message}`,
+            warning.detail ?? ''
+          );
+          this.handlers.onConfigWarning(warning);
+          break;
+        }
+
         case 'error':
           this.handlers.onError(new Error(data.message || 'Unknown error'));
-          break;
-
-        case 'pong':
-          // Handle pong for latency measurement
           break;
       }
     } catch (e) {
@@ -362,18 +679,30 @@ export class WidgetWebSocket {
   }
 
   private attemptReconnect(): void {
+    // A reconnect is already scheduled — don't stack a second timer (would leak
+    // the prior id and double-count attempts).
+    if (this.reconnectTimeoutId !== null) {
+      return;
+    }
     if (this.reconnectAttempts >= this.maxReconnectAttempts) {
       this.handlers.onError(new Error('Max reconnection attempts reached'));
       return;
     }
 
+    // No live socket should remain across the backoff window (D1/D4: a recycled
+    // or dropped socket is already closing); drop the stale ready flag so the
+    // watchdog stays disarmed until the fresh `ready`.
+    this.ready = false;
+
     this.reconnectAttempts++;
+    // Reuse the existing 1.5^attempt backoff with +-20% jitter (D4: same backoff).
     const delay = this.reconnectDelay * Math.pow(1.5, this.reconnectAttempts - 1);
     const jitter = delay * 0.2 * (Math.random() * 2 - 1);
 
     // Store timeout ID so it can be cancelled on disconnect
     this.reconnectTimeoutId = setTimeout(() => {
       this.reconnectTimeoutId = null;
+      // connect() re-sends the full config envelope in onopen (D4: re-send config).
       this.connect().catch((error) => {
         this.handlers.onError(error);
       });
@@ -461,13 +790,6 @@ export class WidgetWebSocket {
 
   clear(): void {
     this.send({ type: 'clear' });
-  }
-
-  ping(): void {
-    this.send({
-      type: 'ping',
-      timestamp: Date.now(),
-    });
   }
 
   get connected(): boolean {

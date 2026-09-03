@@ -20,13 +20,17 @@ pub use input::{AudioInputNode, TextInputNode};
 pub use llm::{ChatMessage, LlmEndpointConfig, LlmEndpointNode, ResponseFormat, ToolDefinition};
 pub use output::{AudioOutputNode, TextOutputNode, WebhookOutputNode};
 pub use processor::ProcessorNode;
-pub use provider::{RealtimeProviderNode, STTProviderNode, TTSProviderNode};
+pub use provider::{
+    RealtimeProviderNode, RealtimeSessionMap, STTProviderNode, SessionRealtime, TTSProviderNode,
+    disconnect_realtime_sessions, realtime_resilience_key, realtime_sessions_key,
+};
 pub use router::{JoinNode, RouterNode, SplitNode};
 pub use transform::{PassthroughNode, TransformNode};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 
 use super::context::DAGContext;
 use super::error::DAGResult;
@@ -320,6 +324,36 @@ pub trait DAGNode: Send + Sync {
 
     /// Execute the node with given input data
     async fn execute(&self, input: DAGData, ctx: &mut DAGContext) -> DAGResult<DAGData>;
+
+    /// Streaming execution (streaming data-plane): consume a stream of inputs and emit a stream of
+    /// outputs, so a downstream node can start producing as soon as an upstream node emits its
+    /// first chunk (e.g. an LLM streams a sentence → TTS speaks it while the LLM keeps generating).
+    ///
+    /// The DEFAULT adapter runs the batch [`execute`](Self::execute) once per input item, so every
+    /// existing node works unchanged inside a streaming chain (it simply buffers one item → one
+    /// output). Streaming-capable nodes (LLM token→sentence, TTS per-chunk) OVERRIDE this to emit
+    /// incrementally for low time-to-first-output. Honors `ctx.cancel_token` for barge-in.
+    async fn execute_streaming(
+        &self,
+        mut inputs: mpsc::Receiver<DAGData>,
+        ctx: &mut DAGContext,
+        outputs: mpsc::Sender<DAGData>,
+    ) -> DAGResult<()> {
+        while let Some(item) = inputs.recv().await {
+            if ctx.cancel_token.is_cancelled() {
+                break;
+            }
+            match self.execute(item, ctx).await? {
+                DAGData::Empty => {}
+                out => {
+                    if outputs.send(out).await.is_err() {
+                        break; // downstream gone
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 
     /// Check if node accepts the given input type
     fn accepts_input(&self, data: &DAGData) -> bool {

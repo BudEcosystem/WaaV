@@ -8,9 +8,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use tokio::sync::{Notify, RwLock};
 use tokio::time::Duration;
-use tracing::debug;
+use tracing::{debug, warn};
 
+use crate::config::utils::parse_bool;
 use crate::core::cache::store::CacheStore;
+use crate::core::observability::ObserverRegistry;
 use crate::core::{
     create_stt_provider, create_tts_provider,
     stt::{
@@ -44,6 +46,22 @@ pub type SmartTurnCallback = Arc<
         + 'static,
 >;
 
+pub(crate) const WAAV_UNINTERRUPTIBLE_PLAYBACK_ENV: &str = "WAAV_UNINTERRUPTIBLE_PLAYBACK";
+
+fn uninterruptible_playback_from_env() -> VoiceManagerResult<bool> {
+    match std::env::var(WAAV_UNINTERRUPTIBLE_PLAYBACK_ENV) {
+        Ok(value) => parse_bool(&value).ok_or_else(|| {
+            VoiceManagerError::InitializationError(format!(
+                "{WAAV_UNINTERRUPTIBLE_PLAYBACK_ENV} must be a boolean (true/false, 1/0, yes/no), got {value:?}"
+            ))
+        }),
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Err(std::env::VarError::NotUnicode(_)) => Err(VoiceManagerError::InitializationError(
+            format!("{WAAV_UNINTERRUPTIBLE_PLAYBACK_ENV} must be valid UTF-8 boolean text"),
+        )),
+    }
+}
+
 /// VoiceManager provides a unified interface for managing STT and TTS providers
 /// Optimized for extreme low-latency with lock-free atomics and pre-allocated buffers
 pub struct VoiceManager {
@@ -68,6 +86,11 @@ pub struct VoiceManager {
     // Uses interior mutability so it can be initialized in start()
     #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
     smart_turn_processor: Arc<RwLock<Option<SmartTurnProcessor>>>,
+    /// C-G5 ingress resampler: wire rate → the 16 kHz the VAD/smart-turn
+    /// models require. Identity (zero work) for 16 kHz clients. The STT
+    /// provider always receives the ORIGINAL bytes at the wire rate.
+    #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
+    ingress_resampler: Arc<SyncRwLock<crate::core::audio::StreamResampler>>,
 
     // Callback for smart turn detection results
     #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
@@ -81,6 +104,30 @@ pub struct VoiceManager {
 
     // Notification for audio clear completion instead of sleep
     clear_notify: Arc<Notify>,
+
+    /// Barge-in CLEAR EPOCH (review wf_85659e16 #5): bumped under the TTS
+    /// write lock by every clear. A speak gated on a captured epoch
+    /// ([`Self::speak_if_epoch`]) re-checks it under the SAME lock, so a
+    /// sentence pump that passed its cancellation check but lost the lock
+    /// race to a barge-in clear can never enqueue stale audio AFTER the
+    /// clear — the leak the BargeInMopUp event couldn't cover when the
+    /// user goes silent.
+    clear_epoch: Arc<AtomicUsize>,
+
+    // Per-session observer registry (latency profiling / instrumentation).
+    // None ⇒ a single relaxed read per call site, zero work. Set once at
+    // session setup via `set_observers`; read-mostly thereafter.
+    observers: Arc<SyncRwLock<Option<Arc<ObserverRegistry>>>>,
+
+    /// A-G6: when uninterruptible playback is enabled, TTS chunks are metered to
+    /// the transport through this pump's queue so a barge-in can selectively
+    /// keep uninterruptible audio. `None` (the default) ⇒ chunks flow straight
+    /// to the transport (the validated immediate-delivery hot path, unchanged).
+    playback_pump: Arc<SyncRwLock<Option<crate::core::audio::PlaybackPump>>>,
+    /// A-G6 master switch (env `WAAV_UNINTERRUPTIBLE_PLAYBACK`, off by default).
+    /// Atomic so it can be toggled before `on_tts_audio` (and in tests) without
+    /// a process-global env var.
+    uninterruptible_playback: AtomicBool,
 }
 
 impl VoiceManager {
@@ -119,10 +166,38 @@ impl VoiceManager {
         config: VoiceManagerConfig,
         turn_detector: Option<Arc<RwLock<TurnDetector>>>,
     ) -> VoiceManagerResult<Self> {
-        let tts = create_tts_provider(&config.tts_config.provider, config.tts_config.clone())
-            .map_err(VoiceManagerError::TTSError)?;
-        let stt = create_stt_provider(&config.stt_config.provider, config.stt_config.clone())
-            .map_err(VoiceManagerError::STTError)?;
+        let uninterruptible_playback = uninterruptible_playback_from_env()?;
+
+        // Prefer the reachable W1 keystone path when a standardized config is present so advanced
+        // features (diarization, keyterms, voice settings, …) are honored END-TO-END. Fall back to
+        // the flat factory for the legacy path (and for providers not yet migrated, where
+        // `create_*_standard` itself delegates to the flat factory).
+        let tts = match &config.standard_tts {
+            Some(std_tts) => crate::core::tts::standard::create_tts_standard(
+                &std_tts.base.provider,
+                std_tts.clone(),
+            )
+            .map_err(VoiceManagerError::TTSError)?,
+            None => create_tts_provider(&config.tts_config.provider, config.tts_config.clone())
+                .map_err(VoiceManagerError::TTSError)?,
+        };
+        let mut stt = match &config.standard_stt {
+            Some(std_stt) => crate::core::stt::standard::create_stt_standard(
+                &std_stt.base.provider,
+                std_stt.clone(),
+            )
+            .map_err(VoiceManagerError::STTError)?,
+            None => create_stt_provider(&config.stt_config.provider, config.stt_config.clone())
+                .map_err(VoiceManagerError::STTError)?,
+        };
+        // W-D2 cross-session wiring: inject the shared process-global resilience handles (the
+        // single reconnect governor + this provider's shared circuit breaker) so all sessions of
+        // the provider trip the same breaker and share the process-wide reconnect cap. A no-op
+        // for providers that don't run a supervised reconnect loop, and skipped entirely when no
+        // handles were supplied (unit tests that don't boot CoreState).
+        if let Some(resilience) = &config.resilience {
+            stt.set_resilience(resilience.clone());
+        }
 
         // Pre-allocate string buffers with reasonable capacity
         const TEXT_BUFFER_CAPACITY: usize = 1024;
@@ -147,10 +222,15 @@ impl VoiceManager {
                 last_forced_text: String::with_capacity(1024),
                 segment_start_ms: AtomicUsize::new(0),
                 hard_timeout_deadline_ms: AtomicUsize::new(0),
+                fire_generation: AtomicUsize::new(0),
             })),
             turn_detector,
             #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
             smart_turn_processor: Arc::new(RwLock::new(None)), // Initialized in start() if configured
+            #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
+            ingress_resampler: Arc::new(
+                SyncRwLock::new(crate::core::audio::StreamResampler::new()),
+            ),
             #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
             smart_turn_callback: Arc::new(SyncRwLock::new(None)),
             interruption_state: Arc::new(InterruptionState {
@@ -158,10 +238,60 @@ impl VoiceManager {
                 non_interruptible_until_ms: AtomicUsize::new(0),
                 current_sample_rate: AtomicU32::new(24000),
                 is_completed: AtomicBool::new(true), // Start as completed
+                playout_end_ms: AtomicUsize::new(0), // Silent at start
             }),
             config,
             clear_notify: Arc::new(Notify::new()),
+            clear_epoch: Arc::new(AtomicUsize::new(0)),
+            observers: Arc::new(SyncRwLock::new(None)),
+            playback_pump: Arc::new(SyncRwLock::new(None)),
+            uninterruptible_playback: AtomicBool::new(uninterruptible_playback),
         })
+    }
+
+    /// A-G6: enable/disable uninterruptible playback (the metered pump path).
+    /// Must be set BEFORE `on_tts_audio` registers the egress callback. Defaults
+    /// from `WAAV_UNINTERRUPTIBLE_PLAYBACK`.
+    pub fn set_uninterruptible_playback(&self, enabled: bool) {
+        self.uninterruptible_playback
+            .store(enabled, Ordering::Release);
+    }
+
+    /// Test seam: is the A-G6 playback pump engaged?
+    #[cfg(test)]
+    pub fn test_has_playback_pump(&self) -> bool {
+        self.playback_pump.read().is_some()
+    }
+
+    /// Test seam: push a chunk through the registered TTS egress wrapper exactly
+    /// as a provider would (so the A-G6 enqueue path is exercised end-to-end).
+    #[cfg(test)]
+    pub async fn test_emit_tts_chunk(&self, audio: AudioData) {
+        let cb = self.tts_audio_callback.read().clone();
+        if let Some(cb) = cb {
+            cb(audio).await;
+        }
+    }
+
+    /// Test seam: set the interruptibility tag applied to subsequently-emitted
+    /// chunks (what `speak_with_interruption` toggles).
+    #[cfg(test)]
+    pub fn test_set_allow_interruption(&self, allow: bool) {
+        self.interruption_state
+            .allow_interruption
+            .store(allow, Ordering::Release);
+    }
+
+    /// Attach a per-session observer registry (latency profiling, custom
+    /// instrumentation). Hooks fire on the audio/STT/TTS paths; with no
+    /// registry attached every hook site is a single cheap read.
+    pub fn set_observers(&self, registry: Arc<ObserverRegistry>) {
+        *self.observers.write() = Some(registry);
+    }
+
+    /// The attached observer registry, if any (cloned `Arc`).
+    pub fn observers(&self) -> Option<Arc<ObserverRegistry>> {
+        self.observers.read().clone()
     }
 
     /// Set the TTS cache store and optionally the precomputed TTS config hash
@@ -235,6 +365,27 @@ impl VoiceManager {
             }
         }
 
+        // LOUD degradation (RC5): a session running without ANY ML end-of-turn
+        // signal falls back to fixed timers — the single largest silent latency
+        // regression a deployment can hit. Say so, once, at session start.
+        {
+            #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
+            let has_smart_turn = self.config.smart_turn_config.is_some();
+            #[cfg(not(any(feature = "silero-vad", feature = "smart-turn")))]
+            let has_smart_turn = false;
+            if !has_smart_turn && self.turn_detector.is_none() {
+                tracing::warn!(
+                    "TURN DETECTION DEGRADED: no smart-turn processor and no text \
+                     turn-detector — end-of-turn falls back to fixed timers \
+                     ({}ms provider wait / {}ms hard ceiling). Enable the \
+                     turn-detect/smart-turn features or accept the added latency.",
+                    self.config.speech_final_config.stt_speech_final_wait_ms,
+                    self.config.speech_final_config.speech_final_hard_timeout_ms
+                );
+                crate::core::metrics::bridge::record_degraded("turn_detection", "timer_fallback");
+            }
+        }
+
         // Set up internal TTS callback - using parking_lot for faster access
         {
             let mut tts = self.tts.write().await;
@@ -271,6 +422,11 @@ impl VoiceManager {
     /// # }
     /// ```
     pub async fn stop(&self) -> VoiceManagerResult<()> {
+        // A-G6: drop the playback pump (aborts its metering task) FIRST, before
+        // the fallible disconnects below — a disconnect error must not leak the
+        // pump task (review wf_e53f4d85 #4; mirrors the timer-abort-first order).
+        *self.playback_pump.write() = None;
+
         // Cancel any pending speech final timer
         {
             let mut state = self.speech_final_state.write();
@@ -383,6 +539,12 @@ impl VoiceManager {
         // CRITICAL: Audio MUST always reach STT provider for real-time guarantees.
         // Smart turn processing is optional - skip if lock is busy to avoid blocking.
 
+        // Per-frame profiling anchor (None ⇒ one cheap read, no work).
+        let frame_observers = self.observers.read().clone();
+        if let Some(obs) = &frame_observers {
+            obs.notify_audio_in(crate::core::observability::now_monotonic_ns());
+        }
+
         // Process audio through Smart Turn Processor if enabled AND lock is available
         #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
         {
@@ -395,9 +557,28 @@ impl VoiceManager {
                         // Convert bytes to f32 samples (assuming 16-bit PCM)
                         let samples = self.bytes_to_f32_samples(&audio);
 
+                        // C-G5 ingress: the VAD/smart-turn models require
+                        // 16 kHz; resample when the wire rate differs (8 kHz
+                        // telephony, 48 kHz WebRTC). Identity (None) for
+                        // 16 kHz clients — zero extra work. The STT provider
+                        // below still gets the ORIGINAL wire-rate bytes.
+                        let wire_rate = self.config.stt_config.sample_rate;
+                        let resampled = self
+                            .ingress_resampler
+                            .write()
+                            .resample(&samples, wire_rate, 16_000);
+                        let samples = resampled.as_deref().unwrap_or(&samples);
+
                         // Process through smart turn detector
-                        match processor.process_audio(&samples).await {
+                        match processor.process_audio(samples).await {
                             Ok(result) => {
+                                if let Some(obs) = &frame_observers {
+                                    obs.notify_smart_turn(
+                                        result.latency_us,
+                                        result.is_turn_complete,
+                                        crate::core::observability::now_monotonic_ns(),
+                                    );
+                                }
                                 // If turn was detected, call the callback
                                 if result.is_turn_complete {
                                     debug!(
@@ -424,6 +605,9 @@ impl VoiceManager {
                     // This is expected under high load. Log at trace level to enable monitoring
                     // without flooding logs. Audio will still be sent to STT below.
                     // Turn detection may be slightly delayed but audio latency is preserved.
+                    if let Some(obs) = &frame_observers {
+                        obs.notify_frame_skipped();
+                    }
                     tracing::trace!(
                         "Smart turn lock contended, skipping frame. Audio forwarding continues."
                     );
@@ -488,7 +672,60 @@ impl VoiceManager {
     /// # Ok(())
     /// # }
     /// ```
+    /// The current barge-in clear epoch. Capture at TURN start and pass to
+    /// [`Self::speak_if_epoch`]: a clear during the turn invalidates every
+    /// later sentence of that turn.
+    pub fn clear_epoch(&self) -> usize {
+        self.clear_epoch.load(Ordering::Acquire)
+    }
+
+    /// Epoch-gated speak: enqueue ONLY if no TTS clear happened since
+    /// `epoch` was captured (checked under the TTS write lock — race-free
+    /// against a concurrent barge-in clear). Returns `false` when skipped.
+    pub async fn speak_if_epoch(
+        &self,
+        text: &str,
+        flush: bool,
+        allow_interruption: bool,
+        epoch: usize,
+    ) -> VoiceManagerResult<bool> {
+        if !allow_interruption {
+            // Non-interruptible utterances keep the time-window semantics.
+            self.speak_with_interruption(text, flush, false).await?;
+            return Ok(true);
+        }
+        if let Some(obs) = self.observers.read().clone() {
+            obs.notify_tts_request(crate::core::observability::now_monotonic_ns());
+        }
+        let mut tts = self.tts.write().await;
+        if self.clear_epoch.load(Ordering::Acquire) != epoch {
+            debug!("speak_if_epoch: clear happened since capture; sentence dropped");
+            return Ok(false);
+        }
+        // D-G9 (review wf_d43814c3): count chars on THIS path too — the
+        // orchestrator speaks via speak_if_epoch, not speak(), so the
+        // counter was never incremented on the production conversation path.
+        crate::core::metrics::bridge::count_tts_chars(
+            &self.config.tts_config.provider,
+            text.chars().count(),
+        );
+        tts.speak(text, flush)
+            .await
+            .map_err(VoiceManagerError::TTSError)?;
+        Ok(true)
+    }
+
     pub async fn speak(&self, text: &str, flush: bool) -> VoiceManagerResult<()> {
+        // Per-turn profiling anchor: TTS synthesis requested (first-of-turn
+        // dedup happens inside the profiler).
+        if let Some(obs) = self.observers.read().clone() {
+            obs.notify_tts_request(crate::core::observability::now_monotonic_ns());
+        }
+        // D-G9: synthesis cost proxy.
+        crate::core::metrics::bridge::count_tts_chars(
+            &self.config.tts_config.provider,
+            text.chars().count(),
+        );
         // Send text to TTS provider
         {
             let mut tts = self.tts.write().await;
@@ -528,11 +765,9 @@ impl VoiceManager {
                     .store(sample_rate, Ordering::Release);
             }
 
-            // Get current timestamp in milliseconds
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as usize;
+            // Monotonic clock (P0.4): interruption windows are relative
+            // intervals; wall-clock breaks them under NTP/VM-restore skew.
+            let now = super::state::now_monotonic_ms();
 
             // Initialize non_interruptible_until_ms to current time
             // The actual duration will be calculated as TTS chunks arrive
@@ -549,6 +784,12 @@ impl VoiceManager {
             self.interruption_state.reset();
         }
 
+        // D-G9: synthesis cost proxy (covers the non-interruptible /
+        // speak_if_epoch-delegated path).
+        crate::core::metrics::bridge::count_tts_chars(
+            &self.config.tts_config.provider,
+            text.chars().count(),
+        );
         // Send text to TTS provider
         {
             let mut tts = self.tts.write().await;
@@ -568,6 +809,26 @@ impl VoiceManager {
         !self.interruption_state.can_interrupt()
     }
 
+    /// D3 (REALTIME_REASONING.md §4.3): open a SHORT, auto-expiring barge-in
+    /// suppression window so a just-enqueued masking/filler clip isn't instantly
+    /// cut by its own VAD tail — while the clip itself stays interruptible in the
+    /// queue. Clamped to ≤400 ms (shorter than human reaction + STT-partial
+    /// latency, so a genuine barge-in is almost never swallowed). After the
+    /// window, `can_interrupt()` returns true again on its own.
+    pub fn arm_barge_in_suppression(&self, ms: u64) {
+        let now = crate::core::voice_manager::state::now_monotonic_ms();
+        let window = ms.min(400) as usize;
+        self.interruption_state
+            .allow_interruption
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.interruption_state
+            .is_completed
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.interruption_state
+            .non_interruptible_until_ms
+            .store(now + window, std::sync::atomic::Ordering::Release);
+    }
+
     /// Clear any queued text from the TTS provider and audio buffers
     ///
     /// This method clears both the TTS text queue and any audio buffers
@@ -576,17 +837,67 @@ impl VoiceManager {
     /// # Returns
     /// * `VoiceManagerResult<()>` - Success or error
     pub async fn clear_tts(&self) -> VoiceManagerResult<()> {
-        // Check if we're allowed to clear
-        if !self.interruption_state.can_interrupt() {
-            // Not allowed to interrupt yet
-            return Ok(());
+        // A-G6: per-chunk selective barge-in. Snapshot the queue Arc without
+        // holding the pump lock across the awaits below.
+        let pb_queue = self
+            .playback_pump
+            .read()
+            .as_ref()
+            .map(|p| p.queue().clone());
+
+        match &pb_queue {
+            // A-G6 ON. The QUEUE's own O(1) `has_uninterruptible_active` is the
+            // protection signal — uninterruptible audio QUEUED *or* IN FLIGHT
+            // (popped by the pump and playing in the transport). It is NOT gated
+            // on the whole-utterance `can_interrupt()` / `non_interruptible_until_ms`
+            // window: that deadline is anchored to *synthesis* time, but the pump
+            // meters *playout*, so it expires while a disclaimer is still queued
+            // behind interruptible audio (brutal review wf_e53f4d85 #1/#3). The
+            // natural bound on protection is the pump's `mark_played` — protection
+            // ends exactly when the audio finishes playing, not on a timer.
+            Some(q) => {
+                if q.has_uninterruptible_active() {
+                    // Protection active: drop queued INTERRUPTIBLE audio (any
+                    // speech queued behind the disclaimer is cut — the A10 fix:
+                    // the old blanket early-return left it stuck), KEEP queued
+                    // uninterruptible audio, and DON'T touch the provider or
+                    // transport so the in-flight disclaimer plays out. Do NOT
+                    // reset the interruption window — that would drop protection.
+                    let dropped = q.clear_interruptible();
+                    debug!(
+                        dropped,
+                        "A-G6 selective barge-in: kept uninterruptible audio, dropped queued interruptible"
+                    );
+                    return Ok(());
+                }
+                // Nothing protected (no uninterruptible queued or in flight) ⇒
+                // FULL clear, including anything still queued.
+                q.clear_all();
+            }
+            // A-G6 OFF: the legacy immediate-delivery path — the whole-utterance
+            // window gates the (blanket) clear, unchanged.
+            None => {
+                if !self.interruption_state.can_interrupt() {
+                    return Ok(());
+                }
+            }
         }
 
         debug!("Starting audio clearing process");
 
-        // Clear TTS text queue
+        // Clear TTS text queue — BEST EFFORT: a provider error must not skip
+        // the audio-buffer clear or the state reset below, or the stale
+        // playout deadline survives the barge-in (review wf_5772cd64 #10).
         let mut tts = self.tts.write().await;
-        tts.clear().await.map_err(VoiceManagerError::TTSError)?;
+        // D-G7: the standardized context seam — defaults to clear(), but
+        // context-aware WS providers cancel the SPECIFIC server context.
+        if let Err(e) = tts.on_audio_context_interrupted(None).await {
+            warn!(error = %e, "TTS provider clear failed; continuing barge-in cleanup");
+        }
+        // Invalidate epoch-gated speaks WHILE holding the TTS lock: any
+        // speak_if_epoch already waiting on this lock observes the bump the
+        // moment it acquires it, and skips (no post-clear stale enqueue).
+        self.clear_epoch.fetch_add(1, Ordering::Release);
         drop(tts); // Release the lock
 
         // Call audio clear callback to clear any audio buffers (e.g., LiveKit)
@@ -674,8 +985,12 @@ impl VoiceManager {
         let speech_final_state_clone = self.speech_final_state.clone();
         let interruption_state_clone = self.interruption_state.clone();
         let turn_detector_clone = self.turn_detector.clone();
+        let observers_clone = self.observers.clone();
 
-        // Create STT processor with configured timeouts from VoiceManagerConfig
+        // Create STT processor with configured timeouts from VoiceManagerConfig,
+        // plus the provider's measured TTFS p99 (A-G2/D-G8: a slow provider's
+        // real final must not be beaten by the forced fire).
+        let provider_ttfs = { self.stt.read().await.ttfs_p99_ms() };
         let processing_config = STTProcessingConfig::new(
             self.config.speech_final_config.stt_speech_final_wait_ms,
             self.config
@@ -683,7 +998,8 @@ impl VoiceManager {
                 .turn_detection_inference_timeout_ms,
             self.config.speech_final_config.speech_final_hard_timeout_ms,
             self.config.speech_final_config.duplicate_window_ms,
-        );
+        )
+        .with_stt_ttfs_p99_ms(provider_ttfs);
         let stt_processor = STTResultProcessor::new(processing_config);
 
         let wrapper_callback: STTResultCallback = Arc::new(move |result| {
@@ -693,6 +1009,7 @@ impl VoiceManager {
             let interruption_state = interruption_state_clone.clone();
             let turn_detector = turn_detector_clone.clone();
             let stt_processor = stt_processor.clone();
+            let observers = observers_clone.read().clone();
 
             Box::pin(async move {
                 // Fast synchronous check for interruption - execute before any async ops
@@ -707,6 +1024,15 @@ impl VoiceManager {
                     .await;
 
                 if let Some(processed_result) = processed_result {
+                    // Per-turn profiling anchors: partials stamp the lock-free
+                    // pre-EOS slot; the finalized result opens the turn.
+                    if let Some(obs) = &observers {
+                        if processed_result.is_final || processed_result.is_speech_final {
+                            obs.notify_stt_result(&processed_result, 0);
+                        } else {
+                            obs.notify_stt_partial(crate::core::observability::now_monotonic_ns());
+                        }
+                    }
                     // Call user callback with processed result
                     callback(processed_result).await;
                 }
@@ -818,11 +1144,36 @@ impl VoiceManager {
     {
         let user_callback = Arc::new(callback);
         let interruption_state_clone = self.interruption_state.clone();
+        let observers_clone = self.observers.clone();
+
+        // A-G6: when uninterruptible playback is enabled, build a pump whose sink
+        // IS the user callback and meter chunks through its queue; the wrapper
+        // enqueues instead of delivering directly. Off (default) ⇒ no pump, the
+        // wrapper delivers straight to the transport (unchanged hot path).
+        let playback_enqueuer = if self.uninterruptible_playback.load(Ordering::Acquire) {
+            let sink_cb = user_callback.clone();
+            let sink: crate::core::audio::PlaybackSink =
+                Arc::new(move |audio: AudioData| sink_cb(audio));
+            let fallback_rate = self.config.tts_config.sample_rate.unwrap_or(24_000);
+            let pump = crate::core::audio::PlaybackPump::spawn(
+                Arc::new(crate::core::audio::PlaybackQueue::new()),
+                sink,
+                fallback_rate,
+                crate::core::audio::DEFAULT_PLAYBACK_LEAD,
+            );
+            let enq = pump.enqueuer();
+            *self.playback_pump.write() = Some(pump); // keep the pump task alive
+            Some(enq)
+        } else {
+            None
+        };
 
         // Create wrapper that checks clearing state and updates interruption timing
-        let wrapper_callback = Arc::new(move |audio_data: AudioData| {
+        let wrapper_callback = Arc::new(move |mut audio_data: AudioData| {
             let user_cb = user_callback.clone();
             let int_state = interruption_state_clone.clone();
+            let observers = observers_clone.read().clone();
+            let playback_enqueuer = playback_enqueuer.clone();
 
             Box::pin(async move {
                 // Check if this is new audio after completion
@@ -830,45 +1181,84 @@ impl VoiceManager {
                     // New audio starting after completion
                     int_state.is_completed.store(false, Ordering::SeqCst);
 
+                    // P0.1 universal boundary (RC1): EVERY provider's audio
+                    // crosses here — including the ~18 with custom speak()
+                    // paths that bypass the shared chunker. Sniff the first
+                    // chunk of each utterance: a container labeled as PCM gets
+                    // relabeled with the truth + counted, fleet-wide.
+                    if crate::core::tts::sniff::is_pcm_family(&audio_data.format)
+                        && let Some(container) =
+                            crate::core::tts::sniff::sniff_container(&audio_data.data)
+                    {
+                        tracing::error!(
+                            declared = %audio_data.format,
+                            actual = container.as_format_str(),
+                            "TTS audio at egress is a container mislabeled as PCM — relabeling"
+                        );
+                        crate::core::metrics::bridge::record_tts_format_mismatch(
+                            "egress-boundary",
+                            "egress",
+                        );
+                        audio_data.format = container.as_format_str().to_string();
+                        audio_data.duration_ms = None;
+                    }
+
                     // Reset the non_interruptible_until_ms to current time if we're in non-interruptible mode
                     if !int_state.allow_interruption.load(Ordering::Acquire) {
-                        let now_ms = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis() as usize;
+                        // Monotonic (P0.4): same clock as can_interrupt().
+                        let now_ms = crate::core::voice_manager::state::now_monotonic_ms();
                         int_state
                             .non_interruptible_until_ms
                             .store(now_ms, Ordering::Release);
                     }
                 }
 
-                // Calculate audio duration and update non_interruptible_until_ms
+                // This chunk's playback duration via the STANDARDIZED
+                // AudioData math (review wf_5772cd64 #7/#8): provider
+                // duration_ms → PCM16 byte math at the CHUNK's rate (not the
+                // stale session atomic) → 250ms compressed over-estimate.
+                let chunk_duration_ms =
+                    audio_data.playback_ms(int_state.current_sample_rate.load(Ordering::Acquire));
+
+                // Estimated bot playout deadline (EVERY chunk): the
+                // bot-speaking truth for turn policy (MinWords gating, A-G3).
+                int_state.extend_playout(chunk_duration_ms);
+
+                // Update non_interruptible_until_ms (non-interruptible mode
+                // only). CAS for the same reason as extend_playout (review
+                // wf_5772cd64 #3 / wf_85659e16 follow-up): a plain
+                // load→store racing a reset could resurrect a stale window.
                 if !int_state.allow_interruption.load(Ordering::Acquire) {
-                    // Calculate actual audio duration from audio data
-                    // For PCM/linear16: bytes / (sample_rate * bytes_per_sample * channels)
-                    // Assuming 16-bit audio (2 bytes per sample) and mono (1 channel)
-                    let bytes_per_sample = 2;
-                    let channels = 1;
-                    let sample_rate = int_state.current_sample_rate.load(Ordering::Acquire);
-
-                    // Guard against division by zero - use default sample rate if zero
-                    let safe_sample_rate = if sample_rate == 0 { 24000 } else { sample_rate };
-
-                    let chunk_duration_seconds = audio_data.data.len() as f32
-                        / (safe_sample_rate as f32 * bytes_per_sample as f32 * channels as f32);
-
-                    let chunk_duration_ms = (chunk_duration_seconds * 1000.0) as usize;
-
-                    // Add duration to non_interruptible_until_ms
-                    let current_until =
-                        int_state.non_interruptible_until_ms.load(Ordering::Acquire);
-                    int_state
-                        .non_interruptible_until_ms
-                        .store(current_until + chunk_duration_ms, Ordering::Release);
+                    let _ = int_state.non_interruptible_until_ms.fetch_update(
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                        |cur| Some(cur + chunk_duration_ms),
+                    );
                 }
 
-                // Call the user's callback
-                user_cb(audio_data).await;
+                // Per-turn profiling anchors: TTS produced audio, and this
+                // delivery to the registered egress callback is the moment the
+                // response becomes audible (first-of-turn dedup in profiler).
+                if let Some(obs) = &observers {
+                    obs.notify_tts_chunk(&audio_data, None);
+                    obs.notify_audio_out(crate::core::observability::now_monotonic_ns());
+                }
+
+                match &playback_enqueuer {
+                    // A-G6 on: enqueue tagged by the CURRENT utterance's
+                    // interruptibility; the pump meters it to the user callback.
+                    Some(enq) => {
+                        let interruptible = int_state.allow_interruption.load(Ordering::Acquire);
+                        let unit = if interruptible {
+                            crate::core::audio::PlaybackUnit::interruptible(audio_data)
+                        } else {
+                            crate::core::audio::PlaybackUnit::uninterruptible(audio_data)
+                        };
+                        enq.enqueue(unit);
+                    }
+                    // A-G6 off: deliver straight to the transport (unchanged).
+                    None => user_cb(audio_data).await,
+                }
             }) as Pin<Box<dyn Future<Output = ()> + Send>>
         });
 
@@ -1025,6 +1415,21 @@ impl VoiceManager {
     pub async fn is_smart_turn_enabled(&self) -> bool {
         let guard = self.smart_turn_processor.read().await;
         guard.is_some()
+    }
+
+    /// The CURRENT turn's buffered partial transcript (the speech-final text
+    /// buffer). Used by eager end-of-turn (P1.2b): a turn-complete prediction
+    /// speculates on what the user has said SO FAR.
+    pub fn current_turn_text(&self) -> String {
+        self.speech_final_state.read().text_buffer.clone()
+    }
+
+    /// Whether the bot is (estimated to be) audibly speaking right now —
+    /// the bot-speaking truth for turn policy (MinWords barge-in gating,
+    /// A-G3). Derived from the per-chunk playout estimate; cleared audio
+    /// (barge-in) snaps it to silent.
+    pub fn is_bot_speaking(&self) -> bool {
+        self.interruption_state.is_audibly_speaking()
     }
 
     /// Returns the current speech state from smart turn processor.
@@ -1209,9 +1614,7 @@ impl VoiceManager {
         // Reconnect STT for continued use
         {
             let mut stt = self.stt.write().await;
-            stt.connect()
-                .await
-                .map_err(VoiceManagerError::STTError)?;
+            stt.connect().await.map_err(VoiceManagerError::STTError)?;
         }
 
         tracing::info!("STT stream finalized and reconnected");

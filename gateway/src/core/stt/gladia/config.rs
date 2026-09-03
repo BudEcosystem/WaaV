@@ -9,6 +9,15 @@ use std::str::FromStr;
 
 use crate::core::stt::base::{STTConfig, STTError};
 
+fn validate_gladia_stt_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 // =============================================================================
 // Region
 // =============================================================================
@@ -246,6 +255,15 @@ pub struct GladiaMessagesConfig {
     /// Receive post-processing events
     #[serde(default)]
     pub receive_post_processing_events: bool,
+    /// Receive acknowledgment messages (Gladia `messages_config.receive_acknowledgments`).
+    #[serde(default)]
+    pub receive_acknowledgments: bool,
+    /// Receive error messages (Gladia `messages_config.receive_errors`).
+    #[serde(default)]
+    pub receive_errors: bool,
+    /// Receive lifecycle event messages (Gladia `messages_config.receive_lifecycle_events`).
+    #[serde(default)]
+    pub receive_lifecycle_events: bool,
 }
 
 fn default_true() -> bool {
@@ -261,6 +279,9 @@ impl Default for GladiaMessagesConfig {
             receive_pre_processing_events: false,
             receive_realtime_processing_events: false,
             receive_post_processing_events: false,
+            receive_acknowledgments: false,
+            receive_errors: false,
+            receive_lifecycle_events: false,
         }
     }
 }
@@ -281,6 +302,39 @@ pub struct GladiaPreProcessing {
 }
 
 // =============================================================================
+// Post-processing Configuration
+// =============================================================================
+
+/// Post-processing configuration (Gladia `post_processing`): summarization + chapterization.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GladiaPostProcessing {
+    /// Enable summarization (`post_processing.summarization`).
+    #[serde(default)]
+    pub summarization: bool,
+    /// Summarization config (`post_processing.summarization_config`), e.g. `{ "type": "bullet_points" }`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summarization_config: Option<GladiaSummarizationConfig>,
+    /// Enable chapterization (`post_processing.chapterization`).
+    #[serde(default)]
+    pub chapterization: bool,
+}
+
+impl GladiaPostProcessing {
+    /// True when no post-processing feature is requested (so the field can be omitted entirely).
+    pub fn is_empty(&self) -> bool {
+        !self.summarization && self.summarization_config.is_none() && !self.chapterization
+    }
+}
+
+/// Summarization config (Gladia `post_processing.summarization_config`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GladiaSummarizationConfig {
+    /// Summary type (e.g. "general", "bullet_points", "concise").
+    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
+    pub summary_type: Option<String>,
+}
+
+// =============================================================================
 // Realtime Processing Configuration
 // =============================================================================
 
@@ -293,18 +347,97 @@ pub struct GladiaRealtimeProcessing {
     /// Custom vocabulary words
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub custom_vocabulary: Vec<String>,
+    /// Custom vocabulary tuning (per-term intensity / pronunciations + default intensity).
+    /// Maps to Gladia `realtime_processing.custom_vocabulary_config`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_vocabulary_config: Option<GladiaCustomVocabularyConfig>,
+    /// Enable custom spelling dictionary (`realtime_processing.custom_spelling`).
+    #[serde(default)]
+    pub custom_spelling: bool,
+    /// Custom spelling dictionary config (`realtime_processing.custom_spelling_config`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_spelling_config: Option<GladiaCustomSpellingConfig>,
     /// Enable real-time translation
     #[serde(default)]
     pub translation: bool,
     /// Target languages for translation
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub translation_target_languages: Vec<String>,
+    /// P5 translation OUTPUT mapping: canonical BCP-47 strings the caller asked
+    /// for, INDEX-ALIGNED to [`translation_target_languages`]'s ISO-639-1 codes.
+    /// Gateway-internal only — `#[serde(skip)]` keeps it out of the Gladia request
+    /// body. Used to upgrade the ISO code Gladia echoes on each `type:"translation"`
+    /// message back to the canonical `translations[].lang`.
+    #[serde(skip)]
+    pub translation_target_canonical: Vec<String>,
+    /// Translation tuning options (`realtime_processing.translation_config`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub translation_config: Option<GladiaTranslationConfig>,
     /// Enable named entity recognition
     #[serde(default)]
     pub named_entity_recognition: bool,
     /// Enable sentiment analysis
     #[serde(default)]
     pub sentiment_analysis: bool,
+}
+
+/// Custom spelling dictionary config: maps a canonical spelling to the spoken variants that
+/// should be replaced by it. Gladia `realtime_processing.custom_spelling_config`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GladiaCustomSpellingConfig {
+    /// Map of canonical spelling -> list of spoken variants.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub spelling_dictionary: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+/// Custom vocabulary tuning config. Gladia `realtime_processing.custom_vocabulary_config`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GladiaCustomVocabularyConfig {
+    /// Vocabulary entries (value + optional intensity/pronunciations/language).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vocabulary: Vec<GladiaVocabularyItem>,
+    /// Default boosting intensity applied to entries without an explicit intensity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_intensity: Option<f32>,
+}
+
+/// A single custom-vocabulary entry for Gladia.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GladiaVocabularyItem {
+    /// The vocabulary term.
+    pub value: String,
+    /// Per-term boosting intensity (overrides `default_intensity`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intensity: Option<f32>,
+    /// Alternative pronunciations to bias toward this term.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pronunciations: Vec<String>,
+    /// Language this entry applies to (ISO 639-1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+}
+
+/// Translation tuning options. Gladia `realtime_processing.translation_config`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GladiaTranslationConfig {
+    /// Translation model to use (e.g. "base", "enhanced").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Match the original utterance segmentation in translations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub match_original_utterances: Option<bool>,
+    /// Optimize translation timing for lip-sync.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lipsync: Option<bool>,
+    /// Adapt translation using prior context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_adaptation: Option<bool>,
+    /// Free-form context string to steer translation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+    /// Use an informal register in the translation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub informal: Option<bool>,
 }
 
 // =============================================================================
@@ -340,8 +473,12 @@ pub struct GladiaSTTConfig {
     pub pre_processing: GladiaPreProcessing,
     /// Realtime processing configuration
     pub realtime_processing: GladiaRealtimeProcessing,
+    /// Post-processing configuration (summarization, chapterization)
+    pub post_processing: GladiaPostProcessing,
     /// Custom metadata for session tracking
     pub custom_metadata: Option<serde_json::Value>,
+    /// Base endpoint override (scheme://host) from the standardized `endpoint_override` — redirects the session-init POST at an in-repo mock; the WS dial follows the `url` the mock returns.
+    pub endpoint_override: Option<String>,
 }
 
 impl Default for GladiaSTTConfig {
@@ -360,7 +497,9 @@ impl Default for GladiaSTTConfig {
             messages_config: GladiaMessagesConfig::default(),
             pre_processing: GladiaPreProcessing::default(),
             realtime_processing: GladiaRealtimeProcessing::default(),
+            post_processing: GladiaPostProcessing::default(),
             custom_metadata: None,
+            endpoint_override: None,
         }
     }
 }
@@ -377,15 +516,13 @@ impl GladiaSTTConfig {
     /// Create configuration from base STTConfig
     pub fn from_base(config: &STTConfig) -> Result<Self, STTError> {
         // API key is required
-        let api_key = if !config.api_key.is_empty() {
-            config.api_key.clone()
-        } else {
-            std::env::var("GLADIA_API_KEY").map_err(|_| {
+        let api_key = crate::core::credentials::explicit_api_key(&config.api_key)
+            .or_else(|| crate::core::credentials::env_api_key("GLADIA_API_KEY"))
+            .ok_or_else(|| {
                 STTError::ConfigurationError(
                     "Gladia API key required. Set api_key or GLADIA_API_KEY env var".to_string(),
                 )
-            })?
-        };
+            })?;
 
         // Parse encoding
         let encoding = config.encoding.parse().unwrap_or(GladiaEncoding::WavPcm);
@@ -403,6 +540,10 @@ impl GladiaSTTConfig {
                 .to_string()
         };
 
+        // Gladia currently exposes a single model ("solaria-1"), so `config.model` is intentionally
+        // NOT mapped: the shared `STTConfig` default model is Deepgram-specific ("nova-3") and
+        // forwarding an arbitrary value would only risk an invalid-model rejection. Map a non-empty
+        // `config.model` onto `self.model` when Gladia adds selectable models.
         Ok(Self {
             api_key,
             encoding,
@@ -410,6 +551,146 @@ impl GladiaSTTConfig {
             language_config: GladiaLanguageConfig::new(language),
             ..Default::default()
         })
+    }
+
+    /// Build from the standardized config (W1 keystone). Gladia models its advanced features on
+    /// the nested `realtime_processing`/`messages_config`/`language_config` structs, so this maps
+    /// the standardized features whose meaning matches an existing Gladia field: interim results,
+    /// word timestamps, custom vocabulary (keyterms), named-entity recognition and automatic
+    /// language detection. Features Gladia cannot express (diarization, smart_format,
+    /// profanity_filter, redaction, vad_events) are capability gaps and stay at default.
+    pub fn from_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        let f = &std.features;
+        let ex = &std.extras.0;
+        let mut cfg = Self::from_base(&std.base)?;
+        if let Some(i) = f.interim_results {
+            cfg.messages_config.receive_partial_transcripts = i;
+        }
+        if let Some(w) = f.word_timestamps {
+            cfg.realtime_processing.words_accurate_timestamps = w;
+        }
+        if let Some(e) = f.entity_detection {
+            cfg.realtime_processing.named_entity_recognition = e;
+        }
+        if let Some(v) = &f.keyterms {
+            cfg.realtime_processing.custom_vocabulary = v.clone();
+        }
+        if let Some(true) = f.language_detection {
+            cfg.language_config = GladiaLanguageConfig::auto();
+        }
+
+        // P5 translation (Class A — arbitrary targets): the canonical block maps to
+        // `realtime_processing.translation` + `translation_target_languages` (ISO-639-1). Gladia
+        // imposes no documented hard cap, so no truncation. `partials` is reflected onto the live
+        // partial-transcript channel (Gladia translation partials ride the partial-transcript flow).
+        if let Some(t) = &std.translation
+            && !t.is_noop()
+        {
+            let targets: Vec<String> = t
+                .target_iso639_1(None)
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect();
+            if !targets.is_empty() {
+                cfg.realtime_processing.translation = true;
+                cfg.realtime_processing.translation_target_languages = targets;
+                // Index-aligned canonical BCP-47 list for the OUTPUT path (upgrade the
+                // ISO code Gladia echoes on `type:"translation"` back to canonical).
+                cfg.realtime_processing.translation_target_canonical = t
+                    .target_canonical(None)
+                    .into_iter()
+                    .map(|s| s.to_string())
+                    .collect();
+                if let Some(p) = t.partials {
+                    cfg.messages_config.receive_partial_transcripts = p;
+                }
+            }
+        }
+
+        // --- Newly-wired Gladia features via the open ProviderExtras passthrough ---------------
+        // All map onto nested fields of the session-init body (realtime_processing /
+        // post_processing / messages_config) and are confirmed Gladia v2 Live params.
+        let rp = &mut cfg.realtime_processing;
+
+        // Custom spelling dictionary -> custom_spelling + custom_spelling_config.spelling_dictionary.
+        if let Some(dict) = ex
+            .get("custom_spelling_dictionary")
+            .or_else(|| ex.get("spelling_dictionary"))
+            .and_then(|v| v.as_object())
+        {
+            let mut spelling = std::collections::BTreeMap::new();
+            for (k, val) in dict {
+                let variants: Vec<String> = match val {
+                    serde_json::Value::Array(arr) => arr
+                        .iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect(),
+                    serde_json::Value::String(s) => vec![s.clone()],
+                    _ => Vec::new(),
+                };
+                spelling.insert(k.clone(), variants);
+            }
+            if !spelling.is_empty() {
+                rp.custom_spelling = true;
+                rp.custom_spelling_config = Some(GladiaCustomSpellingConfig {
+                    spelling_dictionary: spelling,
+                });
+            }
+        }
+        // Allow an explicit boolean toggle even without a dictionary.
+        if let Some(b) = ex.get("custom_spelling").and_then(|v| v.as_bool()) {
+            rp.custom_spelling = b;
+        }
+
+        // Custom vocabulary intensity / pronunciations -> custom_vocabulary_config.
+        if let Some(cvc) = ex.get("custom_vocabulary_config") {
+            if let Ok(parsed) = serde_json::from_value::<GladiaCustomVocabularyConfig>(cvc.clone())
+            {
+                rp.custom_vocabulary_config = Some(parsed);
+            }
+        }
+
+        // Translation tuning options -> translation_config.
+        if let Some(tc) = ex.get("translation_config") {
+            if let Ok(parsed) = serde_json::from_value::<GladiaTranslationConfig>(tc.clone()) {
+                rp.translation_config = Some(parsed);
+            }
+        }
+
+        // Post-processing: summarization (+ type) and chapterization.
+        if let Some(b) = ex.get("summarization").and_then(|v| v.as_bool()) {
+            cfg.post_processing.summarization = b;
+        }
+        if let Some(t) = ex
+            .get("summarization_config")
+            .and_then(|v| v.get("type"))
+            .and_then(|v| v.as_str())
+        {
+            cfg.post_processing.summarization = true;
+            cfg.post_processing.summarization_config = Some(GladiaSummarizationConfig {
+                summary_type: Some(t.to_string()),
+            });
+        }
+        if let Some(b) = ex.get("chapterization").and_then(|v| v.as_bool()) {
+            cfg.post_processing.chapterization = b;
+        }
+
+        // Message stream toggles.
+        if let Some(b) = ex.get("receive_acknowledgments").and_then(|v| v.as_bool()) {
+            cfg.messages_config.receive_acknowledgments = b;
+        }
+        if let Some(b) = ex.get("receive_errors").and_then(|v| v.as_bool()) {
+            cfg.messages_config.receive_errors = b;
+        }
+        if let Some(b) = ex.get("receive_lifecycle_events").and_then(|v| v.as_bool()) {
+            cfg.messages_config.receive_lifecycle_events = b;
+        }
+
+        cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
+
+        Ok(cfg)
     }
 
     /// Validate the configuration
@@ -455,21 +736,37 @@ impl GladiaSTTConfig {
         }
 
         // Validate pre-processing speech threshold
-        if let Some(threshold) = self.pre_processing.speech_threshold {
-            if !(0.0..=1.0).contains(&threshold) {
-                return Err(STTError::ConfigurationError(format!(
-                    "Speech threshold must be between 0.0 and 1.0, got {}",
-                    threshold
-                )));
-            }
+        if let Some(threshold) = self.pre_processing.speech_threshold
+            && !(0.0..=1.0).contains(&threshold)
+        {
+            return Err(STTError::ConfigurationError(format!(
+                "Speech threshold must be between 0.0 and 1.0, got {}",
+                threshold
+            )));
+        }
+
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_gladia_stt_endpoint("endpoint_override", endpoint)
+                .map_err(STTError::ConfigurationError)?;
         }
 
         Ok(())
     }
 
-    /// Get the API URL for session initialization
+    /// Get the API URL for session initialization. When `endpoint_override` (the standardized
+    /// base-url override, used by the credential-free mock e2e) is set, its scheme://host replaces
+    /// that of `GLADIA_LIVE_URL`; the `/v2/live` path and `?region=` query are preserved.
     pub fn api_url(&self) -> String {
-        format!("{}?region={}", super::GLADIA_LIVE_URL, self.region)
+        let base = match self
+            .endpoint_override
+            .as_deref()
+            .map(str::trim)
+            .filter(|o| !o.is_empty())
+        {
+            Some(o) => format!("{}/v2/live", o.trim_end_matches('/')),
+            None => super::GLADIA_LIVE_URL.to_string(),
+        };
+        format!("{}?region={}", base, self.region)
     }
 
     /// Set the region
@@ -559,6 +856,32 @@ impl GladiaSTTConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone: the standardized features unlock Gladia's nested feature surface
+    // (custom vocabulary + word timestamps) — previously unreachable via the flat factory.
+    #[test]
+    fn from_standard_maps_features() {
+        use crate::core::stt::standard::{StandardSTTConfig, SttFeatures};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "gladia".into(),
+                api_key: "test-key".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                word_timestamps: Some(true),
+                keyterms: Some(vec!["WaaV".into(), "Gladia".into()]),
+                ..Default::default()
+            },
+            ..StandardSTTConfig::from_base(STTConfig::default())
+        };
+        let cfg = GladiaSTTConfig::from_standard(&std).unwrap();
+        assert!(cfg.realtime_processing.words_accurate_timestamps);
+        assert_eq!(
+            cfg.realtime_processing.custom_vocabulary,
+            vec!["WaaV", "Gladia"]
+        );
+    }
 
     // Region tests
     #[test]
@@ -747,6 +1070,33 @@ mod tests {
     }
 
     #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = GladiaSTTConfig::new("test-api-key");
+
+        config.endpoint_override = Some("https://gladia-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.to_string().contains("SSRF protection"), "{err}");
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("non-HTTP endpoint_override must be rejected");
+        assert!(err.to_string().contains("not allowed"), "{err}");
+
+        config.endpoint_override = Some("ws://gladia-proxy.example.com".to_string());
+        let err = config
+            .validate()
+            .expect_err("WebSocket endpoint_override must be rejected for REST init");
+        assert!(err.to_string().contains("not allowed"), "{err}");
+    }
+
+    #[test]
     fn test_config_validate_invalid_sample_rate() {
         let mut config = GladiaSTTConfig::new("test-api-key");
         config.sample_rate = 12000;
@@ -850,6 +1200,13 @@ mod tests {
         assert_eq!(
             config.api_url(),
             "https://api.gladia.io/v2/live?region=us-west"
+        );
+
+        let mut config = GladiaSTTConfig::new("test-api-key");
+        config.endpoint_override = Some(" https://gladia-proxy.example.com/ ".to_string());
+        assert_eq!(
+            config.api_url(),
+            "https://gladia-proxy.example.com/v2/live?region=eu-west"
         );
     }
 

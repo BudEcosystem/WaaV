@@ -34,13 +34,26 @@ use crate::core::stt::base::STTError;
 ///
 /// This establishes a secure TLS connection to Tinkoff's STT service.
 pub async fn create_tinkoff_channel(config: &TinkoffSttConfig) -> Result<Channel, STTError> {
-    // Create TLS configuration
-    let tls_config = ClientTlsConfig::new().domain_name("api.tinkoff.ai");
+    // A mock e2e override points the channel at a plaintext localhost endpoint (no TLS); otherwise
+    // the production TLS endpoint is used unchanged.
+    let endpoint = if let Some(ep) = config
+        .endpoint_override
+        .as_deref()
+        .map(str::trim)
+        .filter(|ep| !ep.is_empty())
+    {
+        Endpoint::from_shared(ep.to_string()).map_err(|e| {
+            STTError::ConfigurationError(format!("Invalid endpoint override: {}", e))
+        })?
+    } else {
+        let tls_config = ClientTlsConfig::new().domain_name("api.tinkoff.ai");
+        Endpoint::from_static(TINKOFF_GRPC_ENDPOINT)
+            .tls_config(tls_config)
+            .map_err(|e| STTError::ConfigurationError(format!("TLS config error: {}", e)))?
+    };
 
     // Build and connect the channel
-    let channel = Endpoint::from_static(TINKOFF_GRPC_ENDPOINT)
-        .tls_config(tls_config)
-        .map_err(|e| STTError::ConfigurationError(format!("TLS config error: {}", e)))?
+    let channel = endpoint
         .connect_timeout(Duration::from_secs(config.connection_timeout_secs))
         .timeout(Duration::from_secs(config.request_timeout_secs))
         .connect()
@@ -96,9 +109,42 @@ impl TinkoffGrpcClient {
         Self { channel, config }
     }
 
+    /// Open a fresh bidirectional `StreamingRecognize` stream over the given audio receiver.
+    ///
+    /// The featured session is re-established intrinsically by opening a new stream: the request
+    /// metadata (x-api-key / x-secret-key) is rebuilt from config, and [`AudioChunkStream`] sends
+    /// the FIRST request as the featured `StreamingRecognitionConfig` (encoding, language,
+    /// VAD/diarization/profanity/speech-contexts, interim-results), then audio. This is what the
+    /// supervised transport calls per (re)connect, so a reconnect restores the *featured* session
+    /// rather than a bare one. Returns the raw response stream for the caller to drain; a
+    /// connection-level failure here is classified reconnectable vs fatal by
+    /// [`classify_grpc_outcome`].
+    pub(super) async fn open_stream(
+        &self,
+        audio_rx: mpsc::Receiver<Bytes>,
+        streaming_config: StreamingRecognitionConfig,
+    ) -> Result<Streaming<Bytes>, Status> {
+        // Create the request stream (re-yields the featured config first, then audio).
+        let request_stream = AudioChunkStream::new(audio_rx, streaming_config);
+
+        // Create metadata
+        let metadata = create_tinkoff_metadata(&self.config)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+
+        // Create the gRPC request with metadata
+        let mut request = Request::new(request_stream);
+        *request.metadata_mut() = metadata;
+
+        // Clone channel for the streaming call
+        let channel = self.channel.clone();
+        do_streaming_recognize(channel, request).await
+    }
+
     /// Start a bidirectional streaming session
     ///
     /// Returns a sender for audio chunks and a receiver for transcription results.
+    #[allow(dead_code)] // Retained for the non-supervised path / tests; the supervised transport
+    // drives `open_stream` directly.
     pub async fn start_streaming(
         &self,
         streaming_config: StreamingRecognitionConfig,
@@ -148,6 +194,28 @@ impl TinkoffGrpcClient {
     }
 }
 
+/// Map a gRPC status to a [`ReconnectOutcome`](crate::core::websocket::reconnectable_stream::ReconnectOutcome):
+/// transient transport failures (Unavailable, DeadlineExceeded, Internal, Cancelled, Aborted,
+/// ResourceExhausted) are reconnectable; auth/permission/argument errors are fatal (retrying would
+/// fail identically). Mirrors Tinkoff's own `is_retriable` taxonomy.
+pub(super) fn classify_grpc_outcome(
+    status: tonic::Status,
+) -> crate::core::websocket::reconnectable_stream::ReconnectOutcome {
+    use crate::core::websocket::reconnectable_stream::{ReconnectOutcome, StreamError};
+    use tonic::Code;
+    match status.code() {
+        Code::Unavailable
+        | Code::DeadlineExceeded
+        | Code::Internal
+        | Code::Cancelled
+        | Code::Aborted
+        | Code::ResourceExhausted => {
+            ReconnectOutcome::Reconnectable(StreamError::new(format!("grpc {}", status.code())))
+        }
+        _ => ReconnectOutcome::Fatal(StreamError::new(format!("grpc {}", status.code()))),
+    }
+}
+
 /// Perform the StreamingRecognize gRPC call using tonic's low-level Grpc client
 async fn do_streaming_recognize<S>(
     channel: Channel,
@@ -167,7 +235,7 @@ where
         .map_err(|e| Status::unavailable(format!("Service not ready: {}", e)))?;
 
     // Create the codec
-    let codec = TinkoffCodec::default();
+    let codec = TinkoffCodec;
 
     // Parse the path
     let path = PathAndQuery::from_static(GRPC_SERVICE_PATH);

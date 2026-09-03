@@ -63,7 +63,7 @@ impl fmt::Display for ReverieCloseReason {
 // =============================================================================
 
 /// Result from Reverie ASR (Speech-to-Text)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ReverieAsrResult {
     /// Session ID
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -125,20 +125,6 @@ impl ReverieAsrResult {
         } else {
             // Non-continuous: close on any final result
             true
-        }
-    }
-}
-
-impl Default for ReverieAsrResult {
-    fn default() -> Self {
-        Self {
-            id: None,
-            text: None,
-            r#final: false,
-            cause: None,
-            success: false,
-            confidence: None,
-            display_text: None,
         }
     }
 }

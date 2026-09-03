@@ -9,6 +9,15 @@ use std::str::FromStr;
 
 use crate::core::tts::base::TTSConfig;
 
+fn validate_reverie_tts_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 // =============================================================================
 // Audio Format Enum
 // =============================================================================
@@ -294,6 +303,11 @@ pub struct ReverieTtsConfig {
     pub sample_rate: u32,
     /// Output audio format.
     pub format: ReverieTtsAudioFormat,
+    /// Treat the synthesis input as SSML markup. When set, the request body carries the input under
+    /// the `ssml` key instead of the plain-text `text` array (Reverie's documented SSML input mode).
+    pub ssml_input: bool,
+    /// Optional scheme+host override for the synth HTTP endpoint (path+query preserved); test-only redirect.
+    pub endpoint_override: Option<String>,
 }
 
 impl ReverieTtsConfig {
@@ -361,7 +375,60 @@ impl ReverieTtsConfig {
             pitch: super::DEFAULT_PITCH,
             sample_rate,
             format,
+            ssml_input: false,
+            endpoint_override: None,
         })
+    }
+
+    /// Build from the standardized TTS config (W1 keystone).
+    ///
+    /// Reverie exposes a speed multiplier (0.5-1.5, 1.0 = normal) and a pitch offset in semitones
+    /// (-3 to +3), so this maps `speed` -> `speed` and `pitch` -> `pitch` reusing `from_base`'s /
+    /// `with_*` clamping (`speed` clamped to MIN_SPEED..MAX_SPEED, `pitch` clamped to
+    /// MIN_PITCH..MAX_PITCH), `sample_rate` -> `sample_rate` (snapped to the nearest supported rate
+    /// like `with_sample_rate`), `language` -> the speaker's `language` field, and `ssml` ->
+    /// `ssml_input` (the request body then carries the input under the `ssml` key instead of the
+    /// `text` array). Reverie's non-standard audio `format` knob is read from the `extras`
+    /// passthrough. Features without a Reverie field (volume, stability, similarity_boost, style,
+    /// use_speaker_boost, emotion, instructions, word_timestamps, streaming, seed) are skipped.
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> Result<Self, String> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(std.base.clone())?;
+
+        if let Some(speed) = f.speed {
+            // Reverie speed is a direct multiplier (1.0 = normal), clamped to the valid range.
+            cfg.speed = speed.clamp(super::MIN_SPEED, super::MAX_SPEED);
+        }
+        if let Some(pitch) = f.pitch {
+            // Reverie pitch is a semitone offset (0 = normal), clamped to the valid range.
+            cfg.pitch = pitch.clamp(super::MIN_PITCH, super::MAX_PITCH);
+        }
+        if let Some(rate) = f.sample_rate {
+            cfg.sample_rate = if super::is_valid_sample_rate(rate) {
+                rate
+            } else {
+                super::nearest_sample_rate(rate)
+            };
+        }
+        if let Some(language) = &f.language {
+            cfg.speaker.language = language.clone();
+        }
+        // SSML input mode: route the text through the `ssml` body key (audio-changing — folded into
+        // the cache-key hash by the provider).
+        if let Some(true) = f.ssml {
+            cfg.ssml_input = true;
+        }
+
+        // Provider-specific passthrough.
+        if let Some(fmt) = std.extras.0.get("format").and_then(|v| v.as_str()) {
+            cfg.format = fmt.parse().unwrap_or(cfg.format);
+        }
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
+        cfg.validate()?;
+
+        Ok(cfg)
     }
 
     /// Set the speaker.
@@ -442,6 +509,10 @@ impl ReverieTtsConfig {
                 self.sample_rate,
                 super::SUPPORTED_SAMPLE_RATES
             ));
+        }
+
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_reverie_tts_endpoint("endpoint_override", endpoint)?;
         }
 
         Ok(())
@@ -604,6 +675,73 @@ mod tests {
     // =========================================================================
     // Config Tests
     // =========================================================================
+
+    // W1 keystone (TTS): the standardized prosody features Reverie can express (speed multiplier,
+    // pitch semitone offset, output sample rate, plus the speaker language) reach the config fields,
+    // and the open extras passthrough carries the provider-specific audio format knob.
+    #[test]
+    fn from_standard_maps_prosody_language_and_format_extra() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("format".into(), serde_json::json!("mp3"));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "reverie".to_string(),
+                api_key: "test-api-key".to_string(),
+                model: "test-app-id".to_string(),
+                voice_id: Some("hi_female".to_string()),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(1.3),
+                pitch: Some(2.0),
+                sample_rate: Some(16000),
+                language: Some("en".to_string()),
+                ssml: Some(true),  // SSML input mode -> ssml_input (now wired)
+                volume: Some(0.5), // capability gap: Reverie has no volume knob, must be ignored
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+        let cfg = ReverieTtsConfig::from_standard(&std).unwrap();
+        assert!((cfg.speed - 1.3).abs() < 0.001); // 1.3 in 0.5..1.5 range
+        assert!((cfg.pitch - 2.0).abs() < 0.001); // 2.0 in -3.0..3.0 range
+        assert_eq!(cfg.sample_rate, 16000); // valid supported rate
+        assert_eq!(cfg.speaker.language, "en"); // language override onto speaker
+        assert!(cfg.ssml_input); // ssml feature mapped to ssml_input
+        assert_eq!(cfg.format, ReverieTtsAudioFormat::Mp3); // from extras passthrough
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = ReverieTtsConfig::from_base(create_test_config()).unwrap();
+
+        config.endpoint_override = Some("https://reverie-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.contains("SSRF protection"));
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("file endpoint_override must be rejected");
+        assert!(err.contains("URL scheme"));
+
+        config.endpoint_override = Some("ws://reverie-proxy.example.com".to_string());
+        let err = config
+            .validate()
+            .expect_err("WebSocket endpoint_override must be rejected");
+        assert!(err.contains("URL scheme"));
+
+        let std = crate::core::tts::standard::StandardTTSConfig::from_base(create_test_config())
+            .with_endpoint_override("file:///tmp/socket");
+        assert!(ReverieTtsConfig::from_standard(&std).is_err());
+    }
 
     #[test]
     fn test_config_from_base() {

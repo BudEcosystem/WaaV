@@ -1,5 +1,7 @@
 use std::env;
+use std::fmt::Display;
 use std::path::PathBuf;
+use std::str::FromStr;
 
 use super::parse_auth_api_secrets_json;
 use super::sip::{SipConfig, SipHookConfig};
@@ -9,6 +11,57 @@ use super::validation::{
     validate_tls_config,
 };
 use super::{AuthApiSecret, DAGTimeoutsConfig, PluginConfig, ServerConfig, TlsConfig};
+
+fn parse_env_value<T>(name: &str) -> Result<Option<T>, Box<dyn std::error::Error>>
+where
+    T: FromStr,
+    T::Err: Display,
+{
+    match env::var(name) {
+        Ok(value) => value
+            .parse::<T>()
+            .map(Some)
+            .map_err(|e| format!("Invalid {name} environment variable: {e}").into()),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(env::VarError::NotUnicode(_)) => {
+            Err(format!("{name} environment variable must be valid UTF-8").into())
+        }
+    }
+}
+
+fn parse_env_bool(name: &str) -> Result<Option<bool>, Box<dyn std::error::Error>> {
+    match env::var(name) {
+        Ok(value) => parse_bool(&value).map(Some).ok_or_else(|| {
+            format!("Invalid {name} environment variable: expected true/false/1/0/yes/no").into()
+        }),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(env::VarError::NotUnicode(_)) => {
+            Err(format!("{name} environment variable must be valid UTF-8").into())
+        }
+    }
+}
+
+fn parse_env_path(name: &str) -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
+    match env::var(name) {
+        Ok(value) if value.trim().is_empty() => Ok(None),
+        Ok(value) => Ok(Some(PathBuf::from(value))),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(env::VarError::NotUnicode(_)) => {
+            Err(format!("{name} environment variable must be valid UTF-8").into())
+        }
+    }
+}
+
+fn parse_env_non_empty_string(name: &str) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    match env::var(name) {
+        Ok(value) if value.trim().is_empty() => Ok(None),
+        Ok(value) => Ok(Some(value)),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(env::VarError::NotUnicode(_)) => {
+            Err(format!("{name} environment variable must be valid UTF-8").into())
+        }
+    }
+}
 
 impl ServerConfig {
     /// Load configuration from environment variables
@@ -23,6 +76,23 @@ impl ServerConfig {
     /// - Authentication configuration is invalid
     /// - JWT signing key file doesn't exist
     pub fn from_env() -> Result<Self, Box<dyn std::error::Error>> {
+        // Read a CREDENTIAL env var, treating an empty/whitespace/placeholder
+        // value as UNSET (`None`). A bare `env::var(..).ok()` returns `Some("")`
+        // for an exported-but-empty var (e.g. `HUME_API_KEY=""`), which then
+        // satisfies the realtime handler's `Some(_)` missing-key guard and drives
+        // an attempted connect (observed live: Hume → HTTP 429) instead of a clean
+        // "API key not configured" error. The same `is_placeholder_credential`
+        // filter the YAML/merge path uses applies here so empty == unset across
+        // every credential source. NON-credential vars (regions, endpoints, URLs)
+        // keep plain `.ok()` — an empty string there is not a secret-presence
+        // signal and some (e.g. AWS region) legitimately tolerate it.
+        macro_rules! cred_env {
+            ($var:expr) => {
+                env::var($var)
+                    .ok()
+                    .filter(|v: &String| !super::utils::is_placeholder_credential(v))
+            };
+        }
         // Server configuration
         let host = env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
         let port = env::var("PORT")
@@ -31,18 +101,13 @@ impl ServerConfig {
             .map_err(|e| format!("Invalid port number: {e}"))?;
 
         // TLS configuration
-        let tls_enabled = env::var("TLS_ENABLED")
-            .ok()
-            .and_then(|s| parse_bool(&s))
-            .unwrap_or(false);
+        let tls_enabled = parse_env_bool("TLS_ENABLED")?.unwrap_or(false);
 
         let tls = if tls_enabled {
-            let cert_path = env::var("TLS_CERT_PATH")
-                .map(PathBuf::from)
-                .map_err(|_| "TLS_CERT_PATH is required when TLS_ENABLED=true")?;
-            let key_path = env::var("TLS_KEY_PATH")
-                .map(PathBuf::from)
-                .map_err(|_| "TLS_KEY_PATH is required when TLS_ENABLED=true")?;
+            let cert_path = parse_env_path("TLS_CERT_PATH")?
+                .ok_or("TLS_CERT_PATH is required when TLS_ENABLED=true")?;
+            let key_path = parse_env_path("TLS_KEY_PATH")?
+                .ok_or("TLS_KEY_PATH is required when TLS_ENABLED=true")?;
 
             Some(TlsConfig {
                 cert_path,
@@ -57,91 +122,119 @@ impl ServerConfig {
             env::var("LIVEKIT_URL").unwrap_or_else(|_| "ws://localhost:7880".to_string());
         let livekit_public_url =
             env::var("LIVEKIT_PUBLIC_URL").unwrap_or_else(|_| "http://localhost:7880".to_string());
-        let livekit_api_key = env::var("LIVEKIT_API_KEY").ok();
-        let livekit_api_secret = env::var("LIVEKIT_API_SECRET").ok();
+        // Credentials: an empty/placeholder env value ⇒ None (review wf_e8eaad72 #1).
+        let livekit_api_key = cred_env!("LIVEKIT_API_KEY");
+        let livekit_api_secret = cred_env!("LIVEKIT_API_SECRET");
 
-        // Provider API keys
-        let deepgram_api_key = env::var("DEEPGRAM_API_KEY").ok();
-        let elevenlabs_api_key = env::var("ELEVENLABS_API_KEY").ok();
+        // Provider API keys (empty/placeholder env value ⇒ None — see `cred_env!`).
+        let deepgram_api_key = cred_env!("DEEPGRAM_API_KEY");
+        let elevenlabs_api_key = cred_env!("ELEVENLABS_API_KEY");
         // Google credentials can be:
         // - Path to service account JSON file (GOOGLE_APPLICATION_CREDENTIALS)
         // - Inline JSON content (for secrets management systems)
         // - Empty/None to use Application Default Credentials
-        let google_credentials = env::var("GOOGLE_APPLICATION_CREDENTIALS").ok();
+        // An empty value here means "use ADC" — identical to unset — so the
+        // empty⇒None normalization is correct (and the `get_api_key` google arm
+        // already exempts google from placeholder rejection for the ADC case).
+        let google_credentials = cred_env!("GOOGLE_APPLICATION_CREDENTIALS");
 
         // Azure Speech Services configuration
         // The subscription key is tied to a specific Azure region
-        let azure_speech_subscription_key = env::var("AZURE_SPEECH_SUBSCRIPTION_KEY").ok();
+        let azure_speech_subscription_key = cred_env!("AZURE_SPEECH_SUBSCRIPTION_KEY");
         let azure_speech_region = env::var("AZURE_SPEECH_REGION").ok();
 
         // Cartesia API key (used for both STT and TTS)
-        let cartesia_api_key = env::var("CARTESIA_API_KEY").ok();
+        let cartesia_api_key = cred_env!("CARTESIA_API_KEY");
 
         // OpenAI API key (used for STT, TTS, and Realtime API)
-        let openai_api_key = env::var("OPENAI_API_KEY").ok();
+        let openai_api_key = cred_env!("OPENAI_API_KEY");
+
+        // Azure OpenAI Realtime (OpenAI-protocol clone): api-key header + resource.
+        let azure_openai_api_key = cred_env!("AZURE_OPENAI_API_KEY");
+        let azure_openai_endpoint = env::var("AZURE_OPENAI_ENDPOINT").ok();
+
+        // Grok / xAI Realtime (OpenAI GA-compatible wire, Bearer auth).
+        let grok_api_key = cred_env!("GROK_API_KEY");
+
+        // Inworld Realtime (OpenAI GA wire, Bearer auth).
+        let inworld_api_key = cred_env!("INWORLD_API_KEY");
+
+        // Google Gemini Live (BidiGenerateContent S2S; `?key=` query auth).
+        let gemini_api_key = cred_env!("GEMINI_API_KEY");
+
+        // Ultravox hosted S2S realtime (`X-API-Key` create-call auth).
+        let ultravox_api_key = cred_env!("ULTRAVOX_API_KEY");
+
+        // Speechmatics API key (JWT / temp-token), shared by STT/TTS + the Flow
+        // (Voice AI) realtime provider (`Authorization: Bearer <token>`).
+        let speechmatics_api_key = cred_env!("SPEECHMATICS_API_KEY");
+
+        // Yandex Cloud AI Studio Realtime (OpenAI-protocol clone; GA wire, Bearer
+        // auth). The key is a Yandex IAM token or a static API key; the folder id
+        // (NOT a secret — like azure's endpoint) builds the `gpt://<folder>/…` URI.
+        let yandex_api_key = cred_env!("YANDEX_API_KEY");
+        let yandex_folder_id = env::var("YANDEX_FOLDER_ID").ok();
+
+        // SERVER-SIDE per-provider realtime upstream URL overrides (SSRF-safe).
+        // `<PROVIDER>_REALTIME_URL` → the matching realtime provider's connect URL.
+        // For proxies / self-hosted / gov-cloud / local mock testing. TRUSTED
+        // server config only — never sourced from a client request.
+        let realtime_endpoint_overrides = read_realtime_endpoint_overrides();
 
         // AssemblyAI API key (used for streaming STT)
-        let assemblyai_api_key = env::var("ASSEMBLYAI_API_KEY").ok();
+        let assemblyai_api_key = cred_env!("ASSEMBLYAI_API_KEY");
 
         // Hume AI API key (used for TTS and EVI)
-        let hume_api_key = env::var("HUME_API_KEY").ok();
+        let hume_api_key = cred_env!("HUME_API_KEY");
 
         // LMNT API key (used for TTS and voice cloning)
-        let lmnt_api_key = env::var("LMNT_API_KEY").ok();
+        let lmnt_api_key = cred_env!("LMNT_API_KEY");
 
         // Groq API key (used for ultra-fast Whisper STT)
-        let groq_api_key = env::var("GROQ_API_KEY").ok();
+        let groq_api_key = cred_env!("GROQ_API_KEY");
 
         // Play.ht credentials (used for TTS with voice cloning)
-        let playht_api_key = env::var("PLAYHT_API_KEY").ok();
-        let playht_user_id = env::var("PLAYHT_USER_ID").ok();
+        let playht_api_key = cred_env!("PLAYHT_API_KEY");
+        let playht_user_id = cred_env!("PLAYHT_USER_ID");
 
         // IBM Watson credentials (used for STT/TTS)
-        let ibm_watson_api_key = env::var("IBM_WATSON_API_KEY").ok();
-        let ibm_watson_instance_id = env::var("IBM_WATSON_INSTANCE_ID").ok();
+        let ibm_watson_api_key = cred_env!("IBM_WATSON_API_KEY");
+        let ibm_watson_instance_id = cred_env!("IBM_WATSON_INSTANCE_ID");
         let ibm_watson_region = env::var("IBM_WATSON_REGION").ok();
 
         // AWS credentials (used for Transcribe/Polly)
-        let aws_access_key_id = env::var("AWS_ACCESS_KEY_ID").ok();
-        let aws_secret_access_key = env::var("AWS_SECRET_ACCESS_KEY").ok();
+        let aws_access_key_id = cred_env!("AWS_ACCESS_KEY_ID");
+        let aws_secret_access_key = cred_env!("AWS_SECRET_ACCESS_KEY");
         let aws_region = env::var("AWS_REGION").ok();
 
         // Gnani.ai credentials (used for Indic STT/TTS)
-        let gnani_token = env::var("GNANI_TOKEN").ok();
-        let gnani_access_key = env::var("GNANI_ACCESS_KEY").ok();
-        let gnani_certificate_path = env::var("GNANI_CERTIFICATE_PATH").ok().map(PathBuf::from);
+        let gnani_token = cred_env!("GNANI_TOKEN");
+        let gnani_access_key = cred_env!("GNANI_ACCESS_KEY");
+        let gnani_certificate_path = parse_env_path("GNANI_CERTIFICATE_PATH")?;
 
         // LiveKit recording S3 configuration
         let recording_s3_bucket = env::var("RECORDING_S3_BUCKET").ok();
         let recording_s3_region = env::var("RECORDING_S3_REGION").ok();
         let recording_s3_endpoint = env::var("RECORDING_S3_ENDPOINT").ok();
-        let recording_s3_access_key = env::var("RECORDING_S3_ACCESS_KEY").ok();
-        let recording_s3_secret_key = env::var("RECORDING_S3_SECRET_KEY").ok();
+        let recording_s3_access_key = cred_env!("RECORDING_S3_ACCESS_KEY");
+        let recording_s3_secret_key = cred_env!("RECORDING_S3_SECRET_KEY");
         let recording_s3_prefix = env::var("RECORDING_S3_PREFIX").ok();
 
         // Cache configuration
-        let cache_path = env::var("CACHE_PATH").ok().map(PathBuf::from);
-        let cache_ttl_seconds = env::var("CACHE_TTL_SECONDS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .or(Some(30 * 24 * 60 * 60)); // 1 month (30 days) default
+        let cache_path = parse_env_path("CACHE_PATH")?;
+        let cache_ttl_seconds =
+            parse_env_value::<u64>("CACHE_TTL_SECONDS")?.or(Some(30 * 24 * 60 * 60)); // 1 month (30 days) default
 
         // Authentication configuration
-        let auth_service_url = env::var("AUTH_SERVICE_URL").ok();
-        let auth_signing_key_path = env::var("AUTH_SIGNING_KEY_PATH").ok().map(PathBuf::from);
+        let auth_service_url = parse_env_non_empty_string("AUTH_SERVICE_URL")?;
+        let auth_signing_key_path = parse_env_path("AUTH_SIGNING_KEY_PATH")?;
         let auth_api_secrets_json = env::var("AUTH_API_SECRETS_JSON").ok();
         let auth_api_secret = env::var("AUTH_API_SECRET").ok();
         let auth_api_secret_id = env::var("AUTH_API_SECRET_ID")
             .ok()
             .unwrap_or_else(|| "default".to_string());
-        let auth_timeout_seconds = env::var("AUTH_TIMEOUT_SECONDS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(5);
-        let auth_required = env::var("AUTH_REQUIRED")
-            .ok()
-            .and_then(|v| parse_bool(&v))
-            .unwrap_or(false);
+        let auth_timeout_seconds = parse_env_value::<u64>("AUTH_TIMEOUT_SECONDS")?.unwrap_or(5);
+        let auth_required = parse_env_bool("AUTH_REQUIRED")?.unwrap_or(false);
 
         let auth_api_secrets = if let Some(json) = auth_api_secrets_json {
             parse_auth_api_secrets_json(&json)?
@@ -174,21 +267,12 @@ impl ServerConfig {
 
         // Security configuration
         let cors_allowed_origins = env::var("CORS_ALLOWED_ORIGINS").ok();
-        let rate_limit_requests_per_second = env::var("RATE_LIMIT_REQUESTS_PER_SECOND")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(60);
-        let rate_limit_burst_size = env::var("RATE_LIMIT_BURST_SIZE")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(10);
-        let max_websocket_connections = env::var("MAX_WEBSOCKET_CONNECTIONS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok());
-        let max_connections_per_ip = env::var("MAX_CONNECTIONS_PER_IP")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(100);
+        let rate_limit_requests_per_second =
+            parse_env_value::<u32>("RATE_LIMIT_REQUESTS_PER_SECOND")?.unwrap_or(60);
+        let rate_limit_burst_size = parse_env_value::<u32>("RATE_LIMIT_BURST_SIZE")?.unwrap_or(10);
+        let max_websocket_connections = parse_env_value::<usize>("MAX_WEBSOCKET_CONNECTIONS")?;
+        let max_connections_per_ip =
+            parse_env_value::<u32>("MAX_CONNECTIONS_PER_IP")?.unwrap_or(100);
 
         // Validate security configuration
         validate_security_config(
@@ -198,28 +282,18 @@ impl ServerConfig {
         )?;
 
         // Timeout configuration
-        let ws_processing_timeout_secs = env::var("WS_PROCESSING_TIMEOUT_SECS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(10);
-        let realtime_processing_timeout_secs = env::var("REALTIME_PROCESSING_TIMEOUT_SECS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(30);
+        let ws_processing_timeout_secs =
+            parse_env_value::<u64>("WS_PROCESSING_TIMEOUT_SECS")?.unwrap_or(10);
+        let realtime_processing_timeout_secs =
+            parse_env_value::<u64>("REALTIME_PROCESSING_TIMEOUT_SECS")?.unwrap_or(30);
 
         // SIP configuration limits
-        let sip_max_participants = env::var("SIP_MAX_PARTICIPANTS")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(3);
+        let sip_max_participants = parse_env_value::<u32>("SIP_MAX_PARTICIPANTS")?.unwrap_or(3);
 
         // Plugin configuration (backward compatible: enabled by default)
-        let plugins_enabled = env::var("PLUGINS_ENABLED")
-            .ok()
-            .and_then(|v| parse_bool(&v))
-            .unwrap_or(true); // Enabled by default
+        let plugins_enabled = parse_env_bool("PLUGINS_ENABLED")?.unwrap_or(true); // Enabled by default
 
-        let plugins_dir = env::var("PLUGINS_DIR").ok().map(PathBuf::from);
+        let plugins_dir = parse_env_path("PLUGINS_DIR")?;
 
         let plugins = PluginConfig {
             enabled: plugins_enabled,
@@ -229,29 +303,13 @@ impl ServerConfig {
 
         // DAG timeout configuration
         let dag_timeouts = DAGTimeoutsConfig {
-            node_execution_secs: env::var("DAG_NODE_EXECUTION_SECS")
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok())
+            node_execution_secs: parse_env_value::<u64>("DAG_NODE_EXECUTION_SECS")?.unwrap_or(30),
+            provider_operation_secs: parse_env_value::<u64>("DAG_PROVIDER_OPERATION_SECS")?
                 .unwrap_or(30),
-            provider_operation_secs: env::var("DAG_PROVIDER_OPERATION_SECS")
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(30),
-            stt_endpoint_secs: env::var("DAG_STT_ENDPOINT_SECS")
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(60),
-            tts_endpoint_secs: env::var("DAG_TTS_ENDPOINT_SECS")
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(60),
-            llm_endpoint_secs: env::var("DAG_LLM_ENDPOINT_SECS")
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(120),
-            websocket_operation_secs: env::var("DAG_WEBSOCKET_OPERATION_SECS")
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok())
+            stt_endpoint_secs: parse_env_value::<u64>("DAG_STT_ENDPOINT_SECS")?.unwrap_or(60),
+            tts_endpoint_secs: parse_env_value::<u64>("DAG_TTS_ENDPOINT_SECS")?.unwrap_or(60),
+            llm_endpoint_secs: parse_env_value::<u64>("DAG_LLM_ENDPOINT_SECS")?.unwrap_or(120),
+            websocket_operation_secs: parse_env_value::<u64>("DAG_WEBSOCKET_OPERATION_SECS")?
                 .unwrap_or(30),
         };
 
@@ -270,6 +328,15 @@ impl ServerConfig {
             azure_speech_region,
             cartesia_api_key,
             openai_api_key,
+            azure_openai_api_key,
+            azure_openai_endpoint,
+            grok_api_key,
+            inworld_api_key,
+            gemini_api_key,
+            ultravox_api_key,
+            speechmatics_api_key,
+            yandex_api_key,
+            yandex_folder_id,
             assemblyai_api_key,
             hume_api_key,
             lmnt_api_key,
@@ -312,8 +379,47 @@ impl ServerConfig {
             sip_max_participants,
             plugins,
             dag_timeouts,
+            realtime_endpoint_overrides,
+            // Aliases are config.yaml-only (no env spelling for a whole {stt,tts,llm}
+            // bundle); the env-only path starts with an empty registry.
+            aliases: crate::core::alias::AliasConfig::default(),
         })
     }
+}
+
+/// Provider-name → env-var pairs for the SERVER-SIDE realtime upstream URL
+/// overrides. The provider names are the canonical realtime provider ids (the
+/// keys looked up by the realtime handler).
+pub(crate) const REALTIME_ENDPOINT_OVERRIDE_ENVS: &[(&str, &str)] = &[
+    ("openai", "OPENAI_REALTIME_URL"),
+    ("azure", "AZURE_REALTIME_URL"),
+    ("grok", "GROK_REALTIME_URL"),
+    ("inworld", "INWORLD_REALTIME_URL"),
+    ("deepgram", "DEEPGRAM_REALTIME_URL"),
+    ("elevenlabs", "ELEVENLABS_REALTIME_URL"),
+    ("gemini", "GEMINI_REALTIME_URL"),
+    ("ultravox", "ULTRAVOX_REALTIME_URL"),
+    ("hume", "HUME_REALTIME_URL"),
+    ("speechmatics", "SPEECHMATICS_REALTIME_URL"),
+    ("yandex", "YANDEX_REALTIME_URL"),
+];
+
+/// Read the `<PROVIDER>_REALTIME_URL` env vars into the provider-keyed override
+/// map. Only NON-EMPTY values are stored (an empty/unset var = no override, so
+/// the provider keeps its default host). The value is used verbatim by the
+/// provider's `connect_spec` (which itself ignores anything that is not a
+/// `ws://`/`wss://` url), so no scheme validation is needed here.
+pub(crate) fn read_realtime_endpoint_overrides() -> std::collections::HashMap<String, String> {
+    REALTIME_ENDPOINT_OVERRIDE_ENVS
+        .iter()
+        .filter_map(|(provider, var)| {
+            env::var(var)
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .map(|v| (provider.to_string(), v))
+        })
+        .collect()
 }
 
 /// Parse SIP configuration from environment variables
@@ -422,7 +528,25 @@ mod tests {
             env::remove_var("AUTH_API_SECRETS_JSON");
             env::remove_var("AUTH_API_SECRET");
             env::remove_var("AUTH_API_SECRET_ID");
+            env::remove_var("CACHE_PATH");
+            env::remove_var("GNANI_CERTIFICATE_PATH");
+            env::remove_var("PLUGINS_DIR");
             env::remove_var("AUTH_TIMEOUT_SECONDS");
+            env::remove_var("CACHE_TTL_SECONDS");
+            env::remove_var("RATE_LIMIT_REQUESTS_PER_SECOND");
+            env::remove_var("RATE_LIMIT_BURST_SIZE");
+            env::remove_var("MAX_WEBSOCKET_CONNECTIONS");
+            env::remove_var("MAX_CONNECTIONS_PER_IP");
+            env::remove_var("WS_PROCESSING_TIMEOUT_SECS");
+            env::remove_var("REALTIME_PROCESSING_TIMEOUT_SECS");
+            env::remove_var("SIP_MAX_PARTICIPANTS");
+            env::remove_var("PLUGINS_ENABLED");
+            env::remove_var("DAG_NODE_EXECUTION_SECS");
+            env::remove_var("DAG_PROVIDER_OPERATION_SECS");
+            env::remove_var("DAG_STT_ENDPOINT_SECS");
+            env::remove_var("DAG_TTS_ENDPOINT_SECS");
+            env::remove_var("DAG_LLM_ENDPOINT_SECS");
+            env::remove_var("DAG_WEBSOCKET_OPERATION_SECS");
             env::remove_var("HOST");
             env::remove_var("PORT");
             env::remove_var("TLS_ENABLED");
@@ -433,6 +557,131 @@ mod tests {
             env::remove_var("SIP_HOOKS_JSON");
             env::remove_var("SIP_HOOK_SECRET");
             env::remove_var("RECORDING_S3_PREFIX");
+        }
+    }
+
+    /// `from_env` is the LIVE entrypoint (no `--config`). An exported-but-empty
+    /// credential env var (`HUME_API_KEY=""`) must resolve to `None`, not
+    /// `Some("")` — otherwise the realtime handler's `Some(_)` missing-key guard
+    /// passes and it dials the provider (observed live: Hume 429) instead of
+    /// returning a clean "API key not configured" error (review: empty-key nit).
+    #[test]
+    #[serial]
+    fn test_from_env_empty_credential_resolves_to_none() {
+        cleanup_env_vars();
+        unsafe {
+            env::remove_var("HUME_API_KEY");
+            env::remove_var("OPENAI_API_KEY");
+            env::set_var("HUME_API_KEY", "");
+            env::set_var("OPENAI_API_KEY", "   "); // whitespace-only
+        }
+        let config = ServerConfig::from_env().expect("from_env");
+        assert_eq!(config.hume_api_key, None, "empty env credential ⇒ None");
+        assert_eq!(
+            config.openai_api_key, None,
+            "whitespace-only env credential ⇒ None"
+        );
+
+        // A real key still survives (no over-eager nulling).
+        unsafe {
+            env::set_var("HUME_API_KEY", "hk-real");
+        }
+        let config = ServerConfig::from_env().expect("from_env");
+        assert_eq!(config.hume_api_key, Some("hk-real".to_string()));
+
+        unsafe {
+            env::remove_var("HUME_API_KEY");
+            env::remove_var("OPENAI_API_KEY");
+        }
+        cleanup_env_vars();
+    }
+
+    #[test]
+    #[serial]
+    fn test_from_env_empty_optional_path_values_resolve_to_none() {
+        cleanup_env_vars();
+        unsafe {
+            env::set_var("CACHE_PATH", "");
+            env::set_var("GNANI_CERTIFICATE_PATH", "   ");
+            env::set_var("AUTH_SIGNING_KEY_PATH", "");
+            env::set_var("PLUGINS_DIR", "   ");
+        }
+
+        let config = ServerConfig::from_env().expect("from_env");
+        assert_eq!(config.cache_path, None, "empty CACHE_PATH must be unset");
+        assert_eq!(
+            config.gnani_certificate_path, None,
+            "whitespace GNANI_CERTIFICATE_PATH must be unset"
+        );
+        assert_eq!(
+            config.auth_signing_key_path, None,
+            "empty AUTH_SIGNING_KEY_PATH must be unset"
+        );
+        assert_eq!(
+            config.plugins.plugin_dir, None,
+            "whitespace PLUGINS_DIR must be unset"
+        );
+
+        cleanup_env_vars();
+    }
+
+    #[test]
+    #[serial]
+    fn test_from_env_empty_auth_service_url_resolves_to_none() {
+        cleanup_env_vars();
+        unsafe {
+            env::set_var("AUTH_SERVICE_URL", "   ");
+        }
+
+        let config = ServerConfig::from_env().expect("from_env");
+        assert_eq!(
+            config.auth_service_url, None,
+            "whitespace AUTH_SERVICE_URL must be unset"
+        );
+
+        cleanup_env_vars();
+    }
+
+    /// `read_realtime_endpoint_overrides` maps each `<PROVIDER>_REALTIME_URL` env
+    /// var to its CANONICAL provider key, stores only non-empty values, and is
+    /// empty when nothing is set.
+    #[test]
+    #[serial]
+    fn test_realtime_endpoint_overrides_from_env() {
+        // Clean slate.
+        unsafe {
+            for (_, var) in REALTIME_ENDPOINT_OVERRIDE_ENVS {
+                env::remove_var(var);
+            }
+        }
+        assert!(
+            read_realtime_endpoint_overrides().is_empty(),
+            "no env vars set ⇒ empty map"
+        );
+
+        unsafe {
+            env::set_var("OPENAI_REALTIME_URL", "ws://127.0.0.1:9001/x");
+            env::set_var("GEMINI_REALTIME_URL", "wss://proxy.example/gem");
+            // Blank value must be ignored (treated as unset).
+            env::set_var("DEEPGRAM_REALTIME_URL", "   ");
+        }
+        let map = read_realtime_endpoint_overrides();
+        assert_eq!(
+            map.get("openai").map(String::as_str),
+            Some("ws://127.0.0.1:9001/x")
+        );
+        assert_eq!(
+            map.get("gemini").map(String::as_str),
+            Some("wss://proxy.example/gem")
+        );
+        assert!(map.get("deepgram").is_none(), "blank value ⇒ no override");
+        assert!(map.get("hume").is_none(), "unset ⇒ no override");
+        assert_eq!(map.len(), 2);
+
+        unsafe {
+            for (_, var) in REALTIME_ENDPOINT_OVERRIDE_ENVS {
+                env::remove_var(var);
+            }
         }
     }
 
@@ -510,6 +759,43 @@ mod tests {
         }
         let config = ServerConfig::from_env().expect("Should load config");
         assert!(!config.auth_required);
+
+        cleanup_env_vars();
+    }
+
+    #[test]
+    #[serial]
+    fn test_from_env_invalid_bool_env_fails() {
+        cleanup_env_vars();
+
+        unsafe {
+            env::set_var("AUTH_REQUIRED", "maybe");
+        }
+
+        let result = ServerConfig::from_env();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("AUTH_REQUIRED"));
+
+        cleanup_env_vars();
+    }
+
+    #[test]
+    #[serial]
+    fn test_from_env_invalid_numeric_env_fails() {
+        cleanup_env_vars();
+
+        unsafe {
+            env::set_var("RATE_LIMIT_REQUESTS_PER_SECOND", "many");
+        }
+
+        let result = ServerConfig::from_env();
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("RATE_LIMIT_REQUESTS_PER_SECOND")
+        );
 
         cleanup_env_vars();
     }

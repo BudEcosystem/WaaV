@@ -12,6 +12,15 @@ use super::{
     MIN_TEMPERATURE,
 };
 
+fn validate_playht_tts_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 // =============================================================================
 // Voice Engine / Model
 // =============================================================================
@@ -350,6 +359,10 @@ pub struct PlayHtTtsConfig {
     /// ISO 639-1 language code (Play3.0-mini only)
     pub language: Option<String>,
 
+    /// Emotion / delivery style label (e.g. "female_happy"). Play.ht supports this only on the
+    /// Play3.0-mini, PlayHT2.0 and PlayHT2.0-turbo engines (not PlayDialog).
+    pub emotion: Option<String>,
+
     /// Text adherence control (Play3.0, PlayHT2.0)
     pub text_guidance: Option<f32>,
 
@@ -374,8 +387,15 @@ pub struct PlayHtTtsConfig {
     /// Voice conditioning seconds (PlayDialog)
     pub voice_conditioning_seconds: Option<f32>,
 
+    /// Second-speaker voice conditioning seconds (PlayDialog only): conditioning duration for the
+    /// secondary `voice_2`, trading similarity-to-clone against model stability/expressiveness.
+    pub voice_conditioning_seconds_2: Option<f32>,
+
     /// Number of candidates for ranking (PlayDialog)
     pub num_candidates: Option<u32>,
+
+    /// Test/e2e hook: override base URL (scheme+host) for the synth/connect REST endpoint.
+    pub endpoint_override: Option<String>,
 }
 
 impl PlayHtTtsConfig {
@@ -388,6 +408,58 @@ impl PlayHtTtsConfig {
     ///
     /// * `base` - Base TTS configuration
     /// * `user_id` - Play.ht user ID for authentication
+    /// Build from the standardized config (TTS W1 keystone). Mirrors the flat-factory entry point
+    /// but unlocks the typed [`TtsFeatures`] surface. Play.ht's `user_id` is not a standard field,
+    /// so (like IBM Watson's `instance_id`) it is read from the `provider_extras` passthrough.
+    ///
+    /// Mapped: `speed` → speed (clamped), `style` → `style_guidance`, `language` → language,
+    /// `seed` → seed, `sample_rate` → sample_rate, `emotion` → emotion (Play.ht's delivery-style
+    /// label, e.g. "female_happy"). The non-standard `voice_conditioning_seconds_2` (PlayDialog
+    /// second-speaker conditioning) rides the `extras` passthrough. Features with no real Play.ht
+    /// field (pitch, volume, stability, similarity_boost, use_speaker_boost, instructions,
+    /// ssml, word_timestamps, streaming) are skipped as capability gaps.
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> Self {
+        let f = &std.features;
+        let user_id = std
+            .extras
+            .0
+            .get("user_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        let mut cfg = Self::from_base(std.base.clone(), user_id);
+        if let Some(s) = f.speed {
+            cfg.speed = s.clamp(MIN_SPEED, MAX_SPEED);
+        }
+        if let Some(s) = f.style {
+            cfg.style_guidance = Some(s);
+        }
+        if let Some(l) = &f.language {
+            cfg.language = Some(l.clone());
+        }
+        if let Some(s) = f.seed {
+            cfg.seed = Some(s as i64);
+        }
+        if let Some(r) = f.sample_rate {
+            cfg.sample_rate = r;
+        }
+        if let Some(e) = &f.emotion {
+            cfg.emotion = Some(e.clone());
+        }
+        // `voice_conditioning_seconds_2` is a non-standard PlayDialog-only knob with no canonical
+        // TtsFeatures field, so it rides the open `extras` passthrough.
+        if let Some(vcs2) = std
+            .extras
+            .0
+            .get("voice_conditioning_seconds_2")
+            .and_then(|v| v.as_f64())
+        {
+            cfg.voice_conditioning_seconds_2 = Some(vcs2 as f32);
+        }
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
+        cfg
+    }
+
     pub fn from_base(base: TTSConfig, user_id: String) -> Self {
         let output_format = base
             .audio_format
@@ -418,6 +490,7 @@ impl PlayHtTtsConfig {
             temperature: None,
             seed: None,
             language: None,
+            emotion: None,
             text_guidance: None,
             voice_guidance: None,
             style_guidance: None,
@@ -426,7 +499,9 @@ impl PlayHtTtsConfig {
             turn_prefix: None,
             turn_prefix_2: None,
             voice_conditioning_seconds: None,
+            voice_conditioning_seconds_2: None,
             num_candidates: None,
+            endpoint_override: None,
         }
     }
 
@@ -641,6 +716,10 @@ impl PlayHtTtsConfig {
             ));
         }
 
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_playht_tts_endpoint("endpoint_override", endpoint)?;
+        }
+
         Ok(())
     }
 
@@ -652,6 +731,7 @@ impl PlayHtTtsConfig {
             && self.temperature.is_none()
             && self.seed.is_none()
             && self.language.is_none()
+            && self.emotion.is_none()
             && self.text_guidance.is_none()
             && self.voice_guidance.is_none()
             && self.style_guidance.is_none()
@@ -675,6 +755,89 @@ impl Default for PlayHtTtsConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // TTS W1 keystone: standardized features unlock Play.ht's speed/style/language/seed/sample_rate
+    // surface, and the `user_id` (non-standard) flows through the provider_extras passthrough.
+    #[test]
+    fn from_standard_maps_features_and_extras() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("user_id".into(), serde_json::json!("user-123"));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "playht".into(),
+                voice_id: Some("s3://test-voice/manifest.json".into()),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(1.4),
+                style: Some(0.6),
+                language: Some("en".into()),
+                seed: Some(42),
+                sample_rate: Some(24000),
+                ..Default::default()
+            },
+            extras: crate::core::stt::standard::ProviderExtras(extras),
+        };
+        let cfg = PlayHtTtsConfig::from_standard(&std);
+        assert!((cfg.speed - 1.4).abs() < 0.001);
+        assert_eq!(cfg.style_guidance, Some(0.6));
+        assert_eq!(cfg.language, Some("en".to_string()));
+        assert_eq!(cfg.seed, Some(42));
+        assert_eq!(cfg.sample_rate, 24000);
+        assert_eq!(cfg.user_id, "user-123"); // from provider_extras passthrough
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = PlayHtTtsConfig::from_base(
+            TTSConfig {
+                provider: "playht".into(),
+                api_key: "k".into(),
+                voice_id: Some("s3://test-voice/manifest.json".into()),
+                ..Default::default()
+            },
+            "user-123".to_string(),
+        );
+
+        config.endpoint_override = Some("https://playht-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.contains("SSRF protection"));
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("file endpoint_override must be rejected");
+        assert!(err.contains("URL scheme"));
+
+        config.endpoint_override = Some("ws://playht-proxy.example.com".to_string());
+        let err = config
+            .validate()
+            .expect_err("WebSocket endpoint_override must be rejected for REST PlayHT");
+        assert!(err.contains("URL scheme"));
+
+        let mut extras = serde_json::Map::new();
+        extras.insert("user_id".into(), serde_json::json!("user-123"));
+        let std = crate::core::tts::standard::StandardTTSConfig {
+            base: TTSConfig {
+                provider: "playht".into(),
+                api_key: "k".into(),
+                voice_id: Some("s3://test-voice/manifest.json".into()),
+                ..Default::default()
+            },
+            features: Default::default(),
+            extras: crate::core::stt::standard::ProviderExtras(extras),
+        }
+        .with_endpoint_override("file:///tmp/socket");
+        let cfg = PlayHtTtsConfig::from_standard(&std);
+        assert!(cfg.validate().is_err());
+    }
 
     // =========================================================================
     // PlayHtModel Tests

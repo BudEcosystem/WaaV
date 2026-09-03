@@ -5,6 +5,15 @@
 use crate::core::stt::base::{STTConfig, STTError};
 use serde::{Deserialize, Serialize};
 
+fn validate_huawei_stt_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -450,6 +459,32 @@ pub struct HuaweiCloudSttConfig {
     /// Include word-level timing information.
     pub need_word_info: bool,
 
+    /// Emit interim (partial) recognition results (Huawei SIS RASR `interim_results`).
+    /// Default `true` (Huawei's streaming default).
+    #[serde(default = "huawei_default_interim_results")]
+    pub interim_results: bool,
+
+    /// Initial-silence VAD: max leading silence (ms) before the recognizer gives up waiting for
+    /// speech (Huawei SIS RASR `vad_head`, valid 0–60000). `None` = provider default.
+    #[serde(default)]
+    pub vad_head: Option<u32>,
+
+    /// Tail-silence VAD endpointing: trailing silence (ms) after speech that finalizes the
+    /// utterance (Huawei SIS RASR `vad_tail`, valid 0–3000). `None` = provider default.
+    #[serde(default)]
+    pub vad_tail: Option<u32>,
+
+    /// Maximum utterance/sentence audio duration in seconds (Huawei SIS RASR `max_seconds`,
+    /// valid 1–60). `None` = provider default.
+    #[serde(default)]
+    pub max_seconds: Option<u32>,
+
+    /// Endpoint override (scheme+host) for the credential-free mock harness. When `Some(base)`, both
+    /// the IAM token POST and the ASR (WS/REST) connection are redirected to `base`, keeping the
+    /// original path+query (via `override_rest_endpoint`). `None` = production endpoints.
+    #[serde(default)]
+    pub endpoint_override: Option<String>,
+
     /// Cached IAM token.
     #[serde(skip)]
     pub token: Option<String>,
@@ -474,10 +509,20 @@ impl Default for HuaweiCloudSttConfig {
             digit_norm: true,
             vocabulary_id: None,
             need_word_info: false,
+            interim_results: huawei_default_interim_results(),
+            vad_head: None,
+            vad_tail: None,
+            max_seconds: None,
+            endpoint_override: None,
             token: None,
             token_expires_at: None,
         }
     }
+}
+
+/// Huawei SIS streaming defaults interim (partial) results on.
+fn huawei_default_interim_results() -> bool {
+    true
 }
 
 impl HuaweiCloudSttConfig {
@@ -610,6 +655,11 @@ impl HuaweiCloudSttConfig {
             )));
         }
 
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_huawei_stt_endpoint("endpoint_override", endpoint)
+                .map_err(STTError::ConfigurationError)?;
+        }
+
         Ok(())
     }
 
@@ -624,22 +674,44 @@ impl HuaweiCloudSttConfig {
     }
 
     /// Get the short sentence recognition URL.
+    ///
+    /// Honors `endpoint_override` (scheme+host) when set, keeping the SIS REST path so the
+    /// credential-free mock harness can redirect the POST without losing the served path.
     pub fn get_short_asr_url(&self) -> String {
-        format!(
+        let url = format!(
             "{}{}",
             self.get_https_endpoint(),
             SHORT_ASR_PATH.replace("{project_id}", &self.project_id)
-        )
+        );
+        crate::core::tts::standard::override_rest_endpoint(&url, self.endpoint_override.as_deref())
     }
 
     /// Get the WebSocket URL for real-time recognition.
+    ///
+    /// Honors `endpoint_override` (scheme+host) when set, keeping the SIS RASR WS path so the
+    /// credential-free mock harness can redirect the handshake to a localhost mock (e.g. an
+    /// override base of `ws://127.0.0.1:PORT`) without losing the served path.
     pub fn get_realtime_url(&self) -> Option<String> {
         self.mode.ws_path().map(|path| {
-            format!(
+            let url = format!(
                 "{}{}",
                 self.get_wss_endpoint(),
                 path.replace("{project_id}", &self.project_id)
-            )
+            );
+            let swapped = crate::core::tts::standard::override_rest_endpoint(
+                &url,
+                self.endpoint_override.as_deref(),
+            );
+            // The override base is `http(s)://` (reqwest needs it for the IAM token POST), but the
+            // ASR dial is a WebSocket — normalize the scheme back to `ws(s)://` so `connect_async`
+            // accepts it (same host:port the mock's axum server listens on).
+            if let Some(rest) = swapped.strip_prefix("http://") {
+                format!("ws://{rest}")
+            } else if let Some(rest) = swapped.strip_prefix("https://") {
+                format!("wss://{rest}")
+            } else {
+                swapped
+            }
         })
     }
 
@@ -704,8 +776,7 @@ impl HuaweiCloudSttConfig {
         // Parse region from model string suffix (e.g., "chinese_16k_general@cn-north-4")
         let (model_str, region) = if config.model.contains('@') {
             let model_parts: Vec<&str> = config.model.splitn(2, '@').collect();
-            let region =
-                HuaweiCloudRegion::from_str(model_parts[1]).unwrap_or(HuaweiCloudRegion::default());
+            let region = HuaweiCloudRegion::from_str(model_parts[1]).unwrap_or_default();
             (model_parts[0], region)
         } else {
             (config.model.as_str(), HuaweiCloudRegion::default())
@@ -728,6 +799,50 @@ impl HuaweiCloudSttConfig {
 
         huawei_config.validate()?;
         Ok(huawei_config)
+    }
+
+    /// Build from the standardized config (W1 keystone). Huawei Cloud SIS RASR exposes a set of
+    /// recognition knobs this maps from the standardized vocabulary:
+    /// - word-level timing → `need_word_info`
+    /// - smart formatting → `add_punctuation` (Huawei expresses formatting as auto-punctuation)
+    /// - `interim_results` (typed) → `interim_results`
+    /// - tail-silence VAD endpointing (`endpointing_ms`, canonical) → `vad_tail`
+    /// - initial-silence VAD head (extras `vad_head`) → `vad_head`
+    /// - max utterance/sentence duration (extras `max_seconds`) → `max_seconds`
+    ///
+    /// Features Huawei can't express (diarization, profanity_filter, keyterms — Huawei requires a
+    /// pre-registered vocabulary table ID rather than inline terms — redaction, entity/language
+    /// detection) are capability gaps and stay at their defaults.
+    pub fn from_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(std.base.clone())?;
+        if let Some(w) = f.word_timestamps {
+            cfg.need_word_info = w;
+        }
+        if let Some(s) = f.smart_format {
+            cfg.add_punctuation = s;
+        }
+        if let Some(i) = f.interim_results {
+            cfg.interim_results = i;
+        }
+        // Tail-silence VAD endpointing: the canonical `endpointing_ms` IS Huawei's `vad_tail`
+        // (trailing-silence finalization), both in milliseconds — no unit conversion.
+        if let Some(tail_ms) = f.endpointing_ms {
+            cfg.vad_tail = Some(tail_ms);
+        }
+        // Initial-silence VAD head (no canonical typed field) — extras passthrough, milliseconds.
+        if let Some(head) = std.extras.0.get("vad_head").and_then(|v| v.as_u64()) {
+            cfg.vad_head = Some(head as u32);
+        }
+        // Max utterance/sentence duration (no canonical typed field) — extras passthrough, seconds.
+        if let Some(max_s) = std.extras.0.get("max_seconds").and_then(|v| v.as_u64()) {
+            cfg.max_seconds = Some(max_s as u32);
+        }
+        cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
+        cfg.validate()?;
+        Ok(cfg)
     }
 }
 
@@ -808,6 +923,32 @@ pub struct HuaweiIamError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone: the standardized features unlock Huawei's recognition knobs
+    // (word-level timing + smart formatting/punctuation) — previously unreachable via the flat
+    // factory.
+    #[test]
+    fn from_standard_maps_features() {
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "huawei_cloud".into(),
+                api_key: "user|pass|domain|project123".into(),
+                model: "chinese_16k_general".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                word_timestamps: Some(true),
+                smart_format: Some(false),
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+            translation: None,
+        };
+        let cfg = HuaweiCloudSttConfig::from_standard(&std).unwrap();
+        assert!(cfg.need_word_info); // word_timestamps
+        assert!(!cfg.add_punctuation); // smart_format
+    }
 
     #[test]
     fn test_region_code() {
@@ -934,6 +1075,42 @@ mod tests {
     fn test_config_validation_valid() {
         let config = HuaweiCloudSttConfig::new("user", "pass", "domain", "project_id");
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = HuaweiCloudSttConfig::new("user", "pass", "domain", "project_id");
+        config.endpoint_override = Some("https://gateway.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:8080".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.to_string().contains("SSRF protection"));
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("file endpoint_override must be rejected");
+        assert!(err.to_string().contains("URL scheme"));
+
+        config.endpoint_override = Some("wss://gateway.example.com".to_string());
+        let err = config
+            .validate()
+            .expect_err("WebSocket endpoint_override must be rejected");
+        assert!(err.to_string().contains("URL scheme"));
+
+        let std = crate::core::stt::standard::StandardSTTConfig::from_base(STTConfig {
+            provider: "huawei_cloud".to_string(),
+            api_key: "user|pass|domain|project_id".to_string(),
+            model: "chinese_16k_general".to_string(),
+            encoding: "pcm16k16bit".to_string(),
+            ..Default::default()
+        })
+        .with_endpoint_override("file:///tmp/socket");
+        assert!(HuaweiCloudSttConfig::from_standard(&std).is_err());
     }
 
     #[test]

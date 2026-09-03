@@ -19,6 +19,12 @@ use std::fmt;
 
 use crate::core::stt::base::{STTConfig, STTError};
 
+fn validate_dashscope_stt_endpoint(source: &str, endpoint: &str) -> Result<(), STTError> {
+    crate::core::net::validate_url_for_ssrf(endpoint, &["ws", "wss"]).map_err(|e| {
+        STTError::ConfigurationError(format!("{source} rejected (SSRF protection): {e}"))
+    })
+}
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -489,17 +495,29 @@ pub struct DashScopeSttConfig {
     #[serde(default = "default_true")]
     pub punctuation: bool,
 
-    /// Context biasing text (hotwords).
-    #[serde(default)]
-    pub context_text: Option<String>,
-
-    /// Custom vocabulary ID.
+    /// Custom vocabulary ID (DashScope hotword biasing — a PRE-REGISTERED vocabulary id, set via
+    /// `extras["vocabulary_id"]`; free-text `keyterms` cannot be expressed and are a capability gap).
     #[serde(default)]
     pub vocabulary_id: Option<String>,
 
-    /// Enable word-level timestamps.
+    /// Paraformer-only: VAD multi-threshold mode, which prevents over-segmentation of long
+    /// sentences (`multi_threshold_mode_enabled` in the inference run-task `parameters`).
+    /// `None` omits the field (server default). Has no effect on Qwen realtime models.
     #[serde(default)]
-    pub word_timestamps: bool,
+    pub multi_threshold_mode_enabled: Option<bool>,
+
+    /// Qwen-realtime-only: server-VAD speech-activation threshold (0.0–1.0) sent as
+    /// `turn_detection.threshold` in the `session.update`. Higher = less sensitive (needs louder
+    /// speech to trigger). `None` falls back to the API's default sensitivity. Has no effect on
+    /// Paraformer inference models.
+    #[serde(default)]
+    pub turn_detection_threshold: Option<f32>,
+
+    /// Carried from the standardized `endpoint_override` — points the WS dial at the in-repo
+    /// mock/proxy (`ws://127.0.0.1:PORT`) instead of the production DashScope host. Swaps only
+    /// scheme://host; the `/api-ws/v1/{realtime,inference}` path (+ Qwen `?model=` query) is kept.
+    #[serde(default)]
+    pub endpoint_override: Option<String>,
 }
 
 fn default_sample_rate() -> u32 {
@@ -528,9 +546,10 @@ impl Default for DashScopeSttConfig {
             emotion_recognition: false,
             disfluency_removal: false,
             punctuation: true,
-            context_text: None,
             vocabulary_id: None,
-            word_timestamps: false,
+            multi_threshold_mode_enabled: None,
+            turn_detection_threshold: None,
+            endpoint_override: None,
         }
     }
 }
@@ -579,10 +598,71 @@ impl DashScopeSttConfig {
             emotion_recognition: false,
             disfluency_removal: false,
             punctuation: config.punctuation,
-            context_text: None,
             vocabulary_id: None,
-            word_timestamps: false,
+            multi_threshold_mode_enabled: None,
+            turn_detection_threshold: None,
+            endpoint_override: None,
         })
+    }
+
+    /// Build from the standardized config (W1 keystone). DashScope exposes a focused feature
+    /// surface, so this maps the standardized features it can actually express onto its own
+    /// fields: filler words (`disfluency_removal`, whose sense is inverted — keeping fillers means
+    /// *not* removing disfluencies), the endpointing silence window (`silence_duration_ms` ->
+    /// Paraformer `max_sentence_silence` / Qwen VAD) and automatic language detection
+    /// (`language = Auto`).
+    ///
+    /// Honest capability notes (these do NOT reach the wire, by design):
+    /// - `word_timestamps`: Paraformer real-time ALWAYS returns word-level timestamps in its result
+    ///   `words[]` — there is no enable/disable wire param, so the typed flag is informational only.
+    /// - `keyterms`: DashScope hotword biasing is keyed on a PRE-REGISTERED `vocabulary_id`, not a
+    ///   free-text phrase list, so arbitrary `keyterms` cannot be sent. Callers with a registered
+    ///   vocabulary pass its id through `extras["vocabulary_id"]` (wired to the run-task body below).
+    /// Other features DashScope can't express (diarization, smart_format, profanity_filter,
+    /// interim_results, vad_events, utterance_end, redaction, entity_detection) are capability
+    /// gaps and stay at their defaults.
+    pub fn from_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(std.base.clone())?;
+        if let Some(filler) = f.filler_words {
+            cfg.disfluency_removal = !filler;
+        }
+        if let Some(ms) = f.endpointing_ms {
+            cfg.silence_duration_ms = ms;
+        }
+        if let Some(true) = f.language_detection {
+            cfg.language = DashScopeLanguage::Auto;
+        }
+        // Provider-specific knobs forwarded through the open ProviderExtras passthrough (no canonical
+        // SttFeatures field models them). `multi_threshold_mode_enabled` is a Paraformer inference
+        // run-task parameter (prevents over-segmentation of long sentences); `vocabulary_id` is the
+        // pre-registered DashScope hotword vocabulary; `turn_detection.threshold` is the
+        // Qwen-realtime server-VAD speech-activation threshold.
+        let ex = &std.extras.0;
+        if let Some(b) = ex
+            .get("multi_threshold_mode_enabled")
+            .and_then(|v| v.as_bool())
+        {
+            cfg.multi_threshold_mode_enabled = Some(b);
+        }
+        if let Some(v) = ex
+            .get("vocabulary_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            cfg.vocabulary_id = Some(v.to_string());
+        }
+        if let Some(t) = ex
+            .get("turn_detection.threshold")
+            .or_else(|| ex.get("turn_detection_threshold"))
+            .and_then(|v| v.as_f64())
+        {
+            cfg.turn_detection_threshold = Some(t as f32);
+        }
+        cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
+        Ok(cfg)
     }
 
     /// Validate configuration.
@@ -614,6 +694,10 @@ impl DashScopeSttConfig {
                 "Audio format {} not supported by Qwen models. Use pcm16 or opus.",
                 self.audio_format
             )));
+        }
+
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_dashscope_stt_endpoint("endpoint_override", endpoint)?;
         }
 
         Ok(())
@@ -660,6 +744,42 @@ impl DashScopeSttConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone: maps the standardized features DashScope can actually express. `word_timestamps`
+    // (always-on in Paraformer results) and free-text `keyterms` (DashScope hotwords need a
+    // PRE-REGISTERED vocabulary id) are honest capability gaps — they do NOT reach the wire. The
+    // registered hotword vocabulary is set via `extras["vocabulary_id"]`, and `endpointing_ms`
+    // drives the VAD silence window.
+    #[test]
+    fn from_standard_maps_features() {
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
+        let mut extras = ProviderExtras::default();
+        extras
+            .0
+            .insert("vocabulary_id".into(), serde_json::json!("vocab-123"));
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "alibaba_cloud".into(),
+                api_key: "test-key".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                // These two are capability gaps and must NOT silently pretend to be honored:
+                word_timestamps: Some(true),
+                keyterms: Some(vec!["WaaV".into(), "DashScope".into()]),
+                filler_words: Some(false),
+                endpointing_ms: Some(1200),
+                ..Default::default()
+            },
+            extras,
+            translation: None,
+        };
+        let cfg = DashScopeSttConfig::from_standard(&std).unwrap();
+        // Honored: registered vocabulary id (extras), filler removal, and the endpointing window.
+        assert_eq!(cfg.vocabulary_id.as_deref(), Some("vocab-123"));
+        assert!(cfg.disfluency_removal); // filler_words=false -> remove disfluencies
+        assert_eq!(cfg.silence_duration_ms, 1200);
+    }
 
     #[test]
     fn test_region_urls() {
@@ -796,6 +916,53 @@ mod tests {
         let mut config = DashScopeSttConfig::default();
         config.api_key = "test_api_key".to_string();
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let previous = std::env::var_os("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
+
+        let mut config = DashScopeSttConfig {
+            api_key: "test_api_key".to_string(),
+            endpoint_override: Some("wss://dashscope-proxy.example.com".to_string()),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("ws://dashscope-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("ws://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.to_string().contains("SSRF protection"), "{err}");
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("non-WebSocket endpoint_override must be rejected");
+        assert!(err.to_string().contains("not allowed"), "{err}");
+
+        config.endpoint_override = Some("https://dashscope-proxy.example.com".to_string());
+        let err = config
+            .validate()
+            .expect_err("HTTP endpoint_override must be rejected for DashScope WebSocket dial");
+        assert!(err.to_string().contains("not allowed"), "{err}");
+
+        // SAFETY: restore the process env before releasing the test env lock.
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", previous);
+            } else {
+                std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+            }
+        }
     }
 
     #[test]

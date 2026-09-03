@@ -25,6 +25,15 @@ use crate::core::tts::base::{TTSConfig, TTSError};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+fn validate_prosa_tts_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -308,6 +317,9 @@ pub struct ProsaTtsConfig {
 
     /// Optional label for the request.
     pub label: Option<String>,
+
+    /// Optional base-URL override for the synth endpoint (mock e2e redirect).
+    pub endpoint_override: Option<String>,
 }
 
 impl Default for ProsaTtsConfig {
@@ -322,6 +334,7 @@ impl Default for ProsaTtsConfig {
             as_signed_url: false,
             request_timeout_secs: DEFAULT_REQUEST_TIMEOUT,
             label: None,
+            endpoint_override: None,
         }
     }
 }
@@ -378,7 +391,54 @@ impl ProsaTtsConfig {
             as_signed_url: false,
             request_timeout_secs,
             label: None,
+            endpoint_override: None,
         })
+    }
+
+    /// Build from the standardized TTS config (W1 keystone).
+    ///
+    /// Prosa.ai exposes a narrow prosody surface, so only `speed` (→ `tempo`, clamped to
+    /// `MIN_TEMPO..=MAX_TEMPO`) and `pitch` (→ Prosa's integer `pitch` offset, rounded and clamped
+    /// to `MIN_PITCH..=MAX_PITCH`) map to real fields. Non-standard Prosa knobs (`label`, `wait`,
+    /// `as_signed_url`) are read from the open `extras` passthrough. Voice-tone features
+    /// (volume, stability, similarity_boost, style, use_speaker_boost, emotion, instructions, SSML,
+    /// language, word_timestamps, streaming, seed, sample_rate) have no matching field and are
+    /// skipped.
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> Result<Self, TTSError> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(std.base.clone())?;
+
+        if let Some(speed) = f.speed {
+            cfg.tempo = speed.clamp(MIN_TEMPO, MAX_TEMPO);
+        }
+        if let Some(pitch) = f.pitch {
+            cfg.pitch = (pitch.round() as i32).clamp(MIN_PITCH, MAX_PITCH);
+        }
+
+        // Provider-specific passthrough.
+        if let Some(label) = std
+            .extras
+            .0
+            .get("label")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            cfg.label = Some(label.to_string());
+        }
+        if let Some(wait) = std.extras.0.get("wait").and_then(|v| v.as_bool()) {
+            cfg.wait = wait;
+        }
+        if let Some(as_signed_url) = std.extras.0.get("as_signed_url").and_then(|v| v.as_bool()) {
+            cfg.as_signed_url = as_signed_url;
+        }
+
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
+
+        cfg.validate().map_err(TTSError::InvalidConfiguration)?;
+
+        Ok(cfg)
     }
 
     /// Validate the configuration.
@@ -399,6 +459,10 @@ impl ProsaTtsConfig {
                 "Tempo must be between {} and {}, got {}",
                 MIN_TEMPO, MAX_TEMPO, self.tempo
             ));
+        }
+
+        if let Some(endpoint) = &self.endpoint_override {
+            validate_prosa_tts_endpoint("endpoint_override", endpoint)?;
         }
 
         Ok(())
@@ -635,6 +699,36 @@ impl ProsaTtsResponse {
 mod tests {
     use super::*;
 
+    // W1 keystone: the standardized features Prosa.ai can express (speed → tempo, pitch → the
+    // integer pitch offset) reach their real fields, and the non-standard label / wait /
+    // as_signed_url knobs flow through the open extras passthrough.
+    #[test]
+    fn from_standard_maps_speed_pitch_and_extras() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("label".into(), serde_json::json!("greeting"));
+        extras.insert("as_signed_url".into(), serde_json::json!(true));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "prosa-ai".into(),
+                api_key: "k".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(1.5),
+                pitch: Some(3.0),
+                ssml: Some(true), // capability gap: Prosa has no SSML, must be ignored
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+        let cfg = ProsaTtsConfig::from_standard(&std).unwrap();
+        assert!((cfg.tempo - 1.5).abs() < f32::EPSILON);
+        assert_eq!(cfg.pitch, 3);
+        assert_eq!(cfg.label, Some("greeting".to_string())); // extras passthrough
+        assert!(cfg.as_signed_url);
+    }
+
     #[test]
     fn test_voice_model_ids() {
         assert_eq!(ProsaTtsVoice::DimasFormal.model_id(), "tts-dimas-formal");
@@ -796,6 +890,30 @@ mod tests {
         let mut config = ProsaTtsConfig::default();
         config.api_key = "test_key".to_string();
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = ProsaTtsConfig {
+            api_key: "test_key".to_string(),
+            ..Default::default()
+        };
+
+        config.endpoint_override = Some("https://prosa-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.contains("SSRF protection"), "{err}");
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("non-HTTP endpoint_override must be rejected");
+        assert!(err.contains("SSRF protection"), "{err}");
     }
 
     #[test]

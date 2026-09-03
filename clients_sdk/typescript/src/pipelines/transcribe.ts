@@ -211,7 +211,7 @@ export class BudTranscribe extends BasePipeline {
     }
 
     // Flush and wait for final results
-    this.session.flush();
+    this.session.audioEnd();
 
     // Wait a bit for final transcripts
     await new Promise((r) => setTimeout(r, 1000));
@@ -263,7 +263,7 @@ export class BudTranscribe extends BasePipeline {
       language: this.sttConfig.language,
       durationSeconds,
       processingTimeMs,
-      words: this.words.length > 0 ? this.words : undefined,
+      words: this.normalizedWords(),
     };
 
     // Group by speaker if diarization was enabled
@@ -382,7 +382,7 @@ export class BudTranscribe extends BasePipeline {
       }
 
       // Flush and wait for final results
-      this.session.flush();
+      this.session.audioEnd();
       await new Promise((r) => setTimeout(r, 1000));
 
       const durationSeconds = totalSamples / 16000;
@@ -399,7 +399,7 @@ export class BudTranscribe extends BasePipeline {
         language: this.sttConfig.language,
         durationSeconds,
         processingTimeMs,
-        words: this.words.length > 0 ? this.words : undefined,
+        words: this.normalizedWords(),
       };
     } finally {
       if (unsubscribe) {
@@ -416,13 +416,29 @@ export class BudTranscribe extends BasePipeline {
   }
 
   /**
+   * Coerce the accumulated word list into the public WordTiming shape
+   * (confidence is required there; default missing values to 0).
+   * Returns undefined when no word-level data was collected.
+   */
+  private normalizedWords(): TranscriptionResult['words'] {
+    if (this.words.length === 0) return undefined;
+    return this.words.map((w) => ({
+      word: w.word,
+      start: w.start,
+      end: w.end,
+      confidence: w.confidence ?? 0,
+      ...(w.speakerId !== undefined ? { speakerId: w.speakerId } : {}),
+    }));
+  }
+
+  /**
    * Cancel current transcription
    */
   cancelTranscription(): void {
     if (!this.isTranscribing) return;
 
     this.isTranscribing = false;
-    this.session.stop();
+    this.session.clear();
 
     if (this.rejectTranscription) {
       this.rejectTranscription(new Error('Transcription cancelled'));

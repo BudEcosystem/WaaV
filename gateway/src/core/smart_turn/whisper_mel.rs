@@ -456,7 +456,7 @@ mod tests {
         let mel_spec = extractor.compute(&audio).expect("compute should succeed");
 
         assert_eq!(mel_spec.len(), N_MELS);
-        assert!(mel_spec[0].len() > 0);
+        assert!(!mel_spec[0].is_empty());
 
         // All values should be finite
         for mel_band in &mel_spec {

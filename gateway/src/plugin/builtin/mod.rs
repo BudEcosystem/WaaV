@@ -18,10 +18,25 @@
 //!   Tinkoff, SberDevices, Bhashini, iFlytek, Alibaba Cloud, Baidu, Tencent,
 //!   Huawei Cloud, NAVER CLOVA, Zalo AI, FPT.AI, Viettel AI, Prosa.ai, NECTEC
 //!
-//! ## Realtime Providers (2)
-//! - OpenAI, Hume EVI
+//! ## Realtime Providers (12)
+//! - OpenAI, Hume EVI, Azure OpenAI, Grok/xAI, Inworld, Deepgram Voice Agent,
+//!   ElevenLabs Conversational AI, Google Gemini Live, Ultravox, AWS Nova Sonic
+//!   (Azure/Grok/Inworld are OpenAI-protocol clones reusing the GA wire;
+//!   Deepgram Voice Agent is speech-to-speech with raw linear16 binary frames;
+//!   ElevenLabs Conversational AI is speech-to-speech with base64+JSON frames;
+//!   Gemini Live is speech-to-speech with base64+JSON, MULTI-FRAME serverContent
+//!   parts + session resumption;
+//!   Ultravox is speech-to-speech with raw-PCM binary frames + a RestThenWebSocket
+//!   connect handshake;
+//!   AWS Nova Sonic is speech-to-speech with base64-PCM+JSON events over an Amazon
+//!   Bedrock bidirectional HTTP/2 stream — the first BedrockBidi provider, AWS
+//!   SigV4 via aws-config, NO api-key.)
 
-use crate::core::realtime::{BaseRealtime, HumeEVI, OpenAIRealtime, RealtimeConfig, RealtimeError};
+use crate::core::realtime::{
+    AzureRealtime, BaseRealtime, DeepgramRealtime, ElevenLabsRealtime, GeminiRealtime,
+    GrokRealtime, HumeEVI, InworldRealtime, NovaSonicRealtime, OpenAIRealtime, RealtimeConfig,
+    RealtimeError, SpeechmaticsRealtime, UltravoxRealtime, YandexRealtime,
+};
 use crate::core::stt::{
     AmiVoiceSTT, AssemblyAISTT, AwsTranscribeSTT, AzureSTT, BaiduStt, BaseSTT, BhashiniStt,
     CartesiaSTT, DashScopeStt, DeepgramSTT, ElevenLabsSTT, FptStt, GladiaSTT, GnaniSTT, GoogleSTT,
@@ -1266,6 +1281,107 @@ fn hume_evi_realtime_metadata() -> ProviderMetadata {
         .with_features(["full-duplex", "emotion-analysis", "prosody-scores"])
 }
 
+fn azure_realtime_metadata() -> ProviderMetadata {
+    ProviderMetadata::realtime("azure", "Azure OpenAI Realtime")
+        .with_description(
+            "Azure OpenAI Realtime — OpenAI GA wire on the Azure endpoint (api-key auth)",
+        )
+        .with_aliases(["azure-openai", "azure_openai"])
+        .with_features(["full-duplex", "function-calling", "turn-detection"])
+}
+
+fn grok_realtime_metadata() -> ProviderMetadata {
+    ProviderMetadata::realtime("grok", "Grok / xAI Realtime")
+        .with_description("xAI Grok Realtime — OpenAI GA-compatible wire (endpoint best-known)")
+        .with_alias("xai")
+        .with_features(["full-duplex", "function-calling", "turn-detection"])
+}
+
+fn inworld_realtime_metadata() -> ProviderMetadata {
+    ProviderMetadata::realtime("inworld", "Inworld Realtime")
+        .with_description("Inworld Realtime — OpenAI GA wire (endpoint best-known)")
+        .with_features(["full-duplex", "function-calling", "turn-detection"])
+}
+
+fn deepgram_realtime_metadata() -> ProviderMetadata {
+    ProviderMetadata::realtime("deepgram", "Deepgram Voice Agent")
+        .with_description(
+            "Deepgram Voice Agent — speech-to-speech (raw linear16 binary frames; server VAD)",
+        )
+        .with_aliases(["deepgram-agent", "deepgram_voice_agent"])
+        .with_features([
+            "full-duplex",
+            "function-calling",
+            "turn-detection",
+            "barge-in",
+        ])
+}
+
+fn elevenlabs_realtime_metadata() -> ProviderMetadata {
+    ProviderMetadata::realtime("elevenlabs", "ElevenLabs Conversational AI")
+        .with_description(
+            "ElevenLabs Conversational AI — speech-to-speech (base64+JSON, pcm_16000; pre-created agent; server VAD)",
+        )
+        .with_aliases(["elevenlabs-convai", "11labs"])
+        .with_features(["full-duplex", "function-calling", "turn-detection", "barge-in"])
+}
+
+fn gemini_realtime_metadata() -> ProviderMetadata {
+    ProviderMetadata::realtime("gemini", "Google Gemini Live")
+        .with_description(
+            "Google Gemini Live (BidiGenerateContent) — speech-to-speech (base64+JSON, 16k in / 24k out; MULTI-FRAME serverContent; session resumption; server VAD)",
+        )
+        .with_models(["gemini-2.0-flash-live-001"])
+        .with_aliases(["gemini-live", "google"])
+        .with_features([
+            "full-duplex",
+            "function-calling",
+            "turn-detection",
+            "barge-in",
+            "session-resumption",
+        ])
+}
+
+fn ultravox_realtime_metadata() -> ProviderMetadata {
+    ProviderMetadata::realtime("ultravox", "Ultravox Realtime")
+        .with_description(
+            "Ultravox — hosted speech-to-speech model API (RAW PCM binary, 16k in / 24k out; RestThenWebSocket: a REST create-call mints a pre-authed joinUrl; server VAD)",
+        )
+        .with_models(["fixie-ai/ultravox"])
+        .with_aliases(["fixie"])
+        .with_features(["full-duplex", "function-calling", "turn-detection", "barge-in"])
+}
+
+fn nova_sonic_realtime_metadata() -> ProviderMetadata {
+    ProviderMetadata::realtime("nova_sonic", "AWS Nova Sonic")
+        .with_description(
+            "AWS Nova Sonic — Amazon's speech-to-speech model (base64-PCM + JSON events, 16k in / 24k out; BedrockBidi: an Amazon Bedrock InvokeModelWithBidirectionalStream HTTP/2 event stream; AWS SigV4 via aws-config, NO api-key; server VAD)",
+        )
+        .with_models(["amazon.nova-sonic-v1:0"])
+        .with_aliases(["nova-sonic", "aws"])
+        .with_features(["full-duplex", "function-calling", "turn-detection", "barge-in"])
+}
+
+fn speechmatics_realtime_metadata() -> ProviderMetadata {
+    ProviderMetadata::realtime("speechmatics", "Speechmatics Flow")
+        .with_description(
+            "Speechmatics Flow (Voice AI) — conversational speech-to-speech on Speechmatics' streaming STT (RAW PCM binary audio both ways + JSON control, 16k; template-driven agents; auth Authorization: Bearer <JWT/temp-token>; server VAD)",
+        )
+        .with_models(["default", "flow-service-assistant-amelia"])
+        .with_aliases(["flow"])
+        .with_features(["full-duplex", "function-calling", "turn-detection", "barge-in"])
+}
+
+fn yandex_realtime_metadata() -> ProviderMetadata {
+    ProviderMetadata::realtime("yandex", "Yandex Cloud AI Studio Realtime")
+        .with_description(
+            "Yandex Cloud AI Studio Realtime — OpenAI-protocol clone (GA wire reused by delegation, base64-PCM in JSON both ways; wss://ai.api.cloud.yandex.net/v1/realtime?model=gpt://<folder>/speech-realtime-250923; auth Authorization: Bearer <IAM-token/static-API-key>; folder id required; server VAD)",
+        )
+        .with_models(["speech-realtime-250923"])
+        .with_aliases(["yandexgpt", "yandex-cloud"])
+        .with_features(["full-duplex", "function-calling", "turn-detection", "barge-in"])
+}
+
 // ============================================================================
 // STT Factory Functions
 // ============================================================================
@@ -1562,6 +1678,56 @@ fn create_hume_evi_realtime(
     config: RealtimeConfig,
 ) -> Result<Box<dyn BaseRealtime>, RealtimeError> {
     Ok(Box::new(HumeEVI::new(config)?))
+}
+
+fn create_azure_realtime(config: RealtimeConfig) -> Result<Box<dyn BaseRealtime>, RealtimeError> {
+    Ok(Box::new(AzureRealtime::new(config)?))
+}
+
+fn create_grok_realtime(config: RealtimeConfig) -> Result<Box<dyn BaseRealtime>, RealtimeError> {
+    Ok(Box::new(GrokRealtime::new(config)?))
+}
+
+fn create_inworld_realtime(config: RealtimeConfig) -> Result<Box<dyn BaseRealtime>, RealtimeError> {
+    Ok(Box::new(InworldRealtime::new(config)?))
+}
+
+fn create_deepgram_realtime(
+    config: RealtimeConfig,
+) -> Result<Box<dyn BaseRealtime>, RealtimeError> {
+    Ok(Box::new(DeepgramRealtime::new(config)?))
+}
+
+fn create_elevenlabs_realtime(
+    config: RealtimeConfig,
+) -> Result<Box<dyn BaseRealtime>, RealtimeError> {
+    Ok(Box::new(ElevenLabsRealtime::new(config)?))
+}
+
+fn create_gemini_realtime(config: RealtimeConfig) -> Result<Box<dyn BaseRealtime>, RealtimeError> {
+    Ok(Box::new(GeminiRealtime::new(config)?))
+}
+
+fn create_ultravox_realtime(
+    config: RealtimeConfig,
+) -> Result<Box<dyn BaseRealtime>, RealtimeError> {
+    Ok(Box::new(UltravoxRealtime::new(config)?))
+}
+
+fn create_nova_sonic_realtime(
+    config: RealtimeConfig,
+) -> Result<Box<dyn BaseRealtime>, RealtimeError> {
+    Ok(Box::new(NovaSonicRealtime::new(config)?))
+}
+
+fn create_speechmatics_realtime(
+    config: RealtimeConfig,
+) -> Result<Box<dyn BaseRealtime>, RealtimeError> {
+    Ok(Box::new(SpeechmaticsRealtime::new(config)?))
+}
+
+fn create_yandex_realtime(config: RealtimeConfig) -> Result<Box<dyn BaseRealtime>, RealtimeError> {
+    Ok(Box::new(YandexRealtime::new(config)?))
 }
 
 // ============================================================================
@@ -1916,9 +2082,94 @@ inventory::submit! {
         .with_aliases(&["hume_evi", "hume-evi", "evi"])
 }
 
+inventory::submit! {
+    PluginConstructor::realtime("azure", azure_realtime_metadata, create_azure_realtime)
+        .with_aliases(&["azure-openai", "azure_openai"])
+}
+
+inventory::submit! {
+    PluginConstructor::realtime("grok", grok_realtime_metadata, create_grok_realtime)
+        .with_aliases(&["xai"])
+}
+
+inventory::submit! {
+    PluginConstructor::realtime("inworld", inworld_realtime_metadata, create_inworld_realtime)
+}
+
+inventory::submit! {
+    PluginConstructor::realtime("deepgram", deepgram_realtime_metadata, create_deepgram_realtime)
+        .with_aliases(&["deepgram-agent", "deepgram_voice_agent"])
+}
+
+inventory::submit! {
+    PluginConstructor::realtime("elevenlabs", elevenlabs_realtime_metadata, create_elevenlabs_realtime)
+        .with_aliases(&["elevenlabs-convai", "11labs"])
+}
+
+inventory::submit! {
+    PluginConstructor::realtime("gemini", gemini_realtime_metadata, create_gemini_realtime)
+        .with_aliases(&["gemini-live", "google"])
+}
+
+inventory::submit! {
+    PluginConstructor::realtime("ultravox", ultravox_realtime_metadata, create_ultravox_realtime)
+        .with_aliases(&["fixie"])
+}
+
+inventory::submit! {
+    PluginConstructor::realtime("nova_sonic", nova_sonic_realtime_metadata, create_nova_sonic_realtime)
+        .with_aliases(&["nova-sonic", "aws"])
+}
+
+inventory::submit! {
+    PluginConstructor::realtime("speechmatics", speechmatics_realtime_metadata, create_speechmatics_realtime)
+        .with_aliases(&["flow"])
+}
+
+inventory::submit! {
+    PluginConstructor::realtime("yandex", yandex_realtime_metadata, create_yandex_realtime)
+        .with_aliases(&["yandexgpt", "yandex-cloud"])
+}
+
 #[cfg(test)]
 mod tests {
     use crate::plugin::registry::global_registry;
+
+    /// The cascade `waav-infer` STT/TTS adapters are still transport stubs, so the built-in registry must
+    /// not advertise them as selectable providers. The native S2S realtime Infer provider is the wired
+    /// integration surface today; cascade STT/TTS can be re-registered when their WS transport tests prove
+    /// `connect`/`speak` work end to end.
+    #[test]
+    fn gateway_does_not_register_unwired_infer_cascade_plugins() {
+        let registry = global_registry();
+
+        for alias in [
+            "waav-infer",
+            "infer",
+            "waav_infer",
+            "waavinfer",
+            "self-hosted",
+            "WAAV-INFER",
+            "Infer",
+        ] {
+            assert!(
+                !registry.has_stt_provider(alias),
+                "unwired waav-infer STT alias `{alias}` must not be advertised as selectable"
+            );
+            assert!(
+                !registry.has_tts_provider(alias),
+                "unwired waav-infer TTS alias `{alias}` must not be advertised as selectable"
+            );
+            assert!(
+                registry.get_stt_metadata(alias).is_none(),
+                "unwired waav-infer STT alias `{alias}` must not expose provider metadata"
+            );
+            assert!(
+                registry.get_tts_metadata(alias).is_none(),
+                "unwired waav-infer TTS alias `{alias}` must not expose provider metadata"
+            );
+        }
+    }
 
     #[test]
     fn test_builtin_stt_providers_registered() {
@@ -2079,10 +2330,42 @@ mod tests {
     fn test_builtin_realtime_providers_registered() {
         let registry = global_registry();
 
-        // Both realtime providers should be registered
+        // All 12 realtime providers should be registered.
         assert!(registry.has_realtime_provider("openai"));
         assert!(registry.has_realtime_provider("hume"));
         assert!(registry.has_realtime_provider("evi")); // alias
+        // OpenAI-protocol clones.
+        assert!(registry.has_realtime_provider("azure"));
+        assert!(registry.has_realtime_provider("azure-openai")); // alias
+        assert!(registry.has_realtime_provider("azure_openai")); // alias
+        assert!(registry.has_realtime_provider("grok"));
+        assert!(registry.has_realtime_provider("xai")); // alias
+        assert!(registry.has_realtime_provider("inworld"));
+        // Deepgram Voice Agent (S2S, raw-binary frames).
+        assert!(registry.has_realtime_provider("deepgram"));
+        assert!(registry.has_realtime_provider("deepgram-agent")); // alias
+        assert!(registry.has_realtime_provider("deepgram_voice_agent")); // alias
+        // ElevenLabs Conversational AI (S2S, base64+JSON).
+        assert!(registry.has_realtime_provider("elevenlabs"));
+        assert!(registry.has_realtime_provider("11labs")); // alias
+        // Google Gemini Live (S2S, base64+JSON, MULTI-FRAME serverContent).
+        assert!(registry.has_realtime_provider("gemini"));
+        assert!(registry.has_realtime_provider("gemini-live")); // alias
+        assert!(registry.has_realtime_provider("google")); // alias
+        // Ultravox (S2S, raw-PCM binary; RestThenWebSocket).
+        assert!(registry.has_realtime_provider("ultravox"));
+        assert!(registry.has_realtime_provider("fixie")); // alias
+        // AWS Nova Sonic (S2S, base64-PCM+JSON; BedrockBidi; AWS creds, no api-key).
+        assert!(registry.has_realtime_provider("nova_sonic"));
+        assert!(registry.has_realtime_provider("nova-sonic")); // alias
+        assert!(registry.has_realtime_provider("aws")); // alias
+        // Speechmatics Flow (S2S, raw-PCM binary + JSON control; template-driven).
+        assert!(registry.has_realtime_provider("speechmatics"));
+        assert!(registry.has_realtime_provider("flow")); // alias
+        // Yandex Cloud AI Studio Realtime (OpenAI-protocol clone; GA wire, Bearer).
+        assert!(registry.has_realtime_provider("yandex"));
+        assert!(registry.has_realtime_provider("yandexgpt")); // alias
+        assert!(registry.has_realtime_provider("yandex-cloud")); // alias
     }
 
     #[test]

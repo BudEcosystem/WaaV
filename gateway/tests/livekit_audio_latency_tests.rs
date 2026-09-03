@@ -31,7 +31,7 @@ async fn test_audio_queue_operation_latency() {
     // Simulate 100 queue operations and measure time
     let start = Instant::now();
 
-    for i in 0..100 {
+    for _i in 0..100 {
         let audio_data = vec![0u8; 1024]; // 512 samples at 16-bit
         let mut queue = audio_queue.lock().await;
 
@@ -224,23 +224,26 @@ async fn test_audio_conversion_latency() {
     let start = Instant::now();
 
     // Simulate conversion logic
-    let sample_rate = 16000u32;
+    let _sample_rate = 16000u32;
     let channels = 2u16;
 
     // Validation
-    assert!(audio_data.len() % 2 == 0, "Audio data must have even length");
+    assert!(
+        audio_data.len().is_multiple_of(2),
+        "Audio data must have even length"
+    );
     assert!(channels > 0, "Channels must be > 0");
 
     let num_samples = audio_data.len() / 2;
     let samples_per_channel = num_samples / channels as usize;
 
     assert!(
-        samples_per_channel > 0 && num_samples % channels as usize == 0,
+        samples_per_channel > 0 && num_samples.is_multiple_of(channels as usize),
         "Invalid sample count"
     );
 
     // Zero-copy conversion (when aligned)
-    let samples: Vec<i16> = if (audio_data.as_ptr() as usize) % 2 == 0 {
+    let samples: Vec<i16> = if (audio_data.as_ptr() as usize).is_multiple_of(2) {
         unsafe {
             let ptr = audio_data.as_ptr() as *const i16;
             std::slice::from_raw_parts(ptr, num_samples).to_vec()
@@ -423,7 +426,7 @@ async fn test_full_send_audio_flow_latency() {
     let audio_queue: Arc<Mutex<VecDeque<Vec<u8>>>> = Arc::new(Mutex::new(VecDeque::new()));
     let is_connected = Arc::new(Mutex::new(true));
 
-    let sample_rate = 16000u32;
+    let _sample_rate = 16000u32;
     let channels = 1u16;
 
     // Test data: 10ms of audio at 16kHz mono
@@ -440,7 +443,7 @@ async fn test_full_send_audio_flow_latency() {
     // This is the path that was slow due to retries
 
     // Validate audio format
-    assert!(audio_data.len() % 2 == 0);
+    assert!(audio_data.len().is_multiple_of(2));
     let num_samples = audio_data.len() / 2;
     let samples_per_channel = num_samples / channels as usize;
     assert!(samples_per_channel > 0);

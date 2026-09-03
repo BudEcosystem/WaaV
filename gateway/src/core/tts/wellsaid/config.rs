@@ -9,6 +9,15 @@ use crate::core::tts::{TTSConfig, TTSError, TTSResult};
 
 use super::{DEFAULT_SPEAKER_ID, MAX_TEXT_LENGTH};
 
+fn validate_wellsaid_tts_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 // =============================================================================
 // Model Selection
 // =============================================================================
@@ -105,6 +114,25 @@ impl WellSaidAvatar {
 // TTS Request
 // =============================================================================
 
+/// Per-request audio output configuration nested under `audio_configs` in the WellSaid
+/// `/v1/tts/stream` request body. Both fields are optional so the API default applies when unset.
+#[derive(Debug, Clone, Serialize, PartialEq, Default)]
+pub struct WellSaidAudioConfigs {
+    /// Output sample rate in Hz (`audio_configs.sample_rate`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sample_rate: Option<u32>,
+    /// Output container/codec (`audio_configs.file_format`, e.g. `"mp3"`, `"wav"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_format: Option<String>,
+}
+
+impl WellSaidAudioConfigs {
+    /// Whether every field is unset (so the whole object can be omitted from the body).
+    pub fn is_empty(&self) -> bool {
+        self.sample_rate.is_none() && self.file_format.is_none()
+    }
+}
+
 /// WellSaid TTS streaming request body
 #[derive(Debug, Clone, Serialize)]
 pub struct WellSaidStreamRequest {
@@ -115,6 +143,13 @@ pub struct WellSaidStreamRequest {
     /// Model selection (optional, defaults to "legacy")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Audio output configuration (`audio_configs.sample_rate` / `.file_format`). Omitted when both
+    /// inner fields are unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio_configs: Option<WellSaidAudioConfigs>,
+    /// Pronunciation/voice library IDs to apply (`library_ids`). Omitted when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub library_ids: Vec<String>,
 }
 
 impl WellSaidStreamRequest {
@@ -124,11 +159,18 @@ impl WellSaidStreamRequest {
             speaker_id,
             text: text.into(),
             model: None,
+            audio_configs: None,
+            library_ids: Vec::new(),
         }
     }
 
     /// Create request from config
     pub fn from_config(config: &WellSaidTtsConfig, text: &str) -> Self {
+        let audio_configs = if config.audio_configs.is_empty() {
+            None
+        } else {
+            Some(config.audio_configs.clone())
+        };
         Self {
             speaker_id: config.speaker_id,
             text: text.to_string(),
@@ -137,6 +179,8 @@ impl WellSaidStreamRequest {
             } else {
                 None // Legacy is default, no need to specify
             },
+            audio_configs,
+            library_ids: config.library_ids.clone(),
         }
     }
 
@@ -174,6 +218,15 @@ pub struct WellSaidTtsConfig {
     pub speaker_id: u32,
     /// Model selection (Legacy or Caruso)
     pub model: WellSaidModel,
+    /// Audio output configuration (`audio_configs.sample_rate` / `.file_format` in the request body).
+    pub audio_configs: WellSaidAudioConfigs,
+    /// Voice/pronunciation library IDs to apply (`library_ids` in the request body).
+    pub library_ids: Vec<String>,
+    /// Treat the input text as SSML. When `true` the request sends the `X-Enable-SSML: true` header
+    /// so WellSaid parses the body's `text` as SSML markup.
+    pub ssml: bool,
+    /// Optional base URL (scheme+host) override for the synth HTTP endpoint; used to redirect to a mock in tests.
+    pub endpoint_override: Option<String>,
 }
 
 impl WellSaidTtsConfig {
@@ -183,6 +236,10 @@ impl WellSaidTtsConfig {
             api_key: api_key.into(),
             speaker_id: DEFAULT_SPEAKER_ID,
             model: WellSaidModel::default(),
+            audio_configs: WellSaidAudioConfigs::default(),
+            library_ids: Vec::new(),
+            ssml: false,
+            endpoint_override: None,
         }
     }
 
@@ -204,16 +261,14 @@ impl WellSaidTtsConfig {
     /// The voice_id field is parsed as speaker_id (numeric).
     pub fn from_base(config: &TTSConfig) -> TTSResult<Self> {
         // Get API key from config or environment
-        let api_key = if !config.api_key.is_empty() {
-            config.api_key.clone()
-        } else {
-            std::env::var("WELLSAID_API_KEY").map_err(|_| {
+        let api_key = crate::core::credentials::explicit_api_key(&config.api_key)
+            .or_else(|| crate::core::credentials::env_api_key("WELLSAID_API_KEY"))
+            .ok_or_else(|| {
                 TTSError::InvalidConfiguration(
                     "WELLSAID_API_KEY environment variable not set and no api_key provided"
                         .to_string(),
                 )
-            })?
-        };
+            })?;
 
         // Parse speaker_id from voice_id (numeric string)
         let speaker_id = config
@@ -233,12 +288,66 @@ impl WellSaidTtsConfig {
             api_key,
             speaker_id,
             model,
+            audio_configs: WellSaidAudioConfigs::default(),
+            library_ids: Vec::new(),
+            ssml: false,
+            endpoint_override: None,
         };
 
         // Validate
         wellsaid_config.validate()?;
 
         Ok(wellsaid_config)
+    }
+
+    /// Build from the standardized TTS config (W1 keystone).
+    ///
+    /// Maps the WellSaid `/v1/tts/stream` features the API actually exposes:
+    /// - [`TtsFeatures::sample_rate`] → `audio_configs.sample_rate` (typed) in the request body.
+    /// - [`TtsFeatures::ssml`] → the `X-Enable-SSML` request header (typed), so the body's `text` is
+    ///   parsed as SSML markup.
+    /// - `output_audio_format` (extras) → `audio_configs.file_format` in the request body.
+    /// - `library_ids` (extras, array of strings) → `library_ids` in the request body.
+    ///
+    /// `speaker_id`/`model` flow through the flat base config. The Caruso AI Director (pitch, tempo,
+    /// loudness) is delivered via inline markup in the `text`, not as config state, so the
+    /// prosody-style features (speed, pitch, volume, stability, similarity_boost, style,
+    /// use_speaker_boost, emotion, instructions, language, word_timestamps, streaming, seed) remain
+    /// capability gaps and are skipped.
+    ///
+    /// [`TtsFeatures::sample_rate`]: crate::core::tts::standard::TtsFeatures::sample_rate
+    /// [`TtsFeatures::ssml`]: crate::core::tts::standard::TtsFeatures::ssml
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(&std.base)?;
+
+        if let Some(sample_rate) = f.sample_rate {
+            cfg.audio_configs.sample_rate = Some(sample_rate);
+        }
+        if let Some(ssml) = f.ssml {
+            cfg.ssml = ssml;
+        }
+
+        // Provider-specific passthrough.
+        if let Some(file_format) = std
+            .extras
+            .0
+            .get("output_audio_format")
+            .and_then(|v| v.as_str())
+        {
+            cfg.audio_configs.file_format = Some(file_format.to_string());
+        }
+        if let Some(library_ids) = std.extras.0.get("library_ids").and_then(|v| v.as_array()) {
+            cfg.library_ids = library_ids
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect();
+        }
+
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
+        cfg.validate()?;
+
+        Ok(cfg)
     }
 
     /// Validate the configuration
@@ -253,6 +362,11 @@ impl WellSaidTtsConfig {
             return Err(TTSError::InvalidConfiguration(
                 "Speaker ID must be greater than 0".to_string(),
             ));
+        }
+
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_wellsaid_tts_endpoint("endpoint_override", endpoint)
+                .map_err(TTSError::InvalidConfiguration)?;
         }
 
         Ok(())
@@ -277,6 +391,10 @@ impl Default for WellSaidTtsConfig {
             api_key: String::new(),
             speaker_id: DEFAULT_SPEAKER_ID,
             model: WellSaidModel::default(),
+            audio_configs: WellSaidAudioConfigs::default(),
+            library_ids: Vec::new(),
+            ssml: false,
+            endpoint_override: None,
         }
     }
 }
@@ -288,6 +406,124 @@ impl Default for WellSaidTtsConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone (TTS): `from_standard` maps the WellSaid `/v1/tts/stream` features the API exposes
+    // — sample_rate (typed) -> audio_configs.sample_rate, ssml (typed) -> X-Enable-SSML header flag,
+    // output_audio_format (extras) -> audio_configs.file_format, library_ids (extras) -> library_ids
+    // — while speaker_id/model still flow through from the flat base config. Prosody-style features
+    // (here speed/pitch) remain capability gaps (AI Director is inline markup, not config state).
+    #[test]
+    fn from_standard_maps_audio_configs_ssml_and_library_ids() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("output_audio_format".into(), serde_json::json!("wav"));
+        extras.insert(
+            "library_ids".into(),
+            serde_json::json!(["lib-abc", "lib-def"]),
+        );
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "wellsaid".into(),
+                api_key: "test-key".into(),
+                voice_id: Some("26".into()),
+                model: "caruso".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                sample_rate: Some(44100),
+                ssml: Some(true),
+                speed: Some(1.5), // capability gap: AI Director markup, not config state
+                pitch: Some(70.0), // capability gap
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+        let cfg = WellSaidTtsConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.speaker_id, 26); // from voice_id
+        assert_eq!(cfg.model, WellSaidModel::Caruso); // from base.model
+        assert_eq!(cfg.api_key, "test-key");
+        assert_eq!(cfg.audio_configs.sample_rate, Some(44100)); // typed sample_rate
+        assert_eq!(cfg.audio_configs.file_format, Some("wav".to_string())); // extras
+        assert!(cfg.ssml); // typed ssml -> X-Enable-SSML
+        assert_eq!(cfg.library_ids, vec!["lib-abc", "lib-def"]); // extras
+    }
+
+    // WIRE-LEVEL guard (the recurring bug class is asserting only the config struct). This asserts
+    // sample_rate / file_format / library_ids actually reach the serialized `/v1/tts/stream` request
+    // BODY under `audio_configs.sample_rate`, `audio_configs.file_format`, and `library_ids` — and
+    // that the body OMITS `audio_configs` and `library_ids` entirely when unset.
+    #[test]
+    fn audio_configs_and_library_ids_reach_stream_request_body() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("output_audio_format".into(), serde_json::json!("wav"));
+        extras.insert("library_ids".into(), serde_json::json!(["lib-abc"]));
+        let cfg = WellSaidTtsConfig::from_standard(&StandardTTSConfig {
+            base: TTSConfig {
+                provider: "wellsaid".into(),
+                api_key: "test-key".into(),
+                voice_id: Some("26".into()),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                sample_rate: Some(44100),
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        })
+        .unwrap();
+        let body = serde_json::to_value(WellSaidStreamRequest::from_config(&cfg, "hi")).unwrap();
+        assert_eq!(body["audio_configs"]["sample_rate"], 44100);
+        assert_eq!(body["audio_configs"]["file_format"], "wav");
+        assert_eq!(body["library_ids"][0], "lib-abc");
+
+        // Default config: audio_configs and library_ids must be omitted from the body entirely.
+        let default_body = serde_json::to_value(WellSaidStreamRequest::from_config(
+            &WellSaidTtsConfig::new("k"),
+            "hi",
+        ))
+        .unwrap();
+        assert!(default_body.get("audio_configs").is_none());
+        assert!(default_body.get("library_ids").is_none());
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = WellSaidTtsConfig {
+            api_key: "test-key".to_string(),
+            endpoint_override: Some("https://wellsaid-proxy.example.com".to_string()),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(format!("{err:?}").contains("SSRF protection"));
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("file endpoint_override must be rejected");
+        assert!(format!("{err:?}").contains("URL scheme"));
+
+        config.endpoint_override = Some("ws://wellsaid-proxy.example.com".to_string());
+        let err = config
+            .validate()
+            .expect_err("WebSocket endpoint_override must be rejected");
+        assert!(format!("{err:?}").contains("URL scheme"));
+
+        let std = crate::core::tts::standard::StandardTTSConfig::from_base(TTSConfig {
+            provider: "wellsaid".to_string(),
+            api_key: "test-key".to_string(),
+            voice_id: Some("26".to_string()),
+            ..Default::default()
+        })
+        .with_endpoint_override("file:///tmp/socket");
+        assert!(WellSaidTtsConfig::from_standard(&std).is_err());
+    }
 
     #[test]
     fn test_model_enum() {

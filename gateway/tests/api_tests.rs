@@ -30,6 +30,15 @@ async fn test_health_check() {
         azure_speech_region: None,
         cartesia_api_key: None,
         openai_api_key: None,
+        azure_openai_api_key: None,
+        azure_openai_endpoint: None,
+        grok_api_key: None,
+        inworld_api_key: None,
+        gemini_api_key: None,
+        ultravox_api_key: None,
+        speechmatics_api_key: None,
+        yandex_api_key: None,
+        yandex_folder_id: None,
         assemblyai_api_key: None,
         hume_api_key: None,
         lmnt_api_key: None,
@@ -64,11 +73,13 @@ async fn test_health_check() {
         rate_limit_burst_size: 10,
         max_websocket_connections: None,
         max_connections_per_ip: 100,
-            ws_processing_timeout_secs: 10,
-            realtime_processing_timeout_secs: 30,
-            sip_max_participants: 3,
+        ws_processing_timeout_secs: 10,
+        realtime_processing_timeout_secs: 30,
+        sip_max_participants: 3,
+        realtime_endpoint_overrides: Default::default(),
         plugins: PluginConfig::default(),
         dag_timeouts: DAGTimeoutsConfig::default(),
+        aliases: Default::default(),
     };
 
     // Create app state
@@ -95,7 +106,9 @@ async fn test_health_check() {
         .unwrap();
     let json: Value = serde_json::from_slice(&body).unwrap();
 
-    assert_eq!(json["status"], "OK");
+    // W-C1: the liveness status is lowercase "ok" — this matches the CI smoke grep
+    // ('"status":"ok"') and fixes the prior "OK" vs "ok" mismatch.
+    assert_eq!(json["status"], "ok");
 }
 
 #[tokio::test]
@@ -116,6 +129,15 @@ async fn test_speak_endpoint_missing_api_key() {
         azure_speech_region: None,
         cartesia_api_key: None,
         openai_api_key: None,
+        azure_openai_api_key: None,
+        azure_openai_endpoint: None,
+        grok_api_key: None,
+        inworld_api_key: None,
+        gemini_api_key: None,
+        ultravox_api_key: None,
+        speechmatics_api_key: None,
+        yandex_api_key: None,
+        yandex_folder_id: None,
         assemblyai_api_key: None,
         hume_api_key: None,
         lmnt_api_key: None,
@@ -150,11 +172,13 @@ async fn test_speak_endpoint_missing_api_key() {
         rate_limit_burst_size: 10,
         max_websocket_connections: None,
         max_connections_per_ip: 100,
-            ws_processing_timeout_secs: 10,
-            realtime_processing_timeout_secs: 30,
-            sip_max_participants: 3,
+        ws_processing_timeout_secs: 10,
+        realtime_processing_timeout_secs: 30,
+        sip_max_participants: 3,
+        realtime_endpoint_overrides: Default::default(),
         plugins: PluginConfig::default(),
         dag_timeouts: DAGTimeoutsConfig::default(),
+        aliases: Default::default(),
     };
 
     // Create app state
@@ -210,6 +234,15 @@ async fn test_speak_endpoint_empty_text() {
         azure_speech_region: None,
         cartesia_api_key: None,
         openai_api_key: None,
+        azure_openai_api_key: None,
+        azure_openai_endpoint: None,
+        grok_api_key: None,
+        inworld_api_key: None,
+        gemini_api_key: None,
+        ultravox_api_key: None,
+        speechmatics_api_key: None,
+        yandex_api_key: None,
+        yandex_folder_id: None,
         assemblyai_api_key: None,
         hume_api_key: None,
         lmnt_api_key: None,
@@ -244,11 +277,13 @@ async fn test_speak_endpoint_empty_text() {
         rate_limit_burst_size: 10,
         max_websocket_connections: None,
         max_connections_per_ip: 100,
-            ws_processing_timeout_secs: 10,
-            realtime_processing_timeout_secs: 30,
-            sip_max_participants: 3,
+        ws_processing_timeout_secs: 10,
+        realtime_processing_timeout_secs: 30,
+        sip_max_participants: 3,
+        realtime_endpoint_overrides: Default::default(),
         plugins: PluginConfig::default(),
         dag_timeouts: DAGTimeoutsConfig::default(),
+        aliases: Default::default(),
     };
 
     // Create app state
@@ -310,6 +345,15 @@ async fn test_speak_endpoint_with_pronunciations() {
         azure_speech_region: None,
         cartesia_api_key: None,
         openai_api_key: None,
+        azure_openai_api_key: None,
+        azure_openai_endpoint: None,
+        grok_api_key: None,
+        inworld_api_key: None,
+        gemini_api_key: None,
+        ultravox_api_key: None,
+        speechmatics_api_key: None,
+        yandex_api_key: None,
+        yandex_folder_id: None,
         assemblyai_api_key: None,
         hume_api_key: None,
         lmnt_api_key: None,
@@ -345,11 +389,13 @@ async fn test_speak_endpoint_with_pronunciations() {
         rate_limit_burst_size: 10,
         max_websocket_connections: None,
         max_connections_per_ip: 100,
-            ws_processing_timeout_secs: 10,
-            realtime_processing_timeout_secs: 30,
-            sip_max_participants: 3,
+        ws_processing_timeout_secs: 10,
+        realtime_processing_timeout_secs: 30,
+        sip_max_participants: 3,
+        realtime_endpoint_overrides: Default::default(),
         plugins: PluginConfig::default(),
         dag_timeouts: DAGTimeoutsConfig::default(),
+        aliases: Default::default(),
     };
 
     // Create app state
@@ -413,6 +459,15 @@ async fn test_speak_endpoint_invalid_provider() {
         azure_speech_region: None,
         cartesia_api_key: None,
         openai_api_key: None,
+        azure_openai_api_key: None,
+        azure_openai_endpoint: None,
+        grok_api_key: None,
+        inworld_api_key: None,
+        gemini_api_key: None,
+        ultravox_api_key: None,
+        speechmatics_api_key: None,
+        yandex_api_key: None,
+        yandex_folder_id: None,
         assemblyai_api_key: None,
         hume_api_key: None,
         lmnt_api_key: None,
@@ -448,11 +503,13 @@ async fn test_speak_endpoint_invalid_provider() {
         rate_limit_burst_size: 10,
         max_websocket_connections: None,
         max_connections_per_ip: 100,
-            ws_processing_timeout_secs: 10,
-            realtime_processing_timeout_secs: 30,
-            sip_max_participants: 3,
+        ws_processing_timeout_secs: 10,
+        realtime_processing_timeout_secs: 30,
+        sip_max_participants: 3,
+        realtime_endpoint_overrides: Default::default(),
         plugins: PluginConfig::default(),
         dag_timeouts: DAGTimeoutsConfig::default(),
+        aliases: Default::default(),
     };
 
     // Create app state

@@ -8,6 +8,8 @@ pub mod bhashini;
 pub mod cartesia;
 pub mod cereproc;
 pub mod deepgram;
+/// Deepgram Aura streaming TTS over WebSocket (P1.1; selected via `features.streaming`).
+pub mod deepgram_aura;
 pub mod elevenlabs;
 pub mod fpt_ai;
 pub mod gnani;
@@ -16,6 +18,8 @@ pub mod huawei_cloud;
 pub mod hume;
 pub mod ibm_watson;
 pub mod iflytek;
+/// WaaV-Infer self-hosted cascade TTS adapter (`provider = "waav-infer"`).
+pub mod infer;
 pub mod lmnt;
 pub mod murf;
 pub mod naver_clova;
@@ -28,12 +32,18 @@ pub mod resemble;
 pub mod reverie;
 pub mod sberdevices;
 pub mod smallest;
+/// Magic-byte container sniffing — format truth at every audio boundary (P0.1).
+pub mod sniff;
 pub mod speechify;
 pub mod speechmatics;
+/// Standardized capability-rich TTS config (W1 keystone, additive).
+pub mod standard;
 pub mod tencent;
 pub mod tinkoff;
 pub mod unrealspeech;
 pub mod viettel_ai;
+/// Generic WebSocket streaming-TTS client shared by WS provider variants (P1.1).
+pub mod websocket;
 pub mod wellsaid;
 pub mod yandex;
 pub mod zalo_ai;
@@ -58,12 +68,14 @@ pub use cereproc::{
     CEREVOICE_SPEAK_URL, CereprocAudioFormat, CereprocCredentials, CereprocTts, CereprocTtsConfig,
 };
 pub use deepgram::{DEEPGRAM_TTS_URL, DeepgramTTS};
+pub use deepgram_aura::{DEEPGRAM_TTS_WS_URL, DeepgramAuraTTS};
 pub use elevenlabs::{ELEVENLABS_TTS_URL, ElevenLabsTTS};
 pub use google::{GOOGLE_TTS_URL, GoogleTTS};
 pub use hume::{HUME_TTS_STREAM_URL, HumeTTS, HumeTTSConfig};
 pub use ibm_watson::{
     IBM_WATSON_TTS_URL, IbmOutputFormat, IbmVoice, IbmWatsonTTS, IbmWatsonTTSConfig,
 };
+pub use infer::{INFER_TTS_ALIASES, INFER_TTS_PROVIDER_ID, InferTTS};
 pub use lmnt::{LMNT_TTS_URL, LmntAudioFormat, LmntTts, LmntTtsConfig, LmntVoice};
 pub use murf::{
     MURF_TTS_STREAM_URL, MurfAudioFormat, MurfModel, MurfRegion, MurfRequestBuilder, MurfTts,
@@ -102,6 +114,10 @@ pub use speechmatics::{
 pub use unrealspeech::{
     UNREALSPEECH_STREAM_URL, UnrealSpeechBitrate, UnrealSpeechCodec, UnrealSpeechRequestBuilder,
     UnrealSpeechStreamRequest, UnrealSpeechTts, UnrealSpeechTtsConfig, UnrealSpeechVoice,
+};
+pub use websocket::{
+    PendingUtterance, WebSocketTtsClient, WsTtsConnectSpec, WsTtsEvent, WsTtsProtocol,
+    validate_ws_endpoint_for_ssrf,
 };
 pub use wellsaid::{
     WELLSAID_AVATARS_URL, WELLSAID_TTS_STREAM_URL, WellSaidAvatar, WellSaidModel,

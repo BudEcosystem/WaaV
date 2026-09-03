@@ -7,15 +7,22 @@ import type {
   IncomingMessage,
   OutgoingMessage,
   SpeakMessage,
+  SendMessageMessage,
+  ClearMessage,
   ReadyMessage,
+  ResolvedAlias,
   STTResultMessage,
+  Translation,
   TTSAudioMessage,
   ErrorMessage,
   PongMessage,
   SessionUpdateMessage,
+  ConfigWarningMessage,
   MessageType,
 } from '../types/messages.js';
-import type { STTConfig, TTSConfig, LiveKitConfig } from '../types/config.js';
+import type { STTConfig, TTSConfig, LiveKitConfig, DAGConfig, ConversationConfig, TurnDetectionConfig } from '../types/config.js';
+import { conversationConfigToWire } from '../types/conversation.js';
+import { serializeDAGConfig } from '../types/dag.js';
 import type { FeatureFlags } from '../types/features.js';
 
 // ============================================================================
@@ -100,6 +107,9 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 /**
  * SDK-facing ConfigMessage with camelCase fields.
  * This is different from the wire format which uses snake_case.
+ *
+ * 1:1 with the gateway `/ws` config envelope: stt/tts/livekit/dag/conversation,
+ * plus turn detection (nested into `stt_config.turn_detection` on the wire).
  */
 export interface SDKConfigMessage {
   type: 'config';
@@ -108,6 +118,24 @@ export interface SDKConfigMessage {
   stt?: STTConfig;
   tts?: TTSConfig;
   livekit?: LiveKitConfig;
+  /** DAG routing configuration. */
+  dag?: DAGConfig;
+  /** Built-in conversation/agent loop (serialized into `conversation_config`). */
+  conversation?: ConversationConfig;
+  /** ML turn detection (nested into `stt_config.turn_detection`). */
+  turnDetection?: TurnDetectionConfig;
+  /**
+   * Proxy/alias name (P3): a single server-defined name the gateway resolves to a
+   * full {stt,tts,llm,dag} bundle BEFORE provider construction. Composes with the
+   * rest — an explicit `stt`/`tts`/`conversation` here overrides the alias default.
+   * The resolved concrete providers come back on `ready` as `resolved_alias`.
+   */
+  alias?: string;
+  /**
+   * Legacy client feature flags. These are folded into the nested
+   * `stt_config.features{}` block (NOT emitted as a top-level `features` key,
+   * which the gateway does not recognize and silently drops).
+   */
   features?: FeatureFlags;
 }
 
@@ -141,23 +169,47 @@ function toWireFormat(message: SDKOutgoingMessage): Record<string, unknown> {
       return configToWire(message as SDKConfigMessage);
     case 'speak':
       return speakToWire(message as SpeakMessage);
-    case 'ping':
-      return { type: 'ping', timestamp: Date.now() };
-    case 'audio':
-      return { type: 'audio' }; // Binary audio handled separately
-    case 'stop':
-      return { type: 'stop' };
-    case 'flush':
-      return { type: 'flush' };
-    case 'interrupt':
-      return { type: 'interrupt' };
+    case 'clear':
+      // Barge-in / cancel current TTS playback (gateway op `clear`).
+      return { type: 'clear' };
+    case 'audio_end':
+      // Finalize: tell the gateway the audio stream has ended so it flushes
+      // any pending transcript (gateway op `audio_end`).
+      return { type: 'audio_end' };
+    case 'send_message':
+      return sendMessageToWire(message as SendMessageMessage);
+    case 'sip_transfer':
+      return {
+        type: 'sip_transfer',
+        transfer_to: (message as { transfer_to: string }).transfer_to,
+      };
     default:
       return { type: (message as { type: string }).type };
   }
 }
 
 /**
- * Convert config message to wire format
+ * Convert a send_message (data channel) message to wire format
+ */
+function sendMessageToWire(message: SendMessageMessage): Record<string, unknown> {
+  const wire: Record<string, unknown> = {
+    type: 'send_message',
+    message: message.message,
+    role: message.role,
+  };
+  if (message.topic !== undefined) wire.topic = message.topic;
+  if (message.debug !== undefined) wire.debug = message.debug;
+  return wire;
+}
+
+/**
+ * Convert config message to wire format.
+ *
+ * Mirrors the gateway `/ws` config envelope. The dead top-level `features` key
+ * (silently dropped by the gateway) is GONE: advanced STT/TTS features nest
+ * under `stt_config.features{}` / `tts_config.features{}`, turn detection nests
+ * under `stt_config.turn_detection`, and the conversation/DAG loops get their
+ * own blocks.
  */
 function configToWire(message: SDKConfigMessage): Record<string, unknown> {
   const wire: Record<string, unknown> = {
@@ -168,12 +220,20 @@ function configToWire(message: SDKConfigMessage): Record<string, unknown> {
     wire.stream_id = message.streamId;
   }
 
+  // Proxy/alias name (P3): a single top-level field the gateway resolves to a full
+  // {stt,tts,llm,dag} bundle server-side (an explicit config below overrides it).
+  if (message.alias) {
+    wire.alias = message.alias;
+  }
+
   if (message.audio !== undefined) {
     wire.audio = message.audio;
   }
 
   if (message.stt) {
-    wire.stt_config = sttConfigToWire(message.stt);
+    // Turn detection + legacy feature flags fold INTO the STT block (their real
+    // wire home), never a top-level key.
+    wire.stt_config = sttConfigToWire(message.stt, message.turnDetection, message.features);
   }
 
   if (message.tts) {
@@ -184,83 +244,224 @@ function configToWire(message: SDKConfigMessage): Record<string, unknown> {
     wire.livekit = livekitConfigToWire(message.livekit);
   }
 
-  if (message.features) {
-    wire.features = featuresToWire(message.features);
+  if (message.dag) {
+    wire.dag_config = serializeDAGConfig(message.dag);
+  }
+
+  if (message.conversation) {
+    wire.conversation_config = conversationConfigToWire(message.conversation);
+  }
+
+  return wire;
+}
+
+/** Assign `value` to `target[key]` only when it is not undefined. */
+function setIfDefined(target: Record<string, unknown>, key: string, value: unknown): void {
+  if (value !== undefined) target[key] = value;
+}
+
+/**
+ * Build the nested `stt_config.features{}` block from the canonical SttFeatures
+ * fields on STTConfig (+ legacy FeatureFlags), omitting anything unset. Returns
+ * undefined when no feature is set so the key is omitted entirely.
+ */
+function sttFeaturesToWire(config: STTConfig, features?: FeatureFlags): Record<string, unknown> | undefined {
+  const f: Record<string, unknown> = {};
+
+  // Canonical SttFeatures (gateway/src/core/stt/standard.rs).
+  setIfDefined(f, 'interim_results', config.interimResults);
+  // STTConfig.diarize → canonical `diarization`.
+  setIfDefined(f, 'diarization', config.diarize);
+  setIfDefined(f, 'word_timestamps', config.wordTimestamps);
+  setIfDefined(f, 'smart_format', config.smartFormat);
+  setIfDefined(f, 'profanity_filter', config.profanityFilter);
+  setIfDefined(f, 'filler_words', config.fillerWords);
+  setIfDefined(f, 'vad_events', config.vadEvents);
+  setIfDefined(f, 'endpointing_ms', config.endpointingMs ?? config.endpointing);
+  setIfDefined(f, 'utterance_end_ms', config.utteranceEndMsFeature ?? config.utteranceEndMs);
+  // STTConfig.keywords / .keyterms → canonical `keyterms`.
+  setIfDefined(f, 'keyterms', config.keyterms ?? config.keywords);
+  setIfDefined(f, 'redaction', config.redaction);
+  setIfDefined(f, 'language_detection', config.languageDetection);
+  setIfDefined(f, 'entity_detection', config.entityDetection);
+  setIfDefined(f, 'numerals', config.numerals);
+  setIfDefined(f, 'multichannel', config.multichannel);
+  setIfDefined(f, 'alternatives', config.alternatives);
+  setIfDefined(f, 'sentiment', config.sentiment);
+  setIfDefined(f, 'speech_begin_event', config.speechBeginEvent);
+
+  // Legacy top-level FeatureFlags map onto canonical SttFeatures, without
+  // overriding an explicit per-config value above.
+  if (features) {
+    if (f.interim_results === undefined && features.interimResults !== undefined) f.interim_results = features.interimResults;
+    if (f.diarization === undefined && features.speakerDiarization !== undefined) f.diarization = features.speakerDiarization;
+    if (f.smart_format === undefined && features.smartFormat !== undefined) f.smart_format = features.smartFormat;
+    if (f.profanity_filter === undefined && features.profanityFilter !== undefined) f.profanity_filter = features.profanityFilter;
+    if (f.word_timestamps === undefined && features.wordTimestamps !== undefined) f.word_timestamps = features.wordTimestamps;
+    if (f.filler_words === undefined && features.fillerWords !== undefined) f.filler_words = features.fillerWords;
+  }
+
+  return Object.keys(f).length > 0 ? f : undefined;
+}
+
+/**
+ * Convert STT config to wire format (`STTWebSocketConfig`). Advanced features
+ * nest under `features{}`, ML turn detection under `turn_detection`, and the
+ * no-canonical-field long tail (e.g. customVocabulary) under `extras`.
+ */
+function sttConfigToWire(
+  config: STTConfig,
+  turnDetection?: TurnDetectionConfig,
+  features?: FeatureFlags
+): Record<string, unknown> {
+  const wire: Record<string, unknown> = {
+    provider: config.provider,
+  };
+  // Required-ish top-level scalars (omit when unset; the gateway has serde
+  // defaults for encoding/model and language is required by the gateway).
+  setIfDefined(wire, 'language', config.language);
+  setIfDefined(wire, 'sample_rate', config.sampleRate);
+  setIfDefined(wire, 'channels', config.channels);
+  // STTConfig allows `punctuate` as a Deepgram-style alias of `punctuation`.
+  setIfDefined(wire, 'punctuation', config.punctuation ?? config.punctuate);
+  setIfDefined(wire, 'encoding', config.encoding);
+  // D8 uplink transport codec the GATEWAY decodes before STT (`opus` → one opus packet per binary
+  // frame). Distinct from `encoding`. Only set when the SDK will actually encode opus; the gateway
+  // echoes the effective codec in `ready` and degrades to linear16 if it can't.
+  setIfDefined(wire, 'audio_in_codec', config.audioInCodec);
+  setIfDefined(wire, 'model', config.model);
+  setIfDefined(wire, 'api_key', config.apiKey);
+
+  // Nested canonical features.
+  const featuresWire = sttFeaturesToWire(config, features);
+  if (featuresWire) wire.features = featuresWire;
+
+  // ML turn detection → stt_config.turn_detection (config.rs:345). Only the
+  // three real TurnDetectionWsConfig fields go on the wire; the silence/padding
+  // hints are client-side VAD only.
+  if (turnDetection && turnDetection.enabled) {
+    const td: Record<string, unknown> = { enabled: true };
+    setIfDefined(td, 'threshold', turnDetection.threshold);
+    setIfDefined(td, 'eager', turnDetection.eager);
+    wire.turn_detection = td;
+  }
+
+  // Open passthrough: explicit extras + the no-canonical-field customVocabulary.
+  const extras: Record<string, unknown> = { ...(config.extras ?? {}) };
+  if (config.customVocabulary !== undefined && extras.custom_vocabulary === undefined) {
+    extras.custom_vocabulary = config.customVocabulary;
+  }
+  if (Object.keys(extras).length > 0) wire.extras = extras;
+
+  // Canonical in-stream translation (P5) → stt_config.translation. The gateway
+  // folds Speechmatics/Gladia side-channels + the OpenAI/Groq English fast-path
+  // into a uniform translations:[{lang,text}] array; unsupported providers
+  // degrade with a config_warning (never a 400).
+  if (config.translation) {
+    const t = config.translation;
+    const tWire: Record<string, unknown> = {};
+    if (t.targetLanguages && t.targetLanguages.length > 0) tWire.target_languages = t.targetLanguages;
+    if (t.translateToEnglish !== undefined) tWire.translate_to_english = t.translateToEnglish;
+    if (t.partials !== undefined) tWire.partials = t.partials;
+    if (Object.keys(tWire).length > 0) wire.translation = tWire;
   }
 
   return wire;
 }
 
 /**
- * Convert STT config to wire format
+ * Build the nested `tts_config.features{}` block from the canonical TtsFeatures
+ * fields on TTSConfig, omitting anything unset.
  */
-function sttConfigToWire(config: STTConfig): Record<string, unknown> {
-  return {
-    provider: config.provider,
-    language: config.language,
-    model: config.model,
-    sample_rate: config.sampleRate,
-    encoding: config.encoding,
-    channels: config.channels,
-    interim_results: config.interimResults,
-    punctuate: config.punctuate,
-    profanity_filter: config.profanityFilter,
-    smart_format: config.smartFormat,
-    diarize: config.diarize,
-    keywords: config.keywords,
-    custom_vocabulary: config.customVocabulary,
-    endpointing: config.endpointing,
-    utterance_end_ms: config.utteranceEndMs,
-  };
+function ttsFeaturesToWire(config: TTSConfig): Record<string, unknown> | undefined {
+  const f: Record<string, unknown> = {};
+
+  // Canonical TtsFeatures (gateway/src/core/tts/standard.rs). speed/pitch/volume
+  // /stability/similarity_boost/style/use_speaker_boost are ALSO mirrored here so
+  // providers reading TtsFeatures honor them too.
+  setIfDefined(f, 'speed', config.speed);
+  setIfDefined(f, 'pitch', config.pitch);
+  setIfDefined(f, 'volume', config.volume);
+  setIfDefined(f, 'stability', config.stability);
+  setIfDefined(f, 'similarity_boost', config.similarityBoost);
+  setIfDefined(f, 'style', config.style);
+  setIfDefined(f, 'use_speaker_boost', config.useSpeakerBoost);
+  setIfDefined(f, 'instructions', config.instructions);
+  setIfDefined(f, 'ssml', config.ssml);
+  setIfDefined(f, 'language', config.language);
+  setIfDefined(f, 'word_timestamps', config.wordTimestamps);
+  setIfDefined(f, 'streaming', config.streaming);
+  setIfDefined(f, 'seed', config.seed);
+  setIfDefined(f, 'optimize_streaming_latency', config.optimizeStreamingLatency);
+  setIfDefined(f, 'include_timestamp_types', config.includeTimestampTypes);
+  setIfDefined(f, 'rate_percentage', config.ratePercentage);
+  setIfDefined(f, 'pitch_percentage', config.pitchPercentage);
+
+  return Object.keys(f).length > 0 ? f : undefined;
 }
 
 /**
- * Convert TTS config to wire format
+ * Convert TTS config to wire format (`TTSWebSocketConfig`). Advanced knobs nest
+ * under `features{}`; Hume-only knobs with no canonical field go under `extras`.
  */
 function ttsConfigToWire(config: TTSConfig): Record<string, unknown> {
   const wire: Record<string, unknown> = {
     provider: config.provider,
-    voice: config.voice,
-    voice_id: config.voiceId,
-    model: config.model,
-    sample_rate: config.sampleRate,
-    audio_format: config.audioFormat,
-    speed: config.speed,
-    pitch: config.pitch,
-    volume: config.volume,
-    stability: config.stability,
-    similarity_boost: config.similarityBoost,
-    style: config.style,
-    use_speaker_boost: config.useSpeakerBoost,
   };
+  // `voice` is a convenience alias for `voice_id`.
+  setIfDefined(wire, 'voice_id', config.voiceId ?? config.voice);
+  // Abstract voice selection (P4): the gateway resolves a VoiceDescriptor to a
+  // concrete provider voice_id server-side. Sent under `voice_descriptor` as a
+  // snake_case object; a raw voice_id always wins, so the gateway only uses this
+  // when voice_id is absent. Only set fields are emitted.
+  if (config.voiceDescriptor !== undefined) {
+    const vd = config.voiceDescriptor;
+    const vdWire: Record<string, unknown> = {};
+    setIfDefined(vdWire, 'gender', vd.gender);
+    setIfDefined(vdWire, 'locale', vd.locale);
+    setIfDefined(vdWire, 'accent', vd.accent);
+    setIfDefined(vdWire, 'age', vd.age);
+    setIfDefined(vdWire, 'style', vd.style);
+    setIfDefined(vdWire, 'name_hint', vd.nameHint);
+    if (Object.keys(vdWire).length > 0) wire.voice_descriptor = vdWire;
+  }
+  setIfDefined(wire, 'model', config.model);
+  setIfDefined(wire, 'sample_rate', config.sampleRate);
+  setIfDefined(wire, 'audio_format', config.audioFormat);
+  // Top-level egress rate is `speaking_rate` on TTSWebSocketConfig; accept the
+  // `speakingRate` field or fall back to the `speed` alias.
+  setIfDefined(wire, 'speaking_rate', config.speakingRate ?? config.speed);
+  setIfDefined(wire, 'audio_out_chunk_ms', config.audioOutChunkMs);
+  setIfDefined(wire, 'client_playback_rate', config.clientPlaybackRate);
+  // D8 downlink transport codec: `opus` → the gateway encodes each TTS PCM chunk to one opus packet
+  // per binary frame; the SDK decodes before playout. Only set when the SDK can decode opus; the
+  // gateway echoes the effective codec in `ready` and degrades to linear16 if it can't.
+  setIfDefined(wire, 'audio_out_codec', config.audioOutCodec);
+  setIfDefined(wire, 'connection_timeout', config.connectionTimeout);
+  setIfDefined(wire, 'request_timeout', config.requestTimeout);
+  setIfDefined(wire, 'api_key', config.apiKey);
 
-  // Emotion settings (Unified Emotion System)
-  if (config.emotion !== undefined) {
-    wire.emotion = config.emotion;
-  }
-  if (config.emotionIntensity !== undefined) {
-    wire.emotion_intensity = config.emotionIntensity;
-  }
-  if (config.deliveryStyle !== undefined) {
-    wire.delivery_style = config.deliveryStyle;
-  }
-  if (config.emotionDescription !== undefined) {
-    wire.emotion_description = config.emotionDescription;
+  if (config.pronunciations !== undefined) {
+    wire.pronunciations = config.pronunciations.map((p) => ({ from: p.from, to: p.to }));
   }
 
-  // Hume-specific settings
-  if (config.actingInstructions !== undefined) {
-    wire.acting_instructions = config.actingInstructions;
-  }
-  if (config.voiceDescription !== undefined) {
-    wire.voice_description = config.voiceDescription;
-  }
-  if (config.trailingSilence !== undefined) {
-    wire.trailing_silence = config.trailingSilence;
-  }
-  if (config.instantMode !== undefined) {
-    wire.instant_mode = config.instantMode;
-  }
+  // Emotion settings (Unified Emotion System).
+  setIfDefined(wire, 'emotion', config.emotion);
+  setIfDefined(wire, 'emotion_intensity', config.emotionIntensity);
+  setIfDefined(wire, 'delivery_style', config.deliveryStyle);
+  setIfDefined(wire, 'emotion_description', config.emotionDescription);
+
+  // Nested canonical features.
+  const featuresWire = ttsFeaturesToWire(config);
+  if (featuresWire) wire.features = featuresWire;
+
+  // Hume-only knobs with no canonical TtsFeatures field → extras passthrough.
+  const extras: Record<string, unknown> = { ...(config.extras ?? {}) };
+  if (config.actingInstructions !== undefined && extras.acting_instructions === undefined) extras.acting_instructions = config.actingInstructions;
+  if (config.voiceDescription !== undefined && extras.voice_description === undefined) extras.voice_description = config.voiceDescription;
+  if (config.trailingSilence !== undefined && extras.trailing_silence === undefined) extras.trailing_silence = config.trailingSilence;
+  if (config.instantMode !== undefined && extras.instant_mode === undefined) extras.instant_mode = config.instantMode;
+  if (Object.keys(extras).length > 0) wire.extras = extras;
 
   return wire;
 }
@@ -269,30 +470,17 @@ function ttsConfigToWire(config: TTSConfig): Record<string, unknown> {
  * Convert LiveKit config to wire format
  */
 function livekitConfigToWire(config: LiveKitConfig): Record<string, unknown> {
-  return {
+  const wire: Record<string, unknown> = {
     room_name: config.roomName,
-    identity: config.identity,
-    name: config.name,
-    metadata: config.metadata,
   };
-}
-
-/**
- * Convert features to wire format
- */
-function featuresToWire(features: FeatureFlags): Record<string, unknown> {
-  return {
-    vad: features.vad,
-    noise_cancellation: features.noiseCancellation,
-    speaker_diarization: features.speakerDiarization,
-    interim_results: features.interimResults,
-    punctuation: features.punctuation,
-    profanity_filter: features.profanityFilter,
-    smart_format: features.smartFormat,
-    word_timestamps: features.wordTimestamps,
-    echo_cancellation: features.echoCancellation,
-    filler_words: features.fillerWords,
-  };
+  if (config.enableRecording !== undefined) wire.enable_recording = config.enableRecording;
+  if (config.waavParticipantIdentity !== undefined)
+    wire.waav_participant_identity = config.waavParticipantIdentity;
+  if (config.waavParticipantName !== undefined)
+    wire.waav_participant_name = config.waavParticipantName;
+  if (config.listenParticipants !== undefined)
+    wire.listen_participants = config.listenParticipants;
+  return wire;
 }
 
 /**
@@ -340,17 +528,13 @@ function fromWireFormat(wire: Record<string, unknown>): IncomingMessage {
       return pongFromWire(wire);
     case 'session_update':
       return sessionUpdateFromWire(wire);
-    case 'speaking_started':
-      return { type: 'speaking_started' };
-    case 'speaking_finished':
-      return { type: 'speaking_finished' };
-    case 'listening_started':
-      return { type: 'listening_started' };
-    case 'listening_stopped':
-      return { type: 'listening_stopped' };
+    case 'config_warning':
+      return configWarningFromWire(wire);
     default:
-      // Return generic message for unknown types
-      return { type, ...wire } as IncomingMessage;
+      // Return generic message for unknown types (e.g. tts_playback_complete,
+      // message, participant_disconnected, sip_transfer_error). These already
+      // arrive in the gateway's snake_case wire shape, so pass them through.
+      return { ...wire, type } as IncomingMessage;
   }
 }
 
@@ -358,62 +542,92 @@ function fromWireFormat(wire: Record<string, unknown>): IncomingMessage {
  * Convert ready message from wire format
  */
 function readyFromWire(wire: Record<string, unknown>): ReadyMessage {
-  return {
+  // Gateway wire shape (handlers/ws/messages.rs OutgoingMessage::Ready):
+  // { type, protocol_version, stream_id, livekit_room_name?, livekit_url?,
+  //   waav_participant_identity?, waav_participant_name? }
+  const msg: ReadyMessage = {
     type: 'ready',
-    sessionId: asString(wire.session_id),
-    sttReady: asBoolean(wire.stt_ready),
-    ttsReady: asBoolean(wire.tts_ready),
-    livekitConnected: asBoolean(wire.livekit_connected),
-    serverVersion: asString(wire.server_version),
-    capabilities: asStringArray(wire.capabilities),
+    stream_id: asStringRequired(wire.stream_id, 'stream_id'),
+    protocol_version: asString(wire.protocol_version),
   };
+  const livekitRoomName = asString(wire.livekit_room_name);
+  if (livekitRoomName !== undefined) msg.livekit_room_name = livekitRoomName;
+  const livekitUrl = asString(wire.livekit_url);
+  if (livekitUrl !== undefined) msg.livekit_url = livekitUrl;
+  const pId = asString(wire.waav_participant_identity);
+  if (pId !== undefined) msg.waav_participant_identity = pId;
+  const pName = asString(wire.waav_participant_name);
+  if (pName !== undefined) msg.waav_participant_name = pName;
+  // P3: the resolved-alias echo — the concrete providers the gateway resolved an
+  // `alias` to (no secrets), so a developer can SEE what e.g. "support-bot" became.
+  if (wire.resolved_alias && typeof wire.resolved_alias === 'object') {
+    msg.resolved_alias = wire.resolved_alias as ResolvedAlias;
+  }
+  // D8: the negotiated transport codecs actually in effect (present only when the client requested a
+  // non-default codec) — lets the SDK detect a downgrade and send/decode the right format.
+  const audioInCodec = asString(wire.audio_in_codec);
+  if (audioInCodec !== undefined) msg.audio_in_codec = audioInCodec;
+  const audioOutCodec = asString(wire.audio_out_codec);
+  if (audioOutCodec !== undefined) msg.audio_out_codec = audioOutCodec;
+  return msg;
 }
 
 /**
  * Convert STT result message from wire format
  */
 function sttResultFromWire(wire: Record<string, unknown>): STTResultMessage {
-  // Safely parse words array with validation
-  let words: STTResultMessage['words'];
-  if (Array.isArray(wire.words)) {
-    words = wire.words
-      .filter((w): w is Record<string, unknown> => w !== null && typeof w === 'object')
-      .map((w) => ({
-        word: asStringRequired(w.word, 'word.word'),
-        start: asNumberRequired(w.start, 'word.start'),
-        end: asNumberRequired(w.end, 'word.end'),
-        confidence: asNumber(w.confidence),
-        speakerId: asNumber(w.speaker_id),
-      }));
-  }
-
-  return {
+  // Gateway wire shape (handlers/ws/messages.rs OutgoingMessage::STTResult):
+  // { type, transcript, is_final, is_speech_final, confidence, segment_transcript? }
+  // NOTE: the field is `transcript`, NOT `text` — reading `text` was the bug that
+  // made every transcript come back empty.
+  const msg: STTResultMessage = {
     type: 'stt_result',
-    text: asStringRequired(wire.text, 'text'),
-    isFinal: asBooleanRequired(wire.is_final, 'is_final'),
-    confidence: asNumber(wire.confidence),
-    speakerId: asNumber(wire.speaker_id),
-    language: asString(wire.language),
-    startTime: asNumber(wire.start_time),
-    endTime: asNumber(wire.end_time),
-    words,
-    channelIndex: asNumber(wire.channel_index),
+    transcript: asStringRequired(wire.transcript, 'transcript'),
+    is_final: asBooleanRequired(wire.is_final, 'is_final'),
+    is_speech_final: asBooleanRequired(wire.is_speech_final, 'is_speech_final'),
+    confidence: asNumberRequired(wire.confidence, 'confidence'),
   };
+  const segment = asString(wire.segment_transcript);
+  if (segment !== undefined) msg.segment_transcript = segment;
+  // P5: uniform translations:[{lang,text}] array, folded onto the transcript by
+  // the gateway (Speechmatics/Gladia/OpenAI-EN). Absent on non-translation sessions.
+  if (Array.isArray(wire.translations)) {
+    const translations: Translation[] = [];
+    for (const raw of wire.translations) {
+      const rec = asRecord(raw);
+      if (!rec) continue;
+      const t: Translation = {
+        lang: asString(rec.lang, '') ?? '',
+        text: asString(rec.text, '') ?? '',
+      };
+      const isPartial = asBoolean(rec.is_partial);
+      if (isPartial !== undefined) t.is_partial = isPartial;
+      translations.push(t);
+    }
+    if (translations.length > 0) msg.translations = translations;
+  }
+  return msg;
 }
 
 /**
  * Convert TTS audio message from wire format
  */
 function ttsAudioFromWire(wire: Record<string, unknown>): TTSAudioMessage {
-  return {
+  const msg: TTSAudioMessage = {
     type: 'tts_audio',
     audio: asStringRequired(wire.audio, 'audio'), // Base64 encoded
-    format: asString(wire.format),
-    sampleRate: asNumber(wire.sample_rate),
-    duration: asNumber(wire.duration),
-    isFinal: asBoolean(wire.is_final),
-    sequence: asNumber(wire.sequence),
   };
+  const format = asString(wire.format);
+  if (format !== undefined) msg.format = format;
+  const sampleRate = asNumber(wire.sample_rate);
+  if (sampleRate !== undefined) msg.sample_rate = sampleRate;
+  const duration = asNumber(wire.duration);
+  if (duration !== undefined) msg.duration = duration;
+  const isFinal = asBoolean(wire.is_final);
+  if (isFinal !== undefined) msg.is_final = isFinal;
+  const sequence = asNumber(wire.sequence);
+  if (sequence !== undefined) msg.sequence = sequence;
+  return msg;
 }
 
 /**
@@ -433,11 +647,13 @@ function errorFromWire(wire: Record<string, unknown>): ErrorMessage {
  * Convert pong message from wire format
  */
 function pongFromWire(wire: Record<string, unknown>): PongMessage {
-  return {
+  const msg: PongMessage = {
     type: 'pong',
     timestamp: asNumberRequired(wire.timestamp, 'timestamp'),
-    serverTime: asNumber(wire.server_time),
   };
+  const serverTime = asNumber(wire.server_time);
+  if (serverTime !== undefined) msg.server_time = serverTime;
+  return msg;
 }
 
 /**
@@ -448,26 +664,61 @@ function sessionUpdateFromWire(wire: Record<string, unknown>): SessionUpdateMess
     type: 'session_update',
     field: asStringRequired(wire.field, 'field'),
     value: wire.value, // Any value type allowed
-    previousValue: wire.previous_value, // Any value type allowed
+    previous_value: wire.previous_value, // Any value type allowed
   };
 }
 
 /**
- * Create a config message
+ * Convert config_warning message from wire format. Gateway wire shape
+ * (handlers/ws/messages.rs OutgoingMessage::ConfigWarning):
+ * { type, code, message, detail? }. `detail` is arbitrary JSON.
+ */
+function configWarningFromWire(wire: Record<string, unknown>): ConfigWarningMessage {
+  const msg: ConfigWarningMessage = {
+    type: 'config_warning',
+    code: asStringRequired(wire.code, 'code'),
+    message: asStringRequired(wire.message, 'message'),
+  };
+  const detail = asRecord(wire.detail);
+  if (detail !== undefined) msg.detail = detail;
+  return msg;
+}
+
+/**
+ * Create a config message.
+ *
+ * `stt`/`tts`/`livekit`/`features` are positional for backward compatibility;
+ * the 1:1-mirror additions (dag / conversation / turnDetection / streamId /
+ * audio) are passed via the trailing `extra` options bag.
  */
 export function createConfigMessage(
   stt?: STTConfig,
   tts?: TTSConfig,
   livekit?: LiveKitConfig,
-  features?: FeatureFlags
+  features?: FeatureFlags,
+  extra?: {
+    dag?: DAGConfig;
+    conversation?: ConversationConfig;
+    turnDetection?: TurnDetectionConfig;
+    alias?: string;
+    streamId?: string;
+    audio?: boolean;
+  }
 ): SDKConfigMessage {
-  return {
+  const msg: SDKConfigMessage = {
     type: 'config',
     stt,
     tts,
     livekit,
     features,
   };
+  if (extra?.dag !== undefined) msg.dag = extra.dag;
+  if (extra?.conversation !== undefined) msg.conversation = extra.conversation;
+  if (extra?.turnDetection !== undefined) msg.turnDetection = extra.turnDetection;
+  if (extra?.alias !== undefined) msg.alias = extra.alias;
+  if (extra?.streamId !== undefined) msg.streamId = extra.streamId;
+  if (extra?.audio !== undefined) msg.audio = extra.audio;
+  return msg;
 }
 
 /**
@@ -490,36 +741,34 @@ export function createSpeakMessage(text: string, options?: {
 }
 
 /**
- * Create a ping message
+ * Create a clear message (barge-in / cancel current TTS playback).
+ * This is the gateway's `clear` op — the correct way to interrupt the bot.
  */
-export function createPingMessage(): OutgoingMessage {
-  return { type: 'ping' };
+export function createClearMessage(): ClearMessage {
+  return { type: 'clear' };
 }
 
 /**
- * Create an audio message marker
+ * Create an audio_end message (finalize).
+ * Tells the gateway the audio stream has ended so it flushes any pending
+ * transcript. This is the gateway's `audio_end` op.
  */
-export function createAudioMessage(): OutgoingMessage {
-  return { type: 'audio' };
+export function createAudioEndMessage(): OutgoingMessage {
+  return { type: 'audio_end' };
 }
 
 /**
- * Create a stop message
+ * Create a send_message (data-channel) message.
  */
-export function createStopMessage(): OutgoingMessage {
-  return { type: 'stop' };
-}
-
-/**
- * Create a flush message
- */
-export function createFlushMessage(): OutgoingMessage {
-  return { type: 'flush' };
-}
-
-/**
- * Create an interrupt message
- */
-export function createInterruptMessage(): OutgoingMessage {
-  return { type: 'interrupt' };
+export function createSendMessageMessage(
+  message: string,
+  role: string,
+  options?: { topic?: string; debug?: Record<string, unknown> }
+): SendMessageMessage {
+  return {
+    type: 'send_message',
+    message,
+    role,
+    ...options,
+  };
 }

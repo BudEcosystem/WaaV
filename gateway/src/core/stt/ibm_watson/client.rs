@@ -37,14 +37,23 @@ use std::time::Duration;
 use tokio::sync::{Mutex, Notify, RwLock, mpsc, oneshot};
 use tokio::time::{Instant, interval, timeout};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use url::form_urlencoded;
 
-use super::config::{IBM_IAM_URL, IbmWatsonSTTConfig};
+use super::config::IbmWatsonSTTConfig;
 use super::messages::{IbmWatsonMessage, StopMessage};
+use crate::core::resilience::connect::with_timeout;
 use crate::core::stt::base::{
     BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback,
 };
+use crate::core::websocket::ReconnectionConfig;
+use crate::core::websocket::reconnectable_stream::{
+    ReconnectOutcome, ReconnectableStream, ReconnectableStreamConfig, RestoreError, StreamError,
+    WsTransport,
+};
+use futures::stream::{SplitSink, SplitStream};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 // =============================================================================
 // Constants
@@ -53,6 +62,215 @@ use crate::core::stt::base::{
 /// Per-message idle timeout for WebSocket message reception.
 /// Resets after each successful message. Catches stuck/dead connections.
 const WS_MESSAGE_TIMEOUT: Duration = Duration::from_secs(60);
+
+fn ibm_stt_http_client() -> Result<reqwest::Client, reqwest::Error> {
+    crate::core::net::ssrf_protected_client_builder(crate::core::net::HTTP_URL_SCHEMES)
+        .timeout(Duration::from_secs(30))
+        .connect_timeout(Duration::from_secs(10))
+        .pool_max_idle_per_host(4)
+        .pool_idle_timeout(Duration::from_secs(90))
+        .build()
+}
+
+/// The concrete WebSocket stream type IBM Watson dials.
+type IbmWatsonWs = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// A [`WsTransport`] that adapts IBM Watson's USP-style streaming event loop to the generic
+/// [`ReconnectableStream`] supervisor (W-D1 fleet adoption). One is built per (re)connect by the
+/// supervisor's `connect` closure.
+///
+/// Like Azure (and unlike ElevenLabs' all-in-the-URL handshake), IBM Watson carries its featured
+/// session in a **post-handshake `start` JSON message** (interim results, word timestamps, speaker
+/// labels, smart formatting, redaction, keywords, …) and then waits for a `listening` state frame.
+/// So [`restore_session`](WsTransport::restore_session) re-sends that `start` message and re-waits
+/// for `listening` on the fresh socket — without it a reconnect would resume as a *bare*
+/// (un-featured) recognition session, exactly the failure mode the supervisor doc warns about.
+/// [`run`](WsTransport::run) IS the original `select!` loop, now returning a [`ReconnectOutcome`]
+/// so a mid-stream transport drop reconnects instead of ending the session.
+struct IbmWatsonTransport {
+    ws_sink: SplitSink<IbmWatsonWs, Message>,
+    ws_stream: SplitStream<IbmWatsonWs>,
+    /// Shared inbound audio receiver (single-consumer; locked for the duration of `run`).
+    audio_rx: Arc<Mutex<mpsc::Receiver<Bytes>>>,
+    /// Shared shutdown token (an intentional close must not reconnect).
+    shutdown_token: CancellationToken,
+    result_tx: mpsc::Sender<STTResult>,
+    error_tx: mpsc::Sender<STTError>,
+    /// Fires once after the featured session is (re)established (we saw `listening`), unblocking
+    /// `start_connection`.
+    connected_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    /// Connection-ready flag mirrored from the client so `is_ready` flips false on a transport drop.
+    connected_flag: Arc<AtomicBool>,
+    /// The featured `start` message body, re-sent on every restore so reconnects keep the
+    /// configured recognition features.
+    start_message: serde_json::Value,
+    interim_results_enabled: bool,
+    /// Wall clock of the last audio chunk, for the keep-alive silence frames.
+    last_audio_time: Instant,
+}
+
+impl IbmWatsonTransport {
+    async fn shutdown_gracefully(
+        ws_sink: &mut SplitSink<IbmWatsonWs, Message>,
+    ) -> ReconnectOutcome {
+        let stop_message = StopMessage::new();
+        if let Ok(stop_json) = serde_json::to_string(&stop_message) {
+            let _ = ws_sink.send(Message::Text(stop_json.into())).await;
+        }
+        let _ = ws_sink.send(Message::Close(None)).await;
+        ReconnectOutcome::Completed
+    }
+}
+
+#[async_trait::async_trait]
+impl WsTransport for IbmWatsonTransport {
+    async fn restore_session(&mut self) -> Result<(), RestoreError> {
+        // IBM Watson USP: re-send the featured `start` message, then wait for the `listening`
+        // state frame. This is the featured-session restore — a reconnect must NOT resume as a
+        // bare session.
+        let start_json = serde_json::to_string(&self.start_message)
+            .map_err(|e| RestoreError::new(format!("failed to serialize start message: {e}")))?;
+        self.ws_sink
+            .send(Message::Text(start_json.into()))
+            .await
+            .map_err(|e| RestoreError::new(format!("failed to send IBM Watson start: {e}")))?;
+        debug!("Sent start message to IBM Watson");
+
+        // Wait for the "listening" state message that confirms the featured session is live.
+        let listen_ok = timeout(Duration::from_secs(10), async {
+            while let Some(msg) = self.ws_stream.next().await {
+                if let Ok(Message::Text(text)) = msg
+                    && let Ok(IbmWatsonMessage::Listening(_)) = IbmWatsonMessage::parse(&text)
+                {
+                    return true;
+                }
+            }
+            false
+        })
+        .await;
+
+        match listen_ok {
+            Ok(true) => {
+                self.connected_flag.store(true, Ordering::Release);
+                // The featured session is established: signal the waiting connect() exactly once.
+                if let Some(tx) = self.connected_tx.lock().await.take() {
+                    let _ = tx.send(());
+                }
+                self.last_audio_time = Instant::now();
+                Ok(())
+            }
+            _ => Err(RestoreError::new(
+                "did not receive listening state from IBM Watson",
+            )),
+        }
+    }
+
+    async fn run(&mut self) -> ReconnectOutcome {
+        let shutdown_token = self.shutdown_token.clone();
+        if shutdown_token.is_cancelled() {
+            info!("Received shutdown signal for IBM Watson STT");
+            return Self::shutdown_gracefully(&mut self.ws_sink).await;
+        }
+        let mut audio_rx = self.audio_rx.lock().await;
+        let mut keepalive_timer = interval(Duration::from_secs(5));
+        loop {
+            tokio::select! {
+                // Prioritize audio sending for lowest latency
+                biased;
+
+                // Handle outgoing audio data
+                Some(audio_data) = audio_rx.recv() => {
+                    // IBM Watson expects raw audio as binary WebSocket frames
+                    let message = Message::Binary(audio_data);
+                    if let Err(e) = self.ws_sink.send(message).await {
+                        let stt_error = STTError::NetworkError(format!(
+                            "Failed to send audio to IBM Watson: {e}"
+                        ));
+                        error!("{}", stt_error);
+                        let _ = self.error_tx.try_send(stt_error);
+                        // Transport-level send failure: reconnect to preserve the session.
+                        return ReconnectOutcome::Reconnectable(StreamError::new("audio send failed"));
+                    }
+                    self.last_audio_time = Instant::now();
+                }
+
+                // Handle incoming messages with idle timeout
+                message = timeout(WS_MESSAGE_TIMEOUT, self.ws_stream.next()) => {
+                    match message {
+                        Ok(Some(Ok(msg))) => {
+                            match IbmWatsonSTT::handle_websocket_message(
+                                msg,
+                                &self.result_tx,
+                                &self.error_tx,
+                                self.interim_results_enabled,
+                            ) {
+                                Ok(should_close) => {
+                                    if should_close {
+                                        // A provider `Close` frame or critical error: the session is
+                                        // intentionally over — do NOT reconnect.
+                                        info!("IBM Watson signalled end-of-session");
+                                        return ReconnectOutcome::Completed;
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("IBM Watson message handling error: {}", e);
+                                    let _ = self.error_tx.try_send(e);
+                                    // A provider-level error frame is typically fatal (bad config) —
+                                    // don't hammer it with reconnects.
+                                    return ReconnectOutcome::Fatal(StreamError::new("provider error frame"));
+                                }
+                            }
+                        }
+                        Ok(Some(Err(e))) => {
+                            let stt_error = STTError::NetworkError(format!("WebSocket error: {e}"));
+                            error!("{}", stt_error);
+                            let _ = self.error_tx.try_send(stt_error);
+                            return ReconnectOutcome::Reconnectable(StreamError::new("websocket error"));
+                        }
+                        Ok(None) => {
+                            info!("IBM Watson WebSocket stream ended");
+                            return ReconnectOutcome::Reconnectable(StreamError::new("stream ended"));
+                        }
+                        Err(_elapsed) => {
+                            let stt_error = STTError::NetworkError(
+                                "WebSocket idle timeout - no message for 60 seconds".into()
+                            );
+                            error!("IBM Watson STT idle timeout: {}", stt_error);
+                            let _ = self.error_tx.try_send(stt_error);
+                            return ReconnectOutcome::Reconnectable(StreamError::new("idle timeout"));
+                        }
+                    }
+                }
+
+                // Handle keep-alive timer
+                _ = keepalive_timer.tick() => {
+                    // Send silence frames to prevent timeout
+                    if self.last_audio_time.elapsed() >= Duration::from_secs(10) {
+                        // Send a small buffer of silence (32 samples at 16kHz = 2ms)
+                        let silence_frame = vec![0u8; 64];
+                        let message = Message::Binary(silence_frame.into());
+                        if let Err(e) = self.ws_sink.send(message).await {
+                            let stt_error = STTError::NetworkError(format!(
+                                "Failed to send keep-alive: {e}"
+                            ));
+                            error!("{}", stt_error);
+                            let _ = self.error_tx.try_send(stt_error);
+                            return ReconnectOutcome::Reconnectable(StreamError::new("keepalive send failed"));
+                        }
+                        debug!("Sent keep-alive silence frame to IBM Watson");
+                        self.last_audio_time = Instant::now();
+                    }
+                }
+
+                // Handle shutdown signal (intentional close — must NOT reconnect)
+                _ = shutdown_token.cancelled() => {
+                    info!("Received shutdown signal for IBM Watson STT");
+                    return Self::shutdown_gracefully(&mut self.ws_sink).await;
+                }
+            }
+        }
+    }
+}
 
 // =============================================================================
 // Type Aliases
@@ -101,23 +319,16 @@ struct IamTokenResponse {
 }
 
 /// Fetch IAM access token from IBM Cloud using API key.
-async fn fetch_iam_token(api_key: &str) -> Result<IamToken, STTError> {
-    // Create client with explicit timeouts to prevent indefinite hangs
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .connect_timeout(Duration::from_secs(10))
-        .pool_max_idle_per_host(4) // Limit connection pool size
-        .pool_idle_timeout(Duration::from_secs(90)) // Close idle connections after 90s
-        .build()
-        .map_err(|e| {
-            STTError::AuthenticationFailed(format!("Failed to create HTTP client: {e}"))
-        })?;
+async fn fetch_iam_token(api_key: &str, iam_url: &str) -> Result<IamToken, STTError> {
+    let client = ibm_stt_http_client().map_err(|e| {
+        STTError::AuthenticationFailed(format!("Failed to create HTTP client: {e}"))
+    })?;
 
     // URL-encode the API key
     let encoded_api_key: String = form_urlencoded::byte_serialize(api_key.as_bytes()).collect();
 
     let response = client
-        .post(IBM_IAM_URL)
+        .post(iam_url)
         .header("Content-Type", "application/x-www-form-urlencoded")
         .body(format!(
             "grant_type=urn:ibm:params:oauth:grant-type:apikey&apikey={}",
@@ -244,8 +455,8 @@ pub struct IbmWatsonSTT {
     /// Uses bounded channel (32 items) for backpressure.
     ws_sender: Option<mpsc::Sender<Bytes>>,
 
-    /// Shutdown signal sender.
-    shutdown_tx: Option<oneshot::Sender<()>>,
+    /// Shutdown token shared with supervised transports.
+    shutdown_token: Option<CancellationToken>,
 
     /// Result channel sender.
     result_tx: Option<mpsc::Sender<STTResult>>,
@@ -273,6 +484,18 @@ pub struct IbmWatsonSTT {
 
     /// Connection ready flag for atomic checks.
     connected: Arc<AtomicBool>,
+
+    /// Intentional-disconnect flag shared with the reconnect supervisor (W-D1). Cleared on
+    /// `connect()`, set in `disconnect()` before cancelling the shutdown token, so a client close
+    /// racing a server-side close can never trigger a spurious reconnect.
+    intentional_disconnect: Arc<AtomicBool>,
+
+    /// Shared, process-global resilience handles (W-D2): the single reconnect governor + this
+    /// provider's shared circuit breaker, injected by the VoiceManager from CoreState and driven
+    /// by the generic [`ReconnectableStream`](crate::core::websocket::ReconnectableStream)
+    /// supervisor. `None` before `set_resilience` (a direct unit-test construction) → the
+    /// supervisor uses its own per-session governor/breaker default.
+    resilience: Option<crate::core::resilience::ResilienceHandles>,
 }
 
 impl Default for IbmWatsonSTT {
@@ -282,7 +505,7 @@ impl Default for IbmWatsonSTT {
             state: ConnectionState::Disconnected,
             state_notify: Arc::new(Notify::new()),
             ws_sender: None,
-            shutdown_tx: None,
+            shutdown_token: None,
             result_tx: None,
             error_tx: None,
             connection_handle: None,
@@ -292,11 +515,49 @@ impl Default for IbmWatsonSTT {
             error_callback: Arc::new(Mutex::new(None)),
             iam_token: Arc::new(RwLock::new(None)),
             connected: Arc::new(AtomicBool::new(false)),
+            intentional_disconnect: Arc::new(AtomicBool::new(false)),
+            resilience: None,
         }
     }
 }
 
 impl IbmWatsonSTT {
+    /// W1 keystone — construct directly from the standardized config so IBM Watson's rich feature
+    /// surface (interim results, word timestamps, speaker diarization, smart formatting, profanity
+    /// filtering, redaction) and its non-standard `instance_id` (via `extras`) are honored
+    /// END-TO-END. Mirrors `DeepgramSTT::new_standard`: the api_key is checked first, then the
+    /// provider is built from `IbmWatsonSTTConfig::from_standard`.
+    pub fn new_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        if std.base.api_key.is_empty() {
+            return Err(STTError::AuthenticationFailed(
+                "IBM Watson API key is required".to_string(),
+            ));
+        }
+        let ibm_config =
+            IbmWatsonSTTConfig::from_standard(std).map_err(STTError::ConfigurationError)?;
+
+        Ok(Self {
+            config: Some(ibm_config),
+            state: ConnectionState::Disconnected,
+            state_notify: Arc::new(Notify::new()),
+            ws_sender: None,
+            shutdown_token: None,
+            result_tx: None,
+            error_tx: None,
+            connection_handle: None,
+            result_forward_handle: None,
+            error_forward_handle: None,
+            result_callback: Arc::new(Mutex::new(None)),
+            error_callback: Arc::new(Mutex::new(None)),
+            iam_token: Arc::new(RwLock::new(None)),
+            connected: Arc::new(AtomicBool::new(false)),
+            intentional_disconnect: Arc::new(AtomicBool::new(false)),
+            resilience: None,
+        })
+    }
+
     /// Set the IBM Cloud instance ID.
     ///
     /// The instance ID is found in your IBM Cloud service credentials.
@@ -316,10 +577,10 @@ impl IbmWatsonSTT {
 
     /// Get the current IAM token, refreshing if necessary.
     async fn get_access_token(&self) -> Result<String, STTError> {
-        let api_key = self
+        let (api_key, iam_url) = self
             .config
             .as_ref()
-            .map(|c| c.base.api_key.clone())
+            .map(|c| (c.base.api_key.clone(), c.iam_url()))
             .ok_or_else(|| {
                 STTError::ConfigurationError("No configuration available".to_string())
             })?;
@@ -327,15 +588,15 @@ impl IbmWatsonSTT {
         // Check if we have a valid cached token
         {
             let token_guard = self.iam_token.read().await;
-            if let Some(token) = token_guard.as_ref() {
-                if !token.is_expired() {
-                    return Ok(token.access_token.clone());
-                }
+            if let Some(token) = token_guard.as_ref()
+                && !token.is_expired()
+            {
+                return Ok(token.access_token.clone());
             }
         }
 
         // Need to fetch a new token
-        let new_token = fetch_iam_token(&api_key).await?;
+        let new_token = fetch_iam_token(&api_key, &iam_url).await?;
         let access_token = new_token.access_token.clone();
 
         // Cache the new token
@@ -371,12 +632,11 @@ impl IbmWatsonSTT {
                                     continue;
                                 }
 
-                                if let Some(stt_result) = result.to_stt_result() {
-                                    if !stt_result.transcript.is_empty() {
-                                        if result_tx.try_send(stt_result).is_err() {
-                                            warn!("Failed to send result - channel closed");
-                                        }
-                                    }
+                                if let Some(stt_result) = result.to_stt_result()
+                                    && !stt_result.transcript.is_empty()
+                                    && result_tx.try_send(stt_result).is_err()
+                                {
+                                    warn!("Failed to send result - channel closed");
                                 }
                             }
                         }
@@ -458,6 +718,9 @@ impl IbmWatsonSTT {
                 "IBM Watson instance_id is required. Set it using set_instance_id()".to_string(),
             ));
         }
+        config
+            .validate_endpoint_override()
+            .map_err(STTError::ConfigurationError)?;
 
         // Get access token
         let access_token = self.get_access_token().await?;
@@ -466,8 +729,8 @@ impl IbmWatsonSTT {
         let ws_url = config.build_websocket_url(&access_token);
 
         // Create channels for communication
-        let (ws_tx, mut ws_rx) = mpsc::channel::<Bytes>(32);
-        let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+        let (ws_tx, ws_rx) = mpsc::channel::<Bytes>(32);
+        let shutdown_token = CancellationToken::new();
         // Bounded channels for backpressure - 256 should handle bursts while preventing memory exhaustion
         let (result_tx, mut result_rx) = mpsc::channel::<STTResult>(256);
         let (error_tx, mut error_rx) = mpsc::channel::<STTError>(64);
@@ -475,7 +738,7 @@ impl IbmWatsonSTT {
 
         // Store channels
         self.ws_sender = Some(ws_tx);
-        self.shutdown_tx = Some(shutdown_tx);
+        self.shutdown_token = Some(shutdown_token.clone());
         self.result_tx = Some(result_tx.clone());
         self.error_tx = Some(error_tx.clone());
 
@@ -484,198 +747,108 @@ impl IbmWatsonSTT {
         let interim_results_enabled = config.interim_results;
         let connected_flag = self.connected.clone();
 
-        // Start the connection task
+        // Shared state the supervised transport re-uses across reconnect attempts: a single-
+        // consumer audio receiver, shutdown token, and the one-shot connected signal that fires
+        // after the featured session (start + listening) is restored.
+        let audio_rx = Arc::new(Mutex::new(ws_rx));
+        let connected_tx = Arc::new(Mutex::new(Some(connected_tx)));
+
+        // Storm control + provider breaker: drive the GENERIC ReconnectableStream supervisor (the
+        // same one the chaos tests exercise) with the shared process-global handles from CoreState
+        // (W-D1/W-D2 fleet adoption). When no handles were injected (a direct unit-test
+        // construction), the supervisor uses its own per-session governor/breaker default.
+        let reconnection = ReconnectionConfig::aggressive();
+        let disconnect_flag = Arc::clone(&self.intentional_disconnect);
+        let supervisor = match self.resilience.clone() {
+            Some(r) => ReconnectableStream::with_breaker_and_governor(
+                ReconnectableStreamConfig::new("ibm_watson", reconnection),
+                r.breaker,
+                (*r.governor).clone(),
+            ),
+            None => {
+                ReconnectableStream::new(ReconnectableStreamConfig::new("ibm_watson", reconnection))
+            }
+        }
+        .with_disconnect_flag(disconnect_flag);
+
+        // Start the connection task: the supervisor owns the outer reconnect loop; the `connect`
+        // closure dials the (token-bearing) URL and hands back a transport whose `restore_session`
+        // re-sends the featured `start` message and re-waits for `listening`, and whose `run()` is
+        // the original IBM Watson event loop.
         let connection_handle = tokio::spawn(async move {
-            // Connect to IBM Watson with timeout
-            let connect_result =
-                match timeout(Duration::from_secs(30), connect_async(&ws_url)).await {
-                    Ok(result) => result,
-                    Err(_) => {
-                        let stt_error = STTError::ConnectionFailed(
-                            "Connection to IBM Watson timed out after 30 seconds".to_string(),
-                        );
-                        error!("{}", stt_error);
-                        let _ = error_tx.try_send(stt_error);
-                        return;
-                    }
-                };
-
-            let (ws_stream, _response) = match connect_result {
-                Ok(result) => result,
-                Err(e) => {
-                    let error_msg = format!("Failed to connect to IBM Watson: {e}");
-                    let stt_error = if error_msg.contains("401")
-                        || error_msg.contains("Unauthorized")
-                    {
-                        STTError::AuthenticationFailed(
-                            "IBM Watson authentication failed. Check API key and instance ID."
-                                .to_string(),
-                        )
-                    } else if error_msg.contains("403") || error_msg.contains("Forbidden") {
-                        STTError::AuthenticationFailed(
-                            "IBM Watson access forbidden. Check service permissions.".to_string(),
-                        )
-                    } else {
-                        STTError::ConnectionFailed(error_msg)
-                    };
-                    error!("{}", stt_error);
-                    let _ = error_tx.try_send(stt_error);
-                    return;
-                }
-            };
-
-            info!("Connected to IBM Watson Speech-to-Text WebSocket");
-
-            let (mut ws_sink, mut ws_stream) = ws_stream.split();
-
-            // Send start message to configure recognition
-            let start_json = serde_json::to_string(&start_message).unwrap();
-            if let Err(e) = ws_sink.send(Message::Text(start_json.into())).await {
-                let stt_error =
-                    STTError::ConnectionFailed(format!("Failed to send start message: {e}"));
-                error!("{}", stt_error);
-                let _ = error_tx.try_send(stt_error);
-                return;
-            }
-
-            debug!("Sent start message to IBM Watson");
-
-            // Wait for "listening" state message
-            let listen_timeout = timeout(Duration::from_secs(10), async {
-                while let Some(msg) = ws_stream.next().await {
-                    if let Ok(Message::Text(text)) = msg {
-                        if let Ok(IbmWatsonMessage::Listening(_)) = IbmWatsonMessage::parse(&text) {
-                            return true;
-                        }
-                    }
-                }
-                false
-            })
-            .await;
-
-            match listen_timeout {
-                Ok(true) => {
-                    // Successfully received listening state
-                    connected_flag.store(true, Ordering::Release);
-                    let _ = connected_tx.send(());
-                }
-                _ => {
-                    let stt_error = STTError::ConnectionFailed(
-                        "Did not receive listening state from IBM Watson".to_string(),
-                    );
-                    error!("{}", stt_error);
-                    let _ = error_tx.try_send(stt_error);
-                    return;
-                }
-            }
-
-            // Keep-alive mechanism
-            let mut keepalive_timer = interval(Duration::from_secs(5));
-            let mut last_audio_time = Instant::now();
-
-            // Main event loop
-            loop {
-                tokio::select! {
-                    // Prioritize audio sending for lowest latency
-                    biased;
-
-                    // Handle outgoing audio data
-                    Some(audio_data) = ws_rx.recv() => {
-                        // IBM Watson expects raw audio as binary WebSocket frames
-                        let message = Message::Binary(audio_data);
-                        if let Err(e) = ws_sink.send(message).await {
-                            let stt_error = STTError::NetworkError(format!(
-                                "Failed to send audio to IBM Watson: {e}"
-                            ));
-                            error!("{}", stt_error);
-                            let _ = error_tx.try_send(stt_error);
-                            break;
-                        }
-                        last_audio_time = Instant::now();
-                    }
-
-                    // Handle incoming messages with idle timeout
-                    message = timeout(WS_MESSAGE_TIMEOUT, ws_stream.next()) => {
-                        match message {
-                            Ok(Some(Ok(msg))) => {
-                                match Self::handle_websocket_message(
-                                    msg,
-                                    &result_tx,
-                                    &error_tx,
-                                    interim_results_enabled,
-                                ) {
-                                    Ok(should_close) => {
-                                        if should_close {
-                                            break;
-                                        }
-                                    }
-                                    Err(e) => {
-                                        error!("IBM Watson message handling error: {}", e);
-                                        let _ = error_tx.try_send(e);
-                                        break;
-                                    }
+            let exit = supervisor
+                .run(|| {
+                    let ws_url = ws_url.clone();
+                    let start_message = start_message.clone();
+                    let audio_rx = Arc::clone(&audio_rx);
+                    let shutdown_token = shutdown_token.clone();
+                    let connected_tx = Arc::clone(&connected_tx);
+                    let connected_flag = connected_flag.clone();
+                    let result_tx = result_tx.clone();
+                    let error_tx = error_tx.clone();
+                    async move {
+                        // Connect to IBM Watson with timeout. Classify auth failures as Fatal-ish
+                        // dial errors via the error message (the supervisor records the dial failure
+                        // and backs off; a persistent 401 exhausts rather than loops forever).
+                        // Deadline-bounded dial via the shared resilience helper. IBM keeps its
+                        // historical 30s bound (looser than the canonical 15s
+                        // `core::resilience::connect::WS_CONNECT_TIMEOUT`).
+                        let connect_result =
+                            match with_timeout(Duration::from_secs(30), connect_async(&ws_url)).await
+                            {
+                                Ok(result) => result,
+                                Err(_) => {
+                                    return Err(StreamError::new(
+                                        "Connection to IBM Watson timed out after 30 seconds",
+                                    ));
                                 }
-                            }
-                            Ok(Some(Err(e))) => {
-                                let stt_error = STTError::NetworkError(format!(
-                                    "WebSocket error: {e}"
-                                ));
+                            };
+
+                        let (ws_stream, _response) = match connect_result {
+                            Ok(result) => result,
+                            Err(e) => {
+                                let error_msg = format!("Failed to connect to IBM Watson: {e}");
+                                let stt_error = if error_msg.contains("401")
+                                    || error_msg.contains("Unauthorized")
+                                {
+                                    STTError::AuthenticationFailed(
+                                        "IBM Watson authentication failed. Check API key and instance ID."
+                                            .to_string(),
+                                    )
+                                } else if error_msg.contains("403") || error_msg.contains("Forbidden") {
+                                    STTError::AuthenticationFailed(
+                                        "IBM Watson access forbidden. Check service permissions."
+                                            .to_string(),
+                                    )
+                                } else {
+                                    STTError::ConnectionFailed(error_msg.clone())
+                                };
                                 error!("{}", stt_error);
                                 let _ = error_tx.try_send(stt_error);
-                                break;
+                                return Err(StreamError::new(error_msg));
                             }
-                            Ok(None) => {
-                                info!("IBM Watson WebSocket stream ended");
-                                break;
-                            }
-                            Err(_elapsed) => {
-                                // Idle timeout - no message received for 60s
-                                let stt_error = STTError::NetworkError(
-                                    "WebSocket idle timeout - no message for 60 seconds".into()
-                                );
-                                error!("IBM Watson STT idle timeout: {}", stt_error);
-                                let _ = error_tx.try_send(stt_error);
-                                break;
-                            }
-                        }
-                    }
+                        };
 
-                    // Handle keep-alive timer
-                    _ = keepalive_timer.tick() => {
-                        // Send silence frames to prevent timeout
-                        if last_audio_time.elapsed() >= Duration::from_secs(10) {
-                            // Send a small buffer of silence (32 samples at 16kHz = 2ms)
-                            let silence_frame = vec![0u8; 64];
-                            let message = Message::Binary(silence_frame.into());
-                            if let Err(e) = ws_sink.send(message).await {
-                                let stt_error = STTError::NetworkError(format!(
-                                    "Failed to send keep-alive: {e}"
-                                ));
-                                error!("{}", stt_error);
-                                let _ = error_tx.try_send(stt_error);
-                                break;
-                            }
-                            debug!("Sent keep-alive silence frame to IBM Watson");
-                            last_audio_time = Instant::now();
-                        }
+                        info!("Connected to IBM Watson Speech-to-Text WebSocket");
+                        let (ws_sink, ws_stream) = ws_stream.split();
+                        Ok(IbmWatsonTransport {
+                            ws_sink,
+                            ws_stream,
+                            audio_rx,
+                            shutdown_token,
+                            result_tx,
+                            error_tx,
+                            connected_tx,
+                            connected_flag,
+                            start_message,
+                            interim_results_enabled,
+                            last_audio_time: Instant::now(),
+                        })
                     }
-
-                    // Handle shutdown signal
-                    _ = &mut shutdown_rx => {
-                        info!("Received shutdown signal for IBM Watson STT");
-                        // Send stop message to gracefully end recognition
-                        let stop_message = StopMessage::new();
-                        if let Ok(stop_json) = serde_json::to_string(&stop_message) {
-                            let _ = ws_sink.send(Message::Text(stop_json.into())).await;
-                        }
-                        let _ = ws_sink.send(Message::Close(None)).await;
-                        break;
-                    }
-                }
-            }
-
+                })
+                .await;
             connected_flag.store(false, Ordering::Release);
-            info!("IBM Watson STT WebSocket connection closed");
+            info!("IBM Watson STT WebSocket connection closed (supervisor exit: {exit:?})");
         });
 
         self.connection_handle = Some(connection_handle);
@@ -739,13 +912,20 @@ impl IbmWatsonSTT {
     pub fn get_ibm_config(&self) -> Option<&IbmWatsonSTTConfig> {
         self.config.as_ref()
     }
+
+    /// The shared circuit breaker this session feeds into the generic supervisor, if the
+    /// process-global resilience handles have been injected (W-D1/W-D2). Two `IbmWatsonSTT` built
+    /// from the same [`crate::core::resilience::ResilienceRegistry`] return the *same* `Arc`.
+    pub fn resilience_breaker(&self) -> Option<&Arc<crate::core::resilience::CircuitBreaker>> {
+        self.resilience.as_ref().map(|r| &r.breaker)
+    }
 }
 
 impl Drop for IbmWatsonSTT {
     fn drop(&mut self) {
-        // Send shutdown signal if still connected
-        if let Some(shutdown_tx) = self.shutdown_tx.take() {
-            let _ = shutdown_tx.send(());
+        self.intentional_disconnect.store(true, Ordering::SeqCst);
+        if let Some(shutdown_token) = self.shutdown_token.take() {
+            shutdown_token.cancel();
         }
     }
 }
@@ -773,7 +953,7 @@ impl BaseSTT for IbmWatsonSTT {
             state: ConnectionState::Disconnected,
             state_notify: Arc::new(Notify::new()),
             ws_sender: None,
-            shutdown_tx: None,
+            shutdown_token: None,
             result_tx: None,
             error_tx: None,
             connection_handle: None,
@@ -783,6 +963,8 @@ impl BaseSTT for IbmWatsonSTT {
             error_callback: Arc::new(Mutex::new(None)),
             iam_token: Arc::new(RwLock::new(None)),
             connected: Arc::new(AtomicBool::new(false)),
+            intentional_disconnect: Arc::new(AtomicBool::new(false)),
+            resilience: None,
         })
     }
 
@@ -794,30 +976,48 @@ impl BaseSTT for IbmWatsonSTT {
             ));
         }
 
+        // Fresh session: clear any intent left over from a prior disconnect so the supervisor
+        // does not immediately complete.
+        self.intentional_disconnect.store(false, Ordering::SeqCst);
+
         self.start_connection().await
     }
 
     async fn disconnect(&mut self) -> Result<(), STTError> {
-        // Send shutdown signal
-        if let Some(shutdown_tx) = self.shutdown_tx.take() {
-            let _ = shutdown_tx.send(());
+        // Record the intent BEFORE cancelling the shutdown token so the supervisor sees it even if
+        // the transport's run() just reported a reconnectable drop (the disconnect-vs-close race).
+        self.intentional_disconnect.store(true, Ordering::SeqCst);
+
+        if let Some(shutdown_token) = self.shutdown_token.take() {
+            shutdown_token.cancel();
         }
 
         // Wait for connection task to finish with timeout
         if let Some(handle) = self.connection_handle.take() {
-            let _ = timeout(Duration::from_secs(5), handle).await;
+            crate::core::observability::await_task_shutdown(
+                "ibm-watson-stt-connection",
+                handle,
+                Duration::from_secs(5),
+            )
+            .await;
         }
 
         // Clean up result forwarding task
         if let Some(handle) = self.result_forward_handle.take() {
-            handle.abort();
-            let _ = handle.await;
+            crate::core::observability::abort_and_await_task(
+                "ibm-watson-stt-result-forwarder",
+                handle,
+            )
+            .await;
         }
 
         // Clean up error forwarding task
         if let Some(handle) = self.error_forward_handle.take() {
-            handle.abort();
-            let _ = handle.await;
+            crate::core::observability::abort_and_await_task(
+                "ibm-watson-stt-error-forwarder",
+                handle,
+            )
+            .await;
         }
 
         // Clear all channels
@@ -936,6 +1136,26 @@ impl BaseSTT for IbmWatsonSTT {
                 .is_some_and(|c| c.split_transcript_at_phrase_end),
             low_latency: existing.as_ref().is_some_and(|c| c.low_latency),
             character_insertion_bias: existing.as_ref().and_then(|c| c.character_insertion_bias),
+            keywords: existing
+                .as_ref()
+                .map(|c| c.keywords.clone())
+                .unwrap_or_default(),
+            keywords_threshold: existing.as_ref().and_then(|c| c.keywords_threshold),
+            max_alternatives: existing.as_ref().and_then(|c| c.max_alternatives),
+            word_alternatives_threshold: existing
+                .as_ref()
+                .and_then(|c| c.word_alternatives_threshold),
+            customization_weight: existing.as_ref().and_then(|c| c.customization_weight),
+            base_model_version: existing.as_ref().and_then(|c| c.base_model_version.clone()),
+            grammar_name: existing.as_ref().and_then(|c| c.grammar_name.clone()),
+            audio_metrics: existing.as_ref().is_some_and(|c| c.audio_metrics),
+            processing_metrics: existing.as_ref().is_some_and(|c| c.processing_metrics),
+            processing_metrics_interval: existing
+                .as_ref()
+                .and_then(|c| c.processing_metrics_interval),
+            smart_formatting_version: existing.as_ref().and_then(|c| c.smart_formatting_version),
+            speech_begin_event: existing.as_ref().is_some_and(|c| c.speech_begin_event),
+            endpoint_override: existing.as_ref().and_then(|c| c.endpoint_override.clone()),
         };
 
         self.config = Some(ibm_config);
@@ -946,6 +1166,13 @@ impl BaseSTT for IbmWatsonSTT {
 
     fn get_provider_info(&self) -> &'static str {
         "IBM Watson Speech-to-Text"
+    }
+
+    fn set_resilience(&mut self, resilience: crate::core::resilience::ResilienceHandles) {
+        // Store the shared, process-global handles so `start_connection` drives the generic
+        // ReconnectableStream supervisor with them — every IBM Watson session trips the same breaker
+        // and shares the one process-wide reconnect cap (W-D2).
+        self.resilience = Some(resilience);
     }
 }
 
@@ -1035,5 +1262,84 @@ impl IbmWatsonSTT {
         }
 
         self.connect().await
+    }
+}
+
+#[cfg(test)]
+mod wd1_disconnect_tests {
+    use super::*;
+    use std::io::ErrorKind;
+
+    #[tokio::test]
+    async fn ibm_watson_stt_redirect_policy_rejects_private_hop() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) => {
+                if err.kind() == ErrorKind::PermissionDenied {
+                    eprintln!("Skipping ibm_watson_stt_redirect_policy_rejects_private_hop: {err}");
+                    return;
+                }
+                panic!("Failed to bind redirect test server listener: {err}");
+            }
+        };
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 302 Found\r\n",
+                "Location: http://127.0.0.1:9/metadata\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n"
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+
+        let err = ibm_stt_http_client()
+            .unwrap()
+            .get(format!("http://{addr}/start"))
+            .send()
+            .await
+            .expect_err("private redirect target must be rejected");
+        let mut error_chain = err.to_string();
+        let mut source = std::error::Error::source(&err);
+        while let Some(error) = source {
+            error_chain.push_str(": ");
+            error_chain.push_str(&error.to_string());
+            source = error.source();
+        }
+        assert!(
+            error_chain.contains("redirect URL rejected"),
+            "unexpected redirect error: {error_chain}"
+        );
+    }
+
+    // W-D1: disconnect() must record intent on the supervisor-shared flag so a client close racing
+    // a server-side close can never trigger a spurious reconnect (the supervisor's loop-top guard
+    // observes this same `Arc<AtomicBool>`). Before this wiring the flag was the supervisor's own
+    // and disconnect() never set it. Lives in `client` (not the sibling `tests` module) so it can
+    // read the private `intentional_disconnect` field.
+    #[tokio::test]
+    async fn disconnect_sets_intentional_flag_for_supervisor() {
+        let config = STTConfig {
+            provider: "ibm-watson".to_string(),
+            api_key: "test_key".to_string(),
+            language: "en-US".to_string(),
+            sample_rate: 16000,
+            ..Default::default()
+        };
+        let mut stt = <IbmWatsonSTT as BaseSTT>::new(config).unwrap();
+        assert!(!stt.intentional_disconnect.load(Ordering::SeqCst));
+        stt.disconnect().await.unwrap();
+        assert!(
+            stt.intentional_disconnect.load(Ordering::SeqCst),
+            "disconnect() must set the supervisor-shared intentional-disconnect flag",
+        );
     }
 }

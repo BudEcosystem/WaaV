@@ -2,25 +2,64 @@
  * BudClient - Main entry point for @bud-foundry/sdk
  */
 
-import { RestClient, type RestClientOptions } from './rest/client.js';
+import {
+  RestClient,
+  type RestClientOptions,
+  type BatchJob,
+  type BatchTranscribeOptions,
+} from './rest/client.js';
 import { BudSTT, type BudSTTConfig } from './pipelines/stt.js';
 import { BudTTS, type BudTTSConfig } from './pipelines/tts.js';
 import { BudTalk, type BudTalkConfig } from './pipelines/talk.js';
 import { BudTranscribe, type BudTranscribeConfig } from './pipelines/transcribe.js';
+import { AgentSession, type AgentConfig } from './pipelines/agent.js';
+import {
+  GatewayRealtime,
+  type GatewayRealtimeConfig,
+} from './pipelines/realtime-gateway.js';
 import { WebSocketSession, type SessionConfig } from './ws/session.js';
+import { ConnectGate, type ConnectGateConfig } from './ws/connect-gate.js';
 import type { FeatureFlags, DEFAULT_FEATURE_FLAGS } from './types/features.js';
 import type { MetricsSummary } from './types/metrics.js';
 import { getMetricsCollector, resetMetricsCollector } from './metrics/collector.js';
 import { SLOTracker } from './metrics/slo.js';
 import type { SLOThreshold, SLOStatus } from './types/metrics.js';
 
+/** Default gateway URL when neither config nor env provides one. */
+export const DEFAULT_GATEWAY_URL = 'http://127.0.0.1:3001';
+
+/** Env var the SDK reads for the gateway URL (e.g. ws://127.0.0.1:3001). */
+export const GATEWAY_URL_ENV = 'WAAV_GATEWAY_URL';
+
+/**
+ * Read the gateway URL from the environment (`WAAV_GATEWAY_URL`) if available.
+ * Safe in browser bundles where `process` is undefined.
+ */
+function readGatewayEnvUrl(): string | undefined {
+  const env = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env;
+  const value = env?.[GATEWAY_URL_ENV];
+  return value && value.trim() !== '' ? value.trim() : undefined;
+}
+
+/** Normalise an ws/wss URL to http/https (REST uses http); pass others through. */
+function normalizeHttpUrl(url: string): string {
+  if (url.startsWith('ws://')) return 'http://' + url.slice('ws://'.length);
+  if (url.startsWith('wss://')) return 'https://' + url.slice('wss://'.length);
+  return url;
+}
+
 /**
  * BudClient configuration
  */
 export interface BudClientConfig {
-  /** Base URL for REST API (e.g., "http://localhost:3001") */
-  baseUrl: string;
-  /** WebSocket URL (e.g., "ws://localhost:3001/ws"). Defaults to baseUrl with /ws path */
+  /**
+   * Base URL for the gateway REST API (e.g., "http://127.0.0.1:3001").
+   * Optional: defaults to the `WAAV_GATEWAY_URL` env var when set, otherwise
+   * "http://127.0.0.1:3001". An ws/wss URL is also accepted and normalised to
+   * http/https for REST.
+   */
+  baseUrl?: string;
+  /** WebSocket URL (e.g., "ws://127.0.0.1:3001/ws"). Defaults to baseUrl with /ws path */
   wsUrl?: string;
   /** API key for authentication */
   apiKey?: string;
@@ -34,6 +73,15 @@ export interface BudClientConfig {
   headers?: Record<string, string>;
   /** Default feature flags for all pipelines */
   features?: FeatureFlags;
+  /**
+   * WS connect-concurrency cap (D7). A burst of sessions/pipelines created from
+   * this client share ONE gate that caps concurrent connects + paces their
+   * starts, so they cooperate with the gateway's per-IP 60rps/burst10 bucket
+   * instead of self-DDoSing into a 429/503 storm. `true`/omitted uses defaults;
+   * pass an object to tune (`maxConcurrent`/`minSpacingMs`), or `false` to
+   * disable the cap.
+   */
+  connectGate?: boolean | ConnectGateConfig;
 }
 
 /**
@@ -73,8 +121,16 @@ export class BudClient {
   private config: BudClientConfig;
   private restClient: RestClient;
   private wsUrl: string;
+  /** Resolved gateway base URL (http/https). */
+  private baseUrl: string;
   private sloTracker: SLOTracker;
   private activePipelines: Set<BudSTT | BudTTS | BudTalk | BudTranscribe> = new Set();
+  /**
+   * D7: shared WS connect-concurrency gate, passed to every session this client
+   * creates so a burst of connects paces under the gateway's per-IP rate bucket.
+   * Undefined when disabled via `connectGate: false`.
+   */
+  private connectGate?: ConnectGate;
 
   /**
    * STT (Speech-to-Text) pipeline factory
@@ -129,15 +185,20 @@ export class BudClient {
    */
   readonly rest: RestClient;
 
-  constructor(config: BudClientConfig) {
-    this.config = config;
+  constructor(config: BudClientConfig = {}) {
+    // Resolve the gateway base URL: explicit config wins, then the
+    // WAAV_GATEWAY_URL env var, then the local default. An ws/wss URL is
+    // normalised to http/https so REST calls work.
+    const baseUrl = normalizeHttpUrl(config.baseUrl ?? readGatewayEnvUrl() ?? DEFAULT_GATEWAY_URL);
+    this.baseUrl = baseUrl;
+    this.config = { ...config, baseUrl };
 
     // Derive WebSocket URL from base URL if not provided
-    this.wsUrl = config.wsUrl ?? this.deriveWsUrl(config.baseUrl);
+    this.wsUrl = config.wsUrl ?? this.deriveWsUrl(baseUrl);
 
     // Initialize REST client
     this.restClient = new RestClient({
-      baseUrl: config.baseUrl,
+      baseUrl,
       apiKey: config.apiKey,
       timeout: config.timeout,
       fetch: config.fetch,
@@ -148,11 +209,219 @@ export class BudClient {
     // Initialize SLO tracker
     this.sloTracker = new SLOTracker();
 
+    // D7: one shared connect gate for all sessions from this client (the gateway
+    // rate limit is per-IP, so the cap is per-client). Disabled with `false`.
+    if (config.connectGate !== false) {
+      this.connectGate = new ConnectGate(
+        typeof config.connectGate === 'object' ? config.connectGate : {}
+      );
+    }
+
     // Setup pipeline factories
     this.stt = this.createSTTFactory();
     this.tts = this.createTTSFactory();
     this.talk = this.createTalkFactory();
     this.transcribe = this.createTranscribeFactory();
+  }
+
+  /**
+   * Create the flagship agent loop (STT → built-in LLM → TTS) in ~5 lines.
+   *
+   * This is the ONLY entry point that reaches the gateway's built-in
+   * conversation loop with reasoning + barge-in + latency masking. It
+   * serializes `conversation_config` and nests turn detection into
+   * `stt_config.turn_detection`. Returns an UNCONNECTED {@link AgentSession};
+   * subscribe to events, then `await agent.connect()`.
+   *
+   * @example
+   * ```typescript
+   * const agent = bud.agent({
+   *   stt: { provider: 'deepgram', language: 'en-US' },
+   *   tts: { provider: 'deepgram', voiceId: 'aura-asteria-en' },
+   *   llm: {
+   *     baseUrl: 'http://localhost:11434/v1',
+   *     model: 'llama3.2:1b',
+   *     reasoningEffort: 'minimal',
+   *     latencyFiller: 'auto',
+   *   },
+   *   turn: { eagerEot: true },
+   * });
+   * agent.on('transcript', (t) => console.log('user:', t.text));
+   * agent.on('audio', (a) => playback(a.audio));     // bot speech
+   * agent.on('configWarning', (w) => console.warn(w.code, w.message));
+   * await agent.connect();
+   * agent.sendAudio(pcm);
+   * ```
+   */
+  agent(config: AgentConfig): AgentSession {
+    // Thread the client's custom WebSocket impl (Node) unless the caller set one.
+    const merged: AgentConfig = { ...config };
+    if (merged.WebSocket === undefined && this.config.WebSocket !== undefined) {
+      merged.WebSocket = this.config.WebSocket;
+    }
+    // D7: thread the shared connect gate so a fleet of agents paces its connects.
+    return new AgentSession(merged, this.wsUrl, this.config.apiKey, this.connectGate);
+  }
+
+  /**
+   * The GATEWAY-NATIVE realtime entry point (recommended).
+   *
+   * Returns an UNCONNECTED {@link GatewayRealtime} that speaks the gateway's
+   * provider-agnostic `/realtime` WebSocket protocol, so the SAME surface works
+   * for ALL 12 realtime/S2S providers — `provider` is just a field: `openai`,
+   * `hume`, `azure`, `grok`, `inworld`, `deepgram`, `elevenlabs`, `gemini`,
+   * `ultravox`, `nova_sonic`, `speechmatics`, `yandex`.
+   *
+   * Unlike {@link BudRealtime} (the provider-NATIVE OpenAI/Hume escape hatch that
+   * can bypass the gateway), this client never speaks a vendor wire: the gateway
+   * connects the provider server-side from its own credentials. Consume events
+   * via callbacks (`session.on(...)`) AND/OR the unified async stream
+   * (`for await (const ev of session.events())`).
+   *
+   * @example
+   * ```ts
+   * const session = bud.realtime({ provider: 'openai', voice: 'alloy', instructions: 'You are helpful.' });
+   * session.on('transcript', (t) => console.log(t.text));
+   * session.on('audio', (a) => playback(a.audio));   // bot speech
+   * await session.connect();
+   * session.sendAudio(pcm);
+   * ```
+   */
+  realtime(config: GatewayRealtimeConfig): GatewayRealtime {
+    // Derive the /realtime WS URL from the gateway base (sibling of /ws).
+    const realtimeUrl = this.wsUrl.replace(/\/ws$/, '/realtime');
+    return new GatewayRealtime({
+      url: realtimeUrl,
+      config,
+      apiKey: this.config.apiKey,
+      WebSocket: this.config.WebSocket,
+    });
+  }
+
+  /**
+   * Submit a batched/async transcription job and (by default) poll until done
+   * (`POST /transcribe/batch` → `GET /transcribe/batch/{job_id}`).
+   *
+   * The batch envelope REUSES the streaming {@link STTConfig} VERBATIM plus
+   * batch-only knobs (`batch=`) that the streaming path drops but ARE
+   * batch-capable on Deepgram prerecorded / AssemblyAI async / OpenAI
+   * (alternatives, detectLanguage, summarize, topics, intents, paragraphs,
+   * utterances).
+   *
+   * Audio source — pass `audio` as a URL string, a `File`/`Blob`, or an
+   * `ArrayBuffer`/`Uint8Array` (base64-encoded for you); or set `url`/
+   * `audioBase64` directly via {@link BatchTranscribeOptions}. With `callbackUrl`
+   * set, the gateway returns `{job_id, status:"queued"}` and POSTs the result to
+   * the webhook.
+   *
+   * @example
+   * ```ts
+   * const job = await bud.transcribeBatch({
+   *   audio: 'https://example.com/call.wav',
+   *   config: { provider: 'deepgram', language: 'en-US' },
+   *   batch: { summarize: true, detectLanguage: true, alternatives: 3 },
+   *   translation: { targetLanguages: ['es-ES'] },
+   * });
+   * if (job.status === 'completed') console.log(job.result);
+   * ```
+   */
+  async transcribeBatch(
+    options: BatchTranscribeOptions & { audio?: string | File | Blob | ArrayBuffer | Uint8Array },
+  ): Promise<BatchJob> {
+    const { audio, ...rest } = options;
+    const opts: BatchTranscribeOptions = { ...rest };
+
+    if (audio !== undefined && opts.url === undefined && opts.audioBase64 === undefined) {
+      if (typeof audio === 'string') {
+        opts.url = audio;
+      } else {
+        opts.audioBase64 = await arrayBufferToBase64Async(audio);
+      }
+    }
+    return this.restClient.transcribeBatch(opts);
+  }
+
+  /**
+   * Pre-warm the gateway connection (D6) — call at page-load / app-start, well
+   * BEFORE the first user action, to shave the cold DNS + TLS handshake (and,
+   * under Node with the D7 keep-alive agent, an actual pooled TCP connection)
+   * off the first real connect. Mirrors LiveKit's `Room.prepareConnection()`.
+   *
+   * It fires a cheap `HEAD /` (falling back to `GET /` for servers that reject
+   * HEAD) against the gateway origin so the OS resolves DNS, the TLS session is
+   * negotiated, and — with the keep-alive agent — the warmed connection is left
+   * in the pool for the subsequent REST/WS call to reuse. Optionally prefetches
+   * an auth token via a caller-supplied resolver, off the connect critical path.
+   *
+   * Best-effort and never throws: a warmup failure (gateway briefly down, HEAD
+   * unsupported) is swallowed — the real connect will surface any genuine error.
+   * Returns whether the warmup round-trip succeeded (useful in tests/diagnostics).
+   *
+   * NOTE on fastest perceived start: prefer a server-side `alias` on your
+   * session config — the gateway resolves the WHOLE `{stt, tts, llm, dag}` bundle
+   * in ONE round-trip (echoed back as `resolvedAlias` on `ready`), instead of the
+   * client sending a large multi-provider config. Combine `prepareConnection()`
+   * (warm the transport) with an `alias` (one-RTT resolve) for the lowest
+   * time-to-first-audio.
+   *
+   * @example
+   * ```ts
+   * const bud = new BudClient({ baseUrl: 'https://gw.example.com' });
+   * // At app start, before the user clicks "talk":
+   * void bud.prepareConnection();
+   * // ...later, the first connect reuses the warmed DNS/TLS/pool:
+   * const agent = bud.agent({ alias: 'support-bot' });
+   * await agent.connect();
+   * ```
+   */
+  async prepareConnection(options?: {
+    /** Optional async token resolver; its result is ignored here but the call
+     *  is awaited so any token round-trip happens off the connect critical path. */
+    prefetchToken?: () => Promise<unknown>;
+    /** Per-warmup timeout in ms (default 5000). */
+    timeoutMs?: number;
+  }): Promise<boolean> {
+    const timeoutMs = options?.timeoutMs ?? 5000;
+    const fetchFn = this.config.fetch ?? globalThis.fetch;
+    let warmed = false;
+
+    if (typeof fetchFn === 'function') {
+      const controller = typeof AbortController !== 'undefined' ? new AbortController() : undefined;
+      const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : undefined;
+      const reqInit: RequestInit = controller ? { signal: controller.signal } : {};
+      try {
+        // HEAD is the cheapest warmup; some servers 405 it, so fall back to GET.
+        try {
+          await fetchFn(this.baseUrl + '/', { method: 'HEAD', ...reqInit });
+          warmed = true;
+        } catch {
+          await fetchFn(this.baseUrl + '/', { method: 'GET', ...reqInit });
+          warmed = true;
+        }
+      } catch {
+        // Best-effort warmup — swallow (the real connect surfaces real errors).
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    }
+
+    // Optional token prefetch, off the connect critical path. Swallowed too.
+    if (options?.prefetchToken) {
+      try {
+        await options.prefetchToken();
+      } catch {
+        // Ignore — token resolution is the caller's concern at connect time.
+      }
+    }
+
+    return warmed;
+  }
+
+  /**
+   * Alias for {@link prepareConnection} (matches the SDK's `prewarm` vocabulary).
+   */
+  async prewarm(options?: Parameters<BudClient['prepareConnection']>[0]): Promise<boolean> {
+    return this.prepareConnection(options);
   }
 
   /**
@@ -175,6 +444,7 @@ export class BudClient {
           url: this.wsUrl,
           apiKey: this.config.apiKey,
           features: this.config.features,
+          ...(this.connectGate ? { connectGate: this.connectGate } : {}),
           ...config,
         });
         this.activePipelines.add(pipeline);
@@ -198,7 +468,8 @@ export class BudClient {
           url: this.wsUrl,
           apiKey: this.config.apiKey,
           features: this.config.features,
-          restBaseUrl: this.config.baseUrl,
+          restBaseUrl: this.baseUrl,
+          ...(this.connectGate ? { connectGate: this.connectGate } : {}),
           ...config,
         });
         this.activePipelines.add(pipeline);
@@ -232,6 +503,7 @@ export class BudClient {
           url: this.wsUrl,
           apiKey: this.config.apiKey,
           features: this.config.features,
+          ...(this.connectGate ? { connectGate: this.connectGate } : {}),
           ...config,
         });
         this.activePipelines.add(pipeline);
@@ -286,6 +558,20 @@ export class BudClient {
    */
   async listVoices(provider?: string) {
     return this.restClient.listVoices(provider);
+  }
+
+  /**
+   * Voice-cloning helpers (P4): `bud.voices.clone({...})` + poll-until-ready.
+   *
+   * ```ts
+   * const { voiceId, status } = await bud.voices.clone({
+   *   provider: 'elevenlabs', name: 'My Voice', audioFiles: [wavBuffer],
+   * });
+   * // use voiceId as a TTS voiceId once status === 'ready'
+   * ```
+   */
+  get voices() {
+    return this.restClient.voices;
   }
 
   /**
@@ -420,6 +706,41 @@ export class BudClient {
     await this.disconnectAll();
     this.sloTracker.reset();
   }
+}
+
+/**
+ * Encode audio (File/Blob/ArrayBuffer/Uint8Array) to base64. Works in the
+ * browser (btoa) and Node (Buffer); used by {@link BudClient.transcribeBatch}
+ * for inline-bytes submission.
+ */
+async function arrayBufferToBase64Async(
+  audio: File | Blob | ArrayBuffer | Uint8Array,
+): Promise<string> {
+  let bytes: Uint8Array;
+  if (audio instanceof Uint8Array) {
+    bytes = audio;
+  } else if (audio instanceof ArrayBuffer) {
+    bytes = new Uint8Array(audio);
+  } else {
+    // File | Blob
+    bytes = new Uint8Array(await audio.arrayBuffer());
+  }
+
+  // Node path: Buffer is fastest and avoids btoa's binary-string limits.
+  const maybeBuffer = (globalThis as { Buffer?: { from(b: Uint8Array): { toString(enc: string): string } } })
+    .Buffer;
+  if (maybeBuffer) {
+    return maybeBuffer.from(bytes).toString('base64');
+  }
+
+  // Browser path: chunked binary string → btoa (8KB chunks avoid stack limits).
+  const chunkSize = 8192;
+  const chunks: string[] = [];
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const chunk = bytes.subarray(i, Math.min(i + chunkSize, bytes.length));
+    chunks.push(String.fromCharCode(...chunk));
+  }
+  return btoa(chunks.join(''));
 }
 
 /**

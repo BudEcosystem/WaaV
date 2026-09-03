@@ -166,10 +166,8 @@ export class BudRealtime extends EventEmitter {
   private _lastUrl: string | null = null;
   private _reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
-  public readonly config: Required<
-    Pick<RealtimeConfig, 'provider' | 'apiKey'> &
-      Partial<Omit<RealtimeConfig, 'provider' | 'apiKey'>>
-  >;
+  public readonly config: Required<Pick<RealtimeConfig, 'provider' | 'apiKey'>> &
+    Omit<RealtimeConfig, 'provider' | 'apiKey'>;
 
   /**
    * Create a new BudRealtime instance.

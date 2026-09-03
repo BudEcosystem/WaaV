@@ -9,6 +9,15 @@ use crate::core::tts::{TTSConfig, TTSError, TTSResult};
 
 use super::{DEFAULT_SAMPLE_RATE, MAX_TEXT_LENGTH_STREAM};
 
+fn validate_resemble_tts_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 // =============================================================================
 // Model Selection
 // =============================================================================
@@ -248,6 +257,10 @@ pub struct ResembleStreamRequest {
     /// Enable HD synthesis
     #[serde(skip_serializing_if = "Option::is_none")]
     pub use_hd: Option<bool>,
+    /// Apply the project's custom pronunciation rules during synthesis
+    /// (Resemble `/stream` body flag — audio-changing).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub apply_custom_pronunciations: Option<bool>,
 }
 
 impl ResembleStreamRequest {
@@ -261,6 +274,7 @@ impl ResembleStreamRequest {
             precision: None,
             sample_rate: None,
             use_hd: None,
+            apply_custom_pronunciations: None,
         }
     }
 
@@ -286,6 +300,13 @@ impl ResembleStreamRequest {
                 Some(config.sample_rate)
             },
             use_hd: if config.use_hd { Some(true) } else { None },
+            // Only emit the flag when explicitly enabled; omit otherwise so the request matches the
+            // pre-feature wire shape (Resemble defaults to off).
+            apply_custom_pronunciations: if config.apply_custom_pronunciations {
+                Some(true)
+            } else {
+                None
+            },
         }
     }
 
@@ -355,6 +376,10 @@ pub struct ResembleTtsConfig {
     pub sample_rate: u32,
     /// Enable HD synthesis
     pub use_hd: bool,
+    /// Apply the project's custom pronunciation rules during synthesis.
+    pub apply_custom_pronunciations: bool,
+    /// Optional base URL override (scheme+host) for the synth/connect endpoint; used by tests/mocks.
+    pub endpoint_override: Option<String>,
 }
 
 impl ResembleTtsConfig {
@@ -369,6 +394,8 @@ impl ResembleTtsConfig {
             precision: ResemblePrecision::default(),
             sample_rate: DEFAULT_SAMPLE_RATE,
             use_hd: false,
+            apply_custom_pronunciations: false,
+            endpoint_override: None,
         }
     }
 
@@ -408,22 +435,66 @@ impl ResembleTtsConfig {
         self
     }
 
+    /// Apply the project's custom pronunciation rules during synthesis.
+    pub fn with_custom_pronunciations(mut self, apply: bool) -> Self {
+        self.apply_custom_pronunciations = apply;
+        self
+    }
+
+    /// Build from the standardized TTS config (W1 keystone — TTS fleet).
+    ///
+    /// Resemble exposes a narrow advanced surface, so only `sample_rate` maps to a real field.
+    /// Non-standard Resemble settings (`project_uuid`, `use_hd`, `apply_custom_pronunciations`) are
+    /// read from the open `extras` passthrough. Voice-tone features (stability, style, emotion,
+    /// instructions, SSML, speed/pitch/volume, word_timestamps, streaming, seed) have no matching
+    /// field and are skipped.
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(&std.base)?;
+        if let Some(sr) = f.sample_rate {
+            cfg.sample_rate = sr;
+        }
+        if let Some(p) = std
+            .extras
+            .0
+            .get("project_uuid")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            cfg.project_uuid = Some(p.to_string());
+        }
+        if let Some(hd) = std.extras.0.get("use_hd").and_then(|v| v.as_bool()) {
+            cfg.use_hd = hd;
+        }
+        // Resemble has no canonical `TtsFeatures` field for this project-level pronunciation flag,
+        // so it travels through the open extras passthrough and is emitted in the `/stream` body.
+        if let Some(apply) = std
+            .extras
+            .0
+            .get("apply_custom_pronunciations")
+            .and_then(|v| v.as_bool())
+        {
+            cfg.apply_custom_pronunciations = apply;
+        }
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
     /// Create configuration from base TTSConfig
     ///
     /// Extracts Resemble-specific settings from the base TTS config.
     /// The voice_id field is used as voice_uuid.
     pub fn from_base(config: &TTSConfig) -> TTSResult<Self> {
         // Get API key from config or environment
-        let api_key = if !config.api_key.is_empty() {
-            config.api_key.clone()
-        } else {
-            std::env::var("RESEMBLE_API_KEY").map_err(|_| {
+        let api_key = crate::core::credentials::explicit_api_key(&config.api_key)
+            .or_else(|| crate::core::credentials::env_api_key("RESEMBLE_API_KEY"))
+            .ok_or_else(|| {
                 TTSError::InvalidConfiguration(
                     "RESEMBLE_API_KEY environment variable not set and no api_key provided"
                         .to_string(),
                 )
-            })?
-        };
+            })?;
 
         // Get voice UUID from voice_id
         let voice_uuid = config
@@ -462,6 +533,8 @@ impl ResembleTtsConfig {
             precision: ResemblePrecision::default(),
             sample_rate,
             use_hd: false,
+            apply_custom_pronunciations: false,
+            endpoint_override: None,
         };
 
         // Validate
@@ -493,6 +566,11 @@ impl ResembleTtsConfig {
             )));
         }
 
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_resemble_tts_endpoint("endpoint_override", endpoint)
+                .map_err(TTSError::InvalidConfiguration)?;
+        }
+
         Ok(())
     }
 
@@ -520,6 +598,8 @@ impl Default for ResembleTtsConfig {
             precision: ResemblePrecision::default(),
             sample_rate: DEFAULT_SAMPLE_RATE,
             use_hd: false,
+            apply_custom_pronunciations: false,
+            endpoint_override: None,
         }
     }
 }
@@ -531,6 +611,73 @@ impl Default for ResembleTtsConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone (TTS fleet): standardized config unlocks the sample_rate override plus the
+    // Resemble-only `project_uuid` / `use_hd` via the open extras passthrough.
+    #[test]
+    fn from_standard_maps_sample_rate_and_extras() {
+        use crate::core::stt::standard::ProviderExtras;
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+
+        let mut extras = serde_json::Map::new();
+        extras.insert("project_uuid".into(), serde_json::json!("proj-123"));
+        extras.insert("use_hd".into(), serde_json::json!(true));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                api_key: "test-key".to_string(),
+                voice_id: Some("voice-uuid".to_string()),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                sample_rate: Some(44100),
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+
+        let cfg = ResembleTtsConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.api_key, "test-key"); // base carried through
+        assert_eq!(cfg.voice_uuid, "voice-uuid"); // base carried through
+        assert_eq!(cfg.sample_rate, 44100); // mapped feature
+        assert_eq!(cfg.project_uuid, Some("proj-123".to_string())); // extras passthrough
+        assert!(cfg.use_hd); // extras passthrough
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = ResembleTtsConfig::new("test-key", "voice-uuid");
+
+        config.endpoint_override = Some("https://resemble-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(format!("{err:?}").contains("SSRF protection"));
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("file endpoint_override must be rejected");
+        assert!(format!("{err:?}").contains("URL scheme"));
+
+        config.endpoint_override = Some("ws://resemble-proxy.example.com".to_string());
+        let err = config
+            .validate()
+            .expect_err("WebSocket endpoint_override must be rejected");
+        assert!(format!("{err:?}").contains("URL scheme"));
+
+        let std = crate::core::tts::standard::StandardTTSConfig::from_base(TTSConfig {
+            provider: "resemble".to_string(),
+            api_key: "test-key".to_string(),
+            voice_id: Some("voice-uuid".to_string()),
+            ..Default::default()
+        })
+        .with_endpoint_override("file:///tmp/socket");
+        assert!(ResembleTtsConfig::from_standard(&std).is_err());
+    }
 
     #[test]
     fn test_model_enum() {

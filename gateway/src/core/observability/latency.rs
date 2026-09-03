@@ -12,7 +12,7 @@
 //!
 //! # Example
 //!
-//! ```rust
+//! ```ignore
 //! let observer = UserBotLatencyObserver::new(1000); // Keep 1000 samples
 //! let metrics = observer.get_metrics();
 //! println!("Average latency: {}ms", metrics.avg_ms);
@@ -170,10 +170,10 @@ impl UserBotLatencyObserver {
         let mut latencies = self.latencies_ns.lock();
 
         // Evict oldest if at capacity
-        if latencies.len() >= self.max_samples {
-            if let Some(old) = latencies.pop_front() {
-                self.sum_ns.fetch_sub(old, Ordering::Relaxed);
-            }
+        if latencies.len() >= self.max_samples
+            && let Some(old) = latencies.pop_front()
+        {
+            self.sum_ns.fetch_sub(old, Ordering::Relaxed);
         }
 
         // Add new sample

@@ -33,6 +33,7 @@ use tracing::{debug, error, info, warn};
 use super::super::base::{
     BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback,
 };
+use super::super::http_resilience::HttpBreaker;
 use super::config::{BHASHINI_CONFIG_URL, BhashiniSttConfig};
 use super::messages::{
     BhashiniErrorResponse, PipelineComputeRequest, PipelineComputeResponse, PipelineConfigRequest,
@@ -63,6 +64,7 @@ const BASE_RETRY_DELAY_MS: u64 = 500;
 
 /// User-Agent header value for API requests.
 const USER_AGENT: &str = concat!("WaaV-Gateway/", env!("CARGO_PKG_VERSION"));
+const BHASHINI_CALLBACK_URL_SCHEMES: &[&str] = &["http", "https"];
 
 // =============================================================================
 // Cached Pipeline Config
@@ -133,6 +135,19 @@ pub struct BhashiniStt {
 
     /// Error callback.
     error_callback: Arc<Mutex<Option<STTErrorCallback>>>,
+
+    /// Shared per-provider circuit breaker for the REST transport (uniform with the WS fleet):
+    /// consulted before each upstream call (config + compute), fed by the unified HTTP status
+    /// classification. Inert until `set_resilience` injects the process-global handles (W-D2).
+    resilience: HttpBreaker,
+}
+
+fn bhashini_stt_http_client() -> Result<Client, reqwest::Error> {
+    crate::core::net::ssrf_protected_client_builder(crate::core::net::HTTP_URL_SCHEMES)
+        .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
+        .connect_timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS))
+        .user_agent(USER_AGENT)
+        .build()
 }
 
 impl BhashiniStt {
@@ -141,18 +156,21 @@ impl BhashiniStt {
         let bhashini_config = BhashiniSttConfig::from_base(config.clone()).map_err(|e| {
             STTError::ConfigurationError(format!("Invalid Bhashini configuration: {}", e))
         })?;
+        Self::from_bhashini_config(config, bhashini_config)
+    }
 
-        let client = Client::builder()
-            .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
-            .connect_timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS))
-            .user_agent(USER_AGENT)
-            .build()
-            .map_err(|e| {
-                STTError::ConnectionFailed(format!("Failed to create HTTP client: {}", e))
-            })?;
+    /// Internal: assemble the client from an already-mapped Bhashini config (shared by
+    /// `create_internal`/`new` and `new_standard`).
+    fn from_bhashini_config(
+        base_config: STTConfig,
+        bhashini_config: BhashiniSttConfig,
+    ) -> Result<Self, STTError> {
+        let client = bhashini_stt_http_client().map_err(|e| {
+            STTError::ConnectionFailed(format!("Failed to create HTTP client: {}", e))
+        })?;
 
         Ok(Self {
-            base_config: config,
+            base_config,
             config: bhashini_config,
             client,
             pipeline_config: Arc::new(Mutex::new(None)),
@@ -160,12 +178,34 @@ impl BhashiniStt {
             connected: AtomicBool::new(false),
             result_callback: Arc::new(Mutex::new(None)),
             error_callback: Arc::new(Mutex::new(None)),
+            resilience: HttpBreaker::new("bhashini"),
         })
+    }
+
+    /// The shared circuit breaker this client feeds, if the process-global resilience handles
+    /// have been injected (W-D2). Two `BhashiniStt` built from the same
+    /// [`crate::core::resilience::ResilienceRegistry`] return the *same* `Arc`.
+    pub fn resilience_breaker(&self) -> Option<&Arc<crate::core::resilience::CircuitBreaker>> {
+        self.resilience.breaker()
     }
 
     /// Public constructor for external use.
     pub fn new(config: STTConfig) -> Result<Self, STTError> {
         Self::create_internal(config)
+    }
+
+    /// W1 keystone — construct directly from the standardized config. The typed `SttFeatures`
+    /// are all capability gaps for this batch ULCA provider and stay at default, but two
+    /// Bhashini-specific ULCA pipeline knobs (`sourceScriptCode`, `postProcessors`) carried via
+    /// the standardized extras passthrough DO reach `pipelineTasks[].config` on the wire — see
+    /// `BhashiniSttConfig::from_standard` and `fetch_pipeline_config`.
+    pub fn new_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        let bhashini_config = BhashiniSttConfig::from_standard(std).map_err(|e| {
+            STTError::ConfigurationError(format!("Invalid Bhashini configuration: {}", e))
+        })?;
+        Self::from_bhashini_config(std.base.clone(), bhashini_config)
     }
 
     /// Fetch pipeline configuration from Bhashini.
@@ -175,14 +215,25 @@ impl BhashiniStt {
             self.config.language.as_code()
         );
 
-        let request = PipelineConfigRequest::new_asr(
+        // Carry the advanced ULCA ASR knobs (sourceScriptCode + postProcessors) into the
+        // pipeline-config request body when configured via the standardized extras passthrough.
+        let request = PipelineConfigRequest::new_asr_with(
             self.config.language.as_code(),
             self.config.pipeline_id(),
+            self.config.source_script_code.clone(),
+            self.config.post_processors.clone(),
         );
+
+        // Consult the shared per-provider breaker before paying the upstream round-trip: an
+        // open breaker fails fast with a typed classified refusal (uniform with the WS fleet).
+        self.resilience.check()?;
 
         let response = self
             .client
-            .post(BHASHINI_CONFIG_URL)
+            .post(crate::core::tts::standard::override_rest_endpoint(
+                BHASHINI_CONFIG_URL,
+                self.config.endpoint_override.as_deref(),
+            ))
             .header("userID", &self.config.user_id)
             .header("ulcaApiKey", &self.config.ulca_api_key)
             .header("Content-Type", "application/json")
@@ -190,10 +241,12 @@ impl BhashiniStt {
             .send()
             .await
             .map_err(|e| {
+                self.resilience.record_send_error();
                 STTError::NetworkError(format!("Pipeline config request failed: {}", e))
             })?;
 
         let status = response.status();
+        self.resilience.record_status(status);
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
             if let Ok(error) = serde_json::from_str::<BhashiniErrorResponse>(&body) {
@@ -222,6 +275,7 @@ impl BhashiniStt {
             .ok_or_else(|| {
                 STTError::ProviderError("No callback URL in pipeline config response".to_string())
             })?;
+        let callback_url = validate_compute_callback_url(&callback_url)?;
 
         // Extract inference API key
         let (auth_header_name, auth_header_value) = config_response
@@ -284,7 +338,8 @@ impl BhashiniStt {
         );
 
         // Encode audio as WAV and then base64
-        let wav_data = wav::encode_wav(&audio_data, self.config.sample_rate, 16, 1);
+        let wav_data = wav::try_encode_wav(&audio_data, self.config.sample_rate, 16, 1)
+            .map_err(|e| STTError::AudioProcessingError(format!("Invalid WAV parameters: {e}")))?;
         let audio_base64 = BASE64.encode(&wav_data);
 
         // Create compute request
@@ -354,8 +409,22 @@ impl BhashiniStt {
         pipeline_config: &CachedPipelineConfig,
         request: &PipelineComputeRequest,
     ) -> Result<PipelineComputeResponse, STTError> {
-        let response = self
-            .client
+        let callback_client =
+            crate::core::net::ssrf_protected_client_builder(BHASHINI_CALLBACK_URL_SCHEMES)
+                .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
+                .connect_timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS))
+                .build()
+                .map_err(|e| {
+                    STTError::NetworkError(format!(
+                        "Failed to create SSRF-protected callback client: {e}"
+                    ))
+                })?;
+        // Consult the shared per-provider breaker before each compute attempt: once the breaker
+        // opens, the retry loop in `send_audio_to_compute` keeps its bounded backoff but no
+        // attempt pays a doomed upstream round-trip — each one fails fast with the typed refusal.
+        self.resilience.check()?;
+
+        let response = callback_client
             .post(&pipeline_config.callback_url)
             .header(
                 &pipeline_config.auth_header_name,
@@ -365,9 +434,13 @@ impl BhashiniStt {
             .json(request)
             .send()
             .await
-            .map_err(|e| STTError::NetworkError(format!("Compute request failed: {}", e)))?;
+            .map_err(|e| {
+                self.resilience.record_send_error();
+                STTError::NetworkError(format!("Compute request failed: {}", e))
+            })?;
 
         let status = response.status();
+        self.resilience.record_status(status);
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
             if let Ok(error) = serde_json::from_str::<BhashiniErrorResponse>(&body) {
@@ -517,6 +590,30 @@ impl BaseSTT for BhashiniStt {
     fn get_provider_info(&self) -> &'static str {
         PROVIDER_INFO
     }
+
+    /// W-D2: attach the shared per-provider circuit breaker so every Bhashini session trips
+    /// (and observes) the SAME breaker, uniform with the WS fleet. The REST transport consults
+    /// it before each upstream call and feeds it the unified HTTP status classification.
+    fn set_resilience(&mut self, resilience: crate::core::resilience::ResilienceHandles) {
+        self.resilience.set_handles(resilience);
+    }
+}
+
+fn validate_compute_callback_url(url: &str) -> Result<String, STTError> {
+    let url = url.trim();
+    if url.is_empty() {
+        return Err(STTError::ProviderError(
+            "Bhashini callback URL rejected (SSRF protection): empty URL".to_string(),
+        ));
+    }
+
+    crate::core::net::validate_url_for_ssrf(url, BHASHINI_CALLBACK_URL_SCHEMES)
+        .map(|_| url.to_string())
+        .map_err(|msg| {
+            STTError::ProviderError(format!(
+                "Bhashini callback URL rejected (SSRF protection): {msg}"
+            ))
+        })
 }
 
 // =============================================================================
@@ -537,10 +634,99 @@ mod tests {
     }
 
     #[test]
+    fn compute_callback_url_is_ssrf_checked() {
+        let _env = crate::core::net::ssrf_env_lock();
+        assert_eq!(
+            validate_compute_callback_url(" https://compute.example.com/asr ").unwrap(),
+            "https://compute.example.com/asr"
+        );
+
+        let err = validate_compute_callback_url("file:///tmp/compute")
+            .expect_err("non-HTTP callback URL must be rejected");
+        assert!(err.to_string().contains("not allowed"), "{err}");
+
+        let err =
+            validate_compute_callback_url("   ").expect_err("empty callback URL must be rejected");
+        assert!(err.to_string().contains("empty URL"), "{err}");
+    }
+
+    #[test]
     fn test_bhashini_stt_creation() {
         let config = create_test_config();
         let result = BhashiniStt::new(config);
         assert!(result.is_ok());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn bhashini_stt_redirect_policy_rejects_private_hop() {
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local redirect test server");
+        let addr = listener.local_addr().expect("local addr");
+
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 1024];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 302 Found\r\n",
+                "Location: http://127.0.0.1:9/metadata\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n"
+            );
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await;
+        });
+
+        let stt = BhashiniStt::new(create_test_config()).expect("construct Bhashini STT");
+        let err = stt
+            .client
+            .get(format!("http://{addr}/start"))
+            .send()
+            .await
+            .expect_err("private redirect target must be rejected");
+        let mut error_chain = err.to_string();
+        let mut source = std::error::Error::source(&err);
+        while let Some(err) = source {
+            error_chain.push_str(": ");
+            error_chain.push_str(&err.to_string());
+            source = err.source();
+        }
+        assert!(error_chain.contains("SSRF protection"), "{error_chain}");
+    }
+
+    // W1 keystone: Bhashini maps zero advanced features (batch ULCA provider), so new_standard is a
+    // pure passthrough — the base credentials parsed from api_key carry through to the stored config.
+    #[test]
+    fn new_standard_passthrough_carries_base() {
+        use crate::core::stt::standard::{StandardSTTConfig, SttFeatures};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "bhashini".into(),
+                api_key: "user123|apikey456".into(),
+                language: "hi".into(),
+                sample_rate: 16000,
+                ..Default::default()
+            },
+            features: SttFeatures {
+                // None of these map to a real Bhashini field; they must be ignored, not error.
+                diarization: Some(true),
+                word_timestamps: Some(true),
+                ..Default::default()
+            },
+            extras: Default::default(),
+            translation: None,
+        };
+        let stt = BhashiniStt::new_standard(&std).unwrap();
+        assert_eq!(stt.config.user_id, "user123");
+        assert_eq!(stt.config.ulca_api_key, "apikey456");
     }
 
     #[test]

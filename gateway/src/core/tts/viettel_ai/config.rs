@@ -24,6 +24,15 @@
 use crate::core::tts::base::{TTSConfig, TTSError};
 use serde::{Deserialize, Serialize};
 
+fn validate_viettel_http_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -261,6 +270,9 @@ pub struct ViettelTtsConfig {
 
     /// Request timeout in seconds.
     pub request_timeout_secs: u64,
+
+    /// Optional base URL override (scheme+host) for the synth endpoint; used by mock e2e tests.
+    pub endpoint_override: Option<String>,
 }
 
 impl Default for ViettelTtsConfig {
@@ -272,6 +284,7 @@ impl Default for ViettelTtsConfig {
             without_filter: false,
             tts_return_option: DEFAULT_TTS_RETURN_OPTION,
             request_timeout_secs: DEFAULT_REQUEST_TIMEOUT,
+            endpoint_override: None,
         }
     }
 }
@@ -309,7 +322,47 @@ impl ViettelTtsConfig {
             without_filter: false,
             tts_return_option: DEFAULT_TTS_RETURN_OPTION,
             request_timeout_secs,
+            endpoint_override: None,
         })
+    }
+
+    /// Build from the standardized TTS config (W1 keystone).
+    ///
+    /// Viettel exposes a single prosody knob (`speed`), so this maps `speed` onto it (reusing
+    /// `from_base`'s `clamp(MIN_SPEED, MAX_SPEED)` so 1.0 = normal and the value matches the flat
+    /// path). Viettel's non-standard `without_filter` and `tts_return_option` knobs are read from
+    /// the `extras` passthrough. Features without a Viettel field (pitch, volume, stability,
+    /// similarity_boost, style, use_speaker_boost, emotion, instructions, ssml, language,
+    /// word_timestamps, streaming, seed, sample_rate) are skipped.
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> Result<Self, TTSError> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(std.base.clone())?;
+
+        if let Some(speed) = f.speed {
+            // Reuse from_base's clamp so 1.0 = normal and the value matches the flat path.
+            cfg.speed = speed.clamp(MIN_SPEED, MAX_SPEED);
+        }
+
+        // Provider-specific passthrough.
+        if let Some(without_filter) = std.extras.0.get("without_filter").and_then(|v| v.as_bool()) {
+            cfg.without_filter = without_filter;
+        }
+        if let Some(opt) = std
+            .extras
+            .0
+            .get("tts_return_option")
+            .and_then(|v| v.as_u64())
+        {
+            cfg.tts_return_option = opt as u8;
+        }
+
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
+
+        cfg.validate().map_err(TTSError::InvalidConfiguration)?;
+
+        Ok(cfg)
     }
 
     /// Validate the configuration.
@@ -323,6 +376,10 @@ impl ViettelTtsConfig {
                 "Speed must be between {} and {}, got {}",
                 MIN_SPEED, MAX_SPEED, self.speed
             ));
+        }
+
+        if let Some(endpoint) = &self.endpoint_override {
+            validate_viettel_http_endpoint("endpoint_override", endpoint)?;
         }
 
         Ok(())
@@ -422,6 +479,35 @@ impl ViettelTtsResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone (TTS): the standardized `speed` feature Viettel can express reaches the request
+    // `speed` field (clamped to MIN_SPEED..=MAX_SPEED), and the open extras passthrough carries the
+    // provider-specific without_filter / tts_return_option knobs.
+    #[test]
+    fn from_standard_maps_speed_and_extras() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("without_filter".into(), serde_json::json!(true));
+        extras.insert("tts_return_option".into(), serde_json::json!(1));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "viettel_ai".into(),
+                api_key: "test_token".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(1.5),
+                pitch: Some(70.0), // capability gap: Viettel has no pitch, must be ignored
+                ssml: Some(true),  // capability gap: Viettel has no SSML, must be ignored
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+        let cfg = ViettelTtsConfig::from_standard(&std).unwrap();
+        assert!((cfg.speed - 1.5).abs() < f32::EPSILON); // 1.5.clamp(0.5, 2.0) -> 1.5
+        assert!(cfg.without_filter); // from extras passthrough
+        assert_eq!(cfg.tts_return_option, 1);
+    }
 
     #[test]
     fn test_voice_ids() {
@@ -554,6 +640,45 @@ mod tests {
         config.api_key = "test_token".to_string();
 
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let previous = std::env::var_os("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
+
+        let mut config = ViettelTtsConfig {
+            api_key: "test_token".to_string(),
+            ..Default::default()
+        };
+
+        config.endpoint_override = Some("https://viettel-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.contains("SSRF protection"), "{err}");
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("non-HTTP endpoint_override must be rejected");
+        assert!(err.contains("not allowed"), "{err}");
+
+        // SAFETY: restore the process env before releasing the shared test env lock.
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", previous);
+            } else {
+                std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+            }
+        }
     }
 
     #[test]

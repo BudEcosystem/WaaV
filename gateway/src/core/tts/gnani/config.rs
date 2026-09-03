@@ -7,6 +7,15 @@ use crate::core::tts::base::TTSConfig;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+fn validate_gnani_tts_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 /// Gnani TTS provider-specific configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GnaniTTSConfig {
@@ -45,6 +54,10 @@ pub struct GnaniTTSConfig {
     /// Request timeout in seconds
     #[serde(default = "default_request_timeout")]
     pub request_timeout_secs: u64,
+
+    /// Test-only override base (scheme+host) for the synth endpoint; passthrough when None.
+    #[serde(default, skip_serializing)]
+    pub endpoint_override: Option<String>,
 }
 
 fn default_sample_rate() -> u32 {
@@ -80,6 +93,7 @@ impl Default for GnaniTTSConfig {
             ssml_gender: GnaniGender::default(),
             output_sample_rate: default_sample_rate(),
             request_timeout_secs: default_request_timeout(),
+            endpoint_override: None,
         }
     }
 }
@@ -87,9 +101,31 @@ impl Default for GnaniTTSConfig {
 impl GnaniTTSConfig {
     /// Create GnaniTTSConfig from base TTSConfig
     pub fn from_base(base: TTSConfig) -> Result<Self, String> {
-        // Get credentials from environment
-        let token = std::env::var("GNANI_TOKEN").unwrap_or_default();
-        let access_key = std::env::var("GNANI_ACCESS_KEY").unwrap_or_default();
+        // Credentials come through the standardized `api_key` (the keystone channel every provider
+        // shares) as `token|access_key`; either half may be omitted to fall back to the GNANI_TOKEN
+        // / GNANI_ACCESS_KEY env vars for env-configured deployments.
+        let explicit_api_key = crate::core::credentials::explicit_api_key(&base.api_key);
+        let (token, access_key) = if let Some(api_key) = explicit_api_key {
+            match api_key.split_once('|') {
+                Some((t, a)) => (
+                    crate::core::credentials::explicit_api_key(t)
+                        .or_else(|| crate::core::credentials::env_api_key("GNANI_TOKEN"))
+                        .unwrap_or_default(),
+                    crate::core::credentials::explicit_api_key(a)
+                        .or_else(|| crate::core::credentials::env_api_key("GNANI_ACCESS_KEY"))
+                        .unwrap_or_default(),
+                ),
+                None => (
+                    api_key,
+                    crate::core::credentials::env_api_key("GNANI_ACCESS_KEY").unwrap_or_default(),
+                ),
+            }
+        } else {
+            (
+                crate::core::credentials::env_api_key("GNANI_TOKEN").unwrap_or_default(),
+                crate::core::credentials::env_api_key("GNANI_ACCESS_KEY").unwrap_or_default(),
+            )
+        };
         let certificate_path = std::env::var("GNANI_CERTIFICATE_PATH")
             .ok()
             .map(PathBuf::from);
@@ -120,7 +156,44 @@ impl GnaniTTSConfig {
             ssml_gender,
             output_sample_rate,
             request_timeout_secs: default_request_timeout(),
+            endpoint_override: None,
         })
+    }
+
+    /// Build from the standardized TTS config (W1 keystone). Gnani's request surface is limited to
+    /// language selection, SSML gender and the output sample rate, so this maps the standardized
+    /// features that have a real field: `language` -> `language_code` (parsed, falling back to the
+    /// `from_base` value on an unrecognized code) and `sample_rate` -> `output_sample_rate`.
+    /// Gnani has no speed/pitch/volume/stability/emotion/instructions/SSML-input knobs
+    /// (`ssml_gender` is voice gender, not the `ssml` text-mode flag), so those features are
+    /// skipped. The non-standard `voice_name` is read from the `extras` passthrough.
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> Result<Self, String> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(std.base.clone())?;
+
+        if let Some(language) = f.language.as_deref()
+            && let Ok(lang) = GnaniTTSLanguage::from_str(language)
+        {
+            cfg.language_code = lang;
+        }
+        if let Some(rate) = f.sample_rate {
+            cfg.output_sample_rate = rate;
+        }
+
+        // Provider-specific passthrough.
+        if let Some(voice_name) = std.extras.0.get("voice_name").and_then(|v| v.as_str()) {
+            cfg.voice_name = Some(voice_name.to_string());
+        }
+
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
+
+        if let Some(endpoint) = &cfg.endpoint_override {
+            validate_gnani_tts_endpoint("endpoint_override", endpoint)?;
+        }
+
+        Ok(cfg)
     }
 
     /// Validate configuration
@@ -136,6 +209,10 @@ impl GnaniTTSConfig {
                 "Gnani access key is required. Set GNANI_ACCESS_KEY environment variable."
                     .to_string(),
             );
+        }
+
+        if let Some(endpoint) = &self.endpoint_override {
+            validate_gnani_tts_endpoint("endpoint_override", endpoint)?;
         }
 
         Ok(())
@@ -326,6 +403,58 @@ impl GnaniTTSLanguage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone (TTS): the standardized features Gnani can express (language override, output
+    // sample rate) reach their real fields, and the non-standard voice_name flows through the
+    // extras passthrough. Features Gnani has no field for (e.g. ssml text-mode) are ignored.
+    #[test]
+    fn from_standard_maps_language_and_sample_rate() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("voice_name".into(), serde_json::json!("speaker-3"));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "gnani".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                language: Some("Ta-IN".into()),
+                sample_rate: Some(16000),
+                ssml: Some(true), // capability gap: Gnani has no SSML text mode, must be ignored
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+        let cfg = GnaniTTSConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.language_code, GnaniTTSLanguage::Tamil);
+        assert_eq!(cfg.output_sample_rate, 16000);
+        assert_eq!(cfg.voice_name, Some("speaker-3".to_string())); // extras passthrough
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = GnaniTTSConfig {
+            token: "test-token".to_string(),
+            access_key: "test-access-key".to_string(),
+            ..Default::default()
+        };
+
+        config.endpoint_override = Some("https://gnani-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.contains("SSRF protection"), "{err}");
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("non-HTTP endpoint_override must be rejected");
+        assert!(err.contains("SSRF protection"), "{err}");
+    }
 
     #[test]
     fn test_gnani_tts_language_from_str() {

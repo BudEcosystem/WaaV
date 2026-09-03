@@ -2,10 +2,15 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use google_api_proto::google::cloud::speech::v2::{
-    ExplicitDecodingConfig, RecognitionConfig, RecognitionFeatures, StreamingRecognitionConfig,
+    ExplicitDecodingConfig, PhraseSet, RecognitionConfig, RecognitionFeatures,
+    SpeakerDiarizationConfig, SpeechAdaptation, StreamingRecognitionConfig,
     StreamingRecognitionFeatures, StreamingRecognizeRequest, StreamingRecognizeResponse,
-    explicit_decoding_config::AudioEncoding, streaming_recognition_features::VoiceActivityTimeout,
+    TranscriptNormalization, explicit_decoding_config::AudioEncoding, phrase_set::Phrase,
+    recognition_features::MultiChannelMode, speech_adaptation::AdaptationPhraseSet,
+    speech_adaptation::adaptation_phrase_set::Value as PhraseSetValue,
+    streaming_recognition_features::VoiceActivityTimeout,
     streaming_recognize_request::StreamingRequest, streaming_recognize_response::SpeechEventType,
+    transcript_normalization::Entry as TranscriptNormalizationEntry,
 };
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -27,17 +32,60 @@ pub(super) const KEEPALIVE_INTERVAL_SECS: u64 = 1;
 /// This is short enough to not interfere with speech detection but keeps the stream alive.
 pub(super) const KEEPALIVE_SILENCE_DURATION_MS: u64 = 20;
 
+const BYTES_PER_LINEAR16_SAMPLE: u64 = 2;
+
 /// Generate silent audio bytes for keep-alive.
 /// The size is calculated based on sample rate, channels, and bytes per sample.
 #[inline]
-pub(super) fn generate_silence_audio(sample_rate: u32, channels: u32, duration_ms: u64) -> Bytes {
-    // For LINEAR16, each sample is 2 bytes
-    let bytes_per_sample = 2u32;
-    let num_samples = (sample_rate as u64 * duration_ms / 1000) as usize;
-    let total_bytes = num_samples * channels as usize * bytes_per_sample as usize;
+pub(super) fn generate_silence_audio(
+    sample_rate: u32,
+    channels: u32,
+    duration_ms: u64,
+) -> Result<Bytes, STTError> {
+    let total_bytes = silence_audio_len(sample_rate, channels, duration_ms)?;
 
     // Pre-allocate and fill with zeros (silence for LINEAR16)
-    Bytes::from(vec![0u8; total_bytes])
+    Ok(Bytes::from(vec![0u8; total_bytes]))
+}
+
+pub(super) fn validate_keepalive_audio_geometry(
+    sample_rate: u32,
+    channels: u32,
+) -> Result<(), STTError> {
+    silence_audio_len(sample_rate, channels, KEEPALIVE_SILENCE_DURATION_MS)?;
+    Ok(())
+}
+
+fn silence_audio_len(sample_rate: u32, channels: u32, duration_ms: u64) -> Result<usize, STTError> {
+    if sample_rate == 0 {
+        return Err(STTError::ConfigurationError(
+            "Google STT keepalive sample_rate cannot be zero".to_string(),
+        ));
+    }
+    if channels == 0 {
+        return Err(STTError::ConfigurationError(
+            "Google STT keepalive channels cannot be zero".to_string(),
+        ));
+    }
+
+    let sample_count = u64::from(sample_rate)
+        .checked_mul(duration_ms)
+        .ok_or_else(|| {
+            STTError::ConfigurationError("Google STT keepalive sample count overflowed".to_string())
+        })?
+        / 1000;
+    let total_bytes = sample_count
+        .checked_mul(u64::from(channels))
+        .and_then(|v| v.checked_mul(BYTES_PER_LINEAR16_SAMPLE))
+        .ok_or_else(|| {
+            STTError::ConfigurationError("Google STT keepalive byte size overflowed".to_string())
+        })?;
+
+    usize::try_from(total_bytes).map_err(|_| {
+        STTError::ConfigurationError(
+            "Google STT keepalive byte size exceeds platform limits".to_string(),
+        )
+    })
 }
 
 /// Tracks the last activity time for keep-alive logic.
@@ -71,7 +119,7 @@ impl KeepaliveTracker {
 
     /// Generate keep-alive silence audio.
     #[inline]
-    pub fn generate_keepalive(&self) -> Bytes {
+    pub fn generate_keepalive(&self) -> Result<Bytes, STTError> {
         generate_silence_audio(
             self.sample_rate,
             self.channels,
@@ -107,16 +155,92 @@ pub(super) fn build_config_request(config: &GoogleSTTConfig) -> StreamingRecogni
         )
     );
 
+    // Speaker diarization: when enabled, request a speaker-count range. Google requires
+    // min/max >= 1 (max valid 1-6); fall back to a sensible auto range (1-6) when the caller
+    // left the counts at 0.
+    let diarization_config = if config.diarization {
+        let min = if config.diarization_min_speakers >= 1 {
+            config.diarization_min_speakers
+        } else {
+            1
+        };
+        let max = if config.diarization_max_speakers >= min {
+            config.diarization_max_speakers
+        } else {
+            6
+        };
+        Some(SpeakerDiarizationConfig {
+            min_speaker_count: min,
+            max_speaker_count: max,
+        })
+    } else {
+        None
+    };
+
+    let multi_channel_mode = if config.multichannel {
+        MultiChannelMode::SeparateRecognitionPerChannel as i32
+    } else {
+        MultiChannelMode::Unspecified as i32
+    };
+
     let features = Some(RecognitionFeatures {
         enable_automatic_punctuation: config.base.punctuation,
-        ..Default::default()
+        profanity_filter: config.profanity_filter,
+        enable_word_time_offsets: config.enable_word_time_offsets,
+        enable_word_confidence: config.enable_word_confidence,
+        enable_spoken_punctuation: config.enable_spoken_punctuation,
+        enable_spoken_emojis: config.enable_spoken_emojis,
+        multi_channel_mode,
+        diarization_config,
+        max_alternatives: config.max_alternatives,
     });
+
+    // Phrase/keyterm boosting via an inline PhraseSet adaptation.
+    let adaptation = if config.adaptation_phrases.is_empty() {
+        None
+    } else {
+        let phrases = config
+            .adaptation_phrases
+            .iter()
+            .map(|p| Phrase {
+                value: p.clone(),
+                boost: 0.0,
+            })
+            .collect();
+        Some(SpeechAdaptation {
+            phrase_sets: vec![AdaptationPhraseSet {
+                value: Some(PhraseSetValue::InlinePhraseSet(PhraseSet {
+                    phrases,
+                    ..Default::default()
+                })),
+            }],
+            custom_classes: vec![],
+        })
+    };
+
+    let transcript_normalization = if config.transcript_normalization.is_empty() {
+        None
+    } else {
+        Some(TranscriptNormalization {
+            entries: config
+                .transcript_normalization
+                .iter()
+                .map(|e| TranscriptNormalizationEntry {
+                    search: e.search.clone(),
+                    replace: e.replace.clone(),
+                    case_sensitive: e.case_sensitive,
+                })
+                .collect(),
+        })
+    };
 
     let recognition_config = Some(RecognitionConfig {
         decoding_config,
         model: config.base.model.clone(),
         language_codes: vec![config.base.language.clone()],
         features,
+        adaptation,
+        transcript_normalization,
         ..Default::default()
     });
 

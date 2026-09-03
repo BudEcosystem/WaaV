@@ -33,8 +33,15 @@
 //! }
 //! ```
 
+pub mod audio_replay;
+pub mod reconnectable_stream;
 pub mod reconnection;
 
+pub use audio_replay::{AudioReplayBuffer, DEFAULT_REPLAY_CAP_BYTES};
+pub use reconnectable_stream::{
+    DisconnectHandle, ReconnectOutcome, ReconnectableStream, ReconnectableStreamConfig,
+    RestoreError, StreamError, SupervisorExit, WsTransport,
+};
 pub use reconnection::{
     ReconnectionConfig, ReconnectionConfigBuilder, ReconnectionManager, ReconnectionSnapshot,
     ReconnectionState,

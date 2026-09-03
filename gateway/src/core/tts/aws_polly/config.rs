@@ -26,6 +26,16 @@ use serde::{Deserialize, Serialize};
 use crate::core::stt::aws_transcribe::AwsRegion;
 use crate::core::tts::base::TTSConfig;
 
+fn validate_aws_polly_tts_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 // =============================================================================
 // Polly Engine
 // =============================================================================
@@ -551,6 +561,19 @@ pub struct AwsPollyTTSConfig {
     /// Custom lexicon names to apply
     #[serde(default)]
     pub lexicon_names: Vec<String>,
+
+    /// Requested speech-mark types (`word` / `sentence` / `viseme` / `ssml`). When non-empty,
+    /// Polly's `SynthesizeSpeech` returns a JSON metadata stream of timing/viseme/SSML marks
+    /// instead of audio (AWS forbids audio + marks in one request — they are a separate `Json`
+    /// output-format call). Canonical lowercase names; the provider maps them to the SDK
+    /// `SpeechMarkType` enum on the wire.
+    /// Ref: <https://docs.aws.amazon.com/polly/latest/dg/API_SynthesizeSpeech.html#polly-SynthesizeSpeech-request-SpeechMarkTypes>
+    #[serde(default)]
+    pub speech_mark_types: Vec<String>,
+
+    /// Override the AWS Polly endpoint base URL (e.g. a localhost mock for e2e tests).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint_override: Option<String>,
 }
 
 impl Default for AwsPollyTTSConfig {
@@ -580,11 +603,99 @@ impl Default for AwsPollyTTSConfig {
             text_type: TextType::default(),
             language_code: None,
             lexicon_names: Vec::new(),
+            speech_mark_types: Vec::new(),
+            endpoint_override: None,
         }
     }
 }
 
+/// The valid AWS Polly speech-mark type names. Used to filter the `speech_mark_types` extra so a
+/// typo cannot silently reach the wire as an `Unknown` SDK variant.
+pub const VALID_SPEECH_MARK_TYPES: [&str; 4] = ["word", "sentence", "viseme", "ssml"];
+
 impl AwsPollyTTSConfig {
+    /// Build from the standardized config (W1 keystone). Maps the TTS features Polly can express
+    /// to real fields: `ssml` toggles the input [`TextType`], `language` overrides the language
+    /// code, and `sample_rate` sets the output rate. The non-standard `region` is read from the
+    /// `provider_extras` passthrough. ElevenLabs-style voice settings, emotion, instructions,
+    /// speed/pitch/volume and word timestamps have no dedicated Polly field (Polly expresses those
+    /// via SSML prosody), so they are skipped.
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> Self {
+        let f = &std.features;
+        let mut cfg = Self {
+            base: std.base.clone(),
+            ..Default::default()
+        };
+        // Map the standardized voice/model onto Polly's dedicated `voice`/`engine` fields (these
+        // are what the request builder actually reads). Previously `from_standard` left them at
+        // defaults, so the standardized path silently ignored the caller's voice and engine.
+        if let Some(v) = std.base.voice_id.as_deref().filter(|v| !v.is_empty()) {
+            cfg.voice = PollyVoice::from_str_or_default(v);
+        }
+        if !std.base.model.is_empty() {
+            cfg.engine = PollyEngine::from_str_or_default(&std.base.model);
+        }
+        if let Some(region) = std.extras.0.get("region").and_then(|v| v.as_str()) {
+            cfg.region = AwsRegion::from_str_or_default(region);
+        }
+        if let Some(true) = f.ssml {
+            cfg.text_type = TextType::Ssml;
+        }
+        if let Some(language) = &f.language {
+            cfg.language_code = Some(language.clone());
+        }
+        if let Some(rate) = f.sample_rate {
+            cfg.base.sample_rate = Some(rate);
+        }
+        // Speech marks (word / sentence / viseme / ssml timing & metadata). There is no shared
+        // `TtsFeatures` field for this Polly-specific knob, so it flows through the `extras`
+        // passthrough as a string array; only the four valid AWS names are kept so a typo cannot
+        // reach the wire as an SDK `Unknown` variant.
+        if let Some(marks) = std
+            .extras
+            .0
+            .get("speech_mark_types")
+            .and_then(|v| v.as_array())
+        {
+            cfg.speech_mark_types = marks
+                .iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| s.to_ascii_lowercase())
+                .filter(|s| VALID_SPEECH_MARK_TYPES.contains(&s.as_str()))
+                .collect();
+        }
+        // Endpoint override (mock harness): point the AWS SDK Polly client at a localhost mock.
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
+        // AWS credentials flow through the standardized path via the `extras` passthrough; without
+        // this the standard path could never authenticate (the explicit-credential branch in
+        // `init_client` was unreachable from `from_standard`).
+        if let Some(k) = std
+            .extras
+            .0
+            .get("aws_access_key_id")
+            .and_then(|v| v.as_str())
+        {
+            cfg.aws_access_key_id = Some(k.to_string());
+        }
+        if let Some(k) = std
+            .extras
+            .0
+            .get("aws_secret_access_key")
+            .and_then(|v| v.as_str())
+        {
+            cfg.aws_secret_access_key = Some(k.to_string());
+        }
+        if let Some(k) = std
+            .extras
+            .0
+            .get("aws_session_token")
+            .and_then(|v| v.as_str())
+        {
+            cfg.aws_session_token = Some(k.to_string());
+        }
+        cfg
+    }
+
     /// Create a new configuration with the given voice.
     pub fn with_voice(voice: PollyVoice) -> Self {
         let mut config = Self::default();
@@ -613,6 +724,10 @@ impl AwsPollyTTSConfig {
             return Err("Maximum 5 lexicons can be applied per request".to_string());
         }
 
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_aws_polly_tts_endpoint("endpoint_override", endpoint)?;
+        }
+
         Ok(())
     }
 
@@ -632,6 +747,35 @@ impl AwsPollyTTSConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone: the standardized features Polly can express (SSML input, language override,
+    // output sample rate) reach their real fields, and the non-standard region flows through the
+    // provider_extras passthrough.
+    #[test]
+    fn from_standard_maps_ssml_language_rate_and_region() {
+        use crate::core::stt::standard::ProviderExtras;
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("region".into(), serde_json::json!("eu-west-1"));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "aws-polly".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                ssml: Some(true),
+                language: Some("en-GB".into()),
+                sample_rate: Some(22050),
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+        let cfg = AwsPollyTTSConfig::from_standard(&std);
+        assert_eq!(cfg.text_type, TextType::Ssml);
+        assert_eq!(cfg.language_code, Some("en-GB".to_string()));
+        assert_eq!(cfg.base.sample_rate, Some(22050));
+        assert_eq!(cfg.region, AwsRegion::EuWest1);
+    }
 
     #[test]
     fn test_polly_engine() {
@@ -729,6 +873,42 @@ mod tests {
         let result = config.validate();
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("lexicons"));
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = AwsPollyTTSConfig::default();
+
+        config.endpoint_override = Some("https://polly-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.contains("SSRF protection"));
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("file endpoint_override must be rejected");
+        assert!(err.contains("URL scheme"));
+
+        config.endpoint_override = Some("ws://polly-proxy.example.com".to_string());
+        let err = config
+            .validate()
+            .expect_err("WebSocket endpoint_override must be rejected for REST Polly");
+        assert!(err.contains("URL scheme"));
+
+        let std = crate::core::tts::standard::StandardTTSConfig::from_base(TTSConfig {
+            provider: "aws-polly".into(),
+            sample_rate: Some(16000),
+            ..Default::default()
+        })
+        .with_endpoint_override("file:///tmp/socket");
+        let cfg = AwsPollyTTSConfig::from_standard(&std);
+        assert!(cfg.validate().is_err());
     }
 
     #[test]

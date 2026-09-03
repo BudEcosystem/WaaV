@@ -4,7 +4,7 @@
 //! using HTTP streaming for real-time audio synthesis.
 
 use async_trait::async_trait;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
@@ -13,6 +13,10 @@ use super::config::{AcapelaAccountInfo, AcapelaTtsConfig, AcapelaVoice};
 use super::messages::{AcapelaApiError, LoginRequest, LoginResponse};
 use crate::core::tts::base::{BaseTTS, ConnectionState, TTSConfig, TTSError, TTSResult};
 use crate::core::tts::provider::{PronunciationReplacer, TTSProvider, TTSRequestBuilder};
+
+fn acapela_tts_http_client() -> Result<reqwest::Client, reqwest::Error> {
+    crate::core::net::ssrf_protected_client_builder(crate::core::net::HTTP_URL_SCHEMES).build()
+}
 
 // =============================================================================
 // Token Cache
@@ -64,12 +68,15 @@ pub struct AcapelaRequestBuilder {
 impl AcapelaRequestBuilder {
     /// Create a new request builder from configurations
     pub fn new(acapela_config: AcapelaTtsConfig, base_config: TTSConfig, token: String) -> Self {
-        // Build pronunciation replacer from base config
-        let pronunciation_replacer = if !base_config.pronunciations.is_empty() {
-            Some(PronunciationReplacer::new(&base_config.pronunciations))
-        } else {
-            None
-        };
+        // Build pronunciation replacer from base config. SSML input is forwarded verbatim — the
+        // word-boundary regex substitution would corrupt the markup — so the replacer is disabled
+        // when `ssml_input` is set (pronunciation control belongs inside the SSML in that case).
+        let pronunciation_replacer =
+            if !base_config.pronunciations.is_empty() && !acapela_config.ssml_input {
+                Some(PronunciationReplacer::new(&base_config.pronunciations))
+            } else {
+                None
+            };
 
         Self {
             config: acapela_config,
@@ -95,15 +102,8 @@ impl TTSRequestBuilder for AcapelaRequestBuilder {
         // Build query parameters
         let params = self.config.build_query_params(text);
 
-        // Build headers
-        let mut headers = HeaderMap::new();
-
         // Acapela uses "Token <token>" format for authorization
         let auth_value = format!("Token {}", self.token);
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&auth_value).unwrap_or_else(|_| HeaderValue::from_static("")),
-        );
 
         debug!(
             "Acapela TTS request: voice={}, format={}, sample_rate={}, url={}",
@@ -115,8 +115,11 @@ impl TTSRequestBuilder for AcapelaRequestBuilder {
 
         // Build and return the request with query parameters
         client
-            .get(self.command_url())
-            .headers(headers)
+            .get(crate::core::tts::standard::override_rest_endpoint(
+                self.command_url(),
+                self.config.endpoint_override.as_deref(),
+            ))
+            .header(AUTHORIZATION, auth_value)
             .query(&params)
     }
 
@@ -194,7 +197,10 @@ impl AcapelaTts {
 
         let response = self
             .auth_client
-            .post(super::ACAPELA_LOGIN_URL)
+            .post(crate::core::tts::standard::override_rest_endpoint(
+                super::ACAPELA_LOGIN_URL,
+                self.acapela_config.endpoint_override.as_deref(),
+            ))
             .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
             .form(&[
                 ("email", &login_request.email),
@@ -366,6 +372,30 @@ impl AcapelaTts {
         &self.acapela_config
     }
 
+    /// Build the provider from the standardized config (W1 keystone), mirroring
+    /// `DeepgramTTS::from_standard`. Delegates the feature mapping to
+    /// [`AcapelaTtsConfig::from_standard`] (speed/volume/sample_rate/word_timestamps + the
+    /// `bitrate`/`dictionaries`/`application` extras) so advanced features reach the live request
+    /// builder through the standardized dispatch instead of being dropped at the flat boundary.
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
+        let acapela_config = AcapelaTtsConfig::from_standard(std)?;
+        let auth_client = acapela_tts_http_client()
+            .map_err(|e| TTSError::NetworkError(format!("Failed to build HTTP client: {e}")))?;
+
+        info!(
+            "Creating Acapela Cloud TTS provider (standardized): voice={}, format={}, sample_rate={}",
+            acapela_config.voice_id, acapela_config.audio_format, acapela_config.sample_rate
+        );
+
+        Ok(Self {
+            provider: TTSProvider::new(),
+            acapela_config,
+            base_config: std.base.clone(),
+            token_cache: Arc::new(RwLock::new(None)),
+            auth_client,
+        })
+    }
+
     /// Get the command endpoint URL being used
     pub fn command_url(&self) -> &str {
         super::ACAPELA_COMMAND_URL
@@ -381,6 +411,8 @@ impl BaseTTS for AcapelaTts {
     {
         // Parse Acapela-specific configuration from base config
         let acapela_config = AcapelaTtsConfig::from_base(&config)?;
+        let auth_client = acapela_tts_http_client()
+            .map_err(|e| TTSError::NetworkError(format!("Failed to build HTTP client: {e}")))?;
 
         info!(
             "Creating Acapela Cloud TTS provider: voice={}, format={}, sample_rate={}",
@@ -388,11 +420,11 @@ impl BaseTTS for AcapelaTts {
         );
 
         Ok(Self {
-            provider: TTSProvider::new()?,
+            provider: TTSProvider::new(),
             acapela_config,
             base_config: config,
             token_cache: Arc::new(RwLock::new(None)),
-            auth_client: reqwest::Client::new(),
+            auth_client,
         })
     }
 
@@ -417,7 +449,13 @@ impl BaseTTS for AcapelaTts {
 
         // Initialize HTTP connection pool
         self.provider
-            .generic_connect_with_config(super::ACAPELA_COMMAND_URL, &self.base_config)
+            .generic_connect_with_config(
+                &crate::core::tts::standard::override_rest_endpoint(
+                    super::ACAPELA_COMMAND_URL,
+                    self.acapela_config.endpoint_override.as_deref(),
+                ),
+                &self.base_config,
+            )
             .await
     }
 
@@ -522,6 +560,164 @@ impl BaseTTS for AcapelaTts {
 mod tests {
     use super::*;
     use crate::core::tts::acapela::AcapelaAudioFormat;
+    use std::io::ErrorKind;
+
+    // W1 keystone: a StandardTTSConfig advanced feature Acapela supports (speed/volume/
+    // sample_rate/word_timestamps) reaches the provider's `acapela_config` through the provider
+    // struct's `from_standard`, mirroring `DeepgramTTS::from_standard`.
+    #[test]
+    fn from_standard_reaches_provider_config() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "acapela".into(),
+                api_key: "user@example.com:password".into(),
+                voice_id: Some("alice".into()),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(1.5),
+                volume: Some(40000.0),
+                sample_rate: Some(16000),
+                word_timestamps: Some(true),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let tts = AcapelaTts::from_standard(&std).unwrap();
+        // 1.5 multiplier -> 150 on Acapela's 100-is-normal scale.
+        assert_eq!(tts.acapela_config().speed, 150);
+        assert_eq!(tts.acapela_config().volume, 40000);
+        assert_eq!(tts.acapela_config().sample_rate, 16000);
+        assert!(tts.acapela_config().word_positions);
+        // base carried through.
+        assert_eq!(tts.base_config.api_key, "user@example.com:password");
+    }
+
+    // WIRE-LEVEL: with `ssml=true`, the SSML markup must reach the actual `text` query parameter
+    // of the Acapela command request VERBATIM (Acapela auto-detects SSML in `text`; there is no
+    // separate input-type param), and pronunciation replacement — which would corrupt the tags —
+    // must be suppressed on that request. Asserts on the real query the request builder emits, not
+    // just the config struct.
+    #[test]
+    fn ssml_reaches_text_query_param_verbatim_and_disables_replacer() {
+        use crate::core::tts::base::Pronunciation;
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+
+        const SSML: &str =
+            r#"<speak>Hello <break time="300ms"/><prosody rate="slow">Acapela</prosody></speak>"#;
+
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "acapela".into(),
+                api_key: "user@example.com:password".into(),
+                voice_id: Some("alice".into()),
+                // A pronunciation that WOULD rewrite "Acapela" inside the SSML if not suppressed.
+                pronunciations: vec![Pronunciation {
+                    word: "Acapela".into(),
+                    pronunciation: "ah-kah-peh-lah".into(),
+                }],
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                ssml: Some(true),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let tts = AcapelaTts::from_standard(&std).unwrap();
+        assert!(
+            tts.acapela_config().ssml_input,
+            "ssml feature must set ssml_input"
+        );
+
+        // The request builder must NOT mangle SSML — the replacer is suppressed.
+        let builder = AcapelaRequestBuilder::new(
+            tts.acapela_config().clone(),
+            std.base.clone(),
+            "test-token".into(),
+        );
+        assert!(
+            builder.get_pronunciation_replacer().is_none(),
+            "pronunciation replacement must be suppressed for SSML input"
+        );
+
+        // The SSML reaches the `text` query parameter verbatim (this is the body the wire carries).
+        let params = tts.acapela_config().build_query_params(SSML);
+        let params_map: std::collections::HashMap<_, _> = params.into_iter().collect();
+        assert_eq!(
+            params_map.get("text"),
+            Some(&SSML.to_string()),
+            "SSML markup must reach the `text` query parameter verbatim"
+        );
+    }
+
+    #[test]
+    fn invalid_acapela_token_header_value_is_request_build_error() {
+        let config = TTSConfig {
+            api_key: "user@example.com:password".into(),
+            voice_id: Some("alice".into()),
+            ..Default::default()
+        };
+        let acapela_config = AcapelaTtsConfig::from_base(&config).unwrap();
+        let builder = AcapelaRequestBuilder::new(acapela_config, config, "bad\ntoken".into());
+        let err = builder
+            .build_http_request(&reqwest::Client::new(), "hello")
+            .build()
+            .expect_err("malformed Acapela token must not become an empty Authorization header");
+
+        assert!(err.is_builder(), "unexpected reqwest error: {err}");
+    }
+
+    #[tokio::test]
+    async fn acapela_tts_redirect_policy_rejects_private_hop() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) => {
+                if err.kind() == ErrorKind::PermissionDenied {
+                    eprintln!("Skipping acapela_tts_redirect_policy_rejects_private_hop: {err}");
+                    return;
+                }
+                panic!("Failed to bind redirect test server listener: {err}");
+            }
+        };
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 302 Found\r\n",
+                "Location: http://127.0.0.1:9/metadata\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n"
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+
+        let err = acapela_tts_http_client()
+            .unwrap()
+            .get(format!("http://{addr}/start"))
+            .send()
+            .await
+            .expect_err("private redirect target must be rejected");
+        let mut error_chain = err.to_string();
+        let mut source = std::error::Error::source(&err);
+        while let Some(error) = source {
+            error_chain.push_str(": ");
+            error_chain.push_str(&error.to_string());
+            source = error.source();
+        }
+        assert!(
+            error_chain.contains("redirect URL rejected"),
+            "unexpected redirect error: {error_chain}"
+        );
+    }
 
     #[test]
     fn test_acapela_tts_creation() {

@@ -36,7 +36,7 @@ fn test_audio_conversion_aligned_data() {
 #[test]
 fn test_audio_conversion_unaligned_data() {
     // Create a buffer and get an unaligned slice
-    let mut buffer = vec![0u8; 17];
+    let mut buffer = [0u8; 17];
     buffer[1] = 0x00;
     buffer[2] = 0x01;
     buffer[3] = 0xFF;
@@ -73,36 +73,91 @@ fn test_audio_conversion_empty() {
     assert!(samples.is_empty());
 }
 
-/// Safe audio conversion function (mimics the improved pattern)
+/// Endian-safe audio conversion mirroring the production
+/// `convert_audio_to_frame_ref` decode path in `src/livekit/client/audio.rs`.
+///
+/// The wire format is always 16-bit little-endian PCM. The aligned fast path
+/// uses `bytemuck::cast_slice` (zero-copy, byte-order-preserving) ONLY on
+/// little-endian hosts, where it is bit-identical to `from_le_bytes`. On
+/// big-endian hosts (or unaligned buffers) it always decodes via
+/// `i16::from_le_bytes`, so the result is independent of host endianness.
 fn convert_bytes_to_i16_safe(audio_data: &[u8]) -> Vec<i16> {
     let num_samples = audio_data.len() / 2;
     if num_samples == 0 {
         return Vec::new();
     }
 
-    // Check alignment
-    let is_aligned = (audio_data.as_ptr() as usize) % 2 == 0;
-
-    if is_aligned {
-        // SAFETY: We've verified:
-        // 1. The pointer is aligned to 2 bytes (checked above)
-        // 2. The length is valid (num_samples = len/2, so num_samples*2 <= len)
-        // 3. The data is valid for the lifetime of the slice
-        debug_assert!((audio_data.as_ptr() as usize) % std::mem::align_of::<i16>() == 0);
-        debug_assert!(num_samples * std::mem::size_of::<i16>() <= audio_data.len());
-
-        unsafe {
-            let ptr = audio_data.as_ptr() as *const i16;
-            let slice = std::slice::from_raw_parts(ptr, num_samples);
-            slice.to_vec()
+    #[cfg(target_endian = "little")]
+    {
+        if bytemuck::try_cast_slice::<u8, i16>(&audio_data[..num_samples * 2]).is_ok() {
+            return bytemuck::cast_slice::<u8, i16>(&audio_data[..num_samples * 2]).to_vec();
         }
-    } else {
-        // Fallback for unaligned data
-        audio_data
-            .chunks_exact(2)
-            .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
-            .collect()
     }
+
+    // Unaligned, or big-endian host: endian-explicit decode.
+    audio_data
+        .chunks_exact(2)
+        .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
+        .collect()
+}
+
+/// Reference decode that is correct on ANY endianness: pure `from_le_bytes`.
+/// Used as the oracle the production fast path must match bit-for-bit.
+fn convert_bytes_to_i16_le_reference(audio_data: &[u8]) -> Vec<i16> {
+    audio_data
+        .chunks_exact(2)
+        .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
+        .collect()
+}
+
+/// Fix 2 (W-E1): a fixed little-endian byte pattern must decode to the same
+/// `[i16]` regardless of host endianness. Under the old host-endian
+/// `*const i16` reinterpret this assertion would fail on big-endian targets
+/// (UB-shaped); the endian-safe path makes it hold everywhere.
+#[test]
+fn test_audio_conversion_fixed_pattern_is_endian_safe() {
+    // Each pair is little-endian: low byte first.
+    let bytes: Vec<u8> = vec![
+        0x01, 0x00, // 0x0001 = 1
+        0xFF, 0xFF, // 0xFFFF = -1
+        0x00, 0x80, // 0x8000 = i16::MIN
+        0xFF, 0x7F, // 0x7FFF = i16::MAX
+        0x34, 0x12, // 0x1234 = 4660
+    ];
+    let expected: Vec<i16> = vec![1, -1, i16::MIN, i16::MAX, 0x1234];
+
+    // Aligned (Vec buffers are at least 2-byte aligned): fast path.
+    let decoded = convert_bytes_to_i16_safe(&bytes);
+    assert_eq!(decoded, expected, "aligned decode must be LE-correct");
+
+    // The fast path must agree bit-for-bit with the endian-explicit oracle.
+    assert_eq!(
+        decoded,
+        convert_bytes_to_i16_le_reference(&bytes),
+        "fast path must equal from_le_bytes oracle"
+    );
+}
+
+/// Fix 2 (W-E1): the aligned fast path and the unaligned fallback must produce
+/// identical results for the same logical samples (no path-dependent skew).
+#[test]
+fn test_audio_conversion_aligned_matches_unaligned() {
+    let pattern: Vec<u8> = vec![0x10, 0x20, 0x30, 0x40, 0x00, 0x80, 0xFF, 0x7F, 0xAB, 0xCD];
+
+    // Aligned slice (offset 0 of a fresh Vec).
+    let aligned = convert_bytes_to_i16_safe(&pattern);
+
+    // Force an unaligned slice: put the same payload at an odd offset.
+    let mut buf = vec![0u8; pattern.len() + 1];
+    buf[1..].copy_from_slice(&pattern);
+    let unaligned_slice = &buf[1..];
+    let unaligned = convert_bytes_to_i16_safe(unaligned_slice);
+
+    assert_eq!(
+        aligned, unaligned,
+        "aligned fast path and unaligned fallback must agree"
+    );
+    assert_eq!(aligned, convert_bytes_to_i16_le_reference(&pattern));
 }
 
 // =============================================================================
@@ -186,11 +241,8 @@ impl<T: Copy + Default> TestAlignedBuffer<T> {
             };
         }
 
-        let layout = Layout::from_size_align(
-            capacity * std::mem::size_of::<T>(),
-            CACHE_LINE_SIZE,
-        )
-        .expect("Invalid layout");
+        let layout = Layout::from_size_align(capacity * std::mem::size_of::<T>(), CACHE_LINE_SIZE)
+            .expect("Invalid layout");
 
         // SAFETY: Layout is valid and non-zero
         let ptr = unsafe {
@@ -221,7 +273,7 @@ impl<T: Copy + Default> TestAlignedBuffer<T> {
 
     fn is_aligned(&self) -> bool {
         match self.ptr {
-            Some(ptr) => (ptr.as_ptr() as usize) % CACHE_LINE_SIZE == 0,
+            Some(ptr) => (ptr.as_ptr() as usize).is_multiple_of(CACHE_LINE_SIZE),
             None => true, // Zero-capacity is considered aligned
         }
     }
@@ -230,8 +282,13 @@ impl<T: Copy + Default> TestAlignedBuffer<T> {
         match self.ptr {
             Some(ptr) => {
                 // Debug assertions for safety
-                debug_assert!(self.len <= self.capacity, "len {} > capacity {}", self.len, self.capacity);
-                debug_assert!(!ptr.as_ptr().is_null(), "null pointer in AlignedBuffer");
+                debug_assert!(
+                    self.len <= self.capacity,
+                    "len {} > capacity {}",
+                    self.len,
+                    self.capacity
+                );
+                // (No null check: `ptr` is a NonNull, so `as_ptr()` is never null by construction.)
 
                 // SAFETY: ptr is valid, len <= capacity (checked in debug)
                 unsafe { std::slice::from_raw_parts(ptr.as_ptr(), self.len) }
@@ -243,18 +300,23 @@ impl<T: Copy + Default> TestAlignedBuffer<T> {
     fn resize(&mut self, new_len: usize, value: T) {
         assert!(new_len <= self.capacity, "Cannot resize beyond capacity");
 
-        if let Some(ptr) = self.ptr {
-            if new_len > self.len {
-                // Debug assertions for bounds checking
-                debug_assert!(new_len <= self.capacity, "new_len {} > capacity {}", new_len, self.capacity);
+        if let Some(ptr) = self.ptr
+            && new_len > self.len
+        {
+            // Debug assertions for bounds checking
+            debug_assert!(
+                new_len <= self.capacity,
+                "new_len {} > capacity {}",
+                new_len,
+                self.capacity
+            );
 
-                // SAFETY: bounds checked above
-                unsafe {
-                    let start = ptr.as_ptr().add(self.len);
-                    for i in 0..(new_len - self.len) {
-                        debug_assert!(self.len + i < self.capacity, "Write beyond capacity");
-                        std::ptr::write(start.add(i), value);
-                    }
+            // SAFETY: bounds checked above
+            unsafe {
+                let start = ptr.as_ptr().add(self.len);
+                for i in 0..(new_len - self.len) {
+                    debug_assert!(self.len + i < self.capacity, "Write beyond capacity");
+                    std::ptr::write(start.add(i), value);
                 }
             }
         }
@@ -283,18 +345,16 @@ impl<T: Copy + Default> TestAlignedBuffer<T> {
 
 impl<T: Copy + Default> Drop for TestAlignedBuffer<T> {
     fn drop(&mut self) {
-        if let Some(ptr) = self.ptr {
-            if self.capacity > 0 {
-                let layout = Layout::from_size_align(
-                    self.capacity * std::mem::size_of::<T>(),
-                    CACHE_LINE_SIZE,
-                )
-                .expect("Invalid layout");
+        if let Some(ptr) = self.ptr
+            && self.capacity > 0
+        {
+            let layout =
+                Layout::from_size_align(self.capacity * std::mem::size_of::<T>(), CACHE_LINE_SIZE)
+                    .expect("Invalid layout");
 
-                // SAFETY: ptr was allocated with this layout
-                unsafe {
-                    dealloc(ptr.as_ptr() as *mut u8, layout);
-                }
+            // SAFETY: ptr was allocated with this layout
+            unsafe {
+                dealloc(ptr.as_ptr() as *mut u8, layout);
             }
         }
     }

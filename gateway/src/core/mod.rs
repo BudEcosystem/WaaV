@@ -1,18 +1,53 @@
+/// Server-side ALIAS registry (P3): a logical name (e.g. `support-bot`) → a resolved
+/// `{stt, tts, llm}` / `dag_template` bundle, spliced into the session config BEFORE
+/// provider construction so ops can re-point providers with ZERO client redeploy.
+/// Mirrors the [`crate::dag::templates`] named-whole-DAG indirection primitive;
+/// SSRF-safe (definitions are server-config-only).
+pub mod alias;
 pub mod audio;
 pub mod cache;
+pub mod conversation;
+pub mod credentials;
 pub mod emotion;
+pub mod flow;
+/// Unified language system (P2): one canonical region-qualified BCP-47 token per request, mapped to
+/// each provider's native notation. Mirrors the [`emotion`] mapper chassis. Registered right after
+/// `emotion` per the standardization plan.
+pub mod lang;
+pub mod llm;
 pub mod metrics;
+pub(crate) mod model_integrity;
+// Canonical SSRF/URL validation shared by the DAG endpoint nodes, the
+// streaming-TTS endpoint override, and the conversation LLM URL check.
+pub mod net;
 pub mod observability;
+// Hardware execution-provider policy (MASTER_PLAN §7 H). Available exactly when
+// `ort` is pulled in, i.e. whenever any of the three ONNX consumers is enabled.
+#[cfg(any(
+    feature = "turn-detect",
+    feature = "smart-turn",
+    feature = "silero-vad"
+))]
+pub mod onnx;
 pub mod pipeline;
 pub mod providers;
+pub mod readiness;
 pub mod realtime;
+pub mod resilience;
 pub mod silero_vad;
 pub mod smart_turn;
 pub mod state;
 pub mod stt;
+pub mod text;
 pub mod tts;
+pub mod turn;
 pub mod turn_decision;
 pub mod turn_detect;
+/// Unified VOICE-DESCRIPTOR system (P4): a canonical `{gender, locale/accent, style,
+/// age, name_hint}` resolved server-side to a provider `voice_id` over the `/voices`
+/// catalog. Mirrors the [`emotion`] / [`lang`] mapper chassis; raw `voice_id` is the
+/// escape hatch, no-match → provider default + `config_warning` (never a 400).
+pub mod voice;
 pub mod voice_manager;
 pub mod websocket;
 
@@ -44,6 +79,18 @@ pub use voice_manager::{
     VoiceManagerError, VoiceManagerResult,
 };
 
+// Re-export the feature-flag-free LLM client (shared by the conversation loop
+// and the DAG llm node).
+pub use llm::{
+    ChatMessage, LlmClient, LlmClientConfig, LlmError, LlmResponse, LlmResult, MessageRole,
+    ResponseFormat, ToolDefinition,
+};
+
+// Re-export the built-in conversation orchestrator (W-O2).
+pub use conversation::{
+    ConversationConfig, ConversationOrchestrator, ConversationOrchestratorError,
+};
+
 // Re-export CoreState for external use
 pub use state::CoreState;
 
@@ -54,6 +101,16 @@ pub use emotion::{
     map_emotion_for_provider, provider_supports_emotions, validate_emotion_config,
 };
 
+// Re-export voice-descriptor types (P4) for convenience.
+pub use voice::{Age, Gender, ResolvedVoice, VoiceDescriptor, resolve_voice};
+
+// Re-export the unified language system (P2): canonical language + provider mapping.
+pub use lang::{
+    CanonicalLanguage, LanguageMapper, MappedLanguage, NotationKind, ProviderLanguageSupport,
+    get_language_mapper, language_support_matrix, map_language, resolve as resolve_language,
+    to_provider_language,
+};
+
 // Re-export audio types for VAD
 pub use audio::{AudioRingBuffer, VADAnalyzer, VADParams, VADState, VADTransition};
 
@@ -61,7 +118,7 @@ pub use audio::{AudioRingBuffer, VADAnalyzer, VADParams, VADState, VADTransition
 pub use silero_vad::{SileroVAD, SileroVADConfig, SileroVADResult};
 
 // Re-export metrics types for provider monitoring
-pub use metrics::{ProviderMetrics, ProviderMetricsSnapshot, RequestTimer};
+pub use metrics::{MetricsRegistry, ProviderMetrics, ProviderMetricsSnapshot, RequestTimer};
 
 // Re-export observability types for monitoring
 pub use observability::{
@@ -75,6 +132,19 @@ pub use pipeline::{FramePriority, FramePriorityQueue, PriorityFrame, QueueSnapsh
 pub use websocket::{
     ReconnectionConfig, ReconnectionConfigBuilder, ReconnectionManager, ReconnectionSnapshot,
     ReconnectionState,
+};
+
+// Re-export resilience primitives (circuit breaker + reconnect governor + the shared
+// process-global registry) — W-D2.
+pub use resilience::{
+    CircuitBreaker, CircuitBreakerConfig, CircuitBreakerSnapshot, CircuitState, ReconnectGovernor,
+    ReconnectPermit, ResilienceHandles, ResilienceRegistry,
+};
+
+// Re-export the generic reconnectable stream supervisor — W-D1.
+pub use websocket::reconnectable_stream::{
+    ReconnectOutcome, ReconnectableStream, ReconnectableStreamConfig, RestoreError, StreamError,
+    WsTransport,
 };
 
 // Re-export Smart Turn types for audio-based turn detection

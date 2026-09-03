@@ -20,6 +20,15 @@ use crate::core::stt::ibm_watson::IbmRegion;
 use crate::core::tts::base::TTSConfig;
 use serde::{Deserialize, Serialize};
 
+fn validate_ibm_tts_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -37,6 +46,12 @@ pub const MAX_TEXT_LENGTH: usize = 5120;
 /// Default sample rate for PCM audio (22050 Hz).
 pub const DEFAULT_SAMPLE_RATE: u32 = 22050;
 
+/// Lowest IBM TTS sample rate accepted by this gateway.
+pub const MIN_SAMPLE_RATE: u32 = 8000;
+
+/// Highest IBM TTS sample rate accepted by this gateway.
+pub const MAX_SAMPLE_RATE: u32 = 192_000;
+
 // =============================================================================
 // Voice Configuration
 // =============================================================================
@@ -50,9 +65,11 @@ pub const DEFAULT_SAMPLE_RATE: u32 = 22050;
 /// Voices are available in multiple languages with various characteristics.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
+#[derive(Default)]
 pub enum IbmVoice {
     // US English voices
     /// Allison - US English, Female, V3 Neural
+    #[default]
     EnUsAllisonV3Voice,
     /// Emily - US English, Female, V3 Neural
     EnUsEmilyV3Voice,
@@ -366,12 +383,6 @@ impl IbmVoice {
     }
 }
 
-impl Default for IbmVoice {
-    fn default() -> Self {
-        Self::EnUsAllisonV3Voice
-    }
-}
-
 impl std::fmt::Display for IbmVoice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.as_str())
@@ -611,6 +622,10 @@ pub struct IbmWatsonTTSConfig {
     /// Enable spell out mode (spell words letter by letter).
     #[serde(default)]
     pub spell_out_mode: Option<String>,
+
+    /// Mock-harness endpoint override: redirects the IAM token POST and synth POST to a localhost mock.
+    #[serde(default)]
+    pub endpoint_override: Option<String>,
 }
 
 impl Default for IbmWatsonTTSConfig {
@@ -638,11 +653,71 @@ impl Default for IbmWatsonTTSConfig {
             pitch_percentage: None,
             customization_ids: Vec::new(),
             spell_out_mode: None,
+            endpoint_override: None,
         }
     }
 }
 
 impl IbmWatsonTTSConfig {
+    /// Build from the standardized TTS config. IBM Watson exposes prosody via the **native**
+    /// `rate_percentage`/`pitch_percentage` `/v1/synthesize` query params, so this maps the typed
+    /// `rate_percentage`/`pitch_percentage` features 1:1 (or, as a fallback, derives them from the
+    /// provider-agnostic `speed`/`pitch` multipliers), plus `sample_rate` -> `base.sample_rate`.
+    /// IBM's `instance_id` (not a standard field) is read from the `extras` passthrough, falling
+    /// back to the `IBM_WATSON_INSTANCE_ID` env var (precedence: extras > env). Features
+    /// without an IBM field (stability, similarity_boost, style, use_speaker_boost, emotion,
+    /// instructions, ssml, language, word_timestamps, streaming, seed, volume) are skipped.
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> Result<Self, String> {
+        let f = &std.features;
+        let instance_id = std
+            .extras
+            .0
+            .get("instance_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .or_else(|| {
+                std::env::var("IBM_WATSON_INSTANCE_ID")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+            })
+            .unwrap_or_default();
+        let mut cfg = Self {
+            base: std.base.clone(),
+            instance_id,
+            ..Default::default()
+        };
+        // Map the standardized voice onto IBM's dedicated `voice` field (what the request builder
+        // reads). Previously `from_standard` left it at the default, silently ignoring the voice.
+        if let Some(v) = std.base.voice_id.as_deref().filter(|v| !v.is_empty()) {
+            cfg.voice = IbmVoice::from_str_or_default(v);
+        }
+        // Prefer IBM's native percentage-delta knobs when the caller supplies them directly
+        // (they reach the `rate_percentage`/`pitch_percentage` query params 1:1). Otherwise fall
+        // back to deriving them from the provider-agnostic `speed`/`pitch` multipliers.
+        if let Some(rate) = f.rate_percentage {
+            cfg.rate_percentage = Some(rate);
+        } else if let Some(speed) = f.speed {
+            // IBM rate is a percentage delta (0 = normal); a 1.0 multiplier maps to +0%.
+            cfg.rate_percentage = Some(((speed - 1.0) * 100.0) as i32);
+        }
+        if let Some(pitch) = f.pitch_percentage {
+            cfg.pitch_percentage = Some(pitch);
+        } else if let Some(pitch) = f.pitch {
+            // IBM pitch is a percentage delta (0 = normal).
+            cfg.pitch_percentage = Some(pitch as i32);
+        }
+        if let Some(rate) = f.sample_rate {
+            cfg.base.sample_rate = Some(rate);
+        }
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
+        cfg.validate_sample_rate()?;
+        cfg.validate_endpoint_override()?;
+        Ok(cfg)
+    }
+
     /// Create a new configuration with the given voice.
     pub fn with_voice(voice: IbmVoice) -> Self {
         let mut config = Self::default();
@@ -663,24 +738,26 @@ impl IbmWatsonTTSConfig {
             return Err("API key is required".to_string());
         }
 
+        self.validate_sample_rate()?;
+
         // Validate rate percentage if set
-        if let Some(rate) = self.rate_percentage {
-            if !(-100..=100).contains(&rate) {
-                return Err(format!(
-                    "Rate percentage must be between -100 and 100, got {}",
-                    rate
-                ));
-            }
+        if let Some(rate) = self.rate_percentage
+            && !(-100..=100).contains(&rate)
+        {
+            return Err(format!(
+                "Rate percentage must be between -100 and 100, got {}",
+                rate
+            ));
         }
 
         // Validate pitch percentage if set
-        if let Some(pitch) = self.pitch_percentage {
-            if !(-100..=100).contains(&pitch) {
-                return Err(format!(
-                    "Pitch percentage must be between -100 and 100, got {}",
-                    pitch
-                ));
-            }
+        if let Some(pitch) = self.pitch_percentage
+            && !(-100..=100).contains(&pitch)
+        {
+            return Err(format!(
+                "Pitch percentage must be between -100 and 100, got {}",
+                pitch
+            ));
         }
 
         // Validate customization count (max 2)
@@ -688,45 +765,76 @@ impl IbmWatsonTTSConfig {
             return Err("Maximum 2 customization IDs allowed per request".to_string());
         }
 
+        self.validate_endpoint_override()?;
+
+        Ok(())
+    }
+
+    pub fn validate_sample_rate(&self) -> Result<(), String> {
+        let Some(sample_rate) = self.base.sample_rate else {
+            return Ok(());
+        };
+
+        if !(MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE).contains(&sample_rate) {
+            return Err(format!(
+                "Sample rate must be between {} and {} Hz, got {}",
+                MIN_SAMPLE_RATE, MAX_SAMPLE_RATE, sample_rate
+            ));
+        }
+
+        Ok(())
+    }
+
+    pub fn validate_endpoint_override(&self) -> Result<(), String> {
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_ibm_tts_endpoint("endpoint_override", endpoint)?;
+        }
         Ok(())
     }
 
     /// Build the synthesis URL for the TTS API.
+    ///
+    /// Honors `endpoint_override` (mock harness): swaps scheme+host while keeping the
+    /// `/instances/{id}/v1/synthesize` path so a localhost mock can serve the synth POST.
     pub fn build_synthesis_url(&self) -> String {
-        format!(
+        let url = format!(
             "https://{}/instances/{}/v1/synthesize",
             self.region.tts_hostname(),
             self.instance_id
-        )
+        );
+        crate::core::tts::standard::override_rest_endpoint(&url, self.endpoint_override.as_deref())
     }
 
     /// Build query parameters for the synthesis request.
+    ///
+    /// `rate_percentage` and `pitch_percentage` are emitted as IBM Watson's **native**
+    /// `/v1/synthesize` query parameters (introduced 2022-08-31, see release notes) — a signed
+    /// integer percentage delta from the per-voice default (0 = normal). This is the documented
+    /// mechanism and is applied per-request without an SSML wrapper, so the param reaches the wire
+    /// 1:1. See <https://cloud.ibm.com/docs/text-to-speech?topic=text-to-speech-synthesis-params>.
     pub fn build_query_params(&self) -> Vec<(&'static str, String)> {
-        let mut params = vec![("voice".to_string(), self.voice.as_str().to_string())];
+        let mut params: Vec<(&'static str, String)> =
+            vec![("voice", self.voice.as_str().to_string())];
 
         // Add customization IDs if present
         for customization_id in &self.customization_ids {
-            params.push(("customization_id".to_string(), customization_id.clone()));
+            params.push(("customization_id", customization_id.clone()));
         }
 
         // Add spell out mode if set
         if let Some(ref mode) = self.spell_out_mode {
-            params.push(("spell_out_mode".to_string(), mode.clone()));
+            params.push(("spell_out_mode", mode.clone()));
         }
 
-        // Return as static str references with values
+        // Native prosody query params (audio-changing). Emitted as plain signed integers.
+        if let Some(rate) = self.rate_percentage {
+            params.push(("rate_percentage", rate.to_string()));
+        }
+        if let Some(pitch) = self.pitch_percentage {
+            params.push(("pitch_percentage", pitch.to_string()));
+        }
+
         params
-            .into_iter()
-            .map(|(k, v)| {
-                let key: &'static str = match k.as_str() {
-                    "voice" => "voice",
-                    "customization_id" => "customization_id",
-                    "spell_out_mode" => "spell_out_mode",
-                    _ => "voice",
-                };
-                (key, v)
-            })
-            .collect()
     }
 
     /// Get the Accept header for the request.
@@ -749,6 +857,140 @@ impl IbmWatsonTTSConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Maps speed -> rate_percentage and pitch -> pitch_percentage (IBM SSML prosody deltas),
+    // sample_rate -> base.sample_rate, and demonstrates the extras passthrough (instance_id).
+    #[test]
+    fn from_standard_maps_prosody_and_extras() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("instance_id".into(), serde_json::json!("inst-abc"));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "ibm-watson".into(),
+                api_key: "k".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(1.5),
+                pitch: Some(25.0),
+                sample_rate: Some(16000),
+                ..Default::default()
+            },
+            extras: crate::core::stt::standard::ProviderExtras(extras),
+        };
+        let cfg = IbmWatsonTTSConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.rate_percentage, Some(50)); // 1.5x -> +50%
+        assert_eq!(cfg.pitch_percentage, Some(25));
+        assert_eq!(cfg.base.sample_rate, Some(16000));
+        assert_eq!(cfg.instance_id, "inst-abc"); // from extras passthrough
+    }
+
+    // instance_id falls back to the IBM_WATSON_INSTANCE_ID env var when extras don't carry it,
+    // and an explicit extras value takes precedence over the env var (extras > env).
+    #[test]
+    fn from_standard_instance_id_env_fallback_and_extras_precedence() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        // SAFETY: Test-only, no concurrent access to this env var.
+        unsafe {
+            std::env::set_var("IBM_WATSON_INSTANCE_ID", "inst-from-env");
+        }
+
+        // No extras -> env var fills instance_id.
+        let std_no_extras = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "ibm-watson".into(),
+                api_key: "k".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures::default(),
+            extras: Default::default(),
+        };
+        let cfg = IbmWatsonTTSConfig::from_standard(&std_no_extras).unwrap();
+        assert_eq!(cfg.instance_id, "inst-from-env"); // env fallback
+
+        // Extras present -> extras win over the env var.
+        let mut extras = serde_json::Map::new();
+        extras.insert("instance_id".into(), serde_json::json!("inst-extras"));
+        let std_extras = StandardTTSConfig {
+            extras: crate::core::stt::standard::ProviderExtras(extras),
+            ..std_no_extras
+        };
+        let cfg = IbmWatsonTTSConfig::from_standard(&std_extras).unwrap();
+        assert_eq!(cfg.instance_id, "inst-extras"); // extras > env
+
+        // SAFETY: Test-only, no concurrent access to this env var.
+        unsafe {
+            std::env::remove_var("IBM_WATSON_INSTANCE_ID");
+        }
+    }
+
+    // The native typed `rate_percentage`/`pitch_percentage` features reach the config 1:1 and take
+    // precedence over the multiplicative `speed`/`pitch` derivation when both are present.
+    #[test]
+    fn from_standard_prefers_native_rate_and_pitch_percentage() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "ibm-watson".into(),
+                api_key: "k".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                // Multipliers present too — native percentage knobs must win.
+                speed: Some(2.0),
+                pitch: Some(99.0),
+                rate_percentage: Some(-15),
+                pitch_percentage: Some(40),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let cfg = IbmWatsonTTSConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.rate_percentage, Some(-15)); // native knob, not speed-derived
+        assert_eq!(cfg.pitch_percentage, Some(40)); // native knob, not pitch-derived
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = IbmWatsonTTSConfig {
+            instance_id: "inst".to_string(),
+            base: TTSConfig {
+                api_key: "k".to_string(),
+                ..Default::default()
+            },
+            endpoint_override: Some("https://gateway.example.com".to_string()),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:8080".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.contains("SSRF protection"));
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("file endpoint_override must be rejected");
+        assert!(err.contains("URL scheme"));
+
+        config.endpoint_override = Some("ws://gateway.example.com".to_string());
+        let err = config
+            .validate()
+            .expect_err("WebSocket endpoint_override must be rejected");
+        assert!(err.contains("URL scheme"));
+
+        let std = crate::core::tts::standard::StandardTTSConfig::from_base(TTSConfig {
+            provider: "ibm-watson".to_string(),
+            api_key: "k".to_string(),
+            ..Default::default()
+        })
+        .with_endpoint_override("file:///tmp/socket");
+        assert!(IbmWatsonTTSConfig::from_standard(&std).is_err());
+    }
 
     #[test]
     fn test_voice_names() {
@@ -889,6 +1131,31 @@ mod tests {
         let result = config.validate();
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("API key"));
+    }
+
+    #[test]
+    fn test_config_validation_rejects_invalid_sample_rate() {
+        let mut config = IbmWatsonTTSConfig::default();
+        config.instance_id = "test-instance".to_string();
+        config.base.api_key = "test-api-key".to_string();
+
+        config.base.sample_rate = Some(99);
+        let err = config
+            .validate()
+            .expect_err("sub-100 Hz sample rates can create zero-byte chunks");
+        assert!(err.contains("Sample rate"), "{err}");
+
+        config.base.sample_rate = Some(0);
+        let err = config
+            .validate_sample_rate()
+            .expect_err("zero sample rate must be rejected");
+        assert!(err.contains("Sample rate"), "{err}");
+
+        config.base.sample_rate = Some(u32::MAX);
+        let err = config
+            .validate_sample_rate()
+            .expect_err("pathological sample rate must be rejected");
+        assert!(err.contains("Sample rate"), "{err}");
     }
 
     #[test]

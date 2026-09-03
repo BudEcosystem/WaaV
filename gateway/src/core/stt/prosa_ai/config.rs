@@ -24,6 +24,15 @@
 use crate::core::stt::base::{STTConfig, STTError};
 use serde::{Deserialize, Serialize};
 
+fn validate_prosa_stt_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_WS_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -219,6 +228,11 @@ pub struct ProsaSttConfig {
 
     /// Optional job label.
     pub label: Option<String>,
+
+    /// Carried from the standardized `endpoint_override` — points the dial at the in-repo mock/proxy
+    /// (a local `ws://` server) for credential-free end-to-end integration tests; `None` uses the
+    /// production Prosa.ai endpoint.
+    pub endpoint_override: Option<String>,
 }
 
 impl Default for ProsaSttConfig {
@@ -237,6 +251,7 @@ impl Default for ProsaSttConfig {
             enable_spoken_numerals: true,
             request_timeout_secs: DEFAULT_REQUEST_TIMEOUT,
             label: None,
+            endpoint_override: None,
         }
     }
 }
@@ -285,7 +300,34 @@ impl ProsaSttConfig {
             enable_spoken_numerals: true,
             request_timeout_secs: DEFAULT_REQUEST_TIMEOUT,
             label: None,
+            endpoint_override: None,
         })
+    }
+
+    /// Build from the standardized config (W1 keystone). Prosa.ai exposes a small set of request
+    /// toggles, so this maps the standardized features whose meaning matches an existing Prosa
+    /// field: interim results (`include_partial`), filler words (`include_filler`) and smart
+    /// formatting (`auto_punctuation`). Features Prosa cannot express (diarization is only an
+    /// integer speaker count with no boolean toggle, plus word_timestamps, profanity_filter,
+    /// vad/endpointing, keyterms, redaction, entity/language detection) are capability gaps and
+    /// stay at their defaults.
+    pub fn from_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(&std.base)?;
+        if let Some(i) = f.interim_results {
+            cfg.include_partial = i;
+        }
+        if let Some(filler) = f.filler_words {
+            cfg.include_filler = filler;
+        }
+        if let Some(s) = f.smart_format {
+            cfg.auto_punctuation = s;
+        }
+        cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
+        cfg.validate().map_err(STTError::ConfigurationError)?;
+        Ok(cfg)
     }
 
     /// Validate the configuration.
@@ -300,6 +342,10 @@ impl ProsaSttConfig {
 
         if self.channels == 0 {
             return Err("Channels must be greater than 0".to_string());
+        }
+
+        if let Some(endpoint) = &self.endpoint_override {
+            validate_prosa_stt_endpoint("endpoint_override", endpoint)?;
         }
 
         Ok(())
@@ -376,6 +422,13 @@ pub struct ProsaSttStreamConfig {
     /// Include partial results.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub include_partial: Option<bool>,
+
+    /// Include filler words ("um", "uh") in the streaming transcript rather than dropping them.
+    /// Mirrors the REST request's `include_filler`; Prosa.ai's streaming `config` message accepts
+    /// the same recognition toggles as the REST `config` object (Prosa.ai STT v2 streaming docs:
+    /// the WS session `config` is the streaming analogue of the REST `config`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include_filler: Option<bool>,
 
     /// Audio configuration.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -578,6 +631,30 @@ pub enum ProsaSttWsMessage {
 mod tests {
     use super::*;
 
+    // W1 keystone: maps the standardized features Prosa.ai can express (interim results +
+    // filler words) onto its own config fields.
+    #[test]
+    fn from_standard_maps_features() {
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "prosa_ai".into(),
+                api_key: "test-key".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                interim_results: Some(false),
+                filler_words: Some(true),
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+            translation: None,
+        };
+        let cfg = ProsaSttConfig::from_standard(&std).unwrap();
+        assert!(!cfg.include_partial); // interim_results
+        assert!(cfg.include_filler); // filler_words
+    }
+
     #[test]
     fn test_config_default() {
         let config = ProsaSttConfig::default();
@@ -618,6 +695,33 @@ mod tests {
         let mut config = ProsaSttConfig::default();
         config.api_key = "test_key".to_string();
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = ProsaSttConfig {
+            api_key: "test_key".to_string(),
+            ..Default::default()
+        };
+
+        config.endpoint_override = Some("https://prosa-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("wss://prosa-stream.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.contains("SSRF protection"), "{err}");
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("non-HTTP/WS endpoint_override must be rejected");
+        assert!(err.contains("SSRF protection"), "{err}");
     }
 
     #[test]
@@ -860,6 +964,7 @@ mod tests {
             model: "stt-general-online".to_string(),
             label: Some("test".to_string()),
             include_partial: Some(true),
+            include_filler: Some(true),
             audio: Some(ProsaSttAudioConfig {
                 format: "wav".to_string(),
                 channels: Some(1),
@@ -871,5 +976,6 @@ mod tests {
         assert!(json.contains("stt-general-online"));
         assert!(json.contains("wav"));
         assert!(json.contains("16000"));
+        assert!(json.contains("include_filler"));
     }
 }

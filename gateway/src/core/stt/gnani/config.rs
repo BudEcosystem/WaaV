@@ -7,6 +7,15 @@ use crate::core::stt::base::STTConfig;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+fn validate_gnani_stt_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 /// Gnani STT provider-specific configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GnaniSTTConfig {
@@ -21,6 +30,10 @@ pub struct GnaniSTTConfig {
     /// Gnani access key (received via email after registration)
     #[serde(default, skip_serializing)]
     pub access_key: String,
+
+    /// Override gRPC endpoint (plaintext, no TLS/cert) — used by mock e2e tests.
+    #[serde(default, skip_serializing)]
+    pub endpoint_override: Option<String>,
 
     /// Path to SSL certificate file (cert.pem)
     /// Required for gRPC connection authentication
@@ -47,6 +60,18 @@ pub struct GnaniSTTConfig {
     /// Enable interim (partial) results
     #[serde(default = "default_interim_results")]
     pub interim_results: bool,
+
+    /// Sensitive-data flag: sent to Gnani as the `sensitive` gRPC request header so the
+    /// provider treats the audio as sensitive (e.g. suppresses logging/retention). `None`
+    /// omits the header entirely. Maps from the `sensitive` ProviderExtras key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sensitive: Option<bool>,
+
+    /// Optional audio filename forwarded as the `filename` gRPC request header for
+    /// server-side debugging/correlation. `None` omits the header. Maps from the
+    /// `filename` ProviderExtras key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
 }
 
 fn default_connection_timeout() -> u64 {
@@ -76,17 +101,55 @@ impl Default for GnaniSTTConfig {
             },
             token: String::new(),
             access_key: String::new(),
+            endpoint_override: None,
             certificate_path: None,
             certificate_content: None,
             audio_format: GnaniAudioFormat::default(),
             connection_timeout_secs: default_connection_timeout(),
             request_timeout_secs: default_request_timeout(),
             interim_results: default_interim_results(),
+            sensitive: None,
+            filename: None,
         }
     }
 }
 
 impl GnaniSTTConfig {
+    /// Build from the standardized config (W1 keystone). Gnani is a thin gRPC streaming provider
+    /// whose only standardized-feature surface is interim (partial) results, so this maps that one
+    /// boolean; the remaining advanced features (diarization, word_timestamps, redaction, keyterms,
+    /// …) are capability gaps Gnani cannot express and are left at default. Gnani's non-standard
+    /// credentials (`token`, `access_key`) and request headers (`sensitive`, `filename`) are read
+    /// from `provider_extras` when present, overriding the env-var defaults that `from_base`
+    /// supplies. `sensitive`/`filename` are forwarded as gRPC metadata by `create_gnani_metadata`.
+    pub fn from_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, String> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(std.base.clone())?;
+        if let Some(i) = f.interim_results {
+            cfg.interim_results = i;
+        }
+        if let Some(t) = std.extras.0.get("token").and_then(|v| v.as_str()) {
+            cfg.token = t.to_string();
+        }
+        if let Some(k) = std.extras.0.get("access_key").and_then(|v| v.as_str()) {
+            cfg.access_key = k.to_string();
+        }
+        // Newly-wired Gnani request headers (forwarded as gRPC metadata by create_gnani_metadata).
+        if let Some(s) = std.extras.0.get("sensitive").and_then(|v| v.as_bool()) {
+            cfg.sensitive = Some(s);
+        }
+        if let Some(fname) = std.extras.0.get("filename").and_then(|v| v.as_str()) {
+            cfg.filename = Some(fname.to_string());
+        }
+        cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
+        if let Some(endpoint) = &cfg.endpoint_override {
+            validate_gnani_stt_endpoint("endpoint_override", endpoint)?;
+        }
+        Ok(cfg)
+    }
+
     /// Create GnaniSTTConfig from base STTConfig
     ///
     /// Extracts Gnani-specific credentials from environment variables if not
@@ -115,12 +178,15 @@ impl GnaniSTTConfig {
             base: STTConfig { language, ..base },
             token,
             access_key,
+            endpoint_override: None,
             certificate_path,
             certificate_content,
             audio_format,
             connection_timeout_secs: default_connection_timeout(),
             request_timeout_secs: default_request_timeout(),
             interim_results: default_interim_results(),
+            sensitive: None,
+            filename: None,
         })
     }
 
@@ -139,20 +205,29 @@ impl GnaniSTTConfig {
             );
         }
 
-        if self.certificate_path.is_none() && self.certificate_content.is_none() {
+        if let Some(endpoint) = &self.endpoint_override {
+            validate_gnani_stt_endpoint("endpoint_override", endpoint)?;
+        }
+
+        // The TLS CA certificate is only needed for the production endpoint; a plaintext
+        // `endpoint_override` (mock/proxy) skips TLS entirely, so don't require a cert there.
+        if self.endpoint_override.is_none()
+            && self.certificate_path.is_none()
+            && self.certificate_content.is_none()
+        {
             return Err(
                 "Gnani certificate is required. Set GNANI_CERTIFICATE_PATH or GNANI_CERTIFICATE_CONTENT environment variable.".to_string()
             );
         }
 
         // Validate certificate path exists if provided
-        if let Some(ref path) = self.certificate_path {
-            if !path.exists() {
-                return Err(format!(
-                    "Gnani certificate file not found: {}",
-                    path.display()
-                ));
-            }
+        if let Some(ref path) = self.certificate_path
+            && !path.exists()
+        {
+            return Err(format!(
+                "Gnani certificate file not found: {}",
+                path.display()
+            ));
         }
 
         // Validate language is supported
@@ -212,7 +287,7 @@ impl GnaniAudioFormat {
 }
 
 /// Supported languages for Gnani STT (14 languages)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum GnaniLanguage {
     /// Kannada (kn-IN)
     #[serde(rename = "kn-IN")]
@@ -246,6 +321,7 @@ pub enum GnaniLanguage {
     Urdu,
     /// English - India (en-IN)
     #[serde(rename = "en-IN")]
+    #[default]
     EnglishIndia,
     /// English - UK (en-GB)
     #[serde(rename = "en-GB")]
@@ -256,12 +332,6 @@ pub enum GnaniLanguage {
     /// English - Singapore (en-SG)
     #[serde(rename = "en-SG")]
     EnglishSG,
-}
-
-impl Default for GnaniLanguage {
-    fn default() -> Self {
-        Self::EnglishIndia
-    }
 }
 
 impl GnaniLanguage {
@@ -354,6 +424,61 @@ impl GnaniLanguage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone: the standardized features unlock Gnani's only mappable feature surface
+    // (interim/partial results) plus its non-standard credentials via extras — previously
+    // unreachable through the flat factory.
+    #[test]
+    fn from_standard_maps_features() {
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "gnani".into(),
+                api_key: String::new(),
+                language: "hi-IN".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                interim_results: Some(false),
+                ..Default::default()
+            },
+            extras: ProviderExtras(
+                serde_json::json!({ "access_key": "ak-123" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+            translation: None,
+        };
+        let cfg = GnaniSTTConfig::from_standard(&std).unwrap();
+        assert!(!cfg.interim_results);
+        assert_eq!(cfg.access_key, "ak-123");
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = GnaniSTTConfig {
+            token: "test-token".to_string(),
+            access_key: "test-access-key".to_string(),
+            endpoint_override: Some("https://gnani-proxy.example.com".to_string()),
+            ..Default::default()
+        };
+
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.contains("SSRF protection"), "{err}");
+
+        config.endpoint_override = Some("grpc://gnani-proxy.example.com".to_string());
+        let err = config
+            .validate()
+            .expect_err("non-HTTP endpoint_override must be rejected");
+        assert!(err.contains("SSRF protection"), "{err}");
+    }
 
     #[test]
     fn test_gnani_language_from_str() {

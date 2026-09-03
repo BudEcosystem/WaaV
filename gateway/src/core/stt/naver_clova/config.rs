@@ -27,6 +27,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::core::stt::base::{STTConfig, STTError};
 
+fn validate_naver_clova_http_endpoint(source: &str, endpoint: &str) -> Result<(), STTError> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Err(STTError::ConfigurationError(format!(
+            "{source} must not be empty"
+        )));
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES).map_err(
+        |msg| STTError::ConfigurationError(format!("{source} rejected (SSRF protection): {msg}")),
+    )
+}
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -39,6 +51,9 @@ pub const MAX_AUDIO_DURATION_SECONDS: usize = 60;
 
 /// Minimum sample rate in Hz.
 pub const MIN_SAMPLE_RATE: u32 = 16000;
+
+/// Maximum sample rate accepted from user-facing config.
+pub const MAX_SAMPLE_RATE: u32 = 192000;
 
 /// Default sample rate in Hz.
 pub const DEFAULT_SAMPLE_RATE: u32 = 16000;
@@ -232,6 +247,10 @@ pub struct NaverClovaSttConfig {
 
     /// Custom endpoint URL (for enterprise deployments).
     pub custom_endpoint: Option<String>,
+
+    /// Base endpoint override (scheme://host) from the standardized `endpoint_override` — points the
+    /// batch POST at an in-repo mock/proxy for credential-free e2e; `None` uses the production host.
+    pub endpoint_override: Option<String>,
 }
 
 impl Default for NaverClovaSttConfig {
@@ -245,6 +264,7 @@ impl Default for NaverClovaSttConfig {
             connection_timeout_secs: 10,
             request_timeout_secs: 60,
             custom_endpoint: None,
+            endpoint_override: None,
         }
     }
 }
@@ -298,7 +318,7 @@ impl NaverClovaSttConfig {
             DEFAULT_SAMPLE_RATE
         };
 
-        Ok(Self {
+        let cfg = Self {
             client_id,
             client_secret,
             language,
@@ -307,7 +327,29 @@ impl NaverClovaSttConfig {
             connection_timeout_secs: 10,
             request_timeout_secs: 60,
             custom_endpoint: None,
-        })
+            endpoint_override: None,
+        };
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Build from the standardized config (W1 keystone). NAVER CLOVA CSR is a simple batch
+    /// (REST) recognizer that returns plain text and exposes none of the standardized advanced
+    /// features (diarization, word_timestamps, smart_format, profanity_filter, filler_words,
+    /// interim_results, vad/endpointing, keyterms, redaction, entity/language detection) on its
+    /// config, so there is nothing to map: this is a uniform standardized entry point that simply
+    /// delegates to `from_base`. Every standardized feature is a capability gap and stays unset.
+    pub fn from_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        let mut cfg = Self::from_base(std.base.clone())?;
+        cfg.endpoint_override = std
+            .endpoint_override()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        cfg.validate()?;
+        Ok(cfg)
     }
 
     /// Validate the configuration.
@@ -329,6 +371,21 @@ impl NaverClovaSttConfig {
                 "Sample rate must be at least {} Hz, got {}",
                 MIN_SAMPLE_RATE, self.sample_rate
             )));
+        }
+
+        if self.sample_rate > MAX_SAMPLE_RATE {
+            return Err(STTError::ConfigurationError(format!(
+                "Sample rate must be at most {} Hz, got {}",
+                MAX_SAMPLE_RATE, self.sample_rate
+            )));
+        }
+
+        if let Some(endpoint) = &self.custom_endpoint {
+            validate_naver_clova_http_endpoint("custom_endpoint", endpoint)?;
+        }
+
+        if let Some(endpoint) = &self.endpoint_override {
+            validate_naver_clova_http_endpoint("endpoint_override", endpoint)?;
         }
 
         Ok(())
@@ -360,6 +417,30 @@ impl NaverClovaSttConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone: NAVER CLOVA CSR is a simple batch recognizer with no mappable advanced
+    // features, so `from_standard` is a pure `from_base` passthrough — it must succeed and carry
+    // the base credentials (parsed client_id|client_secret) through unchanged.
+    #[test]
+    fn from_standard_passthrough_carries_base() {
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "naver_clova".into(),
+                api_key: "client_id|client_secret".into(),
+                language: "ko-KR".into(),
+                sample_rate: 16000,
+                ..Default::default()
+            },
+            features: SttFeatures::default(),
+            extras: ProviderExtras::default(),
+            translation: None,
+        };
+        let cfg = NaverClovaSttConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.client_id, "client_id"); // base api_key carried through
+        assert_eq!(cfg.client_secret, "client_secret");
+        assert_eq!(cfg.language, NaverClovaLanguage::Korean);
+    }
 
     #[test]
     fn test_language_code() {
@@ -442,6 +523,27 @@ mod tests {
     }
 
     #[test]
+    fn test_config_from_base_rejects_invalid_sample_rate() {
+        let low = STTConfig {
+            api_key: "client_id|client_secret".to_string(),
+            sample_rate: 8000,
+            ..Default::default()
+        };
+        let err = NaverClovaSttConfig::from_base(low)
+            .expect_err("from_base must validate low sample rates");
+        assert!(err.to_string().contains("at least"), "{err}");
+
+        let pathological = STTConfig {
+            api_key: "client_id|client_secret".to_string(),
+            sample_rate: u32::MAX,
+            ..Default::default()
+        };
+        let err = NaverClovaSttConfig::from_base(pathological)
+            .expect_err("from_base must reject pathological sample rates");
+        assert!(err.to_string().contains("at most"), "{err}");
+    }
+
+    #[test]
     fn test_config_from_base_invalid_format() {
         let base = STTConfig {
             api_key: "no_separator".to_string(),
@@ -506,6 +608,41 @@ mod tests {
         };
 
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_targets() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let base = NaverClovaSttConfig {
+            client_id: "test_id".to_string(),
+            client_secret: "test_secret".to_string(),
+            ..Default::default()
+        };
+
+        let mut config = base.clone();
+        config.custom_endpoint = Some("https://enterprise.example.com/stt".to_string());
+        assert!(config.validate().is_ok());
+
+        let mut config = base.clone();
+        config.custom_endpoint = Some("http://127.0.0.1:9000/stt".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback custom_endpoint must be rejected");
+        assert!(err.to_string().contains("SSRF protection"), "{err}");
+
+        let mut config = base.clone();
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.to_string().contains("SSRF protection"), "{err}");
+
+        let mut config = base;
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("non-HTTP endpoint_override must be rejected");
+        assert!(err.to_string().contains("not allowed"), "{err}");
     }
 
     #[test]

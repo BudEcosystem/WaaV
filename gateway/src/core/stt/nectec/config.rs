@@ -26,6 +26,15 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
 
+fn validate_nectec_http_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -190,6 +199,9 @@ pub struct NectecSttConfig {
 
     /// Partii4 output format (only for Partii4).
     pub output_format: Partii4OutputFormat,
+
+    /// Optional endpoint base override (scheme+host) for test/mock redirection.
+    pub endpoint_override: Option<String>,
 }
 
 impl Default for NectecSttConfig {
@@ -202,6 +214,7 @@ impl Default for NectecSttConfig {
             request_timeout_secs: DEFAULT_REQUEST_TIMEOUT,
             output_level: Partii4OutputLevel::default(),
             output_format: Partii4OutputFormat::default(),
+            endpoint_override: None,
         }
     }
 }
@@ -244,7 +257,26 @@ impl NectecSttConfig {
             request_timeout_secs: DEFAULT_REQUEST_TIMEOUT,
             output_level: Partii4OutputLevel::default(),
             output_format: Partii4OutputFormat::default(),
+            endpoint_override: None,
         })
+    }
+
+    /// Build from the standardized config (W1 keystone — FINAL batch, completes the STT migration).
+    ///
+    /// NECTEC is a simple batch Thai-only engine (Partii4/Partii5): its config exposes only the
+    /// model, audio shape, timeout, and the two Partii4 output knobs (`output_level`/`output_format`).
+    /// None of the canonical [`SttFeatures`](crate::core::stt::standard::SttFeatures) — interim_results,
+    /// diarization, word_timestamps, smart_format, profanity_filter, filler_words, vad_events,
+    /// endpointing/utterance timing, keyterms, redaction, language/entity detection — has a real field
+    /// to map onto, so this is a pure `from_base` passthrough: a uniform standardized entry point with
+    /// no feature mapping (every standardized feature is a capability gap and stays at its default).
+    pub fn from_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        let mut cfg = Self::from_base(&std.base)?;
+        cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
+        cfg.validate().map_err(STTError::ConfigurationError)?;
+        Ok(cfg)
     }
 
     /// Validate the configuration.
@@ -267,6 +299,10 @@ impl NectecSttConfig {
                 "NECTEC requires mono audio (1 channel), got {} channels",
                 self.channels
             ));
+        }
+
+        if let Some(endpoint) = &self.endpoint_override {
+            validate_nectec_http_endpoint("endpoint_override", endpoint)?;
         }
 
         Ok(())
@@ -378,6 +414,33 @@ impl std::error::Error for NectecSttError {}
 mod tests {
     use super::*;
 
+    // W1 keystone (FINAL batch): NECTEC is a simple batch engine with no advanced-feature fields,
+    // so `from_standard` is a pure `from_base` passthrough — assert it succeeds and the base
+    // (api_key/model) carries through even when advanced features are requested (they're capability
+    // gaps and are intentionally dropped).
+    #[test]
+    fn from_standard_passthrough_carries_base() {
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "nectec".into(),
+                api_key: "test-key".into(),
+                model: "partii4".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                diarization: Some(true),
+                profanity_filter: Some(true),
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+            translation: None,
+        };
+        let cfg = NectecSttConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.api_key, "test-key");
+        assert_eq!(cfg.model, NectecSttModel::Partii4);
+    }
+
     #[test]
     fn test_default_config() {
         let config = NectecSttConfig::default();
@@ -482,6 +545,32 @@ mod tests {
             ..Default::default()
         };
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = NectecSttConfig {
+            api_key: "test_key".to_string(),
+            sample_rate: 16000,
+            channels: 1,
+            ..Default::default()
+        };
+
+        config.endpoint_override = Some("https://nectec-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.contains("SSRF protection"), "{err}");
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("non-HTTP endpoint_override must be rejected");
+        assert!(err.contains("not allowed"), "{err}");
     }
 
     #[test]

@@ -21,7 +21,7 @@
 //!         "http://localhost:7880".to_string(),
 //!         "api_key".to_string(),
 //!         "api_secret".to_string(),
-//!     );
+//!     )?;
 //!
 //!     // Configure trunk and dispatch rules
 //!     let trunk_config = TrunkConfig {
@@ -48,7 +48,7 @@
 //! ```
 
 use livekit_api::services::sip::{
-    CreateSIPDispatchRuleOptions, ListSIPDispatchRuleFilter, ListSIPInboundTrunkFilter, SIPClient,
+    ListSIPDispatchRuleFilter, ListSIPInboundTrunkFilter, SIPClient,
 };
 use livekit_protocol as proto;
 
@@ -103,7 +103,7 @@ impl LiveKitSipHandler {
     /// * `api_secret` - LiveKit API secret
     ///
     /// # Returns
-    /// * `Self` - New handler instance
+    /// * `Result<Self, LiveKitError>` - New handler instance or client setup error
     ///
     /// # Example
     /// ```rust,no_run
@@ -113,19 +113,19 @@ impl LiveKitSipHandler {
     ///     "http://localhost:7880".to_string(),
     ///     "api_key".to_string(),
     ///     "api_secret".to_string(),
-    /// );
+    /// ).expect("create SIP handler");
     /// ```
-    pub fn new(url: String, api_key: String, api_secret: String) -> Self {
+    pub fn new(url: String, api_key: String, api_secret: String) -> Result<Self, LiveKitError> {
         let sip_client = SIPClient::with_api_key(&url, &api_key, &api_secret);
-        let sip_api_client = SIPApiClient::new(url.clone(), api_key.clone(), api_secret.clone());
+        let sip_api_client = SIPApiClient::new(url.clone(), api_key.clone(), api_secret.clone())?;
 
-        Self {
+        Ok(Self {
             url,
             api_key,
             api_secret,
             sip_client,
             sip_api_client,
-        }
+        })
     }
 
     /// Configure SIP dispatch rules including trunk and dispatch rule creation
@@ -148,7 +148,7 @@ impl LiveKitSipHandler {
     ///     "http://localhost:7880".to_string(),
     ///     "api_key".to_string(),
     ///     "api_secret".to_string(),
-    /// );
+    /// )?;
     ///
     /// let trunk_config = TrunkConfig {
     ///     trunk_name: "local-trunk".to_string(),
@@ -219,15 +219,10 @@ impl LiveKitSipHandler {
             .any(|rule| rule.name == dispatch_config.dispatch_name);
 
         if !rule_exists {
-            // Note: The livekit-api crate doesn't currently support setting room_config
-            // through CreateSIPDispatchRuleOptions. The max_participants setting
-            // needs to be set through the LiveKit server's admin API or dashboard
-            // after creating the dispatch rule.
-            //
-            // TODO: Extend the livekit-api crate to support room_config in dispatch rules,
-            // or use a lower-level twirp client request to set it during creation.
-
-            // Create dispatch rule with individual dispatch (room prefix)
+            // Create dispatch rule with individual dispatch (room prefix). Routed through the raw
+            // twirp client because livekit-api's wrapper drops `room_config` — the configured
+            // `max_participants` is now applied AT CREATION (previously it was silently ignored
+            // with a "set it in the dashboard" note).
             let dispatch_rule = proto::sip_dispatch_rule::Rule::DispatchRuleIndividual(
                 proto::SipDispatchRuleIndividual {
                     room_prefix: dispatch_config.room_prefix.clone(),
@@ -235,22 +230,19 @@ impl LiveKitSipHandler {
                 },
             );
 
-            let dispatch_options = CreateSIPDispatchRuleOptions {
-                name: dispatch_config.dispatch_name.clone(),
-                ..Default::default()
-            };
-
-            self.sip_client
-                .create_sip_dispatch_rule(dispatch_rule, dispatch_options)
+            self.sip_api_client
+                .create_sip_dispatch_rule_with_room_config(
+                    dispatch_config.dispatch_name.clone(),
+                    dispatch_rule,
+                    Vec::new(),
+                    dispatch_config.max_participants,
+                )
                 .await
                 .map_err(|e| {
                     LiveKitError::ConnectionFailed(format!(
                         "Failed to create SIP dispatch rule: {e}"
                     ))
                 })?;
-
-            // Note: max_participants must be configured separately through
-            // the LiveKit dashboard or API
         }
 
         Ok(())
@@ -283,7 +275,7 @@ impl LiveKitSipHandler {
     ///     "http://localhost:7880".to_string(),
     ///     "api_key".to_string(),
     ///     "api_secret".to_string(),
-    /// );
+    /// )?;
     ///
     /// // Transfer to international number
     /// handler.transfer_call("participant-id", "room-name", "+1234567890").await?;
@@ -332,7 +324,8 @@ mod tests {
             "http://localhost:7880".to_string(),
             "test_key".to_string(),
             "test_secret".to_string(),
-        );
+        )
+        .expect("create SIP handler");
 
         assert_eq!(handler.url(), "http://localhost:7880");
         assert_eq!(handler.api_key(), "test_key");
@@ -388,7 +381,8 @@ mod tests {
             "http://localhost:7880".to_string(),
             "invalid_key".to_string(),
             "invalid_secret".to_string(),
-        );
+        )
+        .expect("create SIP handler");
 
         let trunk_config = TrunkConfig {
             trunk_name: "test-trunk".to_string(),
@@ -416,7 +410,8 @@ mod tests {
             "http://localhost:7880".to_string(),
             "invalid_key".to_string(),
             "invalid_secret".to_string(),
-        );
+        )
+        .expect("create SIP handler");
 
         let result = handler
             .transfer_call("participant-id", "room-name", "tel:+1234567890")
@@ -434,7 +429,8 @@ mod tests {
             "http://localhost:7880".to_string(),
             "test_key".to_string(),
             "test_secret".to_string(),
-        );
+        )
+        .expect("create SIP handler");
 
         // Test without tel: prefix - should still work (error due to no server)
         let result = handler
@@ -493,7 +489,8 @@ mod tests {
             "http://my-livekit:7880".to_string(),
             "my_api_key".to_string(),
             "my_api_secret".to_string(),
-        );
+        )
+        .expect("create SIP handler");
 
         assert_eq!(handler.url(), "http://my-livekit:7880");
         assert_eq!(handler.api_key(), "my_api_key");

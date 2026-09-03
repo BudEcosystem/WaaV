@@ -33,18 +33,31 @@
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use tokio::time::{Instant, interval, timeout};
 use tokio_tungstenite::tungstenite::handshake::client::generate_key;
-use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{client::IntoClientRequest, protocol::Message},
+};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use super::config::AzureSTTConfig;
 use super::messages::{AzureMessage, RecognitionStatus};
+use crate::core::resilience::connect::with_timeout;
 use crate::core::stt::base::{
     BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback,
 };
+use crate::core::websocket::ReconnectionConfig;
+use crate::core::websocket::reconnectable_stream::{
+    ReconnectOutcome, ReconnectableStream, ReconnectableStreamConfig, RestoreError, StreamError,
+    WsTransport,
+};
+use futures::stream::{SplitSink, SplitStream};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 // =============================================================================
 // Constants
@@ -71,6 +84,196 @@ type AsyncErrorCallback = Box<
         + Send
         + Sync,
 >;
+
+/// The concrete WebSocket stream type Azure dials.
+type AzureWs = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// A [`WsTransport`] that adapts Azure's USP streaming event loop to the generic
+/// [`ReconnectableStream`] supervisor (W-D1 fleet adoption). One is built per (re)connect by the
+/// supervisor's `connect` closure.
+///
+/// Unlike ElevenLabs (all features in the URL → no-op restore), Azure carries its featured
+/// session in **post-handshake USP messages** (`speech.config` + the advanced-feature
+/// `speech.context`). So [`restore_session`](WsTransport::restore_session) re-sends those on the
+/// fresh socket — without it a reconnect would resume as a *bare* (un-featured) session, exactly
+/// the failure mode the supervisor doc warns about. [`run`](WsTransport::run) IS the original
+/// `select!` loop, now returning a [`ReconnectOutcome`] so a transport drop reconnects instead of
+/// ending the session.
+struct AzureTransport {
+    ws_sink: SplitSink<AzureWs, Message>,
+    ws_stream: SplitStream<AzureWs>,
+    /// Shared inbound audio receiver (single-consumer; locked for the duration of `run`).
+    audio_rx: Arc<Mutex<mpsc::Receiver<Bytes>>>,
+    /// Shared shutdown token (an intentional close must not reconnect).
+    shutdown_token: CancellationToken,
+    result_tx: mpsc::Sender<STTResult>,
+    error_tx: mpsc::Sender<STTError>,
+    /// Fires once after the featured session is (re)established, unblocking `start_connection`.
+    connected_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    /// A fresh USP request id per connection (Azure correlates `speech.config`/`speech.context`/
+    /// audio under one X-RequestId for a recognition turn).
+    request_id: String,
+    content_type: String,
+    interim_results_enabled: bool,
+    /// The advanced-feature `speech.context` body (None → Azure defaults), re-sent on every
+    /// restore so reconnects keep diarization/languageId/phrase-list biasing.
+    speech_context_body: Option<String>,
+    /// Wall clock of the last audio chunk, for the keep-alive silence frames.
+    last_audio_time: Instant,
+}
+
+impl AzureTransport {
+    async fn shutdown_gracefully(ws_sink: &mut SplitSink<AzureWs, Message>) -> ReconnectOutcome {
+        let _ = ws_sink.send(Message::Close(None)).await;
+        ReconnectOutcome::Completed
+    }
+}
+
+#[async_trait::async_trait]
+impl WsTransport for AzureTransport {
+    async fn restore_session(&mut self) -> Result<(), RestoreError> {
+        // Azure USP: re-send the mandatory `speech.config`, then (if any advanced feature is
+        // configured) the `speech.context`, under a fresh request id for this connection. This is
+        // the featured-session restore — a reconnect must NOT resume as a bare session.
+        self.request_id = AzureSTT::new_request_id();
+        let speech_config = AzureSTT::usp_text_message(
+            "speech.config",
+            &self.request_id,
+            &AzureSTT::iso8601_now(),
+            "application/json",
+            &AzureSTT::speech_config_body(),
+        );
+        self.ws_sink
+            .send(Message::Text(speech_config.into()))
+            .await
+            .map_err(|e| RestoreError::new(format!("failed to send Azure speech.config: {e}")))?;
+
+        if let Some(ref ctx_body) = self.speech_context_body {
+            let speech_context = AzureSTT::usp_text_message(
+                "speech.context",
+                &self.request_id,
+                &AzureSTT::iso8601_now(),
+                "application/json",
+                ctx_body,
+            );
+            self.ws_sink
+                .send(Message::Text(speech_context.into()))
+                .await
+                .map_err(|e| {
+                    RestoreError::new(format!("failed to send Azure speech.context: {e}"))
+                })?;
+        }
+
+        // The featured session is established: signal the waiting connect() exactly once.
+        if let Some(tx) = self.connected_tx.lock().await.take() {
+            let _ = tx.send(());
+        }
+        self.last_audio_time = Instant::now();
+        Ok(())
+    }
+
+    async fn run(&mut self) -> ReconnectOutcome {
+        let shutdown_token = self.shutdown_token.clone();
+        if shutdown_token.is_cancelled() {
+            info!("Received shutdown signal for Azure STT");
+            return Self::shutdown_gracefully(&mut self.ws_sink).await;
+        }
+        let mut audio_rx = self.audio_rx.lock().await;
+        let mut keepalive_timer = interval(Duration::from_secs(1));
+        loop {
+            tokio::select! {
+                // Prioritize audio sending for lowest latency
+                biased;
+
+                // Handle outgoing audio data
+                Some(audio_data) = audio_rx.recv() => {
+                    let framed = AzureSTT::usp_audio_frame(
+                        &self.request_id,
+                        &AzureSTT::iso8601_now(),
+                        &self.content_type,
+                        &audio_data,
+                    );
+                    if let Err(e) = self.ws_sink.send(Message::Binary(framed.into())).await {
+                        let stt_error = STTError::NetworkError(format!(
+                            "Failed to send audio to Azure: {e}"
+                        ));
+                        error!("{}", stt_error);
+                        let _ = self.error_tx.try_send(stt_error);
+                        // Transport-level send failure: reconnect to preserve the session.
+                        return ReconnectOutcome::Reconnectable(StreamError::new("audio send failed"));
+                    }
+                    self.last_audio_time = Instant::now();
+                }
+
+                // Handle incoming messages with timeout to detect hung connections
+                message = timeout(WS_MESSAGE_TIMEOUT, self.ws_stream.next()) => {
+                    match message {
+                        Ok(Some(Ok(msg))) => {
+                            if let Err(e) = AzureSTT::handle_websocket_message(
+                                msg,
+                                &self.result_tx,
+                                self.interim_results_enabled,
+                            ) {
+                                error!("Azure streaming error: {}", e);
+                                let _ = self.error_tx.try_send(e);
+                                // A provider recognition error is typically fatal (bad config) —
+                                // don't hammer it with reconnects.
+                                return ReconnectOutcome::Fatal(StreamError::new("provider error frame"));
+                            }
+                        }
+                        Ok(Some(Err(e))) => {
+                            let stt_error = STTError::NetworkError(format!("WebSocket error: {e}"));
+                            error!("{}", stt_error);
+                            let _ = self.error_tx.try_send(stt_error);
+                            return ReconnectOutcome::Reconnectable(StreamError::new("websocket error"));
+                        }
+                        Ok(None) => {
+                            info!("Azure WebSocket stream ended");
+                            return ReconnectOutcome::Reconnectable(StreamError::new("stream ended"));
+                        }
+                        Err(_elapsed) => {
+                            let stt_error = STTError::NetworkError(
+                                "Azure WebSocket timeout - no message received within 60 seconds".to_string()
+                            );
+                            error!("{}", stt_error);
+                            let _ = self.error_tx.try_send(stt_error);
+                            return ReconnectOutcome::Reconnectable(StreamError::new("idle timeout"));
+                        }
+                    }
+                }
+
+                // Handle keep-alive timer
+                _ = keepalive_timer.tick() => {
+                    if self.last_audio_time.elapsed() >= Duration::from_secs(5) {
+                        let silence_frame = vec![0u8; 64];
+                        let framed = AzureSTT::usp_audio_frame(
+                            &self.request_id,
+                            &AzureSTT::iso8601_now(),
+                            &self.content_type,
+                            &silence_frame,
+                        );
+                        if let Err(e) = self.ws_sink.send(Message::Binary(framed.into())).await {
+                            let stt_error = STTError::NetworkError(format!(
+                                "Failed to send keep-alive: {e}"
+                            ));
+                            error!("{}", stt_error);
+                            let _ = self.error_tx.try_send(stt_error);
+                            return ReconnectOutcome::Reconnectable(StreamError::new("keepalive send failed"));
+                        }
+                        debug!("Sent keep-alive silence frame to Azure");
+                        self.last_audio_time = Instant::now();
+                    }
+                }
+
+                // Handle shutdown signal (intentional close — must NOT reconnect)
+                _ = shutdown_token.cancelled() => {
+                    info!("Received shutdown signal for Azure STT");
+                    return Self::shutdown_gracefully(&mut self.ws_sink).await;
+                }
+            }
+        }
+    }
+}
 
 // =============================================================================
 // Connection State
@@ -157,6 +360,11 @@ pub struct AzureSTT {
     /// Current connection state.
     state: ConnectionState,
 
+    /// Intentional-disconnect flag shared with the reconnect supervisor (W-D1). Cleared on
+    /// `connect()`, set in `disconnect()` before cancelling the shutdown token, so a client close
+    /// racing a server-side close can never trigger a spurious reconnect.
+    intentional_disconnect: Arc<AtomicBool>,
+
     /// State change notification.
     state_notify: Arc<Notify>,
 
@@ -164,8 +372,8 @@ pub struct AzureSTT {
     /// Uses bounded channel (32 items) to provide backpressure.
     ws_sender: Option<mpsc::Sender<Bytes>>,
 
-    /// Shutdown signal sender.
-    shutdown_tx: Option<oneshot::Sender<()>>,
+    /// Shutdown token shared with supervised transports.
+    shutdown_token: Option<CancellationToken>,
 
     /// Result channel sender.
     result_tx: Option<mpsc::Sender<STTResult>>,
@@ -190,6 +398,13 @@ pub struct AzureSTT {
 
     /// Connection ID for debugging (sent to Azure in headers).
     connection_id: String,
+
+    /// Shared, process-global resilience handles (W-D2): the single reconnect governor + this
+    /// provider's shared circuit breaker, injected by the VoiceManager from CoreState and driven
+    /// by the generic [`ReconnectableStream`](crate::core::websocket::ReconnectableStream)
+    /// supervisor. `None` before `set_resilience` (a direct unit-test construction) → the
+    /// supervisor uses its own per-session governor/breaker default.
+    resilience: Option<crate::core::resilience::ResilienceHandles>,
 }
 
 impl Default for AzureSTT {
@@ -197,9 +412,10 @@ impl Default for AzureSTT {
         Self {
             config: None,
             state: ConnectionState::Disconnected,
+            intentional_disconnect: Arc::new(AtomicBool::new(false)),
             state_notify: Arc::new(Notify::new()),
             ws_sender: None,
-            shutdown_tx: None,
+            shutdown_token: None,
             result_tx: None,
             error_tx: None,
             connection_handle: None,
@@ -208,11 +424,33 @@ impl Default for AzureSTT {
             result_callback: Arc::new(Mutex::new(None)),
             error_callback: Arc::new(Mutex::new(None)),
             connection_id: generate_key(),
+            resilience: None,
         }
     }
 }
 
 impl AzureSTT {
+    /// W1 keystone — construct directly from the standardized config so the advanced features
+    /// Azure can express (interim results, word-level timing, profanity handling) are honored
+    /// END-TO-END. The flat `BaseSTT::new` path uses `from_base` (defaults only); this is the
+    /// reachable standardized path. Capabilities Azure has no field for stay at their defaults.
+    pub fn new_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        if std.base.api_key.is_empty() {
+            return Err(STTError::AuthenticationFailed(
+                "Azure subscription key is required".to_string(),
+            ));
+        }
+        // `Self` implements `Drop`, so the struct-update (`..Default::default()`) move is illegal;
+        // start from the Default value and overwrite only the config.
+        let config = AzureSTTConfig::from_standard(std);
+        config.validate().map_err(STTError::ConfigurationError)?;
+        let mut stt = Self::default();
+        stt.config = Some(config);
+        Ok(stt)
+    }
+
     /// Build the Content-Type header value for audio format.
     ///
     /// Azure expects a specific format like:
@@ -222,6 +460,73 @@ impl AzureSTT {
             "audio/wav; codecs=audio/pcm; samplerate={}",
             config.base.sample_rate
         )
+    }
+
+    /// A fresh 32-hex-char request id (GUID without dashes), as Azure's USP protocol expects.
+    fn new_request_id() -> String {
+        uuid::Uuid::new_v4().simple().to_string()
+    }
+
+    /// Current UTC time formatted as ISO-8601 (Azure `X-Timestamp`). Built from `time`
+    /// accessors so it needs no extra crate feature.
+    fn iso8601_now() -> String {
+        let n = time::OffsetDateTime::now_utc();
+        format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+            n.year(),
+            n.month() as u8,
+            n.day(),
+            n.hour(),
+            n.minute(),
+            n.second(),
+            n.millisecond()
+        )
+    }
+
+    /// Build an Azure USP **text** message: a CRLF header block (`Path`, `X-RequestId`,
+    /// `X-Timestamp`, `Content-Type`) + a blank line + the body. Sent as a WebSocket Text frame.
+    fn usp_text_message(
+        path: &str,
+        request_id: &str,
+        timestamp: &str,
+        content_type: &str,
+        body: &str,
+    ) -> String {
+        format!(
+            "Path: {path}\r\nX-RequestId: {request_id}\r\nX-Timestamp: {timestamp}\r\nContent-Type: {content_type}\r\n\r\n{body}"
+        )
+    }
+
+    /// Build an Azure USP **binary** (audio) message: a 2-byte big-endian header length, the
+    /// CRLF header block, then the raw audio payload. Sending unframed binary (the previous
+    /// behaviour) is silently ignored by Azure — this is the protocol the service requires.
+    fn usp_audio_frame(
+        request_id: &str,
+        timestamp: &str,
+        content_type: &str,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let header = format!(
+            "Path: audio\r\nX-RequestId: {request_id}\r\nX-Timestamp: {timestamp}\r\nContent-Type: {content_type}\r\n"
+        );
+        let hb = header.as_bytes();
+        let mut out = Vec::with_capacity(2 + hb.len() + payload.len());
+        out.extend_from_slice(&(hb.len() as u16).to_be_bytes());
+        out.extend_from_slice(hb);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// The `speech.config` JSON body Azure requires once after the handshake (system context).
+    fn speech_config_body() -> String {
+        serde_json::json!({
+            "context": {
+                "system": { "name": "WaaV-Gateway", "version": "1.0.0" },
+                "os": { "platform": "Linux", "name": "WaaV", "version": "1.0" },
+                "device": { "manufacturer": "WaaV", "model": "Gateway", "version": "1.0" }
+            }
+        })
+        .to_string()
     }
 
     /// Handle incoming WebSocket messages from Azure.
@@ -326,8 +631,8 @@ impl AzureSTT {
         let ws_url = config.build_websocket_url();
 
         // Create channels for communication
-        let (ws_tx, mut ws_rx) = mpsc::channel::<Bytes>(32);
-        let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+        let (ws_tx, ws_rx) = mpsc::channel::<Bytes>(32);
+        let shutdown_token = CancellationToken::new();
         // Bounded channels for backpressure - 256 should handle bursts while preventing memory exhaustion
         let (result_tx, mut result_rx) = mpsc::channel::<STTResult>(256);
         let (error_tx, mut error_rx) = mpsc::channel::<STTError>(64);
@@ -335,7 +640,7 @@ impl AzureSTT {
 
         // Store channels
         self.ws_sender = Some(ws_tx);
-        self.shutdown_tx = Some(shutdown_tx);
+        self.shutdown_token = Some(shutdown_token.clone());
         self.result_tx = Some(result_tx.clone());
         self.error_tx = Some(error_tx.clone());
 
@@ -345,183 +650,129 @@ impl AzureSTT {
         let content_type = Self::build_content_type(&config);
         let connection_id = self.connection_id.clone();
         let interim_results_enabled = config.interim_results;
+        // Advanced recognition features ride a USP `speech.context` message (built from the
+        // standardized features). `None` → no advanced feature requested, so the message is
+        // skipped and the wire stays at Azure defaults. The supervised transport re-sends this on
+        // every restore so reconnects keep the featured session.
+        let speech_context_body = config.build_speech_context_body();
 
-        // Start the connection task
+        // Shared state the supervised transport re-uses across reconnect attempts: a single-
+        // consumer audio receiver, shutdown token, and the one-shot connected signal that fires
+        // after the featured session is restored.
+        let audio_rx = Arc::new(Mutex::new(ws_rx));
+        let connected_tx = Arc::new(Mutex::new(Some(connected_tx)));
+
+        // Storm control + provider breaker: drive the GENERIC ReconnectableStream supervisor (the
+        // same one the chaos tests exercise) with the shared process-global handles from CoreState
+        // (W-D1/W-D2 fleet adoption). When no handles were injected (a direct unit-test
+        // construction), the supervisor uses its own per-session governor/breaker default.
+        let reconnection = ReconnectionConfig::aggressive();
+        // Share the client-owned intentional-disconnect flag INTO the supervisor (W-D1): a client
+        // close racing a server-side close must never trigger a spurious reconnect. Captured here
+        // while `self` is still borrowable, before the supervisor is moved into `tokio::spawn`.
+        let disconnect_flag = Arc::clone(&self.intentional_disconnect);
+        let supervisor = match self.resilience.clone() {
+            Some(r) => ReconnectableStream::with_breaker_and_governor(
+                ReconnectableStreamConfig::new("azure", reconnection),
+                r.breaker,
+                (*r.governor).clone(),
+            ),
+            None => ReconnectableStream::new(ReconnectableStreamConfig::new("azure", reconnection)),
+        }
+        .with_disconnect_flag(disconnect_flag);
+
+        // Start the connection task: the supervisor owns the outer reconnect loop; the `connect`
+        // closure dials with Azure auth headers and hands back a transport whose `restore_session`
+        // re-sends the USP `speech.config`/`speech.context` and whose `run()` is the original
+        // Azure event loop.
         let connection_handle = tokio::spawn(async move {
-            // Build WebSocket request with Azure authentication headers
-            let request = match tokio_tungstenite::tungstenite::http::Request::builder()
-                .method("GET")
-                .uri(&ws_url)
-                .header("Host", &host)
-                .header("Upgrade", "websocket")
-                .header("Connection", "upgrade")
-                .header("Sec-WebSocket-Key", generate_key())
-                .header("Sec-WebSocket-Version", "13")
-                // Azure-specific authentication header
-                .header("Ocp-Apim-Subscription-Key", &api_key)
-                // Connection ID for debugging
-                .header("X-ConnectionId", &connection_id)
-                // Audio format specification
-                .header("Content-Type", &content_type)
-                .body(())
-            {
-                Ok(request) => request,
-                Err(e) => {
-                    let stt_error = STTError::ConnectionFailed(format!(
-                        "Failed to create WebSocket request: {e}"
-                    ));
-                    error!("{}", stt_error);
-                    let _ = error_tx.try_send(stt_error);
-                    return;
-                }
-            };
-
-            // Connect to Azure with timeout
-            let connect_result =
-                match timeout(Duration::from_secs(30), connect_async(request)).await {
-                    Ok(result) => result,
-                    Err(_) => {
-                        let stt_error = STTError::ConnectionFailed(
-                            "Connection to Azure timed out after 30 seconds".to_string(),
+            let exit = supervisor
+                .run(|| {
+                    let ws_url = ws_url.clone();
+                    let host = host.clone();
+                    let api_key = api_key.clone();
+                    let connection_id = connection_id.clone();
+                    let content_type = content_type.clone();
+                    let speech_context_body = speech_context_body.clone();
+                    let audio_rx = Arc::clone(&audio_rx);
+                    let shutdown_token = shutdown_token.clone();
+                    let connected_tx = Arc::clone(&connected_tx);
+                    let result_tx = result_tx.clone();
+                    let error_tx = error_tx.clone();
+                    async move {
+                        // Build the upgrade request via `into_client_request` (repo convention):
+                        // it derives the 5 mandatory WS handshake headers (`Host`, `Connection`,
+                        // `Upgrade`, `Sec-WebSocket-Version`, `Sec-WebSocket-Key`) from the dial
+                        // URL; only Azure's auth/session headers ride on top. The explicit `Host`
+                        // is then pinned to the regional STT hostname: identical to the
+                        // URL-derived value in production, and it preserves the historical
+                        // behavior of keeping the production Host when an `endpoint_override`
+                        // redirects the dial to a local mock.
+                        let map_req_err = |e: &dyn std::fmt::Display| {
+                            StreamError::new(format!("Failed to create WebSocket request: {e}"))
+                        };
+                        let mut request = ws_url
+                            .as_str()
+                            .into_client_request()
+                            .map_err(|e| map_req_err(&e))?;
+                        let headers = request.headers_mut();
+                        headers.insert("Host", host.parse().map_err(|e| map_req_err(&e))?);
+                        headers.insert(
+                            "Ocp-Apim-Subscription-Key",
+                            api_key.parse().map_err(|e| map_req_err(&e))?,
                         );
-                        error!("{}", stt_error);
-                        let _ = error_tx.try_send(stt_error);
-                        return;
-                    }
-                };
+                        headers.insert(
+                            "X-ConnectionId",
+                            connection_id.parse().map_err(|e| map_req_err(&e))?,
+                        );
+                        headers.insert(
+                            "Content-Type",
+                            content_type.parse().map_err(|e| map_req_err(&e))?,
+                        );
 
-            let (ws_stream, _response) = match connect_result {
-                Ok(result) => result,
-                Err(e) => {
-                    let error_msg = format!("Failed to connect to Azure: {e}");
-                    // Check for authentication errors
-                    let stt_error = if error_msg.contains("401")
-                        || error_msg.contains("Unauthorized")
-                    {
-                        STTError::AuthenticationFailed(
-                            "Azure authentication failed. Check subscription key and region."
-                                .to_string(),
-                        )
-                    } else if error_msg.contains("403") || error_msg.contains("Forbidden") {
-                        STTError::AuthenticationFailed(
-                            "Azure access forbidden. Subscription may be inactive or region mismatch.".to_string()
-                        )
-                    } else {
-                        STTError::ConnectionFailed(error_msg)
-                    };
-                    error!("{}", stt_error);
-                    let _ = error_tx.try_send(stt_error);
-                    return;
-                }
-            };
-
-            info!(
-                "Connected to Azure Speech-to-Text WebSocket (connection_id: {})",
-                connection_id
-            );
-
-            // Signal successful connection
-            let _ = connected_tx.send(());
-
-            let (mut ws_sink, mut ws_stream) = ws_stream.split();
-
-            // Keep-alive mechanism: Azure connections may timeout during silence
-            // Send silence frames every 5 seconds if no audio was sent
-            let mut keepalive_timer = interval(Duration::from_secs(1));
-            let mut last_audio_time = Instant::now();
-
-            // Main event loop
-            loop {
-                tokio::select! {
-                    // Prioritize audio sending for lowest latency
-                    biased;
-
-                    // Handle outgoing audio data
-                    Some(audio_data) = ws_rx.recv() => {
-                        // Azure expects raw PCM audio as binary messages
-                        let message = Message::Binary(audio_data);
-                        if let Err(e) = ws_sink.send(message).await {
-                            let stt_error = STTError::NetworkError(format!(
-                                "Failed to send audio to Azure: {e}"
-                            ));
-                            error!("{}", stt_error);
-                            let _ = error_tx.try_send(stt_error);
-                            break;
-                        }
-                        // Update last audio time for keep-alive tracking
-                        last_audio_time = Instant::now();
-                    }
-
-                    // Handle incoming messages with timeout to detect hung connections
-                    message = timeout(WS_MESSAGE_TIMEOUT, ws_stream.next()) => {
-                        match message {
-                            Ok(Some(Ok(msg))) => {
-                                if let Err(e) = Self::handle_websocket_message(
-                                    msg,
-                                    &result_tx,
-                                    interim_results_enabled,
-                                ) {
-                                    error!("Azure streaming error: {}", e);
-                                    let _ = error_tx.try_send(e);
-                                    break;
+                        // Deadline-bounded dial via the shared resilience helper. Azure keeps its
+                        // historical 30s bound (looser than the canonical 15s
+                        // `core::resilience::connect::WS_CONNECT_TIMEOUT`).
+                        let (ws_stream, _response) =
+                            match with_timeout(Duration::from_secs(30), connect_async(request))
+                                .await
+                            {
+                                Ok(Ok(s)) => s,
+                                Ok(Err(e)) => {
+                                    return Err(StreamError::new(format!(
+                                        "Failed to connect to Azure: {e}"
+                                    )));
                                 }
-                            }
-                            Ok(Some(Err(e))) => {
-                                let stt_error = STTError::NetworkError(format!(
-                                    "WebSocket error: {e}"
-                                ));
-                                error!("{}", stt_error);
-                                let _ = error_tx.try_send(stt_error);
-                                break;
-                            }
-                            Ok(None) => {
-                                info!("Azure WebSocket stream ended");
-                                break;
-                            }
-                            Err(_elapsed) => {
-                                let stt_error = STTError::NetworkError(
-                                    "Azure WebSocket timeout - no message received within 60 seconds".to_string()
-                                );
-                                error!("{}", stt_error);
-                                let _ = error_tx.try_send(stt_error);
-                                break;
-                            }
-                        }
+                                Err(_) => {
+                                    return Err(StreamError::new(
+                                        "Connection to Azure timed out after 30 seconds"
+                                            .to_string(),
+                                    ));
+                                }
+                            };
+                        info!(
+                            "Connected to Azure Speech-to-Text WebSocket (connection_id: {})",
+                            connection_id
+                        );
+                        let (ws_sink, ws_stream) = ws_stream.split();
+                        Ok(AzureTransport {
+                            ws_sink,
+                            ws_stream,
+                            audio_rx,
+                            shutdown_token,
+                            result_tx,
+                            error_tx,
+                            connected_tx,
+                            request_id: AzureSTT::new_request_id(),
+                            content_type,
+                            interim_results_enabled,
+                            speech_context_body,
+                            last_audio_time: Instant::now(),
+                        })
                     }
-
-                    // Handle keep-alive timer
-                    _ = keepalive_timer.tick() => {
-                        // Check if we need to send silence to keep connection alive
-                        // Azure may timeout after extended silence (typically 30-60 seconds)
-                        if last_audio_time.elapsed() >= Duration::from_secs(5) {
-                            // Send a small buffer of silence (32 samples at 16kHz = 2ms)
-                            // This is minimal overhead but keeps the connection alive
-                            let silence_frame = vec![0u8; 64]; // 32 16-bit samples
-                            let message = Message::Binary(silence_frame.into());
-                            if let Err(e) = ws_sink.send(message).await {
-                                let stt_error = STTError::NetworkError(format!(
-                                    "Failed to send keep-alive: {e}"
-                                ));
-                                error!("{}", stt_error);
-                                let _ = error_tx.try_send(stt_error);
-                                break;
-                            }
-                            debug!("Sent keep-alive silence frame to Azure");
-                            last_audio_time = Instant::now();
-                        }
-                    }
-
-                    // Handle shutdown signal
-                    _ = &mut shutdown_rx => {
-                        info!("Received shutdown signal for Azure STT");
-                        // Send close message
-                        let _ = ws_sink.send(Message::Close(None)).await;
-                        break;
-                    }
-                }
-            }
-
-            info!("Azure STT WebSocket connection closed");
+                })
+                .await;
+            info!("Azure STT WebSocket connection closed (supervisor exit: {exit:?})");
         });
 
         self.connection_handle = Some(connection_handle);
@@ -589,6 +840,13 @@ impl AzureSTT {
         &self.connection_id
     }
 
+    /// The shared circuit breaker this session feeds into the generic supervisor, if the
+    /// process-global resilience handles have been injected (W-D1/W-D2). Two `AzureSTT` built from
+    /// the same [`crate::core::resilience::ResilienceRegistry`] return the *same* `Arc`.
+    pub fn resilience_breaker(&self) -> Option<&Arc<crate::core::resilience::CircuitBreaker>> {
+        self.resilience.as_ref().map(|r| &r.breaker)
+    }
+
     /// Get the Azure-specific configuration.
     ///
     /// Returns `None` if the client was not properly initialized.
@@ -599,9 +857,9 @@ impl AzureSTT {
 
 impl Drop for AzureSTT {
     fn drop(&mut self) {
-        // Send shutdown signal if still connected
-        if let Some(shutdown_tx) = self.shutdown_tx.take() {
-            let _ = shutdown_tx.send(());
+        self.intentional_disconnect.store(true, Ordering::SeqCst);
+        if let Some(shutdown_token) = self.shutdown_token.take() {
+            shutdown_token.cancel();
         }
     }
 }
@@ -622,13 +880,17 @@ impl BaseSTT for AzureSTT {
 
         // Create Azure-specific configuration with defaults
         let azure_config = AzureSTTConfig::from_base(config);
+        azure_config
+            .validate()
+            .map_err(STTError::ConfigurationError)?;
 
         Ok(Self {
             config: Some(azure_config),
             state: ConnectionState::Disconnected,
+            intentional_disconnect: Arc::new(AtomicBool::new(false)),
             state_notify: Arc::new(Notify::new()),
             ws_sender: None,
-            shutdown_tx: None,
+            shutdown_token: None,
             result_tx: None,
             error_tx: None,
             connection_handle: None,
@@ -637,6 +899,7 @@ impl BaseSTT for AzureSTT {
             result_callback: Arc::new(Mutex::new(None)),
             error_callback: Arc::new(Mutex::new(None)),
             connection_id: generate_key(),
+            resilience: None,
         })
     }
 
@@ -648,9 +911,14 @@ impl BaseSTT for AzureSTT {
             ));
         }
 
+        // Fresh session: clear any intent left over from a prior disconnect so the supervisor
+        // does not immediately complete.
+        self.intentional_disconnect.store(false, Ordering::SeqCst);
+
         let config = self.config.as_ref().ok_or_else(|| {
             STTError::ConfigurationError("No configuration available".to_string())
         })?;
+        config.validate().map_err(STTError::ConfigurationError)?;
 
         // Generate new connection ID for this connection attempt
         self.connection_id = generate_key();
@@ -659,26 +927,34 @@ impl BaseSTT for AzureSTT {
     }
 
     async fn disconnect(&mut self) -> Result<(), STTError> {
-        // Send shutdown signal
-        if let Some(shutdown_tx) = self.shutdown_tx.take() {
-            let _ = shutdown_tx.send(());
+        // Record the intent BEFORE firing the shutdown signal so the supervisor sees it even if the
+        // transport's run() just reported a reconnectable drop (the disconnect-vs-close race).
+        self.intentional_disconnect.store(true, Ordering::SeqCst);
+
+        if let Some(shutdown_token) = self.shutdown_token.take() {
+            shutdown_token.cancel();
         }
 
         // Wait for connection task to finish with timeout
         if let Some(handle) = self.connection_handle.take() {
-            let _ = timeout(Duration::from_secs(5), handle).await;
+            crate::core::observability::await_task_shutdown(
+                "azure-stt-connection",
+                handle,
+                Duration::from_secs(5),
+            )
+            .await;
         }
 
         // Clean up result forwarding task
         if let Some(handle) = self.result_forward_handle.take() {
-            handle.abort();
-            let _ = handle.await;
+            crate::core::observability::abort_and_await_task("azure-stt-result-forwarder", handle)
+                .await;
         }
 
         // Clean up error forwarding task
         if let Some(handle) = self.error_forward_handle.take() {
-            handle.abort();
-            let _ = handle.await;
+            crate::core::observability::abort_and_await_task("azure-stt-error-forwarder", handle)
+                .await;
         }
 
         // Clear all channels
@@ -774,6 +1050,25 @@ impl BaseSTT for AzureSTT {
             auto_detect_languages: existing
                 .as_ref()
                 .and_then(|c| c.auto_detect_languages.clone()),
+            // Preserve the advanced speech.context features across a config update (set from the
+            // standardized features at session start; must survive a mid-session base swap).
+            speaker_diarization: existing.as_ref().is_some_and(|c| c.speaker_diarization),
+            segmentation_silence_timeout_ms: existing
+                .as_ref()
+                .and_then(|c| c.segmentation_silence_timeout_ms),
+            language_id_continuous: existing.as_ref().is_some_and(|c| c.language_id_continuous),
+            nbest_count: existing.as_ref().and_then(|c| c.nbest_count),
+            phrase_list: existing
+                .as_ref()
+                .map(|c| c.phrase_list.clone())
+                .unwrap_or_default(),
+            phrase_output_options: existing
+                .as_ref()
+                .map(|c| c.phrase_output_options.clone())
+                .unwrap_or_default(),
+            dictation_mode: existing.as_ref().is_some_and(|c| c.dictation_mode),
+            sentiment_analysis: existing.as_ref().is_some_and(|c| c.sentiment_analysis),
+            endpoint_override: existing.as_ref().and_then(|c| c.endpoint_override.clone()),
         };
 
         self.config = Some(azure_config);
@@ -784,6 +1079,13 @@ impl BaseSTT for AzureSTT {
 
     fn get_provider_info(&self) -> &'static str {
         "Microsoft Azure Speech-to-Text"
+    }
+
+    fn set_resilience(&mut self, resilience: crate::core::resilience::ResilienceHandles) {
+        // Store the shared, process-global handles so `start_connection` drives the generic
+        // ReconnectableStream supervisor with them — every Azure session trips the same breaker
+        // and shares the one process-wide reconnect cap (W-D2).
+        self.resilience = Some(resilience);
     }
 }
 
@@ -886,6 +1188,144 @@ impl AzureSTT {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone: a standardized advanced feature Azure supports (word-level timing) survives
+    // through new_standard onto the stored provider config — the flat factory path drops it.
+    #[test]
+    fn new_standard_carries_word_timestamps_to_config() {
+        use crate::core::stt::standard::{StandardSTTConfig, SttFeatures};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "azure".into(),
+                api_key: "subscription-key".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                word_timestamps: Some(true),
+                ..Default::default()
+            },
+            extras: Default::default(),
+            translation: None,
+        };
+        let stt = AzureSTT::new_standard(&std).unwrap();
+        assert!(stt.config.as_ref().unwrap().word_level_timing);
+
+        // Missing key is rejected through the standardized path too.
+        let bad = StandardSTTConfig::from_base(STTConfig {
+            api_key: String::new(),
+            ..Default::default()
+        });
+        assert!(AzureSTT::new_standard(&bad).is_err());
+    }
+
+    #[test]
+    fn test_new_standard_rejects_ssrf_endpoint_override() {
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
+
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let previous = std::env::var_os("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
+
+        let mk = |endpoint: &str| {
+            StandardSTTConfig {
+                base: STTConfig {
+                    provider: "azure".into(),
+                    api_key: "subscription-key".into(),
+                    language: "en-US".into(),
+                    sample_rate: 16000,
+                    ..Default::default()
+                },
+                features: SttFeatures::default(),
+                extras: ProviderExtras::default(),
+                translation: None,
+            }
+            .with_endpoint_override(endpoint)
+        };
+
+        assert!(AzureSTT::new_standard(&mk("wss://azure-proxy.example.com")).is_ok());
+        assert!(AzureSTT::new_standard(&mk("ws://127.0.0.1:9000")).is_err());
+        assert!(AzureSTT::new_standard(&mk("file:///tmp/socket")).is_err());
+        assert!(AzureSTT::new_standard(&mk("https://azure-proxy.example.com")).is_err());
+
+        // SAFETY: restore the process env before releasing the test env lock.
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", previous);
+            } else {
+                std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+            }
+        }
+    }
+
+    // Azure USP framing — converts the provider from BROKEN (unframed binary, no speech.config)
+    // to the documented Universal Speech Protocol. Byte-exact acceptance is gated on the live
+    // CI smoke test; these assert the framing STRUCTURE the protocol requires.
+    #[test]
+    fn usp_audio_frame_has_2byte_header_len_then_header_then_payload() {
+        let payload = [1u8, 2, 3, 4];
+        let frame =
+            AzureSTT::usp_audio_frame("rid", "2024-01-01T00:00:00.000Z", "audio/x-wav", &payload);
+        // First 2 bytes = big-endian header length.
+        let hdr_len = u16::from_be_bytes([frame[0], frame[1]]) as usize;
+        let header = std::str::from_utf8(&frame[2..2 + hdr_len]).unwrap();
+        assert!(header.starts_with("Path: audio\r\n"));
+        assert!(header.contains("X-RequestId: rid\r\n"));
+        assert!(header.contains("X-Timestamp: 2024-01-01T00:00:00.000Z\r\n"));
+        assert!(header.contains("Content-Type: audio/x-wav\r\n"));
+        // Payload is appended verbatim after the header block.
+        assert_eq!(&frame[2 + hdr_len..], &payload);
+    }
+
+    #[test]
+    fn usp_text_message_has_headers_blank_line_then_body() {
+        let body = AzureSTT::speech_config_body();
+        let msg = AzureSTT::usp_text_message(
+            "speech.config",
+            "rid",
+            "2024-01-01T00:00:00.000Z",
+            "application/json",
+            &body,
+        );
+        assert!(msg.starts_with("Path: speech.config\r\n"));
+        assert!(msg.contains("Content-Type: application/json\r\n\r\n"));
+        // Body is valid JSON with the required `context` block.
+        let json_part = msg.split("\r\n\r\n").nth(1).unwrap();
+        let v: serde_json::Value = serde_json::from_str(json_part).unwrap();
+        assert!(v["context"]["system"]["name"].is_string());
+    }
+
+    #[test]
+    fn iso8601_now_is_well_formed() {
+        let ts = AzureSTT::iso8601_now();
+        // YYYY-MM-DDTHH:MM:SS.mmmZ
+        assert_eq!(ts.len(), 24);
+        assert!(ts.ends_with('Z') && ts.contains('T'));
+    }
+
+    // W-D1: disconnect() must record intent on the supervisor-shared flag so a client close racing
+    // a server-side close can never trigger a spurious reconnect (the supervisor's loop-top guard
+    // observes this same `Arc<AtomicBool>`). Before this wiring the flag was the supervisor's own
+    // and disconnect() never set it.
+    #[tokio::test]
+    async fn disconnect_sets_intentional_flag_for_supervisor() {
+        let config = STTConfig {
+            provider: "azure".to_string(),
+            api_key: "test_key".to_string(),
+            language: "en-US".to_string(),
+            sample_rate: 16000,
+            ..Default::default()
+        };
+        let mut stt = <AzureSTT as BaseSTT>::new(config).unwrap();
+        assert!(!stt.intentional_disconnect.load(Ordering::SeqCst));
+        stt.disconnect().await.unwrap();
+        assert!(
+            stt.intentional_disconnect.load(Ordering::SeqCst),
+            "disconnect() must set the supervisor-shared intentional-disconnect flag",
+        );
+    }
 
     #[test]
     fn test_azure_stt_creation() {

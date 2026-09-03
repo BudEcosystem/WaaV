@@ -189,7 +189,10 @@ impl TTSRequestBuilder for LmntRequestBuilder {
 
         // Build the HTTP request with all required headers
         client
-            .post(LMNT_TTS_URL)
+            .post(crate::core::tts::standard::override_rest_endpoint(
+                LMNT_TTS_URL,
+                self.lmnt_config.endpoint_override.as_deref(),
+            ))
             .header("X-API-Key", &self.config.api_key)
             .header("Content-Type", "application/json")
             .header("Accept", self.lmnt_config.output_format.content_type())
@@ -327,6 +330,17 @@ pub struct LmntTts {
 }
 
 impl LmntTts {
+    fn from_parts_unchecked(config: TTSConfig, lmnt_config: LmntTtsConfig) -> Self {
+        let request_builder = LmntRequestBuilder::new(config.clone(), lmnt_config.clone());
+        let config_hash = compute_lmnt_tts_config_hash(&config, &lmnt_config);
+
+        Self {
+            provider: TTSProvider::new(),
+            request_builder,
+            config_hash,
+        }
+    }
+
     /// Creates a new LMNT TTS provider instance.
     ///
     /// # Arguments
@@ -358,7 +372,7 @@ impl LmntTts {
         );
 
         Ok(Self {
-            provider: TTSProvider::new()?,
+            provider: TTSProvider::new(),
             request_builder,
             config_hash,
         })
@@ -391,6 +405,15 @@ impl LmntTts {
     ///
     /// let tts = LmntTts::with_config(config)?;
     /// ```
+    /// Build from the standardized config (W1 keystone for TTS), mirroring
+    /// `DeepgramTTS::from_standard`. Delegates to the config-level
+    /// [`LmntTtsConfig::from_standard`] (which maps `speed`, `language`, `sample_rate`, `seed`,
+    /// `stability`→`top_p`, and the non-standard `debug` extra) then constructs through
+    /// `with_config` so the mapped LMNT settings are honored end-to-end through the dispatch path.
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
+        Self::with_config(LmntTtsConfig::from_standard(std))
+    }
+
     pub fn with_config(lmnt_config: LmntTtsConfig) -> TTSResult<Self> {
         // Validate configuration
         if let Err(e) = lmnt_config.validate() {
@@ -409,7 +432,7 @@ impl LmntTts {
         );
 
         Ok(Self {
-            provider: TTSProvider::new()?,
+            provider: TTSProvider::new(),
             request_builder,
             config_hash,
         })
@@ -506,7 +529,10 @@ impl LmntTts {
 
 impl Default for LmntTts {
     fn default() -> Self {
-        Self::new(TTSConfig::default()).expect("Default LmntTts should have valid configuration")
+        let config = TTSConfig::default();
+        let lmnt_config = LmntTtsConfig::from_base(config.clone());
+
+        Self::from_parts_unchecked(config, lmnt_config)
     }
 }
 
@@ -525,7 +551,16 @@ impl BaseTTS for LmntTts {
     /// Connect to the TTS provider.
     async fn connect(&mut self) -> TTSResult<()> {
         self.provider
-            .generic_connect_with_config(LMNT_TTS_URL, &self.request_builder.config)
+            .generic_connect_with_config(
+                &crate::core::tts::standard::override_rest_endpoint(
+                    LMNT_TTS_URL,
+                    self.request_builder
+                        .lmnt_config
+                        .endpoint_override
+                        .as_deref(),
+                ),
+                &self.request_builder.config,
+            )
             .await?;
 
         info!("LMNT TTS provider connected and ready");
@@ -905,10 +940,64 @@ mod tests {
         assert_eq!(tts.get_connection_state(), ConnectionState::Disconnected);
     }
 
+    // W1 keystone: the struct-level `from_standard` (the dispatch entry point, mirroring
+    // `DeepgramTTS::from_standard`) must carry the standardized advanced features onto the live
+    // provider's LMNT config — not just the config-level helper. Asserts stability→top_p plus
+    // speed/language/seed reach `lmnt_config()`.
     #[test]
-    fn test_lmnt_tts_default() {
+    fn from_standard_reaches_provider_config() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "lmnt".to_string(),
+                api_key: "k".to_string(),
+                voice_id: Some("lily".to_string()),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(1.5),
+                language: Some("en".to_string()),
+                sample_rate: Some(16000),
+                seed: Some(12345),
+                stability: Some(0.9),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+
+        let tts = LmntTts::from_standard(&std).unwrap();
+        let cfg = tts.lmnt_config();
+        assert!((cfg.speed - 1.5).abs() < 0.001);
+        assert_eq!(cfg.language, "en");
+        assert_eq!(cfg.sample_rate, 16000);
+        assert_eq!(cfg.seed, Some(12345));
+        assert!((cfg.top_p - 0.9).abs() < 0.001); // stability → top_p
+        assert_eq!(cfg.voice_id(), "lily"); // base carried through
+    }
+
+    #[test]
+    fn from_standard_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let std = crate::core::tts::standard::StandardTTSConfig::from_base(TTSConfig {
+            provider: "lmnt".to_string(),
+            api_key: "k".to_string(),
+            voice_id: Some("lily".to_string()),
+            ..Default::default()
+        })
+        .with_endpoint_override("http://127.0.0.1:9000");
+
+        match LmntTts::from_standard(&std) {
+            Ok(_) => panic!("LMNT provider construction must reject unsafe endpoint_override"),
+            Err(err) => assert!(err.to_string().contains("SSRF protection")),
+        }
+    }
+
+    #[test]
+    fn lmnt_tts_default_does_not_depend_on_result_unwrap() {
         let tts = LmntTts::default();
         assert!(!tts.is_ready());
+        assert_eq!(tts.lmnt_config().base.api_key, "");
         // Default TTSConfig has voice_id "aura-asteria-en" which is used
         // The voice_id will be whatever the base config provides
         assert!(!tts.lmnt_config().voice_id().is_empty());

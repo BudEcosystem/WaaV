@@ -80,6 +80,30 @@ impl ElevenLabsEmotionMapper {
             Emotion::Embarrassed => (0.5, 0.8, 0.15),
             Emotion::Content => (0.6, 0.8, 0.1),
             Emotion::Bored => (0.7, 0.75, 0.05),
+            // P4 widened affective states (voice-settings approximation; the v3 tag
+            // path in `map_emotion` carries the open-vocabulary token verbatim).
+            Emotion::Amazed => (0.3, 0.7, 0.4),
+            Emotion::Amused => (0.35, 0.72, 0.35),
+            Emotion::Affectionate => (0.55, 0.82, 0.2),
+            Emotion::Intrigued => (0.42, 0.75, 0.3),
+            Emotion::Flirtatious => (0.4, 0.75, 0.4),
+            Emotion::Frustrated => (0.28, 0.7, 0.4),
+            Emotion::Annoyed => (0.35, 0.72, 0.3),
+            Emotion::Determined => (0.45, 0.75, 0.3),
+            Emotion::Reassuring => (0.6, 0.82, 0.1),
+            Emotion::Sympathetic => (0.55, 0.82, 0.15),
+            Emotion::Nostalgic => (0.6, 0.8, 0.15),
+            Emotion::Serene => (0.72, 0.82, 0.0),
+            Emotion::Terrified => (0.25, 0.72, 0.35),
+            Emotion::Ecstatic => (0.2, 0.68, 0.5),
+            Emotion::Skeptical => (0.5, 0.75, 0.25),
+            Emotion::Relieved => (0.55, 0.8, 0.15),
+            Emotion::Panicked => (0.2, 0.7, 0.4),
+            Emotion::Concerned => (0.45, 0.78, 0.2),
+            Emotion::Apologetic => (0.55, 0.8, 0.15),
+            Emotion::Resigned => (0.65, 0.78, 0.1),
+            Emotion::Wistful => (0.6, 0.8, 0.15),
+            Emotion::Contemplative => (0.6, 0.8, 0.1),
         };
 
         // Apply intensity modifier
@@ -118,15 +142,88 @@ impl ElevenLabsEmotionMapper {
             DeliveryStyle::Professional => (0.6, similarity_boost + 0.05, style_value),
             DeliveryStyle::Casual => (stability - 0.1, similarity_boost, style_value + 0.1),
             DeliveryStyle::Storytelling => (stability - 0.15, similarity_boost, style_value + 0.15),
-            DeliveryStyle::Soft => (stability + 0.1, similarity_boost + 0.05, style_value - 0.1),
             DeliveryStyle::Loud => (stability - 0.1, similarity_boost - 0.05, style_value + 0.1),
-            DeliveryStyle::Cheerful => (stability - 0.1, similarity_boost, style_value + 0.15),
-            DeliveryStyle::Serious => (
-                stability + 0.15,
-                similarity_boost + 0.05,
-                style_value - 0.05,
-            ),
             DeliveryStyle::Formal => (0.6, similarity_boost + 0.05, style_value),
+            // Gentle / relaxed narration → softer, more stable.
+            DeliveryStyle::Gentle
+            | DeliveryStyle::NarrationRelaxed
+            | DeliveryStyle::PoetryReading => {
+                (stability + 0.1, similarity_boost + 0.05, style_value - 0.1)
+            }
+            // Animated scenario reads → more expressive.
+            DeliveryStyle::SportsCommentaryExcited | DeliveryStyle::AdvertisementUpbeat => {
+                (stability - 0.2, similarity_boost - 0.05, style_value + 0.2)
+            }
+            // Composed scenario reads (newscast/customer-service/assistant/documentary/…)
+            // → steady, professional register.
+            _ => (0.55, similarity_boost + 0.03, style_value),
+        }
+    }
+
+    /// Maps a canonical [`Emotion`] to an ElevenLabs **v3 inline audio tag** (the
+    /// open-vocabulary bracket tag that gets PREPENDED to the input text on v3,
+    /// e.g. `[excited]`). v2/turbo ignore tags and fall back to voice settings, so
+    /// the handler only injects this when the model is v3-capable.
+    fn emotion_to_v3_tag(emotion: &Emotion) -> Option<&'static str> {
+        match emotion {
+            Emotion::Neutral => None,
+            Emotion::Happy => Some("[happy]"),
+            Emotion::Sad => Some("[sad]"),
+            Emotion::Angry => Some("[angry]"),
+            Emotion::Fearful => Some("[nervous]"),
+            Emotion::Surprised => Some("[gasps]"),
+            Emotion::Disgusted => Some("[disgusted]"),
+            Emotion::Excited => Some("[excited]"),
+            Emotion::Calm => Some("[calm]"),
+            Emotion::Anxious => Some("[nervous]"),
+            Emotion::Confident => Some("[confident]"),
+            Emotion::Confused => Some("[confused]"),
+            Emotion::Empathetic => Some("[empathetic]"),
+            Emotion::Sarcastic => Some("[sarcastic]"),
+            Emotion::Hopeful => Some("[hopeful]"),
+            Emotion::Disappointed => Some("[disappointed]"),
+            Emotion::Curious => Some("[curious]"),
+            Emotion::Grateful => Some("[grateful]"),
+            Emotion::Proud => Some("[proud]"),
+            Emotion::Embarrassed => Some("[embarrassed]"),
+            Emotion::Content => Some("[content]"),
+            Emotion::Bored => Some("[tired]"),
+            Emotion::Amazed => Some("[amazed]"),
+            Emotion::Amused => Some("[laughs]"),
+            Emotion::Affectionate => Some("[affectionate]"),
+            Emotion::Intrigued => Some("[curious]"),
+            Emotion::Flirtatious => Some("[mischievously]"),
+            Emotion::Frustrated => Some("[frustrated]"),
+            Emotion::Annoyed => Some("[annoyed]"),
+            Emotion::Determined => Some("[determined]"),
+            Emotion::Reassuring => Some("[reassuring]"),
+            Emotion::Sympathetic => Some("[sympathetic]"),
+            Emotion::Nostalgic => Some("[wistful]"),
+            Emotion::Serene => Some("[calm]"),
+            Emotion::Terrified => Some("[terrified]"),
+            Emotion::Ecstatic => Some("[ecstatic]"),
+            Emotion::Skeptical => Some("[skeptical]"),
+            Emotion::Relieved => Some("[relieved]"),
+            Emotion::Panicked => Some("[panicked]"),
+            Emotion::Concerned => Some("[concerned]"),
+            Emotion::Apologetic => Some("[apologetic]"),
+            Emotion::Resigned => Some("[sighs]"),
+            Emotion::Wistful => Some("[wistful]"),
+            Emotion::Contemplative => Some("[thoughtful]"),
+        }
+    }
+
+    /// Maps a delivery [`DeliveryStyle`] to an ElevenLabs v3 inline tag where one
+    /// exists for the *mechanism* (whisper/shout/rushed/…). Scenario framings have
+    /// no native v3 tag and return `None` (the voice-settings path still applies).
+    fn delivery_style_to_v3_tag(style: &DeliveryStyle) -> Option<&'static str> {
+        match style {
+            DeliveryStyle::Whispered => Some("[whispers]"),
+            DeliveryStyle::Shouted | DeliveryStyle::Loud => Some("[shouting]"),
+            DeliveryStyle::Rushed => Some("[rushed]"),
+            DeliveryStyle::Measured => Some("[drawn out]"),
+            DeliveryStyle::Gentle => Some("[gently]"),
+            _ => None,
         }
     }
 }
@@ -190,6 +287,29 @@ impl EmotionMapper for ElevenLabsEmotionMapper {
             mapped.stability = Some(stability);
             mapped.similarity_boost = Some(similarity_boost);
             mapped.style = Some(style);
+        }
+
+        // ElevenLabs v3 open-vocabulary inline tags: emit the bracket tag(s) so a
+        // v3-capable handler can PREPEND them to the input text. v2/turbo ignore
+        // tags and use the voice-settings above, so this is purely additive — the
+        // handler decides whether to inject based on the model id.
+        let mut tags = String::new();
+        if let Some(emotion) = &config.emotion
+            && let Some(tag) = Self::emotion_to_v3_tag(emotion)
+        {
+            tags.push_str(tag);
+        }
+        if let Some(delivery_style) = &config.style
+            && let Some(tag) = Self::delivery_style_to_v3_tag(delivery_style)
+        {
+            if !tags.is_empty() {
+                tags.push(' ');
+            }
+            tags.push_str(tag);
+        }
+        if !tags.is_empty() {
+            tags.push(' ');
+            mapped.inline_tags = Some(tags);
         }
 
         mapped
@@ -361,10 +481,10 @@ mod tests {
 
             // All emotions should produce valid settings
             if let Some(stability) = mapped.stability {
-                assert!(stability >= 0.0 && stability <= 1.0);
+                assert!((0.0..=1.0).contains(&stability));
             }
             if let Some(style) = mapped.style {
-                assert!(style >= 0.0 && style <= 1.0);
+                assert!((0.0..=1.0).contains(&style));
             }
         }
     }

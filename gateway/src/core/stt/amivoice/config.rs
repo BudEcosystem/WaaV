@@ -23,6 +23,11 @@
 use crate::core::stt::base::STTConfig;
 use serde::{Deserialize, Serialize};
 
+fn validate_amivoice_stt_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    crate::core::net::validate_url_for_ssrf(endpoint, &["ws", "wss"])
+        .map_err(|e| format!("{source} rejected (SSRF protection): {e}"))
+}
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -473,6 +478,46 @@ pub struct AmiVoiceSTTConfig {
 
     /// Inactivity timeout in seconds.
     pub inactivity_timeout_secs: u32,
+
+    // -------------------------------------------------------------------------
+    // Advanced AmiVoice request parameters (emitted on the `s` start command).
+    // All `Option`, so `None` omits the param and keeps the AmiVoice default.
+    // -------------------------------------------------------------------------
+    /// Keep filler tokens ("えーと", "あのー") in the result instead of dropping them
+    /// (`keepFillerToken=1`). Mapped from the typed `SttFeatures::filler_words`.
+    pub keep_filler_words: Option<bool>,
+
+    /// No-input timeout in milliseconds (`noInputTimeout`): how long to wait for the first
+    /// utterance before ending the session.
+    pub no_input_timeout: Option<u32>,
+
+    /// Usage-aggregation tag (`extension`): a free-form string AmiVoice echoes back for
+    /// per-tag usage accounting.
+    pub usage_aggregation_tag: Option<String>,
+
+    /// Max decoding time in milliseconds (`maxDecodingTime`).
+    pub max_decoding_time: Option<u32>,
+
+    /// Max response time in milliseconds (`maxResponseTime`).
+    pub max_response_time: Option<u32>,
+
+    /// Max decoding rate, a real-time-factor multiplier (`maxDecodingRate`).
+    pub max_decoding_rate: Option<f32>,
+
+    /// Target response time in milliseconds (`targetResponseTime`).
+    pub target_response_time: Option<u32>,
+
+    /// Target decoding rate, a real-time-factor multiplier (`targetDecodingRate`).
+    pub target_decoding_rate: Option<f32>,
+
+    /// Recognition timeout in milliseconds (`recognitionTimeout`): hard cap on recognition time.
+    pub recognition_timeout: Option<u32>,
+
+    /// Carried from the standardized `endpoint_override` — points the dial at the in-repo mock/proxy
+    /// (a local `ws://` server) for credential-free end-to-end integration tests; `None` uses the
+    /// production AmiVoice endpoint. The featured `s` start command is unchanged (auth is in-band);
+    /// only the dialed scheme://host is swapped, with the AmiVoice `/v1/` path re-appended.
+    pub endpoint_override: Option<String>,
 }
 
 impl Default for AmiVoiceSTTConfig {
@@ -492,6 +537,16 @@ impl Default for AmiVoiceSTTConfig {
             segmenter_properties: None,
             connection_timeout_secs: 30,
             inactivity_timeout_secs: DEFAULT_INACTIVITY_TIMEOUT,
+            keep_filler_words: None,
+            no_input_timeout: None,
+            usage_aggregation_tag: None,
+            max_decoding_time: None,
+            max_response_time: None,
+            max_decoding_rate: None,
+            target_response_time: None,
+            target_decoding_rate: None,
+            recognition_timeout: None,
+            endpoint_override: None,
         }
     }
 }
@@ -526,15 +581,100 @@ impl AmiVoiceSTTConfig {
             segmenter_properties: None,
             connection_timeout_secs: 30,
             inactivity_timeout_secs: DEFAULT_INACTIVITY_TIMEOUT,
+            keep_filler_words: None,
+            no_input_timeout: None,
+            usage_aggregation_tag: None,
+            max_decoding_time: None,
+            max_response_time: None,
+            max_decoding_rate: None,
+            target_response_time: None,
+            target_decoding_rate: None,
+            recognition_timeout: None,
+            endpoint_override: None,
         }
     }
 
-    /// Get the WebSocket URL.
-    pub fn get_websocket_url(&self) -> &'static str {
-        if self.no_logging {
-            AMIVOICE_WS_NOLOG_URL
+    /// Build from the standardized config (W1 keystone). AmiVoice exposes a narrow boolean
+    /// surface, so this maps the standardized features whose meaning matches an existing AmiVoice
+    /// field: speaker diarization (`enable_diarization`), interim/partial results
+    /// (`interim_results`) and filler-word retention (typed `filler_words` → `keepFillerToken`).
+    /// AmiVoice also has a set of provider-specific request knobs with no canonical SttFeatures
+    /// field (no-input timeout, usage-aggregation tag, decoding/response time + rate caps,
+    /// recognition timeout); those are forwarded through the open `ProviderExtras` passthrough.
+    /// Features AmiVoice cannot express (word_timestamps, smart_format, profanity_filter,
+    /// redaction, keyterms, vad_events, language_detection, entity_detection) are capability gaps
+    /// and stay at default.
+    pub fn from_standard(std: &crate::core::stt::standard::StandardSTTConfig) -> Self {
+        let f = &std.features;
+        let mut cfg = Self::from_base(std.base.clone());
+        if let Some(d) = f.diarization {
+            cfg.enable_diarization = d;
+        }
+        if let Some(i) = f.interim_results {
+            cfg.interim_results = i;
+        }
+        // keep_filler_words is a shared semantic (typed): filler_words=true ⇒ keepFillerToken=1.
+        if let Some(keep) = f.filler_words {
+            cfg.keep_filler_words = Some(keep);
+        }
+        // Provider-specific tuning knobs via the open passthrough.
+        let ex = &std.extras.0;
+        cfg.no_input_timeout = ex
+            .get("no_input_timeout")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32);
+        cfg.usage_aggregation_tag = ex
+            .get("usage_aggregation_tag")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        cfg.max_decoding_time = ex
+            .get("max_decoding_time")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32);
+        cfg.max_response_time = ex
+            .get("max_response_time")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32);
+        cfg.max_decoding_rate = ex
+            .get("max_decoding_rate")
+            .and_then(|v| v.as_f64())
+            .map(|v| v as f32);
+        cfg.target_response_time = ex
+            .get("target_response_time")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32);
+        cfg.target_decoding_rate = ex
+            .get("target_decoding_rate")
+            .and_then(|v| v.as_f64())
+            .map(|v| v as f32);
+        cfg.recognition_timeout = ex
+            .get("recognition_timeout")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32);
+        // Standardized endpoint override (mock/proxy host) for credential-free integration tests.
+        cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
+        cfg
+    }
+
+    /// Get the WebSocket URL. Honors an `endpoint_override` (the in-repo mock/proxy points this at a
+    /// local ws:// server) for credential-free integration; otherwise the production AmiVoice
+    /// endpoint. The override carries only `scheme://host[:port]`, so the AmiVoice `/v1/` (or
+    /// `/v1/nolog/`) path is re-appended — a path-less URL would fail the WS handshake.
+    pub fn get_websocket_url(&self) -> String {
+        let path = if self.no_logging {
+            "/v1/nolog/"
         } else {
-            AMIVOICE_WS_URL
+            "/v1/"
+        };
+        match self
+            .endpoint_override
+            .as_deref()
+            .map(str::trim)
+            .filter(|o| !o.is_empty())
+        {
+            Some(o) => format!("{}{}", o.trim_end_matches('/'), path),
+            None if self.no_logging => AMIVOICE_WS_NOLOG_URL.to_string(),
+            None => AMIVOICE_WS_URL.to_string(),
         }
     }
 
@@ -594,6 +734,37 @@ impl AmiVoiceSTTConfig {
             parts.push(format!("segmenterProperties=\"{}\"", props));
         }
 
+        // --- Advanced AmiVoice request parameters -------------------------------------------
+        // Each is emitted as a `key=value` token only when set, so unset knobs keep the
+        // AmiVoice default. `keepFillerToken` is a 0/1 flag; the rest are numeric/string.
+        if let Some(keep) = self.keep_filler_words {
+            parts.push(format!("keepFillerToken={}", if keep { 1 } else { 0 }));
+        }
+        if let Some(t) = self.no_input_timeout {
+            parts.push(format!("noInputTimeout={t}"));
+        }
+        if let Some(tag) = &self.usage_aggregation_tag {
+            parts.push(format!("extension={tag}"));
+        }
+        if let Some(v) = self.max_decoding_time {
+            parts.push(format!("maxDecodingTime={v}"));
+        }
+        if let Some(v) = self.max_response_time {
+            parts.push(format!("maxResponseTime={v}"));
+        }
+        if let Some(v) = self.max_decoding_rate {
+            parts.push(format!("maxDecodingRate={v}"));
+        }
+        if let Some(v) = self.target_response_time {
+            parts.push(format!("targetResponseTime={v}"));
+        }
+        if let Some(v) = self.target_decoding_rate {
+            parts.push(format!("targetDecodingRate={v}"));
+        }
+        if let Some(v) = self.recognition_timeout {
+            parts.push(format!("recognitionTimeout={v}"));
+        }
+
         parts.join(" ")
     }
 
@@ -605,6 +776,15 @@ impl AmiVoiceSTTConfig {
 
         if self.result_updated_interval < 100 {
             return Err("result_updated_interval must be at least 100ms".to_string());
+        }
+
+        if let Some(endpoint) = self
+            .endpoint_override
+            .as_deref()
+            .map(str::trim)
+            .filter(|endpoint| !endpoint.is_empty())
+        {
+            validate_amivoice_stt_endpoint("endpoint_override", endpoint)?;
         }
 
         Ok(())
@@ -626,6 +806,146 @@ impl AmiVoiceSTTConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone: the standardized features unlock AmiVoice's diarization + interim results
+    // surface — previously unreachable via the flat factory.
+    #[test]
+    fn from_standard_maps_features() {
+        use crate::core::stt::standard::{StandardSTTConfig, SttFeatures};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "amivoice".into(),
+                api_key: "test-key".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                diarization: Some(true),
+                interim_results: Some(false),
+                filler_words: Some(true),
+                ..Default::default()
+            },
+            ..StandardSTTConfig::from_base(STTConfig::default())
+        };
+        let cfg = AmiVoiceSTTConfig::from_standard(&std);
+        assert!(cfg.enable_diarization);
+        assert!(!cfg.interim_results);
+        assert_eq!(cfg.keep_filler_words, Some(true)); // keep_filler_words (typed)
+    }
+
+    // WIRE-LEVEL keystone: typed filler_words + ProviderExtras knobs -> from_standard ->
+    // build_start_command. The 9 advanced params must land in the actual `s` start command sent
+    // on the wire (not merely on the config struct — the recurring bug class).
+    #[test]
+    fn from_standard_advanced_params_reach_start_command() {
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
+        let extras = ProviderExtras(
+            serde_json::json!({
+                "no_input_timeout": 5000,
+                "usage_aggregation_tag": "tenant-acme",
+                "max_decoding_time": 12000,
+                "max_response_time": 8000,
+                "max_decoding_rate": 1.5,
+                "target_response_time": 3000,
+                "target_decoding_rate": 1.2,
+                "recognition_timeout": 60000
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        );
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "amivoice".into(),
+                api_key: "APPKEY".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                filler_words: Some(true),
+                ..Default::default()
+            },
+            extras,
+            translation: None,
+        };
+        let cfg = AmiVoiceSTTConfig::from_standard(&std);
+        // Mapped onto the config...
+        assert_eq!(cfg.keep_filler_words, Some(true));
+        assert_eq!(cfg.no_input_timeout, Some(5000));
+        assert_eq!(cfg.usage_aggregation_tag.as_deref(), Some("tenant-acme"));
+        assert_eq!(cfg.max_decoding_time, Some(12000));
+        assert_eq!(cfg.max_response_time, Some(8000));
+        assert_eq!(cfg.max_decoding_rate, Some(1.5));
+        assert_eq!(cfg.target_response_time, Some(3000));
+        assert_eq!(cfg.target_decoding_rate, Some(1.2));
+        assert_eq!(cfg.recognition_timeout, Some(60000));
+        // ...and reach the actual `s` start command sent on the wire.
+        let cmd = cfg.build_start_command();
+        assert!(
+            cmd.contains("keepFillerToken=1"),
+            "keepFillerToken missing: {cmd}"
+        );
+        assert!(
+            cmd.contains("noInputTimeout=5000"),
+            "noInputTimeout missing: {cmd}"
+        );
+        assert!(
+            cmd.contains("extension=tenant-acme"),
+            "extension missing: {cmd}"
+        );
+        assert!(
+            cmd.contains("maxDecodingTime=12000"),
+            "maxDecodingTime missing: {cmd}"
+        );
+        assert!(
+            cmd.contains("maxResponseTime=8000"),
+            "maxResponseTime missing: {cmd}"
+        );
+        assert!(
+            cmd.contains("maxDecodingRate=1.5"),
+            "maxDecodingRate missing: {cmd}"
+        );
+        assert!(
+            cmd.contains("targetResponseTime=3000"),
+            "targetResponseTime missing: {cmd}"
+        );
+        assert!(
+            cmd.contains("targetDecodingRate=1.2"),
+            "targetDecodingRate missing: {cmd}"
+        );
+        assert!(
+            cmd.contains("recognitionTimeout=60000"),
+            "recognitionTimeout missing: {cmd}"
+        );
+    }
+
+    // WIRE-LEVEL negative guard: keepFillerToken must reflect false as `0`, and unset advanced
+    // params must NOT appear in the start command at all.
+    #[test]
+    fn unset_advanced_params_absent_and_filler_false_is_zero() {
+        let mut cfg = AmiVoiceSTTConfig::default();
+        cfg.app_key = "APPKEY".to_string();
+        // Nothing set => none of the advanced tokens appear.
+        let cmd = cfg.build_start_command();
+        for tok in [
+            "keepFillerToken=",
+            "noInputTimeout=",
+            "extension=",
+            "maxDecodingTime=",
+            "maxResponseTime=",
+            "maxDecodingRate=",
+            "targetResponseTime=",
+            "targetDecodingRate=",
+            "recognitionTimeout=",
+        ] {
+            assert!(!cmd.contains(tok), "{tok} leaked when unset: {cmd}");
+        }
+        // filler_words=false => keepFillerToken=0 (explicitly retain-off on the wire).
+        cfg.keep_filler_words = Some(false);
+        let cmd = cfg.build_start_command();
+        assert!(
+            cmd.contains("keepFillerToken=0"),
+            "filler false not emitted as 0: {cmd}"
+        );
+    }
 
     #[test]
     fn test_engine_id() {
@@ -722,6 +1042,53 @@ mod tests {
     }
 
     #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let previous = std::env::var_os("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
+
+        let mut config = AmiVoiceSTTConfig {
+            app_key: "test_key".to_string(),
+            endpoint_override: Some("wss://amivoice-proxy.example.com".to_string()),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("ws://amivoice-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("ws://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.contains("SSRF protection"), "{err}");
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("non-WebSocket endpoint_override must be rejected");
+        assert!(err.contains("not allowed"), "{err}");
+
+        config.endpoint_override = Some("https://amivoice-proxy.example.com".to_string());
+        let err = config
+            .validate()
+            .expect_err("HTTP endpoint_override must be rejected for AmiVoice WebSocket dial");
+        assert!(err.contains("not allowed"), "{err}");
+
+        // SAFETY: restore the process env before releasing the test env lock.
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", previous);
+            } else {
+                std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+            }
+        }
+    }
+
+    #[test]
     fn test_build_start_command() {
         let mut config = AmiVoiceSTTConfig::default();
         config.app_key = "TEST_APP_KEY".to_string();
@@ -759,6 +1126,25 @@ mod tests {
 
         config.no_logging = true;
         assert_eq!(config.get_websocket_url(), AMIVOICE_WS_NOLOG_URL);
+    }
+
+    #[test]
+    fn test_websocket_url_trims_endpoint_override() {
+        let mut config = AmiVoiceSTTConfig {
+            endpoint_override: Some(" wss://amivoice-proxy.example.com/ ".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            config.get_websocket_url(),
+            "wss://amivoice-proxy.example.com/v1/"
+        );
+
+        config.no_logging = true;
+        assert_eq!(
+            config.get_websocket_url(),
+            "wss://amivoice-proxy.example.com/v1/nolog/"
+        );
     }
 
     #[test]

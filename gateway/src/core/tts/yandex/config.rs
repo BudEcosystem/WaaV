@@ -8,6 +8,15 @@ use std::fmt;
 
 use crate::core::tts::base::{TTSConfig, TTSError, TTSResult};
 
+fn validate_yandex_tts_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 // =============================================================================
 // Audio Format Enum
 // =============================================================================
@@ -88,8 +97,10 @@ impl std::str::FromStr for YandexAudioFormat {
 /// Supported voices for Yandex SpeechKit TTS
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum YandexVoice {
     // Russian voices
+    #[default]
     Alena,
     Filipp,
     Ermil,
@@ -199,12 +210,6 @@ impl YandexVoice {
                 | Self::ZhanarRu
                 | Self::YulduzRu
         )
-    }
-}
-
-impl Default for YandexVoice {
-    fn default() -> Self {
-        Self::Alena
     }
 }
 
@@ -407,6 +412,12 @@ pub struct YandexTtsConfig {
     pub audio_format: YandexAudioFormat,
     /// Sample rate in Hz (only for LPCM format)
     pub sample_rate: u32,
+    /// Treat the synthesis input as SSML markup. When `true`, the text is sent in the v1
+    /// `:synthesize` request's `ssml` form field instead of `text` (the two are mutually exclusive
+    /// per the Yandex v1 REST API — see docs/providers/yandex.md "SSML Support").
+    pub ssml: bool,
+    /// Override base (scheme+host) for the synth HTTP POST; used by the mock e2e harness.
+    pub endpoint_override: Option<String>,
 }
 
 impl YandexTtsConfig {
@@ -511,13 +522,89 @@ impl YandexTtsConfig {
             speed,
             audio_format,
             sample_rate,
+            ssml: false,
+            endpoint_override: None,
         })
+    }
+
+    /// Build from the standardized TTS config (W1 keystone). Maps the features Yandex SpeechKit can
+    /// express to real fields: [`TtsFeatures::speed`] is a `1.0`-normal multiplier applied directly
+    /// to `speed` (reusing `from_base`'s `MIN_SPEED..=MAX_SPEED` clamp), [`TtsFeatures::emotion`] is
+    /// matched to a [`YandexEmotion`] using the same string mapping as `from_base`,
+    /// [`TtsFeatures::language`] overrides the [`YandexLanguage`] when it parses, and
+    /// [`TtsFeatures::sample_rate`] is normalized to Yandex's supported rates (8000/16000/48000)
+    /// using `from_base`'s bucketing, and [`TtsFeatures::ssml`] flips the input to the v1
+    /// `:synthesize` `ssml` form field (instead of `text`). Yandex's non-standard `folder_id` and
+    /// `is_iam_token` knobs are read from the `extras` passthrough. Features without a Yandex field
+    /// (pitch, volume, stability, similarity_boost, style, use_speaker_boost, instructions,
+    /// word_timestamps, streaming, seed) are skipped.
+    ///
+    /// [`TtsFeatures::speed`]: crate::core::tts::standard::TtsFeatures::speed
+    /// [`TtsFeatures::emotion`]: crate::core::tts::standard::TtsFeatures::emotion
+    /// [`TtsFeatures::language`]: crate::core::tts::standard::TtsFeatures::language
+    /// [`TtsFeatures::sample_rate`]: crate::core::tts::standard::TtsFeatures::sample_rate
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(&std.base)?;
+
+        if let Some(speed) = f.speed {
+            // Standardized speed is a 1.0-is-normal multiplier; Yandex uses the same scale.
+            cfg.speed = speed.clamp(super::MIN_SPEED, super::MAX_SPEED);
+        }
+        if let Some(ref emotion) = f.emotion {
+            // Reuse from_base's string -> YandexEmotion mapping; unknown values leave the base value.
+            match emotion.to_lowercase().as_str() {
+                "happy" | "cheerful" | "good" | "joyful" => cfg.emotion = YandexEmotion::Good,
+                "angry" | "evil" | "irritated" | "frustrated" => cfg.emotion = YandexEmotion::Evil,
+                "formal" | "strict" | "professional" => cfg.emotion = YandexEmotion::Strict,
+                "friendly" | "warm" | "kind" => cfg.emotion = YandexEmotion::Friendly,
+                "whisper" | "quiet" => cfg.emotion = YandexEmotion::Whisper,
+                _ => {}
+            }
+        }
+        if let Some(ref language) = f.language
+            && let Ok(lang) = language.parse::<YandexLanguage>()
+        {
+            cfg.language = lang;
+        }
+        if let Some(sr) = f.sample_rate {
+            // Reuse from_base's normalization to Yandex's supported rates.
+            cfg.sample_rate = if sr == 0 {
+                super::DEFAULT_SAMPLE_RATE
+            } else if sr <= 12000 {
+                super::MIN_SAMPLE_RATE
+            } else if sr <= 32000 {
+                16000
+            } else {
+                super::MAX_SAMPLE_RATE
+            };
+        }
+        if let Some(ssml) = f.ssml {
+            // SSML input is sent in the `ssml` form field instead of `text` on the v1 endpoint.
+            cfg.ssml = ssml;
+        }
+
+        // Provider-specific passthrough.
+        if let Some(folder_id) = std.extras.0.get("folder_id").and_then(|v| v.as_str()) {
+            cfg.folder_id = Some(folder_id.to_string());
+        }
+        if let Some(is_iam_token) = std.extras.0.get("is_iam_token").and_then(|v| v.as_bool()) {
+            cfg.is_iam_token = is_iam_token;
+        }
+
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
+
+        cfg.validate()?;
+        Ok(cfg)
     }
 
     /// Build the form parameters for the synthesis request
     pub fn build_form_params(&self, text: &str) -> Vec<(&'static str, String)> {
+        // The v1 `:synthesize` endpoint takes the input under EITHER `text` (plain) OR `ssml`
+        // (SSML markup) — they are mutually exclusive (docs/providers/yandex.md "SSML Support").
+        let input_field = if self.ssml { "ssml" } else { "text" };
         let mut params = vec![
-            ("text", text.to_string()),
+            (input_field, text.to_string()),
             ("voice", self.voice.to_string()),
             ("lang", self.language.to_string()),
             ("format", self.audio_format.to_string()),
@@ -566,6 +653,15 @@ impl YandexTtsConfig {
         }
         Ok(())
     }
+
+    /// Validate provider-specific URL surfaces.
+    pub fn validate(&self) -> TTSResult<()> {
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_yandex_tts_endpoint("endpoint_override", endpoint)
+                .map_err(TTSError::InvalidConfiguration)?;
+        }
+        Ok(())
+    }
 }
 
 // =============================================================================
@@ -575,6 +671,127 @@ impl YandexTtsConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone: the standardized features Yandex can express (speed, emotion, language, output
+    // sample rate) reach their real config fields, and the non-standard folder_id / is_iam_token
+    // knobs flow through the extras passthrough.
+    #[test]
+    fn from_standard_maps_speed_emotion_language_and_extras() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("folder_id".into(), serde_json::json!("b1gfolder123"));
+        extras.insert("is_iam_token".into(), serde_json::json!(true));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "yandex".into(),
+                api_key: "AQVN1234567890".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(1.5),
+                emotion: Some("cheerful".into()),
+                language: Some("en-US".into()),
+                sample_rate: Some(16000),
+                ssml: Some(true), // now a real field: routes input to the `ssml` form param
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+        let cfg = YandexTtsConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.speed, 1.5); // 1.5 multiplier clamped to 0.1..=3.0
+        assert_eq!(cfg.emotion, YandexEmotion::Good); // "cheerful" -> Good
+        assert_eq!(cfg.language, YandexLanguage::English); // "en-US" -> English
+        assert_eq!(cfg.sample_rate, 16000); // 16000 -> 16000 bucket
+        assert!(cfg.ssml); // ssml feature mapped onto the config
+        assert_eq!(cfg.folder_id, Some("b1gfolder123".to_string())); // extras passthrough
+        assert!(cfg.is_iam_token);
+    }
+
+    // WIRE-LEVEL guard (the recurring bug class is asserting only the config struct). This asserts
+    // the `ssml` feature actually reaches the v1 `:synthesize` form BODY: the synthesis input is
+    // emitted under the `ssml` form key and NOT under `text` (the two are mutually exclusive per the
+    // Yandex v1 REST API). Without the wiring in `build_form_params` the input would stay under
+    // `text` and this test fails.
+    #[test]
+    fn ssml_feature_reaches_synthesize_form_body_under_ssml_key() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let ssml_text = "<speak>Привет<break time=\"500ms\"/>мир</speak>";
+
+        // Plain (ssml = false): input is `text`, no `ssml` key.
+        let plain = YandexTtsConfig::from_standard(&StandardTTSConfig {
+            base: TTSConfig {
+                provider: "yandex".into(),
+                api_key: "AQVN1234567890".into(),
+                voice_id: Some("alena".into()),
+                ..Default::default()
+            },
+            features: TtsFeatures::default(),
+            extras: Default::default(),
+        })
+        .unwrap();
+        let plain_params = plain.build_form_params(ssml_text);
+        assert!(
+            plain_params
+                .iter()
+                .any(|(k, v)| *k == "text" && v == ssml_text),
+            "plain input must be under `text`"
+        );
+        assert!(
+            !plain_params.iter().any(|(k, _)| *k == "ssml"),
+            "no `ssml` key when the feature is off"
+        );
+
+        // ssml = true: input moves to the `ssml` form key and `text` is absent.
+        let ssml_cfg = YandexTtsConfig::from_standard(&StandardTTSConfig {
+            base: TTSConfig {
+                provider: "yandex".into(),
+                api_key: "AQVN1234567890".into(),
+                voice_id: Some("alena".into()),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                ssml: Some(true),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        })
+        .unwrap();
+        let ssml_params = ssml_cfg.build_form_params(ssml_text);
+        assert!(
+            ssml_params
+                .iter()
+                .any(|(k, v)| *k == "ssml" && v == ssml_text),
+            "ssml input must reach the `ssml` form key"
+        );
+        assert!(
+            !ssml_params.iter().any(|(k, _)| *k == "text"),
+            "`text` must be omitted when sending SSML (mutually exclusive)"
+        );
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+
+        let mk = |endpoint: &str| {
+            StandardTTSConfig {
+                base: TTSConfig {
+                    provider: "yandex".into(),
+                    api_key: "test-key".into(),
+                    ..Default::default()
+                },
+                features: TtsFeatures::default(),
+                extras: ProviderExtras::default(),
+            }
+            .with_endpoint_override(endpoint)
+        };
+
+        assert!(YandexTtsConfig::from_standard(&mk("https://tts-proxy.example.com")).is_ok());
+        assert!(YandexTtsConfig::from_standard(&mk("http://127.0.0.1:9000")).is_err());
+        assert!(YandexTtsConfig::from_standard(&mk("file:///tmp/socket")).is_err());
+        assert!(YandexTtsConfig::from_standard(&mk("wss://tts-proxy.example.com")).is_err());
+    }
 
     #[test]
     fn test_audio_format_conversion() {

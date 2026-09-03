@@ -8,6 +8,17 @@ use std::str::FromStr;
 
 use crate::core::stt::base::{STTConfig, STTError};
 
+fn validate_speechmatics_stt_endpoint(source: &str, endpoint: &str) -> Result<(), STTError> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+
+    crate::core::net::validate_url_for_ssrf(endpoint, &["ws", "wss"]).map_err(|e| {
+        STTError::ConfigurationError(format!("{source} rejected (SSRF protection): {e}"))
+    })
+}
+
 // =============================================================================
 // Region
 // =============================================================================
@@ -497,6 +508,69 @@ pub struct SpeechmaticsSTTConfig {
     pub additional_vocab: Vec<String>,
     /// Punctuation sensitivity (0.0-1.0)
     pub punctuation_sensitivity: Option<f32>,
+    // -------------------------------------------------------------------------
+    // Standardized advanced features emitted into `transcription_config`.
+    // `None`/empty => the corresponding `transcription_config` key is omitted (provider default).
+    // -------------------------------------------------------------------------
+    /// Diarization mode override ("speaker", "channel", "channel_and_speaker"). When set this takes
+    /// precedence over the legacy `enable_diarization` (which only ever requests "speaker").
+    /// Mapped from the typed `multichannel`/`diarization` features. Speechmatics
+    /// `transcription_config.diarization`.
+    pub diarization_mode: Option<String>,
+    /// End-of-utterance silence trigger in SECONDS (turn detection). Mapped from the typed
+    /// `utterance_end_ms` (ms -> seconds). Speechmatics
+    /// `transcription_config.conversation_config.end_of_utterance_silence_trigger`.
+    pub end_of_utterance_silence_trigger: Option<f32>,
+    /// Remove disfluencies. Mapped from the typed `filler_words` (inverted: keeping fillers means
+    /// NOT removing disfluencies). Speechmatics
+    /// `transcription_config.transcript_filtering_config.remove_disfluencies`.
+    pub remove_disfluencies: Option<bool>,
+    // --- the following are carried via the open `extras` passthrough ---
+    /// Speaker diarization sensitivity (0.0-1.0). `speaker_diarization_config.speaker_sensitivity`.
+    pub speaker_sensitivity: Option<f32>,
+    /// Prefer attributing ambiguous words to the current speaker.
+    /// `speaker_diarization_config.prefer_current_speaker`.
+    pub prefer_current_speaker: Option<bool>,
+    /// Punctuation permitted-marks override. `punctuation_overrides.permitted_marks`.
+    pub permitted_marks: Option<Vec<String>>,
+    /// Find-and-replace rules: `(from, to)` pairs.
+    /// `transcript_filtering_config.replacements`.
+    pub replacements: Option<Vec<(String, String)>>,
+    /// Output locale (regional variant). `transcription_config.output_locale`.
+    pub output_locale: Option<String>,
+    /// Domain language pack. `transcription_config.domain`.
+    pub domain: Option<String>,
+    /// Max-delay mode ("flexible" | "fixed"). `transcription_config.max_delay_mode`.
+    pub max_delay_mode: Option<String>,
+    /// Phonetic hints per vocabulary word: `word -> [sounds_like, ...]`.
+    /// `transcription_config.additional_vocab[].sounds_like`.
+    pub vocab_sounds_like: std::collections::BTreeMap<String, Vec<String>>,
+    /// Carried from the standardized `endpoint_override` — points the dial at the in-repo mock/proxy
+    /// (a local `ws://` server) for credential-free end-to-end integration tests; `None` uses the
+    /// region endpoint from `ws_url()`. Only the dialed scheme://host is swapped; the `/v2` path is
+    /// preserved (a path-less URL fails the WS handshake).
+    pub endpoint_override: Option<String>,
+
+    /// P5 translation (Class A): target languages (ISO-639-1) for the `translation_config` PEER
+    /// object (a sibling of `transcription_config`, NOT nested inside it). Empty = no translation.
+    /// Speechmatics accepts at most 5; the canonical mapper truncates + warns. Source language is
+    /// the normal `transcription_config.language`. Stream output arrives as `AddTranslation` /
+    /// `AddPartialTranslation` messages folded into the uniform `translations[]`.
+    pub translation_target_languages: Vec<String>,
+
+    /// P5 translation: emit `AddPartialTranslation` (interim) alongside finals
+    /// (`translation_config.enable_partials`). `None` = provider default (finals only).
+    pub translation_enable_partials: Option<bool>,
+
+    /// P5 translation OUTPUT mapping: the CANONICAL BCP-47 target strings the
+    /// developer asked for (e.g. `"es-ES"`, `"de-DE"`), in the SAME order as
+    /// [`translation_target_languages`](Self::translation_target_languages)'s
+    /// ISO-639-1 codes. Speechmatics echoes only the ISO-639-1 code on each
+    /// `AddTranslation` frame (`"es"`), which is lossy; the client uses this to
+    /// upgrade that code back to the canonical BCP-47 the caller requested so
+    /// the uniform `translations[].lang` stays canonical. Empty = no upgrade
+    /// (pass the provider code through verbatim).
+    pub translation_target_canonical: Vec<String>,
 }
 
 impl Default for SpeechmaticsSTTConfig {
@@ -515,6 +589,21 @@ impl Default for SpeechmaticsSTTConfig {
             enable_entities: false,
             additional_vocab: Vec::new(),
             punctuation_sensitivity: None,
+            diarization_mode: None,
+            end_of_utterance_silence_trigger: None,
+            remove_disfluencies: None,
+            speaker_sensitivity: None,
+            prefer_current_speaker: None,
+            permitted_marks: None,
+            replacements: None,
+            output_locale: None,
+            domain: None,
+            max_delay_mode: None,
+            vocab_sounds_like: std::collections::BTreeMap::new(),
+            endpoint_override: None,
+            translation_target_languages: Vec::new(),
+            translation_enable_partials: None,
+            translation_target_canonical: Vec::new(),
         }
     }
 }
@@ -531,16 +620,14 @@ impl SpeechmaticsSTTConfig {
     /// Create configuration from base STTConfig
     pub fn from_base(config: &STTConfig) -> Result<Self, STTError> {
         // API key is required
-        let api_key = if !config.api_key.is_empty() {
-            config.api_key.clone()
-        } else {
-            std::env::var("SPEECHMATICS_API_KEY").map_err(|_| {
+        let api_key = crate::core::credentials::explicit_api_key(&config.api_key)
+            .or_else(|| crate::core::credentials::env_api_key("SPEECHMATICS_API_KEY"))
+            .ok_or_else(|| {
                 STTError::ConfigurationError(
                     "Speechmatics API key required. Set api_key or SPEECHMATICS_API_KEY env var"
                         .to_string(),
                 )
-            })?
-        };
+            })?;
 
         // Parse language
         let language = config
@@ -561,6 +648,140 @@ impl SpeechmaticsSTTConfig {
             encoding,
             ..Default::default()
         })
+    }
+
+    /// Build from the standardized config (W1 keystone — 3rd provider). Speechmatics has a rich
+    /// feature surface, so this unlocks diarization, entity detection, custom vocabulary and
+    /// partials through the standardized API — previously all unreachable via the flat factory.
+    pub fn from_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(&std.base)?;
+        if let Some(d) = f.diarization {
+            cfg.enable_diarization = d;
+        }
+        if let Some(i) = f.interim_results {
+            cfg.enable_partials = i;
+        }
+        if let Some(e) = f.entity_detection {
+            cfg.enable_entities = e;
+        }
+        if let Some(v) = &f.keyterms {
+            cfg.additional_vocab = v.clone();
+        }
+        // Channel diarization mode (typed): `multichannel` requests per-channel transcription. If
+        // speaker diarization is ALSO requested, use the combined "channel_and_speaker" mode;
+        // otherwise plain "channel". When only `diarization` (speaker) is requested the existing
+        // `enable_diarization` path ("speaker") still applies.
+        if f.multichannel == Some(true) {
+            cfg.diarization_mode = Some(if f.diarization == Some(true) {
+                "channel_and_speaker".to_string()
+            } else {
+                "channel".to_string()
+            });
+        }
+        // End-of-utterance silence trigger (typed): `utterance_end_ms` is in ms; Speechmatics wants
+        // seconds.
+        if let Some(ms) = f.utterance_end_ms {
+            cfg.end_of_utterance_silence_trigger = Some(ms as f32 / 1000.0);
+        }
+        // Disfluency removal (typed): `filler_words` has inverted sense — keeping fillers (true)
+        // means NOT removing disfluencies.
+        if let Some(filler) = f.filler_words {
+            cfg.remove_disfluencies = Some(!filler);
+        }
+
+        // Provider extras → transcription_config knobs not modeled by the typed vocabulary.
+        let e = &std.extras.0;
+        if let Some(v) = e.get("speaker_sensitivity").and_then(|v| v.as_f64()) {
+            cfg.speaker_sensitivity = Some(v as f32);
+        }
+        if let Some(v) = e.get("prefer_current_speaker").and_then(|v| v.as_bool()) {
+            cfg.prefer_current_speaker = Some(v);
+        }
+        if let Some(arr) = e.get("permitted_marks").and_then(|v| v.as_array()) {
+            cfg.permitted_marks = Some(
+                arr.iter()
+                    .filter_map(|m| m.as_str().map(str::to_string))
+                    .collect(),
+            );
+        }
+        if let Some(v) = e.get("punctuation_sensitivity").and_then(|v| v.as_f64()) {
+            cfg.punctuation_sensitivity = Some(v as f32);
+        }
+        if let Some(arr) = e.get("replacements").and_then(|v| v.as_array()) {
+            // Each replacement is `{ "from": "...", "to": "..." }`.
+            let reps: Vec<(String, String)> = arr
+                .iter()
+                .filter_map(|r| {
+                    let from = r.get("from").and_then(|v| v.as_str())?;
+                    let to = r.get("to").and_then(|v| v.as_str())?;
+                    Some((from.to_string(), to.to_string()))
+                })
+                .collect();
+            if !reps.is_empty() {
+                cfg.replacements = Some(reps);
+            }
+        }
+        if let Some(v) = e.get("output_locale").and_then(|v| v.as_str()) {
+            cfg.output_locale = Some(v.to_string());
+        }
+        if let Some(v) = e.get("domain").and_then(|v| v.as_str()) {
+            cfg.domain = Some(v.to_string());
+        }
+        if let Some(v) = e.get("max_delay_mode").and_then(|v| v.as_str()) {
+            cfg.max_delay_mode = Some(v.to_string());
+        }
+        // Phonetic hints per vocab word: extras["additional_vocab"] = [{ "content": "...",
+        // "sounds_like": ["..."] }, ...]. The `content` words are also folded into the
+        // `additional_vocab` list (so a sounds_like-only vocab does not need a separate keyterms).
+        if let Some(arr) = e.get("additional_vocab").and_then(|v| v.as_array()) {
+            for entry in arr {
+                let Some(content) = entry.get("content").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                if !cfg.additional_vocab.iter().any(|w| w == content) {
+                    cfg.additional_vocab.push(content.to_string());
+                }
+                if let Some(sl) = entry.get("sounds_like").and_then(|v| v.as_array()) {
+                    let hints: Vec<String> = sl
+                        .iter()
+                        .filter_map(|h| h.as_str().map(str::to_string))
+                        .collect();
+                    if !hints.is_empty() {
+                        cfg.vocab_sounds_like.insert(content.to_string(), hints);
+                    }
+                }
+            }
+        }
+        // Standardized endpoint override (mock/proxy host) for credential-free integration tests.
+        cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
+        // P5 translation (Class A — arbitrary targets): the canonical block maps to the
+        // `translation_config` PEER object. `target_iso639_1(Some(5))` caps to Speechmatics' MAX 5
+        // (the truncation is surfaced as a `config_warning` by `TranslationConfig::warnings_for`).
+        if let Some(t) = &std.translation
+            && !t.is_noop()
+        {
+            cfg.translation_target_languages = t
+                .target_iso639_1(Some(
+                    crate::core::stt::standard::SPEECHMATICS_MAX_TRANSLATION_TARGETS,
+                ))
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect();
+            // Index-aligned canonical BCP-47 list, so the OUTPUT path can upgrade
+            // the ISO-639-1 code Speechmatics echoes back to the canonical target.
+            cfg.translation_target_canonical = t
+                .target_canonical(Some(
+                    crate::core::stt::standard::SPEECHMATICS_MAX_TRANSLATION_TARGETS,
+                ))
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect();
+            cfg.translation_enable_partials = t.partials;
+        }
+        Ok(cfg)
     }
 
     /// Validate the configuration
@@ -585,22 +806,26 @@ impl SpeechmaticsSTTConfig {
             )));
         }
 
-        if let Some(sensitivity) = self.punctuation_sensitivity {
-            if !(0.0..=1.0).contains(&sensitivity) {
-                return Err(STTError::ConfigurationError(format!(
-                    "Punctuation sensitivity must be between 0.0 and 1.0, got {}",
-                    sensitivity
-                )));
-            }
+        if let Some(sensitivity) = self.punctuation_sensitivity
+            && !(0.0..=1.0).contains(&sensitivity)
+        {
+            return Err(STTError::ConfigurationError(format!(
+                "Punctuation sensitivity must be between 0.0 and 1.0, got {}",
+                sensitivity
+            )));
         }
 
-        if let Some(max_speakers) = self.max_speakers {
-            if max_speakers < 1 || max_speakers > 20 {
-                return Err(STTError::ConfigurationError(format!(
-                    "Max speakers must be between 1 and 20, got {}",
-                    max_speakers
-                )));
-            }
+        if let Some(max_speakers) = self.max_speakers
+            && (!(1..=20).contains(&max_speakers))
+        {
+            return Err(STTError::ConfigurationError(format!(
+                "Max speakers must be between 1 and 20, got {}",
+                max_speakers
+            )));
+        }
+
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_speechmatics_stt_endpoint("endpoint_override", endpoint)?;
         }
 
         Ok(())
@@ -656,6 +881,65 @@ impl SpeechmaticsSTTConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone (3rd provider): the standardized features unlock Speechmatics' rich surface
+    // (diarization, entities, vocabulary, partials) — previously unreachable via the flat factory.
+    #[test]
+    fn from_standard_unlocks_speechmatics_features() {
+        use crate::core::stt::standard::{StandardSTTConfig, SttFeatures};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "speechmatics".into(),
+                api_key: "k".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                diarization: Some(true),
+                entity_detection: Some(true),
+                keyterms: Some(vec!["WaaV".into(), "Speechmatics".into()]),
+                interim_results: Some(false),
+                ..Default::default()
+            },
+            extras: Default::default(),
+            translation: None,
+        };
+        let cfg = SpeechmaticsSTTConfig::from_standard(&std).unwrap();
+        assert!(cfg.enable_diarization);
+        assert!(cfg.enable_entities);
+        assert_eq!(cfg.additional_vocab, vec!["WaaV", "Speechmatics"]);
+        assert!(!cfg.enable_partials);
+    }
+
+    #[test]
+    fn from_standard_maps_canonical_translation_to_peer_object() {
+        // P5: the canonical translation block (Class A) → `translation_config` peer fields,
+        // canonical BCP-47 → ISO-639-1, with the Speechmatics MAX-5 cap applied.
+        use crate::core::lang::CanonicalLanguage;
+        use crate::core::stt::standard::{StandardSTTConfig, TranslationConfig};
+        let mut std = StandardSTTConfig::from_base(STTConfig {
+            provider: "speechmatics".into(),
+            api_key: "k".into(),
+            ..Default::default()
+        });
+        std.translation = Some(TranslationConfig {
+            target_languages: vec![
+                CanonicalLanguage::EsEs,
+                CanonicalLanguage::DeDe,
+                CanonicalLanguage::FrFr,
+                CanonicalLanguage::ItIt,
+                CanonicalLanguage::PtPt,
+                CanonicalLanguage::NlNl, // 6th → truncated by the cap
+            ],
+            translate_to_english: None,
+            partials: Some(true),
+        });
+        let cfg = SpeechmaticsSTTConfig::from_standard(&std).unwrap();
+        assert_eq!(
+            cfg.translation_target_languages,
+            vec!["es", "de", "fr", "it", "pt"]
+        );
+        assert_eq!(cfg.translation_enable_partials, Some(true));
+    }
 
     #[test]
     fn test_region_default() {
@@ -806,6 +1090,52 @@ mod tests {
     fn test_config_validate_valid() {
         let config = SpeechmaticsSTTConfig::new("test-api-key");
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let previous = std::env::var_os("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
+
+        let mut config = SpeechmaticsSTTConfig {
+            endpoint_override: Some("wss://speechmatics-proxy.example.com".to_string()),
+            ..SpeechmaticsSTTConfig::new("test-api-key")
+        };
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("ws://speechmatics-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("ws://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.to_string().contains("SSRF protection"), "{err}");
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("non-WebSocket endpoint_override must be rejected");
+        assert!(err.to_string().contains("not allowed"), "{err}");
+
+        config.endpoint_override = Some("https://speechmatics-proxy.example.com".to_string());
+        let err = config
+            .validate()
+            .expect_err("HTTP endpoint_override must be rejected for Speechmatics WebSocket dial");
+        assert!(err.to_string().contains("not allowed"), "{err}");
+
+        // SAFETY: restore the process env before releasing the test env lock.
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", previous);
+            } else {
+                std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+            }
+        }
     }
 
     #[test]

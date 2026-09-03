@@ -10,6 +10,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
+use tokio_tungstenite::tungstenite::http::{
+    HeaderMap as WsHeaderMap, HeaderName as WsHeaderName, HeaderValue as WsHeaderValue,
+};
 use tracing::{debug, error, info, warn};
 
 use super::{DAGData, DAGNode, NodeCapability};
@@ -17,8 +20,6 @@ use crate::dag::context::{DAGContext, resource_keys};
 use crate::dag::definition::HttpMethod;
 use crate::dag::error::{DAGError, DAGResult};
 use crate::livekit::LiveKitClient;
-
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// Validate a URL for SSRF (Server-Side Request Forgery) protection
 ///
@@ -28,162 +29,108 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 /// - Does not point to private IP ranges
 /// - Does not use blocked cloud metadata endpoints
 ///
-/// Returns the validated URL or an error if validation fails.
+/// Thin wrapper over the canonical [`crate::core::net::validate_url_for_ssrf`]
+/// (which also carries the `WAAV_ALLOW_LOOPBACK_ENDPOINTS=1` test escape hatch
+/// for in-process mock servers — DAG data-plane e2e, W-O1/W-T0).
 pub fn validate_url_for_ssrf(url: &str) -> DAGResult<()> {
-    // Parse URL
-    let parsed = url::Url::parse(url)
-        .map_err(|e| DAGError::ConfigError(format!("Invalid URL '{}': {}", url, e)))?;
+    crate::core::net::validate_url_for_ssrf(url, crate::core::net::HTTP_WS_URL_SCHEMES)
+        .map_err(DAGError::ConfigError)
+}
 
-    // Check scheme
-    let scheme = parsed.scheme().to_lowercase();
-    if !["http", "https", "ws", "wss"].contains(&scheme.as_str()) {
-        return Err(DAGError::ConfigError(format!(
-            "URL scheme '{}' not allowed. Use http, https, ws, or wss",
-            scheme
-        )));
+/// Validate an HTTP-only DAG URL for SSRF protection.
+///
+/// HTTP endpoint and webhook nodes execute via `reqwest`, so accepting `ws://`
+/// or `wss://` only defers a bad scheme to runtime. WebSocket DAG nodes use
+/// [`validate_url_for_ssrf`] above.
+pub(super) fn validate_http_url_for_ssrf(url: &str) -> DAGResult<()> {
+    crate::core::net::validate_url_for_ssrf(url, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(DAGError::ConfigError)
+}
+
+pub(super) fn ssrf_protected_http_client() -> DAGResult<reqwest::Client> {
+    crate::core::net::ssrf_protected_client(crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|e| DAGError::ConfigError(format!("failed to build DAG HTTP client: {e}")))
+}
+
+pub(super) fn optional_ssrf_protected_http_client() -> (Option<reqwest::Client>, Option<String>) {
+    match ssrf_protected_http_client() {
+        Ok(client) => (Some(client), None),
+        Err(error) => (None, Some(error.to_string())),
     }
+}
 
-    // Get host
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| DAGError::ConfigError(format!("URL '{}' has no host", url)))?;
+fn insert_websocket_header(
+    headers: &mut WsHeaderMap,
+    url: &str,
+    source: &str,
+    key: &str,
+    value: &str,
+) -> DAGResult<()> {
+    let name = key
+        .parse::<WsHeaderName>()
+        .map_err(|e| DAGError::WebSocketEndpointError {
+            url: url.to_string(),
+            error: format!("Invalid {source} header name {key:?}: {e}"),
+        })?;
+    let value = value
+        .parse::<WsHeaderValue>()
+        .map_err(|e| DAGError::WebSocketEndpointError {
+            url: url.to_string(),
+            error: format!("Invalid {source} header value for {key:?}: {e}"),
+        })?;
 
-    // Check for blocked hostnames (case-insensitive)
-    let host_lower = host.to_lowercase();
-    let blocked_hostnames = [
-        "localhost",
-        "localhost.localdomain",
-        "127.0.0.1",
-        "::1",
-        "0.0.0.0",
-        "[::1]",
-        "[::ffff:127.0.0.1]",
-        // AWS metadata endpoints
-        "169.254.169.254",
-        "metadata.google.internal",
-        "metadata.gcp.internal",
-        // Azure metadata endpoint
-        "169.254.169.254",
-        // Common internal hostnames
-        "internal",
-        "intranet",
-    ];
-
-    for blocked in blocked_hostnames.iter() {
-        if host_lower == *blocked {
-            return Err(DAGError::ConfigError(format!(
-                "URL host '{}' is blocked (SSRF protection)",
-                host
-            )));
-        }
-    }
-
-    // Try to parse as IP address
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        if is_private_ip(&ip) {
-            return Err(DAGError::ConfigError(format!(
-                "URL points to private IP '{}' (SSRF protection)",
-                ip
-            )));
-        }
-    }
-
-    // Check for IPv6 addresses in brackets
-    if host.starts_with('[') && host.ends_with(']') {
-        let ip_str = &host[1..host.len() - 1];
-        if let Ok(ip) = ip_str.parse::<Ipv6Addr>() {
-            if is_private_ipv6(&ip) {
-                return Err(DAGError::ConfigError(format!(
-                    "URL points to private IPv6 '{}' (SSRF protection)",
-                    ip
-                )));
-            }
-        }
-    }
-
+    headers.insert(name, value);
     Ok(())
 }
 
-/// Check if an IP address is private/internal
-fn is_private_ip(ip: &IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => is_private_ipv4(v4),
-        IpAddr::V6(v6) => is_private_ipv6(v6),
-    }
+fn grpc_metadata_value(
+    service: &str,
+    method: &str,
+    source: &str,
+    value: &str,
+) -> DAGResult<tonic::metadata::AsciiMetadataValue> {
+    value
+        .parse::<tonic::metadata::AsciiMetadataValue>()
+        .map_err(|e| DAGError::GrpcEndpointError {
+            service: service.to_string(),
+            method: method.to_string(),
+            error: format!("Invalid {source} metadata value: {e}"),
+        })
 }
 
-/// Check if an IPv4 address is private/internal
-fn is_private_ipv4(ip: &Ipv4Addr) -> bool {
-    // Loopback: 127.0.0.0/8
-    if ip.is_loopback() {
-        return true;
-    }
-
-    // Link-local: 169.254.0.0/16 (includes AWS metadata endpoint)
-    if ip.is_link_local() {
-        return true;
-    }
-
-    // Private ranges
-    // 10.0.0.0/8
-    if ip.octets()[0] == 10 {
-        return true;
-    }
-
-    // 172.16.0.0/12
-    let first = ip.octets()[0];
-    let second = ip.octets()[1];
-    if first == 172 && (16..=31).contains(&second) {
-        return true;
-    }
-
-    // 192.168.0.0/16
-    if first == 192 && second == 168 {
-        return true;
-    }
-
-    // 0.0.0.0/8 (current network)
-    if first == 0 {
-        return true;
-    }
-
-    // Broadcast
-    if ip.is_broadcast() {
-        return true;
-    }
-
-    false
+/// Resolve a DNS hostname and reject if any resolved IP is private/internal.
+///
+/// Thin wrapper over [`crate::core::net::validate_resolved_host_for_ssrf`]:
+/// synchronous resolve-then-validate (usable from the synchronous DAG compile
+/// path); a host that fails to resolve is allowed through, the goal is to
+/// reject hosts that *currently* resolve to a blocked range, which is the
+/// DNS-rebind vector for client-supplied DAGs.
+pub fn validate_resolved_host_for_ssrf(host: &str) -> DAGResult<()> {
+    crate::core::net::validate_resolved_host_for_ssrf(host).map_err(DAGError::ConfigError)
 }
 
-/// Check if an IPv6 address is private/internal
-fn is_private_ipv6(ip: &Ipv6Addr) -> bool {
-    // Loopback: ::1
-    if ip.is_loopback() {
-        return true;
-    }
+/// Validate a gRPC target address for SSRF.
+///
+/// gRPC addresses are typically `host:port` or `scheme://host:port`. This
+/// normalizes the address into a URL and runs the same resolve-then-validate
+/// SSRF checks used by HTTP/WS/webhook endpoints (W-O3 bug #3).
+pub fn validate_grpc_address_for_ssrf(address: &str) -> DAGResult<()> {
+    // Normalize to a URL so we can reuse the URL validator. gRPC addresses may
+    // omit a scheme (e.g. "example.com:443") — default to https for parsing.
+    let normalized = if address.starts_with("http://")
+        || address.starts_with("https://")
+        || address.starts_with("grpc://")
+        || address.starts_with("grpcs://")
+    {
+        // Map grpc(s):// to http(s):// for the URL parser / scheme allow-list.
+        address
+            .replacen("grpcs://", "https://", 1)
+            .replacen("grpc://", "http://", 1)
+    } else {
+        format!("https://{}", address)
+    };
 
-    // Unspecified: ::
-    if ip.is_unspecified() {
-        return true;
-    }
-
-    // IPv4-mapped addresses (check the embedded IPv4)
-    if let Some(v4) = ip.to_ipv4_mapped() {
-        return is_private_ipv4(&v4);
-    }
-
-    // Link-local: fe80::/10
-    let segments = ip.segments();
-    if segments[0] >= 0xfe80 && segments[0] <= 0xfebf {
-        return true;
-    }
-
-    // Unique local: fc00::/7
-    if segments[0] >= 0xfc00 && segments[0] <= 0xfdff {
-        return true;
-    }
-
-    false
+    validate_url_for_ssrf(&normalized)
 }
 
 /// Generic bytes codec for gRPC calls without proto definitions.
@@ -258,7 +205,8 @@ pub struct HttpEndpointNode {
     headers: HashMap<String, String>,
     timeout_ms: u64,
     /// Pooled HTTP client for connection reuse
-    client: reqwest::Client,
+    client: Option<reqwest::Client>,
+    http_client_init_error: Option<String>,
 }
 
 impl HttpEndpointNode {
@@ -272,13 +220,15 @@ impl HttpEndpointNode {
     /// Note: This constructor does NOT validate the URL for SSRF attacks.
     /// Use `try_new()` for production code that needs SSRF protection.
     pub fn new(id: impl Into<String>, url: impl Into<String>) -> Self {
+        let (client, http_client_init_error) = optional_ssrf_protected_http_client();
         Self {
             id: id.into(),
             url: url.into(),
             method: HttpMethod::POST,
             headers: HashMap::new(),
             timeout_ms: 30000,
-            client: reqwest::Client::new(),
+            client,
+            http_client_init_error,
         }
     }
 
@@ -292,14 +242,15 @@ impl HttpEndpointNode {
     /// Returns an error if the URL is invalid or blocked.
     pub fn try_new(id: impl Into<String>, url: impl Into<String>) -> DAGResult<Self> {
         let url_str = url.into();
-        validate_url_for_ssrf(&url_str)?;
+        validate_http_url_for_ssrf(&url_str)?;
         Ok(Self {
             id: id.into(),
             url: url_str,
             method: HttpMethod::POST,
             headers: HashMap::new(),
             timeout_ms: 30000,
-            client: reqwest::Client::new(),
+            client: Some(ssrf_protected_http_client()?),
+            http_client_init_error: None,
         })
     }
 
@@ -358,6 +309,15 @@ impl DAGNode for HttpEndpointNode {
     }
 
     async fn execute(&self, input: DAGData, ctx: &mut DAGContext) -> DAGResult<DAGData> {
+        let Some(client) = &self.client else {
+            return Err(DAGError::HttpEndpointError {
+                url: self.url.clone(),
+                error: self
+                    .http_client_init_error
+                    .clone()
+                    .unwrap_or_else(|| "DAG HTTP client was not initialized".to_string()),
+            });
+        };
         let payload = input.to_json();
 
         debug!(
@@ -368,8 +328,7 @@ impl DAGNode for HttpEndpointNode {
         );
 
         // Use the pre-created pooled client for connection reuse
-        let mut request = self
-            .client
+        let mut request = client
             .request(self.method.clone().into(), &self.url)
             .timeout(Duration::from_millis(self.timeout_ms))
             .header("Content-Type", "application/json")
@@ -439,6 +398,9 @@ pub struct GrpcEndpointNode {
 
 impl GrpcEndpointNode {
     /// Create a new gRPC endpoint node
+    ///
+    /// Note: this constructor does NOT validate the address for SSRF attacks.
+    /// Use `try_new()` for client-supplied addresses (the compiler does).
     pub fn new(
         id: impl Into<String>,
         address: impl Into<String>,
@@ -454,6 +416,31 @@ impl GrpcEndpointNode {
             tls_domain_name: None,
             verify_certificates: true,
         }
+    }
+
+    /// Create a new gRPC endpoint node with SSRF address validation.
+    ///
+    /// Validates the target address against SSRF attacks (loopback, link-local,
+    /// RFC1918, cloud-metadata, and DNS names that resolve to those ranges).
+    /// The DAG compiler MUST use this for client-supplied gRPC addresses
+    /// (W-O3 bug #3).
+    pub fn try_new(
+        id: impl Into<String>,
+        address: impl Into<String>,
+        service: impl Into<String>,
+        method: impl Into<String>,
+    ) -> DAGResult<Self> {
+        let address: String = address.into();
+        validate_grpc_address_for_ssrf(&address)?;
+        Ok(Self {
+            id: id.into(),
+            address,
+            service: service.into(),
+            method: method.into(),
+            timeout_ms: 30000,
+            tls_domain_name: None,
+            verify_certificates: true,
+        })
     }
 
     /// Set timeout in milliseconds
@@ -591,6 +578,19 @@ impl DAGNode for GrpcEndpointNode {
                 error: format!("Invalid service/method path '{}': {}", path, e),
             })?;
 
+        let stream_id_metadata =
+            grpc_metadata_value(&self.service, &self.method, "stream id", &ctx.stream_id)?;
+        let authorization_metadata = if let Some(api_key) = &ctx.api_key {
+            Some(grpc_metadata_value(
+                &self.service,
+                &self.method,
+                "authorization",
+                &format!("Bearer {}", api_key),
+            )?)
+        } else {
+            None
+        };
+
         // Determine if TLS is needed based on address
         let use_tls = self.address.starts_with("https://")
             || (!self.address.starts_with("http://") && !self.address.contains("localhost"));
@@ -683,18 +683,13 @@ impl DAGNode for GrpcEndpointNode {
         let mut request = tonic::Request::new(request_bytes);
 
         // Add stream ID to metadata
-        request.metadata_mut().insert(
-            "x-stream-id",
-            ctx.stream_id
-                .parse()
-                .unwrap_or_else(|_| tonic::metadata::MetadataValue::from_static("unknown")),
-        );
+        request
+            .metadata_mut()
+            .insert("x-stream-id", stream_id_metadata);
 
         // Add API key if available
-        if let Some(api_key) = &ctx.api_key {
-            if let Ok(value) = format!("Bearer {}", api_key).parse() {
-                request.metadata_mut().insert("authorization", value);
-            }
+        if let Some(value) = authorization_metadata {
+            request.metadata_mut().insert("authorization", value);
         }
 
         // Set timeout on request
@@ -894,37 +889,27 @@ impl DAGNode for WebSocketEndpointNode {
 
         // Add custom headers
         for (key, value) in &self.headers {
-            if let (Ok(name), Ok(val)) = (
-                key.parse::<tokio_tungstenite::tungstenite::http::HeaderName>(),
-                value.parse::<tokio_tungstenite::tungstenite::http::HeaderValue>(),
-            ) {
-                request.headers_mut().insert(name, val);
-            }
+            insert_websocket_header(request.headers_mut(), &self.url, "custom", key, value)?;
         }
 
         // Add stream ID header
-        if let Ok(val) = ctx
-            .stream_id
-            .parse::<tokio_tungstenite::tungstenite::http::HeaderValue>()
-        {
-            if let Ok(name) =
-                "X-Stream-ID".parse::<tokio_tungstenite::tungstenite::http::HeaderName>()
-            {
-                request.headers_mut().insert(name, val);
-            }
-        }
+        insert_websocket_header(
+            request.headers_mut(),
+            &self.url,
+            "stream id",
+            "X-Stream-ID",
+            &ctx.stream_id,
+        )?;
 
         // Add authorization header if API key available
         if let Some(api_key) = &ctx.api_key {
-            if let Ok(val) = format!("Bearer {}", api_key)
-                .parse::<tokio_tungstenite::tungstenite::http::HeaderValue>()
-            {
-                if let Ok(name) =
-                    "Authorization".parse::<tokio_tungstenite::tungstenite::http::HeaderName>()
-                {
-                    request.headers_mut().insert(name, val);
-                }
-            }
+            insert_websocket_header(
+                request.headers_mut(),
+                &self.url,
+                "authorization",
+                "Authorization",
+                &format!("Bearer {}", api_key),
+            )?;
         }
 
         info!(
@@ -1054,6 +1039,7 @@ pub struct IpcEndpointNode {
     input_format: Option<String>,
     output_format: Option<String>,
     timeout_ms: u64,
+    config_error: Option<String>,
 }
 
 /// Validate and sanitize IPC socket name to prevent path traversal attacks.
@@ -1112,18 +1098,31 @@ impl IpcEndpointNode {
     /// - Only alphanumeric, underscore, and hyphen characters are allowed
     /// - Path traversal attempts (../) are rejected
     ///
-    /// # Panics
-    /// Panics if the shm_name is invalid. Use `try_new()` for fallible construction.
+    /// Invalid names build an inert node that returns a typed config error on execution.
+    /// Use `try_new()` when the caller needs the error at construction time.
     pub fn new(id: impl Into<String>, shm_name: impl Into<String>) -> Self {
+        let id = id.into();
         let shm_name_str = shm_name.into();
-        let sanitized = sanitize_ipc_socket_name(&shm_name_str)
-            .expect("Invalid IPC socket name - use try_new() for fallible construction");
+        let (sanitized, config_error) = match sanitize_ipc_socket_name(&shm_name_str) {
+            Ok(sanitized) => (sanitized, None),
+            Err(error) => {
+                let message = error.to_string();
+                warn!(
+                    node_id = %id,
+                    shm_name = %shm_name_str,
+                    error = %message,
+                    "invalid IPC socket name in infallible constructor; node will fail closed"
+                );
+                ("__invalid_ipc_socket__".to_string(), Some(message))
+            }
+        };
         Self {
-            id: id.into(),
+            id,
             shm_name: sanitized,
             input_format: None,
             output_format: None,
             timeout_ms: 30000,
+            config_error,
         }
     }
 
@@ -1138,6 +1137,7 @@ impl IpcEndpointNode {
             input_format: None,
             output_format: None,
             timeout_ms: 30000,
+            config_error: None,
         })
     }
 
@@ -1182,6 +1182,7 @@ impl std::fmt::Debug for IpcEndpointNode {
             .field("input_format", &self.input_format)
             .field("output_format", &self.output_format)
             .field("timeout_ms", &self.timeout_ms)
+            .field("config_error", &self.config_error)
             .finish()
     }
 }
@@ -1211,6 +1212,10 @@ impl DAGNode for IpcEndpointNode {
     async fn execute(&self, input: DAGData, ctx: &mut DAGContext) -> DAGResult<DAGData> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::UnixStream;
+
+        if let Some(error) = &self.config_error {
+            return Err(DAGError::ConfigError(error.clone()));
+        }
 
         let socket_path = self.socket_path();
 
@@ -1392,6 +1397,10 @@ impl DAGNode for IpcEndpointNode {
 
     #[cfg(not(unix))]
     async fn execute(&self, _input: DAGData, _ctx: &mut DAGContext) -> DAGResult<DAGData> {
+        if let Some(error) = &self.config_error {
+            return Err(DAGError::ConfigError(error.clone()));
+        }
+
         Err(DAGError::IpcEndpointError {
             name: self.shm_name.clone(),
             error: "IPC endpoints are only supported on Unix platforms".to_string(),
@@ -1684,6 +1693,134 @@ mod tests {
     }
 
     #[test]
+    fn test_http_endpoint_try_new_is_http_only() {
+        assert!(HttpEndpointNode::try_new("http", "https://api.example.com").is_ok());
+        assert!(HttpEndpointNode::try_new("http", "wss://api.example.com/socket").is_err());
+    }
+
+    #[tokio::test]
+    async fn http_endpoint_client_init_failure_returns_typed_error() {
+        let node = HttpEndpointNode {
+            id: "http".to_string(),
+            url: "https://api.example.com".to_string(),
+            method: HttpMethod::POST,
+            headers: HashMap::new(),
+            timeout_ms: 30000,
+            client: None,
+            http_client_init_error: Some("client build failed".to_string()),
+        };
+        let mut ctx = DAGContext::new("client-init-failure");
+
+        let error = node
+            .execute(DAGData::Text("payload".to_string()), &mut ctx)
+            .await
+            .expect_err("missing client must return an HTTP endpoint error");
+
+        match error {
+            DAGError::HttpEndpointError { error, .. } => {
+                assert!(error.contains("client build failed"), "{error}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn http_endpoint_redirect_policy_rejects_private_hop() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local redirect test server");
+        let addr = listener.local_addr().expect("local addr");
+
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 1024];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 302 Found\r\n",
+                "Location: http://127.0.0.1:9/metadata\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n"
+            );
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await;
+        });
+
+        let node = HttpEndpointNode::new("http", format!("http://{addr}/start"));
+        let mut ctx = DAGContext::new("redirect-test");
+        let err = node
+            .execute(DAGData::Json(serde_json::json!({"ping": true})), &mut ctx)
+            .await
+            .expect_err("private redirect target must be rejected");
+        match err {
+            DAGError::HttpEndpointError { error, .. } => assert!(
+                error.contains("error following redirect"),
+                "unexpected HTTP endpoint error: {error}"
+            ),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_endpoint_invalid_custom_header_fails_before_connect() {
+        let node = WebSocketEndpointNode::new("ws", "wss://example.com/socket")
+            .with_header("X-Test", "bad\nvalue");
+        let mut ctx = DAGContext::new("ws-header-test");
+
+        let err = node
+            .execute(DAGData::Text("ping".to_string()), &mut ctx)
+            .await
+            .expect_err("invalid custom header must fail before websocket connect");
+
+        match err {
+            DAGError::WebSocketEndpointError { error, .. } => {
+                assert!(error.contains("Invalid custom header value"), "{error}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_endpoint_invalid_stream_id_header_fails_before_connect() {
+        let node = WebSocketEndpointNode::new("ws", "wss://example.com/socket");
+        let mut ctx = DAGContext::new("bad\nstream");
+
+        let err = node
+            .execute(DAGData::Text("ping".to_string()), &mut ctx)
+            .await
+            .expect_err("invalid stream id header must fail before websocket connect");
+
+        match err {
+            DAGError::WebSocketEndpointError { error, .. } => {
+                assert!(error.contains("Invalid stream id header value"), "{error}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_endpoint_invalid_authorization_header_fails_before_connect() {
+        let node = WebSocketEndpointNode::new("ws", "wss://example.com/socket");
+        let mut ctx = DAGContext::with_auth("ws-auth-test", Some("bad\nkey".to_string()), None);
+
+        let err = node
+            .execute(DAGData::Text("ping".to_string()), &mut ctx)
+            .await
+            .expect_err("invalid bearer token header must fail before websocket connect");
+
+        match err {
+            DAGError::WebSocketEndpointError { error, .. } => {
+                assert!(
+                    error.contains("Invalid authorization header value"),
+                    "{error}"
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_grpc_endpoint_builder() {
         let node = GrpcEndpointNode::new(
             "grpc",
@@ -1697,6 +1834,58 @@ mod tests {
         assert_eq!(node.address(), "localhost:50051");
         assert_eq!(node.service, "inference.LLMService");
         assert_eq!(node.method, "Generate");
+    }
+
+    #[tokio::test]
+    async fn grpc_endpoint_invalid_stream_id_metadata_fails_before_connect() {
+        let node = GrpcEndpointNode::new(
+            "grpc",
+            "localhost:50051",
+            "inference.LLMService",
+            "Generate",
+        );
+        let mut ctx = DAGContext::new("bad\nstream");
+
+        let err = node
+            .execute(DAGData::Text("payload".to_string()), &mut ctx)
+            .await
+            .expect_err("invalid stream id metadata must fail before gRPC connect");
+
+        match err {
+            DAGError::GrpcEndpointError { error, .. } => {
+                assert!(
+                    error.contains("Invalid stream id metadata value"),
+                    "{error}"
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn grpc_endpoint_invalid_authorization_metadata_fails_before_connect() {
+        let node = GrpcEndpointNode::new(
+            "grpc",
+            "localhost:50051",
+            "inference.LLMService",
+            "Generate",
+        );
+        let mut ctx = DAGContext::with_auth("grpc-auth-test", Some("bad\nkey".to_string()), None);
+
+        let err = node
+            .execute(DAGData::Text("payload".to_string()), &mut ctx)
+            .await
+            .expect_err("invalid authorization metadata must fail before gRPC connect");
+
+        match err {
+            DAGError::GrpcEndpointError { error, .. } => {
+                assert!(
+                    error.contains("Invalid authorization metadata value"),
+                    "{error}"
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     #[test]
@@ -1740,6 +1929,25 @@ mod tests {
 
         let result = IpcEndpointNode::try_new("ipc", "socket123");
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn ipc_endpoint_new_invalid_name_fails_closed_without_panic() {
+        let node = IpcEndpointNode::new("ipc", "../../../etc/passwd");
+        assert_eq!(node.shm_name(), "__invalid_ipc_socket__");
+
+        let mut ctx = DAGContext::new("ipc-invalid-name");
+        let err = node
+            .execute(DAGData::Text("payload".to_string()), &mut ctx)
+            .await
+            .expect_err("invalid legacy IPC constructor must fail closed before socket use");
+
+        match err {
+            DAGError::ConfigError(message) => {
+                assert!(message.contains("Invalid IPC socket name"), "{message}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     #[test]

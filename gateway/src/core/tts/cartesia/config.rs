@@ -33,6 +33,17 @@
 use crate::core::tts::base::{TTSConfig, TTSError};
 use serde::{Deserialize, Serialize};
 
+fn validate_cartesia_tts_endpoint(source: &str, endpoint: &str) -> Result<(), TTSError> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES).map_err(
+        |msg| TTSError::InvalidConfiguration(format!("{source} rejected (SSRF protection): {msg}")),
+    )
+}
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -610,9 +621,124 @@ pub struct CartesiaTTSConfig {
     /// Format: "YYYY-MM-DD"
     /// Default: "2025-04-16"
     pub api_version: String,
+
+    /// Optional spoken-language override sent as the top-level `language` body field.
+    ///
+    /// Cartesia's `/tts/bytes` accepts an optional `language` parameter (BCP-47-ish code,
+    /// e.g. "en", "fr", "de") that controls which language the model speaks. When `None`,
+    /// the request builder falls back to the default ("en"). Populated from the standardized
+    /// [`TtsFeatures::language`].
+    ///
+    /// [`TtsFeatures::language`]: crate::core::tts::standard::TtsFeatures::language
+    pub language: Option<String>,
+
+    /// Optional loudness multiplier sent as `generation_config.volume`.
+    ///
+    /// Cartesia's `generation_config.volume` is a multiplier in [0.5, 2.0] (default 1.0).
+    /// This is an audio-changing field, so it is folded into the cache-key hash. Populated
+    /// from the standardized [`TtsFeatures::volume`].
+    ///
+    /// [`TtsFeatures::volume`]: crate::core::tts::standard::TtsFeatures::volume
+    pub volume: Option<f32>,
+
+    /// Optional pronunciation-dictionary id sent as the top-level `pronunciation_dict_id`
+    /// body field.
+    ///
+    /// Cartesia's `/tts/bytes` accepts an optional `pronunciation_dict_id` (a custom
+    /// pronunciation dictionary reference) that changes how words are spoken, so it is an
+    /// audio-changing field folded into the cache-key hash. Populated from the
+    /// `provider_extras` passthrough (`pronunciation_dict_id`).
+    pub pronunciation_dict_id: Option<String>,
+
+    /// Optional base-URL override (scheme+host) for the synth HTTP endpoint (test harness only).
+    pub endpoint_override: Option<String>,
 }
 
 impl CartesiaTTSConfig {
+    pub(crate) fn validate_endpoint_override(&self) -> Result<(), TTSError> {
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_cartesia_tts_endpoint("endpoint_override", endpoint)?;
+        }
+        Ok(())
+    }
+
+    /// Build from the standardized config (W1 keystone for TTS — uniform entry point).
+    ///
+    /// Cartesia's request body (confirmed against the `POST /tts/bytes` reference) exposes a
+    /// top-level `language` and `pronunciation_dict_id`, a `generation_config` (speed + volume +
+    /// emotion) and an `output_format` (sample rate), so this maps the matching standardized
+    /// features:
+    /// - [`TtsFeatures::speed`] → `base.speaking_rate` (sent as `generation_config.speed`)
+    /// - [`TtsFeatures::volume`] → `self.volume` (sent as `generation_config.volume`)
+    /// - [`TtsFeatures::emotion`] → `base.emotion_config` (sent as `generation_config.emotion`)
+    /// - [`TtsFeatures::language`] → `self.language` (sent as the top-level `language`)
+    /// - [`TtsFeatures::sample_rate`] → `output_format.sample_rate`
+    /// - `provider_extras["pronunciation_dict_id"]` → `self.pronunciation_dict_id` (sent as the
+    ///   top-level `pronunciation_dict_id`)
+    ///
+    /// Features Cartesia can't express (pitch, ElevenLabs voice settings, instructions, ssml,
+    /// word_timestamps, streaming, seed) are skipped.
+    ///
+    /// [`TtsFeatures::speed`]: crate::core::tts::standard::TtsFeatures::speed
+    /// [`TtsFeatures::volume`]: crate::core::tts::standard::TtsFeatures::volume
+    /// [`TtsFeatures::emotion`]: crate::core::tts::standard::TtsFeatures::emotion
+    /// [`TtsFeatures::language`]: crate::core::tts::standard::TtsFeatures::language
+    /// [`TtsFeatures::sample_rate`]: crate::core::tts::standard::TtsFeatures::sample_rate
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> Self {
+        let f = &std.features;
+        let mut base = std.base.clone();
+        if let Some(s) = f.speed {
+            base.speaking_rate = Some(s);
+        }
+        // P4 double-path: the unified `to_emotion_config` path (which also folds the
+        // flat `features.emotion` String + delivery_style/description) populates
+        // `base.emotion_config` BEFORE dispatch and takes precedence. Only when it is
+        // absent do we parse the flat String here as a backstop (e.g. the `/speak`
+        // REST path, which does not run the WS unifier).
+        if base.emotion_config.is_none()
+            && let Some(emotion) = f
+                .emotion
+                .as_deref()
+                .and_then(crate::core::emotion::Emotion::from_str)
+        {
+            base.emotion_config = Some(crate::core::emotion::EmotionConfig::with_emotion(emotion));
+        }
+        let mut cfg = Self::from_base(base);
+        if let Some(rate) = f.sample_rate {
+            cfg.output_format.sample_rate = rate;
+        }
+        // Volume → generation_config.volume (audio-changing; folded into the cache hash).
+        if let Some(volume) = f.volume {
+            cfg.volume = Some(volume);
+        }
+        // Language → top-level `language` (replaces the request builder's hardcoded "en").
+        // Precedence: typed `features.language` > extras["language"] > builder default "en".
+        if let Some(language) = f.language.as_ref().filter(|s| !s.is_empty()) {
+            cfg.language = Some(language.clone());
+        } else if let Some(language) = std
+            .extras
+            .0
+            .get("language")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            cfg.language = Some(language.to_string());
+        }
+        // pronunciation_dict_id → top-level `pronunciation_dict_id` (extras passthrough;
+        // audio-changing, so folded into the cache hash).
+        if let Some(dict_id) = std
+            .extras
+            .0
+            .get("pronunciation_dict_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            cfg.pronunciation_dict_id = Some(dict_id.to_string());
+        }
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
+        cfg
+    }
+
     /// Creates a CartesiaTTSConfig from a base TTSConfig with default Cartesia settings.
     ///
     /// Maps base config fields to Cartesia-specific settings:
@@ -662,6 +788,10 @@ impl CartesiaTTSConfig {
             model,
             output_format,
             api_version: DEFAULT_API_VERSION.to_string(),
+            language: None,
+            volume: None,
+            pronunciation_dict_id: None,
+            endpoint_override: None,
         }
     }
 
@@ -711,6 +841,7 @@ impl CartesiaTTSConfig {
 
         // Validate output format (includes sample rate validation)
         self.output_format.validate()?;
+        self.validate_endpoint_override()?;
 
         Ok(())
     }
@@ -763,6 +894,10 @@ impl Default for CartesiaTTSConfig {
             model: DEFAULT_MODEL.to_string(),
             output_format: CartesiaOutputFormat::default(),
             api_version: DEFAULT_API_VERSION.to_string(),
+            language: None,
+            volume: None,
+            pronunciation_dict_id: None,
+            endpoint_override: None,
         }
     }
 }
@@ -774,6 +909,102 @@ impl Default for CartesiaTTSConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // =========================================================================
+    // from_standard Tests
+    // =========================================================================
+
+    // W1 keystone (TTS): the standardized features Cartesia can express (speed, emotion, sample
+    // rate) reach the fields the request builder consumes (generation_config + output_format).
+    #[test]
+    fn from_standard_maps_speed_emotion_and_sample_rate() {
+        use crate::core::emotion::Emotion;
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "cartesia".into(),
+                api_key: "k".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(1.5),
+                emotion: Some("cheerful".into()),
+                sample_rate: Some(44100),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+
+        let cfg = CartesiaTTSConfig::from_standard(&std);
+        assert_eq!(cfg.base.speaking_rate, Some(1.5));
+        assert_eq!(
+            cfg.base.emotion_config.and_then(|e| e.emotion),
+            Some(Emotion::Happy) // "cheerful" parses to Emotion::Happy
+        );
+        assert_eq!(cfg.output_format.sample_rate, 44100);
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = CartesiaTTSConfig::from_base(TTSConfig {
+            provider: "cartesia".into(),
+            api_key: "k".into(),
+            voice_id: Some("a0e99841-438c-4a64-b679-ae501e7d6091".into()),
+            ..Default::default()
+        });
+
+        config.endpoint_override = Some("https://cartesia-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.to_string().contains("SSRF protection"));
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("file endpoint_override must be rejected");
+        assert!(err.to_string().contains("URL scheme"));
+
+        config.endpoint_override = Some("ws://cartesia-proxy.example.com".to_string());
+        let err = config
+            .validate()
+            .expect_err("WebSocket endpoint_override must be rejected for REST Cartesia");
+        assert!(err.to_string().contains("URL scheme"));
+
+        let std = crate::core::tts::standard::StandardTTSConfig::from_base(TTSConfig {
+            provider: "cartesia".into(),
+            api_key: "k".into(),
+            voice_id: Some("a0e99841-438c-4a64-b679-ae501e7d6091".into()),
+            ..Default::default()
+        })
+        .with_endpoint_override("file:///tmp/socket");
+        let cfg = CartesiaTTSConfig::from_standard(&std);
+        assert!(cfg.validate_endpoint_override().is_err());
+    }
+
+    #[test]
+    fn from_standard_no_features_passes_base_through() {
+        use crate::core::tts::standard::StandardTTSConfig;
+
+        let std = StandardTTSConfig::from_base(TTSConfig {
+            api_key: "k".into(),
+            model: "sonic-3-2025-10-27".into(),
+            ..Default::default()
+        });
+
+        let cfg = CartesiaTTSConfig::from_standard(&std);
+        // Pure from_base passthrough: no features set, so the base is forwarded untouched
+        // (including its `TTSConfig::default()` values like `speaking_rate: Some(1.0)`).
+        assert_eq!(cfg.base.api_key, "k");
+        assert_eq!(cfg.model, "sonic-3-2025-10-27");
+        assert_eq!(cfg.base.speaking_rate, TTSConfig::default().speaking_rate);
+        assert!(cfg.base.emotion_config.is_none());
+    }
 
     // =========================================================================
     // CartesiaAudioContainer Tests

@@ -38,6 +38,19 @@ pub enum EmotionMethod {
     /// Example: `stability: 0.3, similarity_boost: 0.8`
     VoiceSettings,
 
+    /// Natural-language acting instructions string injected into a dedicated
+    /// provider field (OpenAI gpt-4o-mini-tts `instructions`, gpt-realtime
+    /// session/response `instructions`, AWS Nova-Sonic system prompt, Gemini-Live
+    /// `setup.system_instruction`). Distinct from [`NaturalLanguage`](Self::NaturalLanguage)
+    /// (Hume's per-utterance `description`) only in WHERE the string lands; both
+    /// populate [`MappedEmotion::instruction_text`].
+    InstructionText,
+
+    /// Native emotion string/array in the provider's API params (Cartesia
+    /// Sonic-3 `generation_config.emotion`, Sonic-2 `__experimental_controls.emotion`).
+    /// Populates [`MappedEmotion::native_emotion`] / [`MappedEmotion::emotion_array`].
+    NativeEmotionString,
+
     /// No emotion support (Deepgram, Cartesia basic)
     None,
 }
@@ -46,13 +59,30 @@ impl EmotionMethod {
     /// Returns whether this method supports fine-grained emotion control.
     #[inline]
     pub fn supports_custom_emotions(&self) -> bool {
-        matches!(self, EmotionMethod::NaturalLanguage | EmotionMethod::Ssml)
+        matches!(
+            self,
+            EmotionMethod::NaturalLanguage
+                | EmotionMethod::Ssml
+                | EmotionMethod::InstructionText
+                | EmotionMethod::AudioTags
+                | EmotionMethod::NativeEmotionString
+        )
     }
 
     /// Returns whether this method allows free-form descriptions.
     #[inline]
     pub fn supports_free_description(&self) -> bool {
-        matches!(self, EmotionMethod::NaturalLanguage)
+        matches!(
+            self,
+            EmotionMethod::NaturalLanguage | EmotionMethod::InstructionText
+        )
+    }
+
+    /// Returns whether this method injects content INTO the input text
+    /// (bracket tags or inline style markers) rather than via API parameters.
+    #[inline]
+    pub fn injects_into_text(&self) -> bool {
+        matches!(self, EmotionMethod::AudioTags)
     }
 }
 
@@ -128,8 +158,24 @@ pub struct MappedEmotion {
     pub similarity_boost: Option<f32>,
     pub style: Option<f32>,
 
-    /// Audio tags to prepend to text (for ElevenLabs v3)
-    pub audio_tags: Option<String>,
+    /// Inline bracket tags / inline style markers injected INTO the input text
+    /// (ElevenLabs v3 `[excited] `, Azure DragonHD-Omni `[whispering] `, Cartesia
+    /// `[laughter]`). The TTS handler PREPENDS this to the text (or interleaves).
+    /// This is the generalization of the old ElevenLabs-v3-only `audio_tags` prefix.
+    pub inline_tags: Option<String>,
+
+    /// Natural-language acting instructions string (OpenAI gpt-4o-mini-tts
+    /// `instructions`, gpt-realtime / Nova-Sonic / Gemini-Live session prompt,
+    /// Resemble). Multi-line; synthesized from emotion+intensity+style+description.
+    pub instruction_text: Option<String>,
+
+    /// Native single-token emotion for providers that take an emotion enum/string
+    /// directly in API params (Cartesia Sonic-3 `generation_config.emotion`).
+    pub native_emotion: Option<String>,
+
+    /// Native emotion array of `"name:level"` entries (Cartesia Sonic-2 legacy
+    /// `voice.__experimental_controls.emotion`).
+    pub emotion_array: Option<Vec<String>>,
 
     /// Speed/rate adjustment (0.5 to 2.0)
     pub speed: Option<f32>,
@@ -175,6 +221,36 @@ impl MappedEmotion {
         }
     }
 
+    /// Creates a mapped emotion with a natural-language instructions string
+    /// (OpenAI / Nova-Sonic / Gemini-Live / Resemble path).
+    #[inline]
+    pub fn with_instruction_text(text: impl Into<String>) -> Self {
+        Self {
+            instruction_text: Some(text.into()),
+            ..Default::default()
+        }
+    }
+
+    /// Creates a mapped emotion with inline bracket tags to inject into the text
+    /// (ElevenLabs v3 / Azure DragonHD-Omni / Cartesia `[laughter]`).
+    #[inline]
+    pub fn with_inline_tags(tags: impl Into<String>) -> Self {
+        Self {
+            inline_tags: Some(tags.into()),
+            ..Default::default()
+        }
+    }
+
+    /// Creates a mapped emotion with a single native emotion token
+    /// (Cartesia Sonic-3 `generation_config.emotion`).
+    #[inline]
+    pub fn with_native_emotion(emotion: impl Into<String>) -> Self {
+        Self {
+            native_emotion: Some(emotion.into()),
+            ..Default::default()
+        }
+    }
+
     /// Adds a warning message.
     #[inline]
     pub fn add_warning(&mut self, warning: impl Into<String>) {
@@ -193,7 +269,10 @@ impl MappedEmotion {
         self.description.is_some()
             || self.ssml_style.is_some()
             || self.stability.is_some()
-            || self.audio_tags.is_some()
+            || self.inline_tags.is_some()
+            || self.instruction_text.is_some()
+            || self.native_emotion.is_some()
+            || self.emotion_array.is_some()
             || self.speed.is_some()
     }
 

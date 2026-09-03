@@ -72,12 +72,14 @@ impl AmiVoiceMessage {
         }
 
         // Get the first character (command/event type)
-        let first_char = text.chars().next().unwrap();
+        let Some(first_char) = text.chars().next() else {
+            return Err("Empty message".to_string());
+        };
+        let rest = text[first_char.len_utf8()..].trim();
 
         match first_char {
             's' => {
                 // Session start response
-                let rest = text[1..].trim();
                 if rest.is_empty() {
                     Ok(Self::SessionStartOk)
                 } else {
@@ -87,14 +89,12 @@ impl AmiVoiceMessage {
 
             'S' => {
                 // Speech start event: "S <timestamp>"
-                let rest = text[1..].trim();
                 let timestamp_ms = rest.parse::<u64>().unwrap_or(0);
                 Ok(Self::SpeechStart { timestamp_ms })
             }
 
             'E' => {
                 // Speech end event: "E <timestamp>"
-                let rest = text[1..].trim();
                 let timestamp_ms = rest.parse::<u64>().unwrap_or(0);
                 Ok(Self::SpeechEnd { timestamp_ms })
             }
@@ -106,7 +106,7 @@ impl AmiVoiceMessage {
 
             'U' => {
                 // Interim result: "U <json>"
-                let json_str = text[1..].trim();
+                let json_str = rest;
                 match serde_json::from_str::<AmiVoiceResult>(json_str) {
                     Ok(result) => Ok(Self::InterimResult(result)),
                     Err(e) => {
@@ -118,7 +118,7 @@ impl AmiVoiceMessage {
 
             'A' => {
                 // Final result: "A <json>"
-                let json_str = text[1..].trim();
+                let json_str = rest;
                 match serde_json::from_str::<AmiVoiceResult>(json_str) {
                     Ok(result) => Ok(Self::FinalResult(result)),
                     Err(e) => {
@@ -130,13 +130,11 @@ impl AmiVoiceMessage {
 
             'G' => {
                 // Server-generated info: "G <info>"
-                let rest = text[1..].trim();
                 Ok(Self::ServerInfo(rest.to_string()))
             }
 
             'e' => {
                 // Session end response
-                let rest = text[1..].trim();
                 if rest.is_empty() {
                     Ok(Self::SessionEndOk)
                 } else {
@@ -477,6 +475,12 @@ mod tests {
     #[test]
     fn test_parse_unknown_message() {
         let result = AmiVoiceMessage::parse("X unknown");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_unknown_multibyte_message_type() {
+        let result = AmiVoiceMessage::parse("あ unknown");
         assert!(result.is_err());
     }
 

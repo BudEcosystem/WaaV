@@ -25,7 +25,7 @@ use thiserror::Error;
 // =============================================================================
 
 /// Errors that can occur during realtime operations.
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 pub enum RealtimeError {
     /// Connection to the provider failed
     #[error("Connection failed: {0}")]
@@ -173,7 +173,17 @@ fn rand_jitter(range: f64) -> f64 {
 /// Base configuration for realtime providers.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RealtimeConfig {
-    /// API key for authentication
+    /// API key for authentication.
+    ///
+    /// `#[serde(default)]` so the WHOLE struct is deserialize-friendly from a
+    /// partial config blob (every other field already defaults). Without it,
+    /// `serde_json::from_value` on a config that omits `api_key` (e.g. a DAG node
+    /// whose credential comes from the env via `${VAR}` resolution, or any
+    /// feature-only blob) fails on the missing field and silently drops the entire
+    /// feature surface. The credential is always set authoritatively AFTER
+    /// deserialization (HTTP path: `build_realtime_config`; DAG path:
+    /// `RealtimeProviderNode::build_node_realtime_config`).
+    #[serde(default)]
     pub api_key: String,
 
     /// Provider name (e.g., "openai")
@@ -228,9 +238,63 @@ pub struct RealtimeConfig {
     #[serde(default)]
     pub modalities: Option<Vec<String>>,
 
+    /// S2S (REALTIME_REASONING.md §6): reasoning-effort dial — the ONE default
+    /// that spans BOTH the cascade and realtime paths. On a reasoning-capable
+    /// realtime model it maps to the session's native `reasoning.effort`; `Off`
+    /// (or `None`) sends nothing (a non-reasoning realtime model rejects it —
+    /// same fail-safe as the cascade adapter). Recommended start: `low`.
+    #[serde(default)]
+    pub reasoning_effort: Option<crate::core::llm::ReasoningEffort>,
+
+    /// Input-audio noise reduction: `"near_field"` (headsets / close mics) or
+    /// `"far_field"` (laptop / room mics). `None`/`"off"` = off.
+    #[serde(default)]
+    pub input_audio_noise_reduction: Option<String>,
+
+    /// Provider endpoint / resource override. Used by OpenAI-protocol CLONES that
+    /// reuse the GA wire on a DIFFERENT host: Azure OpenAI Realtime reads its
+    /// resource here (the `<resource>.openai.azure.com` host, or a full `wss://…`
+    /// base URL). OpenAI itself ignores it (the URL is fixed). `None` ⇒ the clone
+    /// falls back to its documented default host.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+
+    /// SERVER-CONFIG-ONLY realtime upstream URL override (SSRF-safe). When `Some`
+    /// and it starts with `ws://`/`wss://`, every WebSocket provider's
+    /// [`connect_spec`](crate::core::realtime::scaffold::RealtimeProtocol::connect_spec)
+    /// dials THIS url VERBATIM instead of the provider's documented host (the
+    /// provider's normal auth headers/query are still attached; a query-key
+    /// provider — gemini/hume — appends its `?key=`/`?api_key=` auth query when the
+    /// override carries no query of its own). Supports pointing a provider at a
+    /// PROXY / a SELF-HOSTED or GOV-CLOUD deployment / a local MOCK for testing.
+    ///
+    /// SECURITY: this is populated EXCLUSIVELY from the server's trusted
+    /// configuration (the `<PROVIDER>_REALTIME_URL` env vars →
+    /// [`ServerConfig::realtime_endpoint_overrides`](crate::config::ServerConfig::realtime_endpoint_overrides),
+    /// injected by the realtime handler). It is NEVER read from the untrusted
+    /// client `RealtimeSessionConfig` — the converter
+    /// (`handlers::realtime::build_realtime_config`) must not copy any
+    /// client-supplied endpoint here — so a connecting client cannot redirect the
+    /// gateway's upstream connection (no Server-Side Request Forgery). Distinct
+    /// from [`endpoint`](Self::endpoint), which carries azure's resource / inworld's
+    /// session id; the override is a SEPARATE field that WINS over `endpoint` when
+    /// set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub realtime_endpoint_override: Option<String>,
+
     /// Reconnection configuration for automatic reconnection on connection loss.
     #[serde(default)]
     pub reconnection: Option<ReconnectionConfig>,
+
+    /// **GW-17 (INFER_GATEWAY_INTEGRATION §13): the propagated W3C `traceparent` the gateway forwards to a
+    /// co-located WaaV Infer tier** so one distributed trace spans the gateway turn AND the intra-Infer
+    /// STT/LLM/TTS stages. A canonical `00-<trace32>-<span16>-01` string (reusing the inbound request's
+    /// trace id when present, else freshly minted — see the realtime handler). The Infer-S2S adapter injects
+    /// it onto the `session.config` `trace` field + a `traceparent` connect header; the engine parses it into
+    /// `SessionConfig::trace` and parents its per-turn / per-stage spans under it. `None` ⇒ untraced (the
+    /// engine opens a fresh root span). Server-set only; other providers ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace: Option<String>,
 }
 
 /// Configuration for input audio transcription.
@@ -398,6 +462,48 @@ pub struct RealtimeAudioData {
     pub response_id: Option<String>,
 }
 
+/// One conversation item for post-reconnect replay (B-G2).
+#[derive(Debug, Clone)]
+pub struct ReplayConversationItem {
+    pub role: TranscriptRole,
+    pub text: String,
+}
+
+/// Clamp a truncate point to what the user could ACTUALLY have heard: never
+/// beyond the audio received so far (`duration_ms`), never beyond wall-clock
+/// elapsed playback (`elapsed_ms`). Over-truncating 400s on the OpenAI API.
+pub fn clamp_truncate_ms(elapsed_ms: u64, duration_ms: u64) -> u64 {
+    elapsed_ms.min(duration_ms)
+}
+
+/// The barge-in sequence for a realtime (S2S) provider, in Pipecat's order
+/// (B-G2): [clear the input buffer → replay the user-audio preroll] → cancel
+/// the in-flight response → truncate the partially-heard item so server state
+/// matches heard audio. Each step is best-effort (a failed clear must not skip
+/// the cancel).
+///
+/// MODE-AWARE (review wf_d43814c3 #11): the bracketed input-buffer steps run
+/// ONLY in MANUAL mode. In server-VAD mode the provider already detects the
+/// barge-in and manages its own input buffer; a gateway clear+preroll there
+/// re-triggers the server VAD and destroys user speech beyond the preroll
+/// ring. cancel + truncate run in both modes.
+pub async fn run_barge_in_sequence(
+    provider: &mut (dyn BaseRealtime + Send),
+) -> RealtimeResult<Option<(String, u64)>> {
+    if !provider.emits_user_turn_frames() {
+        if let Err(e) = provider.clear_audio_buffer().await {
+            tracing::warn!(error = %e, "barge-in: input buffer clear failed; continuing");
+        }
+        if let Err(e) = provider.replay_user_audio_preroll().await {
+            tracing::warn!(error = %e, "barge-in: preroll replay failed; continuing");
+        }
+    }
+    if let Err(e) = provider.cancel_response().await {
+        tracing::warn!(error = %e, "barge-in: response cancel failed; continuing");
+    }
+    provider.truncate_current_response().await
+}
+
 /// Function call request from the model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FunctionCallRequest {
@@ -517,6 +623,30 @@ pub type ReconnectionCallback =
 ///     realtime.send_audio(audio_bytes).await?;
 /// }
 /// ```
+/// Per-response override for [`BaseRealtime::create_response_with`]
+/// (provider-agnostic).
+///
+/// Maps onto the OpenAI Realtime GA `response.create` `response` object so a
+/// single turn can override the session defaults — e.g. a text-only out-of-band
+/// summary, a different voice, or a tighter token cap. All-default ⇒ no override
+/// (behaves exactly like [`BaseRealtime::create_response`]).
+#[derive(Debug, Clone, Default)]
+pub struct RealtimeResponseOverride {
+    /// Output modalities for THIS response (e.g. `["text"]` or `["audio"]`).
+    pub modalities: Option<Vec<String>>,
+    /// Per-response system instructions (override the session instructions).
+    pub instructions: Option<String>,
+    /// Output voice for THIS response.
+    pub voice: Option<String>,
+    /// Max output tokens for THIS response (negative ⇒ "inf").
+    pub max_output_tokens: Option<i32>,
+    /// Out-of-band response: do NOT add it to the default conversation
+    /// (GA `conversation: "none"`) — e.g. a side classification/summary.
+    pub out_of_band: bool,
+    /// Opaque metadata echoed back on the response.
+    pub metadata: Option<serde_json::Value>,
+}
+
 #[async_trait]
 pub trait BaseRealtime: Send + Sync {
     /// Create a new realtime provider instance.
@@ -554,6 +684,18 @@ pub trait BaseRealtime: Send + Sync {
 
     /// Request the model to generate a response.
     async fn create_response(&mut self) -> RealtimeResult<()>;
+
+    /// Request a response with a per-response override (provider-agnostic).
+    ///
+    /// The default implementation ignores the override and delegates to
+    /// [`Self::create_response`]; providers that support per-response params
+    /// (OpenAI Realtime GA `response.create`) override this to apply them.
+    async fn create_response_with(
+        &mut self,
+        _overrides: RealtimeResponseOverride,
+    ) -> RealtimeResult<()> {
+        self.create_response().await
+    }
 
     /// Cancel the current response generation.
     async fn cancel_response(&mut self) -> RealtimeResult<()>;
@@ -605,6 +747,59 @@ pub trait BaseRealtime: Send + Sync {
 
     /// Get provider information.
     fn get_provider_info(&self) -> serde_json::Value;
+
+    /// Inject the shared, process-global resilience handles (W-D2): the single reconnect governor
+    /// + this provider's shared circuit breaker. The realtime providers own a bespoke reconnect
+    /// loop; with the handles injected they *participate* in process-wide storm control + per-
+    /// provider breaker tripping and publish `waav_circuit_breaker_state{provider}` on transition.
+    /// Default is a no-op so providers that don't (yet) consume the handles compile unchanged.
+    fn set_resilience(&mut self, _resilience: crate::core::resilience::ResilienceHandles) {}
+
+    // ── B-G2: S2S-as-a-service surface (defaults are no-ops so every
+    //    provider compiles; OpenAI Realtime implements them fully) ──
+
+    /// Whether the provider emits SERVER-side user-turn signals (live
+    /// `turn_detection`). `false` ⇒ the gateway's own turn policy drives
+    /// commits/responses (Pipecat `RealtimeServiceInfo.emits_user_turn_frames`).
+    fn emits_user_turn_frames(&self) -> bool {
+        true
+    }
+
+    /// Truncate a (partially heard) assistant item server-side so the
+    /// provider's conversation state matches what the user ACTUALLY heard.
+    /// Callers must clamp `audio_end_ms` (see [`clamp_truncate_ms`]) — the
+    /// OpenAI API 400s on over-truncate.
+    async fn truncate_response(
+        &mut self,
+        _item_id: &str,
+        _audio_end_ms: u64,
+    ) -> RealtimeResult<()> {
+        Ok(())
+    }
+
+    /// Truncate the CURRENTLY-playing response using the provider's own
+    /// playback tracking (elapsed vs received duration, clamped). Returns
+    /// what was truncated, `None` when nothing is playing.
+    async fn truncate_current_response(&mut self) -> RealtimeResult<Option<(String, u64)>> {
+        Ok(None)
+    }
+
+    /// Re-append the rolling user-audio preroll after an input-buffer clear
+    /// (the clear wipes the speech onset the VAD needed — Pipecat
+    /// `_replay_user_audio_preroll`).
+    async fn replay_user_audio_preroll(&mut self) -> RealtimeResult<()> {
+        Ok(())
+    }
+
+    /// Rebuild server-side conversation state after a reconnect by replaying
+    /// items — WITHOUT requesting a response (the socket is disposable, the
+    /// context is the durable truth).
+    async fn replay_conversation(
+        &mut self,
+        _items: &[ReplayConversationItem],
+    ) -> RealtimeResult<()> {
+        Ok(())
+    }
 }
 
 // =============================================================================
@@ -623,6 +818,158 @@ pub trait RealtimeFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncate_clamps_audio_end_to_min_elapsed_and_duration() {
+        // Never beyond received audio; never beyond wall-clock playback.
+        assert_eq!(clamp_truncate_ms(500, 1200), 500, "elapsed bounds");
+        assert_eq!(clamp_truncate_ms(3000, 1200), 1200, "duration bounds");
+        assert_eq!(clamp_truncate_ms(0, 1200), 0);
+        assert_eq!(clamp_truncate_ms(700, 700), 700);
+    }
+
+    /// B-G2: the barge-in sequence order is the load-bearing contract —
+    /// clear → preroll replay → cancel → truncate, each step best-effort.
+    #[tokio::test]
+    async fn barge_in_sends_clear_then_preroll_then_cancel_then_truncate_in_order() {
+        use std::sync::Mutex as StdMutex;
+
+        #[derive(Default)]
+        struct Recorder(Arc<StdMutex<Vec<&'static str>>>);
+
+        struct MockRt {
+            calls: Arc<StdMutex<Vec<&'static str>>>,
+            fail_clear: bool,
+            server_vad: bool,
+        }
+
+        #[async_trait::async_trait]
+        impl BaseRealtime for MockRt {
+            fn new(_c: RealtimeConfig) -> RealtimeResult<Self> {
+                unreachable!()
+            }
+            fn emits_user_turn_frames(&self) -> bool {
+                self.server_vad
+            }
+            async fn connect(&mut self) -> RealtimeResult<()> {
+                Ok(())
+            }
+            async fn disconnect(&mut self) -> RealtimeResult<()> {
+                Ok(())
+            }
+            fn is_ready(&self) -> bool {
+                true
+            }
+            fn get_connection_state(&self) -> ConnectionState {
+                ConnectionState::Connected
+            }
+            async fn send_audio(&mut self, _a: bytes::Bytes) -> RealtimeResult<()> {
+                Ok(())
+            }
+            async fn send_text(&mut self, _t: &str) -> RealtimeResult<()> {
+                Ok(())
+            }
+            async fn create_response(&mut self) -> RealtimeResult<()> {
+                Ok(())
+            }
+            async fn cancel_response(&mut self) -> RealtimeResult<()> {
+                self.calls.lock().unwrap().push("cancel");
+                Ok(())
+            }
+            async fn commit_audio_buffer(&mut self) -> RealtimeResult<()> {
+                Ok(())
+            }
+            async fn clear_audio_buffer(&mut self) -> RealtimeResult<()> {
+                self.calls.lock().unwrap().push("clear");
+                if self.fail_clear {
+                    return Err(RealtimeError::ProviderError("clear failed".into()));
+                }
+                Ok(())
+            }
+            fn on_transcript(&mut self, _c: TranscriptCallback) -> RealtimeResult<()> {
+                Ok(())
+            }
+            fn on_audio(&mut self, _c: AudioOutputCallback) -> RealtimeResult<()> {
+                Ok(())
+            }
+            fn on_error(&mut self, _c: RealtimeErrorCallback) -> RealtimeResult<()> {
+                Ok(())
+            }
+            fn on_function_call(&mut self, _c: FunctionCallCallback) -> RealtimeResult<()> {
+                Ok(())
+            }
+            fn on_speech_event(&mut self, _c: SpeechEventCallback) -> RealtimeResult<()> {
+                Ok(())
+            }
+            fn on_response_done(&mut self, _c: ResponseDoneCallback) -> RealtimeResult<()> {
+                Ok(())
+            }
+            fn on_reconnection(&mut self, _c: ReconnectionCallback) -> RealtimeResult<()> {
+                Ok(())
+            }
+            async fn update_session(&mut self, _c: RealtimeConfig) -> RealtimeResult<()> {
+                Ok(())
+            }
+            async fn submit_function_result(&mut self, _id: &str, _r: &str) -> RealtimeResult<()> {
+                Ok(())
+            }
+            fn get_provider_info(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            async fn replay_user_audio_preroll(&mut self) -> RealtimeResult<()> {
+                self.calls.lock().unwrap().push("preroll");
+                Ok(())
+            }
+            async fn truncate_current_response(&mut self) -> RealtimeResult<Option<(String, u64)>> {
+                self.calls.lock().unwrap().push("truncate");
+                Ok(Some(("item_1".into(), 420)))
+            }
+        }
+
+        // MANUAL mode: the full sequence, exact order.
+        let rec = Recorder::default();
+        let mut rt = MockRt {
+            calls: Arc::clone(&rec.0),
+            fail_clear: false,
+            server_vad: false,
+        };
+        let truncated = run_barge_in_sequence(&mut rt).await.unwrap();
+        assert_eq!(truncated, Some(("item_1".to_string(), 420)));
+        assert_eq!(
+            *rec.0.lock().unwrap(),
+            vec!["clear", "preroll", "cancel", "truncate"],
+            "manual mode: exact Pipecat order"
+        );
+
+        // Best-effort: a failed clear must not skip the rest.
+        let rec = Recorder::default();
+        let mut rt = MockRt {
+            calls: Arc::clone(&rec.0),
+            fail_clear: true,
+            server_vad: false,
+        };
+        let _ = run_barge_in_sequence(&mut rt).await;
+        assert_eq!(
+            *rec.0.lock().unwrap(),
+            vec!["clear", "preroll", "cancel", "truncate"]
+        );
+
+        // review wf_d43814c3 #11: SERVER-VAD mode SKIPS the input-buffer
+        // clear+preroll (which would re-trigger the server VAD and destroy
+        // user speech); only cancel + truncate run.
+        let rec = Recorder::default();
+        let mut rt = MockRt {
+            calls: Arc::clone(&rec.0),
+            fail_clear: false,
+            server_vad: true,
+        };
+        let _ = run_barge_in_sequence(&mut rt).await;
+        assert_eq!(
+            *rec.0.lock().unwrap(),
+            vec!["cancel", "truncate"],
+            "server-VAD mode: no input-buffer clear/preroll"
+        );
+    }
 
     #[test]
     fn test_connection_state_display() {
@@ -749,7 +1096,7 @@ mod tests {
         // With jitter, the delay should be within 25% of the base delay
         let delay = config.calculate_delay(1);
         assert!(
-            delay >= 750 && delay <= 1250,
+            (750..=1250).contains(&delay),
             "Delay {} should be within 750-1250",
             delay
         );

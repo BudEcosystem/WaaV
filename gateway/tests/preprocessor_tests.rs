@@ -501,7 +501,7 @@ fn test_full_audio_pipeline_simulation() {
     // 5. Analyze
 
     // Step 1: Generate speech
-    let clean_speech = audio_fixtures::generate_speech_pattern(audio_fixtures::SECOND * 3);
+    let _clean_speech = audio_fixtures::generate_speech_pattern(audio_fixtures::SECOND * 3);
 
     // Step 2: Add noise (simulate real-world audio)
     let noisy_speech = audio_fixtures::generate_noisy_speech(audio_fixtures::SECOND * 3, 15.0);

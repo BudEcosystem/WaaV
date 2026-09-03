@@ -9,6 +9,16 @@ pub use crate::core::stt::bhashini::{
     BHASHINI_CONFIG_URL, BhashiniLanguage, BhashiniPipelineProvider, LanguageFamily,
 };
 
+fn validate_bhashini_tts_endpoint(source: &str, endpoint: &str) -> Result<(), TTSError> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES).map_err(
+        |msg| TTSError::InvalidConfiguration(format!("{source} rejected (SSRF protection): {msg}")),
+    )
+}
+
 /// Default sample rate for TTS output (22.05 kHz).
 pub const DEFAULT_TTS_SAMPLE_RATE: u32 = 22050;
 
@@ -101,6 +111,8 @@ pub struct BhashiniTtsConfig {
     pub custom_callback_url: Option<String>,
     /// Custom service ID (if not using pipeline config).
     pub custom_service_id: Option<String>,
+    /// Test-only base-URL override for the pipeline CONFIG POST (scheme+host swap; path/query kept).
+    pub endpoint_override: Option<String>,
 }
 
 impl Default for BhashiniTtsConfig {
@@ -116,6 +128,7 @@ impl Default for BhashiniTtsConfig {
             pipeline_provider: BhashiniPipelineProvider::default(),
             custom_callback_url: None,
             custom_service_id: None,
+            endpoint_override: None,
         }
     }
 }
@@ -152,7 +165,7 @@ impl BhashiniTtsConfig {
         let language_str = config
             .voice_id
             .as_deref()
-            .or_else(|| {
+            .or({
                 if config.model.is_empty() {
                     None
                 } else {
@@ -199,7 +212,56 @@ impl BhashiniTtsConfig {
             pipeline_provider: BhashiniPipelineProvider::default(),
             custom_callback_url: None,
             custom_service_id: None,
+            endpoint_override: None,
         })
+    }
+
+    /// Build from the standardized TTS config. Bhashini's surface is a fixed AI4Bharat
+    /// pipeline, so only the features that match real fields are mapped: `sample_rate`
+    /// overrides the output rate and `language` re-selects the Bhashini language (when it
+    /// parses to a supported code). Provider-specific knobs (`custom_callback_url`,
+    /// `custom_service_id`) are read from the `extras` passthrough. Features with no
+    /// Bhashini field (speed, pitch, volume, stability, similarity_boost, style,
+    /// use_speaker_boost, emotion, instructions, ssml, word_timestamps, streaming, seed)
+    /// are skipped.
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> Result<Self, TTSError> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(std.base.clone())?;
+
+        if let Some(rate) = f.sample_rate {
+            cfg.sample_rate = rate;
+        }
+        if let Some(lang) = f.language.as_deref()
+            && let Some(language) = BhashiniLanguage::from_code(lang)
+        {
+            cfg.language = language;
+        }
+
+        // Provider-specific passthrough.
+        if let Some(url) = std
+            .extras
+            .0
+            .get("custom_callback_url")
+            .and_then(|v| v.as_str())
+        {
+            cfg.custom_callback_url = Some(url.to_string());
+        }
+        if let Some(id) = std
+            .extras
+            .0
+            .get("custom_service_id")
+            .and_then(|v| v.as_str())
+        {
+            cfg.custom_service_id = Some(id.to_string());
+        }
+
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
+
+        cfg.validate()?;
+
+        Ok(cfg)
     }
 
     /// Validate the configuration.
@@ -213,6 +275,9 @@ impl BhashiniTtsConfig {
             return Err(TTSError::InvalidConfiguration(
                 "ULCA API key is required".to_string(),
             ));
+        }
+        if let Some(endpoint) = &self.endpoint_override {
+            validate_bhashini_tts_endpoint("endpoint_override", endpoint)?;
         }
         Ok(())
     }
@@ -241,13 +306,9 @@ impl BhashiniLanguage {
                     "ai4bharat/indic-tts-coqui-indo_aryan-gpu--t4"
                 }
             }
-            LanguageFamily::Misc => {
-                if matches!(self, Self::English) {
-                    "ai4bharat/indic-tts-coqui-misc-gpu--t4"
-                } else {
-                    "ai4bharat/indic-tts-coqui-misc-gpu--t4"
-                }
-            }
+            // The Misc family uses a single coqui model regardless of English vs other languages
+            // (both branches were identical — collapsed; clippy if_same_then_else).
+            LanguageFamily::Misc => "ai4bharat/indic-tts-coqui-misc-gpu--t4",
         }
     }
 }
@@ -255,6 +316,44 @@ impl BhashiniLanguage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Bhashini maps only the features that have real fields: sample_rate -> output rate,
+    // language -> Bhashini language, plus the custom_service_id / custom_callback_url
+    // extras passthrough. Prosody/style features have no Bhashini field and are skipped.
+    #[test]
+    fn from_standard_maps_sample_rate_language_and_extras() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("custom_service_id".into(), serde_json::json!("svc-123"));
+        extras.insert(
+            "custom_callback_url".into(),
+            serde_json::json!("https://cb.example"),
+        );
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "bhashini".into(),
+                api_key: "user|key".into(),
+                voice_id: Some("hi".into()),
+                sample_rate: Some(22050),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                sample_rate: Some(16000),
+                language: Some("ta".into()),
+                speed: Some(1.5), // capability gap: Bhashini has no speed field, must be ignored
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+        let cfg = BhashiniTtsConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.sample_rate, 16000);
+        assert_eq!(cfg.language, BhashiniLanguage::Tamil);
+        assert_eq!(cfg.custom_service_id, Some("svc-123".to_string())); // extras passthrough
+        assert_eq!(
+            cfg.custom_callback_url,
+            Some("https://cb.example".to_string())
+        );
+    }
 
     #[test]
     fn test_config_from_base_valid() {
@@ -348,5 +447,30 @@ mod tests {
         config.user_id = "user".to_string();
         config.ulca_api_key = "key".to_string();
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = BhashiniTtsConfig {
+            user_id: "user".to_string(),
+            ulca_api_key: "key".to_string(),
+            ..Default::default()
+        };
+
+        config.endpoint_override = Some("https://bhashini-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.to_string().contains("SSRF protection"), "{err}");
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("non-HTTP endpoint_override must be rejected");
+        assert!(err.to_string().contains("SSRF protection"), "{err}");
     }
 }

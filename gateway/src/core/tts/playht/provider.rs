@@ -132,6 +132,11 @@ impl PlayHtRequestBuilder {
             body["language"] = json!(lang);
         }
 
+        // Add emotion if specified (Play3.0-mini / PlayHT2.0 / PlayHT2.0-turbo).
+        if let Some(emotion) = &self.playht_config.emotion {
+            body["emotion"] = json!(emotion);
+        }
+
         // Add guidance parameters if specified
         if let Some(tg) = self.playht_config.text_guidance {
             body["text_guidance"] = json!(tg);
@@ -158,6 +163,9 @@ impl PlayHtRequestBuilder {
         }
         if let Some(vcs) = self.playht_config.voice_conditioning_seconds {
             body["voice_conditioning_seconds"] = json!(vcs);
+        }
+        if let Some(vcs2) = self.playht_config.voice_conditioning_seconds_2 {
+            body["voice_conditioning_seconds_2"] = json!(vcs2);
         }
         if let Some(nc) = self.playht_config.num_candidates {
             body["num_candidates"] = json!(nc);
@@ -206,7 +214,10 @@ impl TTSRequestBuilder for PlayHtRequestBuilder {
 
         // Build the HTTP request with all required headers
         client
-            .post(PLAYHT_TTS_URL)
+            .post(crate::core::tts::standard::override_rest_endpoint(
+                PLAYHT_TTS_URL,
+                self.playht_config.endpoint_override.as_deref(),
+            ))
             .header("X-USER-ID", &self.playht_config.user_id)
             .header("AUTHORIZATION", &self.config.api_key)
             .header("Content-Type", "application/json")
@@ -244,8 +255,9 @@ impl TTSRequestBuilder for PlayHtRequestBuilder {
 /// - Temperature
 /// - Seed (if provided)
 /// - Language (if provided)
+/// - Emotion (if provided)
 /// - Guidance parameters (if provided)
-/// - PlayDialog parameters (if provided)
+/// - PlayDialog parameters (if provided, incl. voice_conditioning_seconds_2)
 fn compute_playht_tts_config_hash(config: &TTSConfig, playht_config: &PlayHtTtsConfig) -> String {
     let mut s = String::with_capacity(512);
 
@@ -294,6 +306,12 @@ fn compute_playht_tts_config_hash(config: &TTSConfig, playht_config: &PlayHtTtsC
     }
     s.push('|');
 
+    // Emotion (audio-changing delivery-style label)
+    if let Some(emotion) = &playht_config.emotion {
+        s.push_str(emotion);
+    }
+    s.push('|');
+
     // Guidance parameters
     if let Some(tg) = playht_config.text_guidance {
         s.push_str(&format!("{:.3}", tg));
@@ -323,6 +341,12 @@ fn compute_playht_tts_config_hash(config: &TTSConfig, playht_config: &PlayHtTtsC
     s.push('|');
     if let Some(tp2) = &playht_config.turn_prefix_2 {
         s.push_str(tp2);
+    }
+    s.push('|');
+
+    // Second-speaker voice conditioning (audio-changing: trades clone-similarity vs. stability)
+    if let Some(vcs2) = playht_config.voice_conditioning_seconds_2 {
+        s.push_str(&format!("{vcs2:.3}"));
     }
     s.push('|');
 
@@ -451,7 +475,7 @@ impl PlayHtTts {
         );
 
         Ok(Self {
-            provider: TTSProvider::new()?,
+            provider: TTSProvider::new(),
             request_builder,
             config_hash,
         })
@@ -500,10 +524,23 @@ impl PlayHtTts {
         );
 
         Ok(Self {
-            provider: TTSProvider::new()?,
+            provider: TTSProvider::new(),
             request_builder,
             config_hash,
         })
+    }
+
+    /// Builds the provider from the standardized config (W1 keystone for TTS — uniform entry
+    /// point, mirroring `DeepgramTTS::from_standard`).
+    ///
+    /// Delegates the feature mapping to [`PlayHtTtsConfig::from_standard`] (speed → speed,
+    /// style → style_guidance, language, seed, sample_rate; the non-standard `user_id` flows
+    /// through the `extras` passthrough), then constructs the provider via [`Self::with_config`].
+    /// Capability gaps (pitch, volume, stability, similarity_boost, use_speaker_boost, emotion,
+    /// instructions, ssml, word_timestamps, streaming) have no Play.ht field and are skipped.
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
+        let playht_config = PlayHtTtsConfig::from_standard(std);
+        Self::with_config(playht_config)
     }
 
     /// Sets the request manager for connection pooling.
@@ -735,7 +772,16 @@ impl BaseTTS for PlayHtTts {
     /// Connect to the TTS provider.
     async fn connect(&mut self) -> TTSResult<()> {
         self.provider
-            .generic_connect_with_config(PLAYHT_TTS_URL, &self.request_builder.config)
+            .generic_connect_with_config(
+                &crate::core::tts::standard::override_rest_endpoint(
+                    PLAYHT_TTS_URL,
+                    self.request_builder
+                        .playht_config
+                        .endpoint_override
+                        .as_deref(),
+                ),
+                &self.request_builder.config,
+            )
             .await?;
 
         info!("Play.ht TTS provider connected and ready");
@@ -870,6 +916,157 @@ mod tests {
             request_pool_size: Some(4),
             emotion_config: None,
         }
+    }
+
+    // =========================================================================
+    // W1 keystone (TTS): standardized-path mapping on the provider STRUCT
+    // =========================================================================
+
+    // The standardized config's advanced features (speed/style/language/seed/sample_rate) reach the
+    // built provider's Play.ht config through the struct-level `from_standard` (not just the
+    // config-level one), and the non-standard `user_id` flows via the extras passthrough.
+    #[test]
+    fn from_standard_maps_features_to_provider() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("user_id".into(), serde_json::json!("user-123"));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "playht".into(),
+                api_key: "k".into(),
+                voice_id: Some("s3://test-voice/manifest.json".into()),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(1.4),
+                style: Some(0.6),
+                language: Some("en".into()),
+                seed: Some(42),
+                sample_rate: Some(24000),
+                ..Default::default()
+            },
+            extras: crate::core::stt::standard::ProviderExtras(extras),
+        };
+        let tts = PlayHtTts::from_standard(&std).unwrap();
+        let cfg = tts.playht_config();
+        assert!((cfg.speed - 1.4).abs() < 0.001);
+        assert_eq!(cfg.style_guidance, Some(0.6));
+        assert_eq!(cfg.language, Some("en".to_string()));
+        assert_eq!(cfg.seed, Some(42));
+        assert_eq!(cfg.sample_rate, 24000);
+        assert_eq!(cfg.user_id, "user-123");
+        assert_eq!(cfg.base.api_key, "k");
+    }
+
+    #[test]
+    fn from_standard_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut extras = serde_json::Map::new();
+        extras.insert("user_id".into(), serde_json::json!("user-123"));
+        let std = crate::core::tts::standard::StandardTTSConfig {
+            base: TTSConfig {
+                provider: "playht".into(),
+                api_key: "k".into(),
+                voice_id: Some("s3://test-voice/manifest.json".into()),
+                ..Default::default()
+            },
+            features: Default::default(),
+            extras: crate::core::stt::standard::ProviderExtras(extras),
+        }
+        .with_endpoint_override("http://127.0.0.1:9000");
+
+        match PlayHtTts::from_standard(&std) {
+            Ok(_) => panic!("PlayHT provider construction must reject unsafe endpoint_override"),
+            Err(err) => assert!(err.to_string().contains("SSRF protection")),
+        }
+    }
+
+    // WIRE-LEVEL (recurring bug class: assert the request BODY, not just the config struct): the
+    // standardized `emotion` feature must reach the `emotion` field of the JSON body POSTed to
+    // https://api.play.ht/api/v2/tts/stream — the exact body `build_request_body` serializes.
+    // Goes through `from_standard` (dispatch entry point) on the default Play3.0-mini engine, which
+    // is one of the engines Play.ht supports `emotion` on (per docs).
+    #[test]
+    fn from_standard_emotion_reaches_stream_request_body() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("user_id".into(), serde_json::json!("user-123"));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "playht".into(),
+                api_key: "k".into(),
+                voice_id: Some("s3://test-voice/manifest.json".into()),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                emotion: Some("female_happy".into()),
+                ..Default::default()
+            },
+            extras: crate::core::stt::standard::ProviderExtras(extras),
+        };
+        let tts = PlayHtTts::from_standard(&std).unwrap();
+        let body = tts.request_builder.build_request_body("Hello world");
+        assert_eq!(
+            body["emotion"], "female_happy",
+            "emotion must reach the /api/v2/tts/stream JSON body, got: {body}"
+        );
+    }
+
+    // WIRE-LEVEL: the `voice_conditioning_seconds_2` extra (PlayDialog second-speaker conditioning)
+    // must reach the `voice_conditioning_seconds_2` JSON body field on the wire. Goes through
+    // `from_standard` on the PlayDialog engine (the only engine Play.ht supports it on, per docs).
+    #[test]
+    fn from_standard_voice_conditioning_seconds_2_reaches_stream_request_body() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("user_id".into(), serde_json::json!("user-123"));
+        extras.insert(
+            "voice_conditioning_seconds_2".into(),
+            serde_json::json!(15.0),
+        );
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "playht".into(),
+                api_key: "k".into(),
+                voice_id: Some("s3://test-voice/manifest.json".into()),
+                model: "PlayDialog".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures::default(),
+            extras: crate::core::stt::standard::ProviderExtras(extras),
+        };
+        let tts = PlayHtTts::from_standard(&std).unwrap();
+        let body = tts.request_builder.build_request_body("Hello world");
+        let vcs2 = body["voice_conditioning_seconds_2"].as_f64().unwrap();
+        assert!(
+            (vcs2 - 15.0).abs() < 0.001,
+            "voice_conditioning_seconds_2 must reach the /api/v2/tts/stream JSON body, got: {body}"
+        );
+    }
+
+    // Cache-key collision guard (prior review's bug class): `emotion` and
+    // `voice_conditioning_seconds_2` are audio-changing TTS fields, so two configs differing only
+    // in those must hash differently — otherwise a cached clip from one delivery is served for the
+    // other.
+    #[test]
+    fn config_hash_distinguishes_emotion_and_voice_conditioning_seconds_2() {
+        let config = create_test_config();
+
+        let base_cfg = PlayHtTtsConfig::from_base(config.clone(), "test-user".to_string());
+        let base_hash = compute_playht_tts_config_hash(&config, &base_cfg);
+
+        let mut emo_cfg = PlayHtTtsConfig::from_base(config.clone(), "test-user".to_string());
+        emo_cfg.emotion = Some("female_happy".to_string());
+        let emo_hash = compute_playht_tts_config_hash(&config, &emo_cfg);
+        assert_ne!(base_hash, emo_hash, "emotion must affect the cache key");
+
+        let mut vcs2_cfg = PlayHtTtsConfig::from_base(config.clone(), "test-user".to_string());
+        vcs2_cfg.voice_conditioning_seconds_2 = Some(15.0);
+        let vcs2_hash = compute_playht_tts_config_hash(&config, &vcs2_cfg);
+        assert_ne!(
+            base_hash, vcs2_hash,
+            "voice_conditioning_seconds_2 must affect the cache key"
+        );
     }
 
     // =========================================================================

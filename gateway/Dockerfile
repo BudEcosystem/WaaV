@@ -1,6 +1,11 @@
 # syntax=docker/dockerfile:1
 ARG RUST_VERSION=1.88.0
-ARG CARGO_BUILD_FEATURES="--no-default-features --features turn-detect,noise-filter"
+# Production feature set — must match CI's PROD_FEATURES (.github/workflows/ci.yml) so the shipped
+# binary is exactly what CI gates. Ships the DAG orchestration engine (dag-routing) and the full
+# neural turn-detection ensemble (turn-ensemble = smart-turn + turn-detect + silero-vad) — NOT just
+# basic turn-detect. smart-turn/silero ONNX models lazy-download on first use (cached thereafter);
+# turn-detect assets are pre-baked by the `init` stage below.
+ARG CARGO_BUILD_FEATURES="--no-default-features --features dag-routing,turn-ensemble,noise-filter,openapi"
 ARG ONNX_VERSION=1.23.2
 
 # ==================== Chef Base ====================

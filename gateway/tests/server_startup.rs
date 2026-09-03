@@ -36,6 +36,15 @@ fn create_minimal_config(port: u16) -> ServerConfig {
         azure_speech_region: None,
         cartesia_api_key: None,
         openai_api_key: None,
+        azure_openai_api_key: None,
+        azure_openai_endpoint: None,
+        grok_api_key: None,
+        inworld_api_key: None,
+        gemini_api_key: None,
+        ultravox_api_key: None,
+        speechmatics_api_key: None,
+        yandex_api_key: None,
+        yandex_folder_id: None,
         assemblyai_api_key: None,
         hume_api_key: None,
         lmnt_api_key: None,
@@ -73,8 +82,10 @@ fn create_minimal_config(port: u16) -> ServerConfig {
         ws_processing_timeout_secs: 10,
         realtime_processing_timeout_secs: 30,
         sip_max_participants: 3,
+        realtime_endpoint_overrides: Default::default(),
         plugins: PluginConfig::default(),
         dag_timeouts: DAGTimeoutsConfig::default(),
+        aliases: Default::default(),
     }
 }
 
@@ -347,7 +358,7 @@ async fn test_livekit_configurations() {
 async fn test_graceful_shutdown_simulation() {
     let port = find_available_port();
     let config = create_minimal_config(port);
-    let app_state = AppState::new(config).await;
+    let _app_state = AppState::new(config).await;
 
     // Create a shutdown signal
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -365,7 +376,9 @@ async fn test_graceful_shutdown_simulation() {
 
     // Task should complete within timeout
     let result = timeout(Duration::from_secs(1), task).await;
-    assert!(result.is_ok());
+    result
+        .expect("shutdown task should complete within 1s")
+        .expect("shutdown task should not panic");
 }
 
 /// Test that the server correctly handles WebSocket route setup

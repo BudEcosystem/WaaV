@@ -18,7 +18,19 @@
  */
 
 import { BudWidget, defineWidget } from './widget';
-import { mergeConfig } from './config';
+import { mergeConfig, parseConfigFromAttributes } from './config';
+import { buildConfigMessage, buildConversationConfig } from './websocket';
+import { AudioPlayer } from './audio/player';
+import { AudioRecorder } from './audio/recorder';
+import { JitterBuffer } from './audio/jitter-buffer';
+import {
+  STT_PROVIDERS,
+  TTS_PROVIDERS,
+  REALTIME_PROVIDERS,
+  isValidSTTProvider,
+  isValidTTSProvider,
+  isValidRealtimeProvider,
+} from './providers';
 import type {
   WidgetConfig,
   WidgetState,
@@ -26,16 +38,46 @@ import type {
   AudioChunk,
   WidgetMetrics,
   WidgetEventMap,
+  ConfigWarning,
   STTConfig,
   TTSConfig,
+  ConversationConfig,
   FeatureFlags,
+  STTProvider,
+  TTSProvider,
+  RealtimeProvider,
+  AdapterKind,
+  MuteStrategy,
+  RoutingMode,
+  ReasoningEffort,
+  LatencyFiller,
 } from './types';
 
 // Auto-register the custom element
 defineWidget();
 
 // Export everything for programmatic usage
-export { BudWidget, defineWidget, mergeConfig };
+export {
+  BudWidget,
+  defineWidget,
+  mergeConfig,
+  parseConfigFromAttributes,
+  buildConfigMessage,
+  buildConversationConfig,
+  // Audio primitives (D2 scheduled player / D3 AudioWorklet recorder / D9 adaptive
+  // jitter buffer). Exported so advanced embedders can drive playout/capture
+  // directly and for unit testing.
+  AudioPlayer,
+  AudioRecorder,
+  JitterBuffer,
+  // Canonical provider value-space (mirrors the gateway dispatch tables).
+  STT_PROVIDERS,
+  TTS_PROVIDERS,
+  REALTIME_PROVIDERS,
+  isValidSTTProvider,
+  isValidTTSProvider,
+  isValidRealtimeProvider,
+};
 export type {
   WidgetConfig,
   WidgetState,
@@ -43,9 +85,19 @@ export type {
   AudioChunk,
   WidgetMetrics,
   WidgetEventMap,
+  ConfigWarning,
   STTConfig,
   TTSConfig,
+  ConversationConfig,
   FeatureFlags,
+  STTProvider,
+  TTSProvider,
+  RealtimeProvider,
+  AdapterKind,
+  MuteStrategy,
+  RoutingMode,
+  ReasoningEffort,
+  LatencyFiller,
 };
 
 // Factory function for programmatic creation

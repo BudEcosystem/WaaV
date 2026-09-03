@@ -4,17 +4,21 @@
 
 import type {
   WidgetConfig,
-  STTConfig,
-  TTSConfig,
-  FeatureFlags,
-  EmotionConfig,
-  RealtimeConfig,
+  ConversationConfig,
   AudioFeatures,
   STTProvider,
   TTSProvider,
   RealtimeProvider,
   EmotionType,
   DeliveryStyle,
+  VoiceDescriptor,
+  VoiceGender,
+  VoiceAge,
+  ReasoningEffort,
+  LatencyFiller,
+  AdapterKind,
+  MuteStrategy,
+  RoutingMode,
 } from './types';
 
 /**
@@ -24,6 +28,8 @@ export function parseConfigFromAttributes(element: HTMLElement): WidgetConfig {
   const config: WidgetConfig = {
     gatewayUrl: element.dataset.gatewayUrl || 'ws://localhost:3001/ws',
     apiKey: element.dataset.apiKey || element.dataset.authToken,
+    // P3 proxy/alias: a server-defined name resolved to a full agent bundle.
+    alias: element.dataset.alias,
     theme: parseTheme(element.dataset.theme),
     position: parsePosition(element.dataset.position),
     mode: parseMode(element.dataset.mode),
@@ -42,15 +48,42 @@ export function parseConfigFromAttributes(element: HTMLElement): WidgetConfig {
       channels: parseInt(element.dataset.sttChannels || '1', 10),
       encoding: element.dataset.sttEncoding || 'linear16',
     };
+    // Canonical in-stream translation (P5): `data-translate-target="hi-IN,es-ES"`
+    // (canonical BCP-47, comma-separated) and/or `data-translate-to-english`. The
+    // gateway emits translations[]{lang,text} on each stt_result.
+    const targets = (element.dataset.translateTarget || '')
+      .split(',').map((s) => s.trim()).filter(Boolean);
+    const toEnglish = element.dataset.translateToEnglish === 'true';
+    if (targets.length || toEnglish) {
+      config.stt.translation = {
+        ...(targets.length ? { targetLanguages: targets } : {}),
+        ...(toEnglish ? { translateToEnglish: true } : {}),
+      };
+    }
   }
 
-  // Parse TTS config with emotion support
+  // Parse TTS config with emotion support.
+  //
+  // Flagship one-tag ergonomics: a bare `data-tts-voice` (or `data-tts-voice-id`)
+  // is enough to make the bot speak — we default the provider to `deepgram` when
+  // only a voice is given, so `data-llm-* + data-stt-provider + data-tts-voice`
+  // produces a full talking loop in a single HTML tag. An explicit
+  // `data-tts-provider` always wins.
   const ttsProvider = element.dataset.ttsProvider;
-  if (ttsProvider) {
+  const ttsVoice = element.dataset.ttsVoice;
+  const ttsVoiceId = element.dataset.ttsVoiceId;
+  // Abstract voice selection (P4): `data-voice-gender` / `data-voice-locale` /
+  // `data-voice-accent` / `data-voice-age` / `data-voice-style` /
+  // `data-voice-name-hint`. The gateway resolves this to a concrete provider
+  // voice_id server-side, so `data-voice-gender="female"` alone is enough (no need
+  // to hardcode a provider voice id). A raw `data-tts-voice-id` always wins.
+  const voiceDescriptor = parseVoiceDescriptor(element);
+  if (ttsProvider || ttsVoice || ttsVoiceId || voiceDescriptor) {
     config.tts = {
-      provider: ttsProvider as TTSProvider,
-      voice: element.dataset.ttsVoice,
-      voiceId: element.dataset.ttsVoiceId,
+      provider: (ttsProvider as TTSProvider | undefined) || 'deepgram',
+      voice: ttsVoice,
+      voiceId: ttsVoiceId,
+      voiceDescriptor,
       model: element.dataset.ttsModel,
       sampleRate: parseInt(element.dataset.ttsSampleRate || '24000', 10),
     };
@@ -84,6 +117,17 @@ export function parseConfigFromAttributes(element: HTMLElement): WidgetConfig {
     };
   }
 
+  // Parse conversation-loop (LLM) config — drives the gateway STT->LLM->TTS loop
+  // so the bot talks back. Requires at least a base URL + model. This is the
+  // FLAGSHIP one-tag surface: `data-llm-base-url` + `data-llm-model` give a
+  // talking bot; the reasoning / barge-in / latency-filler dials below add
+  // realtime-reasoning in a few more attributes. Maps 1:1 to conversation_config.
+  const llmBaseUrl = element.dataset.llmBaseUrl;
+  const llmModel = element.dataset.llmModel;
+  if (llmBaseUrl && llmModel) {
+    config.conversation = parseConversationFromAttributes(element, llmBaseUrl, llmModel);
+  }
+
   // Parse feature flags
   config.features = {
     vad: element.dataset.vad !== 'false',
@@ -100,6 +144,151 @@ export function parseConfigFromAttributes(element: HTMLElement): WidgetConfig {
   config.audioFeatures = parseAudioFeatures(element);
 
   return config;
+}
+
+/**
+ * Parse the conversation-loop (LLM) config from `data-llm-*` attributes.
+ *
+ * `baseUrl` + `model` are required (passed in by the caller after the presence
+ * check). Every other field maps 1:1 to a {@link ConversationConfig} key and is
+ * only set when its attribute is present, so an unspecified dial takes the
+ * gateway default. Exported-shaped as a module helper for testability.
+ */
+function parseConversationFromAttributes(
+  element: HTMLElement,
+  baseUrl: string,
+  model: string
+): ConversationConfig {
+  const d = element.dataset;
+  const conv: ConversationConfig = { baseUrl, model };
+
+  // Core LLM
+  if (d.llmSystemPrompt !== undefined) conv.systemPrompt = d.llmSystemPrompt;
+  if (d.llmApiKey !== undefined) {
+    // SECURITY: a data-llm-api-key attribute puts a RAW upstream provider key in the page DOM —
+    // any end user can read it via view-source/devtools, and it is forwarded on the wire. The safe
+    // pattern is a server-side alias (the gateway's `alias` config resolves provider keys
+    // server-side; the page only ever carries the gateway auth token). Warn loudly; do not block
+    // (self-hosted demos may accept the tradeoff knowingly).
+    console.warn(
+      '[waav-widget] data-llm-api-key embeds a raw LLM provider key in the page DOM — any visitor ' +
+        'can read it. Use a server-side alias config on the gateway instead and drop this attribute.'
+    );
+    conv.apiKey = d.llmApiKey;
+  }
+  const temperature = parseFloatAttr(d.llmTemperature);
+  if (temperature !== undefined) conv.temperature = temperature;
+  const maxTokens = parseIntAttr(d.llmMaxTokens);
+  if (maxTokens !== undefined) conv.maxTokens = maxTokens;
+  const streaming = parseBoolAttr(d.llmStreaming);
+  if (streaming !== undefined) conv.streaming = streaming;
+  const maxHistory = parseIntAttr(d.llmMaxHistory);
+  if (maxHistory !== undefined) conv.maxHistory = maxHistory;
+  const allowInterruption = parseBoolAttr(d.llmAllowInterruption);
+  if (allowInterruption !== undefined) conv.allowInterruption = allowInterruption;
+  if (d.llmProviderKind !== undefined) conv.providerKind = d.llmProviderKind as AdapterKind;
+  const stripMarkdown = parseBoolAttr(d.llmStripMarkdown);
+  if (stripMarkdown !== undefined) conv.stripMarkdown = stripMarkdown;
+
+  // Barge-in / mute
+  const eagerEot = parseBoolAttr(d.llmEagerEot);
+  if (eagerEot !== undefined) conv.eagerEot = eagerEot;
+  const bargeInMinWords = parseIntAttr(d.llmBargeInMinWords);
+  if (bargeInMinWords !== undefined) conv.bargeInMinWords = bargeInMinWords;
+  if (d.llmMuteStrategy !== undefined) conv.muteStrategy = d.llmMuteStrategy as MuteStrategy;
+  const userIdleTimeoutMs = parseIntAttr(d.llmUserIdleTimeoutMs);
+  if (userIdleTimeoutMs !== undefined) conv.userIdleTimeoutMs = userIdleTimeoutMs;
+  const summarizeTargetTokens = parseIntAttr(d.llmSummarizeTargetTokens);
+  if (summarizeTargetTokens !== undefined) conv.summarizeTargetTokens = summarizeTargetTokens;
+
+  // Latency filler
+  if (d.llmLatencyFiller !== undefined) conv.latencyFiller = d.llmLatencyFiller as LatencyFiller;
+  const latencyFillerAfterMs = parseIntAttr(d.llmLatencyFillerAfterMs);
+  if (latencyFillerAfterMs !== undefined) conv.latencyFillerAfterMs = latencyFillerAfterMs;
+  const latencyFillerPhrases = parseCsvAttr(d.llmLatencyFillerPhrases);
+  if (latencyFillerPhrases !== undefined) conv.latencyFillerPhrases = latencyFillerPhrases;
+
+  // Reasoning tier (two-tier)
+  if (d.llmReasoningEffort !== undefined)
+    conv.reasoningEffort = d.llmReasoningEffort as ReasoningEffort;
+  if (d.llmReasoningModel !== undefined) conv.reasoningModel = d.llmReasoningModel;
+  if (d.llmReasoningBaseUrl !== undefined) conv.reasoningBaseUrl = d.llmReasoningBaseUrl;
+  if (d.llmReasoningApiKey !== undefined) {
+    console.warn(
+      '[waav-widget] data-llm-reasoning-api-key embeds a raw provider key in the page DOM — any ' +
+        'visitor can read it. Use a server-side alias config on the gateway instead.'
+    );
+    conv.reasoningApiKey = d.llmReasoningApiKey;
+  }
+  if (d.llmReasoningProviderKind !== undefined)
+    conv.reasoningProviderKind = d.llmReasoningProviderKind as AdapterKind;
+  if (d.llmReasoningRoute !== undefined) conv.reasoningRoute = d.llmReasoningRoute as RoutingMode;
+  const reasoningBudgetMs = parseIntAttr(d.llmReasoningBudgetMs);
+  if (reasoningBudgetMs !== undefined) conv.reasoningBudgetMs = reasoningBudgetMs;
+  if (d.llmDegradationMessage !== undefined) conv.degradationMessage = d.llmDegradationMessage;
+  const maxLlmCallsPerTurn = parseIntAttr(d.llmMaxLlmCallsPerTurn);
+  if (maxLlmCallsPerTurn !== undefined) conv.maxLlmCallsPerTurn = maxLlmCallsPerTurn;
+  const maxReasoningTokens = parseIntAttr(d.llmMaxReasoningTokens);
+  if (maxReasoningTokens !== undefined) conv.maxReasoningTokens = maxReasoningTokens;
+
+  return conv;
+}
+
+/** Parse an integer attribute; undefined when absent or non-numeric. */
+function parseIntAttr(value: string | undefined): number | undefined {
+  if (value === undefined || value === '') return undefined;
+  const n = parseInt(value, 10);
+  return Number.isNaN(n) ? undefined : n;
+}
+
+/** Parse a float attribute; undefined when absent or non-numeric. */
+function parseFloatAttr(value: string | undefined): number | undefined {
+  if (value === undefined || value === '') return undefined;
+  const n = parseFloat(value);
+  return Number.isNaN(n) ? undefined : n;
+}
+
+/** Parse a boolean attribute; undefined when absent ("false" => false, else true). */
+function parseBoolAttr(value: string | undefined): boolean | undefined {
+  if (value === undefined) return undefined;
+  return value !== 'false';
+}
+
+/** Parse a comma-separated attribute into a trimmed, non-empty string array. */
+function parseCsvAttr(value: string | undefined): string[] | undefined {
+  if (value === undefined) return undefined;
+  const parts = value
+    .split(',')
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  return parts.length > 0 ? parts : undefined;
+}
+
+/**
+ * Parse an abstract {@link VoiceDescriptor} from `data-voice-*` attributes (P4).
+ *
+ * Returns `undefined` when none are present (so it never forces an empty descriptor
+ * onto the wire). The gateway resolves the descriptor to a concrete provider
+ * voice_id server-side; a raw `data-tts-voice-id` always wins.
+ */
+function parseVoiceDescriptor(element: HTMLElement): VoiceDescriptor | undefined {
+  const d = element.dataset;
+  const vd: VoiceDescriptor = {
+    gender: d.voiceGender as VoiceGender | undefined,
+    locale: d.voiceLocale,
+    accent: d.voiceAccent,
+    age: d.voiceAge as VoiceAge | undefined,
+    style: d.voiceStyle,
+    nameHint: d.voiceNameHint,
+  };
+  const hasAny =
+    vd.gender !== undefined ||
+    vd.locale !== undefined ||
+    vd.accent !== undefined ||
+    vd.age !== undefined ||
+    vd.style !== undefined ||
+    vd.nameHint !== undefined;
+  return hasAny ? vd : undefined;
 }
 
 /**
@@ -132,12 +321,7 @@ function parseAudioFeatures(element: HTMLElement): AudioFeatures {
       threshold: element.dataset.turnDetectionThreshold
         ? parseFloat(element.dataset.turnDetectionThreshold)
         : undefined,
-      silenceMs: element.dataset.turnDetectionSilenceMs
-        ? parseInt(element.dataset.turnDetectionSilenceMs, 10)
-        : undefined,
-      prefixPaddingMs: element.dataset.turnDetectionPrefixPaddingMs
-        ? parseInt(element.dataset.turnDetectionPrefixPaddingMs, 10)
-        : undefined,
+      eager: element.dataset.turnDetectionEager === 'true' || undefined,
     };
   }
 
@@ -209,6 +393,9 @@ export function mergeConfig(config: Partial<WidgetConfig>): WidgetConfig {
   return {
     gatewayUrl: config.gatewayUrl || 'ws://localhost:3001/ws',
     apiKey: config.apiKey,
+    // P3 proxy/alias: carry the server-defined alias name through (it was being
+    // dropped by this explicit-field rebuild — a real bug the alias test caught).
+    alias: config.alias,
     theme: config.theme || 'auto',
     position: config.position || 'bottom-right',
     mode: config.mode || 'vad',
@@ -226,6 +413,7 @@ export function mergeConfig(config: Partial<WidgetConfig>): WidgetConfig {
       sampleRate: 24000,
     },
     realtime: config.realtime,
+    conversation: config.conversation,
     features: {
       vad: config.features?.vad ?? true,
       noiseCancellation: config.features?.noiseCancellation ?? false,

@@ -31,6 +31,7 @@ use super::super::base::{
     BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback, SpeakerInfo,
     WordTiming,
 };
+use super::super::http_resilience::HttpBreaker;
 use super::config::{FlushStrategy, OpenAISTTConfig, ResponseFormat};
 use super::messages::{
     DiarizedTranscriptionResponse, OpenAIErrorResponse, TranscriptionResponse, TranscriptionResult,
@@ -47,6 +48,27 @@ const MAX_BUFFER_SIZE_BYTES: usize = 20 * 1024 * 1024;
 
 /// Scale factor for converting PCM 16-bit samples to normalized float (-1.0 to 1.0)
 const PCM_TO_FLOAT_SCALE: f32 = 1.0 / 32768.0;
+
+fn openai_stt_http_client() -> Result<Client, reqwest::Error> {
+    crate::core::net::ssrf_protected_client_builder(crate::core::net::HTTP_URL_SCHEMES)
+        .timeout(Duration::from_secs(30))
+        .pool_max_idle_per_host(4)
+        .pool_idle_timeout(Duration::from_secs(90))
+        .build()
+}
+
+fn default_openai_stt_http_client() -> Option<Client> {
+    match openai_stt_http_client() {
+        Ok(client) => Some(client),
+        Err(err) => {
+            warn!(
+                error = %err,
+                "failed to create default OpenAI STT HTTP client; default instance is inert until rebuilt with a valid config"
+            );
+            None
+        }
+    }
+}
 
 // =============================================================================
 // Type Aliases
@@ -116,7 +138,7 @@ pub struct OpenAISTT {
     pub(crate) config: Option<OpenAISTTConfig>,
 
     /// HTTP client for API requests (reused for connection pooling).
-    http_client: Client,
+    http_client: Option<Client>,
 
     /// Audio buffer for accumulating PCM data.
     /// Uses Vec for efficient appending with pre-allocated capacity.
@@ -145,6 +167,11 @@ pub struct OpenAISTT {
 
     /// Whether the last audio chunk was detected as silent
     last_was_silent: bool,
+
+    /// Shared per-provider circuit breaker for the REST transport (uniform with the WS fleet):
+    /// consulted before each upstream call, fed by the unified HTTP status classification.
+    /// Inert until `set_resilience` injects the process-global handles (W-D2).
+    resilience: HttpBreaker,
 }
 
 impl OpenAISTT {
@@ -155,20 +182,31 @@ impl OpenAISTT {
     ///
     /// # Returns
     /// * `Result<Self, STTError>` - New instance or error
+    /// W1 keystone — construct directly from the standardized config so the advanced features
+    /// OpenAI can express (diarization → DiarizedJson response format, word_timestamps → word
+    /// timestamp granularity, keyterms → prompt) are honored END-TO-END. The flat `BaseSTT::new`
+    /// path can only see the base config; this is the reachable standardized path. Features OpenAI's
+    /// API lacks remain capability gaps at default.
+    pub fn new_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        if std.base.api_key.is_empty() {
+            return Err(STTError::AuthenticationFailed(
+                "API key is required".to_string(),
+            ));
+        }
+        Self::with_config(OpenAISTTConfig::from_standard(std))
+    }
+
     pub fn with_config(config: OpenAISTTConfig) -> Result<Self, STTError> {
         // Validate configuration
         config.validate().map_err(STTError::ConfigurationError)?;
 
         // Create HTTP client with sensible defaults
         // 30s timeout balances long audio transcription with timely failure detection
-        let http_client = Client::builder()
-            .timeout(Duration::from_secs(30))
-            .pool_max_idle_per_host(4) // Connection pooling
-            .pool_idle_timeout(Duration::from_secs(90)) // Close idle connections after 90s
-            .build()
-            .map_err(|e| {
-                STTError::ConfigurationError(format!("Failed to create HTTP client: {e}"))
-            })?;
+        let http_client = openai_stt_http_client().map_err(|e| {
+            STTError::ConfigurationError(format!("Failed to create HTTP client: {e}"))
+        })?;
 
         // Pre-allocate audio buffer with expected capacity
         // Typical audio: 16kHz, 16-bit mono = 32KB/sec
@@ -177,7 +215,7 @@ impl OpenAISTT {
 
         Ok(Self {
             config: Some(config),
-            http_client,
+            http_client: Some(http_client),
             audio_buffer: Vec::with_capacity(initial_capacity),
             connected: AtomicBool::new(false),
             result_callback: Arc::new(Mutex::new(None)),
@@ -186,7 +224,15 @@ impl OpenAISTT {
             first_audio_time: None,
             silence_start_time: None,
             last_was_silent: false,
+            resilience: HttpBreaker::new("openai"),
         })
+    }
+
+    /// The shared circuit breaker this client feeds, if the process-global resilience handles
+    /// have been injected (W-D2). Two `OpenAISTT` built from the same
+    /// [`crate::core::resilience::ResilienceRegistry`] return the *same* `Arc`.
+    pub fn resilience_breaker(&self) -> Option<&Arc<crate::core::resilience::CircuitBreaker>> {
+        self.resilience.breaker()
     }
 
     /// Publicly accessible flush method.
@@ -350,11 +396,12 @@ impl OpenAISTT {
         }
 
         // Create WAV file from buffered PCM data
-        let wav_data = wav::create_wav(
+        let wav_data = wav::try_create_wav(
             &self.audio_buffer,
             config.base.sample_rate,
             config.base.channels,
-        );
+        )
+        .map_err(|err| STTError::AudioProcessingError(format!("Invalid WAV parameters: {err}")))?;
 
         // Build multipart form
         let file_part = Part::bytes(wav_data)
@@ -362,57 +409,46 @@ impl OpenAISTT {
             .mime_str(config.audio_input_format.mime_type())
             .map_err(|e| STTError::ConfigurationError(format!("Invalid MIME type: {e}")))?;
 
-        let mut form = Form::new()
-            .part("file", file_part)
-            .text("model", config.model.as_str().to_string())
-            .text(
-                "response_format",
-                config.response_format.as_str().to_string(),
-            );
+        let mut form = Form::new().part("file", file_part);
 
-        // Add optional parameters
-        if !config.base.language.is_empty() {
-            form = form.text("language", config.base.language.clone());
+        // All text form fields (model, response_format, language, temperature, prompt,
+        // timestamp_granularities[], stream, include[]=logprobs, chunking_strategy,
+        // known_speaker_names[], known_speaker_references[]) come from the single wire-surface
+        // builder so what is tested is exactly what is sent. See `transcription_text_fields`.
+        for (key, value) in config.transcription_text_fields() {
+            form = form.text(key, value);
         }
 
-        if let Some(temp) = config.temperature {
-            form = form.text("temperature", temp.to_string());
-        }
+        let api_url = config.try_api_url().map_err(STTError::ConfigurationError)?;
 
-        if let Some(ref prompt) = config.prompt {
-            form = form.text("prompt", prompt.clone());
-        }
+        let http_client = self.http_client.as_ref().ok_or_else(|| {
+            STTError::ConfigurationError(
+                "OpenAI STT default HTTP client is unavailable; construct with OpenAISTT::new or with_config".to_string(),
+            )
+        })?;
 
-        // Add timestamp granularities for verbose_json format
-        if config.response_format == ResponseFormat::VerboseJson
-            && !config.timestamp_granularities.is_empty()
-        {
-            for granularity in &config.timestamp_granularities {
-                form = form.text(
-                    "timestamp_granularities[]",
-                    granularity.as_str().to_string(),
-                );
-            }
-        }
+        // Consult the shared per-provider breaker before paying the upstream round-trip: an
+        // open breaker fails fast with a typed classified refusal (uniform with the WS fleet).
+        self.resilience.check()?;
 
         // Send request to OpenAI API
-        let response = self
-            .http_client
-            .post(config.api_url())
+        let response = http_client
+            .post(api_url)
             .header("Authorization", format!("Bearer {}", config.base.api_key))
             .multipart(form)
             .send()
             .await
-            .map_err(|e| STTError::NetworkError(format!("Request failed: {e}")))?;
+            .map_err(|e| {
+                self.resilience.record_send_error();
+                STTError::NetworkError(format!("Request failed: {e}"))
+            })?;
 
         // Check response status
         let status = response.status();
-        let response_text = response
-            .text()
-            .await
-            .map_err(|e| STTError::NetworkError(format!("Failed to read response: {e}")))?;
+        self.resilience.record_status(status);
 
         if !status.is_success() {
+            let response_text = response.text().await.unwrap_or_default();
             // Try to parse as OpenAI error
             let error_msg = if let Ok(error_response) =
                 serde_json::from_str::<OpenAIErrorResponse>(&response_text)
@@ -437,6 +473,22 @@ impl OpenAISTT {
 
             return Err(STTError::ProviderError(error_msg));
         }
+
+        // Streaming (gpt-4o-transcribe / -mini + interim_results): the body is an
+        // SSE stream of `transcript.text.delta` → `transcript.text.done`, NOT a
+        // single JSON doc. Parse it incrementally, emitting interim + final
+        // STTResults. whisper-1 silently ignores `stream`, so it stays on the
+        // batch path below.
+        if config.stream && config.model.as_str() != "whisper-1" {
+            self.process_streaming_transcription(response).await?;
+            self.audio_buffer.clear();
+            return Ok(());
+        }
+
+        let response_text = response
+            .text()
+            .await
+            .map_err(|e| STTError::NetworkError(format!("Failed to read response: {e}")))?;
 
         // Parse response based on format
         let transcription_result = self.parse_response(&response_text, config)?;
@@ -463,6 +515,75 @@ impl OpenAISTT {
         // Clear the buffer after successful transcription
         self.audio_buffer.clear();
 
+        Ok(())
+    }
+
+    /// Parse an SSE transcription stream (`stream=true` on gpt-4o-transcribe /
+    /// gpt-4o-mini-transcribe). `transcript.text.delta` events accumulate into
+    /// interim (non-final) results; `transcript.text.done` carries the full
+    /// final text. Wire shape live-confirmed against the real API.
+    async fn process_streaming_transcription(
+        &self,
+        response: reqwest::Response,
+    ) -> Result<(), STTError> {
+        use futures_util::StreamExt;
+        let mut stream = response.bytes_stream();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut accumulated = String::new();
+        let mut got_final = false;
+        while let Some(chunk) = stream.next().await {
+            let chunk =
+                chunk.map_err(|e| STTError::NetworkError(format!("stream read failed: {e}")))?;
+            buf.extend_from_slice(&chunk);
+            // Drain complete `\n`-terminated lines; SSE events are `data: {json}`.
+            while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+                let raw: Vec<u8> = buf.drain(..=nl).collect();
+                let line = String::from_utf8_lossy(&raw);
+                let line = line.trim();
+                let Some(data) = line.strip_prefix("data:") else {
+                    continue;
+                };
+                let data = data.trim();
+                if data == "[DONE]" {
+                    continue;
+                }
+                let Ok(ev) = serde_json::from_str::<serde_json::Value>(data) else {
+                    continue;
+                };
+                match ev.get("type").and_then(|t| t.as_str()) {
+                    Some("transcript.text.delta") => {
+                        if let Some(d) = ev.get("delta").and_then(|d| d.as_str()) {
+                            accumulated.push_str(d);
+                            if let Some(cb) = self.result_callback.lock().await.as_ref() {
+                                cb(STTResult::new(accumulated.clone(), false, false, 1.0)).await;
+                            }
+                        }
+                    }
+                    Some("transcript.text.done") => {
+                        let text = ev
+                            .get("text")
+                            .and_then(|t| t.as_str())
+                            .map(str::to_string)
+                            .unwrap_or_else(|| accumulated.clone());
+                        got_final = true;
+                        info!(
+                            "Streaming transcription complete: {} characters",
+                            text.len()
+                        );
+                        if let Some(cb) = self.result_callback.lock().await.as_ref() {
+                            cb(STTResult::new(text, true, true, 1.0)).await;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // Stream ended without an explicit done event → finalize what we have.
+        if !got_final && !accumulated.is_empty() {
+            if let Some(cb) = self.result_callback.lock().await.as_ref() {
+                cb(STTResult::new(accumulated, true, true, 1.0)).await;
+            }
+        }
         Ok(())
     }
 
@@ -642,7 +763,7 @@ impl Default for OpenAISTT {
     fn default() -> Self {
         Self {
             config: None,
-            http_client: Client::new(),
+            http_client: default_openai_stt_http_client(),
             audio_buffer: Vec::with_capacity(32 * 1024 * 30),
             connected: AtomicBool::new(false),
             result_callback: Arc::new(Mutex::new(None)),
@@ -651,6 +772,7 @@ impl Default for OpenAISTT {
             first_audio_time: None,
             silence_start_time: None,
             last_was_silent: false,
+            resilience: HttpBreaker::new("openai"),
         }
     }
 }
@@ -825,6 +947,13 @@ impl BaseSTT for OpenAISTT {
     /// Get provider information string.
     fn get_provider_info(&self) -> &'static str {
         "OpenAI Whisper STT"
+    }
+
+    /// W-D2: attach the shared per-provider circuit breaker so every OpenAI STT session trips
+    /// (and observes) the SAME breaker, uniform with the WS fleet. The REST transport consults
+    /// it before each upstream call and feeds it the unified HTTP status classification.
+    fn set_resilience(&mut self, resilience: crate::core::resilience::ResilienceHandles) {
+        self.resilience.set_handles(resilience);
     }
 }
 
@@ -1020,6 +1149,116 @@ mod tests {
         assert_eq!(stored_config.temperature, Some(0.2));
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn openai_stt_redirect_policy_rejects_private_hop() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local redirect test server");
+        let addr = listener.local_addr().expect("local addr");
+
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 8192];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 302 Found\r\n",
+                "Location: http://127.0.0.1:9/metadata\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n"
+            );
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await;
+        });
+
+        let config = OpenAISTTConfig {
+            base: STTConfig {
+                api_key: "test_key".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let stt = OpenAISTT::with_config(config).expect("construct OpenAI STT");
+        let err = stt
+            .http_client
+            .as_ref()
+            .expect("strict constructor builds an HTTP client")
+            .get(format!("http://{addr}/start"))
+            .send()
+            .await
+            .expect_err("private redirect target must be rejected");
+        let mut error_chain = err.to_string();
+        let mut source = std::error::Error::source(&err);
+        while let Some(error) = source {
+            error_chain.push_str(": ");
+            error_chain.push_str(&error.to_string());
+            source = error.source();
+        }
+        assert!(
+            error_chain.contains("redirect URL rejected"),
+            "unexpected OpenAI STT redirect error: {error_chain}"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_without_http_client_returns_typed_error_without_panic() {
+        let mut stt = OpenAISTT::default();
+        stt.http_client = None;
+        stt.config = Some(OpenAISTTConfig {
+            base: STTConfig {
+                api_key: "test_key".to_string(),
+                sample_rate: 16_000,
+                channels: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        stt.audio_buffer.extend_from_slice(&[0, 0, 1, 0]);
+
+        let err = stt
+            .flush_buffer()
+            .await
+            .expect_err("inert default client must fail with a typed error");
+
+        match err {
+            STTError::ConfigurationError(msg) => {
+                assert!(msg.contains("default HTTP client"), "{msg}");
+            }
+            other => panic!("expected ConfigurationError, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn flush_buffer_rejects_invalid_wav_geometry_without_panic() {
+        let mut stt = OpenAISTT::default();
+        stt.http_client = None;
+        stt.config = Some(OpenAISTTConfig {
+            base: STTConfig {
+                api_key: "test_key".to_string(),
+                sample_rate: u32::MAX,
+                channels: u16::MAX,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        stt.audio_buffer.extend_from_slice(&[0, 0, 1, 0]);
+
+        let err = stt
+            .flush_buffer()
+            .await
+            .expect_err("invalid WAV geometry must fail with a typed error");
+
+        match err {
+            STTError::AudioProcessingError(msg) => {
+                assert!(msg.contains("Invalid WAV parameters"), "{msg}");
+                assert!(msg.contains("WAV header arithmetic overflowed"), "{msg}");
+            }
+            other => panic!("expected AudioProcessingError, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_should_flush_on_threshold() {
         use super::super::config::FlushStrategy;
@@ -1073,5 +1312,200 @@ mod tests {
         // Even above threshold, OnDisconnect strategy should not flush
         stt.audio_buffer = vec![0u8; 5000];
         assert!(!stt.should_flush(None));
+    }
+
+    // =========================================================================
+    // Resilience-trio wiring (shared per-provider circuit breaker on the REST path)
+    // =========================================================================
+
+    /// Build an `OpenAISTT` against a local mock endpoint with the shared registry breaker
+    /// injected (the same `set_resilience` call the VoiceManager makes in production).
+    fn breaker_wired_stt(
+        endpoint: String,
+        reg: &crate::core::resilience::ResilienceRegistry,
+    ) -> OpenAISTT {
+        let config = OpenAISTTConfig {
+            base: STTConfig {
+                api_key: "test_key".to_string(),
+                ..Default::default()
+            },
+            endpoint_override: Some(endpoint),
+            ..Default::default()
+        };
+        let mut stt = OpenAISTT::with_config(config).expect("construct OpenAI STT");
+        stt.set_resilience(reg.handles_for("openai"));
+        stt
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    // The env-lock guard must span the mock round-trips: `try_api_url` re-reads
+    // WAAV_ALLOW_LOOPBACK_ENDPOINTS at flush time (same accepted pattern as the
+    // redirect-policy tests above, which also hold the guard across awaits).
+    #[allow(clippy::await_holding_lock)]
+    async fn breaker_records_failure_on_upstream_5xx() {
+        // Uniformity gate: a failed upstream round-trip must be recorded on the SAME shared
+        // per-provider breaker the registry hands the WS fleet.
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let previous = std::env::var_os("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1") };
+
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/v1/audio/transcriptions")
+            .with_status(500)
+            .with_body("upstream exploded")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let reg = crate::core::resilience::ResilienceRegistry::new(4);
+        let mut stt = breaker_wired_stt(server.url(), &reg);
+        // The injected breaker IS the registry's shared per-provider breaker.
+        assert!(
+            Arc::ptr_eq(
+                stt.resilience_breaker().expect("breaker injected"),
+                &reg.breaker_for("openai")
+            ),
+            "provider must feed the registry's shared breaker"
+        );
+
+        stt.connect().await.expect("connect");
+        stt.send_audio(Bytes::from(vec![0u8; 3200]))
+            .await
+            .expect("send_audio buffers");
+        let err = stt.flush().await.expect_err("5xx must surface an error");
+        assert!(matches!(err, STTError::ProviderError(_)), "{err:?}");
+
+        let snap = stt.resilience_breaker().unwrap().snapshot();
+        assert_eq!(snap.failures, 1, "the 5xx must be recorded as ONE failure");
+        assert_eq!(snap.successes, 0);
+        mock.assert_async().await;
+
+        // SAFETY: restore the process env before releasing the test env lock.
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", previous);
+            } else {
+                std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    // The env-lock guard must span the mock round-trips: `try_api_url` re-reads
+    // WAAV_ALLOW_LOOPBACK_ENDPOINTS at flush time (same accepted pattern as the
+    // redirect-policy tests above, which also hold the guard across awaits).
+    #[allow(clippy::await_holding_lock)]
+    async fn open_breaker_fails_fast_with_typed_refusal_without_contacting_upstream() {
+        // Failover gate: with the shared breaker OPEN (e.g. tripped by other sessions), the
+        // REST path must refuse with a typed classified error BEFORE paying the upstream
+        // round-trip — the mock asserts ZERO hits.
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let previous = std::env::var_os("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1") };
+
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/v1/audio/transcriptions")
+            .with_status(200)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let reg = crate::core::resilience::ResilienceRegistry::new(4);
+        let mut stt = breaker_wired_stt(server.url(), &reg);
+
+        // Another "session" of the same provider trips the shared breaker.
+        let shared = reg.breaker_for("openai");
+        for _ in 0..10 {
+            shared.record_failure();
+        }
+        assert_eq!(shared.state(), crate::core::resilience::CircuitState::Open);
+
+        stt.connect().await.expect("connect");
+        stt.send_audio(Bytes::from(vec![0u8; 3200]))
+            .await
+            .expect("send_audio buffers");
+        let err = stt
+            .flush()
+            .await
+            .expect_err("open breaker must refuse the flush");
+        match err {
+            STTError::ConnectionFailed(msg) => {
+                assert!(msg.contains("circuit breaker"), "{msg}");
+                assert!(msg.contains("openai"), "{msg}");
+            }
+            other => panic!("expected typed ConnectionFailed refusal, got {other:?}"),
+        }
+        mock.assert_async().await; // zero upstream hits
+
+        // SAFETY: restore the process env before releasing the test env lock.
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", previous);
+            } else {
+                std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    // The env-lock guard must span the mock round-trips: `try_api_url` re-reads
+    // WAAV_ALLOW_LOOPBACK_ENDPOINTS at flush time (same accepted pattern as the
+    // redirect-policy tests above, which also hold the guard across awaits).
+    #[allow(clippy::await_holding_lock)]
+    async fn three_upstream_401s_arm_the_credentials_fatal_state() {
+        // Classification gate: auth rejections flow through the provider path into the D-G2
+        // credentials-fatal detector, exactly like three sub-stable server-side WS closes.
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let previous = std::env::var_os("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1") };
+
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/v1/audio/transcriptions")
+            .with_status(401)
+            .with_body(r#"{"error":{"message":"bad key","type":"invalid_request_error"}}"#)
+            .expect(3)
+            .create_async()
+            .await;
+
+        let reg = crate::core::resilience::ResilienceRegistry::new(4);
+        let mut stt = breaker_wired_stt(server.url(), &reg);
+        stt.connect().await.expect("connect");
+
+        for _ in 0..3 {
+            // The buffer is intentionally NOT cleared on failure, so each flush retries the
+            // same audio against the 401 endpoint.
+            stt.send_audio(Bytes::from(vec![0u8; 1600]))
+                .await
+                .expect("send_audio buffers");
+            let _ = stt.flush().await.expect_err("401 must surface an error");
+            stt.audio_buffer.clear();
+        }
+
+        assert!(
+            stt.resilience_breaker().unwrap().is_permanently_failed(),
+            "3 consecutive 401s must arm the (recoverable) credentials-FATAL state"
+        );
+        mock.assert_async().await;
+
+        // SAFETY: restore the process env before releasing the test env lock.
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", previous);
+            } else {
+                std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+            }
+        }
     }
 }

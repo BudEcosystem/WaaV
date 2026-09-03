@@ -49,6 +49,18 @@ fn extract_token(request: &Request) -> Result<String, AuthError> {
     Err(AuthError::MissingAuthHeader)
 }
 
+fn parse_auth_request_body(body_bytes: &[u8]) -> Result<serde_json::Value, AuthError> {
+    if body_bytes.is_empty() {
+        Ok(serde_json::json!({}))
+    } else {
+        serde_json::from_slice(body_bytes).map_err(|err| {
+            AuthError::InvalidRequestBody(format!(
+                "request body must be valid JSON for auth validation: {err}"
+            ))
+        })
+    }
+}
+
 /// Authentication middleware that validates bearer tokens
 ///
 /// This middleware supports two authentication modes:
@@ -162,12 +174,10 @@ pub async fn auth_middleware(
             .map_err(|e| AuthError::ConfigError(format!("Failed to read request body: {e}")))?
             .to_bytes();
 
-        // Parse the body as JSON (if it fails, use empty object)
-        let request_body: serde_json::Value = if body_bytes.is_empty() {
-            serde_json::json!({})
-        } else {
-            serde_json::from_slice(&body_bytes).unwrap_or_else(|_| serde_json::json!({}))
-        };
+        // Parse the body as JSON. Empty bodies are represented as an empty object, but malformed
+        // non-empty bodies fail closed so the auth service and downstream handler cannot disagree
+        // about request semantics.
+        let request_body = parse_auth_request_body(&body_bytes)?;
 
         // Validate the token with the auth service
         match auth_client
@@ -237,6 +247,30 @@ mod tests {
 
         let auth_header = request.headers().get("authorization").unwrap();
         assert_eq!(auth_header, "Bearer test-token");
+    }
+
+    #[test]
+    fn parse_auth_request_body_empty_is_empty_json_object() {
+        let parsed = parse_auth_request_body(b"").unwrap();
+        assert_eq!(parsed, serde_json::json!({}));
+    }
+
+    #[test]
+    fn parse_auth_request_body_valid_json_preserved() {
+        let parsed = parse_auth_request_body(br#"{"text":"Hello","metadata":{"x":1}}"#).unwrap();
+        assert_eq!(
+            parsed,
+            serde_json::json!({"text": "Hello", "metadata": {"x": 1}})
+        );
+    }
+
+    #[test]
+    fn parse_auth_request_body_malformed_json_fails_closed() {
+        let err = parse_auth_request_body(br#"{"text":"unterminated""#).unwrap_err();
+
+        assert!(matches!(err, AuthError::InvalidRequestBody(_)));
+        assert_eq!(err.status_code(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(err.error_code(), "invalid_request_body");
     }
 
     // Note: Full middleware tests are in tests/auth_integration_test.rs

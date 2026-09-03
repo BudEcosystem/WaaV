@@ -34,6 +34,7 @@ from .types import (
     STTProvider,
     TTSProvider,
     RealtimeProvider,
+    CANONICAL_LANGUAGES,
     STT_PROVIDER_CAPABILITIES,
     TTS_PROVIDER_CAPABILITIES,
     REALTIME_PROVIDER_CAPABILITIES,
@@ -41,9 +42,11 @@ from .types import (
     is_valid_tts_provider,
     is_valid_realtime_provider,
     get_provider_capabilities,
+    language_capabilities,
     # Configuration types
     STTConfig,
     TTSConfig,
+    TranslationConfig,
     LiveKitConfig,
     FeatureFlags,
     STTResult,
@@ -51,6 +54,7 @@ from .types import (
     AudioEvent,
     Voice,
     WordInfo,
+    Translation,
     PercentileStats,
     STTMetrics,
     TTSMetrics,
@@ -67,6 +71,16 @@ from .types import (
     EmotionIntensityLevel,
     EmotionConfig,
     intensity_to_number,
+    # Voice descriptor (abstract voice selection, resolved server-side; P4)
+    VoiceDescriptor,
+    VoiceGender,
+    VoiceAge,
+    # Conversation / agent-loop types (built-in LLM loop + reasoning)
+    ConversationConfig,
+    ReasoningEffort,
+    LatencyFiller,
+    RoutingMode,
+    MuteStrategy,
     # DAG routing types
     DAGNodeType,
     OutputDestination,
@@ -110,6 +124,7 @@ from .types import (
     REALTIME_DEFAULTS,
     # Voice cloning types
     VoiceCloneProvider,
+    CloneMode,
     VoiceCloneRequest,
     VoiceCloneStatus,
     VoiceCloneResponse,
@@ -123,13 +138,17 @@ from .errors import (
     ConnectionError,
     TimeoutError,
     ReconnectError,
+    FatalConnectionError,
+    ProtocolVersionError,
     APIError,
+    RateLimitError,
     STTError,
     TranscriptionError,
     TTSError,
     SynthesisError,
     ConfigurationError,
 )
+from .config_mirror import ADAPTER_KINDS, SDK_CONFIG_REACH
 from .pipelines import (
     BudSTT,
     STTSession,
@@ -138,6 +157,7 @@ from .pipelines import (
     BudTalk,
     TalkSession,
     TalkEvent,
+    ConfigWarning,
     BudTranscribe,
     TranscribeSession,
     # Realtime pipeline
@@ -151,8 +171,21 @@ from .pipelines import (
     RealtimeAudioEvent,
     EmotionEvent,
     StateChangeEvent,
+    # Gateway-native realtime (provider-agnostic /realtime — all 12 providers)
+    GatewayRealtime,
+    GatewayRealtimeConfig,
+    GatewayTurnDetection,
+    RealtimeTool,
+    RealtimeEvent,
+    SpeechEvent,
+    ErrorEvent,
+    SessionCreatedEvent,
+    ResponseEvent,
+    REALTIME_PROVIDERS,
+    get_supported_realtime_providers,
 )
 from .rest import RestClient
+from .voices import VoicesAPI, CloneResult
 from .ws import WebSocketSession, SessionMetrics, ReconnectConfig, MessageQueue, QueueConfig, QueueStats
 from .audio import AudioProcessor, VADConfig as AudioVADConfig, VADFrame, VADState, VoiceActivityDetector
 from .metrics.slo import SLOTracker, SLODefinition, SLOViolation, SLOComparison
@@ -165,6 +198,7 @@ __all__ = [
     "STTProvider",
     "TTSProvider",
     "RealtimeProvider",
+    "CANONICAL_LANGUAGES",
     "STT_PROVIDER_CAPABILITIES",
     "TTS_PROVIDER_CAPABILITIES",
     "REALTIME_PROVIDER_CAPABILITIES",
@@ -172,9 +206,11 @@ __all__ = [
     "is_valid_tts_provider",
     "is_valid_realtime_provider",
     "get_provider_capabilities",
+    "language_capabilities",
     # Configuration types
     "STTConfig",
     "TTSConfig",
+    "TranslationConfig",
     "LiveKitConfig",
     "FeatureFlags",
     # Emotion types (Unified Emotion System)
@@ -183,6 +219,16 @@ __all__ = [
     "EmotionIntensityLevel",
     "EmotionConfig",
     "intensity_to_number",
+    # Voice descriptor (abstract voice selection, resolved server-side; P4)
+    "VoiceDescriptor",
+    "VoiceGender",
+    "VoiceAge",
+    # Conversation / agent-loop types (built-in LLM loop + reasoning)
+    "ConversationConfig",
+    "ReasoningEffort",
+    "LatencyFiller",
+    "RoutingMode",
+    "MuteStrategy",
     # DAG routing types
     "DAGNodeType",
     "OutputDestination",
@@ -224,11 +270,14 @@ __all__ = [
     "RealtimeAudioChunk",
     "VOICE_DEFAULTS",
     "REALTIME_DEFAULTS",
-    # Voice cloning types
+    # Voice cloning types + helpers
     "VoiceCloneProvider",
+    "CloneMode",
     "VoiceCloneRequest",
     "VoiceCloneStatus",
     "VoiceCloneResponse",
+    "VoicesAPI",
+    "CloneResult",
     # Hume EVI types
     "HumeEVIVersion",
     "HumeEVIConfig",
@@ -239,6 +288,7 @@ __all__ = [
     "AudioEvent",
     "Voice",
     "WordInfo",
+    "Translation",
     # Metrics types
     "PercentileStats",
     "STTMetrics",
@@ -258,7 +308,10 @@ __all__ = [
     "ConnectionError",
     "TimeoutError",
     "ReconnectError",
+    "FatalConnectionError",
+    "ProtocolVersionError",
     "APIError",
+    "RateLimitError",
     "STTError",
     "TranscriptionError",
     "TTSError",
@@ -272,8 +325,12 @@ __all__ = [
     "BudTalk",
     "TalkSession",
     "TalkEvent",
+    "ConfigWarning",
     "BudTranscribe",
     "TranscribeSession",
+    # Drift-guarded config mirror surface
+    "SDK_CONFIG_REACH",
+    "ADAPTER_KINDS",
     # Realtime pipeline
     "BudRealtime",
     "RealtimeSession",
@@ -285,6 +342,18 @@ __all__ = [
     "RealtimeAudioEvent",
     "EmotionEvent",
     "StateChangeEvent",
+    # Gateway-native realtime (provider-agnostic /realtime — all 12 providers)
+    "GatewayRealtime",
+    "GatewayRealtimeConfig",
+    "GatewayTurnDetection",
+    "RealtimeTool",
+    "RealtimeEvent",
+    "SpeechEvent",
+    "ErrorEvent",
+    "SessionCreatedEvent",
+    "ResponseEvent",
+    "REALTIME_PROVIDERS",
+    "get_supported_realtime_providers",
     # Utility classes
     "RestClient",
     "WebSocketSession",

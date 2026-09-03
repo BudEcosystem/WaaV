@@ -7,6 +7,7 @@ import { StateMachine } from './state';
 import { WidgetWebSocket } from './websocket';
 import { AudioRecorder } from './audio/recorder';
 import { AudioPlayer } from './audio/player';
+import { JitterBuffer } from './audio/jitter-buffer';
 import { widgetStyles } from './ui/styles';
 import { getIcon } from './ui/icons';
 import type { WidgetConfig, WidgetState, TranscriptResult, WidgetMetrics, WidgetEventMap } from './types';
@@ -17,6 +18,15 @@ export class BudWidget extends HTMLElement {
   private ws: WidgetWebSocket | null = null;
   private recorder: AudioRecorder | null = null;
   private player: AudioPlayer | null = null;
+  /**
+   * D9 adaptive jitter buffer between the websocket `onAudio` callback and the
+   * player. Default-on but self-bypasses on a clean network (zero added latency);
+   * only re-times delivery once it MEASURES arrival jitter. Never resamples (the
+   * gateway's client_playback_rate is the only resample stage).
+   */
+  private jitterBuffer: JitterBuffer | null = null;
+  /** D6 prewarm: an AudioContext warmed at page-load and adopted by the player. */
+  private prewarmedContext: AudioContext | null = null;
   private shadow: ShadowRoot;
   private button: HTMLButtonElement | null = null;
   private panel: HTMLDivElement | null = null;
@@ -67,6 +77,24 @@ export class BudWidget extends HTMLElement {
       'data-stt-provider',
       'data-tts-provider',
       'data-tts-voice',
+      // P4 abstract voice selection: `data-voice-*` is resolved to a concrete
+      // provider voice_id server-side, so re-parse when any descriptor changes.
+      'data-voice-gender',
+      'data-voice-locale',
+      'data-voice-accent',
+      'data-voice-age',
+      'data-voice-style',
+      'data-voice-name-hint',
+      // P5 in-stream translation (canonical BCP-47 targets, comma-separated).
+      'data-translate-target',
+      'data-translate-to-english',
+      // Flagship one-tag conversation loop: re-parse when the LLM target changes
+      // so a talking bot can be configured declaratively after mount.
+      'data-llm-base-url',
+      'data-llm-model',
+      // P3 proxy/alias: `<bud-widget data-alias="support-bot">` is a complete
+      // agent resolved + re-pointable server-side.
+      'data-alias',
     ];
   }
 
@@ -271,6 +299,19 @@ export class BudWidget extends HTMLElement {
             this.state.transition('listening');
           }
         },
+        onConfigWarning: (warning) => {
+          // Surface the gateway advisory as a typed, non-fatal event. A
+          // developer can listen for 'configWarning' to learn that a config key
+          // was ignored (typo / wrong nesting) or a feature no-ops — instead of
+          // debugging a silent no-op. Does NOT change widget state.
+          this.dispatchEvent(
+            new CustomEvent('configWarning', {
+              detail: warning,
+              bubbles: true,
+              composed: true,
+            })
+          );
+        },
         onError: (error) => {
           this.handleError(error);
         },
@@ -284,13 +325,84 @@ export class BudWidget extends HTMLElement {
 
       await this.ws.connect();
 
-      // Initialize audio player
-      this.player = new AudioPlayer({
-        sampleRate: this.config.tts?.sampleRate || 24000,
-      });
+      // Initialize audio player. If prewarm() warmed an AudioContext, hand it to
+      // the player so the first chunk plays without a cold context-create stall.
+      const sinkRate = this.config.tts?.sampleRate || 24000;
+      this.player = new AudioPlayer({ sampleRate: sinkRate });
+      if (this.prewarmedContext) {
+        this.player.adoptContext(this.prewarmedContext);
+        this.prewarmedContext = null;
+      }
       await this.player.initialize();
+
+      // D9: build the adaptive jitter buffer feeding the (D2 scheduled) player.
+      // It re-times arrival into player.play() ONLY when it measures network
+      // jitter; on a clean link it passes chunks straight through (0ms added).
+      // It never resamples — the gateway already resampled to client_playback_rate.
+      // Downlink TTS PCM is mono linear16 (the gateway emits single-channel), so
+      // the depth<->ms accounting uses 1 channel.
+      this.jitterBuffer = new JitterBuffer(sinkRate, 1, (data) => {
+        if (this.player) this.player.play(data);
+      });
     } catch (error) {
       this.handleError(error as Error);
+    }
+  }
+
+  /**
+   * D6 connect-time prewarm: warm the expensive bits BEFORE the first user gesture
+   * so the perceived connect is faster. Safe to call at page-load and idempotent.
+   *
+   *  - Warms an AudioContext (the first one is otherwise created on the user
+   *    gesture, adding a cold-start stall before the first TTS chunk). It is left
+   *    suspended (autoplay policy) and resume()d on the real gesture; the player
+   *    adopts it on connect().
+   *  - Fires a best-effort HEAD to the gateway ORIGIN to prime DNS + TLS so the
+   *    later WS upgrade skips the cold handshake (LiveKit prepareConnection). Any
+   *    failure is swallowed — prewarm must never throw or block.
+   *
+   * The heavy connect cost (server-side PROVIDER_READY) is unavoidable here, but
+   * this removes the client-side DNS/TLS + AudioContext cold-start from the
+   * critical path.
+   */
+  async prewarm(): Promise<void> {
+    // 1) Warm an AudioContext (suspended until the user gesture resumes it).
+    try {
+      if (!this.prewarmedContext && typeof AudioContext !== 'undefined') {
+        this.prewarmedContext = new AudioContext({
+          sampleRate: this.config.tts?.sampleRate || 24000,
+        });
+      }
+    } catch (e) {
+      // AudioContext unavailable (e.g. SSR/test host) — ignore.
+    }
+
+    // 2) Prime DNS + TLS to the gateway origin with a best-effort HEAD.
+    try {
+      const httpOrigin = this.gatewayHttpOrigin();
+      if (httpOrigin && typeof fetch === 'function') {
+        // no-cors + keepalive: we don't read the response, we only want the
+        // connection warmed. Never await-throws into the caller.
+        await fetch(httpOrigin, { method: 'HEAD', mode: 'no-cors', keepalive: true }).catch(
+          () => {}
+        );
+      }
+    } catch (e) {
+      // Network/permission error — prewarm is best-effort, swallow.
+    }
+  }
+
+  /**
+   * Map the `ws(s)://host/path` gateway URL to its `http(s)://host` origin for the
+   * prewarm HEAD. Returns null if the URL can't be parsed.
+   */
+  private gatewayHttpOrigin(): string | null {
+    try {
+      const u = new URL(this.config.gatewayUrl);
+      const httpProto = u.protocol === 'wss:' ? 'https:' : u.protocol === 'ws:' ? 'http:' : u.protocol;
+      return `${httpProto}//${u.host}`;
+    } catch (e) {
+      return null;
     }
   }
 
@@ -300,6 +412,13 @@ export class BudWidget extends HTMLElement {
     if (this.ws) {
       this.ws.disconnect();
       this.ws = null;
+    }
+
+    // D9: tear down the jitter buffer (stops its release timer) BEFORE the player
+    // so no residual chunk is handed to a closing player.
+    if (this.jitterBuffer) {
+      this.jitterBuffer.close();
+      this.jitterBuffer = null;
     }
 
     if (this.player) {
@@ -315,6 +434,9 @@ export class BudWidget extends HTMLElement {
     if (!this.state.is('connected')) return;
 
     try {
+      // D10: AEC/NS/AGC default true (the recorder defaults them on); the widget
+      // FeatureFlags can override echoCancellation / noiseCancellation. AGC stays
+      // on by default (no flag yet) since it improves quiet-talker capture.
       this.recorder = new AudioRecorder({
         sampleRate: this.config.stt?.sampleRate || 16000,
         echoCancellation: this.config.features?.echoCancellation,
@@ -330,6 +452,18 @@ export class BudWidget extends HTMLElement {
       this.recorder.onSilence(() => {
         // In VAD mode, don't stop on silence
         // The server will handle end of speech detection
+      });
+
+      // D10: surface a likely-muted/dead mic as a typed event so the app can
+      // prompt the user (the call would otherwise just be silent dead-air).
+      this.recorder.onMicSilence(() => {
+        this.dispatchEvent(
+          new CustomEvent('micSilence', {
+            detail: { message: 'No microphone input detected — the mic may be muted.' },
+            bubbles: true,
+            composed: true,
+          })
+        );
       });
 
       await this.recorder.start();
@@ -380,7 +514,14 @@ export class BudWidget extends HTMLElement {
         this.state.transition('speaking');
       }
 
-      this.player.play(audio);
+      // D9: route through the adaptive jitter buffer (which calls player.play()).
+      // On a clean link it forwards immediately; under jitter it re-times delivery
+      // so the scheduled player doesn't underrun on bursty arrivals.
+      if (this.jitterBuffer) {
+        this.jitterBuffer.push(audio);
+      } else {
+        this.player.play(audio);
+      }
     }
 
     this.dispatchEvent(
@@ -548,6 +689,12 @@ export class BudWidget extends HTMLElement {
   clear(): void {
     if (this.ws) {
       this.ws.clear();
+    }
+    // D9: drop any jitter-buffered chunks WITHOUT forwarding them (reset, not
+    // flush) — the player is being stopped, so flushing would re-queue audio the
+    // user just barged over. Reset BEFORE player.stop() so no held chunk races in.
+    if (this.jitterBuffer) {
+      this.jitterBuffer.reset();
     }
     if (this.player) {
       this.player.stop();

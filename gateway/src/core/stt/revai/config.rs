@@ -11,6 +11,17 @@ use super::{
     MIN_CHANNELS, MIN_SAMPLE_RATE, REVAI_STREAM_URL,
 };
 
+fn validate_revai_stt_endpoint(source: &str, endpoint: &str) -> Result<(), STTError> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+
+    crate::core::net::validate_url_for_ssrf(endpoint, &["ws", "wss"]).map_err(|e| {
+        STTError::ConfigurationError(format!("{source} rejected (SSRF protection): {e}"))
+    })
+}
+
 // =============================================================================
 // Sample Format
 // =============================================================================
@@ -206,6 +217,24 @@ pub struct RevAISTTConfig {
     /// Skip text post-processing/normalization
     #[serde(default)]
     pub skip_postprocessing: bool,
+
+    /// Optimization mode for the streaming session: `speed` (default) or `accuracy`
+    /// (Rev AI streaming query param `priority`; see docs/providers/rev_ai.md). Carried via the
+    /// standardized `extras` passthrough since it has no canonical typed feature.
+    #[serde(default)]
+    pub priority: Option<String>,
+
+    /// Maximum time (seconds, 60-600) Rev AI will hold the connection open waiting for the next
+    /// audio chunk before closing (Rev AI streaming query param `max_connection_wait_seconds`;
+    /// see docs/providers/rev_ai.md). Carried via the standardized `extras` passthrough.
+    #[serde(default)]
+    pub max_connection_wait_seconds: Option<u32>,
+
+    /// Carried from the standardized `endpoint_override` — points the dial at the in-repo mock/proxy
+    /// (a local `ws://` server) for credential-free end-to-end integration tests; `None` uses the
+    /// production Rev AI endpoint.
+    #[serde(default)]
+    pub endpoint_override: Option<String>,
 }
 
 fn default_language() -> String {
@@ -240,6 +269,9 @@ impl Default for RevAISTTConfig {
             max_segment_duration_seconds: None,
             enable_speaker_switch: false,
             skip_postprocessing: false,
+            priority: None,
+            max_connection_wait_seconds: None,
+            endpoint_override: None,
         }
     }
 }
@@ -362,6 +394,10 @@ impl RevAISTTConfig {
             ));
         }
 
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_revai_stt_endpoint("endpoint_override", endpoint)?;
+        }
+
         Ok(())
     }
 
@@ -382,9 +418,22 @@ impl RevAISTTConfig {
         let encode =
             |s: &str| -> String { form_urlencoded::byte_serialize(s.as_bytes()).collect() };
 
+        // Base endpoint: honor an `endpoint_override` (the in-repo mock/proxy points this at a local
+        // ws:// server) for credential-free integration; otherwise the production Rev AI endpoint.
+        // The override carries only `scheme://host[:port]`, so the Rev AI stream path is re-appended
+        // (a path-less URL would fail the WS handshake), mirroring the Cartesia override handling.
+        let base = match self
+            .endpoint_override
+            .as_deref()
+            .map(str::trim)
+            .filter(|o| !o.is_empty())
+        {
+            Some(o) => format!("{}/speechtotext/v1/stream", o.trim_end_matches('/')),
+            None => REVAI_STREAM_URL.to_string(),
+        };
         let mut url = format!(
             "{}?access_token={}&content_type={}",
-            REVAI_STREAM_URL,
+            base,
             encode(&self.api_key),
             encode(&self.build_content_type())
         );
@@ -437,6 +486,15 @@ impl RevAISTTConfig {
             url.push_str("&skip_postprocessing=true");
         }
 
+        // Provider-extras passthrough params (Rev AI streaming query params; docs/providers/rev_ai.md).
+        if let Some(ref priority) = self.priority {
+            url.push_str(&format!("&priority={}", encode(priority)));
+        }
+
+        if let Some(wait) = self.max_connection_wait_seconds {
+            url.push_str(&format!("&max_connection_wait_seconds={}", wait));
+        }
+
         url
     }
 
@@ -445,17 +503,70 @@ impl RevAISTTConfig {
         let sample_format =
             RevAISampleFormat::from_str(&config.encoding).unwrap_or(RevAISampleFormat::S16LE);
 
+        // Honor an explicitly configured model (Rev AI calls it the "transcriber":
+        // machine / machine_v2 / human); otherwise use the default. Previously `config.model` was
+        // dropped, so the configured transcriber was silently ignored.
+        let transcriber = match config.model.as_str() {
+            "machine" => RevAITranscriber::Machine,
+            "machine_v2" => RevAITranscriber::MachineV2,
+            "human" => RevAITranscriber::Human,
+            _ => RevAITranscriber::default(),
+        };
+
         let revai_config = Self {
             api_key: config.api_key.clone(),
             language: config.language.clone(),
             sample_rate: config.sample_rate,
             channels: config.channels as u8,
             sample_format,
+            transcriber,
             ..Default::default()
         };
 
         revai_config.validate()?;
         Ok(revai_config)
+    }
+
+    /// Build from the standardized config (W1 keystone). Rev AI exposes a narrow boolean surface,
+    /// so this maps the features it can actually express: diarization (`enable_speaker_switch`,
+    /// which requires the `machine_v2` transcriber), profanity filtering (`filter_profanity`), and
+    /// filler words (`remove_disfluencies`, whose sense is inverted — keeping fillers means *not*
+    /// removing disfluencies). Features Rev AI can't express (word_timestamps, smart_format,
+    /// interim_results, vad/endpointing, keyterms, redaction, entity/language detection) are
+    /// capability gaps and stay at their defaults.
+    pub fn from_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(&std.base)?;
+        if let Some(d) = f.diarization {
+            cfg.enable_speaker_switch = d;
+            if d {
+                cfg.transcriber = RevAITranscriber::MachineV2;
+            }
+        }
+        if let Some(p) = f.profanity_filter {
+            cfg.filter_profanity = p;
+        }
+        if let Some(filler) = f.filler_words {
+            cfg.remove_disfluencies = !filler;
+        }
+        // Provider extras → Rev AI streaming query params not modeled by the typed vocabulary
+        // (docs/providers/rev_ai.md): `priority` (speed/accuracy) and `max_connection_wait_seconds`
+        // (60-600). String keys are forwarded verbatim onto the WebSocket URL.
+        let e = &std.extras.0;
+        if let Some(p) = e.get("priority").and_then(|v| v.as_str()) {
+            cfg.priority = Some(p.to_string());
+        }
+        if let Some(w) = e
+            .get("max_connection_wait_seconds")
+            .and_then(|v| v.as_u64())
+        {
+            cfg.max_connection_wait_seconds = Some(w as u32);
+        }
+        // Standardized endpoint override (mock/proxy host) for credential-free integration tests.
+        cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
+        Ok(cfg)
     }
 }
 
@@ -485,6 +596,68 @@ impl From<RevAISTTConfig> for STTConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone: maps the standardized features Rev AI can express (diarization +
+    // profanity filter) onto its own config fields.
+    #[test]
+    fn from_standard_maps_features() {
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "revai".into(),
+                api_key: "test-key".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                diarization: Some(true),
+                profanity_filter: Some(true),
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+            translation: None,
+        };
+        let cfg = RevAISTTConfig::from_standard(&std).unwrap();
+        assert!(cfg.enable_speaker_switch); // diarization
+        assert_eq!(cfg.transcriber, RevAITranscriber::MachineV2); // required by speaker switch
+        assert!(cfg.filter_profanity); // profanity_filter
+    }
+
+    // WIRE-LEVEL: the `priority` and `max_connection_wait_seconds` extras must travel from the
+    // standardized `extras` passthrough all the way onto the streaming WebSocket URL — not merely
+    // land on the config struct. Asserts the actual query string `build_websocket_url` produces
+    // (the bytes that hit the wire), guarding the recurring "set on the struct but never emitted"
+    // gap class.
+    #[test]
+    fn priority_and_max_connection_wait_reach_websocket_url() {
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig};
+        let mut extras = serde_json::Map::new();
+        extras.insert("priority".into(), serde_json::json!("accuracy"));
+        extras.insert("max_connection_wait_seconds".into(), serde_json::json!(120));
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "revai".into(),
+                api_key: "test-key".into(),
+                ..Default::default()
+            },
+            features: Default::default(),
+            extras: ProviderExtras(extras),
+            translation: None,
+        };
+        let cfg = RevAISTTConfig::from_standard(&std).unwrap();
+        // mapped onto the config struct...
+        assert_eq!(cfg.priority.as_deref(), Some("accuracy"));
+        assert_eq!(cfg.max_connection_wait_seconds, Some(120));
+        // ...AND emitted on the wire (the URL the WebSocket actually connects to).
+        let url = cfg.build_websocket_url();
+        assert!(
+            url.contains("priority=accuracy"),
+            "priority must reach the WS URL; got: {url}"
+        );
+        assert!(
+            url.contains("max_connection_wait_seconds=120"),
+            "max_connection_wait_seconds must reach the WS URL; got: {url}"
+        );
+    }
 
     #[test]
     fn test_sample_format_as_str() {
@@ -531,6 +704,27 @@ mod tests {
         assert_eq!(RevAITranscriber::Machine.as_str(), "machine");
         assert_eq!(RevAITranscriber::MachineV2.as_str(), "machine_v2");
         assert_eq!(RevAITranscriber::Human.as_str(), "human");
+    }
+
+    #[test]
+    fn test_from_base_honors_transcriber_model() {
+        // The configured model selects Rev AI's transcriber; previously `config.model` was dropped.
+        let base = STTConfig {
+            api_key: "k".to_string(),
+            model: "machine_v2".to_string(),
+            ..Default::default()
+        };
+        let cfg = RevAISTTConfig::from_base(&base).unwrap();
+        assert_eq!(cfg.transcriber, RevAITranscriber::MachineV2);
+
+        // An unrecognized model falls back to the default transcriber rather than erroring.
+        let base2 = STTConfig {
+            api_key: "k".to_string(),
+            model: "nova-3".to_string(),
+            ..Default::default()
+        };
+        let cfg2 = RevAISTTConfig::from_base(&base2).unwrap();
+        assert_eq!(cfg2.transcriber, RevAITranscriber::default());
     }
 
     #[test]
@@ -624,6 +818,52 @@ mod tests {
     }
 
     #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let previous = std::env::var_os("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
+
+        let mut config = RevAISTTConfig {
+            endpoint_override: Some("wss://revai-proxy.example.com".to_string()),
+            ..RevAISTTConfig::new("test-key")
+        };
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("ws://revai-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("ws://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.to_string().contains("SSRF protection"), "{err}");
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("non-WebSocket endpoint_override must be rejected");
+        assert!(err.to_string().contains("not allowed"), "{err}");
+
+        config.endpoint_override = Some("https://revai-proxy.example.com".to_string());
+        let err = config
+            .validate()
+            .expect_err("HTTP endpoint_override must be rejected for Rev AI WebSocket dial");
+        assert!(err.to_string().contains("not allowed"), "{err}");
+
+        // SAFETY: restore the process env before releasing the test env lock.
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", previous);
+            } else {
+                std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+            }
+        }
+    }
+
+    #[test]
     fn test_build_content_type() {
         let config = RevAISTTConfig::new("test-key")
             .with_sample_rate(16000)
@@ -672,6 +912,21 @@ mod tests {
 
         let url = config.build_websocket_url();
         assert!(url.contains("custom_vocabulary_id=vocab-123"));
+    }
+
+    #[test]
+    fn test_build_websocket_url_trims_endpoint_override() {
+        let config = RevAISTTConfig {
+            endpoint_override: Some(" wss://revai-proxy.example.com/ ".to_string()),
+            ..RevAISTTConfig::new("test-key")
+        };
+
+        let url = config.build_websocket_url();
+        assert!(url.starts_with("wss://revai-proxy.example.com/speechtotext/v1/stream?"));
+        assert!(
+            !url.contains("example.com//speechtotext"),
+            "endpoint_override slash should be normalized: {url}"
+        );
     }
 
     #[test]

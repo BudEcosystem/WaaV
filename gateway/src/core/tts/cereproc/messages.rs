@@ -52,6 +52,16 @@ impl SpeakResponse {
         self.result_code == "1"
     }
 
+    /// Format the vendor result fields for error messages.
+    pub fn status_message(&self) -> String {
+        let description = self.result_description.trim();
+        if description.is_empty() {
+            format!("resultCode={}", self.result_code)
+        } else {
+            format!("resultCode={}, {}", self.result_code, description)
+        }
+    }
+
     /// Get the number of characters used as an integer
     pub fn chars_used(&self) -> u64 {
         self.char_count.parse().unwrap_or(0)

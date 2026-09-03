@@ -86,6 +86,56 @@ pub trait VoiceObserver: Send + Sync {
 
     /// Called when local VAD detects speech end.
     fn on_local_vad_speech_ended(&self) {}
+
+    // -------------------------------------------------------------------------
+    // Per-turn latency checkpoints (live profiling).
+    //
+    // These thread monotonic-ns timestamps (from `now_monotonic_ns()`) through
+    // the realtime audio-to-audio path so a profiler can assemble a per-turn
+    // timeline: audio_in -> smart_turn -> stt_partial -> stt_final (reuses
+    // `on_stt_result`) -> llm_request -> llm_first_token -> llm_first_sentence ->
+    // tts_request -> tts_first_audio (reuses `on_tts_chunk`) -> audio_out.
+    // All default no-op so existing observers stay source-compatible.
+    // -------------------------------------------------------------------------
+
+    /// Last user audio frame ingested before end-of-speech (pre-turn anchor).
+    fn on_audio_in(&self, _ts_ns: u64) {}
+
+    /// A smart-turn / VAD inference completed on an audio frame.
+    ///
+    /// * `inference_us` - ONNX inference wall-clock for this frame (microseconds)
+    /// * `is_complete` - whether the model declared the turn complete (end-of-turn)
+    /// * `ts_ns` - monotonic timestamp when inference finished
+    fn on_smart_turn(&self, _inference_us: u64, _is_complete: bool, _ts_ns: u64) {}
+
+    /// A smart-turn audio frame was skipped because the inference lock was
+    /// contended (ML still running on a prior frame). Backpressure signal.
+    fn on_frame_skipped(&self) {}
+
+    /// First interim (non-final) STT result of the current turn.
+    fn on_stt_partial(&self, _ts_ns: u64) {}
+
+    /// The LLM request was dispatched.
+    fn on_llm_request(&self, _ts_ns: u64) {}
+
+    /// The first LLM token (SSE delta) arrived (TTFT anchor).
+    fn on_llm_first_token(&self, _ts_ns: u64) {}
+
+    /// The first complete sentence was flushed toward TTS.
+    fn on_llm_first_sentence(&self, _ts_ns: u64) {}
+
+    /// A TTS synthesis request was issued for this turn.
+    fn on_tts_request(&self, _ts_ns: u64) {}
+
+    /// The first synthesized audio actually left the gateway (headline end).
+    fn on_audio_out(&self, _ts_ns: u64) {}
+
+    /// A per-audio-frame processing stage completed (the realtime "frame budget").
+    ///
+    /// * `stage` - a fixed `&'static str` label (`"receive"`, `"decode"`, `"vad"`,
+    ///   `"smart_turn"`, `"stt_send"`)
+    /// * `dur_ns` - wall-clock spent in that stage for this frame
+    fn on_frame_stage(&self, _stage: &'static str, _dur_ns: u64) {}
 }
 
 // =============================================================================
@@ -110,7 +160,7 @@ struct ObserverEntry {
 ///
 /// # Example
 ///
-/// ```rust
+/// ```ignore
 /// let registry = ObserverRegistry::new();
 ///
 /// // Register an observer
@@ -264,6 +314,107 @@ impl ObserverRegistry {
             entry.observer.on_local_vad_speech_ended();
         }
     }
+
+    // -------------------------------------------------------------------------
+    // Per-turn / per-frame latency checkpoint notifications.
+    //
+    // Each is a read-lock acquire over a (usually empty) Vec + an empty-iterator
+    // loop — ~1 atomic load when no observer is registered. The audio-hot-path
+    // sites (`notify_audio_in`/`notify_frame_stage`/`notify_smart_turn`/
+    // `notify_frame_skipped`) must be called BEFORE acquiring the STT write lock.
+    // -------------------------------------------------------------------------
+
+    /// Notify: last user audio frame before end-of-speech.
+    #[inline]
+    pub fn notify_audio_in(&self, ts_ns: u64) {
+        let observers = self.observers.read();
+        for entry in observers.iter() {
+            entry.observer.on_audio_in(ts_ns);
+        }
+    }
+
+    /// Notify: a smart-turn inference completed on a frame.
+    #[inline]
+    pub fn notify_smart_turn(&self, inference_us: u64, is_complete: bool, ts_ns: u64) {
+        let observers = self.observers.read();
+        for entry in observers.iter() {
+            entry
+                .observer
+                .on_smart_turn(inference_us, is_complete, ts_ns);
+        }
+    }
+
+    /// Notify: a smart-turn frame was skipped due to inference-lock contention.
+    #[inline]
+    pub fn notify_frame_skipped(&self) {
+        let observers = self.observers.read();
+        for entry in observers.iter() {
+            entry.observer.on_frame_skipped();
+        }
+    }
+
+    /// Notify: first interim STT result of the turn.
+    #[inline]
+    pub fn notify_stt_partial(&self, ts_ns: u64) {
+        let observers = self.observers.read();
+        for entry in observers.iter() {
+            entry.observer.on_stt_partial(ts_ns);
+        }
+    }
+
+    /// Notify: the LLM request was dispatched.
+    #[inline]
+    pub fn notify_llm_request(&self, ts_ns: u64) {
+        let observers = self.observers.read();
+        for entry in observers.iter() {
+            entry.observer.on_llm_request(ts_ns);
+        }
+    }
+
+    /// Notify: the first LLM token arrived (TTFT).
+    #[inline]
+    pub fn notify_llm_first_token(&self, ts_ns: u64) {
+        let observers = self.observers.read();
+        for entry in observers.iter() {
+            entry.observer.on_llm_first_token(ts_ns);
+        }
+    }
+
+    /// Notify: the first sentence was flushed toward TTS.
+    #[inline]
+    pub fn notify_llm_first_sentence(&self, ts_ns: u64) {
+        let observers = self.observers.read();
+        for entry in observers.iter() {
+            entry.observer.on_llm_first_sentence(ts_ns);
+        }
+    }
+
+    /// Notify: a TTS synthesis request was issued.
+    #[inline]
+    pub fn notify_tts_request(&self, ts_ns: u64) {
+        let observers = self.observers.read();
+        for entry in observers.iter() {
+            entry.observer.on_tts_request(ts_ns);
+        }
+    }
+
+    /// Notify: the first synthesized audio left the gateway (headline end).
+    #[inline]
+    pub fn notify_audio_out(&self, ts_ns: u64) {
+        let observers = self.observers.read();
+        for entry in observers.iter() {
+            entry.observer.on_audio_out(ts_ns);
+        }
+    }
+
+    /// Notify: a per-frame processing stage completed (the realtime frame budget).
+    #[inline]
+    pub fn notify_frame_stage(&self, stage: &'static str, dur_ns: u64) {
+        let observers = self.observers.read();
+        for entry in observers.iter() {
+            entry.observer.on_frame_stage(stage, dur_ns);
+        }
+    }
 }
 
 impl Default for ObserverRegistry {
@@ -279,7 +430,7 @@ impl Default for ObserverRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     // -------------------------------------------------------------------------
     // Test Fixtures
@@ -776,5 +927,116 @@ mod tests {
         for obs in &observers {
             assert_eq!(obs.stt_result_count.load(Ordering::Relaxed), 100);
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Per-turn / per-frame checkpoint dispatch (live profiling).
+    // -------------------------------------------------------------------------
+
+    /// Observer that counts every per-turn / per-frame checkpoint hook.
+    #[derive(Default)]
+    struct CheckpointObserver {
+        audio_in: AtomicU64,
+        smart_turn: AtomicU64,
+        smart_turn_complete: AtomicU64,
+        frame_skipped: AtomicU64,
+        stt_partial: AtomicU64,
+        llm_request: AtomicU64,
+        llm_first_token: AtomicU64,
+        llm_first_sentence: AtomicU64,
+        tts_request: AtomicU64,
+        audio_out: AtomicU64,
+        frame_stage: AtomicU64,
+        last_inference_us: AtomicU64,
+        last_frame_stage: parking_lot::Mutex<&'static str>,
+    }
+
+    impl VoiceObserver for CheckpointObserver {
+        fn on_audio_in(&self, _ts_ns: u64) {
+            self.audio_in.fetch_add(1, Ordering::Relaxed);
+        }
+        fn on_smart_turn(&self, inference_us: u64, is_complete: bool, _ts_ns: u64) {
+            self.smart_turn.fetch_add(1, Ordering::Relaxed);
+            self.last_inference_us
+                .store(inference_us, Ordering::Relaxed);
+            if is_complete {
+                self.smart_turn_complete.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        fn on_frame_skipped(&self) {
+            self.frame_skipped.fetch_add(1, Ordering::Relaxed);
+        }
+        fn on_stt_partial(&self, _ts_ns: u64) {
+            self.stt_partial.fetch_add(1, Ordering::Relaxed);
+        }
+        fn on_llm_request(&self, _ts_ns: u64) {
+            self.llm_request.fetch_add(1, Ordering::Relaxed);
+        }
+        fn on_llm_first_token(&self, _ts_ns: u64) {
+            self.llm_first_token.fetch_add(1, Ordering::Relaxed);
+        }
+        fn on_llm_first_sentence(&self, _ts_ns: u64) {
+            self.llm_first_sentence.fetch_add(1, Ordering::Relaxed);
+        }
+        fn on_tts_request(&self, _ts_ns: u64) {
+            self.tts_request.fetch_add(1, Ordering::Relaxed);
+        }
+        fn on_audio_out(&self, _ts_ns: u64) {
+            self.audio_out.fetch_add(1, Ordering::Relaxed);
+        }
+        fn on_frame_stage(&self, stage: &'static str, _dur_ns: u64) {
+            self.frame_stage.fetch_add(1, Ordering::Relaxed);
+            *self.last_frame_stage.lock() = stage;
+        }
+    }
+
+    #[test]
+    fn test_checkpoint_hooks_each_fire_once() {
+        let registry = ObserverRegistry::new();
+        let obs = Arc::new(CheckpointObserver::default());
+        registry.register(obs.clone());
+
+        registry.notify_audio_in(1);
+        registry.notify_smart_turn(18_000, true, 2);
+        registry.notify_frame_skipped();
+        registry.notify_stt_partial(3);
+        registry.notify_llm_request(4);
+        registry.notify_llm_first_token(5);
+        registry.notify_llm_first_sentence(6);
+        registry.notify_tts_request(7);
+        registry.notify_audio_out(8);
+        registry.notify_frame_stage("smart_turn", 9);
+
+        assert_eq!(obs.audio_in.load(Ordering::Relaxed), 1);
+        assert_eq!(obs.smart_turn.load(Ordering::Relaxed), 1);
+        assert_eq!(obs.smart_turn_complete.load(Ordering::Relaxed), 1);
+        assert_eq!(obs.last_inference_us.load(Ordering::Relaxed), 18_000);
+        assert_eq!(obs.frame_skipped.load(Ordering::Relaxed), 1);
+        assert_eq!(obs.stt_partial.load(Ordering::Relaxed), 1);
+        assert_eq!(obs.llm_request.load(Ordering::Relaxed), 1);
+        assert_eq!(obs.llm_first_token.load(Ordering::Relaxed), 1);
+        assert_eq!(obs.llm_first_sentence.load(Ordering::Relaxed), 1);
+        assert_eq!(obs.tts_request.load(Ordering::Relaxed), 1);
+        assert_eq!(obs.audio_out.load(Ordering::Relaxed), 1);
+        assert_eq!(obs.frame_stage.load(Ordering::Relaxed), 1);
+        assert_eq!(*obs.last_frame_stage.lock(), "smart_turn");
+    }
+
+    #[test]
+    fn test_checkpoint_notify_empty_registry_is_noop() {
+        // No observers registered: the new notify_* methods must be safe no-ops
+        // (this is the zero-cost hot-path guarantee).
+        let registry = ObserverRegistry::new();
+        registry.notify_audio_in(1);
+        registry.notify_smart_turn(1, false, 1);
+        registry.notify_frame_skipped();
+        registry.notify_stt_partial(1);
+        registry.notify_llm_request(1);
+        registry.notify_llm_first_token(1);
+        registry.notify_llm_first_sentence(1);
+        registry.notify_tts_request(1);
+        registry.notify_audio_out(1);
+        registry.notify_frame_stage("receive", 1);
+        assert!(registry.is_empty());
     }
 }

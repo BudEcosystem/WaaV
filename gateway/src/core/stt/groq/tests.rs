@@ -950,6 +950,43 @@ mod client_tests {
         assert_eq!(stored_config.base.api_key, "new_key");
         assert_eq!(stored_config.model, GroqSTTModel::WhisperLargeV3);
     }
+
+    // W1 keystone: Groq's one mappable feature (word-level timestamps) must survive through
+    // `new_standard` into the provider-specific config — previously dropped by the flat factory.
+    #[test]
+    fn new_standard_unlocks_word_timestamps() {
+        use crate::core::stt::standard::{StandardSTTConfig, SttFeatures};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "groq".into(),
+                api_key: "gsk_test".into(),
+                model: "whisper-large-v3".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                word_timestamps: Some(true),
+                ..Default::default()
+            },
+            extras: Default::default(),
+            translation: None,
+        };
+        let stt = GroqSTT::new_standard(&std).expect("new_standard should succeed");
+        let cfg = stt.config.as_ref().expect("config should be set");
+        assert_eq!(cfg.response_format, GroqResponseFormat::VerboseJson);
+        assert!(
+            cfg.timestamp_granularities
+                .contains(&super::super::config::TimestampGranularity::Word)
+        );
+        assert_eq!(cfg.base.api_key, "gsk_test");
+
+        // Empty api_key is rejected through the standardized path too (parity with Deepgram).
+        let bad = StandardSTTConfig::from_base(STTConfig {
+            provider: "groq".into(),
+            api_key: String::new(),
+            ..Default::default()
+        });
+        assert!(GroqSTT::new_standard(&bad).is_err());
+    }
 }
 
 // =============================================================================
@@ -1530,5 +1567,299 @@ mod confidence_constant_tests {
         // Both should be 0.5
         assert!((DEFAULT_UNKNOWN_CONFIDENCE - 0.5).abs() < f32::EPSILON);
         assert!((MESSAGE_DEFAULT_UNKNOWN_CONFIDENCE - 0.5).abs() < f64::EPSILON);
+    }
+}
+
+// =============================================================================
+// Audio-source-by-URL wire tests (Groq batch REST `url` form field)
+// =============================================================================
+
+mod audio_url_wire_tests {
+    use super::*;
+    use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig};
+    use bytes::Bytes;
+
+    fn std_with_url(url: &str) -> StandardSTTConfig {
+        let mut extras = serde_json::Map::new();
+        extras.insert("url".into(), serde_json::json!(url));
+        StandardSTTConfig {
+            base: STTConfig {
+                provider: "groq".into(),
+                api_key: "gsk_test".into(),
+                model: "whisper-large-v3".into(),
+                ..Default::default()
+            },
+            features: Default::default(),
+            extras: ProviderExtras(extras),
+            translation: None,
+        }
+    }
+
+    #[test]
+    fn from_standard_maps_url_from_extras() {
+        // RED guard: the extras `url` passthrough must reach the typed config field.
+        let cfg = GroqSTTConfig::from_standard(&std_with_url(" https://example.com/clip.mp3 "));
+        assert_eq!(
+            cfg.audio_url.as_deref(),
+            Some("https://example.com/clip.mp3")
+        );
+    }
+
+    #[test]
+    fn url_reaches_emitted_form_fields_not_just_config() {
+        // WIRE-LEVEL: `build_form_text_fields` is the exact list `send_request` iterates to
+        // build the multipart body, so asserting on it asserts what reaches Groq's body —
+        // not merely a struct field (the recurring "tested config, not wire" bug class).
+        let cfg = GroqSTTConfig::from_standard(&std_with_url("https://cdn.example.com/clip.mp3"));
+        let fields = cfg.build_form_text_fields();
+        let url = fields
+            .iter()
+            .find(|(name, _)| name == "url")
+            .map(|(_, v)| v.as_str());
+        assert_eq!(
+            url,
+            Some("https://cdn.example.com/clip.mp3"),
+            "`url` must be emitted as a multipart form field"
+        );
+        // A data:/Base64 URL is forwarded verbatim too.
+        let b64 = GroqSTTConfig::from_standard(&std_with_url("data:audio/wav;base64,AAAA"));
+        assert!(
+            b64.build_form_text_fields()
+                .iter()
+                .any(|(n, v)| n == "url" && v == "data:audio/wav;base64,AAAA")
+        );
+    }
+
+    #[test]
+    fn no_url_emits_no_url_field() {
+        // Default (no extras `url`) must NOT emit a `url` field — the uploaded `file` part path.
+        let cfg = GroqSTTConfig::from_base(STTConfig {
+            api_key: "gsk_test".into(),
+            model: "whisper-large-v3".into(),
+            ..Default::default()
+        });
+        assert!(cfg.audio_url.is_none());
+        assert!(
+            !cfg.build_form_text_fields()
+                .iter()
+                .any(|(name, _)| name == "url")
+        );
+    }
+
+    #[test]
+    fn audio_url_validation_rejects_unsafe_targets() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let public = GroqSTTConfig::from_standard(&std_with_url("https://example.com/clip.mp3"));
+        assert!(public.validate().is_ok());
+
+        let data = GroqSTTConfig::from_standard(&std_with_url("data:audio/wav;base64,AAAA"));
+        assert!(data.validate().is_ok());
+
+        let loopback = GroqSTTConfig::from_standard(&std_with_url("http://127.0.0.1:9000/a.wav"));
+        let err = loopback
+            .validate()
+            .expect_err("loopback audio_url must be rejected");
+        assert!(err.contains("SSRF protection"), "{err}");
+
+        let file = GroqSTTConfig::from_standard(&std_with_url("file:///tmp/a.wav"));
+        let err = file
+            .validate()
+            .expect_err("non-HTTP audio_url must be rejected");
+        assert!(err.contains("URL scheme"), "{err}");
+
+        let blank = GroqSTTConfig::from_standard(&std_with_url("   "));
+        let err = blank
+            .validate()
+            .expect_err("blank audio_url must be rejected");
+        assert!(err.contains("empty"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn url_reaches_multipart_request_body_over_the_wire() {
+        // End-to-end wire assert: drive the public path (connect → send_audio → flush) against a
+        // mock HTTP server and assert the captured multipart body actually carries `name="url"`
+        // with the URL value, and carries NO `name="file"` part (url replaces the upload).
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/openai/v1/audio/transcriptions")
+            .match_body(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::Regex(r#"name="url""#.to_string()),
+                mockito::Matcher::Regex(regex::escape("https://cdn.example.com/clip.mp3")),
+            ]))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"text":"hello"}"#)
+            .create_async()
+            .await;
+
+        let mut cfg =
+            GroqSTTConfig::from_standard(&std_with_url("https://cdn.example.com/clip.mp3"));
+        cfg.response_format = GroqResponseFormat::Json;
+        cfg.custom_endpoint = Some(format!("{}/openai/v1/audio/transcriptions", server.url()));
+
+        let mut stt = {
+            let _guard = crate::core::net::test_env_lock()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let previous = std::env::var_os("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+            // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+            unsafe { std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1") };
+            let stt = GroqSTT::with_config(cfg).expect("client");
+            // SAFETY: restore the process env before releasing the test env lock.
+            unsafe {
+                if let Some(previous) = previous {
+                    std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", previous);
+                } else {
+                    std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+                }
+            }
+            stt
+        };
+        stt.connect().await.expect("connect");
+        // Buffer a little audio so the flush gate (non-empty buffer) is satisfied; the body
+        // should still carry `url` (not a `file` part) because `audio_url` is set.
+        stt.send_audio(Bytes::from(vec![0u8; 3200]))
+            .await
+            .expect("send_audio");
+        stt.flush().await.expect("flush");
+
+        mock.assert_async().await;
+    }
+}
+
+// =============================================================================
+// Resilience-trio wiring (shared per-provider circuit breaker on the REST path)
+// =============================================================================
+
+mod resilience_tests {
+    use super::*;
+    use crate::core::resilience::{CircuitState, ResilienceRegistry};
+    use bytes::Bytes;
+    use std::sync::Arc;
+
+    /// Build a `GroqSTT` against a local mock endpoint with the shared registry breaker
+    /// injected (the same `set_resilience` call the VoiceManager makes in production).
+    /// Construction happens under the loopback escape hatch, mirroring the transcribe-by-URL
+    /// mock-harness test above.
+    fn breaker_wired_stt(endpoint: String, reg: &ResilienceRegistry) -> GroqSTT {
+        let cfg = GroqSTTConfig {
+            base: STTConfig {
+                api_key: "test_key".to_string(),
+                ..Default::default()
+            },
+            custom_endpoint: Some(endpoint),
+            ..Default::default()
+        };
+        let mut stt = {
+            let _guard = crate::core::net::test_env_lock()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let previous = std::env::var_os("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+            // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+            unsafe { std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1") };
+            let stt = GroqSTT::with_config(cfg).expect("construct Groq STT");
+            // SAFETY: restore the process env before releasing the test env lock.
+            unsafe {
+                if let Some(previous) = previous {
+                    std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", previous);
+                } else {
+                    std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+                }
+            }
+            stt
+        };
+        stt.set_resilience(reg.handles_for("groq"));
+        stt
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn breaker_records_failure_on_upstream_4xx() {
+        // Uniformity gate: a failed upstream round-trip must be recorded on the SAME shared
+        // per-provider breaker the registry hands the WS fleet. A 400 is non-retryable for
+        // Groq, so exactly ONE attempt (and one recorded failure) happens.
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/openai/v1/audio/transcriptions")
+            .with_status(400)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"error":{"message":"bad request","type":"invalid_request_error"}}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let reg = ResilienceRegistry::new(4);
+        let mut stt = breaker_wired_stt(
+            format!("{}/openai/v1/audio/transcriptions", server.url()),
+            &reg,
+        );
+        // The injected breaker IS the registry's shared per-provider breaker.
+        assert!(
+            Arc::ptr_eq(
+                stt.resilience_breaker().expect("breaker injected"),
+                &reg.breaker_for("groq")
+            ),
+            "provider must feed the registry's shared breaker"
+        );
+
+        stt.connect().await.expect("connect");
+        stt.send_audio(Bytes::from(vec![0u8; 3200]))
+            .await
+            .expect("send_audio buffers");
+        let err = stt.flush().await.expect_err("400 must surface an error");
+        assert!(matches!(err, STTError::ConfigurationError(_)), "{err:?}");
+
+        let snap = stt.resilience_breaker().unwrap().snapshot();
+        assert_eq!(snap.failures, 1, "the 400 must be recorded as ONE failure");
+        assert_eq!(snap.successes, 0);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn open_breaker_fails_fast_with_typed_refusal_without_contacting_upstream() {
+        // Failover gate: with the shared breaker OPEN (e.g. tripped by other sessions), the
+        // REST path must refuse with a typed classified error BEFORE paying the upstream
+        // round-trip — the mock asserts ZERO hits. The refusal is also non-retryable, so
+        // Groq's internal retry loop stops on the first attempt.
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/openai/v1/audio/transcriptions")
+            .with_status(200)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let reg = ResilienceRegistry::new(4);
+        let mut stt = breaker_wired_stt(
+            format!("{}/openai/v1/audio/transcriptions", server.url()),
+            &reg,
+        );
+
+        // Another "session" of the same provider trips the shared breaker.
+        let shared = reg.breaker_for("groq");
+        for _ in 0..10 {
+            shared.record_failure();
+        }
+        assert_eq!(shared.state(), CircuitState::Open);
+
+        stt.connect().await.expect("connect");
+        stt.send_audio(Bytes::from(vec![0u8; 3200]))
+            .await
+            .expect("send_audio buffers");
+        let err = stt
+            .flush()
+            .await
+            .expect_err("open breaker must refuse the flush");
+        match err {
+            STTError::ConnectionFailed(msg) => {
+                assert!(msg.contains("circuit breaker"), "{msg}");
+                assert!(msg.contains("groq"), "{msg}");
+            }
+            other => panic!("expected typed ConnectionFailed refusal, got {other:?}"),
+        }
+        assert!(
+            !GroqSTT::is_retryable_error(&STTError::ConnectionFailed("x".into())),
+            "the refusal must not feed Groq's retry loop"
+        );
+        mock.assert_async().await; // zero upstream hits
     }
 }

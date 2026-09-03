@@ -9,12 +9,11 @@
 mod mock_providers;
 
 use mock_providers::{
-    ChaosConfig, LatencyProfile, MockStats,
+    ChaosConfig, LatencyProfile,
     http_mock::{HttpMockState, spawn_http_mock},
     websocket_mock::{WebSocketMockState, spawn_stt_websocket_mock, spawn_tts_websocket_mock},
 };
 
-use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write as IoWrite};
 use std::path::PathBuf;
@@ -386,6 +385,12 @@ pub struct BenchmarkStats {
     pub result_saver: Option<Arc<ResultSaver>>,
 }
 
+impl Default for BenchmarkStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BenchmarkStats {
     pub fn new() -> Self {
         Self {
@@ -549,6 +554,12 @@ pub struct ResourceMonitor {
     samples: Mutex<Vec<ResourceSnapshot>>,
     start_time: Instant,
     running: AtomicBool,
+}
+
+impl Default for ResourceMonitor {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ResourceMonitor {
@@ -853,7 +864,7 @@ async fn run_stage(
             }
         });
 
-        handles.push(handle);
+        handles.push((worker_id, handle));
     }
 
     // Run for specified duration
@@ -861,8 +872,10 @@ async fn run_stage(
     running.store(false, Ordering::Relaxed);
 
     // Wait for all workers to complete
-    for handle in handles {
-        let _ = handle.await;
+    for (worker_id, handle) in handles {
+        handle.await.unwrap_or_else(|err| {
+            panic!("scale benchmark worker {worker_id}/{vus} failed to join: {err}")
+        });
     }
 
     let stage_duration = stage_start.elapsed();
@@ -1015,6 +1028,7 @@ fn generate_report(
 /// This test requires the gateway to be running on PORT 3001.
 /// Start gateway with: cargo run --release
 #[tokio::test]
+#[ignore = "scale benchmark: needs a live gateway on :3001 + 10k connections. Run explicitly with --ignored"]
 async fn test_scale_benchmark_10k_live() {
     println!("\n{}", "=".repeat(70));
     println!("WaaV Gateway Scale Benchmark - 10,000 Requests");
@@ -1121,6 +1135,7 @@ async fn test_scale_benchmark_10k_live() {
 ///
 /// Uses mock providers with near-zero latency to isolate gateway performance
 #[tokio::test]
+#[ignore = "perf benchmark (high connection volume). Run explicitly with --ignored"]
 async fn test_gateway_overhead_benchmark() {
     println!("\n{}", "=".repeat(70));
     println!("WaaV Gateway Overhead Benchmark (Zero-Latency Mocks)");
@@ -1226,6 +1241,7 @@ async fn test_gateway_overhead_benchmark() {
 
 /// E2E benchmark with realistic provider latencies
 #[tokio::test]
+#[ignore = "perf benchmark (high connection volume). Run explicitly with --ignored"]
 async fn test_e2e_realistic_benchmark() {
     println!("\n{}", "=".repeat(70));
     println!("WaaV Gateway E2E Benchmark (Realistic Provider Latencies)");
@@ -1305,6 +1321,7 @@ async fn test_e2e_realistic_benchmark() {
 
 /// Chaos benchmark - test gateway resilience under provider failures
 #[tokio::test]
+#[ignore = "perf benchmark (high connection volume). Run explicitly with --ignored"]
 async fn test_chaos_benchmark() {
     println!("\n{}", "=".repeat(70));
     println!("WaaV Gateway Chaos Benchmark (5% Failure Rate)");

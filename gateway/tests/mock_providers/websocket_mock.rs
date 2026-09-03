@@ -2,7 +2,10 @@
 //!
 //! Simulates WebSocket-based providers like Deepgram, Cartesia, LMNT
 
-use super::{ChaosConfig, LatencyProfile, MockStats};
+use super::{
+    ChaosConfig, LatencyProfile, MockServerHandle, MockStats, MockTaskScope,
+    spawn_mock_server_with_scope,
+};
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
@@ -19,6 +22,14 @@ pub struct WebSocketMockState {
     pub chaos: ChaosConfig,
     pub stats: MockStats,
     pub connection_count: AtomicU64,
+    /// Number of `{"type":"Speak"}` frames received by the TTS mock (protocol-accurate path).
+    pub tts_speak_frames: AtomicU64,
+    /// Number of `{"type":"Flush"}` frames received by the TTS mock.
+    pub tts_flush_frames: AtomicU64,
+    /// Number of `{"type":"Clear"}` frames received by the TTS mock.
+    pub tts_clear_frames: AtomicU64,
+    /// Accumulated text of the most recent flushed synthesis (what `Flush` synthesized).
+    pub tts_last_flushed_text: std::sync::Mutex<String>,
 }
 
 impl WebSocketMockState {
@@ -33,6 +44,10 @@ impl WebSocketMockState {
             chaos,
             stats: MockStats::default(),
             connection_count: AtomicU64::new(0),
+            tts_speak_frames: AtomicU64::new(0),
+            tts_flush_frames: AtomicU64::new(0),
+            tts_clear_frames: AtomicU64::new(0),
+            tts_last_flushed_text: std::sync::Mutex::new(String::new()),
         }
     }
 
@@ -134,7 +149,7 @@ async fn handle_stt_connection(
                     "duration": 0.5,
                     "start": (audio_chunk_count as f64 - 1.0) * 0.5,
                     "is_final": true,
-                    "speech_final": audio_chunk_count % 5 == 0,
+                    "speech_final": audio_chunk_count.is_multiple_of(5),
                     "channel": {
                         "alternatives": [{
                             "transcript": format!("Mock transcript chunk {}", audio_chunk_count),
@@ -158,10 +173,10 @@ async fn handle_stt_connection(
             }
             Ok(Message::Text(text)) => {
                 // Handle control messages
-                if let Ok(msg) = serde_json::from_str::<Value>(&text) {
-                    if msg.get("type").and_then(|t| t.as_str()) == Some("CloseStream") {
-                        break;
-                    }
+                if let Ok(msg) = serde_json::from_str::<Value>(&text)
+                    && msg.get("type").and_then(|t| t.as_str()) == Some("CloseStream")
+                {
+                    break;
                 }
             }
             Ok(Message::Close(_)) => break,
@@ -180,7 +195,38 @@ async fn handle_stt_connection(
     Ok(())
 }
 
-/// Handle a TTS WebSocket connection (Deepgram Aura style)
+/// Number of audio chunks the mock streams for a given text (1 per 10 chars, min 3).
+pub fn tts_mock_chunk_count(text_len: usize) -> usize {
+    (text_len / 10).max(3)
+}
+
+/// Size of each mock audio chunk in bytes.
+pub const TTS_MOCK_CHUNK_BYTES: usize = 1024;
+/// Inter-chunk pacing of the mock's streamed audio.
+pub const TTS_MOCK_CHUNK_INTERVAL_MS: u64 = 20;
+
+/// Build one mock audio chunk; the first byte carries the chunk index so clients
+/// can assert ordered delivery.
+fn tts_mock_chunk(index: usize) -> Bytes {
+    let mut chunk = vec![0u8; TTS_MOCK_CHUNK_BYTES];
+    chunk[0] = (index % 256) as u8;
+    chunk.into()
+}
+
+/// Handle a TTS WebSocket connection — Deepgram Aura `/v1/speak` WS protocol.
+///
+/// Protocol-accurate path (frames with a `"type"` field):
+/// - `{"type":"Speak","text":…}` buffers text (counted in `tts_speak_frames`).
+/// - `{"type":"Flush"}` synthesizes the buffer: streams binary chunks (first byte =
+///   chunk index) paced at [`TTS_MOCK_CHUNK_INTERVAL_MS`], then sends
+///   `{"type":"Flushed","sequence_id":N}`.
+/// - `{"type":"Clear"}` drops buffered/queued audio immediately and replies
+///   `{"type":"Cleared"}` — incoming frames PREEMPT chunk streaming (biased select),
+///   so a mid-stream Clear actually stops the stream like the real provider.
+/// - `{"type":"Close"}` closes the socket.
+///
+/// Legacy path: a JSON frame with `"text"` but no `"type"` keeps the old behavior
+/// (immediate audio burst + `Flushed`) for pre-existing consumers.
 async fn handle_tts_connection(
     stream: TcpStream,
     state: Arc<WebSocketMockState>,
@@ -196,61 +242,144 @@ async fn handle_tts_connection(
         return Ok(());
     }
 
-    while let Some(msg) = read.next().await {
-        match msg {
-            Ok(Message::Text(text)) => {
-                let start = Instant::now();
+    // Send initial metadata like the real endpoint does on connect.
+    let metadata = json!({
+        "type": "Metadata",
+        "request_id": format!("mock-tts-{}", state.connection_count.load(Ordering::Relaxed)),
+        "model_name": "aura-mock-en",
+    });
+    write
+        .send(Message::Text(metadata.to_string().into()))
+        .await?;
 
-                // Parse speak request
-                if let Ok(request) = serde_json::from_str::<Value>(&text) {
-                    let text_to_speak = request.get("text").and_then(|t| t.as_str()).unwrap_or("");
+    // Buffered Speak text awaiting a Flush.
+    let mut buffered_text = String::new();
+    // Audio chunks queued for paced streaming, plus whether a Flushed is due after.
+    let mut chunk_queue: std::collections::VecDeque<Bytes> = std::collections::VecDeque::new();
+    let mut flushed_due = false;
+    let mut sequence_id: u64 = 0;
+    let mut flush_started: Option<Instant> = None;
+    let mut pacer = tokio::time::interval(Duration::from_millis(TTS_MOCK_CHUNK_INTERVAL_MS));
+    pacer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-                    // Check chaos conditions
-                    if state.chaos.should_fail() {
-                        state.stats.record_failure();
-                        let error = json!({"type": "Error", "message": "Mock TTS error"});
-                        write.send(Message::Text(error.to_string().into())).await?;
-                        continue;
+    loop {
+        tokio::select! {
+            // Incoming control frames preempt chunk streaming (Clear must cancel).
+            biased;
+
+            msg = read.next() => {
+                let Some(msg) = msg else { break };
+                match msg {
+                    Ok(Message::Text(text)) => {
+                        let Ok(request) = serde_json::from_str::<Value>(&text) else { continue };
+                        match request.get("type").and_then(|t| t.as_str()) {
+                            Some("Speak") => {
+                                state.tts_speak_frames.fetch_add(1, Ordering::Relaxed);
+                                buffered_text
+                                    .push_str(request.get("text").and_then(|t| t.as_str()).unwrap_or(""));
+                            }
+                            Some("Flush") => {
+                                state.tts_flush_frames.fetch_add(1, Ordering::Relaxed);
+                                if state.chaos.should_fail() {
+                                    state.stats.record_failure();
+                                    let error = json!({"type": "Error", "description": "Mock TTS error"});
+                                    write.send(Message::Text(error.to_string().into())).await?;
+                                    buffered_text.clear();
+                                    continue;
+                                }
+                                *state.tts_last_flushed_text.lock().unwrap() = buffered_text.clone();
+                                // First-chunk synthesis latency.
+                                let mut latency = state.tts_latency.sample();
+                                let multiplier = state.chaos.slow_multiplier();
+                                if multiplier > 1 {
+                                    latency *= multiplier;
+                                }
+                                tokio::time::sleep(latency).await;
+                                for i in 0..tts_mock_chunk_count(buffered_text.len()) {
+                                    chunk_queue.push_back(tts_mock_chunk(i));
+                                }
+                                buffered_text.clear();
+                                flushed_due = true;
+                                flush_started = Some(Instant::now());
+                            }
+                            Some("Clear") => {
+                                state.tts_clear_frames.fetch_add(1, Ordering::Relaxed);
+                                buffered_text.clear();
+                                chunk_queue.clear();
+                                flushed_due = false;
+                                flush_started = None;
+                                let cleared = json!({"type": "Cleared", "sequence_id": sequence_id});
+                                write.send(Message::Text(cleared.to_string().into())).await?;
+                            }
+                            Some("Close") => {
+                                let _ = write.send(Message::Close(None)).await;
+                                break;
+                            }
+                            Some(_) => {}
+                            None => {
+                                // Legacy loose path: {"text": …} without a "type" —
+                                // immediate audio burst + Flushed (old mock behavior).
+                                let Some(text_to_speak) =
+                                    request.get("text").and_then(|t| t.as_str())
+                                else {
+                                    continue;
+                                };
+                                let start = Instant::now();
+                                if state.chaos.should_fail() {
+                                    state.stats.record_failure();
+                                    let error = json!({"type": "Error", "message": "Mock TTS error"});
+                                    write.send(Message::Text(error.to_string().into())).await?;
+                                    continue;
+                                }
+                                let mut latency = state.tts_latency.sample();
+                                let multiplier = state.chaos.slow_multiplier();
+                                if multiplier > 1 {
+                                    latency *= multiplier;
+                                }
+                                tokio::time::sleep(latency).await;
+                                for i in 0..tts_mock_chunk_count(text_to_speak.len()) {
+                                    write.send(Message::Binary(tts_mock_chunk(i))).await?;
+                                    tokio::time::sleep(Duration::from_millis(
+                                        TTS_MOCK_CHUNK_INTERVAL_MS,
+                                    ))
+                                    .await;
+                                }
+                                let complete = json!({"type": "Flushed"});
+                                write.send(Message::Text(complete.to_string().into())).await?;
+                                state
+                                    .stats
+                                    .record_success(start.elapsed().as_millis() as u64);
+                            }
+                        }
                     }
-
-                    // Simulate TTS processing latency
-                    let mut latency = state.tts_latency.sample();
-                    let multiplier = state.chaos.slow_multiplier();
-                    if multiplier > 1 {
-                        latency *= multiplier;
+                    Ok(Message::Close(_)) => break,
+                    Ok(Message::Ping(data)) => {
+                        write.send(Message::Pong(data)).await?;
                     }
-                    tokio::time::sleep(latency).await;
-
-                    // Send audio chunks (simulate streaming)
-                    let chunk_count = (text_to_speak.len() / 10).max(3);
-                    for _i in 0..chunk_count {
-                        // 1KB audio chunk
-                        let audio_chunk: Bytes = vec![0u8; 1024].into();
-                        write.send(Message::Binary(audio_chunk)).await?;
-
-                        // Small delay between chunks for streaming simulation
-                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    Err(e) => {
+                        eprintln!("TTS WebSocket error: {}", e);
+                        break;
                     }
-
-                    // Send completion
-                    let complete = json!({"type": "Flushed"});
-                    write
-                        .send(Message::Text(complete.to_string().into()))
-                        .await?;
-
-                    let latency_ms = start.elapsed().as_millis() as u64;
-                    state.stats.record_success(latency_ms);
+                    _ => {}
                 }
             }
-            Ok(Message::Close(_)) => break,
-            Ok(Message::Ping(data)) => {
-                write.send(Message::Pong(data)).await?;
+
+            // Paced streaming of queued audio; after the queue drains, send Flushed.
+            _ = pacer.tick(), if !chunk_queue.is_empty() || flushed_due => {
+                if let Some(chunk) = chunk_queue.pop_front() {
+                    write.send(Message::Binary(chunk)).await?;
+                } else if flushed_due {
+                    sequence_id += 1;
+                    let complete = json!({"type": "Flushed", "sequence_id": sequence_id});
+                    write.send(Message::Text(complete.to_string().into())).await?;
+                    flushed_due = false;
+                    if let Some(started) = flush_started.take() {
+                        state
+                            .stats
+                            .record_success(started.elapsed().as_millis() as u64);
+                    }
+                }
             }
-            Err(e) => {
-                eprintln!("TTS WebSocket error: {}", e);
-                break;
-            }
-            _ => {}
         }
     }
 
@@ -263,13 +392,21 @@ pub async fn start_stt_websocket_mock(
     port: u16,
     state: Arc<WebSocketMockState>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    start_stt_websocket_mock_with_scope(port, state, MockTaskScope::detached()).await
+}
+
+async fn start_stt_websocket_mock_with_scope(
+    port: u16,
+    state: Arc<WebSocketMockState>,
+    child_scope: MockTaskScope,
+) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
     println!("STT WebSocket Mock Server listening on port {}", port);
 
     loop {
         let (stream, _) = listener.accept().await?;
         let state = state.clone();
-        tokio::spawn(async move {
+        child_scope.spawn("stt_websocket_connection", async move {
             if let Err(e) = handle_stt_connection(stream, state).await {
                 eprintln!("STT connection error: {}", e);
             }
@@ -282,13 +419,21 @@ pub async fn start_tts_websocket_mock(
     port: u16,
     state: Arc<WebSocketMockState>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    start_tts_websocket_mock_with_scope(port, state, MockTaskScope::detached()).await
+}
+
+async fn start_tts_websocket_mock_with_scope(
+    port: u16,
+    state: Arc<WebSocketMockState>,
+    child_scope: MockTaskScope,
+) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).await?;
     println!("TTS WebSocket Mock Server listening on port {}", port);
 
     loop {
         let (stream, _) = listener.accept().await?;
         let state = state.clone();
-        tokio::spawn(async move {
+        child_scope.spawn("tts_websocket_connection", async move {
             if let Err(e) = handle_tts_connection(stream, state).await {
                 eprintln!("TTS connection error: {}", e);
             }
@@ -297,25 +442,70 @@ pub async fn start_tts_websocket_mock(
 }
 
 /// Spawn STT WebSocket mock in background
-pub fn spawn_stt_websocket_mock(
-    port: u16,
-    state: Arc<WebSocketMockState>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        if let Err(e) = start_stt_websocket_mock(port, state).await {
-            eprintln!("STT WebSocket Mock error: {}", e);
+pub fn spawn_stt_websocket_mock(port: u16, state: Arc<WebSocketMockState>) -> MockServerHandle {
+    spawn_mock_server_with_scope("stt_websocket_mock", move |child_scope| async move {
+        if let Err(e) = start_stt_websocket_mock_with_scope(port, state, child_scope).await {
+            panic!("STT WebSocket Mock error: {e}");
         }
     })
 }
 
-/// Spawn TTS WebSocket mock in background
-pub fn spawn_tts_websocket_mock(
-    port: u16,
+/// Spawn the STT WebSocket mock on an OS-assigned ephemeral port.
+pub async fn spawn_stt_websocket_mock_ephemeral(
     state: Arc<WebSocketMockState>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        if let Err(e) = start_tts_websocket_mock(port, state).await {
-            eprintln!("TTS WebSocket Mock error: {}", e);
+) -> std::io::Result<(u16, MockServerHandle)> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+    let handle = spawn_mock_server_with_scope(
+        "stt_websocket_mock_ephemeral",
+        move |child_scope| async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let state = state.clone();
+                child_scope.spawn("stt_websocket_ephemeral_connection", async move {
+                    if let Err(e) = handle_stt_connection(stream, state).await {
+                        eprintln!("STT connection error: {}", e);
+                    }
+                });
+            }
+        },
+    );
+    Ok((port, handle))
+}
+
+/// Spawn TTS WebSocket mock in background
+pub fn spawn_tts_websocket_mock(port: u16, state: Arc<WebSocketMockState>) -> MockServerHandle {
+    spawn_mock_server_with_scope("tts_websocket_mock", move |child_scope| async move {
+        if let Err(e) = start_tts_websocket_mock_with_scope(port, state, child_scope).await {
+            panic!("TTS WebSocket Mock error: {e}");
         }
     })
+}
+
+/// Spawn the TTS WebSocket mock on an OS-assigned ephemeral port, returning the
+/// bound port (avoids fixed-port collisions when tests run in parallel).
+pub async fn spawn_tts_websocket_mock_ephemeral(
+    state: Arc<WebSocketMockState>,
+) -> std::io::Result<(u16, MockServerHandle)> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+    let handle = spawn_mock_server_with_scope(
+        "tts_websocket_mock_ephemeral",
+        move |child_scope| async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let state = state.clone();
+                child_scope.spawn("tts_websocket_ephemeral_connection", async move {
+                    if let Err(e) = handle_tts_connection(stream, state).await {
+                        eprintln!("TTS connection error: {}", e);
+                    }
+                });
+            }
+        },
+    );
+    Ok((port, handle))
 }

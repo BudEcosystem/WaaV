@@ -23,13 +23,13 @@
 //!             // Process the audio data here
 //!         })
 //!     }
-//!     
+//!
 //!     fn on_error(&self, error: TTSError) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
 //!         Box::pin(async move {
 //!             eprintln!("TTS Error: {}", error);
 //!         })
 //!     }
-//!     
+//!
 //!     fn on_complete(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
 //!         Box::pin(async move {
 //!             println!("TTS synthesis complete");
@@ -47,26 +47,26 @@
 //!         sample_rate: Some(22050),
 //!         ..Default::default()
 //!     };
-//!     
+//!
 //!     // Create your TTS provider (e.g., DeepgramTTS, ElevenLabsTTS, etc.)
 //!     let mut tts_provider = create_tts_provider("deepgram", config)?;
-//!     
+//!
 //!     // Connect to the provider
 //!     tts_provider.connect().await?;
-//!     
+//!
 //!     // Register audio callback
 //!     let callback = Arc::new(MyAudioCallback);
 //!     tts_provider.on_audio(callback)?;
-//!     
+//!
 //!     // Synthesize text
 //!     tts_provider.speak("Hello, world! This is a test of the TTS system.").await?;
-//!     
+//!
 //!     // Flush to ensure immediate processing
 //!     tts_provider.flush().await?;
-//!     
+//!
 //!     // Clean up
 //!     tts_provider.disconnect().await?;
-//!     
+//!
 //!     Ok(())
 //! }
 //!
@@ -82,6 +82,16 @@ use std::sync::Arc;
 use crate::core::emotion::EmotionConfig;
 use crate::utils::req_manager::ReqManager;
 
+fn duration_ms_from_bytes_saturating(
+    data_len: usize,
+    numerator_ms: u128,
+    denominator: u128,
+) -> usize {
+    debug_assert!(denominator > 0, "duration denominator must be non-zero");
+    let duration_ms = (data_len as u128).saturating_mul(numerator_ms) / denominator;
+    duration_ms.min(usize::MAX as u128) as usize
+}
+
 /// Audio data structure for TTS output
 #[derive(Debug, Clone)]
 pub struct AudioData {
@@ -93,6 +103,44 @@ pub struct AudioData {
     pub format: String,
     /// Duration of the audio chunk in milliseconds
     pub duration_ms: Option<u32>,
+}
+
+impl AudioData {
+    /// Estimated playback duration of this chunk in milliseconds —
+    /// the STANDARDIZED math every consumer (interruption window, playout
+    /// estimate) must share. Best source first:
+    /// 1. the provider's own `duration_ms` (exact, format-independent);
+    /// 2. raw-PCM byte math at the CHUNK's declared sample rate (falling
+    ///    back to `fallback_rate`, then 24 kHz): 2 bytes/sample for
+    ///    linear16, 1 byte/sample for G.711 mulaw/alaw (review wf_85659e16
+    ///    #10 — PCM16 math halved telephony durations);
+    /// 3. compressed container with no duration → BITRATE estimate at an
+    ///    assumed 128 kbps (review wf_85659e16 #7/#10: a flat 250 ms was
+    ///    wrong in both directions — burst trains of small chunks booked
+    ///    tens of phantom seconds, single large HTTP bodies under-counted).
+    ///    128 kbps over-estimates low-bitrate voice codecs (the safe
+    ///    direction for bot-speaking truth) while staying within ~2.5x of
+    ///    high-bitrate mp3.
+    pub fn playback_ms(&self, fallback_rate: u32) -> usize {
+        if let Some(d) = self.duration_ms {
+            return d as usize;
+        }
+        let rate = if self.sample_rate != 0 {
+            self.sample_rate
+        } else if fallback_rate != 0 {
+            fallback_rate
+        } else {
+            24_000
+        };
+        if crate::core::tts::sniff::is_linear_pcm16(&self.format) {
+            return duration_ms_from_bytes_saturating(self.data.len(), 1000, u128::from(rate) * 2);
+        }
+        if crate::core::tts::sniff::is_g711(&self.format) {
+            return duration_ms_from_bytes_saturating(self.data.len(), 1000, u128::from(rate));
+        }
+        const ASSUMED_COMPRESSED_BPS: usize = 128_000;
+        duration_ms_from_bytes_saturating(self.data.len(), 8_000, ASSUMED_COMPRESSED_BPS as u128)
+    }
 }
 
 /// TTS-specific error types
@@ -315,6 +363,30 @@ pub trait BaseTTS: Send + Sync {
     /// * `TTSResult<()>` - Success or failure of the synthesis request
     async fn speak(&mut self, text: &str, flush: bool) -> TTSResult<()>;
 
+    /// Send text for synthesis with an optional per-utterance context id (P1.1).
+    ///
+    /// Streaming (WebSocket) providers override this to key in-flight utterances by
+    /// `context_id` so barge-in `clear()` can cancel a specific synthesis mid-stream and
+    /// TTFB can be stamped per utterance. The default implementation delegates to
+    /// [`speak`](Self::speak), ignoring the context id — existing HTTP providers and the
+    /// ~135 existing `.speak(` call sites need zero changes.
+    ///
+    /// # Arguments
+    /// * `text` - The text to synthesize
+    /// * `flush` - Whether to immediately flush and start processing the text
+    /// * `_context_id` - Optional caller-supplied utterance id (e.g. the turn id)
+    ///
+    /// # Returns
+    /// * `TTSResult<()>` - Success or failure of the synthesis request
+    async fn speak_with_context(
+        &mut self,
+        text: &str,
+        flush: bool,
+        _context_id: Option<&str>,
+    ) -> TTSResult<()> {
+        self.speak(text, flush).await
+    }
+
     /// Clear any queued text from the TTS provider
     ///
     /// This method sends a clear command to the target provider to remove any
@@ -330,6 +402,22 @@ pub trait BaseTTS: Send + Sync {
                 "Provider not available for clear".to_string(),
             ))
         }
+    }
+
+    /// An audio CONTEXT was interrupted (barge-in) — Pipecat's
+    /// `on_audio_context_interrupted`, standardized for all providers
+    /// (D-G7). `context_id = None` ⇒ everything. Default delegates to
+    /// [`Self::clear`]; context-aware WebSocket providers override to cancel
+    /// the specific server-side context.
+    async fn on_audio_context_interrupted(&mut self, _context_id: Option<&str>) -> TTSResult<()> {
+        self.clear().await
+    }
+
+    /// An audio context PLAYED TO COMPLETION — free any server-side
+    /// resources tied to it (D-G7). Default no-op; context-aware WebSocket
+    /// providers override (e.g. send a context-close frame).
+    async fn on_audio_context_completed(&mut self, _context_id: &str) -> TTSResult<()> {
+        Ok(())
     }
 
     /// Flush the TTS provider
@@ -562,5 +650,109 @@ mod tests {
         let result = tts.speak("Hello", false).await;
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), TTSError::ProviderNotReady(_)));
+    }
+
+    /// D-G7: the default context-interrupted hook IS clear() — barge-in
+    /// behavior unchanged for all non-context providers.
+    #[tokio::test]
+    async fn default_interrupted_delegates_to_clear() {
+        let config = TTSConfig::default();
+        let mut tts = MockTTS::new(config).unwrap();
+        tts.connect().await.unwrap();
+        // MockTTS::clear errors when not ready; ready → Ok. Delegation is
+        // observable through identical Result behavior on both paths.
+        assert!(tts.on_audio_context_interrupted(None).await.is_ok());
+        tts.disconnect().await.unwrap();
+        assert_eq!(
+            tts.clear().await.is_err(),
+            tts.on_audio_context_interrupted(None).await.is_err(),
+            "interrupted must follow clear()'s behavior exactly"
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_default_is_noop() {
+        let config = TTSConfig::default();
+        let mut tts = MockTTS::new(config).unwrap();
+        // Never connected: a no-op must still succeed (frees nothing).
+        assert!(tts.on_audio_context_completed("ctx-1").await.is_ok());
+    }
+
+    // --- AudioData::playback_ms: the standardized chunk-duration math
+    //     (review wf_5772cd64 #7/#8) ---
+
+    fn chunk(data_len: usize, rate: u32, format: &str, duration_ms: Option<u32>) -> AudioData {
+        AudioData {
+            data: vec![0u8; data_len],
+            sample_rate: rate,
+            format: format.into(),
+            duration_ms,
+        }
+    }
+
+    #[test]
+    fn playback_ms_prefers_provider_duration() {
+        // Provider-declared duration wins over any byte math.
+        let a = chunk(48_000, 24_000, "pcm", Some(123));
+        assert_eq!(a.playback_ms(16_000), 123);
+        // Even for compressed formats.
+        let b = chunk(4_000, 0, "mp3", Some(800));
+        assert_eq!(b.playback_ms(0), 800);
+    }
+
+    #[test]
+    fn playback_ms_uses_the_chunks_own_rate_for_pcm() {
+        // 48000 bytes of PCM16 mono @ 24kHz = 1000ms — and the CHUNK's rate
+        // must win over the (possibly stale) session fallback.
+        let a = chunk(48_000, 24_000, "pcm", None);
+        assert_eq!(a.playback_ms(8_000), 1000);
+        // Undeclared chunk rate → session fallback (16kHz → 1500ms).
+        let b = chunk(48_000, 0, "linear16", None);
+        assert_eq!(b.playback_ms(16_000), 1500);
+        // Nothing declared anywhere → 24kHz default.
+        let c = chunk(48_000, 0, "pcm", None);
+        assert_eq!(c.playback_ms(0), 1000);
+    }
+
+    #[test]
+    fn playback_ms_estimates_compressed_by_bitrate() {
+        // 128 kbps assumption: 1600 bytes = 100ms, 32000 bytes = 2000ms —
+        // scales with chunk size in BOTH directions (a flat floor booked
+        // 250ms for every chunk: burst trains of tiny chunks accumulated
+        // phantom seconds, large HTTP bodies under-counted).
+        let small = chunk(1_600, 24_000, "mp3", None);
+        assert_eq!(small.playback_ms(24_000), 100);
+        let large = chunk(32_000, 24_000, "mp3", None);
+        assert_eq!(large.playback_ms(24_000), 2000);
+    }
+
+    #[test]
+    fn playback_ms_g711_is_one_byte_per_sample() {
+        // 8000 bytes of mulaw @8kHz = exactly 1s (PCM16 math would halve it).
+        let a = chunk(8_000, 8_000, "mulaw", None);
+        assert_eq!(a.playback_ms(8_000), 1000);
+        let b = chunk(8_000, 8_000, "alaw", None);
+        assert_eq!(b.playback_ms(8_000), 1000);
+    }
+
+    #[test]
+    fn playback_ms_integer_math_saturates_without_overflow() {
+        assert_eq!(
+            duration_ms_from_bytes_saturating(usize::MAX, 8_000, 1),
+            usize::MAX,
+            "compressed-duration fallback must saturate instead of overflowing usize math"
+        );
+        assert_eq!(
+            duration_ms_from_bytes_saturating(usize::MAX, 1_000, 1),
+            usize::MAX,
+            "PCM-duration fallback must saturate instead of overflowing usize math"
+        );
+
+        let odd_pcm = chunk(3, 1_000, "pcm", None);
+        assert_eq!(
+            odd_pcm.playback_ms(0),
+            1,
+            "integer PCM math keeps the same floor semantics for partial trailing samples"
+        );
     }
 }

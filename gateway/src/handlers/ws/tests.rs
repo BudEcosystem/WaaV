@@ -18,6 +18,11 @@ fn test_ws_config_serialization() {
         punctuation: true,
         encoding: "linear16".to_string(),
         model: "nova-3".to_string(),
+        features: Default::default(),
+        extras: Default::default(),
+        turn_detection: None,
+        translation: None,
+        audio_in_codec: None,
     };
 
     let json = serde_json::to_string(&stt_ws_config).unwrap();
@@ -33,6 +38,8 @@ fn test_ws_config_serialization() {
         speaking_rate: Some(1.0),
         audio_format: Some("pcm".to_string()),
         sample_rate: Some(22050),
+        client_playback_rate: None,
+        audio_out_chunk_ms: None,
         connection_timeout: Some(30),
         request_timeout: Some(60),
         model: "".to_string(), // Model is in Voice ID for Deepgram
@@ -41,6 +48,10 @@ fn test_ws_config_serialization() {
         emotion_intensity: None,
         delivery_style: None,
         emotion_description: None,
+        voice_descriptor: None,
+        features: Default::default(),
+        extras: Default::default(),
+        audio_out_codec: None,
     };
 
     let json = serde_json::to_string(&tts_ws_config).unwrap();
@@ -65,6 +76,11 @@ fn test_incoming_message_serialization() {
             punctuation: true,
             encoding: "linear16".to_string(),
             model: "nova-3".to_string(),
+            features: Default::default(),
+            extras: Default::default(),
+            turn_detection: None,
+            translation: None,
+            audio_in_codec: None,
         }),
         tts_config: Some(TTSWebSocketConfig {
             api_key: None,
@@ -73,6 +89,8 @@ fn test_incoming_message_serialization() {
             speaking_rate: Some(1.0),
             audio_format: Some("pcm".to_string()),
             sample_rate: Some(22050),
+            client_playback_rate: None,
+            audio_out_chunk_ms: None,
             connection_timeout: Some(30),
             request_timeout: Some(60),
             model: "".to_string(), // Model is in Voice ID for Deepgram
@@ -81,9 +99,15 @@ fn test_incoming_message_serialization() {
             emotion_intensity: None,
             delivery_style: None,
             emotion_description: None,
+            voice_descriptor: None,
+            features: Default::default(),
+            extras: Default::default(),
+            audio_out_codec: None,
         }),
         livekit: None,
         dag_config: None,
+        conversation_config: None,
+        alias: None,
     };
 
     let json = serde_json::to_string(&config_msg).unwrap();
@@ -285,22 +309,30 @@ fn test_incoming_message_serialization() {
 fn test_outgoing_message_serialization() {
     // Test ready message without LiveKit
     let ready_msg = OutgoingMessage::Ready {
+        protocol_version: crate::handlers::ws::messages::PROTOCOL_VERSION.to_string(),
         stream_id: "test-stream".to_string(),
         livekit_room_name: None,
         livekit_url: None,
         waav_participant_identity: None,
         waav_participant_name: None,
+        resolved_alias: None,
+        audio_in_codec: None,
+        audio_out_codec: None,
     };
     let json = serde_json::to_string(&ready_msg).unwrap();
     assert!(json.contains("\"type\":\"ready\""));
 
     // Test ready message with LiveKit room info
     let ready_msg_with_livekit = OutgoingMessage::Ready {
+        protocol_version: crate::handlers::ws::messages::PROTOCOL_VERSION.to_string(),
         stream_id: "test-stream".to_string(),
         livekit_room_name: Some("test-room".to_string()),
         livekit_url: Some("ws://localhost:7880".to_string()),
         waav_participant_identity: Some("waav-ai".to_string()),
         waav_participant_name: Some("WaaV AI".to_string()),
+        resolved_alias: None,
+        audio_in_codec: None,
+        audio_out_codec: None,
     };
     let json_with_livekit = serde_json::to_string(&ready_msg_with_livekit).unwrap();
     assert!(json_with_livekit.contains("\"type\":\"ready\""));
@@ -315,12 +347,35 @@ fn test_outgoing_message_serialization() {
         is_final: true,
         is_speech_final: true,
         confidence: 0.95,
+        segment_transcript: None,
+        translations: Vec::new(),
     };
 
     let json = serde_json::to_string(&stt_msg).unwrap();
     assert!(json.contains("\"type\":\"stt_result\""));
     assert!(json.contains("Hello world"));
     assert!(json.contains("0.95"));
+    // Empty translations are skipped on the wire (no-translation sessions unchanged).
+    assert!(!json.contains("translations"));
+
+    // With translations populated, the uniform `translations:[{lang,text}]` array
+    // is serialized onto the stt_result frame.
+    let stt_with_translation = OutgoingMessage::STTResult {
+        transcript: "Hello world".to_string(),
+        is_final: true,
+        is_speech_final: true,
+        confidence: 0.95,
+        segment_transcript: None,
+        translations: vec![crate::core::stt::standard::Translation {
+            lang: "es-ES".to_string(),
+            text: "Hola mundo".to_string(),
+            is_partial: false,
+        }],
+    };
+    let json = serde_json::to_string(&stt_with_translation).unwrap();
+    assert!(json.contains("\"translations\":[{"));
+    assert!(json.contains("\"lang\":\"es-ES\""));
+    assert!(json.contains("\"text\":\"Hola mundo\""));
 
     // Test error message
     let error_msg = OutgoingMessage::Error {
@@ -356,6 +411,11 @@ fn test_stt_ws_config_conversion() {
         punctuation: true,
         encoding: "linear16".to_string(),
         model: "nova-3".to_string(),
+        features: Default::default(),
+        extras: Default::default(),
+        turn_detection: None,
+        translation: None,
+        audio_in_codec: None,
     };
 
     let api_key = "test_api_key".to_string();
@@ -378,6 +438,8 @@ fn test_tts_ws_config_conversion_with_all_values() {
         speaking_rate: Some(1.5),
         audio_format: Some("wav".to_string()),
         sample_rate: Some(22050),
+        client_playback_rate: None,
+        audio_out_chunk_ms: None,
         connection_timeout: Some(60),
         request_timeout: Some(120),
         model: "".to_string(), // Model is in Voice ID for Deepgram
@@ -386,6 +448,10 @@ fn test_tts_ws_config_conversion_with_all_values() {
         emotion_intensity: None,
         delivery_style: None,
         emotion_description: None,
+        voice_descriptor: None,
+        features: Default::default(),
+        extras: Default::default(),
+        audio_out_codec: None,
     };
 
     let api_key = "test_api_key".to_string();
@@ -410,6 +476,8 @@ fn test_tts_ws_config_conversion_with_defaults() {
         speaking_rate: None,
         audio_format: None,
         sample_rate: None,
+        client_playback_rate: None,
+        audio_out_chunk_ms: None,
         connection_timeout: None,
         request_timeout: None,
         model: "".to_string(), // Model is in Voice ID for Deepgram
@@ -418,6 +486,10 @@ fn test_tts_ws_config_conversion_with_defaults() {
         emotion_intensity: None,
         delivery_style: None,
         emotion_description: None,
+        voice_descriptor: None,
+        features: Default::default(),
+        extras: Default::default(),
+        audio_out_codec: None,
     };
 
     let api_key = "test_api_key".to_string();
@@ -471,6 +543,8 @@ fn test_livekit_ws_config_conversion() {
         speaking_rate: Some(1.0),
         audio_format: Some("pcm".to_string()),
         sample_rate: Some(22050),
+        client_playback_rate: None,
+        audio_out_chunk_ms: None,
         connection_timeout: Some(30),
         request_timeout: Some(60),
         model: "".to_string(),
@@ -479,12 +553,20 @@ fn test_livekit_ws_config_conversion() {
         emotion_intensity: None,
         delivery_style: None,
         emotion_description: None,
+        voice_descriptor: None,
+        features: Default::default(),
+        extras: Default::default(),
+        audio_out_codec: None,
     };
 
     let livekit_url = "wss://test-livekit.com".to_string();
     let test_token = "test-jwt-token".to_string();
-    let livekit_config =
-        livekit_ws_config.to_livekit_config(test_token.clone(), &tts_ws_config, &livekit_url);
+    let livekit_config = livekit_ws_config.to_livekit_config(
+        test_token.clone(),
+        &tts_ws_config,
+        16_000,
+        &livekit_url,
+    );
     assert_eq!(livekit_config.url, "wss://test-livekit.com");
     assert_eq!(livekit_config.token, test_token);
     assert_eq!(livekit_config.room_name, "test-room");
@@ -513,6 +595,8 @@ fn test_livekit_config_with_empty_listen_participants() {
         speaking_rate: Some(1.0),
         audio_format: Some("pcm".to_string()),
         sample_rate: Some(22050),
+        client_playback_rate: None,
+        audio_out_chunk_ms: None,
         connection_timeout: Some(30),
         request_timeout: Some(60),
         model: "".to_string(),
@@ -521,11 +605,16 @@ fn test_livekit_config_with_empty_listen_participants() {
         emotion_intensity: None,
         delivery_style: None,
         emotion_description: None,
+        voice_descriptor: None,
+        features: Default::default(),
+        extras: Default::default(),
+        audio_out_codec: None,
     };
 
     let livekit_config = livekit_ws_config.to_livekit_config(
         "test-token".to_string(),
         &tts_ws_config,
+        16_000,
         "wss://test.com",
     );
 
@@ -552,6 +641,8 @@ fn test_livekit_config_with_listen_participants() {
         speaking_rate: Some(1.0),
         audio_format: Some("pcm".to_string()),
         sample_rate: Some(22050),
+        client_playback_rate: None,
+        audio_out_chunk_ms: None,
         connection_timeout: Some(30),
         request_timeout: Some(60),
         model: "".to_string(),
@@ -560,11 +651,16 @@ fn test_livekit_config_with_listen_participants() {
         emotion_intensity: None,
         delivery_style: None,
         emotion_description: None,
+        voice_descriptor: None,
+        features: Default::default(),
+        extras: Default::default(),
+        audio_out_codec: None,
     };
 
     let livekit_config = livekit_ws_config.to_livekit_config(
         "test-token".to_string(),
         &tts_ws_config,
+        16_000,
         "wss://test.com",
     );
 
@@ -670,6 +766,11 @@ fn test_incoming_message_config_with_livekit() {
             punctuation: true,
             encoding: "linear16".to_string(),
             model: "nova-3".to_string(),
+            features: Default::default(),
+            extras: Default::default(),
+            turn_detection: None,
+            translation: None,
+            audio_in_codec: None,
         }),
         tts_config: Some(TTSWebSocketConfig {
             api_key: None,
@@ -678,6 +779,8 @@ fn test_incoming_message_config_with_livekit() {
             speaking_rate: Some(1.0),
             audio_format: Some("pcm".to_string()),
             sample_rate: Some(22050),
+            client_playback_rate: None,
+            audio_out_chunk_ms: None,
             connection_timeout: Some(30),
             request_timeout: Some(60),
             model: "".to_string(),
@@ -686,6 +789,10 @@ fn test_incoming_message_config_with_livekit() {
             emotion_intensity: None,
             delivery_style: None,
             emotion_description: None,
+            voice_descriptor: None,
+            features: Default::default(),
+            extras: Default::default(),
+            audio_out_codec: None,
         }),
         livekit: Some(LiveKitWebSocketConfig {
             room_name: "test-room".to_string(),
@@ -695,6 +802,8 @@ fn test_incoming_message_config_with_livekit() {
             listen_participants: vec![],
         }),
         dag_config: None,
+        conversation_config: None,
+        alias: None,
     };
 
     let json = serde_json::to_string(&config_msg).unwrap();
@@ -718,6 +827,11 @@ fn test_incoming_message_config_without_livekit() {
             punctuation: true,
             encoding: "linear16".to_string(),
             model: "nova-3".to_string(),
+            features: Default::default(),
+            extras: Default::default(),
+            turn_detection: None,
+            translation: None,
+            audio_in_codec: None,
         }),
         tts_config: Some(TTSWebSocketConfig {
             api_key: None,
@@ -726,6 +840,8 @@ fn test_incoming_message_config_without_livekit() {
             speaking_rate: Some(1.0),
             audio_format: Some("pcm".to_string()),
             sample_rate: Some(22050),
+            client_playback_rate: None,
+            audio_out_chunk_ms: None,
             connection_timeout: Some(30),
             request_timeout: Some(60),
             model: "".to_string(),
@@ -734,9 +850,15 @@ fn test_incoming_message_config_without_livekit() {
             emotion_intensity: None,
             delivery_style: None,
             emotion_description: None,
+            voice_descriptor: None,
+            features: Default::default(),
+            extras: Default::default(),
+            audio_out_codec: None,
         }),
         livekit: None,
         dag_config: None,
+        conversation_config: None,
+        alias: None,
     };
 
     let json = serde_json::to_string(&config_msg).unwrap();
@@ -990,6 +1112,8 @@ fn test_tts_ws_config_conversion_mixed_values() {
         speaking_rate: None, // Should use default
         audio_format: Some("pcm".to_string()),
         sample_rate: None, // Should use default
+        client_playback_rate: None,
+        audio_out_chunk_ms: None,
         connection_timeout: Some(45),
         request_timeout: None, // Should use default
         model: "".to_string(), // Model is in Voice ID for Deepgram
@@ -998,6 +1122,10 @@ fn test_tts_ws_config_conversion_mixed_values() {
         emotion_intensity: None,
         delivery_style: None,
         emotion_description: None,
+        voice_descriptor: None,
+        features: Default::default(),
+        extras: Default::default(),
+        audio_out_codec: None,
     };
 
     let api_key = "test_api_key".to_string();
@@ -1029,6 +1157,11 @@ fn test_config_message_without_livekit_routing() {
             punctuation: true,
             encoding: "linear16".to_string(),
             model: "nova-3".to_string(),
+            features: Default::default(),
+            extras: Default::default(),
+            turn_detection: None,
+            translation: None,
+            audio_in_codec: None,
         }),
         tts_config: Some(TTSWebSocketConfig {
             api_key: None,
@@ -1037,6 +1170,8 @@ fn test_config_message_without_livekit_routing() {
             speaking_rate: Some(1.0),
             audio_format: Some("pcm".to_string()),
             sample_rate: Some(22050),
+            client_playback_rate: None,
+            audio_out_chunk_ms: None,
             connection_timeout: Some(30),
             request_timeout: Some(60),
             model: "".to_string(),
@@ -1045,9 +1180,15 @@ fn test_config_message_without_livekit_routing() {
             emotion_intensity: None,
             delivery_style: None,
             emotion_description: None,
+            voice_descriptor: None,
+            features: Default::default(),
+            extras: Default::default(),
+            audio_out_codec: None,
         }),
         livekit: None, // No LiveKit configuration
         dag_config: None,
+        conversation_config: None,
+        alias: None,
     };
 
     let json = serde_json::to_string(&config_msg).unwrap();
@@ -1082,6 +1223,11 @@ fn test_config_message_with_livekit_routing() {
             punctuation: true,
             encoding: "linear16".to_string(),
             model: "nova-3".to_string(),
+            features: Default::default(),
+            extras: Default::default(),
+            turn_detection: None,
+            translation: None,
+            audio_in_codec: None,
         }),
         tts_config: Some(TTSWebSocketConfig {
             api_key: None,
@@ -1090,6 +1236,8 @@ fn test_config_message_with_livekit_routing() {
             speaking_rate: Some(1.0),
             audio_format: Some("pcm".to_string()),
             sample_rate: Some(22050),
+            client_playback_rate: None,
+            audio_out_chunk_ms: None,
             connection_timeout: Some(30),
             request_timeout: Some(60),
             model: "".to_string(),
@@ -1098,6 +1246,10 @@ fn test_config_message_with_livekit_routing() {
             emotion_intensity: None,
             delivery_style: None,
             emotion_description: None,
+            voice_descriptor: None,
+            features: Default::default(),
+            extras: Default::default(),
+            audio_out_codec: None,
         }),
         livekit: Some(LiveKitWebSocketConfig {
             room_name: "test-room".to_string(),
@@ -1107,6 +1259,8 @@ fn test_config_message_with_livekit_routing() {
             listen_participants: vec![],
         }),
         dag_config: None,
+        conversation_config: None,
+        alias: None,
     };
 
     let json = serde_json::to_string(&config_msg).unwrap();
@@ -1296,6 +1450,8 @@ fn test_config_message_audio_disabled() {
             listen_participants: vec![],
         }),
         dag_config: None,
+        conversation_config: None,
+        alias: None,
     };
 
     let json = serde_json::to_string(&config_msg).unwrap();
@@ -1343,6 +1499,11 @@ fn test_config_message_audio_default() {
             punctuation: true,
             encoding: "linear16".to_string(),
             model: "nova-3".to_string(),
+            features: Default::default(),
+            extras: Default::default(),
+            turn_detection: None,
+            translation: None,
+            audio_in_codec: None,
         }),
         tts_config: Some(TTSWebSocketConfig {
             api_key: None,
@@ -1351,6 +1512,8 @@ fn test_config_message_audio_default() {
             speaking_rate: Some(1.0),
             audio_format: Some("pcm".to_string()),
             sample_rate: Some(22050),
+            client_playback_rate: None,
+            audio_out_chunk_ms: None,
             connection_timeout: Some(30),
             request_timeout: Some(60),
             model: "".to_string(),
@@ -1359,9 +1522,15 @@ fn test_config_message_audio_default() {
             emotion_intensity: None,
             delivery_style: None,
             emotion_description: None,
+            voice_descriptor: None,
+            features: Default::default(),
+            extras: Default::default(),
+            audio_out_codec: None,
         }),
         livekit: None,
         dag_config: None,
+        conversation_config: None,
+        alias: None,
     };
 
     let json = serde_json::to_string(&config_msg).unwrap();
@@ -1434,4 +1603,181 @@ fn test_unified_message_for_livekit_integration() {
     assert!(json_binary.contains("\"data\":"));
     // Should not contain message field for binary data
     assert!(!json_binary.contains("\"message\":null"));
+}
+
+// --- C-G5 pt3: client playback rate (egress resampling) ---
+
+fn tts_cfg(provider_rate: Option<u32>, client_rate: Option<u32>) -> TTSWebSocketConfig {
+    TTSWebSocketConfig {
+        api_key: None,
+        provider: "deepgram".to_string(),
+        voice_id: None,
+        speaking_rate: None,
+        audio_format: Some("linear16".to_string()),
+        sample_rate: provider_rate,
+        client_playback_rate: client_rate,
+        audio_out_chunk_ms: None,
+        connection_timeout: None,
+        request_timeout: None,
+        model: "aura-asteria-en".to_string(),
+        pronunciations: Vec::new(),
+        emotion: None,
+        emotion_intensity: None,
+        delivery_style: None,
+        emotion_description: None,
+        voice_descriptor: None,
+        features: Default::default(),
+        extras: Default::default(),
+        audio_out_codec: None,
+    }
+}
+
+#[test]
+fn client_playback_rate_is_wire_compatible() {
+    // Absent on the wire → None (existing clients unaffected).
+    let json = r#"{"provider":"deepgram","model":"aura-asteria-en"}"#;
+    let cfg: TTSWebSocketConfig = serde_json::from_str(json).unwrap();
+    assert_eq!(cfg.client_playback_rate, None);
+    // Present → honored.
+    let json = r#"{"provider":"deepgram","model":"aura-asteria-en","client_playback_rate":48000}"#;
+    let cfg: TTSWebSocketConfig = serde_json::from_str(json).unwrap();
+    assert_eq!(cfg.client_playback_rate, Some(48000));
+    // Unset never serializes (no schema noise for old readers).
+    let out = serde_json::to_string(&tts_cfg(Some(24000), None)).unwrap();
+    assert!(!out.contains("client_playback_rate"));
+}
+
+#[test]
+fn egress_audio_context_only_when_requested() {
+    use super::config_handler::EgressAudio;
+    assert!(
+        EgressAudio::from_tts_config(None).is_none(),
+        "no TTS config"
+    );
+    assert!(
+        EgressAudio::from_tts_config(Some(&tts_cfg(Some(24000), None))).is_none(),
+        "no client rate requested → zero-cost None"
+    );
+    assert!(EgressAudio::from_tts_config(Some(&tts_cfg(Some(24000), Some(48000)))).is_some());
+}
+
+#[test]
+fn egress_audio_converts_pcm_and_passes_compressed_through() {
+    use super::config_handler::EgressAudio;
+    let egress = EgressAudio::from_tts_config(Some(&tts_cfg(Some(24000), Some(48000)))).unwrap();
+
+    // 0.5s of 24k PCM16 → ~2x bytes at 48k (minus the filter tail).
+    let pcm: Vec<u8> = (0..12_000i32)
+        .flat_map(|i| (((i as f32 * 0.05).sin() * 20000.0) as i16).to_le_bytes())
+        .collect();
+    let out = egress.convert(pcm.clone(), "linear16", 24_000);
+    assert!(
+        out.len() > pcm.len() * 3 / 2,
+        "expected ~2x upsampled bytes, got {} from {}",
+        out.len(),
+        pcm.len()
+    );
+
+    // Compressed: untouched.
+    let mp3 = vec![0xFFu8; 1200];
+    assert_eq!(egress.convert(mp3.clone(), "mp3", 24_000), mp3);
+
+    // Chunk without a stamped rate: the configured provider rate (24k) is
+    // the fallback, so conversion still happens.
+    let out = egress.convert(pcm.clone(), "pcm", 0);
+    assert!(
+        out.len() > pcm.len() * 3 / 2,
+        "configured-rate fallback must convert"
+    );
+}
+
+#[test]
+fn livekit_track_rate_matches_delivered_bytes() {
+    let lk = LiveKitWebSocketConfig {
+        room_name: "room".to_string(),
+        enable_recording: false,
+        waav_participant_identity: None,
+        waav_participant_name: None,
+        listen_participants: vec![],
+    };
+    // No client rate → provider rate.
+    let cfg = lk.to_livekit_config("t".into(), &tts_cfg(Some(22050), None), 16_000, "ws://x");
+    assert_eq!(cfg.sample_rate, 22050);
+    // Client rate set → the track must run at the rate of the RESAMPLED bytes.
+    let cfg = lk.to_livekit_config(
+        "t".into(),
+        &tts_cfg(Some(24000), Some(48000)),
+        16_000,
+        "ws://x",
+    );
+    assert_eq!(cfg.sample_rate, 48000);
+    // Nothing configured → 24k default.
+    let cfg = lk.to_livekit_config("t".into(), &tts_cfg(None, None), 16_000, "ws://x");
+    assert_eq!(cfg.sample_rate, 24000);
+}
+
+#[test]
+fn invalid_client_playback_rate_disables_egress_resampling() {
+    use super::config_handler::EgressAudio;
+    // 0 Hz would configure a 0 Hz LiveKit track; absurd rates build
+    // pathological resamplers — both rejected loudly (review wf_85659e16).
+    assert!(EgressAudio::from_tts_config(Some(&tts_cfg(Some(24000), Some(0)))).is_none());
+    assert!(EgressAudio::from_tts_config(Some(&tts_cfg(Some(24000), Some(4)))).is_none());
+    assert!(EgressAudio::from_tts_config(Some(&tts_cfg(Some(24000), Some(700_000)))).is_none());
+    assert!(EgressAudio::from_tts_config(Some(&tts_cfg(Some(24000), Some(8_000)))).is_some());
+}
+
+#[test]
+fn egress_flush_recovers_the_utterance_tail() {
+    use super::config_handler::EgressAudio;
+    let egress = EgressAudio::from_tts_config(Some(&tts_cfg(Some(24000), Some(48000)))).unwrap();
+    // A sub-chunk final piece converts to NOTHING (buffered)...
+    let tail_in: Vec<u8> = vec![0x10; 600]; // 300 samples < 480-frame chunk
+    let out = egress.convert(tail_in, "linear16", 24_000);
+    assert!(out.is_empty(), "sub-chunk piece is buffered, not emitted");
+    // ...until the utterance-end flush delivers it (review wf_85659e16 #8/#11).
+    let tail = egress.flush();
+    assert!(
+        tail.len() >= 1000,
+        "flush must emit the ~600 buffered output frames, got {} bytes",
+        tail.len()
+    );
+    assert!(
+        egress.flush().is_empty(),
+        "second flush has nothing pending"
+    );
+}
+
+#[test]
+fn livekit_ingress_rate_is_stt_derived_not_client_rate() {
+    // Review wf_85659e16 CRITICAL #1: the egress-only client_playback_rate
+    // must NEVER re-rate the user's microphone (ingress). Ingress follows
+    // the STT pipeline's declared rate; egress follows the client rate.
+    let lk = LiveKitWebSocketConfig {
+        room_name: "room".to_string(),
+        enable_recording: false,
+        waav_participant_identity: None,
+        waav_participant_name: None,
+        listen_participants: vec![],
+    };
+    let cfg = lk.to_livekit_config(
+        "t".into(),
+        &tts_cfg(Some(24000), Some(48000)),
+        16_000,
+        "ws://x",
+    );
+    assert_eq!(
+        cfg.sample_rate, 48000,
+        "egress track follows the client rate"
+    );
+    assert_eq!(
+        cfg.ingress_sample_rate, 16_000,
+        "ingress (user mic -> STT/VAD) follows the STT rate, untouched by the knob"
+    );
+    // An INVALID client rate must not poison the egress track either.
+    let cfg = lk.to_livekit_config("t".into(), &tts_cfg(Some(24000), Some(0)), 16_000, "ws://x");
+    assert_eq!(
+        cfg.sample_rate, 24000,
+        "invalid client rate falls back to provider rate"
+    );
 }

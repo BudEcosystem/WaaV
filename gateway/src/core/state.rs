@@ -11,7 +11,11 @@ use tracing::info;
 use tracing::{debug, info, warn};
 
 use crate::config::ServerConfig;
+use crate::config::utils::parse_bool;
 use crate::core::cache::store::{CacheConfig, CacheStore};
+use crate::core::metrics::MetricsRegistry;
+use crate::core::observability::{LatencyProfiler, ProfilingConfig};
+use crate::core::resilience::ResilienceRegistry;
 use crate::core::tts::get_tts_provider_urls;
 #[cfg(not(feature = "turn-detect"))]
 use crate::core::turn_detect::TurnDetector;
@@ -34,11 +38,33 @@ pub struct CoreState {
     pub turn_detector: Option<Arc<RwLock<TurnDetector>>>,
     /// SIP hooks runtime state with preserved secrets
     pub sip_hooks_state: Option<Arc<RwLock<SipHooksState>>>,
+    /// Per-provider performance metrics shared across handlers; also installs the global
+    /// Prometheus recorder so `GET /metrics` renders (W-C1 observability).
+    pub metrics: Arc<MetricsRegistry>,
+    /// Process-global resilience handles (W-D2): the SINGLE reconnect governor (storm control
+    /// across all sessions) and the per-provider circuit-breaker map (a trip in one session of
+    /// a provider is visible to every other session of that provider). Constructed once here at
+    /// startup and threaded into each streaming provider's connect path — replacing the prior
+    /// per-session `new()` that defeated both behaviours.
+    pub resilience: Arc<ResilienceRegistry>,
+    /// Process-wide live latency profiler (per-turn timeline + per-frame budget hub). Every
+    /// per-session `TurnProfiler`/`FrameProfiler` feeds here; owns the Prometheus emission,
+    /// rolling percentiles, bottleneck tally, and the live SSE broadcast.
+    pub profiler: Arc<LatencyProfiler>,
+    /// Profiling runtime config (env-driven gates for the system + the `/debug/profile*` routes).
+    pub profiling: ProfilingConfig,
 }
 
 impl CoreState {
     /// Initialize core state, including TTS request managers.
     pub async fn new(config: &ServerConfig) -> Arc<Self> {
+        Self::try_new(config)
+            .await
+            .unwrap_or_else(|e| panic!("invalid core state config: {e}"))
+    }
+
+    /// Initialize core state, including TTS request managers.
+    pub async fn try_new(config: &ServerConfig) -> Result<Arc<Self>, String> {
         let mut tts_req_managers = HashMap::new();
 
         // Build cache configuration based on ServerConfig
@@ -70,20 +96,29 @@ impl CoreState {
                     max_size_bytes: Some(50 * 1024 * 1024), // 50MB fallback
                     ttl_seconds: config.cache_ttl_seconds,
                 };
-                Arc::new(
-                    CacheStore::from_config(fallback_cfg)
-                        .await
-                        .expect("fallback in-memory cache must succeed"),
-                )
+                let fallback = CacheStore::from_config(fallback_cfg).await.map_err(
+                    |fallback_error| {
+                        format!(
+                            "Cache initialization failed ({e:?}) and fallback in-memory cache failed ({fallback_error:?})"
+                        )
+                    },
+                )?;
+                Arc::new(fallback)
             }
         };
 
         let tts_provider_urls = get_tts_provider_urls();
+        // STARTUP/PRIVACY: by default do NOT eagerly warm up every provider URL — that made
+        // outbound connections to all ~37 external TTS endpoints (e.g. https://tsn.baidu.com)
+        // on every boot, regardless of which providers are actually configured. Connection
+        // pools establish lazily on first real use. Opt in with WAAV_EAGER_WARMUP=1.
+        let eager_warmup = parse_env_bool("WAAV_EAGER_WARMUP")?.unwrap_or(false);
         for (provider, url) in tts_provider_urls {
             match ReqManager::new(4).await {
                 Ok(manager) => {
-                    // Optionally warm up connections to providers (e.g., Deepgram)
-                    let _ = manager.warmup(url.as_str(), "OPTIONS").await;
+                    if eager_warmup {
+                        let _ = manager.warmup(url.as_str(), "OPTIONS").await;
+                    }
                     tts_req_managers.insert(provider.clone(), Arc::new(manager));
                     tracing::info!(
                         "Initialized {} ReqManager with 4 concurrent connections",
@@ -107,12 +142,37 @@ impl CoreState {
             None
         };
 
-        Arc::new(Self {
+        // Storm control: the SINGLE process-global reconnect governor caps concurrent in-flight
+        // reconnects across every session/provider. The cap is configurable via env for
+        // operability (a larger fleet may want a wider cap); default 16.
+        let reconnect_cap =
+            parse_env_positive_usize("WAAV_MAX_CONCURRENT_RECONNECTS")?.unwrap_or(16);
+
+        // Live latency profiling (per-turn timeline + per-frame budget). Env-gated; the hub is
+        // always constructed (cheap) but is a no-op when disabled.
+        let profiling = ProfilingConfig::try_from_env()?;
+        let profiler = Arc::new(LatencyProfiler::from_config(&profiling));
+
+        Ok(Arc::new(Self {
             tts_req_managers: Arc::new(RwLock::new(tts_req_managers)),
             cache,
             turn_detector,
             sip_hooks_state,
-        })
+            metrics: Arc::new(MetricsRegistry::new()),
+            resilience: Arc::new(ResilienceRegistry::new(reconnect_cap)),
+            profiler,
+            profiling,
+        }))
+    }
+
+    /// Get the shared per-provider metrics registry.
+    pub fn metrics(&self) -> &Arc<MetricsRegistry> {
+        &self.metrics
+    }
+
+    /// Get the process-global resilience registry (shared governor + per-provider breakers).
+    pub fn resilience(&self) -> &Arc<ResilienceRegistry> {
+        &self.resilience
     }
 
     /// Get a TTS request manager for a specific provider
@@ -245,5 +305,96 @@ impl CoreState {
     /// Get SIP hooks runtime state if SIP is configured.
     pub fn get_sip_hooks_state(&self) -> Option<Arc<RwLock<SipHooksState>>> {
         self.sip_hooks_state.clone()
+    }
+}
+
+fn parse_env_bool(name: &str) -> Result<Option<bool>, String> {
+    match std::env::var(name) {
+        Ok(value) => parse_bool(&value).map(Some).ok_or_else(|| {
+            format!("Invalid {name} environment variable: expected true/false/1/0/yes/no")
+        }),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(format!("{name} environment variable must be valid UTF-8"))
+        }
+    }
+}
+
+fn parse_env_positive_usize(name: &str) -> Result<Option<usize>, String> {
+    match std::env::var(name) {
+        Ok(value) => value
+            .parse::<usize>()
+            .map_err(|e| format!("Invalid {name} environment variable: {e}"))
+            .and_then(|n| {
+                if n > 0 {
+                    Ok(Some(n))
+                } else {
+                    Err(format!(
+                        "{name} environment variable must be greater than zero"
+                    ))
+                }
+            }),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(format!("{name} environment variable must be valid UTF-8"))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+
+    fn cleanup_runtime_env() {
+        unsafe {
+            std::env::remove_var("WAAV_EAGER_WARMUP");
+            std::env::remove_var("WAAV_MAX_CONCURRENT_RECONNECTS");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn runtime_bool_env_rejects_malformed_value() {
+        cleanup_runtime_env();
+        unsafe {
+            std::env::set_var("WAAV_EAGER_WARMUP", "sometimes");
+        }
+
+        let err = parse_env_bool("WAAV_EAGER_WARMUP").expect_err("malformed bool must fail");
+        assert!(
+            err.contains("WAAV_EAGER_WARMUP"),
+            "error should name bad env var: {err}"
+        );
+
+        cleanup_runtime_env();
+    }
+
+    #[test]
+    #[serial]
+    fn runtime_reconnect_cap_rejects_malformed_or_zero_value() {
+        cleanup_runtime_env();
+        unsafe {
+            std::env::set_var("WAAV_MAX_CONCURRENT_RECONNECTS", "wide");
+        }
+
+        let err = parse_env_positive_usize("WAAV_MAX_CONCURRENT_RECONNECTS")
+            .expect_err("malformed cap must fail");
+        assert!(
+            err.contains("WAAV_MAX_CONCURRENT_RECONNECTS"),
+            "error should name bad env var: {err}"
+        );
+
+        unsafe {
+            std::env::set_var("WAAV_MAX_CONCURRENT_RECONNECTS", "0");
+        }
+        let err = parse_env_positive_usize("WAAV_MAX_CONCURRENT_RECONNECTS")
+            .expect_err("zero cap must fail");
+        assert!(
+            err.contains("WAAV_MAX_CONCURRENT_RECONNECTS"),
+            "error should name bad env var: {err}"
+        );
+
+        cleanup_runtime_env();
     }
 }

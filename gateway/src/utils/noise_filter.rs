@@ -3,10 +3,13 @@ pub mod implementation {
     use bytes::Bytes;
     use deep_filter::tract::{DfParams, DfTract, RuntimeParams};
     use ndarray::{Array2, ArrayView2};
-    use std::ops::Deref;
-    use std::sync::{Arc, LazyLock};
-    use tokio::sync::{Mutex, mpsc, oneshot};
-    use tracing::info;
+    use std::sync::{
+        Arc, LazyLock,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::time::Duration;
+    use tokio::sync::{Mutex, Notify, mpsc, oneshot};
+    use tracing::{error, info};
 
     // Import SIMD-optimized operations
     use crate::utils::simd_ops;
@@ -68,7 +71,7 @@ pub mod implementation {
     type WorkerSender = mpsc::Sender<WorkerTask>;
     type PoolSender = mpsc::Sender<WorkerSender>;
     type PoolReceiver = Arc<Mutex<mpsc::Receiver<WorkerSender>>>;
-    type SenderPool = (PoolSender, PoolReceiver);
+    type SenderPool = (PoolSender, PoolReceiver, Arc<AtomicUsize>, Arc<Notify>);
 
     // The pool of senders to the worker threads, managed by a channel.
     // This is the core of our thread-safe, async-friendly pool for the !Send models.
@@ -76,31 +79,50 @@ pub mod implementation {
         // Use a pool size based on available CPU cores, with a minimum of 2.
         let pool_size = num_cpus::get().max(2);
         let (pool_tx, pool_rx) = mpsc::channel(pool_size);
+        let live_workers = Arc::new(AtomicUsize::new(0));
+        let worker_death = Arc::new(Notify::new());
+        let (init_tx, init_rx) = std::sync::mpsc::channel();
+        let mut launched = 0usize;
 
-        for _ in 0..pool_size {
+        for worker_index in 0..pool_size {
             let pool_tx_clone = pool_tx.clone();
+            let init_tx_clone = init_tx.clone();
 
             // Spawn a dedicated OS thread for each worker.
             // This is crucial for pinning the !Send DfTract model to a single thread.
-            std::thread::spawn(move || {
+            match std::thread::Builder::new()
+                .name(format!("waav-noise-filter-{worker_index}"))
+                .spawn(move || {
                 let (worker_task_tx, mut worker_task_rx) = mpsc::channel::<WorkerTask>(1);
-
-                // Provide this worker's sender to the pool so it can be checked out.
-                if pool_tx_clone.blocking_send(worker_task_tx).is_err() {
-                    // The pool has been dropped, so this worker is not needed.
-                    return;
-                }
 
                 // Create the expensive DfTract model ONCE on this thread.
                 let df_params = &*MODEL_PARAMS;
                 let rt_params = create_runtime_params();
+                let mut model = match DfTract::new(df_params.clone(), &rt_params) {
+                    Ok(model) => model,
+                    Err(err) => {
+                        error!(
+                            worker_index,
+                            error = %err,
+                            "Failed to create DfTract model in noise-filter worker"
+                        );
+                        let _ = init_tx_clone.send(false);
+                        return;
+                    }
+                };
 
-                // Log the configuration being used
+                // Provide this worker's sender to the pool only after the model is ready.
+                if pool_tx_clone.blocking_send(worker_task_tx).is_err() {
+                    let _ = init_tx_clone.send(false);
+                    return;
+                }
+                let _ = init_tx_clone.send(true);
+                drop(init_tx_clone);
+
                 info!(
+                    worker_index,
                     "DeepFilterNet initialized with post-filter enabled for optimal noise reduction"
                 );
-                let mut model = DfTract::new(df_params.clone(), &rt_params)
-                    .expect("Failed to create DfTract model in worker thread");
                 let mut skip_counter = 0usize;
 
                 // The worker's main loop. It blocks efficiently until a task arrives.
@@ -110,51 +132,117 @@ pub mod implementation {
                     // Send result back to the caller. Ignore error if caller hung up.
                     let _ = result_tx.send(result);
                 }
-            });
+                })
+            {
+                Ok(_) => launched += 1,
+                Err(err) => {
+                    error!(
+                        worker_index,
+                        error = %err,
+                        "Failed to spawn noise-filter worker thread"
+                    );
+                }
+            }
         }
 
-        (pool_tx, Arc::new(Mutex::new(pool_rx)))
+        drop(init_tx);
+        let initialized = init_rx
+            .into_iter()
+            .take(launched)
+            .filter(|ready| *ready)
+            .count();
+        live_workers.store(initialized, Ordering::Release);
+        if initialized == 0 {
+            error!("Noise-filter worker pool initialized with no live workers");
+        } else if initialized < pool_size {
+            error!(
+                initialized,
+                requested = pool_size,
+                "Noise-filter worker pool initialized with fewer workers than requested"
+            );
+        }
+
+        (
+            pool_tx,
+            Arc::new(Mutex::new(pool_rx)),
+            live_workers,
+            worker_death,
+        )
     });
+
+    fn mark_worker_dead(live_workers: &Arc<AtomicUsize>, worker_death: &Arc<Notify>) {
+        let mut current = live_workers.load(Ordering::Acquire);
+        while current > 0 {
+            match live_workers.compare_exchange_weak(
+                current,
+                current - 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(next) => current = next,
+            }
+        }
+        worker_death.notify_waiters();
+        worker_death.notify_one();
+    }
 
     /// RAII guard that holds a worker sender checked out from the pool.
     /// On drop, it automatically returns the sender to the pool for reuse.
     struct PooledWorkerSender {
         sender: Option<mpsc::Sender<WorkerTask>>,
         pool_tx: mpsc::Sender<mpsc::Sender<WorkerTask>>,
+        live_workers: Arc<AtomicUsize>,
+        worker_death: Arc<Notify>,
     }
 
     impl Drop for PooledWorkerSender {
         fn drop(&mut self) {
             if let Some(sender) = self.sender.take() {
-                // Best-effort attempt to return the sender.
-                // If the pool is full or closed, the sender is dropped, and the worker will eventually exit.
-                let _ = self.pool_tx.try_send(sender);
+                if sender.is_closed() {
+                    mark_worker_dead(&self.live_workers, &self.worker_death);
+                    return;
+                }
+                // Best-effort attempt to return the sender. If this fails, dropping this sender closes that
+                // worker's task channel, so the live count is reduced and waiters are woken.
+                if self.pool_tx.try_send(sender).is_err() {
+                    mark_worker_dead(&self.live_workers, &self.worker_death);
+                }
             }
-        }
-    }
-
-    impl Deref for PooledWorkerSender {
-        type Target = mpsc::Sender<WorkerTask>;
-        fn deref(&self) -> &Self::Target {
-            self.sender.as_ref().expect("Sender should always be Some")
         }
     }
 
     /// Asynchronously checks out a worker sender from the pool.
     /// It will wait efficiently if the pool is empty.
-    async fn get_sender() -> PooledWorkerSender {
-        let (pool_tx, pool_rx_mutex) = &*SENDER_POOL;
-        let sender = {
+    async fn get_sender() -> Result<PooledWorkerSender, Box<dyn std::error::Error + Send + Sync>> {
+        let (pool_tx, pool_rx_mutex, live_workers, worker_death) = &*SENDER_POOL;
+        loop {
+            if live_workers.load(Ordering::Acquire) == 0 {
+                return Err("Noise-filter worker pool has no live workers".into());
+            }
+
             // Lock the mutex asynchronously. The guard is Send and can be held across an await.
             let mut pool_rx = pool_rx_mutex.lock().await;
-            pool_rx.recv().await.expect(
-                "Worker pool channel closed unexpectedly. All worker threads may have died.",
-            )
-        };
+            let Some(sender) = (tokio::select! {
+                maybe_sender = pool_rx.recv() => maybe_sender,
+                _ = worker_death.notified() => continue,
+                _ = tokio::time::sleep(Duration::from_secs(1)) => continue,
+            }) else {
+                return Err("Noise-filter worker pool channel closed unexpectedly".into());
+            };
+            drop(pool_rx);
 
-        PooledWorkerSender {
-            sender: Some(sender),
-            pool_tx: pool_tx.clone(),
+            if sender.is_closed() {
+                mark_worker_dead(live_workers, worker_death);
+                continue;
+            }
+
+            return Ok(PooledWorkerSender {
+                sender: Some(sender),
+                pool_tx: pool_tx.clone(),
+                live_workers: live_workers.clone(),
+                worker_death: worker_death.clone(),
+            });
         }
     }
 
@@ -253,8 +341,11 @@ pub mod implementation {
             df.process(frame, out.view_mut())?;
 
             // Direct memory copy for efficiency
-            let out_slice = out.as_slice().unwrap();
-            enhanced.extend_from_slice(out_slice);
+            if let Some(out_slice) = out.as_slice() {
+                enhanced.extend_from_slice(out_slice);
+            } else {
+                enhanced.extend(out.iter().copied());
+            }
             idx += hop;
         }
 
@@ -267,7 +358,11 @@ pub mod implementation {
                 let frame = ArrayView2::from_shape((1, hop), &padded_frame)?;
                 let mut out = Array2::<f32>::zeros((1, hop));
                 df.process(frame, out.view_mut())?;
-                enhanced.extend_from_slice(&out.as_slice().unwrap()[..remaining]);
+                if let Some(out_slice) = out.as_slice() {
+                    enhanced.extend_from_slice(&out_slice[..remaining]);
+                } else {
+                    enhanced.extend(out.iter().take(remaining).copied());
+                }
             } else {
                 enhanced.extend_from_slice(&wav[idx..]);
             }
@@ -407,13 +502,16 @@ pub mod implementation {
         sample_rate: u32,
     ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
         // 1. Asynchronously get a sender to a free worker.
-        let sender = get_sender().await;
+        let sender = get_sender().await?;
 
         // 2. Create a one-shot channel to receive the result.
         let (response_tx, response_rx) = oneshot::channel();
 
         // 3. Send the task to the worker. If it fails, the worker thread has likely died.
-        sender
+        let Some(worker_tx) = sender.sender.as_ref() else {
+            return Err("Noise-filter worker sender was unavailable after checkout".into());
+        };
+        worker_tx
             .send((pcm, sample_rate, response_tx))
             .await
             .map_err(|_| "Failed to send task to worker thread.")?;
@@ -422,6 +520,42 @@ pub mod implementation {
         response_rx
             .await
             .map_err(|_| "Worker thread panicked or channel closed while processing.")?
+    }
+
+    #[cfg(test)]
+    mod worker_pool_tests {
+        use super::*;
+
+        #[test]
+        fn closed_worker_sender_is_not_returned_to_pool() {
+            let (pool_tx, mut pool_rx) = mpsc::channel::<WorkerSender>(1);
+            let live_workers = Arc::new(AtomicUsize::new(1));
+            let worker_death = Arc::new(Notify::new());
+            let (worker_tx, worker_rx) = mpsc::channel::<WorkerTask>(1);
+            drop(worker_rx);
+
+            {
+                let _checked_out = PooledWorkerSender {
+                    sender: Some(worker_tx),
+                    pool_tx,
+                    live_workers: live_workers.clone(),
+                    worker_death: worker_death.clone(),
+                };
+            }
+
+            assert_eq!(live_workers.load(Ordering::Acquire), 0);
+            assert!(pool_rx.try_recv().is_err());
+        }
+
+        #[test]
+        fn worker_death_count_saturates_at_zero() {
+            let live_workers = Arc::new(AtomicUsize::new(0));
+            let worker_death = Arc::new(Notify::new());
+
+            mark_worker_dead(&live_workers, &worker_death);
+
+            assert_eq!(live_workers.load(Ordering::Acquire), 0);
+        }
     }
 }
 #[cfg(not(feature = "noise-filter"))]

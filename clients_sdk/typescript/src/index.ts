@@ -35,8 +35,16 @@
 export type {
   STTConfig,
   TTSConfig,
+  TranslationConfig,
   Pronunciation,
   LiveKitConfig,
+  SessionConfig,
+  Emotion,
+  DeliveryStyle,
+  EmotionIntensityLevel,
+  VoiceDescriptor,
+  VoiceGender,
+  VoiceAge,
 } from './types/config.js';
 export {
   DEFAULT_STT_CONFIG,
@@ -45,11 +53,42 @@ export {
   createTTSConfig,
 } from './types/config.js';
 
+// Canonical language value space (P2 unified-language system): the region-qualified BCP-47 tokens
+// the gateway maps to each provider's native notation, plus the per-provider capability accessor.
+export {
+  CANONICAL_LANGUAGES,
+  isCanonicalLanguage,
+  languageCapabilities,
+} from './types/canonical-languages.js';
+export type {
+  CanonicalLanguage,
+  LanguageNotation,
+  LanguageCapabilities,
+  CanonicalLanguageInfo,
+  ProviderLanguageSupport,
+  LanguageCapabilitiesResponse,
+} from './types/canonical-languages.js';
+
+// Conversation / agent-loop config (the flagship LLM + reasoning surface).
+export type {
+  ConversationConfig,
+  AdapterKind,
+  ReasoningEffort,
+  LatencyFiller,
+  RoutingMode,
+  MuteStrategy,
+} from './types/conversation.js';
+export { conversationConfigToWire } from './types/conversation.js';
+
+// config_warning typed advisory.
+export type { ConfigWarningEvent, ConfigWarningCode, ConfigWarningMessage } from './types/warnings.js';
+
 export type {
   ConfigMessage,
   SpeakMessage,
   IncomingMessage,
   ReadyMessage,
+  ResolvedAlias,
   STTResultMessage,
   ErrorMessage,
   OutgoingMessage,
@@ -83,6 +122,8 @@ export type {
   TrackInfo,
   RoomListResponse,
   LiveKitConnectOptions,
+  RemoveParticipantResponse,
+  MuteParticipantResponse,
 } from './types/livekit.js';
 
 export type {
@@ -91,6 +132,7 @@ export type {
   SIPHookCreateRequest,
   SIPHookCreateResponse,
   SIPTransferRequest,
+  SIPTransferResponse,
   SIPTransferResult,
 } from './types/sip.js';
 
@@ -149,6 +191,10 @@ export type {
   DAGDefinition,
   DAGConfig,
   DAGValidationResult,
+  DAGTemplateInfo,
+  DAGTemplateListResponse,
+  DAGTemplateDetail,
+  DAGValidateResponse,
 } from './types/dag.js';
 export {
   DAG_NODE_TYPES,
@@ -177,6 +223,11 @@ export {
 
 // Voice cloning and recording types
 export type {
+  VoiceCloneProvider,
+  VoiceCloneRequest,
+  VoiceCloneResponse,
+  VoiceCloneStatus,
+  CloneMode,
   VoiceCloneFilter,
   RecordingStatus,
   RecordingFormat,
@@ -185,7 +236,7 @@ export type {
   RecordingDownloadOptions,
   RecordingList,
 } from './types/voice.js';
-export { VOICE_CLONE_PROVIDERS } from './types/voice.js';
+export { VOICE_CLONE_PROVIDERS, isTerminalCloneStatus } from './types/voice.js';
 
 // Errors
 export * from './errors/index.js';
@@ -207,8 +258,13 @@ export {
   deserializeMessage,
   createConfigMessage,
   createSpeakMessage,
+  createClearMessage,
+  createAudioEndMessage,
+  createSendMessageMessage,
 } from './ws/index.js';
 export type {
+  SDKConfigMessage,
+  SDKOutgoingMessage,
   SessionConfig as WSSessionConfig,
   SessionState,
   WebSocketConnectionOptions,
@@ -222,6 +278,7 @@ export type {
   AudioEvent,
   ReadyEvent,
   SessionErrorEvent,
+  ConfigWarningEvent as WSConfigWarningEvent,
   ConnectionStateEvent,
   MetricsEvent,
   ReconnectEvent,
@@ -236,8 +293,12 @@ export * from './audio/index.js';
 export * from './pipelines/index.js';
 
 // Main Client
-export { BudClient, createBudClient } from './bud.js';
+export { BudClient, createBudClient, DEFAULT_GATEWAY_URL, GATEWAY_URL_ENV } from './bud.js';
 export type { BudClientConfig } from './bud.js';
+
+// Agent (flagship conversation loop) — re-export for direct import.
+export { AgentSession, buildAgentSessionConfig } from './pipelines/agent.js';
+export type { AgentConfig, AgentTurnConfig } from './pipelines/agent.js';
 
 // Version
 export const VERSION = '0.1.0';

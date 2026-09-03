@@ -23,10 +23,13 @@ use super::config::{
     API_KEY_HEADER, LIB_HEADER, LIB_VALUE, MAX_AUDIO_SIZE_BYTES, NectecSttConfig, NectecSttModel,
     Partii4Response, Partii5Response,
 };
+use crate::core::stt::http_resilience::HttpBreaker;
+
 use crate::core::stt::base::{
     BaseSTT, STTConfig, STTConnectionState, STTError, STTErrorCallback, STTResult,
     STTResultCallback,
 };
+use crate::core::stt::wav as stt_wav;
 use bytes::Bytes;
 use reqwest::Client;
 use reqwest::multipart::{Form, Part};
@@ -52,7 +55,7 @@ pub struct NectecStt {
     /// Base STT configuration.
     base_config: Option<STTConfig>,
     /// HTTP client for REST API calls.
-    http_client: Client,
+    http_client: Option<Client>,
     /// Whether the client is ready to receive audio.
     is_ready: AtomicBool,
     /// Current connection state.
@@ -63,9 +66,60 @@ pub struct NectecStt {
     result_callback: Arc<RwLock<Option<STTResultCallback>>>,
     /// Error callback.
     error_callback: Arc<RwLock<Option<STTErrorCallback>>>,
+    /// Shared per-provider circuit breaker for the REST transport (uniform with the WS fleet):
+    /// consulted before each upstream call (Partii4/Partii5), fed by the unified HTTP status
+    /// classification. Inert until `set_resilience` injects the process-global handles (W-D2).
+    resilience: HttpBreaker,
+}
+
+fn nectec_stt_http_client(timeout_secs: u64) -> Result<Client, reqwest::Error> {
+    crate::core::net::ssrf_protected_client_builder(crate::core::net::HTTP_URL_SCHEMES)
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .build()
+}
+
+fn default_nectec_stt_http_client() -> Option<Client> {
+    match nectec_stt_http_client(super::config::DEFAULT_REQUEST_TIMEOUT) {
+        Ok(client) => Some(client),
+        Err(err) => {
+            warn!(
+                error = %err,
+                "failed to create default NECTEC STT HTTP client; default instance is inert until rebuilt with a valid config"
+            );
+            None
+        }
+    }
 }
 
 impl NectecStt {
+    /// W1 keystone — construct from the standardized config. NECTEC is a simple batch Thai-only
+    /// engine (Partii4/Partii5) whose config exposes none of the standardized advanced features, so
+    /// this is a uniform standardized entry point that delegates to `from_standard` (a pure
+    /// `from_base` passthrough): the base config carries through and every advanced feature is a
+    /// capability gap left at default.
+    pub fn new_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        let nectec_config = NectecSttConfig::from_standard(std)?;
+
+        let timeout_secs = nectec_config.request_timeout_secs;
+        let http_client = nectec_stt_http_client(timeout_secs).map_err(|e| {
+            STTError::ConfigurationError(format!("Failed to create HTTP client: {e}"))
+        })?;
+
+        Ok(Self {
+            config: nectec_config,
+            base_config: Some(std.base.clone()),
+            http_client: Some(http_client),
+            is_ready: AtomicBool::new(false),
+            connection_state: Arc::new(RwLock::new(STTConnectionState::Disconnected)),
+            audio_buffer: Arc::new(RwLock::new(Vec::with_capacity(MAX_AUDIO_BUFFER_SIZE))),
+            result_callback: Arc::new(RwLock::new(None)),
+            error_callback: Arc::new(RwLock::new(None)),
+            resilience: HttpBreaker::new("nectec"),
+        })
+    }
+
     /// Process buffered audio and get transcription using Partii5.
     async fn process_partii5(&self, wav_data: Vec<u8>) -> Result<String, STTError> {
         debug!("NECTEC STT: Sending {} bytes to Partii5", wav_data.len());
@@ -77,17 +131,33 @@ impl NectecStt {
 
         let form = Form::new().part("file", part);
 
-        let response = self
-            .http_client
-            .post(self.config.endpoint())
+        let http_client = self.http_client.as_ref().ok_or_else(|| {
+            STTError::ConfigurationError(
+                "NECTEC STT default HTTP client is unavailable; construct with NectecStt::new or new_standard".to_string(),
+            )
+        })?;
+
+        // Consult the shared per-provider breaker before paying the upstream round-trip: an
+        // open breaker fails fast with a typed classified refusal (uniform with the WS fleet).
+        self.resilience.check()?;
+
+        let response = http_client
+            .post(crate::core::tts::standard::override_rest_endpoint(
+                self.config.endpoint(),
+                self.config.endpoint_override.as_deref(),
+            ))
             .header(API_KEY_HEADER, &self.config.api_key)
             .header(LIB_HEADER, LIB_VALUE)
             .multipart(form)
             .send()
             .await
-            .map_err(|e| STTError::NetworkError(format!("Failed to send STT request: {e}")))?;
+            .map_err(|e| {
+                self.resilience.record_send_error();
+                STTError::NetworkError(format!("Failed to send STT request: {e}"))
+            })?;
 
         let status = response.status();
+        self.resilience.record_status(status);
 
         if !status.is_success() {
             let body = response
@@ -159,18 +229,34 @@ impl NectecStt {
                 self.config.output_format.as_param().to_string(),
             );
 
-        let response = self
-            .http_client
-            .post(self.config.endpoint())
+        let http_client = self.http_client.as_ref().ok_or_else(|| {
+            STTError::ConfigurationError(
+                "NECTEC STT default HTTP client is unavailable; construct with NectecStt::new or new_standard".to_string(),
+            )
+        })?;
+
+        // Consult the shared per-provider breaker before paying the upstream round-trip: an
+        // open breaker fails fast with a typed classified refusal (uniform with the WS fleet).
+        self.resilience.check()?;
+
+        let response = http_client
+            .post(crate::core::tts::standard::override_rest_endpoint(
+                self.config.endpoint(),
+                self.config.endpoint_override.as_deref(),
+            ))
             .header(API_KEY_HEADER, &self.config.api_key)
             .header("Cache-Control", "no-cache")
             .header("Connection", "keep-alive")
             .multipart(form)
             .send()
             .await
-            .map_err(|e| STTError::NetworkError(format!("Failed to send STT request: {e}")))?;
+            .map_err(|e| {
+                self.resilience.record_send_error();
+                STTError::NetworkError(format!("Failed to send STT request: {e}"))
+            })?;
 
         let status = response.status();
+        self.resilience.record_status(status);
 
         if !status.is_success() {
             let body = response
@@ -252,7 +338,7 @@ impl NectecStt {
         );
 
         // Build WAV header for raw PCM data
-        let wav_data = self.wrap_in_wav(&audio_data);
+        let wav_data = self.wrap_in_wav(&audio_data)?;
 
         // Route to appropriate model
         match self.config.model {
@@ -262,38 +348,9 @@ impl NectecStt {
     }
 
     /// Wrap raw PCM data in a WAV container.
-    fn wrap_in_wav(&self, pcm_data: &[u8]) -> Vec<u8> {
-        let sample_rate = self.config.sample_rate;
-        let channels = self.config.channels;
-        let bits_per_sample: u16 = 16;
-        let byte_rate = sample_rate * u32::from(channels) * u32::from(bits_per_sample) / 8;
-        let block_align = channels * bits_per_sample / 8;
-        let data_size = pcm_data.len() as u32;
-        let file_size = 36 + data_size;
-
-        let mut wav = Vec::with_capacity(44 + pcm_data.len());
-
-        // RIFF header
-        wav.extend_from_slice(b"RIFF");
-        wav.extend_from_slice(&file_size.to_le_bytes());
-        wav.extend_from_slice(b"WAVE");
-
-        // fmt chunk
-        wav.extend_from_slice(b"fmt ");
-        wav.extend_from_slice(&16u32.to_le_bytes()); // chunk size
-        wav.extend_from_slice(&1u16.to_le_bytes()); // audio format (PCM)
-        wav.extend_from_slice(&channels.to_le_bytes());
-        wav.extend_from_slice(&sample_rate.to_le_bytes());
-        wav.extend_from_slice(&byte_rate.to_le_bytes());
-        wav.extend_from_slice(&block_align.to_le_bytes());
-        wav.extend_from_slice(&bits_per_sample.to_le_bytes());
-
-        // data chunk
-        wav.extend_from_slice(b"data");
-        wav.extend_from_slice(&data_size.to_le_bytes());
-        wav.extend_from_slice(pcm_data);
-
-        wav
+    fn wrap_in_wav(&self, pcm_data: &[u8]) -> Result<Vec<u8>, STTError> {
+        stt_wav::encode_pcm16_wav(pcm_data, self.config.sample_rate, self.config.channels)
+            .map_err(|e| STTError::AudioProcessingError(format!("Invalid WAV parameters: {e}")))
     }
 
     /// Flush the audio buffer and get transcription.
@@ -335,6 +392,13 @@ impl NectecStt {
     pub async fn buffer_size(&self) -> usize {
         self.audio_buffer.read().await.len()
     }
+
+    /// The shared circuit breaker this client feeds, if the process-global resilience handles
+    /// have been injected (W-D2). Two `NectecStt` built from the same
+    /// [`crate::core::resilience::ResilienceRegistry`] return the *same* `Arc`.
+    pub fn resilience_breaker(&self) -> Option<&Arc<crate::core::resilience::CircuitBreaker>> {
+        self.resilience.breaker()
+    }
 }
 
 impl Default for NectecStt {
@@ -342,12 +406,13 @@ impl Default for NectecStt {
         Self {
             config: NectecSttConfig::default(),
             base_config: None,
-            http_client: Client::new(),
+            http_client: default_nectec_stt_http_client(),
             is_ready: AtomicBool::new(false),
             connection_state: Arc::new(RwLock::new(STTConnectionState::Disconnected)),
             audio_buffer: Arc::new(RwLock::new(Vec::with_capacity(MAX_AUDIO_BUFFER_SIZE))),
             result_callback: Arc::new(RwLock::new(None)),
             error_callback: Arc::new(RwLock::new(None)),
+            resilience: HttpBreaker::new("nectec"),
         }
     }
 }
@@ -358,12 +423,9 @@ impl BaseSTT for NectecStt {
         let nectec_config = NectecSttConfig::from_base(&config)?;
 
         let timeout_secs = nectec_config.request_timeout_secs;
-        let http_client = Client::builder()
-            .timeout(std::time::Duration::from_secs(timeout_secs))
-            .build()
-            .map_err(|e| {
-                STTError::ConfigurationError(format!("Failed to create HTTP client: {e}"))
-            })?;
+        let http_client = nectec_stt_http_client(timeout_secs).map_err(|e| {
+            STTError::ConfigurationError(format!("Failed to create HTTP client: {e}"))
+        })?;
 
         info!(
             "NECTEC STT: Initialized with model={}, sample_rate={}, channels={}",
@@ -373,12 +435,13 @@ impl BaseSTT for NectecStt {
         Ok(Self {
             config: nectec_config,
             base_config: Some(config),
-            http_client,
+            http_client: Some(http_client),
             is_ready: AtomicBool::new(false),
             connection_state: Arc::new(RwLock::new(STTConnectionState::Disconnected)),
             audio_buffer: Arc::new(RwLock::new(Vec::with_capacity(MAX_AUDIO_BUFFER_SIZE))),
             result_callback: Arc::new(RwLock::new(None)),
             error_callback: Arc::new(RwLock::new(None)),
+            resilience: HttpBreaker::new("nectec"),
         })
     }
 
@@ -507,6 +570,13 @@ impl BaseSTT for NectecStt {
     fn get_provider_info(&self) -> &'static str {
         "NECTEC AI for Thai (Partii) - Thai language speech recognition"
     }
+
+    /// W-D2: attach the shared per-provider circuit breaker so every NECTEC session trips
+    /// (and observes) the SAME breaker, uniform with the WS fleet. The REST transport consults
+    /// it before each upstream call and feeds it the unified HTTP status classification.
+    fn set_resilience(&mut self, resilience: crate::core::resilience::ResilienceHandles) {
+        self.resilience.set_handles(resilience);
+    }
 }
 
 // =============================================================================
@@ -549,6 +619,77 @@ mod tests {
         assert_eq!(stt.config.model, NectecSttModel::Partii5);
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn nectec_stt_redirect_policy_rejects_private_hop() {
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local redirect test server");
+        let addr = listener.local_addr().expect("local addr");
+
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 1024];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 302 Found\r\n",
+                "Location: http://127.0.0.1:9/metadata\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n"
+            );
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await;
+        });
+
+        let stt = NectecStt::new(STTConfig {
+            api_key: "test_key".to_string(),
+            sample_rate: 16000,
+            channels: 1,
+            ..Default::default()
+        })
+        .expect("construct NECTEC STT");
+        let err = stt
+            .http_client
+            .as_ref()
+            .expect("strict constructor builds an HTTP client")
+            .get(format!("http://{addr}/start"))
+            .send()
+            .await
+            .expect_err("private redirect target must be rejected");
+        let mut error_chain = err.to_string();
+        let mut source = std::error::Error::source(&err);
+        while let Some(err) = source {
+            error_chain.push_str(": ");
+            error_chain.push_str(&err.to_string());
+            source = err.source();
+        }
+        assert!(error_chain.contains("SSRF protection"), "{error_chain}");
+    }
+
+    #[tokio::test]
+    async fn default_without_http_client_returns_typed_error_without_panic() {
+        let mut stt = NectecStt::default();
+        stt.http_client = None;
+
+        let err = stt
+            .process_audio(vec![0; MIN_AUDIO_BUFFER_SIZE])
+            .await
+            .expect_err("inert default client must fail with a typed error");
+
+        match err {
+            STTError::ConfigurationError(msg) => {
+                assert!(msg.contains("default HTTP client"), "{msg}");
+            }
+            other => panic!("expected ConfigurationError, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_new_with_partii4() {
         let config = STTConfig {
@@ -562,6 +703,36 @@ mod tests {
         assert!(result.is_ok());
         let stt = result.unwrap();
         assert_eq!(stt.config.model, NectecSttModel::Partii4);
+    }
+
+    // W1 keystone: NECTEC exposes no mappable advanced features, so the meaningful assertion is
+    // that the base config survives through `new_standard` onto the provider config (api_key,
+    // model) even when advanced features are requested (capability gaps, intentionally dropped) —
+    // proving the standardized path is wired.
+    #[test]
+    fn test_nectec_new_standard_carries_base() {
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "nectec".into(),
+                api_key: "test_key".into(),
+                model: "partii4".into(),
+                sample_rate: 16000,
+                channels: 1,
+                ..Default::default()
+            },
+            // Advanced features the provider cannot express; must not break the standardized path.
+            features: SttFeatures {
+                diarization: Some(true),
+                word_timestamps: Some(true),
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+            translation: None,
+        };
+        let stt = NectecStt::new_standard(&std).unwrap();
+        assert_eq!(stt.config.api_key, "test_key"); // base api_key survived
+        assert_eq!(stt.config.model, NectecSttModel::Partii4); // base model survived
     }
 
     #[test]
@@ -583,7 +754,7 @@ mod tests {
         let stt = NectecStt::new(config).unwrap();
 
         let pcm_data = vec![0u8; 1000];
-        let wav_data = stt.wrap_in_wav(&pcm_data);
+        let wav_data = stt.wrap_in_wav(&pcm_data).expect("valid WAV header");
 
         // Check WAV header
         assert_eq!(&wav_data[0..4], b"RIFF");

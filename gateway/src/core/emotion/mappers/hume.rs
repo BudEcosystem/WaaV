@@ -70,6 +70,29 @@ impl HumeEmotionMapper {
             Emotion::Embarrassed => "embarrassed, sheepish, awkward",
             Emotion::Content => "content, satisfied, at peace",
             Emotion::Bored => "bored, uninterested, disengaged",
+            // P4 widened affective states.
+            Emotion::Amazed => "amazed, awestruck",
+            Emotion::Amused => "amused, entertained",
+            Emotion::Affectionate => "affectionate, warm, loving",
+            Emotion::Intrigued => "intrigued, drawn in",
+            Emotion::Flirtatious => "flirtatious, playful, teasing",
+            Emotion::Frustrated => "frustrated, exasperated",
+            Emotion::Annoyed => "annoyed, irritated",
+            Emotion::Determined => "determined, resolute, driven",
+            Emotion::Reassuring => "reassuring, soothing, comforting",
+            Emotion::Sympathetic => "sympathetic, commiserating",
+            Emotion::Nostalgic => "nostalgic, fondly remembering",
+            Emotion::Serene => "serene, deeply peaceful, tranquil",
+            Emotion::Terrified => "terrified, petrified",
+            Emotion::Ecstatic => "ecstatic, euphoric, elated",
+            Emotion::Skeptical => "skeptical, doubtful, unconvinced",
+            Emotion::Relieved => "relieved, unburdened",
+            Emotion::Panicked => "panicked, alarmed, overwhelmed",
+            Emotion::Concerned => "concerned, worried",
+            Emotion::Apologetic => "apologetic, contrite",
+            Emotion::Resigned => "resigned, accepting",
+            Emotion::Wistful => "wistful, yearning, bittersweet",
+            Emotion::Contemplative => "contemplative, reflective, pensive",
         };
 
         // Add intensity modifier
@@ -95,11 +118,23 @@ impl HumeEmotionMapper {
             DeliveryStyle::Professional => Some("professional, business-like"),
             DeliveryStyle::Casual => Some("casual, conversational"),
             DeliveryStyle::Storytelling => Some("storytelling, narrative, engaging"),
-            DeliveryStyle::Soft => Some("soft, gentle, tender"),
             DeliveryStyle::Loud => Some("loud, strong, emphatic"),
-            DeliveryStyle::Cheerful => Some("cheerful, upbeat, bright"),
-            DeliveryStyle::Serious => Some("serious, grave, solemn"),
             DeliveryStyle::Formal => Some("formal, proper, polished"),
+            DeliveryStyle::Gentle => Some("gentle, soft-spoken, tender"),
+            DeliveryStyle::Newscast => Some("news-anchor, authoritative"),
+            DeliveryStyle::NewscastCasual => Some("relaxed news-anchor"),
+            DeliveryStyle::NewscastFormal => Some("formal news-anchor"),
+            DeliveryStyle::CustomerService => Some("helpful, customer-service"),
+            DeliveryStyle::Assistant => Some("friendly, assistant-like"),
+            DeliveryStyle::Chat => Some("light, conversational"),
+            DeliveryStyle::AdvertisementUpbeat => Some("upbeat, promotional"),
+            DeliveryStyle::SportsCommentary => Some("lively sports commentary"),
+            DeliveryStyle::SportsCommentaryExcited => Some("high-energy sports commentary"),
+            DeliveryStyle::DocumentaryNarration => Some("measured documentary narration"),
+            DeliveryStyle::NarrationProfessional => Some("polished narration"),
+            DeliveryStyle::NarrationRelaxed => Some("relaxed narration"),
+            DeliveryStyle::PoetryReading => Some("lyrical poetry reading"),
+            DeliveryStyle::Lyrical => Some("lyrical, flowing"),
         }
     }
 
@@ -126,7 +161,7 @@ impl HumeEmotionMapper {
         let truncated = &description[..safe_end];
 
         // Find last comma or space before the limit for word boundary
-        if let Some(pos) = truncated.rfind(|c| c == ',' || c == ' ') {
+        if let Some(pos) = truncated.rfind([',', ' ']) {
             // Trim both whitespace and trailing commas
             description[..pos]
                 .trim()
@@ -181,10 +216,10 @@ impl EmotionMapper for HumeEmotionMapper {
         }
 
         // Add style description
-        if let Some(style) = &config.style {
-            if let Some(style_desc) = Self::style_to_description(style) {
-                parts.push(style_desc.to_string());
-            }
+        if let Some(style) = &config.style
+            && let Some(style_desc) = Self::style_to_description(style)
+        {
+            parts.push(style_desc.to_string());
         }
 
         // Add context if it provides useful hints
@@ -344,30 +379,12 @@ mod tests {
     fn test_hume_mapper_all_delivery_styles() {
         let mapper = HumeEmotionMapper::new();
 
-        let styles = [
-            DeliveryStyle::Normal,
-            DeliveryStyle::Whispered,
-            DeliveryStyle::Shouted,
-            DeliveryStyle::Rushed,
-            DeliveryStyle::Measured,
-            DeliveryStyle::Monotone,
-            DeliveryStyle::Expressive,
-            DeliveryStyle::Professional,
-            DeliveryStyle::Casual,
-            DeliveryStyle::Storytelling,
-            DeliveryStyle::Soft,
-            DeliveryStyle::Loud,
-            DeliveryStyle::Cheerful,
-            DeliveryStyle::Serious,
-            DeliveryStyle::Formal,
-        ];
-
-        for style in styles {
-            let config = EmotionConfig::new().emotion(Emotion::Happy).style(style);
+        for style in DeliveryStyle::all() {
+            let config = EmotionConfig::new().emotion(Emotion::Happy).style(*style);
 
             let mapped = mapper.map_emotion(&config);
 
-            if style != DeliveryStyle::Normal {
+            if *style != DeliveryStyle::Normal {
                 let desc = mapped.description.unwrap();
                 assert!(
                     !desc.is_empty(),

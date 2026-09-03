@@ -8,6 +8,15 @@ use std::fmt;
 
 use crate::core::tts::base::{TTSConfig, TTSError, TTSResult};
 
+fn validate_cereproc_tts_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 // =============================================================================
 // Audio Format Enum
 // =============================================================================
@@ -256,6 +265,8 @@ pub struct CereprocTtsConfig {
     pub include_metadata: bool,
     /// Default emotion for the voice (if supported)
     pub emotion: Option<CereprocEmotion>,
+    /// Optional REST endpoint base (scheme+host) override for auth/synth POSTs (test redirection).
+    pub endpoint_override: Option<String>,
 }
 
 impl CereprocTtsConfig {
@@ -320,7 +331,98 @@ impl CereprocTtsConfig {
             audio_3d,
             include_metadata,
             emotion,
+            endpoint_override: None,
         })
+    }
+
+    /// Build from the standardized TTS config (W1 keystone). CereProc expresses emotion through
+    /// custom SSML `<emotion>` tags, so [`TtsFeatures::emotion`] maps to the `emotion` field (using
+    /// the same Happy/Sad/Calm/Cross vocabulary as `from_base`), and [`TtsFeatures::sample_rate`]
+    /// overrides the output `sample_rate` (clamped to the supported range). The non-standard
+    /// `audio_3d` / `include_metadata` knobs are read from the `extras` passthrough.
+    ///
+    /// # Capability gaps on the v2 `/speak` synthesis endpoint
+    ///
+    /// The CereVoice Cloud **v2 REST** `/speak` endpoint this provider targets
+    /// (`https://api.cerevoice.com/v2/speak`) is controlled solely by the query parameters
+    /// `voice`, `audioFormat`, `sampleRate`, `audio3D`, `metadata` (see
+    /// [`build_query_params`]) plus the XML/SSML body. It has **no** `lang`/`language`,
+    /// `accent`, or `streaming` synthesis parameter:
+    ///
+    /// - **`language`** — not a `/speak` parameter. On the v2 REST API the spoken language is
+    ///   determined entirely by the chosen `voice`; `language` is a field only on the *voice
+    ///   metadata* (`VoiceInfo.language`) and on *lexicon/abbreviation uploads*
+    ///   (`LexiconInfo.language`), never on synthesis. Confirmed against the published CereVoice
+    ///   Cloud client surface (`SpeakExtendedInput` exposes only voice/text/audioFormat/sampleRate/
+    ///   audio3D/metadata). So [`TtsFeatures::language`] is a **capability gap** here and is left
+    ///   unwired rather than fabricated onto the wire.
+    /// - **`accent`** — not a `/speak` parameter either; the accent is implicit in the `voice`
+    ///   (e.g. "Stuart" is Scottish English). `accent` appears only on lexicon uploads
+    ///   (`LexiconInfo.accent`). The `extras["accent"]` value is therefore intentionally **not**
+    ///   forwarded to `/speak` (capability gap).
+    /// - **`streaming`** — the v2 `/speak` endpoint returns a `fileUrl` to a fully-rendered audio
+    ///   file (download model), not a chunked/streamed body, so there is no streaming flag to set
+    ///   ([`TtsFeatures::streaming`] is a capability gap).
+    ///
+    /// Other features CereProc has no field for (speed, pitch, volume, stability,
+    /// similarity_boost, style, use_speaker_boost, instructions, ssml, word_timestamps, seed) are
+    /// likewise skipped.
+    ///
+    /// [`TtsFeatures::emotion`]: crate::core::tts::standard::TtsFeatures::emotion
+    /// [`TtsFeatures::sample_rate`]: crate::core::tts::standard::TtsFeatures::sample_rate
+    /// [`TtsFeatures::language`]: crate::core::tts::standard::TtsFeatures::language
+    /// [`TtsFeatures::streaming`]: crate::core::tts::standard::TtsFeatures::streaming
+    /// [`build_query_params`]: CereprocTtsConfig::build_query_params
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(&std.base)?;
+
+        // Emotion via CereProc's custom <emotion> SSML tags (Happy/Sad/Calm/Cross).
+        if let Some(emotion) = f.emotion.as_deref() {
+            cfg.emotion = match emotion.to_lowercase().as_str() {
+                "happy" | "excited" | "joyful" => Some(CereprocEmotion::Happy),
+                "sad" | "melancholy" | "sorrowful" => Some(CereprocEmotion::Sad),
+                "calm" | "peaceful" | "relaxed" | "neutral" => Some(CereprocEmotion::Calm),
+                "angry" | "cross" | "frustrated" | "annoyed" => Some(CereprocEmotion::Cross),
+                _ => cfg.emotion, // Unsupported emotion: keep base mapping (default voice).
+            };
+        }
+        if let Some(rate) = f.sample_rate {
+            cfg.sample_rate = rate.clamp(super::MIN_SAMPLE_RATE, super::MAX_SAMPLE_RATE);
+        }
+
+        // NOTE (capability gaps): `features.language`, `features.streaming`, and
+        // `extras["accent"]` are deliberately NOT mapped — the v2 `/speak` endpoint has no
+        // corresponding synthesis parameter (language/accent come from the voice; the endpoint
+        // returns a fileUrl, not a stream). See the doc comment above for the full citation. They
+        // are left unwired rather than fabricated onto the request.
+
+        // Provider-specific passthrough.
+        if let Some(audio_3d) = std.extras.0.get("audio_3d").and_then(|v| v.as_bool()) {
+            cfg.audio_3d = audio_3d;
+        }
+        if let Some(include_metadata) = std
+            .extras
+            .0
+            .get("include_metadata")
+            .and_then(|v| v.as_bool())
+        {
+            cfg.include_metadata = include_metadata;
+        }
+
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
+        cfg.validate_endpoint_override()?;
+
+        Ok(cfg)
+    }
+
+    /// Validate the provider-level endpoint override, when present.
+    pub fn validate_endpoint_override(&self) -> TTSResult<()> {
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_cereproc_tts_endpoint("endpoint_override", endpoint)
+                .map_err(TTSError::InvalidConfiguration)?;
+        }
+        Ok(())
     }
 
     /// Build the query parameters for the speak endpoint
@@ -394,6 +496,90 @@ impl CereprocTtsConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone (TTS): the standardized features CereProc can express (emotion via its custom
+    // <emotion> SSML tags, output sample rate) reach their real fields, and the non-standard
+    // audio_3d / include_metadata knobs flow through the extras passthrough.
+    #[test]
+    fn from_standard_maps_emotion_sample_rate_and_extras() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("audio_3d".into(), serde_json::json!(true));
+        extras.insert("include_metadata".into(), serde_json::json!(true));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "cereproc".into(),
+                api_key: "user@example.com:password123".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                emotion: Some("cheerful".into()), // unsupported -> stays None; see "happy" below
+                sample_rate: Some(16000),
+                ssml: Some(true), // capability gap: CereProc has no ssml flag field, must be ignored
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+        let cfg = CereprocTtsConfig::from_standard(&std).unwrap();
+        assert!(cfg.emotion.is_none()); // "cheerful" is not in CereProc's vocabulary
+        assert_eq!(cfg.sample_rate, 16000);
+        assert!(cfg.audio_3d); // extras passthrough
+        assert!(cfg.include_metadata); // extras passthrough
+
+        // A supported emotion maps to the matching CereprocEmotion variant.
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                api_key: "user@example.com:password123".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                emotion: Some("happy".into()),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let cfg = CereprocTtsConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.emotion, Some(CereprocEmotion::Happy));
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = CereprocTtsConfig::from_base(&TTSConfig {
+            api_key: "user@example.com:password123".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        config.endpoint_override = Some("https://cereproc-proxy.example.com".to_string());
+        assert!(config.validate_endpoint_override().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config
+            .validate_endpoint_override()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(format!("{err:?}").contains("SSRF protection"));
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate_endpoint_override()
+            .expect_err("file endpoint_override must be rejected");
+        assert!(format!("{err:?}").contains("URL scheme"));
+
+        config.endpoint_override = Some("ws://cereproc-proxy.example.com".to_string());
+        let err = config
+            .validate_endpoint_override()
+            .expect_err("WebSocket endpoint_override must be rejected");
+        assert!(format!("{err:?}").contains("URL scheme"));
+
+        let std = crate::core::tts::standard::StandardTTSConfig::from_base(TTSConfig {
+            provider: "cereproc".to_string(),
+            api_key: "user@example.com:password123".to_string(),
+            ..Default::default()
+        })
+        .with_endpoint_override("file:///tmp/socket");
+        assert!(CereprocTtsConfig::from_standard(&std).is_err());
+    }
 
     #[test]
     fn test_audio_format_conversion() {

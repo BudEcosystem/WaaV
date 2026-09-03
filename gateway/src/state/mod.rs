@@ -12,6 +12,7 @@ use crate::utils::req_manager::ReqManager;
 use dashmap::DashMap;
 use object_store::ObjectStore;
 use object_store::aws::AmazonS3Builder;
+use tokio_util::sync::CancellationToken;
 
 mod sip_hooks_state;
 
@@ -37,11 +38,39 @@ pub struct AppState {
     pub active_ws_connections: Arc<AtomicUsize>,
     /// Connection count per IP address (for per-IP limit enforcement)
     pub connections_per_ip: Arc<DashMap<IpAddr, AtomicUsize>>,
+    /// App-wide shutdown signal (RC6 SIGTERM session drain).
+    ///
+    /// Cancelled by `main()` when SIGTERM/SIGINT is received, BEFORE axum's
+    /// graceful drain starts, so every live WebSocket session can send a final
+    /// protocol notice to its client and tear down providers within the drain
+    /// window. `CancellationToken` clones share state, so every `AppState`
+    /// clone (and every session loop selecting on `shutdown.cancelled()`)
+    /// observes the same cancellation.
+    pub shutdown: CancellationToken,
+
+    /// P5 batched-STT job store: `job_id` → [`BatchJob`](crate::core::stt::batch::BatchJob).
+    /// Holds results for async callback jobs and poll-stored synchronous jobs so
+    /// `GET /transcribe/batch/{job_id}` can return them. In-process (single-node); a multi-node
+    /// deployment would back this with a shared store.
+    pub batch_jobs: Arc<DashMap<String, crate::core::stt::batch::BatchJob>>,
 }
 
 impl AppState {
     pub async fn new(config: ServerConfig) -> Arc<Self> {
-        let core_state = CoreState::new(&config).await;
+        Self::try_new(config)
+            .await
+            .unwrap_or_else(|e| panic!("invalid app state config: {e}"))
+    }
+
+    pub async fn try_new(config: ServerConfig) -> Result<Arc<Self>, String> {
+        // Ensure a process-level rustls CryptoProvider is installed before any provider opens a
+        // TLS/WSS connection (e.g. a realtime STT socket). The gateway binary installs this in
+        // main(); doing it here too — idempotently — makes embedding AppState (tests, SDKs, custom
+        // binaries) robust against the "no process-level CryptoProvider" panic. install_default()
+        // returns Err if one is already installed, which we intentionally ignore.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let core_state = CoreState::try_new(&config).await?;
 
         // Initialize LiveKit room handler if API keys are available
         let livekit_room_handler = if let (Some(api_key), Some(api_secret)) =
@@ -208,7 +237,8 @@ impl AppState {
                     config.livekit_url.clone(),
                     api_key.clone(),
                     api_secret.clone(),
-                );
+                )
+                .map_err(|e| format!("Failed to initialize LiveKit SIP handler: {e}"))?;
 
                 // Build deterministic trunk and dispatch names based on naming_prefix and room_prefix
                 // This allows operators to predict resource names in the LiveKit UI
@@ -278,7 +308,7 @@ impl AppState {
             None
         };
 
-        Arc::new(Self {
+        Ok(Arc::new(Self {
             config,
             core_state,
             livekit_room_handler,
@@ -288,7 +318,9 @@ impl AppState {
             auth_client,
             active_ws_connections: Arc::new(AtomicUsize::new(0)),
             connections_per_ip: Arc::new(DashMap::new()),
-        })
+            shutdown: CancellationToken::new(),
+            batch_jobs: Arc::new(DashMap::new()),
+        }))
     }
 
     /// Get a TTS request manager for a specific provider
@@ -424,6 +456,17 @@ pub enum ConnectionLimitError {
 mod tests {
     use super::*;
     use crate::config::SipConfig;
+    use serial_test::serial;
+
+    fn cleanup_core_runtime_env() {
+        unsafe {
+            std::env::remove_var("WAAV_EAGER_WARMUP");
+            std::env::remove_var("WAAV_MAX_CONCURRENT_RECONNECTS");
+            std::env::remove_var("WAAV_DEBUG_PROFILE");
+            std::env::remove_var("WAAV_DEBUG_PROFILE_SAMPLE_N");
+            std::env::remove_var("WAAV_DEBUG_PROFILE_TOKEN");
+        }
+    }
 
     #[test]
     fn test_sip_handler_not_created_without_config() {
@@ -443,6 +486,15 @@ mod tests {
             azure_speech_region: None,
             cartesia_api_key: None,
             openai_api_key: None,
+            azure_openai_api_key: None,
+            azure_openai_endpoint: None,
+            grok_api_key: None,
+            inworld_api_key: None,
+            gemini_api_key: None,
+            ultravox_api_key: None,
+            speechmatics_api_key: None,
+            yandex_api_key: None,
+            yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -480,6 +532,8 @@ mod tests {
             ws_processing_timeout_secs: 10,
             realtime_processing_timeout_secs: 30,
             sip_max_participants: 3,
+            realtime_endpoint_overrides: Default::default(),
+            aliases: Default::default(),
             plugins: crate::config::PluginConfig::default(),
             dag_timeouts: crate::config::DAGTimeoutsConfig::default(),
         };
@@ -510,6 +564,15 @@ mod tests {
             azure_speech_region: None,
             cartesia_api_key: None,
             openai_api_key: None,
+            azure_openai_api_key: None,
+            azure_openai_endpoint: None,
+            grok_api_key: None,
+            inworld_api_key: None,
+            gemini_api_key: None,
+            ultravox_api_key: None,
+            speechmatics_api_key: None,
+            yandex_api_key: None,
+            yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -553,6 +616,8 @@ mod tests {
             ws_processing_timeout_secs: 10,
             realtime_processing_timeout_secs: 30,
             sip_max_participants: 3,
+            realtime_endpoint_overrides: Default::default(),
+            aliases: Default::default(),
             plugins: crate::config::PluginConfig::default(),
             dag_timeouts: crate::config::DAGTimeoutsConfig::default(),
         };
@@ -598,5 +663,119 @@ mod tests {
         // Default is 3: caller + Sayna + optional third party
         let max_participants: u32 = 3;
         assert_eq!(max_participants, 3);
+    }
+
+    /// Minimal credential-free config for constructing a real `AppState` in tests.
+    fn minimal_test_config() -> ServerConfig {
+        ServerConfig {
+            host: "localhost".to_string(),
+            port: 3001,
+            tls: None,
+            livekit_url: "ws://localhost:7880".to_string(),
+            livekit_public_url: "http://localhost:7880".to_string(),
+            livekit_api_key: None,
+            livekit_api_secret: None,
+            deepgram_api_key: None,
+            elevenlabs_api_key: None,
+            google_credentials: None,
+            azure_speech_subscription_key: None,
+            azure_speech_region: None,
+            cartesia_api_key: None,
+            openai_api_key: None,
+            azure_openai_api_key: None,
+            azure_openai_endpoint: None,
+            grok_api_key: None,
+            inworld_api_key: None,
+            gemini_api_key: None,
+            ultravox_api_key: None,
+            speechmatics_api_key: None,
+            yandex_api_key: None,
+            yandex_folder_id: None,
+            assemblyai_api_key: None,
+            hume_api_key: None,
+            lmnt_api_key: None,
+            groq_api_key: None,
+            playht_api_key: None,
+            playht_user_id: None,
+            ibm_watson_api_key: None,
+            ibm_watson_instance_id: None,
+            ibm_watson_region: None,
+            aws_access_key_id: None,
+            aws_secret_access_key: None,
+            aws_region: None,
+            gnani_token: None,
+            gnani_access_key: None,
+            gnani_certificate_path: None,
+            recording_s3_bucket: None,
+            recording_s3_region: None,
+            recording_s3_endpoint: None,
+            recording_s3_access_key: None,
+            recording_s3_secret_key: None,
+            recording_s3_prefix: None,
+            cache_path: None,
+            cache_ttl_seconds: Some(3600),
+            auth_service_url: None,
+            auth_signing_key_path: None,
+            auth_api_secrets: Vec::new(),
+            auth_timeout_seconds: 5,
+            auth_required: false,
+            sip: None,
+            cors_allowed_origins: None,
+            rate_limit_requests_per_second: 60,
+            rate_limit_burst_size: 10,
+            max_websocket_connections: None,
+            max_connections_per_ip: 100,
+            ws_processing_timeout_secs: 10,
+            realtime_processing_timeout_secs: 30,
+            sip_max_participants: 3,
+            realtime_endpoint_overrides: Default::default(),
+            aliases: Default::default(),
+            plugins: crate::config::PluginConfig::default(),
+            dag_timeouts: crate::config::DAGTimeoutsConfig::default(),
+        }
+    }
+
+    /// RC6 SIGTERM drain: `AppState::new` must construct a live (non-cancelled)
+    /// shutdown token, and cancelling it must be observed by every clone of the
+    /// state (sessions hold clones of `Arc<AppState>` / its token).
+    #[tokio::test]
+    #[serial]
+    async fn test_shutdown_token_shared_across_state_clones() {
+        cleanup_core_runtime_env();
+
+        let state = AppState::new(minimal_test_config()).await;
+        assert!(
+            !state.shutdown.is_cancelled(),
+            "shutdown token must start non-cancelled"
+        );
+
+        // Clone the inner AppState (not just the Arc) to prove the token's
+        // shared-state semantics survive `#[derive(Clone)]`.
+        let clone = (*state).clone();
+        state.shutdown.cancel();
+        assert!(
+            clone.shutdown.is_cancelled(),
+            "cancellation must propagate to all AppState clones"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn app_state_try_new_rejects_malformed_core_runtime_env_without_panic() {
+        cleanup_core_runtime_env();
+        unsafe {
+            std::env::set_var("WAAV_EAGER_WARMUP", "sometimes");
+        }
+
+        let err = match AppState::try_new(minimal_test_config()).await {
+            Ok(_) => panic!("malformed runtime env must fail AppState::try_new"),
+            Err(err) => err,
+        };
+        assert!(
+            err.contains("WAAV_EAGER_WARMUP"),
+            "error should name bad env var: {err}"
+        );
+
+        cleanup_core_runtime_env();
     }
 }

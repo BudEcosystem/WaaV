@@ -6,7 +6,12 @@
 
 use utoipa::OpenApi;
 
+use crate::core::emotion::{
+    DeliveryStyle, Emotion, EmotionConfig, EmotionIntensity, IntensityLevel,
+};
+use crate::core::stt::standard::{ProviderExtras, SttFeatures};
 use crate::core::tts::Pronunciation;
+use crate::core::tts::standard::TtsFeatures;
 use crate::handlers::{
     api::HealthResponse,
     livekit::{
@@ -21,7 +26,10 @@ use crate::handlers::{
     speak::SpeakRequest,
     voices::Voice,
     ws::{
-        config::{LiveKitWebSocketConfig, STTWebSocketConfig, TTSWebSocketConfig},
+        config::{
+            ConversationWebSocketConfig, DAGWebSocketConfig, LiveKitWebSocketConfig,
+            STTWebSocketConfig, TTSWebSocketConfig,
+        },
         messages::{IncomingMessage, OutgoingMessage, ParticipantDisconnectedInfo, UnifiedMessage},
     },
 };
@@ -44,6 +52,9 @@ use crate::handlers::{
     ),
     paths(
         crate::handlers::api::health_check,
+        crate::handlers::api::livez,
+        crate::handlers::api::readyz,
+        crate::handlers::api::metrics_handler,
         crate::handlers::voices::list_voices,
         crate::handlers::speak::speak_handler,
         crate::handlers::livekit::generate_token,
@@ -60,6 +71,8 @@ use crate::handlers::{
     components(schemas(
         // REST API types
         HealthResponse,
+        crate::core::readiness::ReadinessReport,
+        crate::core::readiness::ProviderReadiness,
         Voice,
         SpeakRequest,
         TokenRequest,
@@ -84,7 +97,7 @@ use crate::handlers::{
         SIPTransferRequest,
         SIPTransferResponse,
         SIPTransferErrorResponse,
-        // WebSocket message types
+        // WebSocket message types (the wire contract SDKs must match — W-K1 drift gate)
         IncomingMessage,
         OutgoingMessage,
         UnifiedMessage,
@@ -93,7 +106,41 @@ use crate::handlers::{
         STTWebSocketConfig,
         TTSWebSocketConfig,
         LiveKitWebSocketConfig,
+        DAGWebSocketConfig,
+        ConversationWebSocketConfig,
+        crate::core::llm::ReasoningEffort,
+        crate::core::conversation::LatencyFiller,
+        crate::core::conversation::RoutingMode,
         Pronunciation,
+        // Standardized advanced-feature vocabulary (carried across the dispatch boundary)
+        SttFeatures,
+        TtsFeatures,
+        ProviderExtras,
+        // P5 canonical translation vocabulary (referenced by STTWebSocketConfig.translation)
+        crate::core::stt::standard::TranslationConfig,
+        crate::core::stt::standard::Translation,
+        // P5 batched / async STT vocabulary (POST /transcribe/batch)
+        crate::core::stt::batch::BatchFeatures,
+        crate::core::stt::batch::BatchJob,
+        crate::core::stt::batch::BatchStatus,
+        // Emotion control vocabulary referenced by TTSWebSocketConfig
+        Emotion,
+        EmotionIntensity,
+        IntensityLevel,
+        DeliveryStyle,
+        EmotionConfig,
+        // P4 voice descriptor vocabulary referenced by TTSWebSocketConfig
+        crate::core::voice::VoiceDescriptor,
+        crate::core::voice::Gender,
+        crate::core::voice::Age,
+        // P4 canonical voice-clone vocabulary (POST /voices/clone)
+        crate::handlers::voices::VoiceCloneRequest,
+        crate::handlers::voices::VoiceCloneResponse,
+        crate::handlers::voices::VoiceCloneProvider,
+        crate::handlers::voices::CloneMode,
+        crate::handlers::voices::CloneStatus,
+        crate::handlers::voices::CloneLabels,
+        crate::handlers::voices::CloneConsent,
     )),
     modifiers(&SecurityAddon),
     tags(

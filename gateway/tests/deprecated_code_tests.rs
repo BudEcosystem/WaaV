@@ -66,9 +66,10 @@ impl std::fmt::Display for EVIConfigError {
 impl std::error::Error for EVIConfigError {}
 
 /// EVI Version enum (after fix - V1/V2 removed)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EVIVersionFixed {
     /// EVI version 3 (current, English only)
+    #[default]
     V3,
     /// EVI version 4-mini (multilingual, lower latency)
     V4Mini,
@@ -95,12 +96,6 @@ impl EVIVersionFixed {
             EVIVersionFixed::V3 => "3",
             EVIVersionFixed::V4Mini => "4-mini",
         }
-    }
-}
-
-impl Default for EVIVersionFixed {
-    fn default() -> Self {
-        EVIVersionFixed::V3
     }
 }
 
@@ -148,7 +143,10 @@ impl HumeEVIConfigFixed {
 
     pub fn with_version_str(self, version: &str) -> Result<Self, EVIConfigError> {
         let evi_version = EVIVersionFixed::from_legacy(version)?;
-        Ok(Self { evi_version, ..self })
+        Ok(Self {
+            evi_version,
+            ..self
+        })
     }
 
     pub fn validate(&self) -> Result<(), EVIConfigError> {
@@ -309,11 +307,7 @@ fn test_invalid_version_string_rejected() {
 
     for version in invalid_versions {
         let result = EVIVersionFixed::from_legacy(version);
-        assert!(
-            result.is_err(),
-            "Version '{}' should be rejected",
-            version
-        );
+        assert!(result.is_err(), "Version '{}' should be rejected", version);
     }
 }
 

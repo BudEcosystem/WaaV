@@ -5,16 +5,11 @@
 //!
 //! Run: cargo test --test e2e_latency_benchmark -- --nocapture
 
-use futures_util::{SinkExt, StreamExt};
-use serde_json::{Value, json};
+use serde_json::json;
 use std::net::TcpListener;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use tokio::net::TcpStream;
-use tokio::time::timeout;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
-use wiremock::matchers::{any, method, path};
+use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 // Realistic provider latencies (based on real-world measurements)
@@ -61,6 +56,26 @@ fn find_available_port() -> u16 {
     let port = listener.local_addr().unwrap().port();
     drop(listener);
     port
+}
+
+async fn measure_mock_post_latency(
+    client: Arc<reqwest::Client>,
+    url: String,
+) -> Result<f64, String> {
+    let req_start = Instant::now();
+    let response = client
+        .post(&url)
+        .json(&json!({"text": "test"}))
+        .send()
+        .await
+        .map_err(|err| format!("concurrent latency request failed: {err}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "concurrent latency request returned non-success status {}",
+            response.status()
+        ));
+    }
+    Ok(req_start.elapsed().as_secs_f64() * 1000.0)
 }
 
 /// Test HTTP endpoint latency with mocked backend
@@ -160,22 +175,23 @@ async fn test_concurrent_http_latency() {
         let client = client.clone();
         let url = url.clone();
         handles.push(tokio::spawn(async move {
-            let req_start = Instant::now();
-            let _ = client
-                .post(&url)
-                .json(&json!({"text": "test"}))
-                .send()
-                .await;
-            req_start.elapsed().as_secs_f64() * 1000.0
+            measure_mock_post_latency(client, url).await
         }));
     }
 
     let mut latencies = vec![];
     for handle in handles {
-        if let Ok(latency) = handle.await {
-            latencies.push(latency);
-        }
+        let latency = handle
+            .await
+            .expect("concurrent latency task should not panic")
+            .expect("concurrent latency request should succeed before sampling latency");
+        latencies.push(latency);
     }
+    assert_eq!(
+        latencies.len(),
+        50,
+        "every concurrent request task should produce one latency sample"
+    );
 
     let total_time = start.elapsed().as_secs_f64() * 1000.0;
     latencies.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -198,6 +214,31 @@ async fn test_concurrent_http_latency() {
     assert!(
         total_time < 500.0,
         "Concurrent requests should complete quickly"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_http_latency_rejects_failed_mock_response() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/speak"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&mock_server)
+        .await;
+
+    let result = measure_mock_post_latency(
+        Arc::new(reqwest::Client::new()),
+        format!("{}/v1/speak", mock_server.uri()),
+    )
+    .await;
+
+    assert!(
+        match &result {
+            Err(err) => err.contains("503"),
+            Ok(_) => false,
+        },
+        "failed mock responses must not become latency samples: {result:?}"
     );
 }
 

@@ -4,7 +4,7 @@
 //! using HTTP streaming for real-time audio synthesis.
 
 use async_trait::async_trait;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use tracing::{debug, info};
 
 use super::SPEECHIFY_VOICES_URL;
@@ -13,6 +13,10 @@ use super::config::{
 };
 use crate::core::tts::base::{BaseTTS, ConnectionState, TTSConfig, TTSError, TTSResult};
 use crate::core::tts::provider::{PronunciationReplacer, TTSProvider, TTSRequestBuilder};
+
+fn speechify_tts_http_client() -> Result<reqwest::Client, reqwest::Error> {
+    crate::core::net::ssrf_protected_client_builder(crate::core::net::HTTP_URL_SCHEMES).build()
+}
 
 // =============================================================================
 // Request Builder
@@ -65,16 +69,8 @@ impl TTSRequestBuilder for SpeechifyRequestBuilder {
         // Build request body
         let request_body = SpeechifyStreamRequest::from_config(&self.config, text);
 
-        // Build headers
-        let mut headers = HeaderMap::new();
-
-        // Speechify uses Bearer token authentication
+        // Speechify uses Bearer token authentication.
         let auth_value = format!("Bearer {}", self.config.api_key);
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&auth_value).unwrap_or_else(|_| HeaderValue::from_static("")),
-        );
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
         debug!(
             "Speechify TTS request: voice={}, model={}, format={}, url={}",
@@ -86,8 +82,12 @@ impl TTSRequestBuilder for SpeechifyRequestBuilder {
 
         // Build and return the request
         client
-            .post(self.streaming_url())
-            .headers(headers)
+            .post(crate::core::tts::standard::override_rest_endpoint(
+                self.streaming_url(),
+                self.config.endpoint_override.as_deref(),
+            ))
+            .header(AUTHORIZATION, auth_value)
+            .header(CONTENT_TYPE, "application/json")
             .json(&request_body)
     }
 
@@ -155,7 +155,8 @@ impl SpeechifyTts {
     /// # Returns
     /// * `TTSResult<Vec<SpeechifyVoice>>` - List of available voices
     pub async fn list_voices(api_key: &str) -> TTSResult<Vec<SpeechifyVoice>> {
-        let client = reqwest::Client::new();
+        let client = speechify_tts_http_client()
+            .map_err(|e| TTSError::NetworkError(format!("Failed to build HTTP client: {e}")))?;
 
         let response = client
             .get(SPEECHIFY_VOICES_URL)
@@ -189,6 +190,23 @@ impl SpeechifyTts {
     pub fn streaming_url(&self) -> &str {
         super::SPEECHIFY_TTS_STREAM_URL
     }
+
+    /// Build from the standardized TTS config (W1 keystone).
+    ///
+    /// Mirrors `DeepgramTTS::from_standard`: maps the standardized features onto Speechify's
+    /// provider config via [`SpeechifyTtsConfig::from_standard`] (language + the normalization
+    /// extras), then constructs the provider mirroring [`BaseTTS::new`]. Speechify is a minimal
+    /// surface, so speed/pitch/volume/voice-settings/emotion/instructions/ssml/seed/sample_rate
+    /// are capability gaps and stay at their defaults — never fabricated.
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
+        let speechify_config = SpeechifyTtsConfig::from_standard(std)?;
+
+        Ok(Self {
+            provider: TTSProvider::new(),
+            speechify_config,
+            base_config: std.base.clone(),
+        })
+    }
 }
 
 #[async_trait]
@@ -207,7 +225,7 @@ impl BaseTTS for SpeechifyTts {
         );
 
         Ok(Self {
-            provider: TTSProvider::new()?,
+            provider: TTSProvider::new(),
             speechify_config,
             base_config: config,
         })
@@ -282,6 +300,100 @@ impl BaseTTS for SpeechifyTts {
 mod tests {
     use super::*;
     use crate::core::tts::speechify::SpeechifyModel;
+    use std::io::ErrorKind;
+
+    // The provider struct's `from_standard` (mirroring `DeepgramTTS::from_standard`) maps a
+    // standardized advanced feature (language override) all the way onto the provider config the
+    // request builder reads — proving the standardized dispatch path reaches the struct, not just
+    // the config-level method.
+    #[test]
+    fn from_standard_maps_language_onto_provider_config() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "speechify".to_string(),
+                api_key: "test-api-key".to_string(),
+                voice_id: Some("george".to_string()),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                language: Some("es-ES".to_string()),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let tts = SpeechifyTts::from_standard(&std).unwrap();
+        assert_eq!(tts.speechify_config().language.as_deref(), Some("es-ES"));
+    }
+
+    #[test]
+    fn invalid_speechify_api_key_header_value_is_request_build_error() {
+        let config = TTSConfig {
+            api_key: "bad\nkey".to_string(),
+            voice_id: Some("george".to_string()),
+            ..Default::default()
+        };
+        let speechify_config = SpeechifyTtsConfig::from_base(&config).unwrap();
+        let builder = SpeechifyRequestBuilder::new(speechify_config, config);
+        let err = builder
+            .build_http_request(&reqwest::Client::new(), "hello")
+            .build()
+            .expect_err(
+                "malformed Speechify API key must not become an empty Authorization header",
+            );
+
+        assert!(err.is_builder(), "unexpected reqwest error: {err}");
+    }
+
+    #[tokio::test]
+    async fn speechify_tts_redirect_policy_rejects_private_hop() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) => {
+                if err.kind() == ErrorKind::PermissionDenied {
+                    eprintln!("Skipping speechify_tts_redirect_policy_rejects_private_hop: {err}");
+                    return;
+                }
+                panic!("Failed to bind redirect test server listener: {err}");
+            }
+        };
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 302 Found\r\n",
+                "Location: http://127.0.0.1:9/metadata\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n"
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+
+        let err = speechify_tts_http_client()
+            .unwrap()
+            .get(format!("http://{addr}/start"))
+            .send()
+            .await
+            .expect_err("private redirect target must be rejected");
+        let mut error_chain = err.to_string();
+        let mut source = std::error::Error::source(&err);
+        while let Some(error) = source {
+            error_chain.push_str(": ");
+            error_chain.push_str(&error.to_string());
+            source = error.source();
+        }
+        assert!(
+            error_chain.contains("redirect URL rejected"),
+            "unexpected redirect error: {error_chain}"
+        );
+    }
 
     #[test]
     fn test_speechify_tts_creation() {

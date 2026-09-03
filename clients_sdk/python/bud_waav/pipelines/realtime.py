@@ -13,9 +13,10 @@ from enum import Enum
 from typing import Any, Callable, Literal, Optional
 
 import websockets
-from websockets.legacy.client import WebSocketClientProtocol
+from websockets.asyncio.client import ClientConnection, connect as ws_connect
 
 from ..types import TranscriptEvent, AudioEvent
+from ..ws.session import DEFAULT_CONNECT_TIMEOUT
 
 logger = logging.getLogger(__name__)
 
@@ -236,7 +237,7 @@ class BudRealtime:
         self._use_gateway = config.gateway_url is not None
         self._session_id: Optional[str] = None
 
-        self._ws: Optional[WebSocketClientProtocol] = None
+        self._ws: Optional[ClientConnection] = None
         self._state: RealtimeState = RealtimeState.DISCONNECTED
         self._tools: list[ToolDefinition] = []
         self._reconnect_attempts: int = 0
@@ -348,7 +349,9 @@ class BudRealtime:
         if self._connect_lock is None:
             self._connect_lock = asyncio.Lock()
 
-    async def connect(self, url: Optional[str] = None, timeout: float = 10.0) -> None:
+    async def connect(
+        self, url: Optional[str] = None, timeout: float = DEFAULT_CONNECT_TIMEOUT
+    ) -> None:
         """
         Connect to the realtime service.
 
@@ -401,7 +404,7 @@ class BudRealtime:
                     headers["Authorization"] = f"Bearer {self._config.api_key}"
 
                 self._ws = await asyncio.wait_for(
-                    websockets.connect(connect_url, additional_headers=headers),
+                    ws_connect(connect_url, additional_headers=headers or None),
                     timeout=timeout,
                 )
 

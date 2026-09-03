@@ -197,6 +197,38 @@ impl BuiltinTTSProvider {
 pub enum BuiltinRealtimeProvider {
     OpenAI = 0,
     Hume = 1,
+    /// Azure OpenAI Realtime — OpenAI-protocol clone (GA wire, `api-key` header).
+    Azure = 2,
+    /// Grok / xAI Realtime — OpenAI-protocol clone (GA-compatible wire).
+    Grok = 3,
+    /// Inworld Realtime — OpenAI-protocol clone (GA wire).
+    Inworld = 4,
+    /// Deepgram Voice Agent — speech-to-speech (raw linear16 binary frames; its
+    /// own protocol, NOT an OpenAI clone).
+    Deepgram = 5,
+    /// ElevenLabs Conversational AI — speech-to-speech (base64+JSON; its own
+    /// protocol, the OpenAI-family wire shape, NOT an OpenAI clone).
+    ElevenLabs = 6,
+    /// Google Gemini Live (BidiGenerateContent) — speech-to-speech (base64+JSON;
+    /// its own protocol, MULTI-FRAME `serverContent` + session resumption).
+    Gemini = 7,
+    /// Ultravox — hosted speech-to-speech model API (raw-PCM binary frames; its
+    /// own protocol, the FIRST `RestThenWebSocket` provider — a REST create-call
+    /// mints a pre-authed `joinUrl` the WS then connects).
+    Ultravox = 8,
+    /// AWS Nova Sonic — Amazon's speech-to-speech model (base64-PCM + JSON events;
+    /// its own protocol, the FIRST `BedrockBidi` provider — an Amazon Bedrock
+    /// `InvokeModelWithBidirectionalStream` HTTP/2 event stream, NOT a WebSocket;
+    /// auth is AWS SigV4 via the `aws-config` default chain, NO api-key).
+    NovaSonic = 9,
+    /// Speechmatics Flow (Voice AI) — conversational speech-to-speech on
+    /// Speechmatics' streaming STT (raw-PCM binary frames + JSON control, its own
+    /// protocol; template-driven agents; auth `Authorization: Bearer <token>`).
+    Speechmatics = 10,
+    /// Yandex Cloud AI Studio Realtime — OpenAI-protocol clone (GA wire reused by
+    /// delegation; the `wss://ai.api.cloud.yandex.net/v1/realtime?model=gpt://…`
+    /// host + Bearer auth — a Yandex IAM token / static API key).
+    Yandex = 11,
 }
 
 impl BuiltinRealtimeProvider {
@@ -206,6 +238,16 @@ impl BuiltinRealtimeProvider {
         match self {
             Self::OpenAI => "openai",
             Self::Hume => "hume",
+            Self::Azure => "azure",
+            Self::Grok => "grok",
+            Self::Inworld => "inworld",
+            Self::Deepgram => "deepgram",
+            Self::ElevenLabs => "elevenlabs",
+            Self::Gemini => "gemini",
+            Self::Ultravox => "ultravox",
+            Self::NovaSonic => "nova_sonic",
+            Self::Speechmatics => "speechmatics",
+            Self::Yandex => "yandex",
         }
     }
 }
@@ -426,10 +468,44 @@ pub static REALTIME_PROVIDER_MAP: phf::Map<&'static str, BuiltinRealtimeProvider
     // Primary names
     "openai" => BuiltinRealtimeProvider::OpenAI,
     "hume" => BuiltinRealtimeProvider::Hume,
+    "azure" => BuiltinRealtimeProvider::Azure,
+    "grok" => BuiltinRealtimeProvider::Grok,
+    "inworld" => BuiltinRealtimeProvider::Inworld,
+    "deepgram" => BuiltinRealtimeProvider::Deepgram,
     // Aliases
     "hume_evi" => BuiltinRealtimeProvider::Hume,
     "hume-evi" => BuiltinRealtimeProvider::Hume,
     "evi" => BuiltinRealtimeProvider::Hume,
+    // Azure OpenAI Realtime aliases.
+    "azure-openai" => BuiltinRealtimeProvider::Azure,
+    "azure_openai" => BuiltinRealtimeProvider::Azure,
+    // xAI alias.
+    "xai" => BuiltinRealtimeProvider::Grok,
+    // Deepgram Voice Agent aliases.
+    "deepgram-agent" => BuiltinRealtimeProvider::Deepgram,
+    "deepgram_voice_agent" => BuiltinRealtimeProvider::Deepgram,
+    // ElevenLabs Conversational AI.
+    "elevenlabs" => BuiltinRealtimeProvider::ElevenLabs,
+    "elevenlabs-convai" => BuiltinRealtimeProvider::ElevenLabs,
+    "11labs" => BuiltinRealtimeProvider::ElevenLabs,
+    // Google Gemini Live (BidiGenerateContent).
+    "gemini" => BuiltinRealtimeProvider::Gemini,
+    "gemini-live" => BuiltinRealtimeProvider::Gemini,
+    "google" => BuiltinRealtimeProvider::Gemini,
+    // Ultravox (hosted S2S model API; RestThenWebSocket).
+    "ultravox" => BuiltinRealtimeProvider::Ultravox,
+    "fixie" => BuiltinRealtimeProvider::Ultravox,
+    // AWS Nova Sonic (Amazon Bedrock bidirectional stream; BedrockBidi).
+    "nova_sonic" => BuiltinRealtimeProvider::NovaSonic,
+    "nova-sonic" => BuiltinRealtimeProvider::NovaSonic,
+    "aws" => BuiltinRealtimeProvider::NovaSonic,
+    // Speechmatics Flow (Voice AI; raw-PCM binary + JSON control).
+    "speechmatics" => BuiltinRealtimeProvider::Speechmatics,
+    "flow" => BuiltinRealtimeProvider::Speechmatics,
+    // Yandex Cloud AI Studio Realtime (OpenAI-protocol clone; GA wire, Bearer auth).
+    "yandex" => BuiltinRealtimeProvider::Yandex,
+    "yandexgpt" => BuiltinRealtimeProvider::Yandex,
+    "yandex-cloud" => BuiltinRealtimeProvider::Yandex,
 };
 
 // =============================================================================
@@ -547,7 +623,7 @@ pub const BUILTIN_STT_COUNT: usize = 25;
 pub const BUILTIN_TTS_COUNT: usize = 29;
 
 /// Number of built-in Realtime providers
-pub const BUILTIN_REALTIME_COUNT: usize = 2;
+pub const BUILTIN_REALTIME_COUNT: usize = 12;
 
 /// Total number of built-in providers
 pub const TOTAL_BUILTIN_PROVIDERS: usize =
@@ -620,7 +696,20 @@ pub const BUILTIN_TTS_NAMES: [&str; BUILTIN_TTS_COUNT] = [
 ];
 
 /// All built-in Realtime provider names (canonical only, no aliases)
-pub const BUILTIN_REALTIME_NAMES: [&str; BUILTIN_REALTIME_COUNT] = ["openai", "hume"];
+pub const BUILTIN_REALTIME_NAMES: [&str; BUILTIN_REALTIME_COUNT] = [
+    "openai",
+    "hume",
+    "azure",
+    "grok",
+    "inworld",
+    "deepgram",
+    "elevenlabs",
+    "gemini",
+    "ultravox",
+    "nova_sonic",
+    "speechmatics",
+    "yandex",
+];
 
 #[cfg(test)]
 mod tests {
@@ -709,6 +798,118 @@ mod tests {
         assert_eq!(
             resolve_realtime_provider("evi"),
             Some(BuiltinRealtimeProvider::Hume)
+        );
+        // Deepgram Voice Agent + aliases (case-insensitive).
+        assert_eq!(
+            resolve_realtime_provider("deepgram"),
+            Some(BuiltinRealtimeProvider::Deepgram)
+        );
+        assert_eq!(
+            resolve_realtime_provider("DEEPGRAM"),
+            Some(BuiltinRealtimeProvider::Deepgram)
+        );
+        assert_eq!(
+            resolve_realtime_provider("deepgram-agent"),
+            Some(BuiltinRealtimeProvider::Deepgram)
+        );
+        assert_eq!(
+            resolve_realtime_provider("deepgram_voice_agent"),
+            Some(BuiltinRealtimeProvider::Deepgram)
+        );
+        // ElevenLabs Conversational AI + aliases (case-insensitive).
+        assert_eq!(
+            resolve_realtime_provider("elevenlabs"),
+            Some(BuiltinRealtimeProvider::ElevenLabs)
+        );
+        assert_eq!(
+            resolve_realtime_provider("ELEVENLABS"),
+            Some(BuiltinRealtimeProvider::ElevenLabs)
+        );
+        assert_eq!(
+            resolve_realtime_provider("elevenlabs-convai"),
+            Some(BuiltinRealtimeProvider::ElevenLabs)
+        );
+        assert_eq!(
+            resolve_realtime_provider("11labs"),
+            Some(BuiltinRealtimeProvider::ElevenLabs)
+        );
+        // Google Gemini Live + aliases (case-insensitive).
+        assert_eq!(
+            resolve_realtime_provider("gemini"),
+            Some(BuiltinRealtimeProvider::Gemini)
+        );
+        assert_eq!(
+            resolve_realtime_provider("GEMINI"),
+            Some(BuiltinRealtimeProvider::Gemini)
+        );
+        assert_eq!(
+            resolve_realtime_provider("gemini-live"),
+            Some(BuiltinRealtimeProvider::Gemini)
+        );
+        assert_eq!(
+            resolve_realtime_provider("google"),
+            Some(BuiltinRealtimeProvider::Gemini)
+        );
+        // Ultravox (hosted S2S model API; RestThenWebSocket) + alias (case-insensitive).
+        assert_eq!(
+            resolve_realtime_provider("ultravox"),
+            Some(BuiltinRealtimeProvider::Ultravox)
+        );
+        assert_eq!(
+            resolve_realtime_provider("ULTRAVOX"),
+            Some(BuiltinRealtimeProvider::Ultravox)
+        );
+        assert_eq!(
+            resolve_realtime_provider("fixie"),
+            Some(BuiltinRealtimeProvider::Ultravox)
+        );
+        // AWS Nova Sonic (BedrockBidi) + aliases (case-insensitive).
+        assert_eq!(
+            resolve_realtime_provider("nova_sonic"),
+            Some(BuiltinRealtimeProvider::NovaSonic)
+        );
+        assert_eq!(
+            resolve_realtime_provider("NOVA_SONIC"),
+            Some(BuiltinRealtimeProvider::NovaSonic)
+        );
+        assert_eq!(
+            resolve_realtime_provider("nova-sonic"),
+            Some(BuiltinRealtimeProvider::NovaSonic)
+        );
+        assert_eq!(
+            resolve_realtime_provider("aws"),
+            Some(BuiltinRealtimeProvider::NovaSonic)
+        );
+        // Speechmatics Flow (Voice AI) + alias (case-insensitive).
+        assert_eq!(
+            resolve_realtime_provider("speechmatics"),
+            Some(BuiltinRealtimeProvider::Speechmatics)
+        );
+        assert_eq!(
+            resolve_realtime_provider("SPEECHMATICS"),
+            Some(BuiltinRealtimeProvider::Speechmatics)
+        );
+        assert_eq!(
+            resolve_realtime_provider("flow"),
+            Some(BuiltinRealtimeProvider::Speechmatics)
+        );
+        // Yandex Cloud AI Studio Realtime (OpenAI-protocol clone) + aliases
+        // (case-insensitive).
+        assert_eq!(
+            resolve_realtime_provider("yandex"),
+            Some(BuiltinRealtimeProvider::Yandex)
+        );
+        assert_eq!(
+            resolve_realtime_provider("YANDEX"),
+            Some(BuiltinRealtimeProvider::Yandex)
+        );
+        assert_eq!(
+            resolve_realtime_provider("yandexgpt"),
+            Some(BuiltinRealtimeProvider::Yandex)
+        );
+        assert_eq!(
+            resolve_realtime_provider("yandex-cloud"),
+            Some(BuiltinRealtimeProvider::Yandex)
         );
         assert_eq!(resolve_realtime_provider("unknown"), None);
     }

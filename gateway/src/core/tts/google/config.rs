@@ -28,8 +28,22 @@
 //! assert_eq!(google_config.audio_encoding.as_str(), "MP3");
 //! ```
 
-use crate::core::tts::base::TTSConfig;
+use crate::core::tts::base::{TTSConfig, TTSError};
 use serde::{Deserialize, Serialize};
+
+fn validate_google_tts_endpoint(source: &str, endpoint: &str) -> Result<(), TTSError> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES).map_err(
+        |msg| TTSError::InvalidConfiguration(format!("{source} rejected (SSRF protection): {msg}")),
+    )
+}
+
+pub const MIN_SAMPLE_RATE_HERTZ: u32 = 1;
+pub const MAX_SAMPLE_RATE_HERTZ: u32 = 192_000;
 
 /// Audio encoding formats supported by Google Cloud Text-to-Speech API.
 ///
@@ -153,6 +167,45 @@ pub struct GoogleTTSConfig {
     /// Audio effects profiles for playback optimization
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub effects_profile_id: Vec<String>,
+
+    // ---- Standardized features wired onto the `v1/text:synthesize` request (W1 keystone). All
+    // confirmed against the SynthesisInput / VoiceSelectionParams / AdvancedVoiceOptions schemas:
+    // https://cloud.google.com/text-to-speech/docs/reference/rest/v1/text/synthesize ----
+    /// Treat the input text as SSML → emit `input.ssml` instead of `input.text` (typed `ssml`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ssml: bool,
+    /// Prompt / system instruction for promptable voices → `input.prompt` (typed `instructions`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    /// Voice gender preference → `voice.ssmlGender` ("MALE" | "FEMALE" | "NEUTRAL"). (extras)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssml_gender: Option<String>,
+    /// Chirp 3 Instant Custom Voice clone key → `voice.voiceClone.voiceCloningKey`. (extras)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice_cloning_key: Option<String>,
+    /// AutoML custom voice → `voice.customVoice` (a JSON object: { model, reportedUsage? }). (extras)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_voice: Option<serde_json::Value>,
+    /// API-side custom pronunciations → `input.customPronunciations` (a JSON object). (extras)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_pronunciations: Option<serde_json::Value>,
+    /// Markup for HD voices → `input.markup` (string). (extras)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub markup: Option<String>,
+    /// Multi-speaker dialogue input → `input.multiSpeakerMarkup` (a JSON object). (extras)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multi_speaker_markup: Option<serde_json::Value>,
+    /// Journey low-latency synthesis toggle → `advancedVoiceOptions.lowLatencyJourneySynthesis`
+    /// (bool). (extras)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub low_latency_journey_synthesis: Option<bool>,
+
+    /// Override base (scheme+host) for the `v1/text:synthesize` POST; passthrough when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_override: Option<String>,
+    /// Caller-supplied static OAuth access token (bring-your-own-token); bypasses the auth client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub static_access_token: Option<String>,
 }
 
 impl Default for GoogleTTSConfig {
@@ -165,6 +218,17 @@ impl Default for GoogleTTSConfig {
             pitch: None,
             volume_gain_db: None,
             effects_profile_id: Vec::new(),
+            ssml: false,
+            prompt: None,
+            ssml_gender: None,
+            voice_cloning_key: None,
+            custom_voice: None,
+            custom_pronunciations: None,
+            markup: None,
+            multi_speaker_markup: None,
+            low_latency_journey_synthesis: None,
+            endpoint_override: None,
+            static_access_token: None,
         }
     }
 }
@@ -215,6 +279,168 @@ impl GoogleTTSConfig {
             pitch: None,
             volume_gain_db: None,
             effects_profile_id: Vec::new(),
+            ssml: false,
+            prompt: None,
+            ssml_gender: None,
+            voice_cloning_key: None,
+            custom_voice: None,
+            custom_pronunciations: None,
+            markup: None,
+            multi_speaker_markup: None,
+            low_latency_journey_synthesis: None,
+            endpoint_override: None,
+            static_access_token: None,
+        }
+    }
+
+    /// Builds from the standardized TTS config (W1 keystone for TTS).
+    ///
+    /// Wraps [`from_base_config`](Self::from_base_config) (reading the non-standard `project_id`
+    /// from `extras`) and maps the [`TtsFeatures`] Google can actually express: `pitch` and
+    /// `volume` (Google's `volume_gain_db`), `speed` (Google's `speaking_rate`, carried on the
+    /// base), `language` (overriding the voice-derived `language_code`), and `sample_rate`.
+    /// Features Google has no field for (`stability`/`similarity_boost`/`style`/
+    /// `use_speaker_boost`, `emotion`, `instructions`, `ssml`, `word_timestamps`, `streaming`,
+    /// `seed`) are skipped.
+    ///
+    /// [`TtsFeatures`]: crate::core::tts::standard::TtsFeatures
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> Self {
+        let f = &std.features;
+        let project_id = std
+            .extras
+            .0
+            .get("project_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        let mut cfg = Self::from_base_config(std.base.clone(), project_id);
+        if let Some(p) = f.pitch {
+            cfg.pitch = Some(p as f64);
+        }
+        if let Some(v) = f.volume {
+            cfg.volume_gain_db = Some(v as f64);
+        }
+        if let Some(s) = f.speed {
+            cfg.base.speaking_rate = Some(s);
+        }
+        if let Some(l) = &f.language {
+            cfg.language_code = l.clone();
+        }
+        if let Some(sr) = f.sample_rate {
+            cfg.base.sample_rate = Some(sr);
+        }
+        cfg.apply_standard_synthesis_features(std);
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
+        cfg.static_access_token = std
+            .extras
+            .0
+            .get("access_token")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        cfg
+    }
+
+    pub(crate) fn validate_endpoint_override(&self) -> Result<(), TTSError> {
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_google_tts_endpoint("endpoint_override", endpoint)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_sample_rate(&self) -> Result<(), TTSError> {
+        let Some(sample_rate) = self.base.sample_rate else {
+            return Ok(());
+        };
+
+        if !(MIN_SAMPLE_RATE_HERTZ..=MAX_SAMPLE_RATE_HERTZ).contains(&sample_rate) {
+            return Err(TTSError::InvalidConfiguration(format!(
+                "Google TTS sample_rate must be between {} and {} Hz, got {}",
+                MIN_SAMPLE_RATE_HERTZ, MAX_SAMPLE_RATE_HERTZ, sample_rate
+            )));
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn validate_runtime_config(&self) -> Result<(), TTSError> {
+        self.validate_sample_rate()?;
+        self.validate_endpoint_override()
+    }
+
+    /// Maps the standardized `ssml`/`instructions` typed features and the Google-unique `extras`
+    /// passthrough knobs onto this config. Shared by both [`Self::from_standard`] and the provider
+    /// struct's `from_standard` (the dispatch-constructed path) so the wire mapping is identical.
+    ///
+    /// All fields confirmed against the `v1/text:synthesize` request schemas (SynthesisInput,
+    /// VoiceSelectionParams, AdvancedVoiceOptions, AudioConfig):
+    /// https://cloud.google.com/text-to-speech/docs/reference/rest/v1/text/synthesize
+    pub fn apply_standard_synthesis_features(
+        &mut self,
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) {
+        let f = &std.features;
+        // SSML input → emit `input.ssml` instead of `input.text` (typed feature).
+        if let Some(true) = f.ssml {
+            self.ssml = true;
+        }
+        // Prompt / system instruction for promptable voices → `input.prompt` (typed `instructions`).
+        if let Some(p) = &f.instructions {
+            self.prompt = Some(p.clone());
+        }
+
+        let extras = &std.extras.0;
+        // Voice gender preference → `voice.ssmlGender`.
+        if let Some(g) = extras.get("ssml_gender").and_then(|v| v.as_str()) {
+            self.ssml_gender = Some(g.to_string());
+        }
+        // Chirp 3 Instant Custom Voice → `voice.voiceClone.voiceCloningKey`.
+        if let Some(k) = extras.get("voice_cloning_key").and_then(|v| v.as_str()) {
+            self.voice_cloning_key = Some(k.to_string());
+        }
+        // AutoML custom voice → `voice.customVoice` (object).
+        if let Some(v) = extras.get("custom_voice") {
+            if v.is_object() {
+                self.custom_voice = Some(v.clone());
+            }
+        }
+        // API-side custom pronunciations → `input.customPronunciations` (object).
+        if let Some(v) = extras.get("custom_pronunciations") {
+            if v.is_object() {
+                self.custom_pronunciations = Some(v.clone());
+            }
+        }
+        // Markup for HD voices → `input.markup` (string).
+        if let Some(m) = extras.get("markup").and_then(|v| v.as_str()) {
+            self.markup = Some(m.to_string());
+        }
+        // Multi-speaker dialogue input → `input.multiSpeakerMarkup` (object).
+        if let Some(v) = extras.get("multi_speaker_markup") {
+            if v.is_object() {
+                self.multi_speaker_markup = Some(v.clone());
+            }
+        }
+        // Journey low-latency synthesis toggle → `advancedVoiceOptions.lowLatencyJourneySynthesis`.
+        if let Some(b) = extras
+            .get("low_latency_journey_synthesis")
+            .and_then(|v| v.as_bool())
+        {
+            self.low_latency_journey_synthesis = Some(b);
+        }
+
+        // `effectsProfileId` is a Google-unique AudioConfig field with no canonical `TtsFeatures`
+        // slot, so it rides the open `extras` passthrough. Accepts either a JSON array of strings
+        // (`["headphone-class-device", ...]`) or a single string. Confirmed per-request on the
+        // `v1/text:synthesize` endpoint: AudioConfig.effectsProfileId (string[]).
+        // Doc: https://cloud.google.com/text-to-speech/docs/reference/rest/v1/AudioConfig
+        if let Some(v) = extras.get("effects_profile_id") {
+            if let Some(arr) = v.as_array() {
+                self.effects_profile_id = arr
+                    .iter()
+                    .filter_map(|e| e.as_str().map(|s| s.to_string()))
+                    .collect();
+            } else if let Some(s) = v.as_str() {
+                self.effects_profile_id = vec![s.to_string()];
+            }
         }
     }
 
@@ -378,6 +604,218 @@ impl GoogleTTSConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone (TTS): the standardized features unlock Google's pitch/volume/speed/language/
+    // sample-rate controls, and the non-standard `project_id` flows through `extras` — previously
+    // unreachable via the flat factory.
+    #[test]
+    fn from_standard_maps_google_features_and_extras() {
+        use crate::core::stt::standard::ProviderExtras;
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("project_id".into(), serde_json::json!("my-project"));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "google".into(),
+                voice_id: Some("en-US-Wavenet-D".to_string()),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                pitch: Some(4.0),
+                volume: Some(-3.0),
+                speed: Some(1.5),
+                language: Some("es-ES".into()),
+                sample_rate: Some(48000),
+                // Capability gaps Google can't express — must be ignored, not invented.
+                stability: Some(0.7),
+                ssml: Some(true),
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+        let cfg = GoogleTTSConfig::from_standard(&std);
+        assert_eq!(cfg.project_id, "my-project");
+        assert_eq!(cfg.pitch, Some(4.0));
+        assert_eq!(cfg.volume_gain_db, Some(-3.0));
+        assert_eq!(cfg.base.speaking_rate, Some(1.5));
+        assert_eq!(cfg.language_code, "es-ES");
+        assert_eq!(cfg.base.sample_rate, Some(48000));
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = GoogleTTSConfig::from_base_config(
+            TTSConfig {
+                provider: "google".into(),
+                voice_id: Some("en-US-Wavenet-D".to_string()),
+                ..Default::default()
+            },
+            "test-project".to_string(),
+        );
+
+        config.endpoint_override = Some("https://google-proxy.example.com".to_string());
+        assert!(config.validate_endpoint_override().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config
+            .validate_endpoint_override()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.to_string().contains("SSRF protection"));
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate_endpoint_override()
+            .expect_err("file endpoint_override must be rejected");
+        assert!(err.to_string().contains("URL scheme"));
+
+        config.endpoint_override = Some("ws://google-proxy.example.com".to_string());
+        let err = config
+            .validate_endpoint_override()
+            .expect_err("WebSocket endpoint_override must be rejected for REST Google");
+        assert!(err.to_string().contains("URL scheme"));
+
+        let std = crate::core::tts::standard::StandardTTSConfig::from_base(TTSConfig {
+            provider: "google".into(),
+            voice_id: Some("en-US-Wavenet-D".to_string()),
+            ..Default::default()
+        })
+        .with_endpoint_override("file:///tmp/socket");
+        let cfg = GoogleTTSConfig::from_standard(&std);
+        assert!(cfg.validate_endpoint_override().is_err());
+    }
+
+    #[test]
+    fn test_config_validation_rejects_invalid_sample_rate() {
+        let mut config = GoogleTTSConfig::from_base_config(
+            TTSConfig {
+                provider: "google".into(),
+                sample_rate: Some(24_000),
+                ..Default::default()
+            },
+            "test-project".to_string(),
+        );
+        assert!(config.validate_sample_rate().is_ok());
+
+        config.base.sample_rate = Some(0);
+        let err = config
+            .validate_sample_rate()
+            .expect_err("zero sample_rate must be rejected");
+        assert!(err.to_string().contains("sample_rate"), "{err}");
+
+        config.base.sample_rate = Some(u32::MAX);
+        let err = config
+            .validate_sample_rate()
+            .expect_err("pathological sample_rate must be rejected");
+        assert!(err.to_string().contains("sample_rate"), "{err}");
+    }
+
+    // WIRE-LEVEL: the provider-unique `effects_profile_id` extras passthrough must reach the
+    // SERIALIZED `audioConfig.effectsProfileId` the body builder emits — not just sit in the
+    // config struct (the bug class the last review caught). Accepts an array or a single string.
+    // Doc: https://cloud.google.com/text-to-speech/docs/reference/rest/v1/AudioConfig
+    #[test]
+    fn from_standard_effects_profile_id_extras_reach_serialized_body() {
+        use crate::core::providers::google::CredentialSource;
+        use crate::core::stt::standard::ProviderExtras;
+        use crate::core::tts::provider::TTSRequestBuilder;
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+
+        let mut extras = serde_json::Map::new();
+        extras.insert("project_id".into(), serde_json::json!("p"));
+        extras.insert(
+            "effects_profile_id".into(),
+            serde_json::json!(["headphone-class-device", "wearable-class-device"]),
+        );
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "google".into(),
+                voice_id: Some("en-US-Wavenet-D".to_string()),
+                audio_format: Some("linear16".to_string()),
+                ..Default::default()
+            },
+            features: TtsFeatures::default(),
+            extras: ProviderExtras(extras),
+        };
+
+        let cfg = GoogleTTSConfig::from_standard(&std);
+        // Struct-level (necessary but NOT sufficient).
+        assert_eq!(
+            cfg.effects_profile_id,
+            vec![
+                "headphone-class-device".to_string(),
+                "wearable-class-device".to_string()
+            ]
+        );
+
+        // Wire-level: serialize the actual request body the builder produces and assert the param
+        // is present on the wire under its exact Google field name `effectsProfileId`.
+        let builder = crate::core::tts::google::GoogleRequestBuilder::new(
+            std.base.clone(),
+            cfg.clone(),
+            "tok".to_string(),
+        );
+        let req = builder
+            .build_http_request(&reqwest::Client::new(), "hello")
+            .build()
+            .unwrap();
+        let body_bytes = req.body().unwrap().as_bytes().unwrap();
+        let raw = std::str::from_utf8(body_bytes).unwrap();
+        assert!(
+            raw.contains(
+                "\"effectsProfileId\":[\"headphone-class-device\",\"wearable-class-device\"]"
+            ),
+            "effectsProfileId not on the wire: {raw}"
+        );
+        // Silence unused-import warning when CredentialSource path isn't exercised here.
+        let _ = CredentialSource::from_api_key("");
+    }
+
+    // Single-string form of the extras passthrough is normalized to a one-element wire array.
+    #[test]
+    fn from_standard_effects_profile_id_single_string_reaches_serialized_body() {
+        use crate::core::stt::standard::ProviderExtras;
+        use crate::core::tts::provider::TTSRequestBuilder;
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+
+        let mut extras = serde_json::Map::new();
+        extras.insert("project_id".into(), serde_json::json!("p"));
+        extras.insert(
+            "effects_profile_id".into(),
+            serde_json::json!("telephony-class-application"),
+        );
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "google".into(),
+                voice_id: Some("en-US-Wavenet-D".to_string()),
+                audio_format: Some("linear16".to_string()),
+                ..Default::default()
+            },
+            features: TtsFeatures::default(),
+            extras: ProviderExtras(extras),
+        };
+
+        let cfg = GoogleTTSConfig::from_standard(&std);
+        assert_eq!(
+            cfg.effects_profile_id,
+            vec!["telephony-class-application".to_string()]
+        );
+
+        let builder = crate::core::tts::google::GoogleRequestBuilder::new(
+            std.base.clone(),
+            cfg.clone(),
+            "tok".to_string(),
+        );
+        let req = builder
+            .build_http_request(&reqwest::Client::new(), "hello")
+            .build()
+            .unwrap();
+        let raw = std::str::from_utf8(req.body().unwrap().as_bytes().unwrap()).unwrap();
+        assert!(
+            raw.contains("\"effectsProfileId\":[\"telephony-class-application\"]"),
+            "effectsProfileId single-string not on the wire: {raw}"
+        );
+    }
 
     // ===== GoogleAudioEncoding Tests =====
 
@@ -718,6 +1156,7 @@ mod tests {
             pitch: Some(2.5),
             volume_gain_db: None,
             effects_profile_id: vec!["handset-class-device".to_string()],
+            ..Default::default()
         };
 
         let json = serde_json::to_string(&config).expect("Failed to serialize");

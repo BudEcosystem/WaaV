@@ -87,17 +87,27 @@ export class BudTalk extends BasePipeline {
       diarize: config.stt?.diarize ?? false,
     };
 
+    const ttsSampleRate = config.tts?.sampleRate ?? 24000;
+    const autoPlay = config.autoPlay ?? true;
     const ttsConfig: TTSConfig = {
       provider: config.tts?.provider ?? 'deepgram',
       voice: config.tts?.voice,
       voiceId: config.tts?.voiceId,
       model: config.tts?.model,
-      sampleRate: config.tts?.sampleRate ?? 24000,
+      sampleRate: ttsSampleRate,
       audioFormat: config.tts?.audioFormat ?? 'linear16',
       speed: config.tts?.speed,
       pitch: config.tts?.pitch,
       volume: config.tts?.volume,
     };
+
+    // D2 gateway leverage (see BudTTS): 20ms egress chunks + downlink resampled
+    // to the player sink rate so the scheduled player does no client resampling.
+    // Defaulted only; an explicit user value wins.
+    if (autoPlay) {
+      if (config.tts?.audioOutChunkMs === undefined) ttsConfig.audioOutChunkMs = 20;
+      if (config.tts?.clientPlaybackRate === undefined) ttsConfig.clientPlaybackRate = ttsSampleRate;
+    }
 
     super({
       ...config,
@@ -111,7 +121,7 @@ export class BudTalk extends BasePipeline {
     this.sttConfig = sttConfig;
     this.ttsConfig = ttsConfig;
     this.livekitConfig = config.livekit;
-    this.autoPlay = config.autoPlay ?? true;
+    this.autoPlay = autoPlay;
     this.autoRecord = config.autoRecord ?? false;
     this.bargeIn = config.bargeIn ?? true;
 
@@ -207,7 +217,7 @@ export class BudTalk extends BasePipeline {
     this.e2eLatencyStart = Date.now();
 
     // Flush to finalize transcription
-    this.session.flush();
+    this.session.audioEnd();
   }
 
   /**
@@ -237,7 +247,9 @@ export class BudTalk extends BasePipeline {
     this.emitter.emit('audio', event);
 
     if (this.autoPlay && this.player) {
-      this.player.addPCM(event.audio);
+      // Thread the gateway sequence number so the D9 jitter buffer (if enabled)
+      // can reorder out-of-order arrivals.
+      this.player.addPCM(event.audio, event.sequence);
     }
   }
 
@@ -340,6 +352,14 @@ export class BudTalk extends BasePipeline {
           raw: { type: 'error', code: 'RECORDER_ERROR', message: error.message },
         });
       },
+      // D10: surface the mic-silence watchdog as a typed `micSilent` event so the
+      // app can prompt "your mic may be muted" (and clear it on recovery).
+      onMicSilent: (silentForMs) => {
+        this.emitter.emit('micSilent', { silent: true, silentForMs, timestamp: Date.now() });
+      },
+      onMicActive: () => {
+        this.emitter.emit('micSilent', { silent: false, timestamp: Date.now() });
+      },
     });
 
     await this.recorder.start();
@@ -354,15 +374,46 @@ export class BudTalk extends BasePipeline {
 
     this.recorder.stop();
     this.isListening = false;
-    this.session.flush();
+    this.session.audioEnd();
   }
 
   /**
-   * Interrupt current TTS
+   * Interrupt current TTS (barge-in). Sends the gateway `clear` op (via
+   * super.interrupt -> session.clear) AND cuts the audio the user is currently
+   * hearing: with the D2 scheduled player, `clearBuffer()` now `source.stop()`s
+   * every scheduled node (audible cut within ~20ms) — the old `stop()` here only
+   * emptied a JS array and never interrupted already-scheduled playback. We use
+   * `clearBuffer()` (not the player's own `interrupt()`) to avoid double-sending
+   * `clear`, and keep the player ready to play the next turn (not 'stopped').
    */
   interrupt(): void {
+    // D10: if a must-play prompt is in flight, a barge-in is ignored entirely —
+    // do NOT send the gateway `clear` and do NOT cut local playback, so the
+    // prompt (e.g. a legal disclaimer) plays to completion.
+    if (this.player?.isUninterruptible()) return;
     super.interrupt();
-    this.player?.stop();
+    this.player?.clearBuffer();
+  }
+
+  /**
+   * D10: mark the current/next bot speech as a must-play prompt (uninterruptible)
+   * or restore normal barge-in. While true, both a VAD barge-in and an explicit
+   * {@link interrupt} are ignored so the prompt is never cut off. Remember to
+   * clear it (`false`) when the prompt completes.
+   */
+  setUninterruptible(value: boolean): void {
+    this.player?.setUninterruptible(value);
+  }
+
+  /**
+   * D10: speak a must-play prompt that cannot be barged over (e.g. a legal
+   * disclaimer). Sets the uninterruptible flag for the duration of this
+   * utterance; the caller clears it via {@link setUninterruptible}(false) once
+   * the prompt has finished playing (e.g. on the player's drain/`onBufferEmpty`).
+   */
+  async speakUninterruptible(text: string, options?: Parameters<BudTalk['speak']>[1]): Promise<void> {
+    this.setUninterruptible(true);
+    await this.speak(text, options);
   }
 
   /**

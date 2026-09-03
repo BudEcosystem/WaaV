@@ -8,7 +8,26 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+
+use super::nodes::TTSAudioData;
+
+/// An output produced by a DAG terminal/output node, delivered out-of-band over
+/// the context's `output_tx` channel (W-O1).
+///
+/// Output nodes previously wrote `output_destination` into `ctx.metadata`, but the
+/// executor never read it, so outputs were never delivered. Carrying an explicit
+/// sender on the context lets output nodes push results to a drain task in the WS
+/// handler that maps them to LiveKit / WS binary, regardless of where the node sits
+/// in the graph.
+#[derive(Debug, Clone)]
+pub enum DagOutput {
+    /// Synthesized audio destined for the client (WS binary or LiveKit).
+    Audio(TTSAudioData),
+    /// Text destined for the client (e.g. an LLM/transcript response).
+    Text(String),
+}
 
 /// Context passed through DAG execution
 ///
@@ -44,6 +63,14 @@ pub struct DAGContext {
 
     /// Maximum execution time allowed (optional)
     pub deadline: Option<Instant>,
+
+    /// Sink for outputs produced by output/terminal nodes (W-O1 data-plane wiring).
+    ///
+    /// When set, output nodes push `DagOutput`s here instead of relying on the
+    /// dead `output_destination` metadata path. A drain task in the WS handler maps
+    /// these to LiveKit / WS binary. `None` means outputs are only returned as the
+    /// executor's result (e.g. unit tests, non-streaming callers).
+    pub output_tx: Option<mpsc::Sender<DagOutput>>,
 }
 
 /// Resource keys for external resources stored in DAGContext
@@ -69,6 +96,7 @@ impl DAGContext {
             timing: DAGTiming::new(),
             cancel_token: CancellationToken::new(),
             deadline: None,
+            output_tx: None,
         }
     }
 
@@ -88,6 +116,7 @@ impl DAGContext {
             timing: DAGTiming::new(),
             cancel_token: CancellationToken::new(),
             deadline: None,
+            output_tx: None,
         }
     }
 
@@ -106,6 +135,7 @@ impl DAGContext {
             timing: DAGTiming::new(),
             cancel_token: CancellationToken::new(),
             deadline: None,
+            output_tx: None,
         }
     }
 
@@ -260,6 +290,30 @@ impl DAGContext {
             timing: DAGTiming::new(),
             cancel_token: self.cancel_token.clone(), // Share cancellation
             deadline: self.deadline,
+            output_tx: self.output_tx.clone(), // Branches deliver to the same sink
+        }
+    }
+
+    /// Set the output sink for terminal/output nodes (W-O1).
+    pub fn with_output_tx(mut self, tx: mpsc::Sender<DagOutput>) -> Self {
+        self.output_tx = Some(tx);
+        self
+    }
+
+    /// Set/replace the output sink in place.
+    pub fn set_output_tx(&mut self, tx: mpsc::Sender<DagOutput>) {
+        self.output_tx = Some(tx);
+    }
+
+    /// Deliver an output through the sink if one is attached.
+    ///
+    /// Returns `true` if delivered, `false` if no sink is attached or the channel is
+    /// closed (e.g. the drain task has shut down).
+    pub async fn emit_output(&self, output: DagOutput) -> bool {
+        if let Some(tx) = &self.output_tx {
+            tx.send(output).await.is_ok()
+        } else {
+            false
         }
     }
 

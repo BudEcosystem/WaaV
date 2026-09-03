@@ -71,6 +71,13 @@ pub(crate) const RELIABLE_BUFFER_THRESHOLD_BYTES: u64 = 200 * 1024 * 1024;
 /// Maximum audio queue size based on duration (2 seconds worth of frames at 100 frames/sec)
 pub(crate) const MAX_AUDIO_QUEUE_SIZE: usize = 200;
 
+const MIN_AUDIO_SAMPLE_RATE_HZ: u32 = 8_000;
+const MAX_AUDIO_SAMPLE_RATE_HZ: u32 = 192_000;
+const MAX_AUDIO_CHANNELS: u16 = 8;
+const MIN_AUDIO_BUFFER_POOL_CAPACITY: usize = 4096;
+const MAX_AUDIO_BUFFER_POOL_CAPACITY: usize =
+    (MAX_AUDIO_SAMPLE_RATE_HZ as usize * MAX_AUDIO_CHANNELS as usize * 2) / 100;
+
 /// LiveKit client for handling audio streaming and publishing.
 ///
 /// Optimized for low latency with queue-based operations to eliminate lock contention.
@@ -81,7 +88,12 @@ pub struct LiveKitClient {
     pub(crate) audio_callback: Option<AudioCallback>,
     pub(crate) data_callback: Option<DataCallback>,
     pub(crate) participant_disconnect_callback: Option<ParticipantDisconnectCallback>,
-    pub(crate) active_streams: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    /// E-G3: per-PARTICIPANT audio-stream tasks. Keyed so a resubscribe
+    /// (mute/unmute storms re-drive subscription) aborts the OLD task
+    /// before registering the new one — exactly one producer per
+    /// participant, never an accumulating Vec.
+    pub(crate) active_streams:
+        Arc<Mutex<std::collections::HashMap<String, tokio::task::JoinHandle<()>>>>,
     pub(crate) is_connected: Arc<Mutex<bool>>,
     // Atomic flags for fast status queries
     pub(crate) is_connected_atomic: Arc<AtomicBool>,
@@ -93,11 +105,52 @@ pub struct LiveKitClient {
     pub(crate) audio_queue: Arc<Mutex<VecDeque<Vec<u8>>>>,
     pub(crate) operation_queue: Option<OperationQueue>,
     pub(crate) operation_worker_handle: Option<tokio::task::JoinHandle<()>>,
-    pub(crate) event_handler_handle: Option<tokio::task::JoinHandle<()>>,
+    pub(crate) event_handler_handle: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
     pub(crate) stats: Arc<Mutex<QueueStats>>,
 }
 
 impl LiveKitClient {
+    pub(crate) fn validate_audio_config(config: &LiveKitConfig) -> Result<(), crate::AppError> {
+        Self::validate_sample_rate("sample_rate", config.sample_rate)?;
+        Self::validate_sample_rate("ingress_sample_rate", config.ingress_sample_rate)?;
+
+        if config.channels == 0 || config.channels > MAX_AUDIO_CHANNELS {
+            return Err(crate::AppError::InternalServerError(format!(
+                "Invalid LiveKit audio channels: expected 1..={MAX_AUDIO_CHANNELS}, got {}",
+                config.channels
+            )));
+        }
+
+        Ok(())
+    }
+
+    fn validate_sample_rate(field: &str, rate: u32) -> Result<(), crate::AppError> {
+        if !(MIN_AUDIO_SAMPLE_RATE_HZ..=MAX_AUDIO_SAMPLE_RATE_HZ).contains(&rate) {
+            return Err(crate::AppError::InternalServerError(format!(
+                "Invalid LiveKit {field}: expected {MIN_AUDIO_SAMPLE_RATE_HZ}..={MAX_AUDIO_SAMPLE_RATE_HZ} Hz, got {rate}"
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn samples_per_10ms(sample_rate: u32) -> Result<u32, crate::AppError> {
+        Self::validate_sample_rate("sample_rate", sample_rate)?;
+        Ok(sample_rate / 100)
+    }
+
+    pub(crate) fn audio_buffer_capacity(sample_rate: u32, channels: u16) -> usize {
+        u64::from(sample_rate)
+            .checked_mul(u64::from(channels))
+            .and_then(|v| v.checked_mul(2))
+            .map(|v| v / 100)
+            .and_then(|v| usize::try_from(v).ok())
+            .unwrap_or(MAX_AUDIO_BUFFER_POOL_CAPACITY)
+            .clamp(
+                MIN_AUDIO_BUFFER_POOL_CAPACITY,
+                MAX_AUDIO_BUFFER_POOL_CAPACITY,
+            )
+    }
+
     /// Get a buffer from the pool or create a new one if pool is empty
     pub(crate) fn get_buffer_from_pool(
         pool: &Arc<Mutex<Vec<Vec<u8>>>>,
@@ -131,8 +184,7 @@ impl LiveKitClient {
 
     /// Create a new LiveKit client with the given configuration.
     pub fn new(config: LiveKitConfig) -> Self {
-        let buffer_capacity =
-            ((config.sample_rate as usize * config.channels as usize * 2) / 100).max(4096);
+        let buffer_capacity = Self::audio_buffer_capacity(config.sample_rate, config.channels);
 
         Self {
             config,
@@ -141,7 +193,7 @@ impl LiveKitClient {
             audio_callback: None,
             data_callback: None,
             participant_disconnect_callback: None,
-            active_streams: Arc::new(Mutex::new(Vec::new())),
+            active_streams: Arc::new(Mutex::new(std::collections::HashMap::new())),
             is_connected: Arc::new(Mutex::new(false)),
             is_connected_atomic: Arc::new(AtomicBool::new(false)),
             has_audio_source_atomic: Arc::new(AtomicBool::new(false)),
@@ -156,7 +208,7 @@ impl LiveKitClient {
             audio_queue: Arc::new(Mutex::new(VecDeque::new())),
             operation_queue: None,
             operation_worker_handle: None,
-            event_handler_handle: None,
+            event_handler_handle: Arc::new(std::sync::Mutex::new(None)),
             stats: Arc::new(Mutex::new(QueueStats::default())),
         }
     }
@@ -204,13 +256,18 @@ impl Drop for LiveKitClient {
     fn drop(&mut self) {
         // Abort all active stream handles synchronously
         if let Ok(mut streams) = self.active_streams.try_lock() {
-            for handle in streams.drain(..) {
+            for (_participant, handle) in streams.drain() {
                 handle.abort();
             }
         }
 
         // Abort event handler task if running
-        if let Some(handle) = self.event_handler_handle.take() {
+        if let Some(handle) = self
+            .event_handler_handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
             handle.abort();
         }
 

@@ -1,0 +1,7 @@
+{
+  "_comment": "Coverage ratchet baseline (plan W-T1, exit E8/E12). The `coverage` CI job runs cargo-llvm-cov on the lib and asserts the measured line-coverage ratio is >= `line_ratio` here (a NON-DECREASING ratchet). This is intentionally seeded at 0.0 on day one — NOT an aspirational absolute floor — so the first green run establishes a real, measured floor. To raise it after an improvement, run the job with RATCHET_BLESS=1 (or `scripts/ci/coverage-ratchet.sh bless <measured>`), commit the new value, and coverage can never silently regress below it thereafter. The numerator excludes #[ignore]/live_* tests (those are not run in the coverage job).",
+  "line_ratio": 0.0,
+  "measured_at": "unset",
+  "features": "dag-routing,turn-ensemble,noise-filter,openapi",
+  "scope": "lib"
+}

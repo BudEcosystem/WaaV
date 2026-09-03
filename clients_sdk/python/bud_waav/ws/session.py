@@ -7,6 +7,7 @@ import base64
 import json
 import time
 import random
+from collections import deque
 from typing import Any, AsyncIterator, Callable, Optional, Union
 from dataclasses import dataclass, field
 
@@ -15,21 +16,76 @@ from websockets.asyncio.client import ClientConnection
 
 from ..types import (
     STTConfig, TTSConfig, STTResult, TranscriptEvent, AudioEvent,
-    AudioFeatures, DAGConfig, intensity_to_number,
+    AudioFeatures, DAGConfig, ConversationConfig, intensity_to_number,
+    Translation,
 )
-from ..errors import ConnectionError, ReconnectError, TimeoutError
+from ..errors import (
+    ConnectionError,
+    ReconnectError,
+    TimeoutError,
+    RateLimitError,
+    FatalConnectionError,
+    ProtocolVersionError,
+)
+from .queue import MessageQueue, QueueConfig
+
+# Protocol version the gateway emits on `ready` (messages.rs PROTOCOL_VERSION, plan
+# W-K1). We assert the MAJOR matches so a breaking wire change surfaces as an
+# explicit mismatch instead of silent field drift.
+PROTOCOL_VERSION = "1.0"
+
+# Default connect timeout (D6). For an audio=true session the gateway constructs
+# the STT *and* TTS provider upstreams before it emits `ready`
+# (PROVIDER_READY, config_handler.rs:45) and that can take up to ~30s. The old
+# 10s default therefore TIMED OUT a perfectly healthy slow-cold-start session —
+# a bug. 35s bounds the worst-case PROVIDER_READY with headroom. The WS upgrade
+# handshake itself is ~2ms; this generous bound is only for the post-config
+# provider wait. Trade-off (documented): a genuinely-dead gateway now takes up to
+# 35s to fail the FIRST connect — acceptable, since the D1 liveness watchdog
+# covers post-connect death and a caller may always pass a smaller timeout.
+DEFAULT_CONNECT_TIMEOUT = 35.0
+
+# Default cadence for STT keepalive-silence (D6): when audio=true and no real
+# audio has been sent for this long, emit one short zero-PCM frame to keep the
+# gateway's upstream STT stream warm through a conversational pause. The
+# gateway's auto-pong keeps the SOCKET open but does NOT keep the provider's STT
+# stream from idling out, which is what this covers (Pipecat stt_service.py:45).
+DEFAULT_STT_KEEPALIVE_INTERVAL = 5.0
+# One keepalive frame is ~100ms of 16-bit mono silence at 16kHz = 3200 bytes of
+# zeros. Sized from the session's STT sample_rate at runtime; this is the floor.
+_KEEPALIVE_SILENCE_MS = 100
 
 
 @dataclass
 class ReconnectConfig:
-    """Reconnection configuration."""
+    """Reconnection configuration.
+
+    The defaults encode the Tier-1 D4 hardening:
+
+    * ``initial_delay_ms`` is a FAST first hop (200ms, down from 1000ms) so a
+      transient client<->gateway blip heals in well under a second instead of
+      the measured ~1.65s. The compounding backoff is replaced by decorrelated
+      jitter (see :meth:`WebSocketSession._reconnect`), bounded by
+      ``max_delay_ms``.
+    * ``quick_failure_threshold`` / ``min_stable_seconds`` arm the client-side
+      quick-failure breaker (ported from Pipecat
+      ``websocket_service.py`` ``_MIN_STABLE_CONNECTION_DURATION`` /
+      ``_MAX_CONSECUTIVE_QUICK_FAILURES``): if a connection dies within
+      ``min_stable_seconds`` of becoming ready ``quick_failure_threshold`` times
+      in a row, the loop STOPS with a typed :class:`FatalConnectionError`
+      instead of storming a doomed config.
+    """
 
     enabled: bool = True
-    initial_delay_ms: int = 1000
+    initial_delay_ms: int = 200
     max_delay_ms: int = 30000
     multiplier: float = 1.5
     max_retries: int = 10
     jitter: float = 0.2
+    # D4a quick-failure breaker (Pipecat-ported). A "quick failure" is a session
+    # that becomes ready then dies < min_stable_seconds later.
+    min_stable_seconds: float = 5.0
+    quick_failure_threshold: int = 3
 
 
 @dataclass
@@ -182,8 +238,17 @@ class WebSocketSession:
         livekit_config: Optional[dict[str, Any]] = None,
         audio_features: Optional[AudioFeatures] = None,
         dag_config: Optional[DAGConfig] = None,
+        conversation_config: Optional[ConversationConfig] = None,
         stream_id: Optional[str] = None,
         reconnect: Optional[ReconnectConfig] = None,
+        audio: bool = True,
+        alias: Optional[str] = None,
+        ping_interval: float = 5.0,
+        ping_timeout: float = 3.0,
+        stale_inbound_timeout: float = 12.0,
+        control_queue: Optional[MessageQueue] = None,
+        max_pending_audio: int = 256,
+        stt_keepalive_interval: float = DEFAULT_STT_KEEPALIVE_INTERVAL,
     ):
         """
         Initialize WebSocket session.
@@ -194,10 +259,47 @@ class WebSocketSession:
             stt_config: STT configuration
             tts_config: TTS configuration
             livekit_config: LiveKit configuration
-            audio_features: Audio features (turn detection, noise filter, VAD) - client-side
+            audio_features: Audio features. Only ``turn_detection`` is serialized
+                (nested into ``stt_config.turn_detection``, its real wire home);
+                ``noise_filtering``/``vad`` have NO /ws wire field yet and are
+                intentionally NOT sent (see SDK_STANDARDIZATION_PLAN P4).
             dag_config: DAG routing configuration
+            conversation_config: Built-in LLM conversation-loop configuration
+                (reasoning, latency filler, barge-in, etc.). Serialized into the
+                ``conversation_config`` block of the config message.
             stream_id: Optional stream ID for session tracking
             reconnect: Reconnection configuration
+            ping_interval: Seconds between native WS PING frames (D1 liveness).
+                Overrides the websockets-library 20s default with a voice-cadence
+                5s so a frozen-but-OPEN gateway (zombie socket) is detected fast.
+                Set <=0 to disable native pings (falls back to the app staleness
+                timer only).
+            ping_timeout: Seconds to wait for the matching PONG before the
+                websockets library tears the socket down (D1). 3s pairs with the
+                5s interval; on miss the EXISTING reconnect path runs.
+            stale_inbound_timeout: Belt-and-suspenders app-level staleness window
+                (D1). During an active session the gateway emits frequent
+                inbound frames; if NONE arrive for this many seconds we declare a
+                zombie and reconnect, covering paths the native ping/pong cannot
+                (e.g. a wedged read pump). Well under the gateway's ~300s
+                idle-close. Set <=0 to disable.
+            control_queue: Optional pre-built control :class:`MessageQueue` (D5).
+                When omitted a bounded drop-oldest queue is created so control
+                ops (speak/clear/send_message) buffer-and-flush across a
+                reconnect instead of raising, matching the TS SDK.
+            max_pending_audio: Bound for the uplink audio backlog buffered while
+                disconnected (D5). Oldest frames are shed first (mirrors the
+                gateway's DroppableAudio drop-oldest egress discipline) so a slow
+                or absent gateway never grows uplink latency without limit.
+            stt_keepalive_interval: Seconds of no REAL audio after which the
+                session emits one ~100ms zero-PCM frame to keep the gateway's
+                upstream STT stream warm through a conversational pause (D6,
+                Pipecat stt_service.py:45). Only runs while ``audio`` is True and
+                connected; it is GATED on real audio (a frame is sent only if no
+                ``send_audio`` happened within the interval) so it never fights
+                live capture, and a real ``send_audio`` resets the timer. The
+                gateway's auto-pong keeps the SOCKET alive but NOT the provider
+                STT stream, which is exactly what this covers. Set <=0 to disable.
         """
         self.url = url
         self.api_key = api_key
@@ -206,11 +308,25 @@ class WebSocketSession:
         self.livekit_config = livekit_config
         self.audio_features = audio_features
         self.dag_config = dag_config
+        self.conversation_config = conversation_config
+        # When False, the gateway skips STT/TTS provider construction and reaches
+        # `ready` immediately (config-only session). Default True (a voice session).
+        self.audio = audio
+        # Server-defined proxy/alias name (P3). The gateway resolves it to a full
+        # {stt,tts,llm,dag} bundle BEFORE provider construction; an explicit config
+        # field above always wins. The resolved concrete providers come back on the
+        # `ready` ack as `resolved_alias` (see `resolved_alias` property).
+        self.alias = alias
         self.requested_stream_id = stream_id
         self.reconnect_config = reconnect or ReconnectConfig()
 
         self._ws: Optional[ClientConnection] = None
         self._stream_id: Optional[str] = None
+        self._protocol_version: Optional[str] = None
+        self._resolved_alias: Optional[dict[str, Any]] = None
+        # D8: the transport codecs the gateway negotiated (set on `ready` only when requested).
+        self._audio_in_codec: Optional[str] = None
+        self._audio_out_codec: Optional[str] = None
         self._connected = False
         self._connecting = False
         self._closed = False
@@ -219,8 +335,46 @@ class WebSocketSession:
         self._ready_event: Optional[asyncio.Event] = None
         self._auth_event: Optional[asyncio.Event] = None
         self._message_queue: Optional[asyncio.Queue[dict[str, Any]]] = None
-        self._pending_audio: list[bytes] = []
+        # Uplink audio backlog buffered while disconnected. Bounded + drop-oldest
+        # (D5): a long stall sheds the STALEST frames first so reconnect replays
+        # only recent audio and uplink latency stays bounded.
+        self._pending_audio: deque[bytes] = deque(maxlen=max(1, max_pending_audio))
         self._receive_task: Optional[asyncio.Task[None]] = None
+
+        # D1 liveness knobs.
+        self._ping_interval = ping_interval
+        self._ping_timeout = ping_timeout
+        self._stale_inbound_timeout = stale_inbound_timeout
+        # Monotonic timestamp of the last inbound frame (any type). Drives the
+        # app-level staleness watchdog. None until the first frame / a fresh
+        # socket; set on connect so a silent gateway is caught from t0.
+        self._last_inbound_monotonic: Optional[float] = None
+        self._watchdog_task: Optional[asyncio.Task[None]] = None
+        # Set when the watchdog (or a ping miss) forces a reconnect, so the
+        # receive loop's own ConnectionClosed handler doesn't double-reconnect.
+        self._reconnecting_due_to_stale = False
+
+        # D6 STT keepalive-silence. Monotonic timestamp of the last REAL audio
+        # frame sent (None until the first). The keepalive loop only emits a
+        # zero-PCM frame when this is older than the interval, so it never fights
+        # live capture; a real send_audio() updates it (resetting the timer).
+        self._stt_keepalive_interval = stt_keepalive_interval
+        self._last_real_audio_monotonic: Optional[float] = None
+        self._keepalive_task: Optional[asyncio.Task[None]] = None
+
+        # D5 control-op queue (buffer-and-flush like the TS SDK). Drop-oldest,
+        # bounded; control ops are small JSON so the default cap is generous.
+        self._control_queue: MessageQueue = control_queue or MessageQueue(
+            QueueConfig(max_size=256, max_age_ms=60_000.0, drop_oldest=True)
+        )
+
+        # D4a quick-failure breaker state. _connected_at marks when the CURRENT
+        # session became ready; on close we compare against min_stable_seconds.
+        self._connected_at: Optional[float] = None
+        self._consecutive_quick_failures = 0
+        # Latched once the breaker trips so a doomed config can't be retried by a
+        # later code path; a successful stable session resets it.
+        self._fatal = False
 
         self._metrics = MetricsCollector()
         self._event_handlers: dict[str, list[Callable[..., Any]]] = {}
@@ -244,6 +398,41 @@ class WebSocketSession:
     def stream_id(self) -> Optional[str]:
         """Get the stream ID."""
         return self._stream_id
+
+    @property
+    def protocol_version(self) -> Optional[str]:
+        """Gateway wire-protocol version from the `ready` envelope (plan W-K1)."""
+        return self._protocol_version
+
+    @property
+    def resolved_alias(self) -> Optional[dict[str, Any]]:
+        """The concrete providers the gateway resolved ``alias`` to (P3).
+
+        Populated from the ``ready`` ack when an ``alias`` was sent — e.g.
+        ``{"name": "support-bot", "kind": "agent", "stt": {"provider": "deepgram",
+        ...}, "tts": {"provider": "cartesia", ...}, "llm": {...}}`` (no secrets).
+        ``None`` when no alias was named (or it was unknown). Lets a developer SEE
+        what the alias became, and re-point it server-side with zero client change.
+        """
+        return self._resolved_alias
+
+    @property
+    def audio_in_codec(self) -> Optional[str]:
+        """D8 negotiated UPLINK transport codec in effect (``"linear16"`` | ``"opus"``).
+
+        Populated from the ``ready`` ack only when ``stt_config.audio_in_codec`` was requested.
+        If you asked for ``opus`` and this is ``"linear16"``, the gateway downgraded — send linear16.
+        """
+        return self._audio_in_codec
+
+    @property
+    def audio_out_codec(self) -> Optional[str]:
+        """D8 negotiated DOWNLINK transport codec for TTS egress (``"linear16"`` | ``"opus"``).
+
+        Populated from the ``ready`` ack only when ``tts_config.audio_out_codec`` was requested.
+        Same downgrade semantics as :attr:`audio_in_codec`.
+        """
+        return self._audio_out_codec
 
     def on(self, event: str, handler: Callable[..., Any]) -> None:
         """
@@ -320,14 +509,116 @@ class WebSocketSession:
             self._message_queue = asyncio.Queue()
         return self._message_queue
 
-    async def connect(self, timeout: float = 10.0) -> None:
+    @staticmethod
+    def _classify_connect_error(e: Exception, url: str) -> Exception:
+        """Map a raw websockets connect failure to a typed SDK error.
+
+        Two gateway connect-time rejections are TRANSIENT and must back off
+        rather than fail hard (D7), so both map to a typed :class:`RateLimitError`
+        that the connect retry loop honors identically:
+
+        * **429** — the per-IP token bucket / tower_governor rate limit. Carries
+          ``Retry-After``; common under a burst, so it must not be an opaque
+          ConnectionError.
+        * **503** — "Server at capacity" (global connection-limit saturation,
+          connection_limit.rs). Also transient; back off and retry, do NOT treat
+          as fatal. The gateway rarely sets Retry-After here, so the loop falls
+          back to its exponential base.
+
+        Any other failure is a genuine :class:`ConnectionError`.
+        """
+        status = None
+        headers: dict[str, Any] = {}
+        resp = getattr(e, "response", None)
+        if resp is not None:
+            status = getattr(resp, "status_code", None)
+            headers = getattr(resp, "headers", {}) or {}
+        # websockets<14 used status_code directly on the exception.
+        if status is None:
+            status = getattr(e, "status_code", None)
+        if status in (429, 503):
+            retry_after: Optional[float] = None
+            try:
+                ra = headers.get("retry-after") if hasattr(headers, "get") else None
+                if ra is not None:
+                    retry_after = float(ra)
+            except (TypeError, ValueError):
+                retry_after = None
+            label = "Rate limited (429)" if status == 429 else "Server at capacity (503)"
+            return RateLimitError(
+                message=f"{label} connecting to {url}",
+                retry_after=retry_after,
+                url=url,
+                cause=e,
+            )
+        return ConnectionError(
+            message=f"Failed to connect to {url}: {e}",
+            url=url,
+            cause=e,
+        )
+
+    async def _open_ws(self, timeout: float) -> ClientConnection:
+        """Open the raw WebSocket, classifying timeouts and 429s into typed errors.
+
+        D1 liveness: the gateway NEVER initiates pings to clients (it only
+        auto-pongs, handler.rs:683) and exposes no JSON ping op, so a frozen-
+        but-OPEN gateway is otherwise invisible. We therefore drive native WS
+        PING from the client at a fast voice cadence — the websockets library's
+        20s/20s default did NOT trip in the SIGSTOP zombie test. ``ping_interval
+        <= 0`` disables native pings (app staleness watchdog still covers it).
+        """
+        headers = {}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        connect_kwargs: dict[str, Any] = {"additional_headers": headers}
+        if self._ping_interval and self._ping_interval > 0:
+            connect_kwargs["ping_interval"] = self._ping_interval
+            connect_kwargs["ping_timeout"] = self._ping_timeout
+        else:
+            connect_kwargs["ping_interval"] = None
+        try:
+            return await asyncio.wait_for(
+                websockets.connect(self.url, **connect_kwargs),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            raise TimeoutError(
+                message=f"WebSocket connection timed out after {timeout}s",
+                timeout_ms=int(timeout * 1000),
+                operation="connect",
+            )
+        except (TimeoutError, RateLimitError, ConnectionError):
+            raise
+        except Exception as e:
+            raise self._classify_connect_error(e, self.url)
+
+    async def connect(
+        self,
+        timeout: float = DEFAULT_CONNECT_TIMEOUT,
+        max_rate_limit_retries: int = 3,
+    ) -> None:
         """
         Connect to the WebSocket server.
 
+        On HTTP 429 (the gateway's per-IP token bucket) the connect is retried
+        with jittered backoff honoring the ``Retry-After`` header. On HTTP 503
+        ("Server at capacity", a transient global-saturation signal) it is
+        likewise retried with backoff — a 503 is NOT fatal. If still throttled
+        after the retries it is re-raised as a typed :class:`RateLimitError`.
+
         Args:
-            timeout: Connection timeout in seconds
+            timeout: Connection timeout in seconds. Defaults to
+                :data:`DEFAULT_CONNECT_TIMEOUT` (35s): an audio=true session
+                blocks on server-side PROVIDER_READY (STT+TTS upstream build,
+                up to ~30s) before `ready`, so the old 10s default was a bug that
+                timed out healthy slow-cold-start sessions. The WS upgrade itself
+                is ~2ms; pass a smaller value for a config-only (audio=false)
+                session where no providers are constructed.
+            max_rate_limit_retries: Number of 429/503 backoff retries before
+                giving up.
 
         Raises:
+            RateLimitError: If still rate-limited (429/503) after all retries
             ConnectionError: If connection fails
             TimeoutError: If connection times out
         """
@@ -341,30 +632,21 @@ class WebSocketSession:
             start_time = time.monotonic()
 
             try:
-                headers = {}
-                if self.api_key:
-                    headers["Authorization"] = f"Bearer {self.api_key}"
-
-                try:
-                    self._ws = await asyncio.wait_for(
-                        websockets.connect(
-                            self.url,
-                            additional_headers=headers,
-                        ),
-                        timeout=timeout,
-                    )
-                except asyncio.TimeoutError:
-                    raise TimeoutError(
-                        message=f"WebSocket connection timed out after {timeout}s",
-                        timeout_ms=int(timeout * 1000),
-                        operation="connect",
-                    )
-                except Exception as e:
-                    raise ConnectionError(
-                        message=f"Failed to connect to {self.url}: {e}",
-                        url=self.url,
-                        cause=e,
-                    )
+                # 429-aware connect with jittered backoff on the WS upgrade.
+                attempt = 0
+                while True:
+                    try:
+                        self._ws = await self._open_ws(timeout)
+                        break
+                    except RateLimitError as rle:
+                        if attempt >= max_rate_limit_retries:
+                            raise
+                        # Honor Retry-After when present, else exponential base;
+                        # add +-20% jitter to avoid a synchronized retry storm.
+                        base = rle.retry_after if rle.retry_after else min(2 ** attempt, 15)
+                        jitter = base * 0.2 * (random.random() * 2 - 1)
+                        await asyncio.sleep(max(0.0, base + jitter))
+                        attempt += 1
 
                 connect_time = (time.monotonic() - start_time) * 1000
                 self._metrics.record_ws_connect(connect_time)
@@ -388,10 +670,41 @@ class WebSocketSession:
                         operation="ready",
                     )
 
-                # Send any pending audio
-                for audio in self._pending_audio:
-                    await self.send_audio(audio)
+                # D1 verify-after-reconnect (Pipecat _verify_connection): a socket
+                # being OPEN is not proof it carries data. Round-trip a native WS
+                # ping on the NEW socket and wait for its pong before declaring
+                # healthy, so a half-open replacement is caught at connect time.
+                await self._verify_connection()
+
+                # D4a: this session reached ready. Record WHEN so the breaker in
+                # _reconnect() can later judge a quick failure (died < stable) vs
+                # a recovered session. We deliberately do NOT reset the quick-
+                # failure run here — a doomed config becomes ready then dies in a
+                # loop, so resetting on every ready would wipe the count and let
+                # it storm forever. The breaker resets the run only once a session
+                # SURVIVES min_stable_seconds.
+                self._connected_at = time.monotonic()
+                # D1: seed the staleness clock so a gateway that goes silent right
+                # after ready is still caught, and (re)start the app watchdog.
+                self._last_inbound_monotonic = time.monotonic()
+                self._reconnecting_due_to_stale = False
+                self._start_watchdog()
+                # D6: (re)start the STT keepalive-silence loop. Seed the real-audio
+                # clock to NOW so a brand-new session that opens then pauses gets
+                # its first keepalive only after a full idle interval, not instantly.
+                self._last_real_audio_monotonic = time.monotonic()
+                self._start_keepalive()
+
+                # D5/D4d: flush buffered CONTROL ops first (the gateway has the
+                # fresh config + is ready), then replay buffered uplink AUDIO. The
+                # audio backlog is a bounded drop-oldest deque, so a reconnect that
+                # fires mid-utterance replays the most-recent frames instead of
+                # dropping them (the old code cleared them outright).
+                await self._flush_control_queue()
+                pending = list(self._pending_audio)
                 self._pending_audio.clear()
+                for audio in pending:
+                    await self.send_audio(audio)
 
                 self._emit("ready", self._stream_id)
 
@@ -399,6 +712,183 @@ class WebSocketSession:
                 self._connecting = False
                 self._connected = False
                 raise
+
+    async def _verify_connection(self) -> None:
+        """Prove the freshly-opened socket actually carries data (D1).
+
+        Ported from Pipecat ``WebsocketService._verify_connection``: OPEN is not
+        liveness. ``websockets`` exposes ``ws.ping()`` which returns a future that
+        resolves when the matching pong returns; we await it under
+        ``ping_timeout``. A failure/timeout raises so :meth:`connect` treats the
+        new socket as dead (the caller's reconnect path then tries again) instead
+        of declaring a half-open zombie healthy. No native ping support → skip
+        (browser-style runtimes can't ping anyway; the staleness timer covers it).
+        """
+        ws = self._ws
+        if ws is None or not hasattr(ws, "ping"):
+            return
+        timeout = self._ping_timeout if self._ping_timeout and self._ping_timeout > 0 else 3.0
+        try:
+            pong_waiter = await ws.ping()
+            await asyncio.wait_for(pong_waiter, timeout=timeout)
+        except asyncio.TimeoutError as e:
+            raise ConnectionError(
+                message=(
+                    "Verify-after-reconnect failed: no pong within "
+                    f"{timeout}s on the new socket"
+                ),
+                url=self.url,
+                cause=e,
+            )
+        except Exception as e:
+            # Socket already closed / ping unsupported at runtime → treat as dead.
+            raise ConnectionError(
+                message=f"Verify-after-reconnect failed: {e}",
+                url=self.url,
+                cause=e,
+            )
+
+    def _start_watchdog(self) -> None:
+        """Start (or restart) the app-level stale-inbound watchdog (D1).
+
+        Belt-and-suspenders to the native ping/pong: catches a wedged read pump
+        or any path where the socket stays OPEN but no frames arrive. Disabled
+        when ``stale_inbound_timeout <= 0``.
+        """
+        if self._stale_inbound_timeout <= 0:
+            return
+        self._stop_watchdog()
+        self._watchdog_task = asyncio.create_task(self._watchdog_loop())
+
+    def _stop_watchdog(self) -> None:
+        """Cancel the staleness watchdog if running."""
+        if self._watchdog_task is not None:
+            self._watchdog_task.cancel()
+            self._watchdog_task = None
+
+    async def _watchdog_loop(self) -> None:
+        """Reconnect if no inbound frame arrives within the staleness window (D1).
+
+        Polls at a fraction of the window so detection latency is bounded. On a
+        stale verdict it sets ``_reconnecting_due_to_stale`` (so the receive
+        loop's own ConnectionClosed handler does NOT also reconnect) and closes
+        the socket; closing wakes ``_receive_loop`` which runs the EXISTING
+        reconnect path — the single authoritative reconnect mechanism.
+        """
+        timeout = self._stale_inbound_timeout
+        # Poll often enough to detect within ~1/4 window, capped to a sane floor.
+        poll = max(0.25, min(timeout / 4.0, 3.0))
+        try:
+            while self._connected and not self._closed:
+                await asyncio.sleep(poll)
+                if not self._connected or self._closed:
+                    return
+                last = self._last_inbound_monotonic
+                if last is None:
+                    continue
+                if (time.monotonic() - last) >= timeout and not self._reconnecting_due_to_stale:
+                    # Zombie: OPEN but silent. Force the existing reconnect path.
+                    self._reconnecting_due_to_stale = True
+                    self._emit("zombie_detected", {"stale_seconds": timeout})
+                    ws = self._ws
+                    if ws is not None:
+                        try:
+                            await ws.close(code=1006, reason="stale-inbound watchdog")
+                        except Exception:
+                            pass
+                    return
+        except asyncio.CancelledError:
+            return
+
+    def _keepalive_frame(self) -> bytes:
+        """One ~100ms zero-PCM (16-bit mono) silence frame at the STT rate (D6).
+
+        Sized from ``stt_config.sample_rate`` so it matches what the gateway+STT
+        expect (default 16kHz → 3200 bytes). Pure silence, so it advances the
+        upstream STT stream's clock without affecting transcription.
+        """
+        rate = 16000
+        if self.stt_config is not None and getattr(self.stt_config, "sample_rate", None):
+            rate = int(self.stt_config.sample_rate)
+        # samples = rate * ms/1000 ; 2 bytes/sample (linear16) ; all zeros = silence.
+        n_bytes = max(2, int(rate * (_KEEPALIVE_SILENCE_MS / 1000.0)) * 2)
+        return b"\x00" * n_bytes
+
+    def _start_keepalive(self) -> None:
+        """Start (or restart) the STT keepalive-silence loop (D6).
+
+        Only meaningful for an audio=true session; a config-only / audio=false
+        session has no STT stream to keep warm. Disabled when the interval is
+        <=0.
+        """
+        if not self.audio or self._stt_keepalive_interval <= 0:
+            return
+        self._stop_keepalive()
+        self._keepalive_task = asyncio.create_task(self._keepalive_loop())
+
+    def _stop_keepalive(self) -> None:
+        """Cancel the keepalive-silence loop if running."""
+        if self._keepalive_task is not None:
+            self._keepalive_task.cancel()
+            self._keepalive_task = None
+
+    async def _keepalive_loop(self) -> None:
+        """Emit a zero-PCM frame after each idle gap, GATED on real audio (D6).
+
+        Sleeps the interval, then sends one silence frame ONLY if no real
+        ``send_audio`` happened within the interval — so during active capture it
+        sends nothing (the gate keeps deferring), and only a genuine pause warms
+        the stream. The send goes straight to the socket (never the offline
+        buffer): if we are disconnected the loop simply skips, and reconnect
+        restarts a fresh keepalive timer.
+        """
+        interval = self._stt_keepalive_interval
+        try:
+            while self._connected and not self._closed:
+                await asyncio.sleep(interval)
+                if not self._connected or self._closed or self._ws is None:
+                    continue
+                last = self._last_real_audio_monotonic
+                # Gate: skip if a real frame was sent within the interval (the
+                # line is already warm — never fight live capture).
+                if last is not None and (time.monotonic() - last) < interval:
+                    continue
+                try:
+                    await self._ws.send(self._keepalive_frame())
+                    self._emit("stt_keepalive", {"interval": interval})
+                except Exception:
+                    # Socket died mid-send — let the receive loop handle reconnect.
+                    continue
+        except asyncio.CancelledError:
+            return
+
+    async def _flush_control_queue(self) -> None:
+        """Replay buffered control ops onto the live socket, in order (D5).
+
+        Drains the drop-oldest control queue and re-sends each op SEQUENTIALLY
+        (awaiting each send) so order is preserved — a queued ``speak`` must
+        precede a queued ``clear``. Called from :meth:`connect` AFTER the fresh
+        config + ready so the gateway accepts the ops (it rejects pre-config ops
+        and any 2nd config on a live session). Mirrors the TS SDK's
+        ``flushQueue``. If the socket dies mid-flush the remaining ops are
+        re-buffered for the next reconnect.
+        """
+        if self._control_queue.is_empty:
+            return
+        for raw in self._control_queue.drain():
+            payload = raw.decode() if isinstance(raw, bytes) else raw
+            ws = self._ws
+            if ws is None or not self._connected:
+                # Lost the socket again before flush completed — re-buffer this
+                # and stop; the next successful connect() replays the rest.
+                self._control_queue.enqueue(payload)
+                return
+            try:
+                await ws.send(payload)
+                self._metrics.record_message_sent()
+            except Exception:
+                self._control_queue.enqueue(payload)
+                return
 
     async def _send_config(self) -> None:
         """Send configuration message with all gateway-supported fields.
@@ -408,8 +898,14 @@ class WebSocketSession:
         """
         config: dict[str, Any] = {
             "type": "config",
-            "audio": True,
+            "audio": self.audio,
         }
+
+        # Proxy/alias name (P3): a single top-level field the gateway resolves to a
+        # full {stt,tts,llm,dag} bundle server-side. Composes with everything else —
+        # any explicit stt/tts/conversation config below overrides the alias default.
+        if self.alias:
+            config["alias"] = self.alias
 
         # Include stream_id if requested
         if self.requested_stream_id:
@@ -425,12 +921,72 @@ class WebSocketSession:
                 "encoding": self.stt_config.encoding,
                 "model": self.stt_config.model or "nova-3",
             }
+            # D8 uplink transport codec (linear16|opus); only set when requested. The gateway echoes
+            # the effective codec on `ready` and degrades to linear16 if its build lacks opus.
+            if getattr(self.stt_config, "audio_in_codec", None):
+                stt_dict["audio_in_codec"] = self.stt_config.audio_in_codec
             # Include API key if provided (gateway allows per-request override)
             if self.api_key:
                 stt_dict["api_key"] = self.api_key
+
+            # Advanced STT features → stt_config.features{} (canonical SttFeatures,
+            # gateway/src/core/stt/standard.rs). Flat-on-top was silently dropped;
+            # nesting here makes the ~20 already-typed fields actually reach the wire.
+            stt_features: dict[str, Any] = {}
+            if self.stt_config.interim_results is not None:
+                stt_features["interim_results"] = self.stt_config.interim_results
+            if self.stt_config.diarize:
+                stt_features["diarization"] = self.stt_config.diarize
+            if self.stt_config.smart_format is not None:
+                stt_features["smart_format"] = self.stt_config.smart_format
+            if self.stt_config.profanity_filter:
+                stt_features["profanity_filter"] = self.stt_config.profanity_filter
+            if self.stt_config.keywords:
+                # SttFeatures models boost terms as `keyterms`.
+                stt_features["keyterms"] = list(self.stt_config.keywords)
+            if stt_features:
+                stt_dict["features"] = stt_features
+
+            # custom_vocabulary has NO canonical SttFeatures field — route it
+            # through the open `extras` passthrough so it still reaches the provider.
+            if self.stt_config.custom_vocabulary:
+                stt_dict["extras"] = {
+                    "custom_vocabulary": list(self.stt_config.custom_vocabulary)
+                }
+
+            # Canonical in-stream translation (P5) → stt_config.translation. The
+            # gateway folds Speechmatics/Gladia side-channels + the OpenAI/Groq
+            # English fast-path into a uniform translations:[{lang,text}] array;
+            # unsupported providers degrade with a config_warning (never a 400).
+            translation = getattr(self.stt_config, "translation", None)
+            if translation is not None:
+                tw = translation.to_wire()
+                if tw:
+                    stt_dict["translation"] = tw
+
+            # ML turn detection → stt_config.turn_detection (config.rs:345). This is
+            # the REAL wire home for turn_detection (it was a dead no-op before).
+            td = self.audio_features.turn_detection if self.audio_features else None
+            if td is not None and td.enabled:
+                td_wire: dict[str, Any] = {
+                    "enabled": True,
+                    "threshold": td.threshold,
+                }
+                # Eager end-of-turn needs BOTH stt_config.turn_detection.eager AND
+                # conversation_config.eager_eot (config.rs:357-361). The SDK pairs
+                # them: when the conversation loop opts into eager_eot, set the
+                # detector's eager flag so the speculative-start path is armed.
+                if (
+                    self.conversation_config is not None
+                    and getattr(self.conversation_config, "eager_eot", None)
+                ):
+                    td_wire["eager"] = True
+                stt_dict["turn_detection"] = td_wire
+
             config["stt_config"] = stt_dict
-        else:
-            # Gateway requires stt_config when audio=true - provide minimal default
+        elif self.audio:
+            # Gateway requires stt_config when audio=true - provide minimal default.
+            # Skipped for audio=false (config-only) sessions.
             config["stt_config"] = {
                 "provider": "deepgram",
                 "language": "en-US",
@@ -447,6 +1003,15 @@ class WebSocketSession:
                 "voice_id": self.tts_config.voice_id or self.tts_config.voice,
                 "model": self.tts_config.model or "aura-asteria-en",
             }
+            # Abstract voice selection (P4): the gateway resolves a VoiceDescriptor
+            # to a concrete provider voice_id server-side. Sent under
+            # `tts_config.voice_descriptor` (snake_case object); a raw voice_id
+            # always wins, so the gateway only uses this when voice_id is absent.
+            vd = self.tts_config.voice_descriptor
+            if vd is not None:
+                vd_wire = vd.to_wire() if hasattr(vd, "to_wire") else dict(vd)
+                if vd_wire:
+                    tts_dict["voice_descriptor"] = vd_wire
             # Include optional TTS fields recognized by gateway
             if self.tts_config.sample_rate:
                 tts_dict["sample_rate"] = self.tts_config.sample_rate
@@ -454,6 +1019,10 @@ class WebSocketSession:
                 tts_dict["audio_format"] = self.tts_config.audio_format
             if self.tts_config.speed is not None:
                 tts_dict["speaking_rate"] = self.tts_config.speed
+            # D8 downlink transport codec (linear16|opus); only set when requested. The gateway echoes
+            # the effective codec on `ready` and degrades to linear16 if its build lacks opus.
+            if getattr(self.tts_config, "audio_out_codec", None):
+                tts_dict["audio_out_codec"] = self.tts_config.audio_out_codec
             # Include API key if provided (gateway allows per-request override)
             if self.api_key:
                 tts_dict["api_key"] = self.api_key
@@ -466,9 +1035,48 @@ class WebSocketSession:
                 tts_dict["delivery_style"] = self.tts_config.delivery_style.value if hasattr(self.tts_config.delivery_style, 'value') else str(self.tts_config.delivery_style)
             if self.tts_config.emotion_description is not None:
                 tts_dict["emotion_description"] = self.tts_config.emotion_description
+
+            # Advanced TTS features → tts_config.features{} (canonical TtsFeatures,
+            # gateway/src/core/tts/standard.rs). These were typed but never sent.
+            tts_features: dict[str, Any] = {}
+            if self.tts_config.speed is not None:
+                # Also carried as top-level speaking_rate; mirror into features so
+                # providers that read TtsFeatures.speed honor it too.
+                tts_features["speed"] = self.tts_config.speed
+            if self.tts_config.pitch is not None:
+                tts_features["pitch"] = self.tts_config.pitch
+            if self.tts_config.volume is not None:
+                tts_features["volume"] = self.tts_config.volume
+            if self.tts_config.stability is not None:
+                tts_features["stability"] = self.tts_config.stability
+            if self.tts_config.similarity_boost is not None:
+                tts_features["similarity_boost"] = self.tts_config.similarity_boost
+            if self.tts_config.style is not None:
+                tts_features["style"] = self.tts_config.style
+            if self.tts_config.use_speaker_boost is not None:
+                tts_features["use_speaker_boost"] = self.tts_config.use_speaker_boost
+            if tts_features:
+                tts_dict["features"] = tts_features
+
+            # Hume-specific knobs have NO canonical TtsFeatures field — route them
+            # through the open `extras` passthrough (acting_instructions, instant_mode,
+            # trailing_silence, voice_description).
+            tts_extras: dict[str, Any] = {}
+            if self.tts_config.acting_instructions is not None:
+                tts_extras["acting_instructions"] = self.tts_config.acting_instructions
+            if self.tts_config.instant_mode is not None:
+                tts_extras["instant_mode"] = self.tts_config.instant_mode
+            if self.tts_config.trailing_silence is not None:
+                tts_extras["trailing_silence"] = self.tts_config.trailing_silence
+            if self.tts_config.voice_description is not None:
+                tts_extras["voice_description"] = self.tts_config.voice_description
+            if tts_extras:
+                tts_dict["extras"] = tts_extras
+
             config["tts_config"] = tts_dict
-        else:
-            # Gateway requires tts_config when audio=true - provide minimal default
+        elif self.audio:
+            # Gateway requires tts_config when audio=true - provide minimal default.
+            # Skipped for audio=false (config-only) sessions.
             config["tts_config"] = {
                 "provider": "deepgram",
                 "model": "aura-asteria-en",
@@ -492,16 +1100,80 @@ class WebSocketSession:
                 dag_dict["timeout_ms"] = self.dag_config.timeout_ms
             config["dag_config"] = dag_dict
 
+        # Built-in conversation loop → conversation_config (config.rs:53-217).
+        # The entire LLM loop + reasoning stack was 0% reachable before this.
+        if self.conversation_config is not None:
+            conv = self.conversation_config
+            conv_dict: dict[str, Any] = {
+                # base_url + model are required by the gateway.
+                "base_url": conv.base_url,
+                "model": conv.model,
+            }
+            # Emit every OTHER field only when explicitly set (None = let the
+            # gateway apply its own default). Pydantic enum values are already
+            # coerced to str via use_enum_values=True on the model.
+            optional_fields = (
+                "system_prompt", "api_key", "temperature", "max_tokens",
+                "streaming", "max_history", "allow_interruption", "eager_eot",
+                "provider_kind", "barge_in_min_words", "summarize_target_tokens",
+                "mute_strategy", "strip_markdown", "user_idle_timeout_ms",
+                "reasoning_effort", "latency_filler", "latency_filler_after_ms",
+                "latency_filler_phrases", "reasoning_model", "reasoning_base_url",
+                "reasoning_api_key", "reasoning_provider_kind", "reasoning_route",
+                "reasoning_budget_ms", "degradation_message",
+                "max_llm_calls_per_turn", "max_reasoning_tokens",
+            )
+            for fname in optional_fields:
+                value = getattr(conv, fname, None)
+                if value is not None:
+                    conv_dict[fname] = value
+            config["conversation_config"] = conv_dict
+
         self._config_sent_time = time.monotonic()
         await self._send_json(config)
 
     async def _send_json(self, data: dict[str, Any]) -> None:
-        """Send a JSON message."""
-        if not self._ws:
-            raise ConnectionError(message="Not connected", url=self.url)
+        """Send a JSON control message, buffering it when offline (D5).
 
-        await self._ws.send(json.dumps(data))
-        self._metrics.record_message_sent()
+        Previously this RAISED ConnectionError on a dead socket, so a ``speak`` /
+        ``clear`` / ``send_message`` issued during a reconnect blip was lost and
+        the caller saw an exception — unlike the TS SDK, which enqueues and
+        flushes on reopen. Now an offline control op is appended to the bounded
+        drop-oldest control queue and replayed by :meth:`_flush_control_queue`
+        once the session is ready again, so Python and TS behave identically.
+
+        The ``config`` message is the one exception: it is sent only from inside
+        :meth:`connect` while the socket is open and MUST go to the wire
+        immediately (it is what makes the session ready), so it is never queued.
+        """
+        payload = json.dumps(data)
+
+        # The `config` message is sent ONLY from inside connect() on a freshly
+        # opened socket, and MUST reach the wire immediately (it is what makes
+        # the session ready). It is gated on the socket OBJECT, not the
+        # `connected` flag, and never buffered: a missing/failed socket here is a
+        # hard failure connect() counts as a failed attempt.
+        if data.get("type") == "config":
+            if self._ws is None:
+                raise ConnectionError(message="Not connected", url=self.url)
+            await self._ws.send(payload)
+            self._metrics.record_message_sent()
+            return
+
+        # Control ops (speak/clear/send_message/…). Mirror the TS SDK: when the
+        # session is live, send now; otherwise buffer-and-flush (drop-oldest)
+        # instead of raising ConnectionError, so an op issued during a reconnect
+        # blip survives and replays on reopen.
+        if self._connected and self._ws is not None:
+            try:
+                await self._ws.send(payload)
+                self._metrics.record_message_sent()
+                return
+            except Exception:
+                # Socket died mid-send — fall through and buffer for the replay.
+                pass
+
+        self._control_queue.enqueue(payload)
 
     async def _receive_loop(self) -> None:
         """Receive messages from WebSocket."""
@@ -511,6 +1183,10 @@ class WebSocketSession:
         try:
             async for message in self._ws:
                 self._metrics.record_message_received()
+                # D1: every inbound frame proves the socket is alive — feed the
+                # app-level staleness watchdog so it only fires on a truly silent
+                # (zombie) connection.
+                self._last_inbound_monotonic = time.monotonic()
 
                 if isinstance(message, bytes):
                     # Binary audio data
@@ -542,6 +1218,44 @@ class WebSocketSession:
 
                     if msg_type == "ready":
                         self._stream_id = data.get("stream_id")
+                        # P3: capture the resolved-alias echo — the concrete
+                        # providers the gateway resolved `alias` to (no secrets), so
+                        # a developer can SEE what e.g. "support-bot" became.
+                        self._resolved_alias = data.get("resolved_alias")
+                        # D8: capture the negotiated transport codecs in effect. If we asked for
+                        # `opus` but the gateway echoes `linear16`, it downgraded (e.g. built without
+                        # opus) — callers should send/decode linear16.
+                        self._audio_in_codec = data.get("audio_in_codec")
+                        self._audio_out_codec = data.get("audio_out_codec")
+                        # Capture + drift-check the wire protocol version (plan W-K1).
+                        # The gateway emits this specifically so SDKs detect a
+                        # breaking contract change instead of silent field drift.
+                        self._protocol_version = data.get("protocol_version")
+                        if (
+                            self._protocol_version is not None
+                            and self._protocol_version.split(".")[0]
+                            != PROTOCOL_VERSION.split(".")[0]
+                        ):
+                            msg = (
+                                "WaaV protocol version mismatch: gateway sent "
+                                f"{self._protocol_version!r}, SDK expects "
+                                f"{PROTOCOL_VERSION!r}. Update bud-waav."
+                            )
+                            import sys
+                            print(msg, file=sys.stderr)
+                            # Also surface a typed warning so callers can react
+                            # programmatically (parity with the TS SDK's
+                            # PROTOCOL_VERSION_MISMATCH event). It's a WARNING, not
+                            # a raise: the session still proceeds (best-effort).
+                            warning = ProtocolVersionError(
+                                message=msg,
+                                gateway_version=self._protocol_version,
+                                sdk_version=PROTOCOL_VERSION,
+                            )
+                            self._emit("warning", warning)
+                            await self._get_message_queue().put(
+                                {"type": "warning", "warning": warning}
+                            )
                         self._get_ready_event().set()
 
                     elif msg_type == "stt_result":
@@ -551,15 +1265,35 @@ class WebSocketSession:
                             self._metrics.record_stt_ttft(ttft)
                             self._config_sent_time = None
 
+                        # P5: uniform translations[] array (Speechmatics/Gladia/
+                        # OpenAI-EN fast path), folded onto the transcript. Absent
+                        # on non-translation sessions (gateway skips it when empty).
+                        translations = [
+                            Translation(
+                                lang=t.get("lang", ""),
+                                text=t.get("text", ""),
+                                is_partial=t.get("is_partial", False),
+                            )
+                            for t in data.get("translations", [])
+                        ]
                         result = STTResult(
                             text=data.get("transcript", ""),
                             is_final=data.get("is_final", False),
                             is_speech_final=data.get("is_speech_final", False),
                             confidence=data.get("confidence"),
                             speaker_id=data.get("speaker_id"),
+                            translations=translations,
                         )
+                        # Carry the optional speaker role through the queue (the
+                        # gateway's cascade stt_result has no role, but a DAG
+                        # text_output / assistant echo may set role="assistant").
+                        # The Talk pipeline routes role="assistant" to a `bot_text`
+                        # event; the STTResult shape itself is unchanged.
+                        role = data.get("role")
                         self._emit("transcript", result)
-                        await self._get_message_queue().put({"type": "transcript", "result": result})
+                        await self._get_message_queue().put(
+                            {"type": "transcript", "result": result, "role": role}
+                        )
 
                     elif msg_type == "tts_audio":
                         # Base64 encoded audio
@@ -655,6 +1389,19 @@ class WebSocketSession:
                         self._emit("plugin_response", data)
                         await self._get_message_queue().put({"type": "plugin_response", "data": data})
 
+                    elif msg_type == "config_warning":
+                        # Non-fatal gateway advisory (e.g. reasoning_model_on_voice_path,
+                        # emotion_ignored_for_provider). Surface it as a typed warning so a
+                        # silent server-side degrade becomes visible to the developer.
+                        self._emit("config_warning", data)
+                        await self._get_message_queue().put({"type": "config_warning", "data": data})
+
+                    elif msg_type is not None:
+                        # Forward-compat: never silently drop an unrecognized server
+                        # message — surface it so new gateway events are observable.
+                        self._emit("server_message", data)
+                        await self._get_message_queue().put({"type": "server_message", "data": data})
+
         except websockets.ConnectionClosed:
             self._connected = False
             self._emit("close")
@@ -665,9 +1412,80 @@ class WebSocketSession:
         except Exception as e:
             self._emit("error", e)
 
+    def _note_session_ended(self) -> None:
+        """Feed the quick-failure breaker with the just-ended session's lifespan (D4a).
+
+        Called at the top of :meth:`_reconnect` (the prior session has just
+        dropped). A session that became ready then died within
+        ``min_stable_seconds`` is a "quick failure" — the signature of a doomed
+        config the gateway keeps accepting at the handshake but immediately tears
+        down. We count consecutive quick failures; a session that SURVIVED the
+        stable window resets the run (and clears the fatal latch).
+        """
+        if self._connected_at is None:
+            # Never reached ready this cycle (pure handshake failure). Leave the
+            # run as-is; the per-attempt loop below counts those separately.
+            return
+        survival = time.monotonic() - self._connected_at
+        self._connected_at = None
+        if survival < self.reconnect_config.min_stable_seconds:
+            self._consecutive_quick_failures += 1
+        else:
+            # A genuinely stable session recovered the line — forgive the run.
+            self._consecutive_quick_failures = 0
+            self._fatal = False
+
+    def _trip_if_doomed(self, last_error: Optional[Exception]) -> None:
+        """Raise a typed FATAL once the quick-failure threshold is hit (D4a).
+
+        Stops the SDK's OWN reconnect storm against an unrecoverable config
+        instead of looping ``max_retries`` times. This is the client analog of
+        the gateway's per-provider CircuitBreaker FATAL fast-trip (upstream-only,
+        never on the client wire) — it bounds retries of a doomed CONFIG, it does
+        not mirror the gateway's breaker.
+        """
+        if self._consecutive_quick_failures >= self.reconnect_config.quick_failure_threshold:
+            self._fatal = True
+            err = FatalConnectionError(
+                message=(
+                    "Reconnect stopped: "
+                    f"{self._consecutive_quick_failures} connections in a row each "
+                    f"survived < {self.reconnect_config.min_stable_seconds}s "
+                    "(likely an unrecoverable config — check API key / provider / "
+                    "config)."
+                ),
+                consecutive_quick_failures=self._consecutive_quick_failures,
+                last_error=last_error,
+            )
+            self._emit("error", err)
+            raise err
+
     async def _reconnect(self) -> None:
-        """Attempt to reconnect with exponential backoff."""
-        delay: float = float(self.reconnect_config.initial_delay_ms)
+        """Reconnect with a fast first hop + decorrelated jitter, gated by the
+        quick-failure breaker (D4a/D4b).
+
+        Backoff is decorrelated jitter — ``sleep = min(cap, U(base, prev*3))``
+        (SOTA / AWS) — NOT raw ``base * multiplier**n``, which compounded into the
+        measured storm. The first hop starts at ``initial_delay_ms`` (200ms) for
+        sub-second recovery; the ceiling stays at ``max_delay_ms`` (30s). Before
+        every wait the breaker may trip FATAL so the fast first hop can never
+        storm a doomed config harder.
+        """
+        # Account the session that just dropped, then trip BEFORE any retry so a
+        # doomed config that died fast doesn't even get the fast first hop.
+        self._note_session_ended()
+        self._stop_watchdog()
+        # Stop keepalive too: the old socket is dead, and connect() restarts a
+        # fresh keepalive timer once the new session is ready.
+        self._stop_keepalive()
+        if self._closed:
+            return
+        self._trip_if_doomed(None)
+
+        base = float(self.reconnect_config.initial_delay_ms)
+        cap = float(self.reconnect_config.max_delay_ms)
+        # Decorrelated-jitter running delay (ms). Seeded at the fast first hop.
+        delay = base
         last_error: Optional[Exception] = None
 
         for attempt in range(self.reconnect_config.max_retries):
@@ -675,11 +1493,7 @@ class WebSocketSession:
             if self._closed:
                 return
 
-            # Add jitter
-            jitter = delay * self.reconnect_config.jitter * (random.random() * 2 - 1)
-            wait_time = (delay + jitter) / 1000
-
-            await asyncio.sleep(wait_time)
+            await asyncio.sleep(delay / 1000.0)
 
             # Check again after sleep in case disconnect() was called during wait
             if self._closed:
@@ -692,12 +1506,19 @@ class WebSocketSession:
                 self._emit("reconnect", attempt + 1)
                 return
 
+            except FatalConnectionError:
+                # Breaker tripped inside connect()'s own reconnect chain — propagate.
+                raise
             except Exception as e:
                 last_error = e
-                delay = min(
-                    delay * self.reconnect_config.multiplier,
-                    float(self.reconnect_config.max_delay_ms),
-                )
+                # A reconnect attempt that briefly became ready then died is a
+                # quick failure too; fold it into the run and maybe trip FATAL.
+                self._note_session_ended()
+                self._trip_if_doomed(last_error)
+                # Decorrelated jitter: next = min(cap, uniform(base, delay*3)).
+                lo = base
+                hi = max(delay * 3.0, base)
+                delay = min(cap, random.uniform(lo, hi))
 
         raise ReconnectError(
             message=f"Failed to reconnect after {self.reconnect_config.max_retries} attempts",
@@ -705,10 +1526,26 @@ class WebSocketSession:
             last_error=last_error,
         )
 
-    async def disconnect(self) -> None:
-        """Disconnect from the WebSocket server."""
+    async def disconnect(self, close_timeout: float = 1.0) -> None:
+        """Disconnect from the WebSocket server.
+
+        D4: the close handshake is BOUNDED (was unbounded). ``ws.close()`` waits
+        for the server's Close echo, which a wedged/zombie gateway will never
+        send — leaving disconnect() hung. We fire the close then await it under
+        ``close_timeout`` (default 1s, Pipecat fastapi.py:187 pattern) and move
+        on regardless, so shutdown is prompt even against a dead peer.
+
+        Args:
+            close_timeout: Max seconds to await the close handshake before
+                abandoning it and dropping the socket.
+        """
         self._closed = True
         self._connected = False
+
+        # Stop the liveness watchdog + keepalive first so neither can race a
+        # reconnect (or send into a half-torn socket) during teardown.
+        self._stop_watchdog()
+        self._stop_keepalive()
 
         if self._receive_task:
             self._receive_task.cancel()
@@ -727,8 +1564,14 @@ class WebSocketSession:
             self._handler_tasks.clear()
 
         if self._ws:
-            await self._ws.close()
+            ws = self._ws
             self._ws = None
+            try:
+                await asyncio.wait_for(ws.close(), timeout=close_timeout)
+            except (asyncio.TimeoutError, Exception):
+                # Bounded: a peer that never echoes Close must not hang shutdown.
+                # The socket is abandoned; the OS reclaims it.
+                pass
 
         self._emit("close")
 
@@ -736,10 +1579,26 @@ class WebSocketSession:
         """
         Send audio data.
 
+        While disconnected the frame is buffered in a BOUNDED, drop-oldest deque
+        (D5): if the backlog is already full the stalest frame is shed before the
+        new one is appended (an ``audio_dropped`` event fires). This mirrors the
+        gateway's own DroppableAudio drop-oldest egress discipline so a slow or
+        absent gateway can never grow uplink latency without limit; on reconnect
+        the most-recent frames replay (rather than being cleared outright).
+
         Args:
             audio: PCM audio data (16-bit signed integer)
         """
+        # D6: mark that REAL audio just flowed so the keepalive-silence loop
+        # defers — a genuine frame (live OR buffered while down) means the user
+        # is producing audio, so the line needs no synthetic silence.
+        self._last_real_audio_monotonic = time.monotonic()
+
         if not self._connected:
+            # deque(maxlen=…) drops the oldest automatically on overflow; surface
+            # it so callers can SEE backpressure shedding.
+            if len(self._pending_audio) >= (self._pending_audio.maxlen or 0):
+                self._emit("audio_dropped", {"reason": "uplink_backlog_full"})
             self._pending_audio.append(bytes(audio))
             return
 
@@ -826,13 +1685,6 @@ class WebSocketSession:
             "type": "custom",
             "message_type": message_type,
             "payload": payload,
-        })
-
-    async def ping(self) -> None:
-        """Send a ping message."""
-        await self._send_json({
-            "type": "ping",
-            "timestamp": int(time.time() * 1000),
         })
 
     def get_metrics(self) -> SessionMetrics:

@@ -7,6 +7,15 @@ use crate::core::tts::base::{TTSConfig, TTSError};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
+fn validate_sber_tts_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -293,6 +302,16 @@ pub struct SberTtsConfig {
     /// Request timeout in seconds
     #[serde(default = "default_request_timeout")]
     pub request_timeout_secs: u64,
+
+    /// Treat synthesis input as SSML markup. When set, the synth request is sent with
+    /// `Content-Type: application/ssml` instead of `application/text`, so SaluteSpeech parses the
+    /// input as SSML (the documented SSML input mode for `/rest/v1/text:synthesize`).
+    #[serde(default)]
+    pub ssml_input: bool,
+
+    /// Optional base URL override (scheme+host) for the OAuth token and synth REST calls; used by the mock e2e harness to redirect to localhost.
+    #[serde(skip)]
+    pub endpoint_override: Option<String>,
 }
 
 fn default_sample_rate() -> u32 {
@@ -318,6 +337,8 @@ impl Default for SberTtsConfig {
             sample_rate: default_sample_rate(),
             connection_timeout_secs: default_connection_timeout(),
             request_timeout_secs: default_request_timeout(),
+            ssml_input: false,
+            endpoint_override: None,
         }
     }
 }
@@ -393,7 +414,81 @@ impl SberTtsConfig {
             sample_rate,
             connection_timeout_secs: default_connection_timeout(),
             request_timeout_secs: default_request_timeout(),
+            ssml_input: false,
+            endpoint_override: None,
         })
+    }
+
+    /// Build from the standardized TTS config (W1 keystone). SberDevices SaluteSpeech exposes no
+    /// prosody knobs (the voice/format/scope come from base fields). The standardized features with
+    /// a real wire effect are `sample_rate` -> `sample_rate` (re-validated to the supported
+    /// 8000/24000 Hz set, exactly as `from_base` does) and `ssml` -> `ssml_input` (which flips the
+    /// synth request `Content-Type` to `application/ssml`). The non-standard `connection_timeout_secs`
+    /// and `request_timeout_secs` knobs are read from the `extras` passthrough.
+    ///
+    /// `language` is intentionally NOT mapped: the SaluteSpeech REST `text:synthesize` endpoint has
+    /// no standalone language parameter (its query is only `voice`/`format`/`sample_rate`, and the
+    /// language is fixed by the chosen voice). On the gRPC streaming path the proto carries
+    /// `SynthesisRequest.language` (field 3), and for SSML input the language lives in the
+    /// `<speak xml:lang="...">` attribute the caller supplies — neither is reachable from this REST
+    /// synth without rewriting the URL contract or mutating user-supplied SSML, so it is left as a
+    /// capability gap rather than fabricated. Other unsupported features (speed, pitch, volume,
+    /// stability, similarity_boost, style, use_speaker_boost, emotion, instructions, word_timestamps,
+    /// streaming, seed) are likewise skipped.
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> Result<Self, String> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(std.base.clone())?;
+
+        if let Some(rate) = f.sample_rate {
+            if rate != 8000 && rate != 24000 {
+                return Err(format!(
+                    "Invalid sample rate: {}. SberDevices TTS only supports 8000 or 24000 Hz",
+                    rate
+                ));
+            }
+            cfg.sample_rate = rate;
+        }
+
+        // SSML input mode: flips the synth request Content-Type to `application/ssml`.
+        if let Some(true) = f.ssml {
+            cfg.ssml_input = true;
+        }
+
+        // Provider-specific passthrough.
+        if let Some(secs) = std
+            .extras
+            .0
+            .get("connection_timeout_secs")
+            .and_then(|v| v.as_u64())
+        {
+            cfg.connection_timeout_secs = secs;
+        }
+        if let Some(secs) = std
+            .extras
+            .0
+            .get("request_timeout_secs")
+            .and_then(|v| v.as_u64())
+        {
+            cfg.request_timeout_secs = secs;
+        }
+
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
+
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// The `Content-Type` header value for the synth request: `application/ssml` when the input is
+    /// SSML markup, else `application/text`. This is the wire surface that puts SaluteSpeech into
+    /// SSML input mode for `/rest/v1/text:synthesize`.
+    pub fn synthesis_content_type(&self) -> &'static str {
+        if self.ssml_input {
+            "application/ssml"
+        } else {
+            "application/text"
+        }
     }
 
     /// Validate the configuration
@@ -412,6 +507,10 @@ impl SberTtsConfig {
             ));
         }
 
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_sber_tts_endpoint("endpoint_override", endpoint)?;
+        }
+
         Ok(())
     }
 
@@ -425,14 +524,25 @@ impl SberTtsConfig {
         self.voice.voice_id(self.sample_rate)
     }
 
-    /// Build synthesis URL with query parameters
+    /// Build synthesis URL with query parameters. Honors `endpoint_override` (scheme+host swap,
+    /// path+query preserved) so the mock e2e harness can redirect the synth POST to localhost.
     pub fn synthesis_url(&self) -> String {
-        format!(
+        let url = format!(
             "{}?voice={}&format={}&sample_rate={}",
             SBER_TTS_SYNTHESIZE_URL,
             self.voice_id(),
             self.audio_format.as_str(),
             self.sample_rate
+        );
+        crate::core::tts::standard::override_rest_endpoint(&url, self.endpoint_override.as_deref())
+    }
+
+    /// OAuth token endpoint, honoring `endpoint_override` (scheme+host swap, path preserved) so the
+    /// mock e2e harness can redirect the token POST to localhost.
+    pub fn oauth_url(&self) -> String {
+        crate::core::tts::standard::override_rest_endpoint(
+            OAUTH_ENDPOINT,
+            self.endpoint_override.as_deref(),
         )
     }
 }
@@ -444,6 +554,67 @@ impl SberTtsConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone: SberDevices can express the output sample rate (re-validated to 8000/24000 Hz)
+    // and SSML input mode (ssml -> ssml_input -> application/ssml Content-Type); the non-standard
+    // timeout knobs flow through extras.
+    #[test]
+    fn from_standard_maps_sample_rate_ssml_and_extras() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("connection_timeout_secs".into(), serde_json::json!(15));
+        extras.insert("request_timeout_secs".into(), serde_json::json!(45));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "sberdevices".into(),
+                api_key: "test_client:test_secret".into(),
+                voice_id: Some("Bys".into()),
+                sample_rate: Some(24000),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                sample_rate: Some(8000),
+                ssml: Some(true), // SSML input mode -> ssml_input (now wired)
+                speed: Some(1.2), // capability gap: SberDevices has no speed field, must be ignored
+                ..Default::default()
+            },
+            extras: crate::core::stt::standard::ProviderExtras(extras),
+        };
+        let cfg = SberTtsConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.sample_rate, 8000); // feature override re-validated to supported set
+        assert_eq!(cfg.voice, SberTtsVoice::Bys);
+        assert!(cfg.ssml_input); // ssml feature mapped
+        assert_eq!(cfg.synthesis_content_type(), "application/ssml");
+        assert_eq!(cfg.connection_timeout_secs, 15); // extras passthrough
+        assert_eq!(cfg.request_timeout_secs, 45); // extras passthrough
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+
+        let mk = |endpoint: &str| {
+            StandardTTSConfig {
+                base: TTSConfig {
+                    provider: "sberdevices".into(),
+                    api_key: "test_client:test_secret".into(),
+                    voice_id: Some("Nec".into()),
+                    audio_format: Some("wav".into()),
+                    sample_rate: Some(24000),
+                    ..Default::default()
+                },
+                features: TtsFeatures::default(),
+                extras: ProviderExtras::default(),
+            }
+            .with_endpoint_override(endpoint)
+        };
+
+        assert!(SberTtsConfig::from_standard(&mk("https://sber-proxy.example.com")).is_ok());
+        assert!(SberTtsConfig::from_standard(&mk("http://127.0.0.1:9000")).is_err());
+        assert!(SberTtsConfig::from_standard(&mk("file:///tmp/socket")).is_err());
+        assert!(SberTtsConfig::from_standard(&mk("wss://sber-proxy.example.com")).is_err());
+    }
 
     #[test]
     fn test_voice_from_str() {

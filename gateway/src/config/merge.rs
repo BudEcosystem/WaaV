@@ -1,11 +1,122 @@
 use std::env;
+use std::fmt::Display;
 use std::path::PathBuf;
+use std::str::FromStr;
 
 use super::parse_auth_api_secrets_json;
 use super::sip::{SipConfig, SipHookConfig};
 use super::utils::parse_bool;
 use super::yaml::YamlConfig;
 use super::{AuthApiSecret, DAGTimeoutsConfig, PluginConfig, ServerConfig, TlsConfig};
+
+fn parse_env_value<T>(name: &str) -> Result<Option<T>, Box<dyn std::error::Error>>
+where
+    T: FromStr,
+    T::Err: Display,
+{
+    match env::var(name) {
+        Ok(value) => value
+            .parse::<T>()
+            .map(Some)
+            .map_err(|e| format!("Invalid {name} environment variable: {e}").into()),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(env::VarError::NotUnicode(_)) => {
+            Err(format!("{name} environment variable must be valid UTF-8").into())
+        }
+    }
+}
+
+fn parse_env_bool(name: &str) -> Result<Option<bool>, Box<dyn std::error::Error>> {
+    match env::var(name) {
+        Ok(value) => parse_bool(&value).map(Some).ok_or_else(|| {
+            format!("Invalid {name} environment variable: expected true/false/1/0/yes/no").into()
+        }),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(env::VarError::NotUnicode(_)) => {
+            Err(format!("{name} environment variable must be valid UTF-8").into())
+        }
+    }
+}
+
+fn path_from_config_value(value: String) -> Option<PathBuf> {
+    if value.trim().is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(value))
+    }
+}
+
+fn non_empty_string_from_config_value(value: String) -> Option<String> {
+    if value.trim().is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn parse_env_path(name: &str) -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
+    match env::var(name) {
+        Ok(value) => Ok(path_from_config_value(value)),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(env::VarError::NotUnicode(_)) => {
+            Err(format!("{name} environment variable must be valid UTF-8").into())
+        }
+    }
+}
+
+fn parse_env_non_empty_string(name: &str) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    match env::var(name) {
+        Ok(value) => Ok(non_empty_string_from_config_value(value)),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(env::VarError::NotUnicode(_)) => {
+            Err(format!("{name} environment variable must be valid UTF-8").into())
+        }
+    }
+}
+
+fn yaml_or_env_path(
+    yaml_value: Option<String>,
+    env_var: &str,
+) -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
+    match yaml_value.and_then(path_from_config_value) {
+        Some(path) => Ok(Some(path)),
+        None => parse_env_path(env_var),
+    }
+}
+
+fn yaml_or_env_non_empty_string(
+    yaml_value: Option<String>,
+    env_var: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    match yaml_value.and_then(non_empty_string_from_config_value) {
+        Some(value) => Ok(Some(value)),
+        None => parse_env_non_empty_string(env_var),
+    }
+}
+
+fn yaml_or_env<T>(
+    yaml_value: Option<T>,
+    env_var: &str,
+) -> Result<Option<T>, Box<dyn std::error::Error>>
+where
+    T: FromStr,
+    T::Err: Display,
+{
+    match yaml_value {
+        Some(value) => Ok(Some(value)),
+        None => parse_env_value(env_var),
+    }
+}
+
+fn yaml_or_env_bool(
+    yaml_value: Option<bool>,
+    env_var: &str,
+) -> Result<Option<bool>, Box<dyn std::error::Error>> {
+    match yaml_value {
+        Some(value) => Ok(Some(value)),
+        None => parse_env_bool(env_var),
+    }
+}
 
 /// Merge YAML configuration with environment variables
 ///
@@ -43,6 +154,41 @@ pub fn merge_config(
         };
     }
 
+    // Helper macro for CREDENTIALS: same YAML > ENV precedence, but a
+    // placeholder YAML value (the shipped "your-…-api-key" style) — AND an
+    // empty-string value from EITHER YAML or env — is treated as UNSET so the
+    // `# ENV:` fallback documented in config.yaml actually applies and the
+    // handler's missing-key guard fires cleanly. `is_placeholder_credential`
+    // already classifies an empty/whitespace string as a placeholder, so the
+    // YAML branch handled empty; the env fallback previously did NOT, leaking
+    // `Some("")` to the handler (e.g. `HUME_API_KEY=""` → an attempted connect /
+    // HTTP 429 instead of "API key not configured"). Run the env value through
+    // the SAME placeholder/empty filter. Real values keep their precedence.
+    macro_rules! get_credential {
+        ($env_var:expr, $yaml_value:expr) => {
+            $yaml_value
+                .filter(|v: &String| {
+                    if super::utils::is_placeholder_credential(v) {
+                        tracing::warn!(
+                            field = $env_var,
+                            "config credential is a placeholder — ignoring it ({} env var applies if set)",
+                            $env_var
+                        );
+                        false
+                    } else {
+                        true
+                    }
+                })
+                .or_else(|| {
+                    env::var($env_var)
+                        .ok()
+                        // Empty / placeholder env credential = unset (review: hume
+                        // empty-key 429). Keeps `Some("")` from reaching handlers.
+                        .filter(|v: &String| !super::utils::is_placeholder_credential(v))
+                })
+        };
+    }
+
     // Server configuration
     let host = get_value!(
         "HOST",
@@ -61,32 +207,33 @@ pub fn merge_config(
     };
 
     // TLS configuration
-    let tls_enabled = yaml
-        .server
-        .as_ref()
-        .and_then(|s| s.tls.as_ref())
-        .and_then(|t| t.enabled)
-        .or_else(|| env::var("TLS_ENABLED").ok().and_then(|s| parse_bool(&s)))
-        .unwrap_or(false);
+    let tls_enabled = yaml_or_env_bool(
+        yaml.server
+            .as_ref()
+            .and_then(|s| s.tls.as_ref())
+            .and_then(|t| t.enabled),
+        "TLS_ENABLED",
+    )?
+    .unwrap_or(false);
 
     let tls = if tls_enabled {
-        let cert_path = yaml
-            .server
-            .as_ref()
-            .and_then(|s| s.tls.as_ref())
-            .and_then(|t| t.cert_path.clone())
-            .or_else(|| env::var("TLS_CERT_PATH").ok())
-            .map(PathBuf::from)
-            .ok_or("TLS_CERT_PATH is required when TLS is enabled")?;
+        let cert_path = yaml_or_env_path(
+            yaml.server
+                .as_ref()
+                .and_then(|s| s.tls.as_ref())
+                .and_then(|t| t.cert_path.clone()),
+            "TLS_CERT_PATH",
+        )?
+        .ok_or("TLS_CERT_PATH is required when TLS is enabled")?;
 
-        let key_path = yaml
-            .server
-            .as_ref()
-            .and_then(|s| s.tls.as_ref())
-            .and_then(|t| t.key_path.clone())
-            .or_else(|| env::var("TLS_KEY_PATH").ok())
-            .map(PathBuf::from)
-            .ok_or("TLS_KEY_PATH is required when TLS is enabled")?;
+        let key_path = yaml_or_env_path(
+            yaml.server
+                .as_ref()
+                .and_then(|s| s.tls.as_ref())
+                .and_then(|t| t.key_path.clone()),
+            "TLS_KEY_PATH",
+        )?
+        .ok_or("TLS_KEY_PATH is required when TLS is enabled")?;
 
         Some(TlsConfig {
             cert_path,
@@ -109,25 +256,25 @@ pub fn merge_config(
         "http://localhost:7880"
     );
 
-    let livekit_api_key = get_optional!(
+    let livekit_api_key = get_credential!(
         "LIVEKIT_API_KEY",
         yaml.livekit.as_ref().and_then(|l| l.api_key.clone())
     );
 
-    let livekit_api_secret = get_optional!(
+    let livekit_api_secret = get_credential!(
         "LIVEKIT_API_SECRET",
         yaml.livekit.as_ref().and_then(|l| l.api_secret.clone())
     );
 
     // Provider API keys
-    let deepgram_api_key = get_optional!(
+    let deepgram_api_key = get_credential!(
         "DEEPGRAM_API_KEY",
         yaml.providers
             .as_ref()
             .and_then(|p| p.deepgram_api_key.clone())
     );
 
-    let elevenlabs_api_key = get_optional!(
+    let elevenlabs_api_key = get_credential!(
         "ELEVENLABS_API_KEY",
         yaml.providers
             .as_ref()
@@ -135,7 +282,7 @@ pub fn merge_config(
     );
 
     // Google Cloud credentials (can be path, JSON content, or empty for ADC)
-    let google_credentials = get_optional!(
+    let google_credentials = get_credential!(
         "GOOGLE_APPLICATION_CREDENTIALS",
         yaml.providers
             .as_ref()
@@ -143,7 +290,7 @@ pub fn merge_config(
     );
 
     // Azure Speech Services configuration
-    let azure_speech_subscription_key = get_optional!(
+    let azure_speech_subscription_key = get_credential!(
         "AZURE_SPEECH_SUBSCRIPTION_KEY",
         yaml.providers
             .as_ref()
@@ -158,7 +305,7 @@ pub fn merge_config(
     );
 
     // Cartesia STT API key
-    let cartesia_api_key = get_optional!(
+    let cartesia_api_key = get_credential!(
         "CARTESIA_API_KEY",
         yaml.providers
             .as_ref()
@@ -166,15 +313,84 @@ pub fn merge_config(
     );
 
     // OpenAI API key (STT, TTS, and Realtime API)
-    let openai_api_key = get_optional!(
+    let openai_api_key = get_credential!(
         "OPENAI_API_KEY",
         yaml.providers
             .as_ref()
             .and_then(|p| p.openai_api_key.clone())
     );
 
+    // Azure OpenAI Realtime (OpenAI-protocol clone): api-key + resource/endpoint.
+    let azure_openai_api_key = get_credential!(
+        "AZURE_OPENAI_API_KEY",
+        yaml.providers
+            .as_ref()
+            .and_then(|p| p.azure_openai_api_key.clone())
+    );
+    let azure_openai_endpoint = get_credential!(
+        "AZURE_OPENAI_ENDPOINT",
+        yaml.providers
+            .as_ref()
+            .and_then(|p| p.azure_openai_endpoint.clone())
+    );
+
+    // Grok / xAI Realtime (OpenAI GA-compatible wire).
+    let grok_api_key = get_credential!(
+        "GROK_API_KEY",
+        yaml.providers.as_ref().and_then(|p| p.grok_api_key.clone())
+    );
+
+    // Inworld Realtime (OpenAI GA wire).
+    let inworld_api_key = get_credential!(
+        "INWORLD_API_KEY",
+        yaml.providers
+            .as_ref()
+            .and_then(|p| p.inworld_api_key.clone())
+    );
+
+    // Google Gemini Live (BidiGenerateContent S2S; `?key=` query auth).
+    let gemini_api_key = get_credential!(
+        "GEMINI_API_KEY",
+        yaml.providers
+            .as_ref()
+            .and_then(|p| p.gemini_api_key.clone())
+    );
+
+    // Ultravox hosted S2S realtime (`X-API-Key` create-call auth).
+    let ultravox_api_key = get_credential!(
+        "ULTRAVOX_API_KEY",
+        yaml.providers
+            .as_ref()
+            .and_then(|p| p.ultravox_api_key.clone())
+    );
+
+    // Speechmatics API key (JWT / temp-token) — STT/TTS + Flow (Voice AI) realtime
+    // (`Authorization: Bearer <token>`).
+    let speechmatics_api_key = get_credential!(
+        "SPEECHMATICS_API_KEY",
+        yaml.providers
+            .as_ref()
+            .and_then(|p| p.speechmatics_api_key.clone())
+    );
+
+    // Yandex Cloud AI Studio Realtime (OpenAI-protocol clone; GA wire, Bearer auth).
+    // The key is a Yandex IAM token / static API key; the folder id (non-secret,
+    // like azure's endpoint) builds the `gpt://<folder>/<model>` connect URI.
+    let yandex_api_key = get_credential!(
+        "YANDEX_API_KEY",
+        yaml.providers
+            .as_ref()
+            .and_then(|p| p.yandex_api_key.clone())
+    );
+    let yandex_folder_id = get_credential!(
+        "YANDEX_FOLDER_ID",
+        yaml.providers
+            .as_ref()
+            .and_then(|p| p.yandex_folder_id.clone())
+    );
+
     // AssemblyAI API key (streaming STT)
-    let assemblyai_api_key = get_optional!(
+    let assemblyai_api_key = get_credential!(
         "ASSEMBLYAI_API_KEY",
         yaml.providers
             .as_ref()
@@ -182,31 +398,31 @@ pub fn merge_config(
     );
 
     // Hume AI API key (TTS and EVI)
-    let hume_api_key = get_optional!(
+    let hume_api_key = get_credential!(
         "HUME_API_KEY",
         yaml.providers.as_ref().and_then(|p| p.hume_api_key.clone())
     );
 
     // LMNT API key (TTS and voice cloning)
-    let lmnt_api_key = get_optional!(
+    let lmnt_api_key = get_credential!(
         "LMNT_API_KEY",
         yaml.providers.as_ref().and_then(|p| p.lmnt_api_key.clone())
     );
 
     // Groq API key (ultra-fast Whisper STT)
-    let groq_api_key = get_optional!(
+    let groq_api_key = get_credential!(
         "GROQ_API_KEY",
         yaml.providers.as_ref().and_then(|p| p.groq_api_key.clone())
     );
 
     // Play.ht credentials (TTS with voice cloning)
-    let playht_api_key = get_optional!(
+    let playht_api_key = get_credential!(
         "PLAYHT_API_KEY",
         yaml.providers
             .as_ref()
             .and_then(|p| p.playht_api_key.clone())
     );
-    let playht_user_id = get_optional!(
+    let playht_user_id = get_credential!(
         "PLAYHT_USER_ID",
         yaml.providers
             .as_ref()
@@ -214,13 +430,13 @@ pub fn merge_config(
     );
 
     // IBM Watson credentials (STT/TTS)
-    let ibm_watson_api_key = get_optional!(
+    let ibm_watson_api_key = get_credential!(
         "IBM_WATSON_API_KEY",
         yaml.providers
             .as_ref()
             .and_then(|p| p.ibm_watson_api_key.clone())
     );
-    let ibm_watson_instance_id = get_optional!(
+    let ibm_watson_instance_id = get_credential!(
         "IBM_WATSON_INSTANCE_ID",
         yaml.providers
             .as_ref()
@@ -240,7 +456,7 @@ pub fn merge_config(
             .as_ref()
             .and_then(|p| p.aws_access_key_id.clone())
     );
-    let aws_secret_access_key = get_optional!(
+    let aws_secret_access_key = get_credential!(
         "AWS_SECRET_ACCESS_KEY",
         yaml.providers
             .as_ref()
@@ -252,22 +468,22 @@ pub fn merge_config(
     );
 
     // Gnani.ai credentials
-    let gnani_token = get_optional!(
+    let gnani_token = get_credential!(
         "GNANI_TOKEN",
         yaml.providers.as_ref().and_then(|p| p.gnani_token.clone())
     );
-    let gnani_access_key = get_optional!(
+    let gnani_access_key = get_credential!(
         "GNANI_ACCESS_KEY",
         yaml.providers
             .as_ref()
             .and_then(|p| p.gnani_access_key.clone())
     );
-    let gnani_certificate_path: Option<PathBuf> = yaml
-        .providers
-        .as_ref()
-        .and_then(|p| p.gnani_certificate_path.clone())
-        .or_else(|| env::var("GNANI_CERTIFICATE_PATH").ok())
-        .map(PathBuf::from);
+    let gnani_certificate_path = yaml_or_env_path(
+        yaml.providers
+            .as_ref()
+            .and_then(|p| p.gnani_certificate_path.clone()),
+        "GNANI_CERTIFICATE_PATH",
+    )?;
 
     // Recording S3 configuration
     let recording_s3_bucket = get_optional!(
@@ -285,14 +501,16 @@ pub fn merge_config(
         yaml.recording.as_ref().and_then(|r| r.s3_endpoint.clone())
     );
 
-    let recording_s3_access_key = get_optional!(
+    // S3 creds are credentials — empty/placeholder ⇒ None (review wf_e8eaad72 #1,
+    // consistency with the other credential fields + the from_env path).
+    let recording_s3_access_key = get_credential!(
         "RECORDING_S3_ACCESS_KEY",
         yaml.recording
             .as_ref()
             .and_then(|r| r.s3_access_key.clone())
     );
 
-    let recording_s3_secret_key = get_optional!(
+    let recording_s3_secret_key = get_credential!(
         "RECORDING_S3_SECRET_KEY",
         yaml.recording
             .as_ref()
@@ -305,36 +523,27 @@ pub fn merge_config(
     );
 
     // Cache configuration
-    let cache_path = yaml
-        .cache
-        .as_ref()
-        .and_then(|c| c.path.clone())
-        .or_else(|| env::var("CACHE_PATH").ok())
-        .map(PathBuf::from);
+    let cache_path = yaml_or_env_path(
+        yaml.cache.as_ref().and_then(|c| c.path.clone()),
+        "CACHE_PATH",
+    )?;
 
-    let cache_ttl_seconds = yaml
-        .cache
-        .as_ref()
-        .and_then(|c| c.ttl_seconds)
-        .or_else(|| {
-            env::var("CACHE_TTL_SECONDS")
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok())
-        })
-        .or(Some(30 * 24 * 60 * 60)); // Default to 30 days
+    let cache_ttl_seconds = yaml_or_env::<u64>(
+        yaml.cache.as_ref().and_then(|c| c.ttl_seconds),
+        "CACHE_TTL_SECONDS",
+    )?
+    .or(Some(30 * 24 * 60 * 60)); // Default to 30 days
 
     // Authentication configuration
-    let auth_service_url = get_optional!(
+    let auth_service_url = yaml_or_env_non_empty_string(
+        yaml.auth.as_ref().and_then(|a| a.service_url.clone()),
         "AUTH_SERVICE_URL",
-        yaml.auth.as_ref().and_then(|a| a.service_url.clone())
-    );
+    )?;
 
-    let auth_signing_key_path = yaml
-        .auth
-        .as_ref()
-        .and_then(|a| a.signing_key_path.clone())
-        .or_else(|| env::var("AUTH_SIGNING_KEY_PATH").ok())
-        .map(PathBuf::from);
+    let auth_signing_key_path = yaml_or_env_path(
+        yaml.auth.as_ref().and_then(|a| a.signing_key_path.clone()),
+        "AUTH_SIGNING_KEY_PATH",
+    )?;
 
     // API secret auth precedence:
     // 1) YAML auth.api_secrets (when non-empty)
@@ -372,23 +581,15 @@ pub fn merge_config(
         }
     };
 
-    let auth_timeout_seconds = yaml
-        .auth
-        .as_ref()
-        .and_then(|a| a.timeout_seconds)
-        .or_else(|| {
-            env::var("AUTH_TIMEOUT_SECONDS")
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok())
-        })
-        .unwrap_or(5);
+    let auth_timeout_seconds = yaml_or_env::<u64>(
+        yaml.auth.as_ref().and_then(|a| a.timeout_seconds),
+        "AUTH_TIMEOUT_SECONDS",
+    )?
+    .unwrap_or(5);
 
-    let auth_required = yaml
-        .auth
-        .as_ref()
-        .and_then(|a| a.required)
-        .or_else(|| env::var("AUTH_REQUIRED").ok().and_then(|s| parse_bool(&s)))
-        .unwrap_or(false);
+    let auth_required =
+        yaml_or_env_bool(yaml.auth.as_ref().and_then(|a| a.required), "AUTH_REQUIRED")?
+            .unwrap_or(false);
 
     // SIP configuration (merge YAML and ENV)
     let sip = merge_sip_config(yaml.sip.as_ref())?;
@@ -402,103 +603,76 @@ pub fn merge_config(
     );
 
     // Rate limiting configuration
-    let rate_limit_requests_per_second = yaml
-        .security
-        .as_ref()
-        .and_then(|s| s.rate_limit_requests_per_second)
-        .or_else(|| {
-            env::var("RATE_LIMIT_REQUESTS_PER_SECOND")
-                .ok()
-                .and_then(|s| s.parse::<u32>().ok())
-        })
-        .unwrap_or(60);
+    let rate_limit_requests_per_second = yaml_or_env::<u32>(
+        yaml.security
+            .as_ref()
+            .and_then(|s| s.rate_limit_requests_per_second),
+        "RATE_LIMIT_REQUESTS_PER_SECOND",
+    )?
+    .unwrap_or(60);
 
-    let rate_limit_burst_size = yaml
-        .security
-        .as_ref()
-        .and_then(|s| s.rate_limit_burst_size)
-        .or_else(|| {
-            env::var("RATE_LIMIT_BURST_SIZE")
-                .ok()
-                .and_then(|s| s.parse::<u32>().ok())
-        })
-        .unwrap_or(10);
+    let rate_limit_burst_size = yaml_or_env::<u32>(
+        yaml.security.as_ref().and_then(|s| s.rate_limit_burst_size),
+        "RATE_LIMIT_BURST_SIZE",
+    )?
+    .unwrap_or(10);
 
     // Connection limits
-    let max_websocket_connections = yaml
-        .security
-        .as_ref()
-        .and_then(|s| s.max_websocket_connections)
-        .or_else(|| {
-            env::var("MAX_WEBSOCKET_CONNECTIONS")
-                .ok()
-                .and_then(|s| s.parse::<usize>().ok())
-        });
+    let max_websocket_connections = yaml_or_env::<usize>(
+        yaml.security
+            .as_ref()
+            .and_then(|s| s.max_websocket_connections),
+        "MAX_WEBSOCKET_CONNECTIONS",
+    )?;
 
-    let max_connections_per_ip = yaml
-        .security
-        .as_ref()
-        .and_then(|s| s.max_connections_per_ip)
-        .or_else(|| {
-            env::var("MAX_CONNECTIONS_PER_IP")
-                .ok()
-                .and_then(|s| s.parse::<u32>().ok())
-        })
-        .unwrap_or(100);
+    let max_connections_per_ip = yaml_or_env::<u32>(
+        yaml.security
+            .as_ref()
+            .and_then(|s| s.max_connections_per_ip),
+        "MAX_CONNECTIONS_PER_IP",
+    )?
+    .unwrap_or(100);
 
     // Timeout configuration
-    let ws_processing_timeout_secs = yaml
-        .security
-        .as_ref()
-        .and_then(|s| s.ws_processing_timeout_secs)
-        .or_else(|| {
-            env::var("WS_PROCESSING_TIMEOUT_SECS")
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok())
-        })
-        .unwrap_or(10);
+    let ws_processing_timeout_secs = yaml_or_env::<u64>(
+        yaml.security
+            .as_ref()
+            .and_then(|s| s.ws_processing_timeout_secs),
+        "WS_PROCESSING_TIMEOUT_SECS",
+    )?
+    .unwrap_or(10);
 
-    let realtime_processing_timeout_secs = yaml
-        .security
-        .as_ref()
-        .and_then(|s| s.realtime_processing_timeout_secs)
-        .or_else(|| {
-            env::var("REALTIME_PROCESSING_TIMEOUT_SECS")
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok())
-        })
-        .unwrap_or(30);
+    let realtime_processing_timeout_secs = yaml_or_env::<u64>(
+        yaml.security
+            .as_ref()
+            .and_then(|s| s.realtime_processing_timeout_secs),
+        "REALTIME_PROCESSING_TIMEOUT_SECS",
+    )?
+    .unwrap_or(30);
 
     // SIP configuration limits
-    let sip_max_participants = yaml
-        .sip
-        .as_ref()
-        .and_then(|s| s.max_participants)
-        .or_else(|| {
-            env::var("SIP_MAX_PARTICIPANTS")
-                .ok()
-                .and_then(|s| s.parse::<u32>().ok())
-        })
-        .unwrap_or(3);
+    let sip_max_participants = yaml_or_env::<u32>(
+        yaml.sip.as_ref().and_then(|s| s.max_participants),
+        "SIP_MAX_PARTICIPANTS",
+    )?
+    .unwrap_or(3);
+
+    // SERVER-SIDE realtime upstream URL overrides (`<PROVIDER>_REALTIME_URL`).
+    // Env-only (TRUSTED config; not a YAML/client surface) — same reader as
+    // `ServerConfig::from_env`. SSRF-safe (see the field docs).
+    let realtime_endpoint_overrides = super::env::read_realtime_endpoint_overrides();
 
     // Plugin configuration (backward compatible: enabled by default)
-    let plugins_enabled = yaml
-        .plugins
-        .as_ref()
-        .and_then(|p| p.enabled)
-        .or_else(|| {
-            env::var("PLUGINS_ENABLED")
-                .ok()
-                .and_then(|s| parse_bool(&s))
-        })
-        .unwrap_or(true); // Enabled by default for backward compatibility
+    let plugins_enabled = yaml_or_env_bool(
+        yaml.plugins.as_ref().and_then(|p| p.enabled),
+        "PLUGINS_ENABLED",
+    )?
+    .unwrap_or(true); // Enabled by default for backward compatibility
 
-    let plugins_dir = yaml
-        .plugins
-        .as_ref()
-        .and_then(|p| p.plugin_dir.clone())
-        .or_else(|| env::var("PLUGINS_DIR").ok())
-        .map(PathBuf::from);
+    let plugins_dir = yaml_or_env_path(
+        yaml.plugins.as_ref().and_then(|p| p.plugin_dir.clone()),
+        "PLUGINS_DIR",
+    )?;
 
     let plugins_provider_config = yaml
         .plugins
@@ -514,66 +688,49 @@ pub fn merge_config(
 
     // DAG timeout configuration (uses defaults if not specified)
     let dag_timeouts = DAGTimeoutsConfig {
-        node_execution_secs: yaml
-            .dag_timeouts
-            .as_ref()
-            .and_then(|d| d.node_execution_secs)
-            .or_else(|| {
-                env::var("DAG_NODE_EXECUTION_SECS")
-                    .ok()
-                    .and_then(|s| s.parse::<u64>().ok())
-            })
-            .unwrap_or(30),
-        provider_operation_secs: yaml
-            .dag_timeouts
-            .as_ref()
-            .and_then(|d| d.provider_operation_secs)
-            .or_else(|| {
-                env::var("DAG_PROVIDER_OPERATION_SECS")
-                    .ok()
-                    .and_then(|s| s.parse::<u64>().ok())
-            })
-            .unwrap_or(30),
-        stt_endpoint_secs: yaml
-            .dag_timeouts
-            .as_ref()
-            .and_then(|d| d.stt_endpoint_secs)
-            .or_else(|| {
-                env::var("DAG_STT_ENDPOINT_SECS")
-                    .ok()
-                    .and_then(|s| s.parse::<u64>().ok())
-            })
-            .unwrap_or(60),
-        tts_endpoint_secs: yaml
-            .dag_timeouts
-            .as_ref()
-            .and_then(|d| d.tts_endpoint_secs)
-            .or_else(|| {
-                env::var("DAG_TTS_ENDPOINT_SECS")
-                    .ok()
-                    .and_then(|s| s.parse::<u64>().ok())
-            })
-            .unwrap_or(60),
-        llm_endpoint_secs: yaml
-            .dag_timeouts
-            .as_ref()
-            .and_then(|d| d.llm_endpoint_secs)
-            .or_else(|| {
-                env::var("DAG_LLM_ENDPOINT_SECS")
-                    .ok()
-                    .and_then(|s| s.parse::<u64>().ok())
-            })
-            .unwrap_or(120),
-        websocket_operation_secs: yaml
-            .dag_timeouts
-            .as_ref()
-            .and_then(|d| d.websocket_operation_secs)
-            .or_else(|| {
-                env::var("DAG_WEBSOCKET_OPERATION_SECS")
-                    .ok()
-                    .and_then(|s| s.parse::<u64>().ok())
-            })
-            .unwrap_or(30),
+        node_execution_secs: yaml_or_env::<u64>(
+            yaml.dag_timeouts
+                .as_ref()
+                .and_then(|d| d.node_execution_secs),
+            "DAG_NODE_EXECUTION_SECS",
+        )?
+        .unwrap_or(30),
+        provider_operation_secs: yaml_or_env::<u64>(
+            yaml.dag_timeouts
+                .as_ref()
+                .and_then(|d| d.provider_operation_secs),
+            "DAG_PROVIDER_OPERATION_SECS",
+        )?
+        .unwrap_or(30),
+        stt_endpoint_secs: yaml_or_env::<u64>(
+            yaml.dag_timeouts.as_ref().and_then(|d| d.stt_endpoint_secs),
+            "DAG_STT_ENDPOINT_SECS",
+        )?
+        .unwrap_or(60),
+        tts_endpoint_secs: yaml_or_env::<u64>(
+            yaml.dag_timeouts.as_ref().and_then(|d| d.tts_endpoint_secs),
+            "DAG_TTS_ENDPOINT_SECS",
+        )?
+        .unwrap_or(60),
+        llm_endpoint_secs: yaml_or_env::<u64>(
+            yaml.dag_timeouts.as_ref().and_then(|d| d.llm_endpoint_secs),
+            "DAG_LLM_ENDPOINT_SECS",
+        )?
+        .unwrap_or(120),
+        websocket_operation_secs: yaml_or_env::<u64>(
+            yaml.dag_timeouts
+                .as_ref()
+                .and_then(|d| d.websocket_operation_secs),
+            "DAG_WEBSOCKET_OPERATION_SECS",
+        )?
+        .unwrap_or(30),
+    };
+
+    // P3: server-side alias registry. config.yaml is the ONLY definition source (no env
+    // spelling for a whole {stt,tts,llm} bundle), so this is taken verbatim from the
+    // parsed YAML `aliases:` section (empty when absent). A client can never define one.
+    let aliases = crate::core::alias::AliasConfig {
+        aliases: yaml.aliases.clone().unwrap_or_default(),
     };
 
     Ok(ServerConfig {
@@ -591,6 +748,15 @@ pub fn merge_config(
         azure_speech_region,
         cartesia_api_key,
         openai_api_key,
+        azure_openai_api_key,
+        azure_openai_endpoint,
+        grok_api_key,
+        inworld_api_key,
+        gemini_api_key,
+        ultravox_api_key,
+        speechmatics_api_key,
+        yandex_api_key,
+        yandex_folder_id,
         assemblyai_api_key,
         hume_api_key,
         lmnt_api_key,
@@ -632,6 +798,8 @@ pub fn merge_config(
         sip_max_participants,
         plugins,
         dag_timeouts,
+        realtime_endpoint_overrides,
+        aliases,
     })
 }
 
@@ -768,6 +936,7 @@ mod tests {
             env::remove_var("DEEPGRAM_API_KEY");
             env::remove_var("ELEVENLABS_API_KEY");
             env::remove_var("CACHE_PATH");
+            env::remove_var("GNANI_CERTIFICATE_PATH");
             env::remove_var("CACHE_TTL_SECONDS");
             env::remove_var("AUTH_REQUIRED");
             env::remove_var("AUTH_SERVICE_URL");
@@ -781,7 +950,184 @@ mod tests {
             env::remove_var("SIP_HOOKS_JSON");
             env::remove_var("SIP_HOOK_SECRET");
             env::remove_var("RECORDING_S3_PREFIX");
+            env::remove_var("RATE_LIMIT_REQUESTS_PER_SECOND");
+            env::remove_var("RATE_LIMIT_BURST_SIZE");
+            env::remove_var("MAX_WEBSOCKET_CONNECTIONS");
+            env::remove_var("MAX_CONNECTIONS_PER_IP");
+            env::remove_var("WS_PROCESSING_TIMEOUT_SECS");
+            env::remove_var("REALTIME_PROCESSING_TIMEOUT_SECS");
+            env::remove_var("SIP_MAX_PARTICIPANTS");
+            env::remove_var("PLUGINS_ENABLED");
+            env::remove_var("PLUGINS_DIR");
+            env::remove_var("DAG_NODE_EXECUTION_SECS");
+            env::remove_var("DAG_PROVIDER_OPERATION_SECS");
+            env::remove_var("DAG_STT_ENDPOINT_SECS");
+            env::remove_var("DAG_TTS_ENDPOINT_SECS");
+            env::remove_var("DAG_LLM_ENDPOINT_SECS");
+            env::remove_var("DAG_WEBSOCKET_OPERATION_SECS");
         }
+    }
+
+    /// Empty-key consistency (review: hume empty-key 429). An EMPTY-string
+    /// credential — whether it arrives from YAML or from an exported-but-empty
+    /// env var — must resolve to `None` so the realtime handler's missing-key
+    /// guard returns a clean "API key not configured" error instead of dialing
+    /// the provider with `Some("")` (the YAML branch already handled empty via
+    /// `is_placeholder_credential`; the env fallback used to leak `Some("")`).
+    #[test]
+    #[serial]
+    fn empty_credential_from_yaml_or_env_resolves_to_none() {
+        cleanup_env_vars();
+        unsafe {
+            env::remove_var("HUME_API_KEY");
+        }
+
+        // 1) YAML empty string, no env ⇒ None.
+        let yaml = YamlConfig {
+            providers: Some(super::super::yaml::ProvidersYaml {
+                hume_api_key: Some(String::new()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            merge_config(Some(yaml)).unwrap().hume_api_key,
+            None,
+            "empty YAML credential must merge to None"
+        );
+
+        // 2) Exported-but-empty env var, no YAML ⇒ None (the bug: was Some("")).
+        unsafe {
+            env::set_var("HUME_API_KEY", "");
+        }
+        assert_eq!(
+            merge_config(None).unwrap().hume_api_key,
+            None,
+            "empty env credential must merge to None"
+        );
+
+        // 3) Whitespace-only env var ⇒ None.
+        unsafe {
+            env::set_var("HUME_API_KEY", "   ");
+        }
+        assert_eq!(
+            merge_config(None).unwrap().hume_api_key,
+            None,
+            "whitespace-only env credential must merge to None"
+        );
+
+        // 4) A REAL key still flows through untouched (no false-positive nulling).
+        unsafe {
+            env::set_var("HUME_API_KEY", "hk-real-secret");
+        }
+        assert_eq!(
+            merge_config(None).unwrap().hume_api_key,
+            Some("hk-real-secret".to_string()),
+            "a real env credential must survive the empty/placeholder filter"
+        );
+
+        unsafe {
+            env::remove_var("HUME_API_KEY");
+        }
+        cleanup_env_vars();
+    }
+
+    #[test]
+    #[serial]
+    fn empty_optional_path_values_are_unset_and_blank_yaml_falls_back_to_env() {
+        cleanup_env_vars();
+        unsafe {
+            env::set_var("CACHE_PATH", "");
+            env::set_var("GNANI_CERTIFICATE_PATH", "   ");
+            env::set_var("AUTH_SIGNING_KEY_PATH", "");
+            env::set_var("PLUGINS_DIR", "   ");
+        }
+
+        let config = merge_config(None).unwrap();
+        assert_eq!(config.cache_path, None, "empty CACHE_PATH must be unset");
+        assert_eq!(
+            config.gnani_certificate_path, None,
+            "whitespace GNANI_CERTIFICATE_PATH must be unset"
+        );
+        assert_eq!(
+            config.auth_signing_key_path, None,
+            "empty AUTH_SIGNING_KEY_PATH must be unset"
+        );
+        assert_eq!(
+            config.plugins.plugin_dir, None,
+            "whitespace PLUGINS_DIR must be unset"
+        );
+
+        let temp_dir = TempDir::new().unwrap();
+        let env_cache = temp_dir.path().join("cache");
+        let env_plugin_dir = temp_dir.path().join("plugins");
+        unsafe {
+            env::set_var("CACHE_PATH", env_cache.to_str().unwrap());
+            env::set_var("PLUGINS_DIR", env_plugin_dir.to_str().unwrap());
+        }
+        let yaml = YamlConfig {
+            cache: Some(super::super::yaml::CacheYaml {
+                path: Some("   ".to_string()),
+                ttl_seconds: None,
+            }),
+            plugins: Some(super::super::yaml::PluginsYaml {
+                plugin_dir: Some(String::new()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let config = merge_config(Some(yaml)).unwrap();
+        assert_eq!(
+            config.cache_path,
+            Some(env_cache),
+            "blank YAML cache.path must not mask CACHE_PATH"
+        );
+        assert_eq!(
+            config.plugins.plugin_dir,
+            Some(env_plugin_dir),
+            "blank YAML plugins.plugin_dir must not mask PLUGINS_DIR"
+        );
+
+        cleanup_env_vars();
+    }
+
+    #[test]
+    #[serial]
+    fn empty_auth_service_url_values_are_unset_and_blank_yaml_falls_back_to_env() {
+        cleanup_env_vars();
+        unsafe {
+            env::set_var("AUTH_SERVICE_URL", "");
+        }
+
+        let config = merge_config(None).unwrap();
+        assert_eq!(
+            config.auth_service_url, None,
+            "empty AUTH_SERVICE_URL must be unset"
+        );
+
+        let temp_dir = TempDir::new().unwrap();
+        let key_path = temp_dir.path().join("key.pem");
+        fs::write(&key_path, "fake key").unwrap();
+        unsafe {
+            env::set_var("AUTH_SERVICE_URL", "https://auth.env.com");
+            env::set_var("AUTH_SIGNING_KEY_PATH", key_path.to_str().unwrap());
+        }
+        let yaml = YamlConfig {
+            auth: Some(super::super::yaml::AuthYaml {
+                service_url: Some("   ".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let config = merge_config(Some(yaml)).unwrap();
+        assert_eq!(
+            config.auth_service_url,
+            Some("https://auth.env.com".to_string()),
+            "blank YAML auth.service_url must not mask AUTH_SERVICE_URL"
+        );
+
+        cleanup_env_vars();
     }
 
     #[test]
@@ -851,6 +1197,66 @@ mod tests {
         assert_eq!(config.port, 3001);
         assert_eq!(config.livekit_url, "ws://localhost:7880");
         assert!(!config.auth_required);
+
+        cleanup_env_vars();
+    }
+
+    #[test]
+    #[serial]
+    fn test_merge_invalid_bool_env_fails_when_yaml_absent() {
+        cleanup_env_vars();
+
+        unsafe {
+            env::set_var("PLUGINS_ENABLED", "maybe");
+        }
+
+        let result = merge_config(None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("PLUGINS_ENABLED"));
+
+        cleanup_env_vars();
+    }
+
+    #[test]
+    #[serial]
+    fn test_merge_invalid_numeric_env_fails_when_yaml_absent() {
+        cleanup_env_vars();
+
+        unsafe {
+            env::set_var("RATE_LIMIT_REQUESTS_PER_SECOND", "many");
+        }
+
+        let result = merge_config(None);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("RATE_LIMIT_REQUESTS_PER_SECOND")
+        );
+
+        cleanup_env_vars();
+    }
+
+    #[test]
+    #[serial]
+    fn test_merge_yaml_value_skips_malformed_env_for_same_field() {
+        cleanup_env_vars();
+
+        let yaml = YamlConfig {
+            security: Some(super::super::yaml::SecurityYaml {
+                rate_limit_requests_per_second: Some(12),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        unsafe {
+            env::set_var("RATE_LIMIT_REQUESTS_PER_SECOND", "many");
+        }
+
+        let config = merge_config(Some(yaml)).unwrap();
+        assert_eq!(config.rate_limit_requests_per_second, 12);
 
         cleanup_env_vars();
     }

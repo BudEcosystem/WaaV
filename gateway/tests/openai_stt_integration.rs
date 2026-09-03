@@ -9,11 +9,65 @@
 //! Note: Tests requiring actual API calls are marked with #[ignore]
 //! and require OPENAI_API_KEY environment variable.
 
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use futures::FutureExt;
+use tokio::task::JoinHandle;
 use waav_gateway::core::stt::{
     BaseSTT, OpenAIResponseFormat, OpenAISTT, OpenAISTTModel, STTConfig, STTError, STTProvider,
     create_stt_provider, create_stt_provider_from_enum, get_supported_stt_providers,
 };
+
+struct TestServer {
+    label: &'static str,
+    handle: JoinHandle<()>,
+    panicked: Arc<AtomicBool>,
+}
+
+impl Drop for TestServer {
+    fn drop(&mut self) {
+        if !self.handle.is_finished() {
+            self.handle.abort();
+        }
+        if self.panicked.load(Ordering::SeqCst) {
+            let msg = format!("OpenAI STT test server '{}' panicked", self.label);
+            if std::thread::panicking() {
+                eprintln!("{msg}");
+            } else {
+                panic!("{msg}");
+            }
+        }
+    }
+}
+
+fn spawn_test_server<F>(label: &'static str, future: F) -> TestServer
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let panicked = Arc::new(AtomicBool::new(false));
+    let panicked_in_task = Arc::clone(&panicked);
+    let handle = tokio::spawn(async move {
+        if AssertUnwindSafe(future).catch_unwind().await.is_err() {
+            panicked_in_task.store(true, Ordering::SeqCst);
+            eprintln!("OpenAI STT test server '{label}' panicked");
+        }
+    });
+    TestServer {
+        label,
+        handle,
+        panicked,
+    }
+}
+
+/// Binary-wide lock serializing every test span that SETS or DEPENDS ON `OPENAI_BASE_URL`
+/// (env vars are process-global; see the SAFETY note at the set_var site). Poison-tolerant.
+fn openai_base_url_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// Test that OpenAI is included in supported providers
 #[test]
@@ -27,6 +81,9 @@ fn test_openai_in_supported_providers() {
 /// Test provider creation via string name
 #[test]
 fn test_create_openai_provider_by_name() {
+    // Serialize vs the OPENAI_BASE_URL/loopback override window (readers take the same
+    // lock as the setter — the env-race rule).
+    let _env = openai_base_url_env_lock();
     let config = STTConfig {
         provider: "openai".to_string(),
         api_key: "test-api-key".to_string(),
@@ -50,6 +107,9 @@ fn test_create_openai_provider_by_name() {
 /// Test provider creation via enum
 #[test]
 fn test_create_openai_provider_by_enum() {
+    // Serialize vs the OPENAI_BASE_URL/loopback override window (readers take the same
+    // lock as the setter — the env-race rule).
+    let _env = openai_base_url_env_lock();
     let config = STTConfig {
         provider: "openai".to_string(),
         api_key: "test-api-key".to_string(),
@@ -68,6 +128,9 @@ fn test_create_openai_provider_by_enum() {
 /// Test case-insensitive provider name parsing
 #[test]
 fn test_openai_provider_name_case_insensitive() {
+    // Serialize vs the OPENAI_BASE_URL/loopback override window (readers take the same
+    // lock as the setter — the env-race rule).
+    let _env = openai_base_url_env_lock();
     let config = STTConfig {
         provider: "openai".to_string(),
         api_key: "test-api-key".to_string(),
@@ -83,6 +146,9 @@ fn test_openai_provider_name_case_insensitive() {
 /// Test API key validation
 #[test]
 fn test_openai_requires_api_key() {
+    // Serialize vs the OPENAI_BASE_URL/loopback override window (readers take the same
+    // lock as the setter — the env-race rule).
+    let _env = openai_base_url_env_lock();
     let config = STTConfig {
         provider: "openai".to_string(),
         api_key: String::new(), // Empty API key
@@ -157,6 +223,9 @@ fn test_openai_model_parsing() {
 /// Test callback registration using Arc callbacks
 #[tokio::test]
 async fn test_openai_callback_registration() {
+    // Serialize vs the OPENAI_BASE_URL/loopback override window (readers take the same
+    // lock as the setter — the env-race rule).
+    let _env = openai_base_url_env_lock();
     let config = STTConfig {
         provider: "openai".to_string(),
         api_key: "test-api-key".to_string(),
@@ -180,6 +249,9 @@ async fn test_openai_callback_registration() {
 /// Test default model selection
 #[test]
 fn test_openai_default_model() {
+    // Serialize vs the OPENAI_BASE_URL/loopback override window (readers take the same
+    // lock as the setter — the env-race rule).
+    let _env = openai_base_url_env_lock();
     let config = STTConfig {
         provider: "openai".to_string(),
         api_key: "test-api-key".to_string(),
@@ -194,6 +266,9 @@ fn test_openai_default_model() {
 /// Test provider info
 #[test]
 fn test_openai_provider_info() {
+    // Serialize vs the OPENAI_BASE_URL/loopback override window (readers take the same
+    // lock as the setter — the env-race rule).
+    let _env = openai_base_url_env_lock();
     let config = STTConfig {
         provider: "openai".to_string(),
         api_key: "test-api-key".to_string(),
@@ -210,6 +285,9 @@ fn test_openai_provider_info() {
 /// Test OpenAI STT specific methods using with_config
 #[test]
 fn test_openai_stt_specific_creation() {
+    // Serialize vs the OPENAI_BASE_URL/loopback override window (readers take the same
+    // lock as the setter — the env-race rule).
+    let _env = openai_base_url_env_lock();
     use waav_gateway::core::stt::openai::{OpenAISTTConfig, ResponseFormat};
 
     let config = OpenAISTTConfig {
@@ -377,4 +455,157 @@ async fn test_openai_verbose_json_format() {
     }
 
     stt.disconnect().await.expect("Failed to disconnect");
+}
+
+/// REAL live end-to-end round-trip against a local OpenAI-compatible server.
+///
+/// Unlike the `#[ignore]`d tests above, this one runs in the default suite: it stands up a real
+/// HTTP server implementing `POST /v1/audio/transcriptions`, points the WaaV OpenAI provider at
+/// it via the standard `OPENAI_BASE_URL` override, and drives the *actual* provider lifecycle
+/// (`connect` → `send_audio` → `flush`/`disconnect`). It exercises the provider's real wire path
+/// — multipart form construction, `Authorization: Bearer` header, WAV encoding, the HTTP POST,
+/// and JSON response parsing — end-to-end, with NO paid credentials. This is the credential-free
+/// equivalent of `test_openai_live_transcription`, validating that the integration is wired
+/// correctly against a server that speaks the OpenAI transcription contract.
+#[tokio::test]
+async fn test_openai_stt_local_server_roundtrip() {
+    use axum::{Router, extract::State, http::HeaderMap, routing::post};
+    use bytes::Bytes;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use tokio::net::TcpListener;
+    use tokio::sync::mpsc;
+    use waav_gateway::core::stt::openai::{OpenAISTTConfig, ResponseFormat};
+
+    const EXPECTED: &str = "waav local e2e transcript via openai provider";
+
+    // --- Real local server speaking the OpenAI transcription contract ---
+    #[derive(Default)]
+    struct SrvState {
+        saw_bearer: AtomicBool,
+        saw_multipart: AtomicBool,
+        hits: AtomicUsize,
+    }
+
+    async fn transcribe(
+        State(st): State<Arc<SrvState>>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> axum::Json<serde_json::Value> {
+        st.hits.fetch_add(1, Ordering::SeqCst);
+        if headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|s| s.starts_with("Bearer "))
+        {
+            st.saw_bearer.store(true, Ordering::SeqCst);
+        }
+        if headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|s| s.contains("multipart/form-data"))
+        {
+            st.saw_multipart.store(true, Ordering::SeqCst);
+        }
+        // The body is the real multipart payload (WAV audio + form fields). We require it to be
+        // non-trivial so a broken/empty upload would be caught.
+        assert!(
+            body.len() > 1000,
+            "expected a real multipart audio upload, got {} bytes",
+            body.len()
+        );
+        axum::Json(serde_json::json!({ "text": EXPECTED }))
+    }
+
+    let state = Arc::new(SrvState::default());
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind local server");
+    let addr = listener.local_addr().expect("local_addr");
+    let app = Router::new()
+        .route("/v1/audio/transcriptions", post(transcribe))
+        .with_state(state.clone());
+    // Socket is already bound, so the client can connect immediately; serve() just accepts.
+    let _server = spawn_test_server("local_transcriptions", async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+
+    // --- Point the real WaaV OpenAI provider at our local server ---
+    // SAFETY (edition 2024): set/remove_var are unsafe BECAUSE the process environment is a
+    // shared mutable global — glibc getenv/setenv race across threads (real UB, not just a
+    // logical race), and sibling tests in THIS binary construct providers whose api_url() READS
+    // OPENAI_BASE_URL. Hold a binary-wide lock for the whole set→drive→remove span so no
+    // parallel test observes (or races) the mutation (the PR#2 review finding; same discipline
+    // as the lib suite's net::ssrf_env_lock).
+    let _env_guard = openai_base_url_env_lock();
+    // The endpoint-override SSRF validation (creation-time) rejects loopback URLs by default;
+    // WAAV_ALLOW_LOOPBACK_ENDPOINTS=1 is the sanctioned escape for exactly this in-process
+    // mock-server case (see core::net) — set/removed inside the same lock span.
+    unsafe { std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1") };
+    unsafe { std::env::set_var("OPENAI_BASE_URL", format!("http://{addr}")) };
+
+    let mut config = OpenAISTTConfig::from_base(STTConfig {
+        provider: "openai".to_string(),
+        api_key: "local-test-key".to_string(),
+        language: "en".to_string(),
+        sample_rate: 16000,
+        channels: 1,
+        punctuation: true,
+        encoding: "linear16".to_string(),
+        model: "whisper-1".to_string(),
+    });
+    // Force plain JSON so the server's `{"text": ...}` body is parsed via TranscriptionResponse.
+    config.response_format = ResponseFormat::Json;
+
+    let mut stt = OpenAISTT::with_config(config).expect("create OpenAI STT");
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    stt.on_result(Arc::new(move |result| {
+        let tx = tx.clone();
+        Box::pin(async move {
+            let _ = tx.send(result);
+        })
+    }))
+    .await
+    .expect("register callback");
+
+    stt.connect().await.expect("connect");
+
+    // 0.5s of non-zero PCM so the encoded WAV upload is substantial (> 1000 bytes).
+    let mut audio = Vec::with_capacity(8000 * 2);
+    for i in 0..8000u32 {
+        let sample = (((i as f32) * 0.05).sin() * 8000.0) as i16;
+        audio.extend_from_slice(&sample.to_le_bytes());
+    }
+    stt.send_audio(Bytes::from(audio))
+        .await
+        .expect("send_audio");
+    stt.flush().await.expect("flush");
+
+    let received = tokio::time::timeout(tokio::time::Duration::from_secs(10), rx.recv()).await;
+
+    stt.disconnect().await.expect("disconnect");
+    // Restore global env before asserting so a failure can't leak into other tests.
+    unsafe { std::env::remove_var("OPENAI_BASE_URL") };
+    unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
+
+    let result = received
+        .expect("timed out waiting for transcription result")
+        .expect("result channel closed without a result");
+
+    assert_eq!(
+        result.transcript, EXPECTED,
+        "provider should return the transcript parsed from the local OpenAI-compatible server"
+    );
+    assert!(
+        state.hits.load(Ordering::SeqCst) >= 1,
+        "the provider must have actually POSTed to the local server"
+    );
+    assert!(
+        state.saw_bearer.load(Ordering::SeqCst),
+        "the provider must send an Authorization: Bearer header"
+    );
+    assert!(
+        state.saw_multipart.load(Ordering::SeqCst),
+        "the provider must send a multipart/form-data body (OpenAI transcription contract)"
+    );
 }

@@ -52,7 +52,23 @@ impl GnaniTTS {
     /// Create a new Gnani TTS instance
     pub fn create(config: TTSConfig) -> TTSResult<Self> {
         let gnani_config =
-            GnaniTTSConfig::from_base(config).map_err(|e| TTSError::InvalidConfiguration(e))?;
+            GnaniTTSConfig::from_base(config).map_err(TTSError::InvalidConfiguration)?;
+
+        Ok(Self {
+            config: Some(gnani_config),
+            ..Default::default()
+        })
+    }
+
+    /// Build from the standardized config (W1 keystone), mirroring `DeepgramTTS::from_standard`.
+    /// Gnani's expressible advanced features are `language` (-> `language_code`) and `sample_rate`
+    /// (-> `output_sample_rate`), plus the provider-specific `voice_name` extra; these are mapped
+    /// by [`GnaniTTSConfig::from_standard`] and reach the live synthesis request — previously
+    /// unreachable through the flat factory. Speed/pitch/volume/stability/emotion/instructions/
+    /// SSML-text-mode have no Gnani field and are skipped (capability gaps).
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
+        let gnani_config =
+            GnaniTTSConfig::from_standard(std).map_err(TTSError::InvalidConfiguration)?;
 
         Ok(Self {
             config: Some(gnani_config),
@@ -62,18 +78,17 @@ impl GnaniTTS {
 
     /// Build HTTP client
     fn build_client(config: &GnaniTTSConfig) -> TTSResult<reqwest::Client> {
-        let mut builder = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(config.request_timeout_secs));
+        let mut builder =
+            crate::core::net::ssrf_protected_client_builder(crate::core::net::HTTP_URL_SCHEMES)
+                .timeout(std::time::Duration::from_secs(config.request_timeout_secs));
 
         // Add certificate if provided (optional for TTS)
-        if let Some(ref path) = config.certificate_path {
-            if path.exists() {
-                if let Ok(cert_pem) = std::fs::read(path) {
-                    if let Ok(cert) = reqwest::Certificate::from_pem(&cert_pem) {
-                        builder = builder.add_root_certificate(cert);
-                    }
-                }
-            }
+        if let Some(ref path) = config.certificate_path
+            && path.exists()
+            && let Ok(cert_pem) = std::fs::read(path)
+            && let Ok(cert) = reqwest::Certificate::from_pem(&cert_pem)
+        {
+            builder = builder.add_root_certificate(cert);
         }
 
         builder.build().map_err(|e| {
@@ -120,7 +135,10 @@ impl GnaniTTS {
         );
 
         let response = client
-            .post(config.endpoint())
+            .post(crate::core::tts::standard::override_rest_endpoint(
+                config.endpoint(),
+                config.endpoint_override.as_deref(),
+            ))
             .header("token", &config.token)
             .header("accesskey", &config.access_key)
             .header("lang", config.language_code.as_str())
@@ -360,6 +378,84 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn gnani_tts_redirect_policy_rejects_private_hop() {
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local redirect test server");
+        let addr = listener.local_addr().expect("local addr");
+
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 1024];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 302 Found\r\n",
+                "Location: http://127.0.0.1:9/metadata\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n"
+            );
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await;
+        });
+
+        let mut config = GnaniTTSConfig::default();
+        config.token = "test-token".to_string();
+        config.access_key = "test-access-key".to_string();
+        let client = GnaniTTS::build_client(&config).expect("construct Gnani TTS client");
+        let err = client
+            .get(format!("http://{addr}/start"))
+            .send()
+            .await
+            .expect_err("private redirect target must be rejected");
+        let mut error_chain = err.to_string();
+        let mut source = std::error::Error::source(&err);
+        while let Some(err) = source {
+            error_chain.push_str(": ");
+            error_chain.push_str(&err.to_string());
+            source = err.source();
+        }
+        assert!(error_chain.contains("SSRF protection"), "{error_chain}");
+    }
+
+    // W1 keystone (struct-level, mirrors DeepgramTTS::from_standard): the standardized `language`
+    // and `sample_rate` features and the `voice_name` extra reach the live `GnaniTTSConfig` through
+    // the provider STRUCT's `from_standard` — the path the dispatch helper constructs.
+    #[test]
+    fn from_standard_struct_maps_language_and_sample_rate() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("voice_name".into(), serde_json::json!("speaker-3"));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "gnani".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                language: Some("Ta-IN".into()),
+                sample_rate: Some(16000),
+                ssml: Some(true), // capability gap: must be ignored
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+        let tts = GnaniTTS::from_standard(&std).unwrap();
+        let cfg = tts.config.as_ref().unwrap();
+        assert_eq!(
+            cfg.language_code,
+            crate::core::tts::gnani::GnaniTTSLanguage::Tamil
+        );
+        assert_eq!(cfg.output_sample_rate, 16000);
+        assert_eq!(cfg.voice_name, Some("speaker-3".to_string()));
+    }
+
     #[test]
     fn test_gnani_tts_not_connected_initially() {
         let config = create_test_config();
@@ -373,7 +469,7 @@ mod tests {
         let tts = GnaniTTS::create(config).unwrap();
         let info = tts.get_provider_info();
         assert_eq!(info["provider"], "gnani");
-        assert!(info["features"].as_array().unwrap().len() > 0);
+        assert!(!info["features"].as_array().unwrap().is_empty());
     }
 
     #[test]

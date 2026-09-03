@@ -7,6 +7,15 @@ use std::fmt;
 
 use crate::core::tts::base::{TTSConfig, TTSError, TTSResult};
 
+fn validate_speechify_tts_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 // =============================================================================
 // Model Types
 // =============================================================================
@@ -309,6 +318,9 @@ pub struct SpeechifyTtsConfig {
 
     /// Whether to normalize text (numbers, dates to words)
     pub text_normalization: bool,
+
+    /// Optional base URL override (scheme+host) for the synth HTTP endpoint; used by mock e2e tests.
+    pub endpoint_override: Option<String>,
 }
 
 impl Default for SpeechifyTtsConfig {
@@ -321,6 +333,7 @@ impl Default for SpeechifyTtsConfig {
             language: None,
             loudness_normalization: false,
             text_normalization: false,
+            endpoint_override: None,
         }
     }
 }
@@ -334,11 +347,9 @@ impl SpeechifyTtsConfig {
     /// Create configuration from base TTSConfig
     pub fn from_base(config: &TTSConfig) -> TTSResult<Self> {
         // Get API key from config or environment
-        let api_key = if !config.api_key.is_empty() {
-            config.api_key.clone()
-        } else {
-            std::env::var("SPEECHIFY_API_KEY").unwrap_or_default()
-        };
+        let api_key = crate::core::credentials::explicit_api_key(&config.api_key)
+            .or_else(|| crate::core::credentials::env_api_key("SPEECHIFY_API_KEY"))
+            .unwrap_or_default();
 
         if api_key.is_empty() {
             return Err(TTSError::InvalidConfiguration(
@@ -383,7 +394,50 @@ impl SpeechifyTtsConfig {
             language,
             loudness_normalization: false,
             text_normalization: false,
+            endpoint_override: None,
         })
+    }
+
+    /// Build from the standardized config (W1 keystone). Speechify is a deliberately minimal TTS
+    /// surface: the only standardized feature it can express is [`TtsFeatures::language`], which
+    /// overrides the synthesis `language` (otherwise auto-detected). The non-standard
+    /// `loudness_normalization` and `text_normalization` toggles are read from the `extras`
+    /// passthrough. Speechify exposes no speed, pitch, volume, ElevenLabs-style voice settings,
+    /// emotion, instructions, SSML, word-timestamp, streaming, seed or sample-rate knobs (sample
+    /// rate is fixed by the audio format), so all of those features are skipped.
+    ///
+    /// [`TtsFeatures::language`]: crate::core::tts::standard::TtsFeatures::language
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(&std.base)?;
+
+        // Language override (from_base leaves this as None / auto-detect).
+        if let Some(language) = f.language.as_ref() {
+            cfg.language = Some(language.clone());
+        }
+
+        // Provider-specific passthrough.
+        if let Some(norm) = std
+            .extras
+            .0
+            .get("loudness_normalization")
+            .and_then(|v| v.as_bool())
+        {
+            cfg.loudness_normalization = norm;
+        }
+        if let Some(norm) = std
+            .extras
+            .0
+            .get("text_normalization")
+            .and_then(|v| v.as_bool())
+        {
+            cfg.text_normalization = norm;
+        }
+
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
+        cfg.validate()?;
+
+        Ok(cfg)
     }
 
     /// Validate text length
@@ -410,6 +464,11 @@ impl SpeechifyTtsConfig {
             return Err(TTSError::InvalidConfiguration(
                 "voice_id is required".to_string(),
             ));
+        }
+
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_speechify_tts_endpoint("endpoint_override", endpoint)
+                .map_err(TTSError::InvalidConfiguration)?;
         }
 
         Ok(())
@@ -487,6 +546,7 @@ impl SpeechifyTtsConfigBuilder {
             language: self.language,
             loudness_normalization: self.loudness_normalization,
             text_normalization: self.text_normalization,
+            endpoint_override: None,
         };
 
         config.validate()?;
@@ -501,6 +561,76 @@ impl SpeechifyTtsConfigBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone: the one standardized feature Speechify can express (language override) reaches
+    // its real `language` field, and the non-standard loudness/text normalization toggles flow
+    // through the extras passthrough.
+    #[test]
+    fn from_standard_maps_language_and_normalization_extras() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("loudness_normalization".into(), serde_json::json!(true));
+        extras.insert("text_normalization".into(), serde_json::json!(true));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "speechify".into(),
+                api_key: "test-key".into(),
+                voice_id: Some("henry".into()),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                language: Some("es-ES".into()),
+                // capability gaps: Speechify has no speed/ssml fields, these must be ignored.
+                speed: Some(1.5),
+                ssml: Some(true),
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+        let cfg = SpeechifyTtsConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.language, Some("es-ES".to_string()));
+        assert!(cfg.loudness_normalization); // extras passthrough
+        assert!(cfg.text_normalization);
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = SpeechifyTtsConfig {
+            api_key: "test-key".to_string(),
+            voice_id: "george".to_string(),
+            endpoint_override: Some("https://speechify-proxy.example.com".to_string()),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(format!("{err:?}").contains("SSRF protection"));
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("file endpoint_override must be rejected");
+        assert!(format!("{err:?}").contains("URL scheme"));
+
+        config.endpoint_override = Some("ws://speechify-proxy.example.com".to_string());
+        let err = config
+            .validate()
+            .expect_err("WebSocket endpoint_override must be rejected");
+        assert!(format!("{err:?}").contains("URL scheme"));
+
+        let std = crate::core::tts::standard::StandardTTSConfig::from_base(TTSConfig {
+            provider: "speechify".to_string(),
+            api_key: "test-key".to_string(),
+            voice_id: Some("george".to_string()),
+            ..Default::default()
+        })
+        .with_endpoint_override("file:///tmp/socket");
+        assert!(SpeechifyTtsConfig::from_standard(&std).is_err());
+    }
 
     #[test]
     fn test_model_enum() {
@@ -716,6 +846,7 @@ mod tests {
             language: None,
             loudness_normalization: false,
             text_normalization: false,
+            endpoint_override: None,
         };
 
         let request = SpeechifyStreamRequest::from_config(&config, "Hello world");
@@ -739,6 +870,7 @@ mod tests {
             language: Some("fr-FR".to_string()),
             loudness_normalization: true,
             text_normalization: true,
+            endpoint_override: None,
         };
 
         let request = SpeechifyStreamRequest::from_config(&config, "Bonjour");
@@ -762,6 +894,7 @@ mod tests {
             language: Some("en-US".to_string()),
             loudness_normalization: true,
             text_normalization: false,
+            endpoint_override: None,
         };
 
         let request = SpeechifyStreamRequest::from_config(&config, "Test text");

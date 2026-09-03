@@ -181,6 +181,12 @@ impl SmallestWsRequest {
         self
     }
 
+    /// Sets the max buffer flush time (ms, 0-1000) for the streaming endpoint.
+    pub fn with_max_buffer_flush_ms(mut self, ms: u32) -> Self {
+        self.max_buffer_flush_ms = Some(ms);
+        self
+    }
+
     /// Sets continue stream flag.
     pub fn with_continue(mut self, continue_stream: bool) -> Self {
         self.continue_stream = Some(continue_stream);

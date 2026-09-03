@@ -27,6 +27,7 @@
 
 use pulp::{Arch, Simd, WithSimd};
 use std::alloc::{Layout, alloc, dealloc};
+use std::fmt;
 use std::ptr::NonNull;
 
 /// Pre-calculated constants for PCM conversion
@@ -37,6 +38,85 @@ pub const FLOAT_TO_PCM_SCALE_NEG: f32 = 32768.0;
 /// Cache line size for alignment (64 bytes on x86, 128 bytes on Apple Silicon)
 /// We use 64 bytes as a conservative default that works well on all platforms.
 pub const CACHE_LINE_SIZE: usize = 64;
+
+/// Error returned when an aligned buffer cannot be allocated with the requested
+/// capacity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AlignedBufferError {
+    CapacityOverflow {
+        capacity: usize,
+        element_size: usize,
+    },
+    InvalidLayout {
+        capacity: usize,
+        element_size: usize,
+    },
+    ResizeExceedsCapacity {
+        requested_len: usize,
+        capacity: usize,
+    },
+    SourceExceedsCapacity {
+        source_len: usize,
+        capacity: usize,
+    },
+}
+
+impl fmt::Display for AlignedBufferError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AlignedBufferError::CapacityOverflow {
+                capacity,
+                element_size,
+            } => write!(
+                f,
+                "aligned buffer capacity {capacity} overflows element size {element_size}"
+            ),
+            AlignedBufferError::InvalidLayout {
+                capacity,
+                element_size,
+            } => write!(
+                f,
+                "aligned buffer layout is invalid for capacity {capacity} and element size {element_size}"
+            ),
+            AlignedBufferError::ResizeExceedsCapacity {
+                requested_len,
+                capacity,
+            } => write!(
+                f,
+                "aligned buffer resize requested {requested_len} elements but capacity is {capacity}"
+            ),
+            AlignedBufferError::SourceExceedsCapacity {
+                source_len,
+                capacity,
+            } => write!(
+                f,
+                "aligned buffer copy source has {source_len} elements but capacity is {capacity}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AlignedBufferError {}
+
+/// Error returned when a SIMD tensor copy cannot fit the source in the
+/// destination buffer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TensorCopyError {
+    DestinationTooSmall { src_len: usize, dst_len: usize },
+}
+
+impl fmt::Display for TensorCopyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TensorCopyError::DestinationTooSmall { src_len, dst_len } => write!(
+                f,
+                "SIMD tensor copy destination too small: src has {src_len} samples, dst has {dst_len}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TensorCopyError {}
 
 /// Reports detected SIMD capabilities for logging/debugging.
 ///
@@ -125,23 +205,37 @@ pub struct AlignedBuffer<T: Copy + Default> {
     ptr: NonNull<T>,
     len: usize,
     capacity: usize,
+    layout: Option<Layout>,
 }
 
 impl<T: Copy + Default> AlignedBuffer<T> {
     /// Creates a new aligned buffer with the specified capacity.
     ///
-    /// The buffer is zero-initialized.
+    /// The buffer starts with length 0. Invalid layout requests are logged and
+    /// return an empty buffer; use [`Self::try_new`] to receive a typed error.
     pub fn new(capacity: usize) -> Self {
-        if capacity == 0 {
-            return Self {
+        match Self::try_new(capacity) {
+            Ok(buffer) => buffer,
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    "invalid aligned buffer capacity; returning an empty buffer"
+                );
+                Self::empty()
+            }
+        }
+    }
+
+    /// Creates a new aligned buffer with typed capacity validation errors.
+    pub fn try_new(capacity: usize) -> Result<Self, AlignedBufferError> {
+        let Some(layout) = Self::layout_for_capacity(capacity)? else {
+            return Ok(Self {
                 ptr: NonNull::dangling(),
                 len: 0,
-                capacity: 0,
-            };
-        }
-
-        let layout = Layout::from_size_align(capacity * std::mem::size_of::<T>(), CACHE_LINE_SIZE)
-            .expect("Invalid layout");
+                capacity,
+                layout: None,
+            });
+        };
 
         // SAFETY: Layout is valid and non-zero
         let ptr = unsafe {
@@ -149,23 +243,68 @@ impl<T: Copy + Default> AlignedBuffer<T> {
             if raw_ptr.is_null() {
                 std::alloc::handle_alloc_error(layout);
             }
-            // Zero-initialize
-            std::ptr::write_bytes(raw_ptr, 0, capacity);
             NonNull::new_unchecked(raw_ptr)
         };
 
-        Self {
+        Ok(Self {
             ptr,
             len: 0,
             capacity,
-        }
+            layout: Some(layout),
+        })
     }
 
     /// Creates a new aligned buffer initialized with the given value.
     pub fn with_value(capacity: usize, value: T) -> Self {
-        let mut buf = Self::new(capacity);
-        buf.resize(capacity, value);
-        buf
+        match Self::try_with_value(capacity, value) {
+            Ok(buffer) => buffer,
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    "invalid aligned buffer capacity; returning an empty buffer"
+                );
+                Self::empty()
+            }
+        }
+    }
+
+    /// Creates a new aligned buffer initialized with the given value, returning
+    /// typed capacity validation errors.
+    pub fn try_with_value(capacity: usize, value: T) -> Result<Self, AlignedBufferError> {
+        let mut buf = Self::try_new(capacity)?;
+        buf.resize(capacity, value)?;
+        Ok(buf)
+    }
+
+    fn empty() -> Self {
+        Self {
+            ptr: NonNull::dangling(),
+            len: 0,
+            capacity: 0,
+            layout: None,
+        }
+    }
+
+    fn layout_for_capacity(capacity: usize) -> Result<Option<Layout>, AlignedBufferError> {
+        let element_size = std::mem::size_of::<T>();
+        if capacity == 0 || element_size == 0 {
+            return Ok(None);
+        }
+
+        let size =
+            capacity
+                .checked_mul(element_size)
+                .ok_or(AlignedBufferError::CapacityOverflow {
+                    capacity,
+                    element_size,
+                })?;
+
+        Layout::from_size_align(size, CACHE_LINE_SIZE)
+            .map(Some)
+            .map_err(|_| AlignedBufferError::InvalidLayout {
+                capacity,
+                element_size,
+            })
     }
 
     /// Returns the length of the buffer.
@@ -194,7 +333,12 @@ impl<T: Copy + Default> AlignedBuffer<T> {
         }
         // Debug assertion for safety invariant
         // Note: self.ptr is NonNull, so null check is unnecessary
-        debug_assert!(self.len <= self.capacity, "len {} > capacity {}", self.len, self.capacity);
+        debug_assert!(
+            self.len <= self.capacity,
+            "len {} > capacity {}",
+            self.len,
+            self.capacity
+        );
 
         // SAFETY: ptr is valid (NonNull guarantees non-null) and len <= capacity
         unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
@@ -208,7 +352,12 @@ impl<T: Copy + Default> AlignedBuffer<T> {
         }
         // Debug assertion for safety invariant
         // Note: self.ptr is NonNull, so null check is unnecessary
-        debug_assert!(self.len <= self.capacity, "len {} > capacity {}", self.len, self.capacity);
+        debug_assert!(
+            self.len <= self.capacity,
+            "len {} > capacity {}",
+            self.len,
+            self.capacity
+        );
 
         // SAFETY: ptr is valid (NonNull guarantees non-null) and len <= capacity
         unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
@@ -218,26 +367,47 @@ impl<T: Copy + Default> AlignedBuffer<T> {
     ///
     /// If the new length is greater than the current length, new elements
     /// are initialized with the provided value.
-    pub fn resize(&mut self, new_len: usize, value: T) {
-        assert!(new_len <= self.capacity, "Cannot resize beyond capacity");
+    pub fn resize(&mut self, new_len: usize, value: T) -> Result<(), AlignedBufferError> {
+        if new_len > self.capacity {
+            return Err(AlignedBufferError::ResizeExceedsCapacity {
+                requested_len: new_len,
+                capacity: self.capacity,
+            });
+        }
+
+        if std::mem::size_of::<T>() == 0 {
+            self.len = new_len;
+            return Ok(());
+        }
 
         if new_len > self.len {
             // Debug assertion for bounds checking
             // Note: self.ptr is NonNull, so null check is unnecessary
-            debug_assert!(new_len <= self.capacity, "new_len {} > capacity {}", new_len, self.capacity);
+            debug_assert!(
+                new_len <= self.capacity,
+                "new_len {} > capacity {}",
+                new_len,
+                self.capacity
+            );
 
             // Initialize new elements
             // SAFETY: ptr is valid (NonNull guarantees non-null) and new_len <= capacity
             unsafe {
                 let start = self.ptr.as_ptr().add(self.len);
                 for i in 0..(new_len - self.len) {
-                    debug_assert!(self.len + i < self.capacity, "write index {} >= capacity {}", self.len + i, self.capacity);
+                    debug_assert!(
+                        self.len + i < self.capacity,
+                        "write index {} >= capacity {}",
+                        self.len + i,
+                        self.capacity
+                    );
                     std::ptr::write(start.add(i), value);
                 }
             }
         }
 
         self.len = new_len;
+        Ok(())
     }
 
     /// Clears the buffer, setting length to 0.
@@ -249,30 +419,33 @@ impl<T: Copy + Default> AlignedBuffer<T> {
     /// Copies data from a slice into the buffer.
     ///
     /// The buffer is resized to match the slice length.
-    pub fn copy_from_slice(&mut self, src: &[T]) {
-        assert!(src.len() <= self.capacity, "Source slice too large");
+    pub fn copy_from_slice(&mut self, src: &[T]) -> Result<(), AlignedBufferError> {
+        if src.len() > self.capacity {
+            return Err(AlignedBufferError::SourceExceedsCapacity {
+                source_len: src.len(),
+                capacity: self.capacity,
+            });
+        }
+
         self.len = src.len();
 
-        if src.is_empty() || self.capacity == 0 {
-            return;
+        if src.is_empty() || self.capacity == 0 || std::mem::size_of::<T>() == 0 {
+            return Ok(());
         }
 
         // SAFETY: ptr is valid and src.len() <= capacity
         unsafe {
             std::ptr::copy_nonoverlapping(src.as_ptr(), self.ptr.as_ptr(), src.len());
         }
+        Ok(())
     }
 }
 
 impl<T: Copy + Default> Drop for AlignedBuffer<T> {
     fn drop(&mut self) {
-        if self.capacity == 0 {
+        let Some(layout) = self.layout else {
             return;
-        }
-
-        let layout =
-            Layout::from_size_align(self.capacity * std::mem::size_of::<T>(), CACHE_LINE_SIZE)
-                .expect("Invalid layout");
+        };
 
         // SAFETY: ptr was allocated with this layout
         unsafe {
@@ -872,16 +1045,27 @@ impl WithSimd for ThresholdScaleOp<'_> {
 /// * `src` - Source audio samples
 /// * `dst` - Destination buffer (must be at least same length as src)
 ///
+/// # Errors
+///
+/// Returns [`TensorCopyError::DestinationTooSmall`] when `dst` cannot hold all
+/// source samples.
+///
 /// # Performance
 ///
 /// Uses vectorized copy for efficient transfer.
 #[inline]
-pub fn copy_to_tensor_simd(src: &[f32], dst: &mut [f32]) {
-    debug_assert!(dst.len() >= src.len());
+pub fn copy_to_tensor_simd(src: &[f32], dst: &mut [f32]) -> Result<(), TensorCopyError> {
+    if dst.len() < src.len() {
+        return Err(TensorCopyError::DestinationTooSmall {
+            src_len: src.len(),
+            dst_len: dst.len(),
+        });
+    }
 
     // For audio buffers, copy_from_slice is typically optimized by the compiler
     // and will use SIMD intrinsics when appropriate
     dst[..src.len()].copy_from_slice(src);
+    Ok(())
 }
 
 // =============================================================================
@@ -1177,9 +1361,27 @@ mod tests {
         let src = vec![1.0f32, 2.0, 3.0, 4.0, 5.0];
         let mut dst = vec![0.0f32; 10];
 
-        copy_to_tensor_simd(&src, &mut dst);
+        copy_to_tensor_simd(&src, &mut dst).expect("destination is large enough");
 
         assert_eq!(&dst[..5], &src[..]);
+    }
+
+    #[test]
+    fn test_copy_to_tensor_rejects_short_destination() {
+        let src = vec![1.0f32, 2.0, 3.0, 4.0, 5.0];
+        let mut dst = vec![0.0f32; 4];
+
+        let err = copy_to_tensor_simd(&src, &mut dst)
+            .expect_err("short destination must fail before slicing");
+
+        assert_eq!(
+            err,
+            TensorCopyError::DestinationTooSmall {
+                src_len: 5,
+                dst_len: 4
+            }
+        );
+        assert_eq!(dst, vec![0.0f32; 4]);
     }
 
     // -------------------------------------------------------------------------
@@ -1202,6 +1404,75 @@ mod tests {
     }
 
     #[test]
+    fn test_aligned_buffer_try_new_rejects_capacity_overflow_without_panic() {
+        let element_size = std::mem::size_of::<u16>();
+        let capacity = usize::MAX / element_size + 1;
+
+        let err = match AlignedBuffer::<u16>::try_new(capacity) {
+            Ok(_) => panic!("overflowing capacity unexpectedly created a buffer"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err,
+            AlignedBufferError::CapacityOverflow {
+                capacity,
+                element_size
+            }
+        );
+
+        let buf = std::panic::catch_unwind(|| AlignedBuffer::<u16>::new(capacity))
+            .expect("legacy constructor should return an empty buffer, not panic");
+        assert_eq!(buf.len(), 0);
+        assert_eq!(buf.capacity(), 0);
+    }
+
+    #[test]
+    fn test_aligned_buffer_try_new_rejects_too_large_layout_without_panic() {
+        let element_size = std::mem::size_of::<u8>();
+        let capacity = isize::MAX as usize + 1;
+
+        let err = match AlignedBuffer::<u8>::try_new(capacity) {
+            Ok(_) => panic!("too-large layout unexpectedly created a buffer"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err,
+            AlignedBufferError::InvalidLayout {
+                capacity,
+                element_size
+            }
+        );
+
+        let buf = std::panic::catch_unwind(|| AlignedBuffer::<u8>::new(capacity))
+            .expect("legacy constructor should return an empty buffer, not panic");
+        assert_eq!(buf.len(), 0);
+        assert_eq!(buf.capacity(), 0);
+    }
+
+    #[test]
+    fn test_aligned_buffer_try_with_value_rejects_capacity_overflow_without_panic() {
+        let element_size = std::mem::size_of::<u16>();
+        let capacity = usize::MAX / element_size + 1;
+
+        let err = match AlignedBuffer::<u16>::try_with_value(capacity, 7) {
+            Ok(_) => panic!("overflowing capacity unexpectedly created a buffer"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err,
+            AlignedBufferError::CapacityOverflow {
+                capacity,
+                element_size
+            }
+        );
+
+        let buf = std::panic::catch_unwind(|| AlignedBuffer::<u16>::with_value(capacity, 7))
+            .expect("legacy constructor should return an empty buffer, not panic");
+        assert_eq!(buf.len(), 0);
+        assert_eq!(buf.capacity(), 0);
+    }
+
+    #[test]
     fn test_aligned_buffer_with_value() {
         let buf = AlignedBuffer::<f32>::with_value(10, 1.5);
         assert_eq!(buf.len(), 10);
@@ -1214,7 +1485,7 @@ mod tests {
     fn test_aligned_buffer_copy_from_slice() {
         let mut buf = AlignedBuffer::<f32>::new(100);
         let data = vec![1.0, 2.0, 3.0, 4.0, 5.0];
-        buf.copy_from_slice(&data);
+        buf.copy_from_slice(&data).expect("copy fits buffer");
 
         assert_eq!(buf.len(), 5);
         for i in 0..5 {
@@ -1225,7 +1496,8 @@ mod tests {
     #[test]
     fn test_aligned_buffer_as_slice() {
         let mut buf = AlignedBuffer::<f32>::new(100);
-        buf.copy_from_slice(&[1.0, 2.0, 3.0]);
+        buf.copy_from_slice(&[1.0, 2.0, 3.0])
+            .expect("copy fits buffer");
 
         let slice = buf.as_slice();
         assert_eq!(slice.len(), 3);
@@ -1237,17 +1509,57 @@ mod tests {
     #[test]
     fn test_aligned_buffer_resize() {
         let mut buf = AlignedBuffer::<f32>::new(100);
-        buf.resize(50, 0.0);
+        buf.resize(50, 0.0).expect("resize fits buffer");
         assert_eq!(buf.len(), 50);
 
-        buf.resize(25, 0.0);
+        buf.resize(25, 0.0).expect("resize fits buffer");
         assert_eq!(buf.len(), 25);
+    }
+
+    #[test]
+    fn test_aligned_buffer_resize_rejects_length_beyond_capacity_without_panic() {
+        let mut buf = AlignedBuffer::<f32>::with_value(4, 1.5);
+
+        let err = buf
+            .resize(5, 0.0)
+            .expect_err("resize beyond capacity must be typed");
+
+        assert_eq!(
+            err,
+            AlignedBufferError::ResizeExceedsCapacity {
+                requested_len: 5,
+                capacity: 4
+            }
+        );
+        assert_eq!(buf.len(), 4, "failed resize must leave length unchanged");
+        assert!(buf.as_slice().iter().all(|v| approx_eq(*v, 1.5)));
+    }
+
+    #[test]
+    fn test_aligned_buffer_copy_rejects_source_beyond_capacity_without_panic() {
+        let mut buf = AlignedBuffer::<f32>::with_value(4, 1.5);
+        let src = [0.0f32; 5];
+
+        let err = buf
+            .copy_from_slice(&src)
+            .expect_err("oversized source must be typed");
+
+        assert_eq!(
+            err,
+            AlignedBufferError::SourceExceedsCapacity {
+                source_len: 5,
+                capacity: 4
+            }
+        );
+        assert_eq!(buf.len(), 4, "failed copy must leave length unchanged");
+        assert!(buf.as_slice().iter().all(|v| approx_eq(*v, 1.5)));
     }
 
     #[test]
     fn test_aligned_buffer_clear() {
         let mut buf = AlignedBuffer::<f32>::new(100);
-        buf.copy_from_slice(&[1.0, 2.0, 3.0]);
+        buf.copy_from_slice(&[1.0, 2.0, 3.0])
+            .expect("copy fits buffer");
         buf.clear();
         assert_eq!(buf.len(), 0);
         assert!(buf.is_empty());

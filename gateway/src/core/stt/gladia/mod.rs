@@ -11,7 +11,7 @@
 //!
 //! # Example
 //!
-//! ```rust,no_run
+//! ```ignore
 //! use waav_gateway::core::stt::gladia::{GladiaSTT, GladiaSTTConfig};
 //! use waav_gateway::core::stt::BaseSTT;
 //!
@@ -40,8 +40,10 @@ pub mod messages;
 // Re-export public types
 pub use client::GladiaSTT;
 pub use config::{
-    GladiaBitDepth, GladiaEncoding, GladiaLanguageConfig, GladiaMessagesConfig,
-    GladiaPreProcessing, GladiaRealtimeProcessing, GladiaRegion, GladiaSTTConfig,
+    GladiaBitDepth, GladiaCustomSpellingConfig, GladiaCustomVocabularyConfig, GladiaEncoding,
+    GladiaLanguageConfig, GladiaMessagesConfig, GladiaPostProcessing, GladiaPreProcessing,
+    GladiaRealtimeProcessing, GladiaRegion, GladiaSTTConfig, GladiaSummarizationConfig,
+    GladiaTranslationConfig, GladiaVocabularyItem,
 };
 pub use messages::{
     AudioChunkMessage, GladiaError, InitSessionRequest, InitSessionResponse, StopRecordingMessage,

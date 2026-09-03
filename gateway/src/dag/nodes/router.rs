@@ -16,6 +16,51 @@ use crate::dag::definition::{JoinStrategy, RouteDefinition};
 use crate::dag::error::{DAGError, DAGResult};
 use crate::dag::routing::{CompiledCondition, ConditionEvaluator, create_rhai_engine};
 
+/// Wall-clock budget for a single Join selector/merge Rhai evaluation.
+///
+/// Even with `set_max_operations`, a script can spend real time per operation;
+/// this hard wall-clock deadline (enforced both inside the engine via an
+/// `on_progress` hook and outside via a `spawn_blocking` + timeout) guarantees a
+/// runaway script is killed (W-O3 bug #5).
+const RHAI_EVAL_WALL_CLOCK: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Install a wall-clock deadline on a Rhai engine via its progress hook.
+///
+/// The hook fires periodically as operations execute; once the deadline passes
+/// it returns `Some(..)` which aborts evaluation with a terminated error.
+fn install_wall_clock_deadline(engine: &mut rhai::Engine, deadline: std::time::Instant) {
+    engine.on_progress(move |_ops| {
+        if std::time::Instant::now() >= deadline {
+            Some(Dynamic::from("wall-clock timeout"))
+        } else {
+            None
+        }
+    });
+}
+
+/// Run a Rhai evaluation closure on a blocking thread with a hard wall-clock
+/// timeout backstop.
+///
+/// The closure itself should install an `on_progress` deadline (see
+/// `install_wall_clock_deadline`); the outer `tokio::time::timeout` is a second,
+/// independent guard so a pathological script that somehow evades the progress
+/// hook still cannot hang the executor (W-O3 bug #5).
+async fn eval_rhai_blocking<F>(f: F) -> DAGResult<DAGResult<Dynamic>>
+where
+    F: FnOnce() -> DAGResult<Dynamic> + Send + 'static,
+{
+    // Allow a little slack over the in-engine deadline before the hard kill.
+    let hard = RHAI_EVAL_WALL_CLOCK + std::time::Duration::from_millis(500);
+    match tokio::time::timeout(hard, tokio::task::spawn_blocking(f)).await {
+        Ok(Ok(inner)) => Ok(inner),
+        Ok(Err(join_err)) => Err(DAGError::InternalError(format!(
+            "Rhai eval task panicked: {}",
+            join_err
+        ))),
+        Err(_) => Err(DAGError::ExecutionTimeout(hard.as_millis() as u64)),
+    }
+}
+
 /// Split node for parallel execution
 ///
 /// Broadcasts input to multiple branches for concurrent processing.
@@ -221,7 +266,7 @@ impl DAGNode for JoinNode {
             JoinStrategy::Best => {
                 // Select best result using selector expression
                 if let Some(ref selector) = self.selector {
-                    self.select_best(results, selector, ctx)
+                    self.select_best(results, selector, ctx).await
                 } else {
                     // Default: return first result
                     results.into_iter().next().ok_or(DAGError::EmptyJoin)
@@ -230,7 +275,7 @@ impl DAGNode for JoinNode {
             JoinStrategy::Merge => {
                 // Merge results using merge script
                 if let Some(ref script) = self.merge_script {
-                    self.merge_results(results, script, ctx)
+                    self.merge_results(results, script, ctx).await
                 } else {
                     // Default: return all as array
                     Ok(DAGData::Multiple(results))
@@ -254,7 +299,7 @@ impl JoinNode {
     /// - `results.max_by(|r| r.confidence)` - Select by highest confidence
     /// - `results[0]` - Select first result
     /// - `results.find(|r| r.is_final)` - Select first final result
-    fn select_best(
+    async fn select_best(
         &self,
         results: Vec<DAGData>,
         selector: &str,
@@ -264,24 +309,39 @@ impl JoinNode {
             return Err(DAGError::EmptyJoin);
         }
 
-        // Create Rhai engine with array extensions for selection
-        let mut engine = create_rhai_engine();
+        info!(
+            node_id = %self.id,
+            selector = %selector,
+            result_count = results.len(),
+            "Evaluating selector expression"
+        );
 
-        // Re-enable looping for array iteration in selectors, but with stricter limits
-        // to prevent infinite loops or excessive resource usage
-        engine.set_allow_looping(true);
-        engine.set_max_operations(1_000); // Lower limit when looping is enabled
-        engine.set_max_call_levels(16); // Limit recursion depth
+        // Snapshot inputs to move into the blocking eval task.
+        let selector_owned = selector.to_string();
+        let node_id = self.id.clone();
+        let results_json: Vec<serde_json::Value> = results.iter().map(|r| r.to_json()).collect();
+        let stream_id = ctx.stream_id.clone();
+        let api_key = ctx.api_key.clone();
+        let api_key_id = ctx.api_key_id.clone();
 
-        // Register max_by_field function for selecting best result by numeric field
-        engine.register_fn("max_by_field", |arr: Array, field: &str| -> Dynamic {
-            let mut best: Option<Dynamic> = None;
-            let mut best_score = f64::MIN;
+        // Evaluate on a blocking thread with a hard wall-clock deadline so a
+        // runaway selector cannot stall the async runtime (W-O3 bug #5).
+        let result: Dynamic = eval_rhai_blocking(move || {
+            let deadline = std::time::Instant::now() + RHAI_EVAL_WALL_CLOCK;
 
-            for item in arr.iter() {
-                if let Some(map) = item.clone().try_cast::<rhai::Map>() {
-                    if let Some(val) = map.get(field) {
-                        // Try to get numeric value using Rhai's built-in conversion
+            let mut engine = create_rhai_engine();
+            engine.set_allow_looping(true);
+            engine.set_max_operations(1_000);
+            engine.set_max_call_levels(16);
+            install_wall_clock_deadline(&mut engine, deadline);
+
+            engine.register_fn("max_by_field", |arr: Array, field: &str| -> Dynamic {
+                let mut best: Option<Dynamic> = None;
+                let mut best_score = f64::MIN;
+                for item in arr.iter() {
+                    if let Some(map) = item.clone().try_cast::<rhai::Map>()
+                        && let Some(val) = map.get(field)
+                    {
                         let score: f64 = if val.is::<f64>() {
                             val.clone().cast::<f64>()
                         } else if val.is::<i64>() {
@@ -291,53 +351,39 @@ impl JoinNode {
                         } else {
                             continue;
                         };
-
                         if score > best_score {
                             best_score = score;
                             best = Some(item.clone());
                         }
                     }
                 }
+                best.unwrap_or(Dynamic::UNIT)
+            });
+
+            let mut scope = Scope::new();
+            let rhai_results: Array = results_json.iter().map(json_to_dynamic).collect();
+            scope.push("results", rhai_results);
+            scope.push_constant("stream_id", stream_id);
+            if let Some(api_key) = api_key {
+                scope.push_constant("api_key", api_key);
+            }
+            if let Some(api_key_id) = api_key_id {
+                scope.push_constant("api_key_id", api_key_id);
             }
 
-            best.unwrap_or(Dynamic::UNIT)
-        });
-
-        // Create scope with results array
-        let mut scope = Scope::new();
-
-        // Convert results to Rhai Dynamic array
-        let rhai_results: Array = results
-            .iter()
-            .map(|r| json_to_dynamic(&r.to_json()))
-            .collect();
-
-        scope.push("results", rhai_results.clone());
-        scope.push_constant("stream_id", ctx.stream_id.clone());
-
-        if let Some(api_key) = &ctx.api_key {
-            scope.push_constant("api_key", api_key.clone());
-        }
-        if let Some(api_key_id) = &ctx.api_key_id {
-            scope.push_constant("api_key_id", api_key_id.clone());
-        }
-
-        info!(
-            node_id = %self.id,
-            selector = %selector,
-            result_count = results.len(),
-            "Evaluating selector expression"
-        );
-
-        // Compile and evaluate the selector expression
-        let result = engine
-            .eval_with_scope::<Dynamic>(&mut scope, selector)
-            .map_err(|e| {
-                DAGError::ConditionError(format!(
-                    "Selector expression '{}' failed: {}",
-                    selector, e
-                ))
-            })?;
+            engine
+                .eval_with_scope::<Dynamic>(&mut scope, &selector_owned)
+                .map_err(|e| {
+                    DAGError::ConditionError(format!(
+                        "Selector expression '{}' failed: {}",
+                        selector_owned, e
+                    ))
+                })
+        })
+        .await
+        .map_err(|e| {
+            DAGError::ConditionError(format!("Join '{}' selector evaluation: {}", node_id, e))
+        })??;
 
         // Interpret the result
         if let Some(idx) = result.clone().try_cast::<i64>() {
@@ -384,7 +430,7 @@ impl JoinNode {
     /// for r in results { combined += r.text; }
     /// combined
     /// ```
-    fn merge_results(
+    async fn merge_results(
         &self,
         results: Vec<DAGData>,
         script: &str,
@@ -394,34 +440,6 @@ impl JoinNode {
             return Err(DAGError::EmptyJoin);
         }
 
-        // Create Rhai engine with extensions
-        let mut engine = create_rhai_engine();
-
-        // Re-enable looping for merge scripts, but with stricter limits
-        // to prevent infinite loops or excessive resource usage
-        engine.set_allow_looping(true);
-        engine.set_max_operations(1_000); // Lower limit when looping is enabled
-        engine.set_max_call_levels(16); // Limit recursion depth
-
-        // Create scope with results array
-        let mut scope = Scope::new();
-
-        // Convert results to Rhai Dynamic array
-        let rhai_results: Array = results
-            .iter()
-            .map(|r| json_to_dynamic(&r.to_json()))
-            .collect();
-
-        scope.push("results", rhai_results);
-        scope.push_constant("stream_id", ctx.stream_id.clone());
-
-        if let Some(api_key) = &ctx.api_key {
-            scope.push_constant("api_key", api_key.clone());
-        }
-        if let Some(api_key_id) = &ctx.api_key_id {
-            scope.push_constant("api_key_id", api_key_id.clone());
-        }
-
         info!(
             node_id = %self.id,
             script_len = script.len(),
@@ -429,17 +447,51 @@ impl JoinNode {
             "Evaluating merge script"
         );
 
-        // Compile and evaluate the merge script
-        let ast = engine
-            .compile(script)
-            .map_err(|e| DAGError::ExpressionCompilationError {
-                expression: script.to_string(),
-                error: e.to_string(),
+        // Snapshot inputs to move into the blocking eval task.
+        let script_owned = script.to_string();
+        let node_id = self.id.clone();
+        let results_json: Vec<serde_json::Value> = results.iter().map(|r| r.to_json()).collect();
+        let stream_id = ctx.stream_id.clone();
+        let api_key = ctx.api_key.clone();
+        let api_key_id = ctx.api_key_id.clone();
+
+        // Evaluate on a blocking thread with a hard wall-clock deadline so a
+        // runaway merge script cannot stall the async runtime (W-O3 bug #5).
+        let result: Dynamic = eval_rhai_blocking(move || {
+            let deadline = std::time::Instant::now() + RHAI_EVAL_WALL_CLOCK;
+
+            let mut engine = create_rhai_engine();
+            engine.set_allow_looping(true);
+            engine.set_max_operations(1_000);
+            engine.set_max_call_levels(16);
+            install_wall_clock_deadline(&mut engine, deadline);
+
+            let mut scope = Scope::new();
+            let rhai_results: Array = results_json.iter().map(json_to_dynamic).collect();
+            scope.push("results", rhai_results);
+            scope.push_constant("stream_id", stream_id);
+            if let Some(api_key) = api_key {
+                scope.push_constant("api_key", api_key);
+            }
+            if let Some(api_key_id) = api_key_id {
+                scope.push_constant("api_key_id", api_key_id);
+            }
+
+            let ast = engine.compile(&script_owned).map_err(|e| {
+                DAGError::ExpressionCompilationError {
+                    expression: script_owned.clone(),
+                    error: e.to_string(),
+                }
             })?;
 
-        let result = engine
-            .eval_ast_with_scope::<Dynamic>(&mut scope, &ast)
-            .map_err(|e| DAGError::ConditionError(format!("Merge script failed: {}", e)))?;
+            engine
+                .eval_ast_with_scope::<Dynamic>(&mut scope, &ast)
+                .map_err(|e| DAGError::ConditionError(format!("Merge script failed: {}", e)))
+        })
+        .await
+        .map_err(|e| {
+            DAGError::ConditionError(format!("Join '{}' merge evaluation: {}", node_id, e))
+        })??;
 
         // Convert result to DAGData
         if let Some(s) = result.clone().try_cast::<String>() {
@@ -455,7 +507,7 @@ impl JoinNode {
             return Ok(DAGData::Json(serde_json::json!(b)));
         }
         if let Some(arr) = result.clone().try_cast::<Array>() {
-            let json_arr: Vec<serde_json::Value> = arr.iter().map(|d| dynamic_to_json(d)).collect();
+            let json_arr: Vec<serde_json::Value> = arr.iter().map(dynamic_to_json).collect();
             return Ok(DAGData::Json(serde_json::json!(json_arr)));
         }
         if let Some(map) = result.clone().try_cast::<rhai::Map>() {
@@ -643,10 +695,10 @@ impl RouterNode {
                 continue; // Skip default routes in first pass
             }
 
-            if let Some(ref condition) = route.condition {
-                if evaluator.evaluate(condition, data, ctx)? {
-                    return Ok(Some(&route.target));
-                }
+            if let Some(ref condition) = route.condition
+                && evaluator.evaluate(condition, data, ctx)?
+            {
+                return Ok(Some(&route.target));
             }
             // Routes without conditions and not default are skipped
             // (they should have conditions to be useful)
@@ -794,10 +846,66 @@ mod tests {
         let mut ctx = DAGContext::new("test");
         let input = DAGData::Text("test".into());
 
-        let output = node.execute(input, &mut ctx).await.unwrap();
+        let _output = node.execute(input, &mut ctx).await.unwrap();
         assert_eq!(
             ctx.metadata.get("router_target"),
             Some(&"default_handler".to_string())
+        );
+    }
+
+    // ── W-O3 bug #5: runaway Rhai script is killed by the wall-clock guard ──
+
+    /// An infinite-loop merge script must be terminated (not hang the runtime)
+    /// and the whole `execute` call must return promptly with an error.
+    #[tokio::test]
+    async fn test_infinite_loop_merge_script_killed_by_wall_clock() {
+        let node = JoinNode::all("join", vec!["a".into(), "b".into()])
+            .with_merge_script("let x = 0; loop { x += 1; }");
+        // Force the Merge strategy with the infinite-loop script.
+        let node = JoinNode {
+            strategy: JoinStrategy::Merge,
+            ..node
+        };
+
+        let mut ctx = DAGContext::new("test");
+        let input = DAGData::Multiple(vec![DAGData::Text("a".into()), DAGData::Text("b".into())]);
+
+        let start = std::time::Instant::now();
+        let result = node.execute(input, &mut ctx).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            result.is_err(),
+            "infinite-loop merge script must produce an error, got {:?}",
+            result.map(|d| d.type_name())
+        );
+        // The combined op-limit + wall-clock + spawn_blocking guard must bound
+        // the runtime well under any reasonable test budget.
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "runaway script should be killed quickly, took {:?}",
+            elapsed
+        );
+    }
+
+    /// A valid selector must still evaluate correctly through the new
+    /// spawn_blocking path (regression guard for the refactor).
+    #[tokio::test]
+    async fn test_selector_best_still_works() {
+        let node = JoinNode::new("join", vec!["a".into(), "b".into()], JoinStrategy::Best)
+            .with_selector("max_by_field(results, \"confidence\")");
+
+        let mut ctx = DAGContext::new("test");
+        let input = DAGData::Multiple(vec![
+            DAGData::Json(serde_json::json!({"text": "low", "confidence": 0.2})),
+            DAGData::Json(serde_json::json!({"text": "high", "confidence": 0.9})),
+        ]);
+
+        let output = node.execute(input, &mut ctx).await.unwrap();
+        let json = output.to_json();
+        assert_eq!(
+            json["text"], "high",
+            "selector should pick highest confidence"
         );
     }
 }

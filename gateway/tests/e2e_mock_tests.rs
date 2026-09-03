@@ -11,8 +11,6 @@ use axum::{Router, body::Body, http::Request};
 use serde_json::{Value, json};
 use tokio::time::timeout;
 use tower::util::ServiceExt;
-use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use waav_gateway::{
     ServerConfig,
@@ -38,6 +36,15 @@ fn create_test_config(port: u16) -> ServerConfig {
         azure_speech_region: None,
         cartesia_api_key: None,
         openai_api_key: Some("test_openai_key".to_string()),
+        azure_openai_api_key: None,
+        azure_openai_endpoint: None,
+        grok_api_key: None,
+        inworld_api_key: None,
+        gemini_api_key: None,
+        ultravox_api_key: None,
+        speechmatics_api_key: None,
+        yandex_api_key: None,
+        yandex_folder_id: None,
         assemblyai_api_key: None,
         hume_api_key: None,
         lmnt_api_key: None,
@@ -72,11 +79,13 @@ fn create_test_config(port: u16) -> ServerConfig {
         rate_limit_burst_size: 100,
         max_websocket_connections: None,
         max_connections_per_ip: 1000,
-            ws_processing_timeout_secs: 10,
-            realtime_processing_timeout_secs: 30,
-            sip_max_participants: 3,
+        ws_processing_timeout_secs: 10,
+        realtime_processing_timeout_secs: 30,
+        sip_max_participants: 3,
+        realtime_endpoint_overrides: Default::default(),
         plugins: PluginConfig::default(),
         dag_timeouts: DAGTimeoutsConfig::default(),
+        aliases: Default::default(),
     }
 }
 
@@ -116,8 +125,9 @@ async fn test_e2e_health_check() {
         .unwrap();
     let json: Value = serde_json::from_slice(&body).unwrap();
 
-    // Health check response has status field
-    assert_eq!(json["status"], "OK");
+    // Health check response has status field (lowercase "ok" — W-C1 liveness contract,
+    // matching the CI smoke grep and the /livez endpoint).
+    assert_eq!(json["status"], "ok");
 }
 
 /// Test the speak endpoint validates input correctly
@@ -404,11 +414,12 @@ async fn test_e2e_concurrent_health_checks() {
         .collect();
 
     let mut success_count = 0;
-    for task in tasks {
-        if let Ok(status) = task.await {
-            if status == axum::http::StatusCode::OK {
-                success_count += 1;
-            }
+    for (client_id, task) in tasks.into_iter().enumerate() {
+        let status = task
+            .await
+            .unwrap_or_else(|err| panic!("health-check task {client_id} panicked: {err}"));
+        if status == axum::http::StatusCode::OK {
+            success_count += 1;
         }
     }
 

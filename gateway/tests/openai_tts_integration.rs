@@ -9,11 +9,65 @@
 //! Note: Tests requiring actual API calls are marked with #[ignore]
 //! and require OPENAI_API_KEY environment variable.
 
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use futures::FutureExt;
+use tokio::task::JoinHandle;
 use waav_gateway::core::tts::{
     AudioCallback, AudioData, BaseTTS, ConnectionState, OPENAI_TTS_URL, OpenAITTS, OpenAITTSModel,
     OpenAIVoice, TTSConfig, TTSError, create_tts_provider, get_tts_provider_urls,
 };
+
+struct TestServer {
+    label: &'static str,
+    handle: JoinHandle<()>,
+    panicked: Arc<AtomicBool>,
+}
+
+impl Drop for TestServer {
+    fn drop(&mut self) {
+        if !self.handle.is_finished() {
+            self.handle.abort();
+        }
+        if self.panicked.load(Ordering::SeqCst) {
+            let msg = format!("OpenAI TTS test server '{}' panicked", self.label);
+            if std::thread::panicking() {
+                eprintln!("{msg}");
+            } else {
+                panic!("{msg}");
+            }
+        }
+    }
+}
+
+fn spawn_test_server<F>(label: &'static str, future: F) -> TestServer
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let panicked = Arc::new(AtomicBool::new(false));
+    let panicked_in_task = Arc::clone(&panicked);
+    let handle = tokio::spawn(async move {
+        if AssertUnwindSafe(future).catch_unwind().await.is_err() {
+            panicked_in_task.store(true, Ordering::SeqCst);
+            eprintln!("OpenAI TTS test server '{label}' panicked");
+        }
+    });
+    TestServer {
+        label,
+        handle,
+        panicked,
+    }
+}
+
+/// Binary-wide lock serializing every test span that SETS or DEPENDS ON `OPENAI_BASE_URL`
+/// (env vars are process-global). Poison-tolerant.
+fn openai_base_url_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// Test that OpenAI is included in supported providers
 #[test]
@@ -26,6 +80,9 @@ fn test_openai_in_tts_provider_urls() {
 /// Test provider creation via string name
 #[tokio::test]
 async fn test_create_openai_tts_provider_by_name() {
+    // Serialize vs the OPENAI_BASE_URL/loopback override window (readers take the same
+    // lock as the setter — the env-race rule).
+    let _env = openai_base_url_env_lock();
     let config = TTSConfig {
         provider: "openai".to_string(),
         api_key: "test-api-key".to_string(),
@@ -46,6 +103,9 @@ async fn test_create_openai_tts_provider_by_name() {
 /// Test case-insensitive provider name parsing
 #[tokio::test]
 async fn test_openai_tts_provider_name_case_insensitive() {
+    // Serialize vs the OPENAI_BASE_URL/loopback override window (readers take the same
+    // lock as the setter — the env-race rule).
+    let _env = openai_base_url_env_lock();
     let config = TTSConfig {
         provider: "openai".to_string(),
         api_key: "test-api-key".to_string(),
@@ -61,6 +121,9 @@ async fn test_openai_tts_provider_name_case_insensitive() {
 /// Test model configuration
 #[tokio::test]
 async fn test_openai_tts_model_configuration() {
+    // Serialize vs the OPENAI_BASE_URL/loopback override window (readers take the same
+    // lock as the setter — the env-race rule).
+    let _env = openai_base_url_env_lock();
     // Test tts-1 model
     let config = TTSConfig {
         api_key: "test-api-key".to_string(),
@@ -92,6 +155,9 @@ async fn test_openai_tts_model_configuration() {
 /// Test voice configuration
 #[tokio::test]
 async fn test_openai_tts_voice_configuration() {
+    // Serialize vs the OPENAI_BASE_URL/loopback override window (readers take the same
+    // lock as the setter — the env-race rule).
+    let _env = openai_base_url_env_lock();
     let voices = [
         ("alloy", OpenAIVoice::Alloy),
         ("ash", OpenAIVoice::Ash),
@@ -125,6 +191,9 @@ async fn test_openai_tts_voice_configuration() {
 /// Test speed/speaking rate clamping
 #[tokio::test]
 async fn test_openai_tts_speed_clamping() {
+    // Serialize vs the OPENAI_BASE_URL/loopback override window (readers take the same
+    // lock as the setter — the env-race rule).
+    let _env = openai_base_url_env_lock();
     // Test speed below minimum (should clamp to 0.25)
     let config = TTSConfig {
         api_key: "test-api-key".to_string(),
@@ -188,6 +257,9 @@ fn test_openai_tts_provider_info() {
 /// Test callback registration (without connection)
 #[tokio::test]
 async fn test_openai_tts_callback_registration() {
+    // Serialize vs the OPENAI_BASE_URL/loopback override window (readers take the same
+    // lock as the setter — the env-race rule).
+    let _env = openai_base_url_env_lock();
     let config = TTSConfig {
         api_key: "test-api-key".to_string(),
         ..Default::default()
@@ -359,4 +431,158 @@ async fn test_openai_tts_hd_model() {
     assert_eq!(tts.voice(), OpenAIVoice::Shimmer);
 
     // Just verify creation, actual API test above
+}
+
+/// REAL live end-to-end synthesis round-trip against a local OpenAI-compatible speech server.
+///
+/// The synthesis counterpart of `test_openai_stt_local_server_roundtrip`: it runs in the default
+/// suite (no `#[ignore]`), stands up a real `POST /v1/audio/speech` server, points the WaaV OpenAI
+/// TTS provider at it via the standard `OPENAI_BASE_URL` override, and drives the *actual* provider
+/// pipeline (`connect` → `on_audio` → `speak` → dispatcher/queue worker → audio callback). It
+/// validates the real wire path — JSON request body, `Authorization: Bearer` header, the HTTP POST,
+/// and streaming the response bytes back through `AudioCallback` — with NO paid credentials.
+#[tokio::test]
+async fn test_openai_tts_local_server_roundtrip() {
+    use axum::{Router, extract::State, http::HeaderMap, routing::post};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::net::TcpListener;
+    use tokio::sync::mpsc;
+    use tokio::time::{Duration, timeout};
+
+    // 16 KB of valid s16le PCM "audio" the server will return as the synthesized speech.
+    fn fake_pcm() -> Vec<u8> {
+        let mut v = Vec::with_capacity(8000 * 2);
+        for i in 0..8000u32 {
+            let s = (((i as f32) * 0.04).sin() * 9000.0) as i16;
+            v.extend_from_slice(&s.to_le_bytes());
+        }
+        v
+    }
+
+    #[derive(Default)]
+    struct SrvState {
+        saw_bearer: AtomicBool,
+        saw_json_body: AtomicBool,
+    }
+
+    async fn speak_handler(
+        State(st): State<Arc<SrvState>>,
+        headers: HeaderMap,
+        body: bytes::Bytes,
+    ) -> Vec<u8> {
+        if headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|s| s.starts_with("Bearer "))
+        {
+            st.saw_bearer.store(true, Ordering::SeqCst);
+        }
+        // The OpenAI speech contract is a JSON body containing the input text + voice/model.
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&body)
+            && v.get("input").is_some()
+            && v.get("voice").is_some()
+        {
+            st.saw_json_body.store(true, Ordering::SeqCst);
+        }
+        fake_pcm()
+    }
+
+    let state = Arc::new(SrvState::default());
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind local server");
+    let addr = listener.local_addr().expect("local_addr");
+    let app = Router::new()
+        .route("/v1/audio/speech", post(speak_handler))
+        .with_state(state.clone());
+    let _server = spawn_test_server("local_speech", async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+
+    // SAFETY (edition 2024): set/remove_var are unsafe BECAUSE the process environment is a
+    // shared mutable global (glibc getenv/setenv race across threads) and sibling tests in this
+    // binary construct providers that READ OPENAI_BASE_URL. Hold a binary-wide lock for the whole
+    // set→drive→remove span (the PR#2 review finding).
+    let _env_guard = openai_base_url_env_lock();
+    // The endpoint-override SSRF validation (creation-time) rejects loopback URLs by default;
+    // WAAV_ALLOW_LOOPBACK_ENDPOINTS=1 is the sanctioned escape for exactly this in-process
+    // mock-server case (see core::net) — set/removed inside the same lock span.
+    unsafe { std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1") };
+    unsafe { std::env::set_var("OPENAI_BASE_URL", format!("http://{addr}")) };
+
+    let config = TTSConfig {
+        provider: "openai".to_string(),
+        api_key: "local-test-key".to_string(),
+        voice_id: Some("nova".to_string()),
+        model: "tts-1".to_string(),
+        audio_format: Some("pcm".to_string()),
+        ..Default::default()
+    };
+    let mut tts = OpenAITTS::new(config).expect("create OpenAI TTS");
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<usize>();
+    struct CaptureCallback(mpsc::UnboundedSender<usize>);
+    impl AudioCallback for CaptureCallback {
+        fn on_audio(
+            &self,
+            audio: AudioData,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            let n = audio.data.len();
+            let tx = self.0.clone();
+            Box::pin(async move {
+                let _ = tx.send(n);
+            })
+        }
+        fn on_error(
+            &self,
+            _error: TTSError,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            Box::pin(async move {})
+        }
+        fn on_complete(
+            &self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            Box::pin(async move {})
+        }
+    }
+    tts.on_audio(Arc::new(CaptureCallback(tx)))
+        .expect("register audio callback");
+
+    tts.connect().await.expect("connect");
+    assert!(tts.is_ready());
+
+    timeout(Duration::from_secs(10), tts.speak("Hello from WaaV.", true))
+        .await
+        .expect("speak timed out")
+        .expect("speak failed");
+
+    // Audio is delivered asynchronously by the dispatcher/queue worker via the callback.
+    let total: usize = {
+        let mut acc = 0usize;
+        // Collect whatever chunks arrive within the window.
+        while let Ok(Some(n)) = timeout(Duration::from_secs(5), rx.recv()).await {
+            acc += n;
+            if acc > 0 {
+                break;
+            }
+        }
+        acc
+    };
+
+    tts.disconnect().await.expect("disconnect");
+    unsafe { std::env::remove_var("OPENAI_BASE_URL") };
+    unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
+
+    assert!(
+        total > 0,
+        "the provider must stream synthesized audio bytes back through AudioCallback"
+    );
+    assert!(
+        state.saw_bearer.load(Ordering::SeqCst),
+        "the provider must send an Authorization: Bearer header"
+    );
+    assert!(
+        state.saw_json_body.load(Ordering::SeqCst),
+        "the provider must POST a JSON body with input+voice (OpenAI speech contract)"
+    );
 }

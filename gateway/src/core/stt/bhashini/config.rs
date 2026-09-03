@@ -25,6 +25,15 @@
 use super::super::base::STTConfig;
 use serde::{Deserialize, Serialize};
 
+fn validate_bhashini_stt_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -465,8 +474,20 @@ pub struct BhashiniSttConfig {
     /// Custom callback URL (overrides pipeline config response).
     pub custom_callback_url: Option<String>,
 
+    /// Source script code (ULCA `sourceScriptCode`, ISO-15924). When set, the ASR
+    /// pipeline-config request asks for output transliterated into this script
+    /// (e.g. `"Latn"` for Latin script). Carried via the standardized extras passthrough.
+    pub source_script_code: Option<String>,
+
+    /// ASR post-processors (ULCA `postProcessors`, e.g. `["itn"]` for inverse text
+    /// normalization). Applied server-side to the recognized text. Carried via extras.
+    pub post_processors: Option<Vec<String>>,
+
     /// Maximum audio buffer size in bytes.
     pub max_buffer_size: usize,
+
+    /// Test-only base-URL override for the pipeline CONFIG POST (scheme+host swap; path/query kept).
+    pub endpoint_override: Option<String>,
 }
 
 impl Default for BhashiniSttConfig {
@@ -481,7 +502,10 @@ impl Default for BhashiniSttConfig {
             pipeline_provider: BhashiniPipelineProvider::default(),
             custom_service_id: None,
             custom_callback_url: None,
+            source_script_code: None,
+            post_processors: None,
             max_buffer_size: MAX_AUDIO_SIZE_BYTES,
+            endpoint_override: None,
         }
     }
 }
@@ -549,11 +573,62 @@ impl BhashiniSttConfig {
             pipeline_provider,
             custom_service_id: None,
             custom_callback_url: None,
+            source_script_code: None,
+            post_processors: None,
             max_buffer_size: MAX_AUDIO_SIZE_BYTES,
+            endpoint_override: None,
         };
 
         config.validate()?;
         Ok(config)
+    }
+
+    /// Build from the standardized config (W1 keystone). None of the *typed* `SttFeatures`
+    /// (interim_results, diarization, word_timestamps, smart_format, profanity_filter,
+    /// filler_words, vad_events, endpointing, utterance_end, keyterms, redaction,
+    /// entity_detection, language_detection) maps to a real Bhashini knob — those stay at
+    /// provider defaults (capability gaps for a batch ULCA ASR pipeline).
+    ///
+    /// Two genuinely Bhashini-specific ULCA pipeline knobs that DO exist are carried through the
+    /// open [`ProviderExtras`] passthrough and reach `pipelineTasks[].config` on the wire:
+    /// - `sourceScriptCode` (ISO-15924) → `config.language.sourceScriptCode`
+    /// - `postProcessors` (e.g. `["itn"]`) → `config.postProcessors`
+    ///
+    /// snake_case aliases (`source_script_code`, `post_processors`) are also accepted.
+    pub fn from_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, String> {
+        let mut cfg = Self::from_base(std.base.clone())?;
+        let extras = &std.extras.0;
+
+        if let Some(code) = extras
+            .get("sourceScriptCode")
+            .or_else(|| extras.get("source_script_code"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            cfg.source_script_code = Some(code.to_string());
+        }
+
+        if let Some(arr) = extras
+            .get("postProcessors")
+            .or_else(|| extras.get("post_processors"))
+            .and_then(|v| v.as_array())
+        {
+            let procs: Vec<String> = arr
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect();
+            if !procs.is_empty() {
+                cfg.post_processors = Some(procs);
+            }
+        }
+
+        cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
+
+        cfg.validate()?;
+
+        Ok(cfg)
     }
 
     /// Validate the configuration.
@@ -571,6 +646,10 @@ impl BhashiniSttConfig {
                 "Sample rate must be at least {} Hz, got {}",
                 MIN_SAMPLE_RATE, self.sample_rate
             ));
+        }
+
+        if let Some(endpoint) = &self.endpoint_override {
+            validate_bhashini_stt_endpoint("endpoint_override", endpoint)?;
         }
 
         Ok(())
@@ -603,6 +682,104 @@ impl BhashiniSttConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone: Bhashini maps zero standardized features (batch ULCA provider with no advanced
+    // knobs), so from_standard is a pure from_base passthrough — assert it succeeds and the base
+    // credentials (parsed from api_key) carry through unchanged.
+    #[test]
+    fn from_standard_passthrough_carries_base() {
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "bhashini".into(),
+                api_key: "user123|apikey456".into(),
+                language: "hi".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                // None of these can map to a real Bhashini field; they must be ignored.
+                diarization: Some(true),
+                word_timestamps: Some(true),
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+            translation: None,
+        };
+        let cfg = BhashiniSttConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.user_id, "user123");
+        assert_eq!(cfg.ulca_api_key, "apikey456");
+        assert_eq!(cfg.language, BhashiniLanguage::Hindi);
+        // No extras -> advanced knobs stay unset.
+        assert!(cfg.source_script_code.is_none());
+        assert!(cfg.post_processors.is_none());
+    }
+
+    // WIRE-LEVEL (end-to-end): the standardized extras (`sourceScriptCode`, `postProcessors`)
+    // map onto the Bhashini config AND reach the serialized pipeline-config request body — the
+    // same `PipelineConfigRequest::new_asr_with` call the live `fetch_pipeline_config` makes.
+    #[test]
+    fn extras_reach_pipeline_config_request_body() {
+        use super::super::messages::PipelineConfigRequest;
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig};
+
+        let mut extras = serde_json::Map::new();
+        extras.insert("sourceScriptCode".into(), serde_json::json!("Latn"));
+        extras.insert("postProcessors".into(), serde_json::json!(["itn"]));
+
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "bhashini".into(),
+                api_key: "user123|apikey456".into(),
+                language: "hi".into(),
+                ..Default::default()
+            },
+            features: Default::default(),
+            extras: ProviderExtras(extras),
+            translation: None,
+        };
+        let cfg = BhashiniSttConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.source_script_code.as_deref(), Some("Latn"));
+        assert_eq!(cfg.post_processors, Some(vec!["itn".to_string()]));
+
+        // Build the actual request the client sends and assert the wire body.
+        let request = PipelineConfigRequest::new_asr_with(
+            cfg.language.as_code(),
+            cfg.pipeline_id(),
+            cfg.source_script_code.clone(),
+            cfg.post_processors.clone(),
+        );
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(
+            json.contains("\"sourceScriptCode\":\"Latn\""),
+            "sourceScriptCode missing from request body: {json}"
+        );
+        assert!(
+            json.contains("\"postProcessors\":[\"itn\"]"),
+            "postProcessors missing from request body: {json}"
+        );
+    }
+
+    // snake_case aliases are also accepted (ergonomic passthrough).
+    #[test]
+    fn from_standard_accepts_snake_case_extras() {
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig};
+        let mut extras = serde_json::Map::new();
+        extras.insert("source_script_code".into(), serde_json::json!("Deva"));
+        extras.insert("post_processors".into(), serde_json::json!(["itn"]));
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                api_key: "u|k".into(),
+                language: "hi".into(),
+                ..Default::default()
+            },
+            features: Default::default(),
+            extras: ProviderExtras(extras),
+            translation: None,
+        };
+        let cfg = BhashiniSttConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.source_script_code.as_deref(), Some("Deva"));
+        assert_eq!(cfg.post_processors, Some(vec!["itn".to_string()]));
+    }
 
     #[test]
     fn test_language_codes() {
@@ -770,6 +947,31 @@ mod tests {
 
         config.sample_rate = 1000;
         assert!(config.validate().is_err()); // Below minimum
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = BhashiniSttConfig {
+            user_id: "user123".to_string(),
+            ulca_api_key: "apikey456".to_string(),
+            ..Default::default()
+        };
+
+        config.endpoint_override = Some("https://bhashini-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.contains("SSRF protection"), "{err}");
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("non-HTTP endpoint_override must be rejected");
+        assert!(err.contains("SSRF protection"), "{err}");
     }
 
     #[test]

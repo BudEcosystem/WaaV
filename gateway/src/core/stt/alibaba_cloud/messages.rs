@@ -79,12 +79,16 @@ pub struct QwenTurnDetection {
 
 impl QwenSessionUpdate {
     /// Create a new session update.
+    ///
+    /// `threshold` is the server-VAD speech-activation threshold (0.0–1.0). `None` keeps the
+    /// previous default sensitivity (0.5); `Some(v)` sends the caller's value on the wire.
     pub fn new(
         language: &str,
         sample_rate: u32,
         audio_format: &str,
         silence_duration_ms: u32,
         turn_detection_type: &str,
+        threshold: Option<f32>,
     ) -> Self {
         Self {
             msg_type: "session.update".to_string(),
@@ -98,7 +102,7 @@ impl QwenSessionUpdate {
                 turn_detection: Some(QwenTurnDetection {
                     detection_type: turn_detection_type.to_string(),
                     silence_duration_ms: Some(silence_duration_ms),
-                    threshold: Some(0.5),
+                    threshold: Some(threshold.unwrap_or(0.5)),
                 }),
             },
         }
@@ -371,6 +375,11 @@ pub struct ParaformerParameters {
     /// Enable inverse text normalization.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inverse_text_normalization_enabled: Option<bool>,
+
+    /// Enable VAD multi-threshold mode (prevents over-segmentation of long sentences).
+    /// Omitted from the wire when `None` (server default).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub multi_threshold_mode_enabled: Option<bool>,
 }
 
 /// Complete Paraformer run-task request.
@@ -385,6 +394,12 @@ pub struct ParaformerRunTask {
 
 impl ParaformerRunTask {
     /// Create a new run-task request.
+    ///
+    /// `multi_threshold_mode_enabled` is the VAD multi-threshold knob: `Some(true)` requests it,
+    /// `None` omits the field (server default), preventing over-segmentation of long sentences.
+    /// `vocabulary_id` is DashScope's hotword/biasing mechanism — a PRE-REGISTERED vocabulary id
+    /// (not free text); `None` omits it. `max_sentence_silence` is the VAD endpointing silence (ms).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         model: &str,
         format: &str,
@@ -392,6 +407,9 @@ impl ParaformerRunTask {
         language: &str,
         disfluency_removal: bool,
         punctuation: bool,
+        multi_threshold_mode_enabled: Option<bool>,
+        vocabulary_id: Option<String>,
+        max_sentence_silence: u32,
     ) -> Self {
         Self {
             header: ParaformerHeader {
@@ -408,7 +426,7 @@ impl ParaformerRunTask {
                 parameters: ParaformerParameters {
                     format: format.to_string(),
                     sample_rate,
-                    vocabulary_id: None,
+                    vocabulary_id,
                     disfluency_removal_enabled: Some(disfluency_removal),
                     language_hints: if language != "auto" {
                         Some(vec![language.to_string()])
@@ -416,10 +434,11 @@ impl ParaformerRunTask {
                         None
                     },
                     semantic_punctuation_enabled: Some(punctuation),
-                    max_sentence_silence: Some(800),
+                    max_sentence_silence: Some(max_sentence_silence),
                     punctuation_prediction_enabled: Some(punctuation),
                     heartbeat: Some(true),
                     inverse_text_normalization_enabled: Some(true),
+                    multi_threshold_mode_enabled,
                 },
             },
         }
@@ -703,12 +722,30 @@ mod tests {
     // Qwen format tests
     #[test]
     fn test_qwen_session_update() {
-        let msg = QwenSessionUpdate::new("zh", 16000, "pcm16", 400, "server_vad");
+        let msg = QwenSessionUpdate::new("zh", 16000, "pcm16", 400, "server_vad", None);
         let json = msg.to_json().unwrap();
 
         assert!(json.contains("session.update"));
         assert!(json.contains("pcm16"));
         assert!(json.contains("server_vad"));
+    }
+
+    // WIRE-LEVEL: the server-VAD speech-activation threshold (Qwen realtime) must land in the
+    // serialized session.update body under turn_detection.threshold — not merely on the struct.
+    #[test]
+    fn test_qwen_session_update_threshold_reaches_body() {
+        // None => the previous default (0.5) is emitted.
+        let default_msg = QwenSessionUpdate::new("zh", 16000, "pcm16", 400, "server_vad", None);
+        let v: Value = serde_json::from_str(&default_msg.to_json().unwrap()).unwrap();
+        assert_eq!(v["session"]["turn_detection"]["threshold"], 0.5);
+
+        // Some(0.8) => the caller's value reaches the body.
+        let msg = QwenSessionUpdate::new("zh", 16000, "pcm16", 400, "server_vad", Some(0.8));
+        let v: Value = serde_json::from_str(&msg.to_json().unwrap()).unwrap();
+        let thr = v["session"]["turn_detection"]["threshold"]
+            .as_f64()
+            .unwrap();
+        assert!((thr - 0.8).abs() < 1e-6, "threshold not on wire: {v}");
     }
 
     #[test]
@@ -780,13 +817,64 @@ mod tests {
     // Paraformer format tests
     #[test]
     fn test_paraformer_run_task() {
-        let msg = ParaformerRunTask::new("paraformer-realtime-v2", "pcm", 16000, "zh", true, true);
+        let msg = ParaformerRunTask::new(
+            "paraformer-realtime-v2",
+            "pcm",
+            16000,
+            "zh",
+            true,
+            true,
+            None,
+            None,
+            800,
+        );
         let json = msg.to_json().unwrap();
 
         assert!(json.contains("run-task"));
         assert!(json.contains("paraformer-realtime-v2"));
         assert!(json.contains("asr"));
         assert!(!msg.task_id().is_empty());
+    }
+
+    // WIRE-LEVEL: VAD multi-threshold mode (prevent over-segmentation of long sentences) must land
+    // in the serialized run-task body under parameters.multi_threshold_mode_enabled.
+    #[test]
+    fn test_paraformer_run_task_multi_threshold_reaches_body() {
+        // None => the field is omitted entirely (skip_serializing_if).
+        let off = ParaformerRunTask::new(
+            "paraformer-realtime-v2",
+            "pcm",
+            16000,
+            "zh",
+            true,
+            true,
+            None,
+            None,
+            800,
+        );
+        let json_off = off.to_json().unwrap();
+        assert!(
+            !json_off.contains("multi_threshold_mode_enabled"),
+            "field leaked when None: {json_off}"
+        );
+
+        // Some(true) => the param reaches the body with value true.
+        let on = ParaformerRunTask::new(
+            "paraformer-realtime-v2",
+            "pcm",
+            16000,
+            "zh",
+            true,
+            true,
+            Some(true),
+            None,
+            800,
+        );
+        let v: Value = serde_json::from_str(&on.to_json().unwrap()).unwrap();
+        assert_eq!(
+            v["payload"]["parameters"]["multi_threshold_mode_enabled"], true,
+            "multi_threshold_mode_enabled not on wire: {v}"
+        );
     }
 
     #[test]

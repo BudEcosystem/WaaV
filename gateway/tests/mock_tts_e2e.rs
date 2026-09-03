@@ -1,0 +1,1408 @@
+//! Credential-free END-TO-END integration for TTS providers via `endpoint_override` + a local mock.
+//!
+//! Mirrors `mock_endpoint_e2e.rs` (the STT harness) for the TTS modality: drive the REAL provider
+//! through the full loop — `create_tts_standard` → `connect()` → `speak(text)` → the provider's HTTP
+//! synth request → response audio bytes → `on_audio` callback — against an in-repo mock, no key. The
+//! audio output is the dual of STT's transcript: the test asserts non-empty audio bytes surface.
+//!
+//! Run with `--test-threads=1` (the OpenAI case sets `OPENAI_BASE_URL`, a process-global env var).
+
+use futures_util::FutureExt;
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Once};
+use std::time::Duration;
+use tokio::task::JoinHandle;
+
+use waav_gateway::core::tts::standard::{StandardTTSConfig, create_tts_standard};
+use waav_gateway::core::tts::{AudioCallback, AudioData, BaseTTS, TTSConfig, TTSError};
+
+fn ensure_crypto() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
+fn allow_loopback_endpoint_mocks() {
+    static SET_LOOPBACK_ENV: Once = Once::new();
+    SET_LOOPBACK_ENV.call_once(|| {
+        // SAFETY: integration-test process setup, performed once before mock endpoint validation.
+        unsafe { std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1") };
+    });
+}
+
+/// An `AudioCallback` that accumulates the total number of audio bytes surfaced by the provider.
+struct CaptureAudio {
+    total: Arc<AtomicUsize>,
+}
+
+impl AudioCallback for CaptureAudio {
+    fn on_audio(&self, audio: AudioData) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        let total = self.total.clone();
+        Box::pin(async move {
+            total.fetch_add(audio.data.len(), Ordering::SeqCst);
+        })
+    }
+    fn on_error(&self, _error: TTSError) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async {})
+    }
+    fn on_complete(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async {})
+    }
+}
+
+/// Drive a TTS provider: register an audio sink, connect, speak, flush, wait, disconnect; return the
+/// total audio bytes the provider surfaced via `on_audio`.
+async fn drive_tts(tts: &mut dyn BaseTTS) -> usize {
+    let total = Arc::new(AtomicUsize::new(0));
+    tts.on_audio(Arc::new(CaptureAudio {
+        total: total.clone(),
+    }))
+    .unwrap();
+    tts.connect()
+        .await
+        .expect("connect TTS provider to mock endpoint");
+    tts.speak("hello world", true).await.expect("speak");
+    tts.flush()
+        .await
+        .expect("flush TTS provider after mock synthesis");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    tts.disconnect()
+        .await
+        .expect("disconnect TTS provider from mock endpoint");
+    total.load(Ordering::SeqCst)
+}
+
+struct ConnectFailTts {
+    speak_called: Arc<AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl BaseTTS for ConnectFailTts {
+    fn new(_config: TTSConfig) -> Result<Self, TTSError>
+    where
+        Self: Sized,
+    {
+        Ok(Self {
+            speak_called: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    async fn connect(&mut self) -> Result<(), TTSError> {
+        Err(TTSError::ConnectionFailed(
+            "injected connect failure".into(),
+        ))
+    }
+
+    async fn disconnect(&mut self) -> Result<(), TTSError> {
+        Ok(())
+    }
+
+    async fn speak(&mut self, _text: &str, _flush: bool) -> Result<(), TTSError> {
+        self.speak_called.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn flush(&self) -> Result<(), TTSError> {
+        Ok(())
+    }
+
+    fn on_audio(&mut self, _callback: Arc<dyn AudioCallback>) -> Result<(), TTSError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn drive_tts_fails_fast_on_connect_error() {
+    let speak_called = Arc::new(AtomicBool::new(false));
+    let mut tts = ConnectFailTts {
+        speak_called: speak_called.clone(),
+    };
+
+    let result = AssertUnwindSafe(drive_tts(&mut tts)).catch_unwind().await;
+
+    assert!(
+        result.is_err(),
+        "drive_tts must fail the harness when provider connect fails"
+    );
+    assert!(
+        !speak_called.load(Ordering::SeqCst),
+        "drive_tts must not continue to speak after connect fails"
+    );
+}
+
+struct MockServer {
+    label: &'static str,
+    handle: JoinHandle<()>,
+    panicked: Arc<AtomicBool>,
+}
+
+impl Drop for MockServer {
+    fn drop(&mut self) {
+        if !self.handle.is_finished() {
+            self.handle.abort();
+        }
+        if self.panicked.load(Ordering::SeqCst) {
+            let msg = format!("mock_tts_e2e server '{}' panicked", self.label);
+            if std::thread::panicking() {
+                eprintln!("{msg}");
+            } else {
+                panic!("{msg}");
+            }
+        }
+    }
+}
+
+fn spawn_mock_server<F>(label: &'static str, future: F) -> MockServer
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    allow_loopback_endpoint_mocks();
+
+    let panicked = Arc::new(AtomicBool::new(false));
+    let panicked_in_task = Arc::clone(&panicked);
+    let handle = tokio::spawn(async move {
+        if AssertUnwindSafe(future).catch_unwind().await.is_err() {
+            panicked_in_task.store(true, Ordering::SeqCst);
+            eprintln!("mock_tts_e2e server '{label}' panicked");
+        }
+    });
+    MockServer {
+        label,
+        handle,
+        panicked,
+    }
+}
+
+/// Spawn an axum HTTP mock that returns `audio_bytes` (Content-Type `audio/mpeg`) on `path` AND on
+/// any other path via a fallback. The fallback frees each provider's synth POST from needing an
+/// exact route — some embed dynamic segments (Speechmatics `/generate/<voice>`) or punctuation
+/// (Yandex `/speech/v1/tts:synthesize`) that are awkward to register literally.
+async fn spawn_audio_mock(path: &'static str, audio_bytes: Vec<u8>) -> (u16, MockServer) {
+    use axum::{Router, http::header, routing::post};
+    use tokio::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let primary = audio_bytes.clone();
+    let fallback = audio_bytes.clone();
+    let app = Router::new()
+        .route(
+            path,
+            post(move || {
+                let bytes = primary.clone();
+                async move { ([(header::CONTENT_TYPE, "audio/mpeg")], bytes) }
+            }),
+        )
+        .fallback(move || {
+            let bytes = fallback.clone();
+            async move { ([(header::CONTENT_TYPE, "audio/mpeg")], bytes) }
+        });
+    let server = spawn_mock_server("audio_mock", async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (port, server)
+}
+
+/// Spawn a mock that returns a JSON body with base64-encoded audio under `key`, for providers that
+/// wrap synthesized audio in a JSON envelope (e.g. Gnani's `audioContent`) rather than streaming
+/// raw bytes. Served on every path via a fallback.
+async fn spawn_json_audio_mock(key: &'static str, audio_bytes: Vec<u8>) -> (u16, MockServer) {
+    use axum::{Json, Router};
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use tokio::net::TcpListener;
+    let b64 = STANDARD.encode(&audio_bytes);
+    let body = serde_json::json!({ key: b64 });
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let app = Router::new().fallback(move || {
+        let body = body.clone();
+        async move { Json(body) }
+    });
+    let server = spawn_mock_server("json_audio_mock", async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (port, server)
+}
+
+/// Spawn a mock for a two-step auth+synth TTS provider: `auth_path` returns the JSON token envelope
+/// `token_body` (shape varies per vendor — CereProc `{token}`, Baidu `{access_token,expires_in}`,
+/// Sber `{access_token,expires_at}`); every other path returns raw audio bytes. Used by providers
+/// that fetch a Bearer/OAuth token before synthesizing.
+async fn spawn_auth_then_audio_mock(
+    auth_path: &'static str,
+    token_body: serde_json::Value,
+    audio_bytes: Vec<u8>,
+) -> (u16, MockServer) {
+    use axum::{Json, Router, http::header, routing::post};
+    use tokio::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let app = Router::new()
+        .route(
+            auth_path,
+            post(move || {
+                let b = token_body.clone();
+                async move { Json(b) }
+            }),
+        )
+        .fallback(move || {
+            let bytes = audio_bytes.clone();
+            async move { ([(header::CONTENT_TYPE, "audio/mpeg")], bytes) }
+        });
+    let server = spawn_mock_server("auth_then_audio_mock", async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (port, server)
+}
+
+/// Spawn a mock that returns a fixed JSON `body` on every path. For providers whose synth response
+/// is a JSON envelope with base64 audio nested under vendor-specific keys (e.g. Tencent's
+/// `{"Response":{"Audio": ...}}`); build the body with the base64 audio embedded.
+async fn spawn_fixed_json_mock(body: serde_json::Value) -> (u16, MockServer) {
+    use axum::{Json, Router};
+    use tokio::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let app = Router::new().fallback(move || {
+        let body = body.clone();
+        async move { Json(body) }
+    });
+    let server = spawn_mock_server("fixed_json_mock", async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (port, server)
+}
+
+/// Spawn a mock for providers whose synth POST returns a JSON envelope containing a *download URL*
+/// the provider then GETs for the audio (FPT.AI `{"async": url}`, Zalo `{"data":{"url": url}}`). The
+/// mock builds the response body via `build_body(download_url)` pointing the URL at its own
+/// `/download` route (which serves the audio bytes), so the second-hop GET lands back on the mock.
+async fn spawn_audio_url_then_download_mock(
+    build_body: fn(String) -> serde_json::Value,
+    audio_bytes: Vec<u8>,
+) -> (u16, MockServer) {
+    use axum::{Json, Router, http::header, routing::get};
+    use tokio::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let body = build_body(format!("http://127.0.0.1:{port}/download"));
+    let app = Router::new()
+        .route(
+            "/download",
+            get(move || {
+                let bytes = audio_bytes.clone();
+                async move { ([(header::CONTENT_TYPE, "audio/mpeg")], bytes) }
+            }),
+        )
+        .fallback(move || {
+            let body = body.clone();
+            async move { Json(body) }
+        });
+    let server = spawn_mock_server("audio_url_then_download_mock", async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (port, server)
+}
+
+/// Spawn a mock for providers that authenticate first, then return a JSON envelope containing a
+/// provider-hosted audio URL from their synth endpoint.
+async fn spawn_auth_then_audio_url_download_mock(
+    auth_path: &'static str,
+    token_body: serde_json::Value,
+    build_body: fn(String) -> serde_json::Value,
+    audio_bytes: Vec<u8>,
+) -> (u16, MockServer) {
+    use axum::{Json, Router, http::header, routing::get, routing::post};
+    use tokio::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let body = build_body(format!("http://127.0.0.1:{port}/download"));
+    let app = Router::new()
+        .route(
+            auth_path,
+            post(move || {
+                let b = token_body.clone();
+                async move { Json(b) }
+            }),
+        )
+        .route(
+            "/download",
+            get(move || {
+                let bytes = audio_bytes.clone();
+                async move { ([(header::CONTENT_TYPE, "audio/mpeg")], bytes) }
+            }),
+        )
+        .fallback(move || {
+            let body = body.clone();
+            async move { Json(body) }
+        });
+    let server = spawn_mock_server("auth_then_audio_url_download_mock", async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (port, server)
+}
+
+/// Spawn a WebSocket mock for streaming TTS providers: accept the connection, wait for the client's
+/// synthesis-request frame, then send each JSON `frames` entry as a Text message (the provider's
+/// read loop decodes base64 audio out of them). For iFlytek-style providers that deliver audio as
+/// base64 inside JSON Text frames rather than binary.
+async fn spawn_ws_audio_mock(frames: Vec<serde_json::Value>) -> (u16, MockServer) {
+    use futures::{SinkExt, StreamExt};
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::accept_async;
+    use tokio_tungstenite::tungstenite::protocol::Message;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let frames: Vec<String> = frames.iter().map(|v| v.to_string()).collect();
+    let server = spawn_mock_server("ws_audio_mock", async move {
+        if let Ok((stream, _)) = listener.accept().await
+            && let Ok(ws) = accept_async(stream).await
+        {
+            let (mut write, mut read) = ws.split();
+            // Wait for the synthesis request, then stream the audio frames back.
+            if let Some(Ok(_req)) = read.next().await {
+                for f in &frames {
+                    let _ = write.send(Message::Text(f.clone().into())).await;
+                }
+            }
+        }
+    });
+    (port, server)
+}
+
+/// Hand-encode a Tinkoff `SynthesizeSpeechResponse` (protobuf field 1 = `audio_content`, bytes) so
+/// the gRPC mock can return decodable audio without the prost-generated message type.
+fn encode_protobuf_bytes_field1(audio: &[u8]) -> Vec<u8> {
+    let mut buf = vec![0x0Au8]; // field 1, wire type 2 (length-delimited)
+    let mut n = audio.len();
+    loop {
+        let mut b = (n & 0x7f) as u8;
+        n >>= 7;
+        if n != 0 {
+            b |= 0x80;
+        }
+        buf.push(b);
+        if n == 0 {
+            break;
+        }
+    }
+    buf.extend_from_slice(audio);
+    buf
+}
+
+/// Spawn a minimal tonic gRPC mock server (plaintext) that answers the Tinkoff TTS unary
+/// `Synthesize` RPC with `response` (a pre-encoded `SynthesizeSpeechResponse`). Uses a raw-bytes
+/// codec mirroring the provider's `TinkoffTtsCodec`, so no `.proto` codegen is needed. This is the
+/// 6th harness type (gRPC) and is reusable for the STT gRPC tail.
+async fn spawn_tinkoff_grpc_mock(response: Vec<u8>) -> (u16, MockServer) {
+    use bytes::{Buf, BufMut, Bytes};
+    use futures::Stream;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
+    use tonic::codegen::{Body, BoxFuture, Context, Poll, Service, StdError, http};
+    use tonic::server::{ServerStreamingService, UnaryService};
+    use tonic::{Request, Response, Status};
+
+    #[derive(Clone, Default)]
+    struct ByteCodec;
+    impl Codec for ByteCodec {
+        type Encode = Vec<u8>;
+        type Decode = Bytes;
+        type Encoder = ByteEnc;
+        type Decoder = ByteDec;
+        fn encoder(&mut self) -> ByteEnc {
+            ByteEnc
+        }
+        fn decoder(&mut self) -> ByteDec {
+            ByteDec
+        }
+    }
+    struct ByteEnc;
+    impl Encoder for ByteEnc {
+        type Item = Vec<u8>;
+        type Error = Status;
+        fn encode(&mut self, item: Vec<u8>, dst: &mut EncodeBuf<'_>) -> Result<(), Status> {
+            dst.put_slice(&item);
+            Ok(())
+        }
+    }
+    struct ByteDec;
+    impl Decoder for ByteDec {
+        type Item = Bytes;
+        type Error = Status;
+        fn decode(&mut self, src: &mut DecodeBuf<'_>) -> Result<Option<Bytes>, Status> {
+            let n = src.remaining();
+            if n == 0 {
+                Ok(None)
+            } else {
+                Ok(Some(src.copy_to_bytes(n)))
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct Mock {
+        resp: Arc<Vec<u8>>,
+    }
+    impl tonic::server::NamedService for Mock {
+        const NAME: &'static str = "tinkoff.cloud.tts.v1.TextToSpeech";
+    }
+    impl<B> Service<http::Request<B>> for Mock
+    where
+        B: Body + Send + 'static,
+        B::Error: Into<StdError> + Send + 'static,
+    {
+        type Response = http::Response<tonic::body::BoxBody>;
+        type Error = std::convert::Infallible;
+        type Future = BoxFuture<Self::Response, Self::Error>;
+        fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+        fn call(&mut self, req: http::Request<B>) -> Self::Future {
+            // The `Routes` router dispatches `/{service}/{method}` here; match by method suffix. The
+            // provider uses server-streaming `StreamingSynthesize` when a callback is registered, and
+            // unary `Synthesize` otherwise — handle both. Each response message carries the audio in
+            // protobuf field 1 (audio_content / audio_chunk).
+            let path = req.uri().path().to_string();
+            let resp = self.resp.clone();
+            if path.ends_with("/StreamingSynthesize") {
+                Box::pin(async move {
+                    struct StreamSvc(Arc<Vec<u8>>);
+                    impl ServerStreamingService<Bytes> for StreamSvc {
+                        type Response = Vec<u8>;
+                        type ResponseStream =
+                            Pin<Box<dyn Stream<Item = Result<Vec<u8>, Status>> + Send>>;
+                        type Future = BoxFuture<Response<Self::ResponseStream>, Status>;
+                        fn call(&mut self, _req: Request<Bytes>) -> Self::Future {
+                            let chunk = (*self.0).clone();
+                            Box::pin(async move {
+                                let s = futures::stream::iter(vec![Ok(chunk)]);
+                                Ok(Response::new(Box::pin(s) as Self::ResponseStream))
+                            })
+                        }
+                    }
+                    let mut grpc = tonic::server::Grpc::new(ByteCodec);
+                    Ok(grpc.server_streaming(StreamSvc(resp), req).await)
+                })
+            } else if path.ends_with("/Synthesize") {
+                Box::pin(async move {
+                    struct Svc(Arc<Vec<u8>>);
+                    impl UnaryService<Bytes> for Svc {
+                        type Response = Vec<u8>;
+                        type Future = BoxFuture<Response<Vec<u8>>, Status>;
+                        fn call(&mut self, _req: Request<Bytes>) -> Self::Future {
+                            let r = (*self.0).clone();
+                            Box::pin(async move { Ok(Response::new(r)) })
+                        }
+                    }
+                    let mut grpc = tonic::server::Grpc::new(ByteCodec);
+                    Ok(grpc.unary(Svc(resp), req).await)
+                })
+            } else {
+                Box::pin(async move {
+                    Ok(http::Response::builder()
+                        .status(200)
+                        .header("content-type", "application/grpc")
+                        .header("grpc-status", "12")
+                        .body(tonic::body::empty_body())
+                        .unwrap())
+                })
+            }
+        }
+    }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let incoming = futures::stream::unfold(listener, |l| async move {
+        let res = l.accept().await.map(|(s, _)| s);
+        Some((res, l))
+    });
+    let svc = Mock {
+        resp: Arc::new(response),
+    };
+    let server = spawn_mock_server("tinkoff_grpc_mock", async move {
+        tonic::transport::Server::builder()
+            .add_service(svc)
+            .serve_with_incoming(incoming)
+            .await
+            .expect("tinkoff mock gRPC server");
+    });
+    (port, server)
+}
+
+/// Base64-encode a blob (for JSON-enveloped audio responses).
+fn b64(bytes: &[u8]) -> String {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    STANDARD.encode(bytes)
+}
+
+/// A small blob of fake "audio" bytes the mock returns; the provider passes raw response bytes
+/// through to `on_audio` for the formats these REST TTS endpoints emit.
+fn fake_audio() -> Vec<u8> {
+    // ID3 header + filler so it looks vaguely like an MP3 payload; content is irrelevant.
+    let mut v = b"ID3\x04\x00\x00\x00\x00\x00\x00".to_vec();
+    v.extend(std::iter::repeat_n(0xAAu8, 4096));
+    v
+}
+
+/// Build a REST TTS provider via the keystone with an `endpoint_override`, drive it against a
+/// localhost mock serving `path`, and assert audio bytes surfaced end-to-end. This is the dual of
+/// the STT mock-e2e `drive_rest_and_capture`: it proves the provider's synth POST reaches the wire
+/// (host swapped, path preserved) and the response audio flows back through `on_audio`, with no key.
+async fn assert_rest_tts_surfaces_audio(provider: &str, path: &'static str, base: TTSConfig) {
+    ensure_crypto();
+    let (port, _server) = spawn_audio_mock(path, fake_audio()).await;
+    let std = StandardTTSConfig::from_base(base)
+        .with_endpoint_override(format!("http://127.0.0.1:{port}"));
+    let mut tts = create_tts_standard(provider, std)
+        .unwrap_or_else(|e| panic!("build {provider} tts: {e:?}"));
+    let bytes = drive_tts(tts.as_mut()).await;
+    println!("{provider} TTS mock e2e surfaced {bytes} audio bytes");
+    assert!(bytes > 0, "{provider} TTS surfaced no audio end-to-end");
+}
+
+#[tokio::test]
+async fn openai_tts_full_integration_via_mock_endpoint() {
+    ensure_crypto();
+    let (port, _server) = spawn_audio_mock("/v1/audio/speech", fake_audio()).await;
+    // OpenAI TTS resolves its endpoint via OPENAI_BASE_URL (designed for credential-free e2e).
+    unsafe {
+        std::env::set_var("OPENAI_BASE_URL", format!("http://127.0.0.1:{port}"));
+    }
+    let std = StandardTTSConfig::from_base(TTSConfig {
+        provider: "openai".into(),
+        api_key: "test-key".into(),
+        voice_id: Some("alloy".to_string()),
+        model: "tts-1".to_string(),
+        ..Default::default()
+    });
+    let mut tts = create_tts_standard("openai", std).expect("build openai tts via keystone");
+    let bytes = drive_tts(tts.as_mut()).await;
+    unsafe {
+        std::env::remove_var("OPENAI_BASE_URL");
+    }
+    println!("OpenAI TTS mock e2e surfaced {bytes} audio bytes");
+    assert!(bytes > 0, "OpenAI TTS surfaced no audio end-to-end");
+}
+
+#[tokio::test]
+async fn cartesia_tts_full_integration_via_mock_endpoint() {
+    assert_rest_tts_surfaces_audio(
+        "cartesia",
+        "/tts/bytes",
+        TTSConfig {
+            provider: "cartesia".into(),
+            api_key: "test-key".into(),
+            voice_id: Some("a0e99841-438c-4a64-b679-ae501e7d6091".to_string()),
+            model: "sonic-3".to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn hume_tts_full_integration_via_mock_endpoint() {
+    assert_rest_tts_surfaces_audio(
+        "hume",
+        "/v0/tts/stream/file",
+        TTSConfig {
+            provider: "hume".into(),
+            api_key: "test-key".into(),
+            voice_id: Some("Kora".to_string()),
+            ..Default::default()
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn speechify_tts_full_integration_via_mock_endpoint() {
+    assert_rest_tts_surfaces_audio(
+        "speechify",
+        "/v1/audio/stream",
+        TTSConfig {
+            provider: "speechify".into(),
+            api_key: "test-key".into(),
+            voice_id: Some("george".to_string()),
+            ..Default::default()
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn murf_tts_full_integration_via_mock_endpoint() {
+    assert_rest_tts_surfaces_audio(
+        "murf",
+        "/v1/speech/stream",
+        TTSConfig {
+            provider: "murf".into(),
+            api_key: "test-key".into(),
+            voice_id: Some("en-US-natalie".to_string()),
+            ..Default::default()
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn unrealspeech_tts_full_integration_via_mock_endpoint() {
+    assert_rest_tts_surfaces_audio(
+        "unrealspeech",
+        "/stream",
+        TTSConfig {
+            provider: "unrealspeech".into(),
+            api_key: "test-key".into(),
+            ..Default::default()
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn reverie_tts_full_integration_via_mock_endpoint() {
+    assert_rest_tts_surfaces_audio(
+        "reverie",
+        "/",
+        TTSConfig {
+            provider: "reverie".into(),
+            api_key: "test-key".into(),
+            model: "test-app-id".to_string(),
+            voice_id: Some("hi_female".to_string()),
+            ..Default::default()
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn wellsaid_tts_full_integration_via_mock_endpoint() {
+    assert_rest_tts_surfaces_audio(
+        "wellsaid",
+        "/v1/tts/stream",
+        TTSConfig {
+            provider: "wellsaid".into(),
+            api_key: "test-key".into(),
+            voice_id: Some("3".to_string()),
+            ..Default::default()
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn yandex_tts_full_integration_via_mock_endpoint() {
+    assert_rest_tts_surfaces_audio(
+        "yandex",
+        "/speech/v1/tts_synthesize",
+        TTSConfig {
+            provider: "yandex".into(),
+            // folder_id|api_key packing (no dot → not treated as an IAM token).
+            api_key: "folder123:test-key".into(),
+            voice_id: Some("alena".to_string()),
+            ..Default::default()
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn viettel_ai_tts_full_integration_via_mock_endpoint() {
+    assert_rest_tts_surfaces_audio(
+        "viettel_ai",
+        "/voice/api/tts/v1/rest/syn",
+        TTSConfig {
+            provider: "viettel_ai".into(),
+            api_key: "test-token".into(),
+            voice_id: Some("hn-quynhanh".to_string()),
+            ..Default::default()
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn gnani_tts_full_integration_via_mock_endpoint() {
+    // Gnani wraps audio in a JSON envelope (`audioContent`, base64) rather than streaming raw bytes.
+    ensure_crypto();
+    let (port, _server) = spawn_json_audio_mock("audioContent", fake_audio()).await;
+    let std = StandardTTSConfig::from_base(TTSConfig {
+        provider: "gnani".into(),
+        // token|access_key packing (Gnani requires both credentials).
+        api_key: "test-token|test-access".into(),
+        ..Default::default()
+    })
+    .with_endpoint_override(format!("http://127.0.0.1:{port}"));
+    let mut tts = create_tts_standard("gnani", std).expect("build gnani tts via keystone");
+    let bytes = drive_tts(tts.as_mut()).await;
+    println!("gnani TTS mock e2e surfaced {bytes} audio bytes");
+    assert!(bytes > 0, "gnani TTS surfaced no audio end-to-end");
+}
+
+#[tokio::test]
+async fn naver_clova_tts_full_integration_via_mock_endpoint() {
+    assert_rest_tts_surfaces_audio(
+        "naver_clova",
+        "/tts-premium/v1/tts",
+        TTSConfig {
+            provider: "naver_clova".into(),
+            // client_id|client_secret packing for the X-NCP headers.
+            api_key: "test-id|test-secret".into(),
+            voice_id: Some("nara".to_string()),
+            ..Default::default()
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn speechmatics_tts_full_integration_via_mock_endpoint() {
+    assert_rest_tts_surfaces_audio(
+        "speechmatics",
+        "/generate/sarah",
+        TTSConfig {
+            provider: "speechmatics".into(),
+            api_key: "test-key".into(),
+            voice_id: Some("sarah".to_string()),
+            ..Default::default()
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn azure_tts_full_integration_via_mock_endpoint() {
+    assert_rest_tts_surfaces_audio(
+        "azure",
+        "/cognitiveservices/v1",
+        TTSConfig {
+            provider: "azure".into(),
+            api_key: "test-subscription-key".into(),
+            voice_id: Some("en-US-JennyNeural".to_string()),
+            ..Default::default()
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn deepgram_tts_full_integration_via_mock_endpoint() {
+    assert_rest_tts_surfaces_audio(
+        "deepgram",
+        "/v1/speak",
+        TTSConfig {
+            provider: "deepgram".into(),
+            api_key: "test-key".into(),
+            model: "aura-2-thalia-en".to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn cereproc_tts_full_integration_via_mock_endpoint() {
+    // CereProc is two-step: connect() logs in (POST /v2/auth → {"token":...}) then speak() POSTs
+    // /v2/speak → {"fileUrl": "..."}; the provider must validate and download that URL before
+    // surfacing audio bytes.
+    ensure_crypto();
+    let audio = fake_audio();
+    let expected_bytes = audio.len();
+    let (port, _server) = spawn_auth_then_audio_url_download_mock(
+        "/v2/auth",
+        serde_json::json!({ "token": "mock-token" }),
+        |download_url| {
+            serde_json::json!({
+                "fileUrl": download_url,
+                "charCount": "11",
+                "resultCode": "1",
+                "resultDescription": "Success"
+            })
+        },
+        audio,
+    )
+    .await;
+    let std = StandardTTSConfig::from_base(TTSConfig {
+        provider: "cereproc".into(),
+        // email:password packing for HTTP Basic auth.
+        api_key: "user@example.com:password".into(),
+        voice_id: Some("Heather".to_string()),
+        ..Default::default()
+    })
+    .with_endpoint_override(format!("http://127.0.0.1:{port}"));
+    let mut tts = create_tts_standard("cereproc", std).expect("build cereproc tts via keystone");
+    let bytes = drive_tts(tts.as_mut()).await;
+    println!("cereproc TTS mock e2e surfaced {bytes} audio bytes");
+    assert_eq!(
+        bytes, expected_bytes,
+        "cereproc TTS must download fileUrl audio, not surface the JSON envelope"
+    );
+}
+
+#[tokio::test]
+async fn acapela_tts_full_integration_via_mock_endpoint() {
+    // Acapela: connect() logs in (POST /api/login/ → {"token":...}) then speak() GETs /api/command/
+    // → audio bytes. Auth route serves the token; the fallback serves the audio (GET included).
+    ensure_crypto();
+    let (port, _server) = spawn_auth_then_audio_mock(
+        "/api/login/",
+        serde_json::json!({ "token": "mock-token" }),
+        fake_audio(),
+    )
+    .await;
+    let std = StandardTTSConfig::from_base(TTSConfig {
+        provider: "acapela".into(),
+        // email:password packing for the Acapela login.
+        api_key: "user@example.com:password".into(),
+        voice_id: Some("alice".to_string()),
+        ..Default::default()
+    })
+    .with_endpoint_override(format!("http://127.0.0.1:{port}"));
+    let mut tts = create_tts_standard("acapela", std).expect("build acapela tts via keystone");
+    let bytes = drive_tts(tts.as_mut()).await;
+    println!("acapela TTS mock e2e surfaced {bytes} audio bytes");
+    assert!(bytes > 0, "acapela TTS surfaced no audio end-to-end");
+}
+
+#[tokio::test]
+async fn baidu_tts_full_integration_via_mock_endpoint() {
+    // Baidu: OAuth (POST /oauth/2.0/token → {access_token,expires_in}) then synth (POST /text2audio
+    // → raw audio bytes). connect() fetches the token; the fallback serves the synth audio.
+    ensure_crypto();
+    let (port, _server) = spawn_auth_then_audio_mock(
+        "/oauth/2.0/token",
+        serde_json::json!({ "access_token": "mock-token", "expires_in": 2_592_000 }),
+        fake_audio(),
+    )
+    .await;
+    let std = StandardTTSConfig::from_base(TTSConfig {
+        provider: "baidu".into(),
+        // api_key|secret_key packing (Baidu fetches an OAuth token from these).
+        api_key: "test-key|test-secret".into(),
+        ..Default::default()
+    })
+    .with_endpoint_override(format!("http://127.0.0.1:{port}"));
+    let mut tts = create_tts_standard("baidu", std).expect("build baidu tts via keystone");
+    let bytes = drive_tts(tts.as_mut()).await;
+    println!("baidu TTS mock e2e surfaced {bytes} audio bytes");
+    assert!(bytes > 0, "baidu TTS surfaced no audio end-to-end");
+}
+
+#[tokio::test]
+async fn sberdevices_tts_full_integration_via_mock_endpoint() {
+    // SberDevices: OAuth (POST /api/v2/oauth → {access_token,expires_at_ms}) then synth (POST
+    // /rest/v1/text:synthesize → raw audio bytes). `expires_at` is ms-since-epoch and must be well
+    // in the future so the token is cached past the refresh threshold.
+    ensure_crypto();
+    let (port, _server) = spawn_auth_then_audio_mock(
+        "/api/v2/oauth",
+        serde_json::json!({ "access_token": "mock-token", "expires_at": 9_999_999_999_000u64 }),
+        fake_audio(),
+    )
+    .await;
+    let std = StandardTTSConfig::from_base(TTSConfig {
+        provider: "sberdevices".into(),
+        // client_id:client_secret packing (base64-encoded for HTTP Basic to the OAuth endpoint).
+        api_key: "test-client-id:test-client-secret".into(),
+        voice_id: Some("Nec_24000".to_string()),
+        ..Default::default()
+    })
+    .with_endpoint_override(format!("http://127.0.0.1:{port}"));
+    let mut tts =
+        create_tts_standard("sberdevices", std).expect("build sberdevices tts via keystone");
+    let bytes = drive_tts(tts.as_mut()).await;
+    println!("sberdevices TTS mock e2e surfaced {bytes} audio bytes");
+    assert!(bytes > 0, "sberdevices TTS surfaced no audio end-to-end");
+}
+
+#[tokio::test]
+async fn smallest_tts_full_integration_via_mock_endpoint() {
+    assert_rest_tts_surfaces_audio(
+        "smallest",
+        "/api/v1/lightning/get_speech",
+        TTSConfig {
+            provider: "smallest".into(),
+            api_key: "test-key".into(),
+            voice_id: Some("emily".to_string()),
+            ..Default::default()
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn resemble_tts_full_integration_via_mock_endpoint() {
+    assert_rest_tts_surfaces_audio(
+        "resemble",
+        "/stream",
+        TTSConfig {
+            provider: "resemble".into(),
+            api_key: "test-key".into(),
+            voice_id: Some("55592656".to_string()),
+            ..Default::default()
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn lmnt_tts_full_integration_via_mock_endpoint() {
+    assert_rest_tts_surfaces_audio(
+        "lmnt",
+        "/v1/ai/speech/bytes",
+        TTSConfig {
+            provider: "lmnt".into(),
+            api_key: "test-key".into(),
+            voice_id: Some("lily".to_string()),
+            ..Default::default()
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn tinkoff_tts_full_integration_via_mock_endpoint() {
+    // Tinkoff is genuine tonic gRPC (unary Synthesize). endpoint_override points the channel at a
+    // plaintext localhost tonic mock that returns a SynthesizeSpeechResponse (audio in field 1).
+    ensure_crypto();
+    let (port, _server) =
+        spawn_tinkoff_grpc_mock(encode_protobuf_bytes_field1(&fake_audio())).await;
+    let std = StandardTTSConfig::from_base(TTSConfig {
+        provider: "tinkoff".into(),
+        // api_key|secret_key packing (both needed to sign the JWT; the mock ignores the signature).
+        api_key: "test-api-key|dGVzdC1zZWNyZXQta2V5".into(),
+        voice_id: Some("alyona".to_string()),
+        ..Default::default()
+    })
+    .with_endpoint_override(format!("http://127.0.0.1:{port}"));
+    let mut tts = create_tts_standard("tinkoff", std).expect("build tinkoff tts via keystone");
+    let bytes = drive_tts(tts.as_mut()).await;
+    println!("tinkoff TTS mock e2e surfaced {bytes} audio bytes");
+    assert!(bytes > 0, "tinkoff TTS surfaced no audio end-to-end");
+}
+
+#[tokio::test]
+async fn google_tts_full_integration_via_mock_endpoint() {
+    // Google TTS is REST (POST /v1/text:synthesize -> {audioContent: base64}). Its auth normally
+    // does an OAuth-JWT network exchange; here we use the bring-your-own-token path (a static
+    // access_token + project_id via extras), so no service-account/network is needed.
+    ensure_crypto();
+    let (port, _server) = spawn_json_audio_mock("audioContent", fake_audio()).await;
+    let mut std = StandardTTSConfig::from_base(TTSConfig {
+        provider: "google".into(),
+        // Empty api_key => ApplicationDefault credential source (never invoked: static token wins).
+        api_key: String::new(),
+        voice_id: Some("en-US-Standard-A".to_string()),
+        ..Default::default()
+    })
+    .with_endpoint_override(format!("http://127.0.0.1:{port}"));
+    std.extras.0.insert(
+        "access_token".to_string(),
+        serde_json::Value::String("mock-oauth-token".to_string()),
+    );
+    std.extras.0.insert(
+        "project_id".to_string(),
+        serde_json::Value::String("test-project".to_string()),
+    );
+    let mut tts = create_tts_standard("google", std).expect("build google tts via keystone");
+    let bytes = drive_tts(tts.as_mut()).await;
+    println!("google TTS mock e2e surfaced {bytes} audio bytes");
+    assert!(bytes > 0, "google TTS surfaced no audio end-to-end");
+}
+
+#[tokio::test]
+async fn alibaba_cloud_tts_full_integration_via_mock_endpoint() {
+    // Alibaba DashScope CosyVoice WS: client sends run-task -> mock replies task-started; client
+    // sends continue-task(text) -> mock streams the audio as a BINARY frame then task-finished.
+    // endpoint_override (ws:// base) swaps the wss DashScope host, keeping /api-ws/v1/inference.
+    use futures::{SinkExt, StreamExt};
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::accept_async;
+    use tokio_tungstenite::tungstenite::protocol::Message;
+    ensure_crypto();
+    let audio = fake_audio();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let _server = spawn_mock_server("alibaba_cloud_tts_ws_mock", async move {
+        if let Ok((stream, _)) = listener.accept().await
+            && let Ok(ws) = accept_async(stream).await
+        {
+            let (mut write, mut read) = ws.split();
+            let mut task_id = String::from("task-1");
+            while let Some(Ok(msg)) = read.next().await {
+                if let Message::Text(t) = msg {
+                    let v: serde_json::Value = serde_json::from_str(&t).unwrap_or_default();
+                    if let Some(tid) = v["header"]["task_id"].as_str() {
+                        task_id = tid.to_string();
+                    }
+                    match v["header"]["action"].as_str().unwrap_or("") {
+                        "run-task" => {
+                            let started = serde_json::json!({
+                                "header": { "task_id": task_id, "event": "task-started" }
+                            });
+                            let _ = write.send(Message::Text(started.to_string().into())).await;
+                        }
+                        "continue-task" => {
+                            let _ = write.send(Message::Binary(audio.clone().into())).await;
+                            let finished = serde_json::json!({
+                                "header": { "task_id": task_id, "event": "task-finished" }
+                            });
+                            let _ = write.send(Message::Text(finished.to_string().into())).await;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    });
+
+    let std = StandardTTSConfig::from_base(TTSConfig {
+        provider: "alibaba_cloud".into(),
+        api_key: "test-bearer-token".into(),
+        voice_id: Some("longxiaochun".to_string()),
+        ..Default::default()
+    })
+    .with_endpoint_override(format!("ws://127.0.0.1:{port}"));
+    let mut tts =
+        create_tts_standard("alibaba_cloud", std).expect("build alibaba_cloud tts via keystone");
+    let bytes = drive_tts(tts.as_mut()).await;
+    println!("alibaba_cloud TTS mock e2e surfaced {bytes} audio bytes");
+    assert!(bytes > 0, "alibaba_cloud TTS surfaced no audio end-to-end");
+}
+
+#[tokio::test]
+async fn iflytek_tts_full_integration_via_mock_endpoint() {
+    // iFlytek TTS is a signed WebSocket: connect (signed URL), send a JSON request, receive JSON
+    // Text frames carrying base64 audio under data.audio (status 2 = final chunk). endpoint_override
+    // (a ws:// base) swaps the signed URL's host while keeping the /v2/tts path + auth query.
+    ensure_crypto();
+    let frame = serde_json::json!({
+        "code": 0,
+        "message": "success",
+        "sid": "mock-sid",
+        "data": { "audio": b64(&fake_audio()), "status": 2 }
+    });
+    let (port, _server) = spawn_ws_audio_mock(vec![frame]).await;
+    let std = StandardTTSConfig::from_base(TTSConfig {
+        provider: "iflytek".into(),
+        // app_id|api_key|api_secret packing for the signed-URL auth.
+        api_key: "test-app|test-key-xxxxxxxx|test-secret-xxxxxx".into(),
+        voice_id: Some("xiaoyan".to_string()),
+        // iFlytek TTS only supports 8000/16000 (default config carries 24000).
+        sample_rate: Some(16000),
+        ..Default::default()
+    })
+    .with_endpoint_override(format!("ws://127.0.0.1:{port}"));
+    let mut tts = create_tts_standard("iflytek", std).expect("build iflytek tts via keystone");
+    let bytes = drive_tts(tts.as_mut()).await;
+    println!("iflytek TTS mock e2e surfaced {bytes} audio bytes");
+    assert!(bytes > 0, "iflytek TTS surfaced no audio end-to-end");
+}
+
+#[tokio::test]
+async fn huawei_cloud_tts_full_integration_via_mock_endpoint() {
+    // Huawei: IAM POST /v3/auth/tokens returns the token in the X-Subject-Token RESPONSE HEADER;
+    // synth POST /v1/{project}/tts returns {"result":{"data": base64}}. Both hosts are swapped to
+    // the mock by endpoint_override (the shared token manager honors it via get_token_with_override).
+    use axum::{Json, Router, http::HeaderName, routing::post};
+    use tokio::net::TcpListener;
+    ensure_crypto();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let synth_body = serde_json::json!({ "result": { "data": b64(&fake_audio()) } });
+    let app = Router::new()
+        .route(
+            "/v3/auth/tokens",
+            post(|| async {
+                (
+                    [(HeaderName::from_static("x-subject-token"), "mock-token")],
+                    "{}",
+                )
+            }),
+        )
+        .fallback(move || {
+            let b = synth_body.clone();
+            async move { Json(b) }
+        });
+    let _server = spawn_mock_server("huawei_cloud_tts_mock", async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let std = StandardTTSConfig::from_base(TTSConfig {
+        provider: "huawei_cloud".into(),
+        // username|password|domain_name|project_id packing.
+        api_key: "test-user|test-pass|test-domain|proj-123".into(),
+        // Huawei TTS only supports 8000/16000 (default config carries 24000).
+        sample_rate: Some(16000),
+        ..Default::default()
+    })
+    .with_endpoint_override(format!("http://127.0.0.1:{port}"));
+    let mut tts =
+        create_tts_standard("huawei_cloud", std).expect("build huawei_cloud tts via keystone");
+    let bytes = drive_tts(tts.as_mut()).await;
+    println!("huawei_cloud TTS mock e2e surfaced {bytes} audio bytes");
+    assert!(bytes > 0, "huawei_cloud TTS surfaced no audio end-to-end");
+}
+
+#[tokio::test]
+async fn aws_polly_tts_full_integration_via_mock_endpoint() {
+    // AWS Polly via the SDK: endpoint_override sets the SDK's endpoint_url (raw base); the SDK
+    // appends /v1/speech and SynthesizeSpeech returns the audio in the response body. Credentials
+    // flow through the standardized extras passthrough.
+    ensure_crypto();
+    let (port, _server) = spawn_audio_mock("/v1/speech", fake_audio()).await;
+    let mut std = StandardTTSConfig::from_base(TTSConfig {
+        provider: "aws_polly".into(),
+        voice_id: Some("Joanna".to_string()),
+        // Polly's default pcm output only supports 8000/16000 (default config carries 24000).
+        sample_rate: Some(16000),
+        ..Default::default()
+    })
+    .with_endpoint_override(format!("http://127.0.0.1:{port}"));
+    std.extras.0.insert(
+        "aws_access_key_id".to_string(),
+        serde_json::Value::String("AKIAIOSFODNN7EXAMPLE".to_string()),
+    );
+    std.extras.0.insert(
+        "aws_secret_access_key".to_string(),
+        serde_json::Value::String("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
+    );
+    std.extras.0.insert(
+        "region".to_string(),
+        serde_json::Value::String("us-east-1".to_string()),
+    );
+    let mut tts = create_tts_standard("aws_polly", std).expect("build aws_polly tts via keystone");
+    let bytes = drive_tts(tts.as_mut()).await;
+    println!("aws_polly TTS mock e2e surfaced {bytes} audio bytes");
+    assert!(bytes > 0, "aws_polly TTS surfaced no audio end-to-end");
+}
+
+#[tokio::test]
+async fn bhashini_tts_full_integration_via_mock_endpoint() {
+    // Bhashini is two-step: a pipeline-CONFIG POST then a COMPUTE POST. We override the config POST
+    // (which returns {} → the provider falls back to custom_callback_url for the compute hop and to
+    // the inference key from the api_key) and point custom_callback_url at the mock's /compute route
+    // (returns {pipelineResponse:[{taskType:tts, audio:[{audioUri: ...}]}]}), then /download serves
+    // the audio bytes.
+    use axum::{
+        Json, Router,
+        http::header,
+        routing::{get, post},
+    };
+    use tokio::net::TcpListener;
+    ensure_crypto();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let audio = fake_audio();
+    let expected_bytes = audio.len();
+    let compute_body = serde_json::json!({
+        "pipelineResponse": [
+            { "taskType": "tts", "audio": [{ "audioUri": format!("http://127.0.0.1:{port}/download") }] }
+        ]
+    });
+    let app = Router::new()
+        .route(
+            "/compute",
+            post(move || {
+                let b = compute_body.clone();
+                async move { Json(b) }
+            }),
+        )
+        .route(
+            "/download",
+            get(move || {
+                let bytes = audio.clone();
+                async move { ([(header::CONTENT_TYPE, "audio/mpeg")], bytes) }
+            }),
+        )
+        .fallback(|| async { Json(serde_json::json!({})) });
+    let _server = spawn_mock_server("bhashini_tts_mock", async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let mut std = StandardTTSConfig::from_base(TTSConfig {
+        provider: "bhashini".into(),
+        // userId|ulcaApiKey|inferenceApiKey packing.
+        api_key: "test-user|test-ulca|test-inference".into(),
+        // Bhashini parses voice_id as a BCP-47 language code.
+        voice_id: Some("hi".to_string()),
+        ..Default::default()
+    })
+    .with_endpoint_override(format!("http://127.0.0.1:{port}"));
+    std.extras.0.insert(
+        "custom_callback_url".to_string(),
+        serde_json::Value::String(format!("http://127.0.0.1:{port}/compute")),
+    );
+    std.extras.0.insert(
+        "custom_service_id".to_string(),
+        serde_json::Value::String("ai4bharat/indic-tts".to_string()),
+    );
+    let mut tts = create_tts_standard("bhashini", std).expect("build bhashini tts via keystone");
+    let bytes = drive_tts(tts.as_mut()).await;
+    println!("bhashini TTS mock e2e surfaced {bytes} audio bytes");
+    assert_eq!(
+        bytes, expected_bytes,
+        "bhashini TTS must download audioUri bytes"
+    );
+}
+
+#[tokio::test]
+async fn prosa_ai_tts_full_integration_via_mock_endpoint() {
+    // Prosa with wait=true (default) returns base64 audio directly in the POST response under
+    // {status:"complete", result:{data: ...}} — no poll, no download.
+    ensure_crypto();
+    let body = serde_json::json!({
+        "job_id": "job-1",
+        "status": "complete",
+        "result": { "data": b64(&fake_audio()), "url": "", "duration": 1.0 }
+    });
+    let (port, _server) = spawn_fixed_json_mock(body).await;
+    let std = StandardTTSConfig::from_base(TTSConfig {
+        provider: "prosa_ai".into(),
+        api_key: "test-key".into(),
+        ..Default::default()
+    })
+    .with_endpoint_override(format!("http://127.0.0.1:{port}"));
+    let mut tts = create_tts_standard("prosa_ai", std).expect("build prosa_ai tts via keystone");
+    let bytes = drive_tts(tts.as_mut()).await;
+    println!("prosa_ai TTS mock e2e surfaced {bytes} audio bytes");
+    assert!(bytes > 0, "prosa_ai TTS surfaced no audio end-to-end");
+}
+
+#[tokio::test]
+async fn ibm_watson_tts_full_integration_via_mock_endpoint() {
+    // IBM Watson: IAM token POST /identity/token → {access_token}, then synth POST
+    // /instances/{id}/v1/synthesize → raw audio bytes. instance_id is a provider extra.
+    ensure_crypto();
+    let (port, _server) = spawn_auth_then_audio_mock(
+        "/identity/token",
+        serde_json::json!({ "access_token": "mock-token", "token_type": "Bearer", "expires_in": 3600 }),
+        fake_audio(),
+    )
+    .await;
+    let mut std = StandardTTSConfig::from_base(TTSConfig {
+        provider: "ibm_watson".into(),
+        api_key: "test-key".into(),
+        voice_id: Some("en-US_AllisonV3Voice".to_string()),
+        ..Default::default()
+    })
+    .with_endpoint_override(format!("http://127.0.0.1:{port}"));
+    std.extras.0.insert(
+        "instance_id".to_string(),
+        serde_json::Value::String("inst-1".into()),
+    );
+    let mut tts =
+        create_tts_standard("ibm_watson", std).expect("build ibm_watson tts via keystone");
+    let bytes = drive_tts(tts.as_mut()).await;
+    println!("ibm_watson TTS mock e2e surfaced {bytes} audio bytes");
+    assert!(bytes > 0, "ibm_watson TTS surfaced no audio end-to-end");
+}
+
+#[tokio::test]
+async fn fpt_ai_tts_full_integration_via_mock_endpoint() {
+    // FPT.AI synth POST returns {"async": <download_url>}; the provider then GETs the URL for audio.
+    ensure_crypto();
+    let (port, _server) = spawn_audio_url_then_download_mock(
+        |url| serde_json::json!({ "async": url, "error": 0 }),
+        fake_audio(),
+    )
+    .await;
+    let std = StandardTTSConfig::from_base(TTSConfig {
+        provider: "fpt_ai".into(),
+        api_key: "test-key".into(),
+        voice_id: Some("banmai".to_string()),
+        ..Default::default()
+    })
+    .with_endpoint_override(format!("http://127.0.0.1:{port}"));
+    let mut tts = create_tts_standard("fpt_ai", std).expect("build fpt_ai tts via keystone");
+    let bytes = drive_tts(tts.as_mut()).await;
+    println!("fpt_ai TTS mock e2e surfaced {bytes} audio bytes");
+    assert!(bytes > 0, "fpt_ai TTS surfaced no audio end-to-end");
+}
+
+#[tokio::test]
+async fn nectec_tts_full_integration_via_mock_endpoint() {
+    // NECTEC VAJA9 synth POST returns {"wav_url": <download_url>}; the provider then GETs it.
+    ensure_crypto();
+    let (port, _server) = spawn_audio_url_then_download_mock(
+        |url| serde_json::json!({ "wav_url": url }),
+        fake_audio(),
+    )
+    .await;
+    let std = StandardTTSConfig::from_base(TTSConfig {
+        provider: "nectec".into(),
+        api_key: "test-key".into(),
+        ..Default::default()
+    })
+    .with_endpoint_override(format!("http://127.0.0.1:{port}"));
+    let mut tts = create_tts_standard("nectec", std).expect("build nectec tts via keystone");
+    let bytes = drive_tts(tts.as_mut()).await;
+    println!("nectec TTS mock e2e surfaced {bytes} audio bytes");
+    assert!(bytes > 0, "nectec TTS surfaced no audio end-to-end");
+}
+
+#[tokio::test]
+async fn zalo_ai_tts_full_integration_via_mock_endpoint() {
+    // Zalo synth POST returns {"data":{"url": <download_url>}}; the provider then GETs it for audio.
+    ensure_crypto();
+    let (port, _server) = spawn_audio_url_then_download_mock(
+        |url| serde_json::json!({ "error_code": 0, "data": { "url": url } }),
+        fake_audio(),
+    )
+    .await;
+    let std = StandardTTSConfig::from_base(TTSConfig {
+        provider: "zalo_ai".into(),
+        api_key: "test-key".into(),
+        ..Default::default()
+    })
+    .with_endpoint_override(format!("http://127.0.0.1:{port}"));
+    let mut tts = create_tts_standard("zalo_ai", std).expect("build zalo_ai tts via keystone");
+    let bytes = drive_tts(tts.as_mut()).await;
+    println!("zalo_ai TTS mock e2e surfaced {bytes} audio bytes");
+    assert!(bytes > 0, "zalo_ai TTS surfaced no audio end-to-end");
+}
+
+#[tokio::test]
+async fn tencent_tts_full_integration_via_mock_endpoint() {
+    // Tencent returns audio base64 nested under {"Response":{"Audio": ...}}.
+    ensure_crypto();
+    let body = serde_json::json!({ "Response": { "Audio": b64(&fake_audio()) } });
+    let (port, _server) = spawn_fixed_json_mock(body).await;
+    let std = StandardTTSConfig::from_base(TTSConfig {
+        provider: "tencent".into(),
+        // secret_id|secret_key packing.
+        api_key: "test-secret-id|test-secret-key".into(),
+        voice_id: Some("101001".to_string()),
+        ..Default::default()
+    })
+    .with_endpoint_override(format!("http://127.0.0.1:{port}"));
+    let mut tts = create_tts_standard("tencent", std).expect("build tencent tts via keystone");
+    let bytes = drive_tts(tts.as_mut()).await;
+    println!("tencent TTS mock e2e surfaced {bytes} audio bytes");
+    assert!(bytes > 0, "tencent TTS surfaced no audio end-to-end");
+}
+
+#[tokio::test]
+async fn playht_tts_full_integration_via_mock_endpoint() {
+    // PlayHT authenticates with both an api_key (Authorization) and a user_id (X-USER-ID); the
+    // user_id is a provider-specific extra, not part of the flat config.
+    ensure_crypto();
+    let (port, _server) = spawn_audio_mock("/api/v2/tts/stream", fake_audio()).await;
+    let mut std = StandardTTSConfig::from_base(TTSConfig {
+        provider: "playht".into(),
+        api_key: "test-key".into(),
+        voice_id: Some("s3://voice/manifest.json".to_string()),
+        ..Default::default()
+    })
+    .with_endpoint_override(format!("http://127.0.0.1:{port}"));
+    std.extras.0.insert(
+        "user_id".to_string(),
+        serde_json::Value::String("test-user".into()),
+    );
+    let mut tts = create_tts_standard("playht", std).expect("build playht tts via keystone");
+    let bytes = drive_tts(tts.as_mut()).await;
+    println!("playht TTS mock e2e surfaced {bytes} audio bytes");
+    assert!(bytes > 0, "playht TTS surfaced no audio end-to-end");
+}

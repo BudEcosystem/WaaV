@@ -4,18 +4,12 @@
 //! These tests verify the gateway works correctly from a client's perspective.
 
 use std::net::TcpListener;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use axum::{Router, body::Body, http::Request};
-use bytes::Bytes;
-use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
-use tokio::sync::mpsc;
+use serde_json::json;
 use tokio::time::timeout;
-use tokio_tungstenite::tungstenite::Message;
 use tower::util::ServiceExt;
 
 use waav_gateway::{
@@ -115,6 +109,15 @@ fn create_test_config(port: u16) -> ServerConfig {
         azure_speech_region: None,
         cartesia_api_key: None,
         openai_api_key: Some("test_openai_key".to_string()),
+        azure_openai_api_key: None,
+        azure_openai_endpoint: None,
+        grok_api_key: None,
+        inworld_api_key: None,
+        gemini_api_key: None,
+        ultravox_api_key: None,
+        speechmatics_api_key: None,
+        yandex_api_key: None,
+        yandex_folder_id: None,
         assemblyai_api_key: None,
         hume_api_key: None,
         lmnt_api_key: None,
@@ -149,11 +152,13 @@ fn create_test_config(port: u16) -> ServerConfig {
         rate_limit_burst_size: 100,
         max_websocket_connections: None,
         max_connections_per_ip: 1000,
-            ws_processing_timeout_secs: 10,
-            realtime_processing_timeout_secs: 30,
-            sip_max_participants: 3,
+        ws_processing_timeout_secs: 10,
+        realtime_processing_timeout_secs: 30,
+        sip_max_participants: 3,
+        realtime_endpoint_overrides: Default::default(),
         plugins: PluginConfig::default(),
         dag_timeouts: DAGTimeoutsConfig::default(),
+        aliases: Default::default(),
     }
 }
 
@@ -615,11 +620,12 @@ async fn test_sdk_concurrent_clients() {
         .collect();
 
     let mut success_count = 0;
-    for task in tasks {
-        if let Ok(status) = task.await {
-            if status == axum::http::StatusCode::OK {
-                success_count += 1;
-            }
+    for (client_id, task) in tasks.into_iter().enumerate() {
+        let status = task
+            .await
+            .unwrap_or_else(|err| panic!("SDK client task {client_id} panicked: {err}"));
+        if status == axum::http::StatusCode::OK {
+            success_count += 1;
         }
     }
 

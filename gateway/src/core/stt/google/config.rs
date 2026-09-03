@@ -2,6 +2,29 @@ use std::time::Duration;
 
 use crate::core::stt::base::STTConfig;
 
+fn validate_google_stt_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|e| format!("{source} rejected (SSRF protection): {e}"))
+}
+
+/// A single transcript-normalization replacement entry (Google v2
+/// `TranscriptNormalization.Entry`): replace `search` with `replace`, optionally case-sensitive.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TranscriptNormEntry {
+    /// Text to search for (max 100 chars).
+    pub search: String,
+    /// Replacement text (max 100 chars).
+    pub replace: String,
+    /// Whether the search is case sensitive.
+    #[serde(default)]
+    pub case_sensitive: bool,
+}
+
 /// Configuration specific to Google Speech-to-Text v2 API.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct GoogleSTTConfig {
@@ -24,6 +47,54 @@ pub struct GoogleSTTConfig {
     )]
     pub speech_end_timeout: Option<Duration>,
     pub single_utterance: bool,
+
+    // --- Advanced RecognitionFeatures (v2 RecognitionConfig.features), wired by W2 -------------
+    /// Replace profanities with asterisks (`features.profanity_filter`).
+    #[serde(default)]
+    pub profanity_filter: bool,
+    /// Per-word start/end time offsets (`features.enable_word_time_offsets`).
+    #[serde(default)]
+    pub enable_word_time_offsets: bool,
+    /// Per-word confidence scores (`features.enable_word_confidence`).
+    #[serde(default)]
+    pub enable_word_confidence: bool,
+    /// Replace spoken punctuation with symbols (`features.enable_spoken_punctuation`).
+    #[serde(default)]
+    pub enable_spoken_punctuation: bool,
+    /// Replace spoken emojis with Unicode (`features.enable_spoken_emojis`).
+    #[serde(default)]
+    pub enable_spoken_emojis: bool,
+    /// Transcribe each channel independently (`features.multi_channel_mode`).
+    #[serde(default)]
+    pub multichannel: bool,
+    /// Maximum N-best hypotheses (`features.max_alternatives`, valid 0-30).
+    #[serde(default)]
+    pub max_alternatives: i32,
+    /// Enable speaker diarization (`features.diarization_config`).
+    #[serde(default)]
+    pub diarization: bool,
+    /// Min speaker count for diarization (only used when `diarization` is true).
+    #[serde(default)]
+    pub diarization_min_speakers: i32,
+    /// Max speaker count for diarization (only used when `diarization` is true).
+    #[serde(default)]
+    pub diarization_max_speakers: i32,
+    /// Phrase-set adaptation / keyterm boosting (`config.adaptation`, inline PhraseSet).
+    #[serde(default)]
+    pub adaptation_phrases: Vec<String>,
+    /// Transcript normalization replacement entries (`config.transcript_normalization`).
+    #[serde(default)]
+    pub transcript_normalization: Vec<TranscriptNormEntry>,
+
+    // --- Test/operational endpoint + auth overrides (mirrors GoogleTTSConfig) -------------------
+    /// Override the gRPC endpoint the provider connects to instead of the production Speech
+    /// endpoint. An `http://` value selects a PLAINTEXT channel (a localhost tonic mock for e2e).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_override: Option<String>,
+    /// A pre-minted OAuth access token to use verbatim as the bearer credential, bypassing the
+    /// network OAuth fetch. Lets a mock e2e test authenticate with no Google network round-trip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub static_access_token: Option<String>,
 }
 
 impl Default for GoogleSTTConfig {
@@ -41,11 +112,111 @@ impl Default for GoogleSTTConfig {
             speech_start_timeout: None,
             speech_end_timeout: None,
             single_utterance: false,
+            profanity_filter: false,
+            enable_word_time_offsets: false,
+            enable_word_confidence: false,
+            enable_spoken_punctuation: false,
+            enable_spoken_emojis: false,
+            multichannel: false,
+            max_alternatives: 0,
+            diarization: false,
+            diarization_min_speakers: 0,
+            diarization_max_speakers: 0,
+            adaptation_phrases: Vec::new(),
+            transcript_normalization: Vec::new(),
+            endpoint_override: None,
+            static_access_token: None,
         }
     }
 }
 
 impl GoogleSTTConfig {
+    /// Build from the standardized config (W1 keystone). Google's v2 streaming config models only
+    /// a small advanced surface, so this maps the two standardized features it can express:
+    /// interim results (`interim_results`) and explicit voice-activity events (`vad_events` ->
+    /// `enable_voice_activity_events`). Google's constructor needs a non-standard `project_id`,
+    /// which is read from the `provider_extras` passthrough. Features Google cannot express here
+    /// (diarization, smart_format, profanity_filter, word_timestamps, redaction, keyterms,
+    /// language/entity detection) are capability gaps and stay at default.
+    pub fn from_standard(std: &crate::core::stt::standard::StandardSTTConfig) -> Self {
+        let f = &std.features;
+        let ex = &std.extras.0;
+        let project_id = ex
+            .get("project_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        let mut cfg =
+            crate::core::stt::google::GoogleSTT::create_google_config(std.base.clone(), project_id);
+        // Endpoint + static-token overrides (mirrors GoogleTTSConfig::from_standard): the endpoint
+        // override rides the open `endpoint_override` passthrough; the static access token comes
+        // from `extras["access_token"]` (a pre-minted bearer that bypasses the OAuth network fetch).
+        cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
+        cfg.static_access_token = std
+            .extras
+            .0
+            .get("access_token")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        if let Some(i) = f.interim_results {
+            cfg.interim_results = i;
+        }
+        if let Some(v) = f.vad_events {
+            cfg.enable_voice_activity_events = v;
+        }
+        // --- Newly-wired typed advanced features (v2 RecognitionConfig.features) ---------------
+        if let Some(p) = f.profanity_filter {
+            cfg.profanity_filter = p;
+        }
+        if let Some(w) = f.word_timestamps {
+            cfg.enable_word_time_offsets = w;
+        }
+        if let Some(n) = f.alternatives {
+            cfg.max_alternatives = n as i32;
+        }
+        if let Some(m) = f.multichannel {
+            cfg.multichannel = m;
+        }
+        if let Some(d) = f.diarization {
+            cfg.diarization = d;
+        }
+        // keyterms -> inline phrase-set adaptation (phrase/keyterm boosting).
+        if let Some(k) = &f.keyterms {
+            cfg.adaptation_phrases = k.clone();
+        }
+        // --- Provider-extras passthrough (no shared SttFeatures field) -------------------------
+        if let Some(b) = ex
+            .get("enable_spoken_punctuation")
+            .and_then(|v| v.as_bool())
+        {
+            cfg.enable_spoken_punctuation = b;
+        }
+        if let Some(b) = ex.get("enable_spoken_emojis").and_then(|v| v.as_bool()) {
+            cfg.enable_spoken_emojis = b;
+        }
+        if let Some(b) = ex.get("enable_word_confidence").and_then(|v| v.as_bool()) {
+            cfg.enable_word_confidence = b;
+        }
+        // transcript_normalization: array of {search, replace, case_sensitive}.
+        if let Some(arr) = ex
+            .get("transcript_normalization")
+            .and_then(|v| v.as_array())
+        {
+            cfg.transcript_normalization = arr
+                .iter()
+                .filter_map(|e| serde_json::from_value::<TranscriptNormEntry>(e.clone()).ok())
+                .collect();
+        }
+        cfg
+    }
+
+    pub(crate) fn validate_endpoint_override(&self) -> Result<(), String> {
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_google_stt_endpoint("endpoint_override", endpoint)?;
+        }
+        Ok(())
+    }
+
     pub fn recognizer_path(&self) -> String {
         let recognizer = self.recognizer_id.as_deref().unwrap_or("_");
         format!(
@@ -93,5 +264,85 @@ mod optional_duration_serde {
     {
         let opt: Option<u64> = Option::deserialize(deserializer)?;
         Ok(opt.map(Duration::from_millis))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // W1 keystone: the standardized features unlock Google's interim-results and voice-activity
+    // event flags, and the non-standard `project_id` is read from the provider_extras passthrough.
+    #[test]
+    fn from_standard_maps_features() {
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("project_id".into(), serde_json::json!("proj-123"));
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "google".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                interim_results: Some(false),
+                vad_events: Some(false),
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+            translation: None,
+        };
+        let cfg = GoogleSTTConfig::from_standard(&std);
+        assert!(!cfg.interim_results);
+        assert!(!cfg.enable_voice_activity_events);
+        assert_eq!(cfg.project_id, "proj-123"); // from provider_extras passthrough
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let previous = std::env::var_os("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
+
+        let mut config = GoogleSTTConfig {
+            endpoint_override: Some("https://google-stt-proxy.example.com".to_string()),
+            ..Default::default()
+        };
+        assert!(config.validate_endpoint_override().is_ok());
+
+        config.endpoint_override = Some("http://google-stt-proxy.example.com".to_string());
+        assert!(config.validate_endpoint_override().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config
+            .validate_endpoint_override()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.contains("SSRF protection"), "{err}");
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate_endpoint_override()
+            .expect_err("file endpoint_override must be rejected");
+        assert!(err.contains("not allowed"), "{err}");
+
+        config.endpoint_override = Some("ws://google-stt-proxy.example.com".to_string());
+        let err = config
+            .validate_endpoint_override()
+            .expect_err("WebSocket endpoint_override must be rejected for Google STT gRPC");
+        assert!(err.contains("not allowed"), "{err}");
+
+        config.endpoint_override = Some("   ".to_string());
+        assert!(config.validate_endpoint_override().is_ok());
+
+        // SAFETY: restore the process env before releasing the test env lock.
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", previous);
+            } else {
+                std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+            }
+        }
     }
 }

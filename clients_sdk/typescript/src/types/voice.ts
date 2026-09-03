@@ -4,39 +4,94 @@
 
 /**
  * Supported voice cloning providers.
+ *
+ * The FULL set sourced 1:1 from the gateway `VoiceCloneProvider`
+ * (gateway/src/handlers/voices.rs; P4 widened it from the 3-provider SDK list).
+ * A bare `string` is also accepted by {@link cloneVoice} for forward-compat.
  */
-export const VOICE_CLONE_PROVIDERS = ['elevenlabs', 'playht', 'resemble'] as const;
+export const VOICE_CLONE_PROVIDERS = [
+  'hume',
+  'elevenlabs',
+  'lmnt',
+  'cartesia',
+  'playht',
+  'speechify',
+  'resemble',
+] as const;
 
-export type VoiceCloneProvider = (typeof VOICE_CLONE_PROVIDERS)[number];
+export type VoiceCloneProvider = (typeof VOICE_CLONE_PROVIDERS)[number] | (string & {});
+
+/**
+ * Voice-clone mode (gateway `CloneMode`).
+ * - `instant` (default): IVC / clip clone; returns `ready` immediately or near-instantly.
+ * - `professional`: async high-fidelity (ElevenLabs PVC / Resemble / PlayHT PVC);
+ *   the returned `voiceId` is polled until `ready`.
+ */
+export type CloneMode = 'instant' | 'professional';
+
+/**
+ * Canonical lifecycle status of a cloned voice (gateway `CloneStatus`).
+ * `ready`/`failed` are TERMINAL; the others mean the clone is still being produced.
+ * `processing` is KEPT as a backward-compatible alias for the old SDK status.
+ */
+export type VoiceCloneStatus =
+  | 'ready'
+  | 'verifying'
+  | 'training'
+  | 'queued'
+  | 'failed'
+  // Backward-compatible alias for the pre-P4 SDK status (in-progress).
+  | 'processing';
+
+/** Whether a clone status is terminal (ready or failed → stop polling). */
+export function isTerminalCloneStatus(status: VoiceCloneStatus): boolean {
+  return status === 'ready' || status === 'failed';
+}
 
 /**
  * Request to clone a voice.
+ *
+ * Mirrors the gateway `VoiceCloneRequest` (`POST /voices/clone`). Supply samples as
+ * already-base64/URL `audioSamples` (canonical wire field) OR as raw `audioFiles`
+ * (ArrayBuffers, base64-encoded at send time). `name` + `provider` are required.
  */
 export interface VoiceCloneRequest {
   /** Name for the cloned voice */
   name: string;
-  /** Audio files for voice cloning (raw audio data) */
-  audioFiles: ArrayBuffer[];
   /** Provider to use for cloning */
   provider: VoiceCloneProvider;
-  /** Optional description */
+  /** Audio samples as base64 strings or URLs (canonical gateway wire field). */
+  audioSamples?: string[];
+  /** Raw audio buffers (convenience; base64-encoded into `audioSamples` at send). */
+  audioFiles?: ArrayBuffer[];
+  /** Optional description (Hume design / ElevenLabs label) */
   description?: string;
-  /** Optional labels/tags */
-  labels?: string[];
+  /** Optional labels/tags (ElevenLabs) */
+  labels?: Record<string, string> | string[];
+  /** Clone MODE: `instant` (default) or `professional` (async high-fidelity). */
+  mode?: CloneMode;
+  /** Design-from-existing: the base voice to clone/derive from (provider-specific). */
+  baseVoiceId?: string;
+  /** Remove background noise from samples (ElevenLabs IVC / LMNT enhance). */
+  removeBackgroundNoise?: boolean;
+  /** Sample text for voice generation (Hume only). */
+  sampleText?: string;
 }
 
 /**
- * Response from voice cloning operation.
+ * Response from voice cloning operation (gateway `VoiceCloneResponse`).
  */
 export interface VoiceCloneResponse {
-  /** Unique ID of the cloned voice */
+  /** Unique ID of the cloned voice (usable as a TTS voiceId once ready) */
   voiceId: string;
   /** Name of the voice */
   name: string;
   /** Provider used */
   provider: VoiceCloneProvider;
-  /** Current status */
-  status: 'ready' | 'processing' | 'failed';
+  /** Canonical status: ready | verifying | training | queued | failed */
+  status: VoiceCloneStatus;
+  /** Whether the voice still needs verification before use (ElevenLabs IVC) */
+  requiresVerification?: boolean;
   /** Creation timestamp (ISO 8601) */
   createdAt: string;
   /** Optional metadata */
@@ -52,7 +107,7 @@ export interface VoiceCloneFilter {
   /** Filter by provider */
   provider?: VoiceCloneProvider;
   /** Filter by status */
-  status?: 'ready' | 'processing' | 'failed';
+  status?: VoiceCloneStatus;
   /** Maximum number of results */
   limit?: number;
   /** Offset for pagination */
@@ -178,8 +233,9 @@ export function deserializeVoiceCloneResponse(wire: Record<string, unknown>): Vo
     voiceId: wire.voice_id as string,
     name: wire.name as string,
     provider: wire.provider as VoiceCloneProvider,
-    status: wire.status as VoiceCloneResponse['status'],
-    createdAt: wire.created_at as string,
+    status: wire.status as VoiceCloneStatus,
+    requiresVerification: wire.requires_verification as boolean | undefined,
+    createdAt: (wire.created_at as string | undefined) ?? '',
     metadata: wire.metadata as Record<string, unknown> | undefined,
     error: wire.error as string | undefined,
   };

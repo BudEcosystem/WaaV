@@ -24,6 +24,15 @@ use crate::core::tts::base::TTSConfig;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+fn validate_nectec_http_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -131,6 +140,9 @@ pub struct NectecTtsConfig {
 
     /// Whether to automatically chunk long text.
     pub auto_chunk: bool,
+
+    /// Override base (scheme+host) for the synth POST endpoint (mock/test harness; None = production).
+    pub endpoint_override: Option<String>,
 }
 
 impl Default for NectecTtsConfig {
@@ -142,6 +154,7 @@ impl Default for NectecTtsConfig {
             audiovisual: 0,
             request_timeout_secs: DEFAULT_REQUEST_TIMEOUT,
             auto_chunk: true,
+            endpoint_override: None,
         }
     }
 }
@@ -169,13 +182,42 @@ impl NectecTtsConfig {
             audiovisual: 0,
             request_timeout_secs: DEFAULT_REQUEST_TIMEOUT,
             auto_chunk: true,
+            endpoint_override: None,
         })
+    }
+
+    /// Build from the standardized TTS config (W1 keystone).
+    ///
+    /// NECTEC VAJA9 only synthesizes Thai at a fixed WAV/PCM output with a male/female speaker
+    /// selection (carried through `base.voice_id` by `from_base`). It exposes no prosody, emotion,
+    /// SSML, or sample-rate controls, so none of the standardized [`TtsFeatures`] map to a real
+    /// field — this is a pure `from_base` passthrough. The provider-specific `phrase_break` and
+    /// `audiovisual` knobs (not standard features) are read from the `extras` passthrough.
+    ///
+    /// [`TtsFeatures`]: crate::core::tts::standard::TtsFeatures
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> Result<Self, String> {
+        let mut cfg = Self::from_base(&std.base)?;
+        if let Some(phrase_break) = std.extras.0.get("phrase_break").and_then(|v| v.as_i64()) {
+            cfg.phrase_break = phrase_break as i32;
+        }
+        if let Some(audiovisual) = std.extras.0.get("audiovisual").and_then(|v| v.as_i64()) {
+            cfg.audiovisual = audiovisual as i32;
+        }
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
+        cfg.validate()?;
+        Ok(cfg)
     }
 
     /// Validate the configuration.
     pub fn validate(&self) -> Result<(), String> {
         if self.api_key.is_empty() {
             return Err("NECTEC API key is required".to_string());
+        }
+
+        if let Some(endpoint) = &self.endpoint_override {
+            validate_nectec_http_endpoint("endpoint_override", endpoint)?;
         }
 
         Ok(())
@@ -313,7 +355,7 @@ pub fn chunk_text(text: &str, max_len: usize) -> Vec<String> {
 
         // Try to find sentence break
         let break_point = chunk_text
-            .rfind(|c: char| c == '.' || c == '!' || c == '?' || c == '\n')
+            .rfind(['.', '!', '?', '\n'])
             .map(|p| p + 1)
             // Try word break
             .or_else(|| chunk_text.rfind(|c: char| c.is_whitespace()))
@@ -336,6 +378,38 @@ pub fn chunk_text(text: &str, max_len: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone: NECTEC has no prosody/emotion/SSML/sample-rate surface, so `from_standard` is a
+    // pure `from_base` passthrough — standardized features (speed, ssml, ...) are ignored — while
+    // the provider-specific `phrase_break` / `audiovisual` knobs flow through the extras passthrough.
+    #[test]
+    fn from_standard_passes_base_through_and_reads_extras() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("phrase_break".into(), serde_json::json!(2));
+        extras.insert("audiovisual".into(), serde_json::json!(1));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "nectec".into(),
+                api_key: "test_key".into(),
+                voice_id: Some("female".into()),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(1.5), // capability gap: NECTEC has no speed field, must be ignored
+                ssml: Some(true), // capability gap: NECTEC has no SSML, must be ignored
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+        let cfg = NectecTtsConfig::from_standard(&std).unwrap();
+        // Base carried through via from_base (api key + speaker selection).
+        assert_eq!(cfg.api_key, "test_key");
+        assert_eq!(cfg.voice, NectecVoice::Female);
+        // Provider-specific knobs flow through the extras passthrough.
+        assert_eq!(cfg.phrase_break, 2);
+        assert_eq!(cfg.audiovisual, 1);
+    }
 
     #[test]
     fn test_default_config() {
@@ -401,6 +475,30 @@ mod tests {
             ..Default::default()
         };
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = NectecTtsConfig {
+            api_key: "test_key".to_string(),
+            ..Default::default()
+        };
+
+        config.endpoint_override = Some("https://nectec-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.contains("SSRF protection"), "{err}");
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("non-HTTP endpoint_override must be rejected");
+        assert!(err.contains("not allowed"), "{err}");
     }
 
     #[test]

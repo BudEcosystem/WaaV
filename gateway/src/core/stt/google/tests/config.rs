@@ -216,6 +216,7 @@ fn test_google_stt_config_with_all_options() {
         speech_start_timeout: Some(Duration::from_secs(10)),
         speech_end_timeout: Some(Duration::from_secs(2)),
         single_utterance: true,
+        ..Default::default()
     };
 
     assert_eq!(config.base.language, "ja-JP");
@@ -287,6 +288,7 @@ fn test_config_serialization_roundtrip() {
         speech_start_timeout: Some(Duration::from_millis(3500)),
         speech_end_timeout: Some(Duration::from_millis(750)),
         single_utterance: true,
+        ..Default::default()
     };
 
     let json = serde_json::to_string(&original).expect("Serialization failed");

@@ -3,7 +3,7 @@
  * Buffers messages during disconnection/reconnection
  */
 
-import type { OutgoingMessage } from '../types/messages.js';
+import type { SDKOutgoingMessage } from './messages.js';
 
 /**
  * Queue configuration
@@ -21,8 +21,8 @@ export interface MessageQueueConfig {
  * Queued message with metadata
  */
 interface QueuedMessage {
-  /** The message */
-  message: OutgoingMessage;
+  /** The JSON message (absent for raw binary audio frames) */
+  message?: SDKOutgoingMessage;
   /** Timestamp when queued */
   timestamp: number;
   /** Binary data if applicable */
@@ -53,7 +53,7 @@ export class MessageQueue {
   /**
    * Add message to queue
    */
-  enqueue(message: OutgoingMessage, binaryData?: ArrayBuffer | Uint8Array): boolean {
+  enqueue(message?: SDKOutgoingMessage, binaryData?: ArrayBuffer | Uint8Array): boolean {
     // Remove expired messages first
     this.removeExpired();
 
@@ -81,7 +81,7 @@ export class MessageQueue {
   /**
    * Dequeue next message
    */
-  dequeue(): { message: OutgoingMessage; binaryData?: ArrayBuffer | Uint8Array } | null {
+  dequeue(): { message?: SDKOutgoingMessage; binaryData?: ArrayBuffer | Uint8Array } | null {
     this.removeExpired();
 
     const item = this.queue.shift();
@@ -96,7 +96,7 @@ export class MessageQueue {
   /**
    * Peek at next message without removing
    */
-  peek(): OutgoingMessage | null {
+  peek(): SDKOutgoingMessage | null {
     this.removeExpired();
     return this.queue[0]?.message ?? null;
   }
@@ -104,7 +104,7 @@ export class MessageQueue {
   /**
    * Get all queued messages and clear queue
    */
-  drain(): Array<{ message: OutgoingMessage; binaryData?: ArrayBuffer | Uint8Array }> {
+  drain(): Array<{ message?: SDKOutgoingMessage; binaryData?: ArrayBuffer | Uint8Array }> {
     this.removeExpired();
 
     const messages = this.queue.map((item) => ({

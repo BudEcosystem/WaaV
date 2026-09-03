@@ -12,6 +12,15 @@ use super::{
 };
 use crate::core::tts::base::{TTSConfig, TTSError};
 
+fn validate_smallest_tts_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 // =============================================================================
 // SmallestModel
 // =============================================================================
@@ -19,9 +28,11 @@ use crate::core::tts::base::{TTSConfig, TTSError};
 /// Smallest.ai TTS models.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[derive(Default)]
 pub enum SmallestModel {
     /// Lightning model - fastest, ~100ms latency, REST API.
     #[serde(alias = "lightning")]
+    #[default]
     Lightning,
 
     /// Lightning-Large model - voice cloning support, ~300ms latency.
@@ -74,12 +85,6 @@ impl SmallestModel {
             Self::LightningV2 => 200,
             Self::Thunder => 200,
         }
-    }
-}
-
-impl Default for SmallestModel {
-    fn default() -> Self {
-        Self::Lightning
     }
 }
 
@@ -375,11 +380,20 @@ pub struct SmallestTtsConfig {
     /// Audio enhancement level (0-2, for lightning-large only).
     pub enhancement: u8,
 
+    /// Max wait (ms) before the lightning-v2 streaming WebSocket flushes its output buffer
+    /// (`max_buffer_flush_ms` in the `get_speech/stream` request; 0-1000ms). A latency/chunking
+    /// knob, not an audio-content knob, so it stays out of the synthesis cache key. `None` lets
+    /// the server default apply.
+    pub max_buffer_flush_ms: Option<u32>,
+
     /// Connection timeout in seconds.
     pub connection_timeout: u64,
 
     /// Request timeout in seconds.
     pub request_timeout: u64,
+
+    /// Optional base URL override for the synth REST endpoint (test/mock redirection).
+    pub endpoint_override: Option<String>,
 }
 
 impl SmallestTtsConfig {
@@ -436,9 +450,73 @@ impl SmallestTtsConfig {
             consistency: DEFAULT_CONSISTENCY,
             similarity: DEFAULT_SIMILARITY,
             enhancement: DEFAULT_ENHANCEMENT,
+            max_buffer_flush_ms: None,
             connection_timeout,
             request_timeout,
+            endpoint_override: None,
         })
+    }
+
+    /// Build from the standardized TTS config (W1 keystone).
+    ///
+    /// Smallest exposes a speed multiplier plus the lightning-large voice knobs, so this maps
+    /// `speed` -> `speed` (reusing `from_base`'s `MIN_SPEED..=model.max_speed()` clamp so 1.0 stays
+    /// normal), the ElevenLabs-style `stability` -> `consistency` and `similarity_boost` ->
+    /// `similarity` (both direct 0-1 levels, clamped to their valid ranges), `language` -> the
+    /// `SmallestLanguage` enum (rejecting unknown non-empty values), and `sample_rate` ->
+    /// `sample_rate` (snapped to the nearest supported rate). Smallest's non-standard
+    /// `enhancement` level and the
+    /// lightning-v2 streaming `max_buffer_flush_ms` knob are read from the `extras` passthrough.
+    /// Features without a Smallest field (pitch, volume, style, use_speaker_boost, emotion,
+    /// instructions, ssml, word_timestamps, streaming, seed) are skipped.
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> Result<Self, TTSError> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(std.base.clone())?;
+
+        if let Some(speed) = f.speed {
+            // Reuse from_base's clamp: a 1.0-is-normal multiplier bounded by the model's max speed.
+            cfg.speed = speed.clamp(MIN_SPEED, cfg.model.max_speed());
+        }
+        if let Some(stability) = f.stability {
+            // Smallest voice consistency is a direct 0-1 level (lightning-large only).
+            cfg.consistency = stability.clamp(MIN_CONSISTENCY, MAX_CONSISTENCY);
+        }
+        if let Some(similarity_boost) = f.similarity_boost {
+            // Smallest voice similarity is a direct 0-1 level (lightning-large only).
+            cfg.similarity = similarity_boost.clamp(MIN_SIMILARITY, MAX_SIMILARITY);
+        }
+        if let Some(language) = f
+            .language
+            .as_deref()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+        {
+            cfg.language = language.parse()?;
+        }
+        if let Some(rate) = f.sample_rate {
+            cfg.sample_rate = super::nearest_sample_rate(rate);
+        }
+
+        // Provider-specific passthrough.
+        if let Some(enhancement) = std.extras.0.get("enhancement").and_then(|v| v.as_u64()) {
+            cfg.enhancement = (enhancement as u8).clamp(MIN_ENHANCEMENT, MAX_ENHANCEMENT);
+        }
+        // lightning-v2 streaming buffer-flush latency knob (0-1000ms), reaches the WS request body.
+        if let Some(ms) = std
+            .extras
+            .0
+            .get("max_buffer_flush_ms")
+            .and_then(|v| v.as_u64())
+        {
+            cfg.max_buffer_flush_ms = Some((ms.min(1000)) as u32);
+        }
+
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
+        cfg.validate()?;
+
+        Ok(cfg)
     }
 
     /// Validates the configuration.
@@ -477,11 +555,18 @@ impl SmallestTtsConfig {
             )));
         }
 
-        if self.enhancement < MIN_ENHANCEMENT || self.enhancement > MAX_ENHANCEMENT {
+        // `enhancement` is a `u8` and `MIN_ENHANCEMENT == 0`, so the lower bound is
+        // guaranteed by the type; only the upper bound needs validating.
+        if self.enhancement > MAX_ENHANCEMENT {
             return Err(TTSError::InvalidConfiguration(format!(
                 "Enhancement must be between {} and {}",
                 MIN_ENHANCEMENT, MAX_ENHANCEMENT
             )));
+        }
+
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_smallest_tts_endpoint("endpoint_override", endpoint)
+                .map_err(TTSError::InvalidConfiguration)?;
         }
 
         Ok(())
@@ -566,6 +651,114 @@ mod tests {
             request_pool_size: Some(4),
             emotion_config: None,
         }
+    }
+
+    // W1 keystone (TTS): the standardized features Smallest can express — the speed multiplier,
+    // the lightning-large voice knobs (stability -> consistency, similarity_boost -> similarity),
+    // the synthesis language, and the output sample rate — reach the config fields, and the open
+    // extras passthrough carries the provider-specific enhancement level.
+    #[test]
+    fn from_standard_maps_speed_voice_knobs_language_and_extras() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("enhancement".into(), serde_json::json!(2));
+        let std = StandardTTSConfig {
+            base: create_test_config(),
+            features: TtsFeatures {
+                speed: Some(1.5),
+                stability: Some(0.8),
+                similarity_boost: Some(0.7),
+                language: Some("hi".into()),
+                sample_rate: Some(16000),
+                ssml: Some(true), // capability gap: Smallest has no SSML, must be ignored
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+        let cfg = SmallestTtsConfig::from_standard(&std).unwrap();
+        // Lightning model max speed is 2.0, so 1.5 passes through the clamp unchanged.
+        assert!((cfg.speed - 1.5).abs() < 0.001);
+        assert!((cfg.consistency - 0.8).abs() < 0.001); // stability -> consistency
+        assert!((cfg.similarity - 0.7).abs() < 0.001); // similarity_boost -> similarity
+        assert_eq!(cfg.language, SmallestLanguage::Hindi);
+        assert_eq!(cfg.sample_rate, 16000);
+        assert_eq!(cfg.enhancement, 2); // from extras passthrough
+    }
+
+    // The lightning-v2 streaming `max_buffer_flush_ms` knob arrives via the extras passthrough and
+    // reaches the config field (clamped to the 0-1000ms documented range).
+    #[test]
+    fn from_standard_maps_max_buffer_flush_ms_from_extras() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("max_buffer_flush_ms".into(), serde_json::json!(250));
+        let std = StandardTTSConfig {
+            base: create_test_config(),
+            features: TtsFeatures::default(),
+            extras: ProviderExtras(extras),
+        };
+        let cfg = SmallestTtsConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.max_buffer_flush_ms, Some(250));
+
+        // Over-range values are clamped to the documented 1000ms ceiling.
+        let mut extras = serde_json::Map::new();
+        extras.insert("max_buffer_flush_ms".into(), serde_json::json!(5000));
+        let std = StandardTTSConfig {
+            base: create_test_config(),
+            features: TtsFeatures::default(),
+            extras: ProviderExtras(extras),
+        };
+        let cfg = SmallestTtsConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.max_buffer_flush_ms, Some(1000));
+    }
+
+    #[test]
+    fn from_standard_rejects_unknown_language() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+
+        let std = StandardTTSConfig {
+            base: create_test_config(),
+            features: TtsFeatures {
+                language: Some("klingon".into()),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+
+        let err = SmallestTtsConfig::from_standard(&std)
+            .expect_err("unknown Smallest.ai language must be rejected");
+        assert!(err.to_string().contains("Unknown language: klingon"));
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = SmallestTtsConfig::from_base(create_test_config()).unwrap();
+
+        config.endpoint_override = Some("https://smallest-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(format!("{err:?}").contains("SSRF protection"));
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("file endpoint_override must be rejected");
+        assert!(format!("{err:?}").contains("URL scheme"));
+
+        config.endpoint_override = Some("ws://smallest-proxy.example.com".to_string());
+        let err = config
+            .validate()
+            .expect_err("WebSocket endpoint_override must be rejected");
+        assert!(format!("{err:?}").contains("URL scheme"));
+
+        let std = crate::core::tts::standard::StandardTTSConfig::from_base(create_test_config())
+            .with_endpoint_override("file:///tmp/socket");
+        assert!(SmallestTtsConfig::from_standard(&std).is_err());
     }
 
     // =========================================================================

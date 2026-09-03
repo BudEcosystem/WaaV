@@ -31,18 +31,26 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use tracing::{debug, info};
 use xxhash_rust::xxh3::xxh3_128;
 
 use super::config::{SmallestLanguage, SmallestModel, SmallestOutputFormat, SmallestTtsConfig};
-use super::messages::{SmallestTtsRequest, SmallestVoice, SmallestVoicesResponse};
-use super::{MAX_TEXT_LENGTH, SMALLEST_TTS_URL, SUPPORTED_SAMPLE_RATES, voices_url};
+use super::messages::{
+    SmallestTtsRequest, SmallestVoice, SmallestVoicesResponse, SmallestWsRequest,
+};
+use super::{
+    MAX_TEXT_LENGTH, SMALLEST_TTS_URL, SMALLEST_TTS_WS_URL, SUPPORTED_SAMPLE_RATES, voices_url,
+};
 use crate::core::tts::base::{
     AudioCallback, BaseTTS, ConnectionState, TTSConfig, TTSError, TTSResult,
 };
 use crate::core::tts::provider::{PronunciationReplacer, TTSProvider, TTSRequestBuilder};
 use crate::utils::req_manager::ReqManager;
+
+fn smallest_tts_http_client() -> Result<reqwest::Client, reqwest::Error> {
+    crate::core::net::ssrf_protected_client_builder(crate::core::net::HTTP_URL_SCHEMES).build()
+}
 
 // =============================================================================
 // Request Builder
@@ -84,9 +92,36 @@ impl SmallestRequestBuilder {
         SMALLEST_TTS_URL
     }
 
+    /// Get the lightning-v2 streaming WebSocket endpoint URL.
+    pub fn ws_url(&self) -> &str {
+        SMALLEST_TTS_WS_URL
+    }
+
     /// Get the Smallest configuration
     pub fn smallest_config(&self) -> &SmallestTtsConfig {
         &self.config
+    }
+
+    /// Build the lightning-v2 streaming WebSocket request body for the
+    /// `wss://waves-api.smallest.ai/api/v1/lightning-v2/get_speech/stream` endpoint.
+    ///
+    /// This is the wire body the streaming path sends; it carries the voice params plus the
+    /// `max_buffer_flush_ms` buffer-flush latency knob (omitted when unset so the server default
+    /// applies). Mirrors [`Self::build_http_request`] for the REST path.
+    pub fn build_ws_request(&self, text: &str) -> SmallestWsRequest {
+        let mut request = SmallestWsRequest::new(text, &self.config.voice_id)
+            .with_language(self.config.language.as_code())
+            .with_sample_rate(self.config.sample_rate)
+            .with_speed(self.config.speed)
+            .with_consistency(self.config.consistency)
+            .with_similarity(self.config.similarity)
+            .with_enhancement(self.config.enhancement);
+
+        if let Some(ms) = self.config.max_buffer_flush_ms {
+            request = request.with_max_buffer_flush_ms(ms);
+        }
+
+        request
     }
 }
 
@@ -99,16 +134,8 @@ impl TTSRequestBuilder for SmallestRequestBuilder {
             .with_language(self.config.language.as_code())
             .with_output_format(self.config.format.as_str());
 
-        // Build headers
-        let mut headers = HeaderMap::new();
-
-        // Smallest.ai uses Bearer token authentication
+        // Smallest.ai uses Bearer token authentication.
         let auth_value = format!("Bearer {}", self.config.api_key);
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&auth_value).unwrap_or_else(|_| HeaderValue::from_static("")),
-        );
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
         debug!(
             "Smallest.ai TTS request: voice={}, model={}, format={}, sample_rate={}, speed={}",
@@ -121,8 +148,12 @@ impl TTSRequestBuilder for SmallestRequestBuilder {
 
         // Build and return the request
         client
-            .post(self.rest_url())
-            .headers(headers)
+            .post(crate::core::tts::standard::override_rest_endpoint(
+                self.rest_url(),
+                self.config.endpoint_override.as_deref(),
+            ))
+            .header(AUTHORIZATION, auth_value)
+            .header(CONTENT_TYPE, "application/json")
             .json(&request_body)
     }
 
@@ -181,6 +212,11 @@ fn compute_smallest_tts_config_hash(
     if let Some(rate) = config.speaking_rate {
         s.push_str(&format!("{rate:.3}"));
     }
+
+    // NOTE: `max_buffer_flush_ms` is deliberately NOT part of this key. It is a streaming
+    // buffer-flush latency/chunking knob (lightning-v2 WS), not an audio-content parameter — the
+    // synthesized samples are identical regardless of its value — so folding it in would only
+    // fragment the cache without correctness benefit (the cache-collision/over-keying review note).
 
     // Compute xxHash3-128 and format as hex
     let hash = xxh3_128(s.as_bytes());
@@ -260,7 +296,8 @@ impl SmallestTts {
         api_key: &str,
         model: &super::config::SmallestModel,
     ) -> TTSResult<Vec<SmallestVoice>> {
-        let client = reqwest::Client::new();
+        let client = smallest_tts_http_client()
+            .map_err(|e| TTSError::NetworkError(format!("Failed to build HTTP client: {e}")))?;
         let url = voices_url(model);
 
         let response = client
@@ -368,6 +405,28 @@ impl SmallestTts {
         self.config_hash =
             compute_smallest_tts_config_hash(&self.base_config, &self.smallest_config);
     }
+
+    /// Build from the standardized TTS config (W1 keystone).
+    ///
+    /// Mirrors `DeepgramTTS::from_standard`: maps the standardized features onto Smallest's
+    /// provider config via [`SmallestTtsConfig::from_standard`] (speed, stability -> consistency,
+    /// similarity_boost -> similarity, language, sample_rate + the enhancement extra), then
+    /// constructs the provider mirroring [`BaseTTS::new`]. Capability gaps (pitch, volume, style,
+    /// emotion, instructions, ssml, seed, …) have no Smallest field and stay at their defaults.
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
+        let smallest_config = SmallestTtsConfig::from_standard(std)?;
+        smallest_config.validate()?;
+
+        let base_config = std.base.clone();
+        let config_hash = compute_smallest_tts_config_hash(&base_config, &smallest_config);
+
+        Ok(Self {
+            provider: TTSProvider::new(),
+            smallest_config,
+            base_config,
+            config_hash,
+        })
+    }
 }
 
 #[async_trait]
@@ -395,7 +454,7 @@ impl BaseTTS for SmallestTts {
         let config_hash = compute_smallest_tts_config_hash(&config, &smallest_config);
 
         Ok(Self {
-            provider: TTSProvider::new()?,
+            provider: TTSProvider::new(),
             smallest_config,
             base_config: config,
             config_hash,
@@ -553,6 +612,7 @@ impl BaseTTS for SmallestTts {
 mod tests {
     use super::*;
     use crate::core::tts::smallest::{SmallestModel, SmallestOutputFormat};
+    use std::io::ErrorKind;
 
     fn create_test_config() -> TTSConfig {
         TTSConfig {
@@ -569,6 +629,146 @@ mod tests {
             request_pool_size: Some(4),
             emotion_config: None,
         }
+    }
+
+    // The provider struct's `from_standard` (mirroring `DeepgramTTS::from_standard`) maps a
+    // standardized advanced feature (speed) all the way onto the provider config the request
+    // builder reads — proving the standardized dispatch path reaches the struct, not just the
+    // config-level method.
+    #[test]
+    fn from_standard_maps_speed_onto_provider_config() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let std = StandardTTSConfig {
+            base: create_test_config(),
+            features: TtsFeatures {
+                speed: Some(1.5),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let tts = SmallestTts::from_standard(&std).unwrap();
+        assert_eq!(tts.smallest_config().speed, 1.5);
+    }
+
+    // WIRE-LEVEL: `max_buffer_flush_ms` (from the extras passthrough) must reach the actual
+    // lightning-v2 streaming WS request BODY that is sent to
+    // wss://waves-api.smallest.ai/api/v1/lightning-v2/get_speech/stream — not merely the config
+    // struct. Asserts on the serialized JSON the streaming endpoint receives, guarding the
+    // recurring "config set but never serialized to the wire" bug class.
+    #[test]
+    fn max_buffer_flush_ms_reaches_streaming_ws_request_body() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("max_buffer_flush_ms".into(), serde_json::json!(250));
+        let std = StandardTTSConfig {
+            base: {
+                let mut c = create_test_config();
+                c.model = "lightning-v2".to_string();
+                c
+            },
+            features: TtsFeatures::default(),
+            extras: ProviderExtras(extras),
+        };
+        let tts = SmallestTts::from_standard(&std).unwrap();
+        assert_eq!(tts.smallest_config().max_buffer_flush_ms, Some(250));
+
+        // Build the actual streaming WS request body and serialize it to the wire JSON.
+        let builder = tts.create_request_builder();
+        assert_eq!(
+            builder.ws_url(),
+            "wss://waves-api.smallest.ai/api/v1/lightning-v2/get_speech/stream"
+        );
+        let ws_request = builder.build_ws_request("Hello streaming");
+        let json = serde_json::to_string(&ws_request).unwrap();
+        // The exact wire param name with the configured value must be present in the body.
+        assert!(
+            json.contains("\"max_buffer_flush_ms\":250"),
+            "max_buffer_flush_ms missing from streaming WS body: {json}"
+        );
+    }
+
+    // WIRE-LEVEL counterpart: when unset, `max_buffer_flush_ms` must be OMITTED from the WS body
+    // (serde skip_serializing_if) so the server default applies — no spurious value on the wire.
+    #[test]
+    fn max_buffer_flush_ms_omitted_from_ws_body_when_unset() {
+        let mut config = create_test_config();
+        config.model = "lightning-v2".to_string();
+        let tts = SmallestTts::new(config).unwrap();
+
+        let builder = tts.create_request_builder();
+        let ws_request = builder.build_ws_request("Hello");
+        let json = serde_json::to_string(&ws_request).unwrap();
+        assert!(
+            !json.contains("max_buffer_flush_ms"),
+            "max_buffer_flush_ms must be omitted when unset: {json}"
+        );
+    }
+
+    #[test]
+    fn invalid_smallest_api_key_header_value_is_request_build_error() {
+        let mut config = create_test_config();
+        config.api_key = "bad\nkey".to_string();
+
+        let smallest_config = SmallestTtsConfig::from_base(config.clone()).unwrap();
+        let builder = SmallestRequestBuilder::new(smallest_config, config);
+        let err = builder
+            .build_http_request(&reqwest::Client::new(), "hello")
+            .build()
+            .expect_err(
+                "malformed Smallest.ai API key must not become an empty Authorization header",
+            );
+
+        assert!(err.is_builder(), "unexpected reqwest error: {err}");
+    }
+
+    #[tokio::test]
+    async fn smallest_tts_redirect_policy_rejects_private_hop() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) => {
+                if err.kind() == ErrorKind::PermissionDenied {
+                    eprintln!("Skipping smallest_tts_redirect_policy_rejects_private_hop: {err}");
+                    return;
+                }
+                panic!("Failed to bind redirect test server listener: {err}");
+            }
+        };
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 302 Found\r\n",
+                "Location: http://127.0.0.1:9/metadata\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n"
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+
+        let err = smallest_tts_http_client()
+            .unwrap()
+            .get(format!("http://{addr}/start"))
+            .send()
+            .await
+            .expect_err("private redirect target must be rejected");
+        let mut error_chain = err.to_string();
+        let mut source = std::error::Error::source(&err);
+        while let Some(error) = source {
+            error_chain.push_str(": ");
+            error_chain.push_str(&error.to_string());
+            source = error.source();
+        }
+        assert!(
+            error_chain.contains("redirect URL rejected"),
+            "unexpected redirect error: {error_chain}"
+        );
     }
 
     // =========================================================================

@@ -27,6 +27,24 @@
 use crate::core::tts::base::{TTSConfig, TTSError};
 use serde::{Deserialize, Serialize};
 
+fn validate_fpt_http_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
+fn validate_fpt_callback_url(source: &str, url: &str) -> Result<(), String> {
+    let url = url.trim();
+    if url.is_empty() {
+        return Err(format!("{source} rejected (SSRF protection): empty URL"));
+    }
+    crate::core::net::validate_url_for_ssrf(url, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -237,6 +255,9 @@ pub struct FptTtsConfig {
 
     /// Optional callback URL for async notification.
     pub callback_url: Option<String>,
+
+    /// Optional base URL override for the synth endpoint (host/scheme swap; for tests/proxies).
+    pub endpoint_override: Option<String>,
 }
 
 impl Default for FptTtsConfig {
@@ -248,6 +269,7 @@ impl Default for FptTtsConfig {
             format: FptAudioFormat::default(),
             request_timeout_secs: DEFAULT_REQUEST_TIMEOUT,
             callback_url: None,
+            endpoint_override: None,
         }
     }
 }
@@ -301,7 +323,43 @@ impl FptTtsConfig {
             format,
             request_timeout_secs,
             callback_url: None,
+            endpoint_override: None,
         })
+    }
+
+    /// Build from the standardized TTS config (W1 keystone).
+    ///
+    /// FPT.AI's only adjustable delivery knob is integer `speed` (-3..=+3), so the standardized
+    /// [`speed`] feature maps there — converted from the float multiplier the same way `from_base`
+    /// converts `speaking_rate` (1.0 → 0, 0.5 → -3, 2.0 → +3) and clamped to the API range. The
+    /// provider-specific `callback_url` is read from the open `extras` passthrough. FPT.AI exposes
+    /// no pitch / volume / stability / emotion / instructions / SSML / language / word-timestamp /
+    /// seed / sample-rate surface, so those features are skipped.
+    ///
+    /// [`speed`]: crate::core::tts::standard::TtsFeatures::speed
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> Result<Self, TTSError> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(std.base.clone())?;
+
+        if let Some(rate) = f.speed {
+            // Map the float multiplier (typically 0.5-2.0) to FPT's -3..=+3 scale,
+            // matching `from_base`'s `speaking_rate` conversion.
+            let mapped = ((rate - 1.0) * 6.0).round() as i8;
+            cfg.speed = mapped.clamp(MIN_SPEED, MAX_SPEED);
+        }
+
+        // Provider-specific passthrough.
+        if let Some(url) = std.extras.0.get("callback_url").and_then(|v| v.as_str()) {
+            cfg.callback_url = Some(url.to_string());
+        }
+
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
+
+        cfg.validate().map_err(TTSError::InvalidConfiguration)?;
+
+        Ok(cfg)
     }
 
     /// Validate the configuration.
@@ -315,6 +373,13 @@ impl FptTtsConfig {
                 "Speed must be between {} and {}, got {}",
                 MIN_SPEED, MAX_SPEED, self.speed
             ));
+        }
+
+        if let Some(endpoint) = &self.endpoint_override {
+            validate_fpt_http_endpoint("endpoint_override", endpoint)?;
+        }
+        if let Some(callback_url) = &self.callback_url {
+            validate_fpt_callback_url("callback_url", callback_url)?;
         }
 
         Ok(())
@@ -389,6 +454,38 @@ impl FptTtsResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone (TTS): the standardized `speed` feature reaches FPT's integer `speed` field
+    // (via the same `speaking_rate` conversion `from_base` uses), and the provider-specific
+    // `callback_url` flows through the open extras passthrough.
+    #[test]
+    fn from_standard_maps_speed_and_callback_url() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+
+        let mut extras = serde_json::Map::new();
+        extras.insert(
+            "callback_url".into(),
+            serde_json::json!("https://example.com/cb"),
+        );
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "fpt_ai".into(),
+                api_key: "k".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(1.5),         // 1.5 -> +3 on FPT's -3..=+3 scale
+                ssml: Some(true),         // capability gap: FPT has no SSML, must be ignored
+                sample_rate: Some(48000), // capability gap: FPT rate is fixed, must be ignored
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+
+        let cfg = FptTtsConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.speed, 3); // mapped feature reached the speed field
+        assert_eq!(cfg.callback_url, Some("https://example.com/cb".to_string())); // extras passthrough
+    }
 
     #[test]
     fn test_voice_ids() {
@@ -571,6 +668,85 @@ mod tests {
         config.api_key = "test_key".to_string();
 
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = FptTtsConfig {
+            api_key: "test_key".to_string(),
+            ..Default::default()
+        };
+
+        config.endpoint_override = Some("https://fpt-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.contains("SSRF protection"), "{err}");
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("non-HTTP endpoint_override must be rejected");
+        assert!(err.contains("not allowed"), "{err}");
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_callback_url() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = FptTtsConfig {
+            api_key: "test_key".to_string(),
+            ..Default::default()
+        };
+
+        config.callback_url = Some("https://callback.example.com/fpt".to_string());
+        assert!(config.validate().is_ok());
+
+        config.callback_url = Some("   ".to_string());
+        let err = config
+            .validate()
+            .expect_err("empty callback_url must be rejected when configured");
+        assert!(err.contains("empty URL"), "{err}");
+
+        config.callback_url = Some("http://127.0.0.1:9000/fpt".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback callback_url must be rejected");
+        assert!(err.contains("SSRF protection"), "{err}");
+
+        config.callback_url = Some("file:///tmp/fpt-callback".to_string());
+        let err = config
+            .validate()
+            .expect_err("non-HTTP callback_url must be rejected");
+        assert!(err.contains("not allowed"), "{err}");
+    }
+
+    #[test]
+    fn from_standard_rejects_ssrf_callback_url_extra() {
+        let _env = crate::core::net::ssrf_env_lock();
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig};
+
+        let mut extras = serde_json::Map::new();
+        extras.insert(
+            "callback_url".to_string(),
+            serde_json::json!("http://127.0.0.1:9000/fpt"),
+        );
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "fpt-ai".to_string(),
+                api_key: "test_key".to_string(),
+                ..Default::default()
+            },
+            features: Default::default(),
+            extras: ProviderExtras(extras),
+        };
+
+        let err = FptTtsConfig::from_standard(&std)
+            .expect_err("standardized callback_url extra must be validated");
+        assert!(err.to_string().contains("SSRF protection"), "{err}");
     }
 
     #[test]

@@ -25,6 +25,7 @@ use crate::core::stt::base::{
     BaseSTT, STTConfig, STTConnectionState, STTError, STTErrorCallback, STTResult,
     STTResultCallback,
 };
+use crate::core::stt::wav as stt_wav;
 use bytes::Bytes;
 use reqwest::{
     Client,
@@ -45,7 +46,7 @@ pub struct ViettelStt {
     /// Base STT configuration.
     base_config: Option<STTConfig>,
     /// HTTP client for REST API calls.
-    http_client: Client,
+    http_client: Option<Client>,
     /// Whether the client is ready to receive audio.
     is_ready: AtomicBool,
     /// Current connection state.
@@ -58,7 +59,57 @@ pub struct ViettelStt {
     error_callback: Arc<RwLock<Option<STTErrorCallback>>>,
 }
 
+fn viettel_stt_http_client(timeout_secs: u64) -> Result<Client, reqwest::Error> {
+    crate::core::net::ssrf_protected_client_builder(crate::core::net::HTTP_URL_SCHEMES)
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .build()
+}
+
+fn default_viettel_stt_http_client() -> Option<Client> {
+    match viettel_stt_http_client(super::config::DEFAULT_REQUEST_TIMEOUT) {
+        Ok(client) => Some(client),
+        Err(err) => {
+            warn!(
+                error = %err,
+                "failed to create default Viettel STT HTTP client; default instance is inert until rebuilt with a valid config"
+            );
+            None
+        }
+    }
+}
+
 impl ViettelStt {
+    /// W1 keystone — construct directly from the standardized config. Viettel AI is a simple
+    /// batch decode endpoint that exposes no advanced-feature surface, so `from_standard` is a
+    /// pure `from_base` passthrough: this gives a uniform standardized entry point that carries
+    /// the base config through unchanged. Mirrors `DeepgramSTT::new_standard`.
+    pub fn new_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        if std.base.api_key.is_empty() {
+            return Err(STTError::AuthenticationFailed(
+                "Viettel AI API token is required".to_string(),
+            ));
+        }
+        let viettel_config = ViettelSttConfig::from_standard(std)?;
+
+        let timeout_secs = viettel_config.request_timeout_secs;
+        let http_client = viettel_stt_http_client(timeout_secs).map_err(|e| {
+            STTError::ConfigurationError(format!("Failed to create HTTP client: {e}"))
+        })?;
+
+        Ok(Self {
+            config: viettel_config,
+            base_config: Some(std.base.clone()),
+            http_client: Some(http_client),
+            is_ready: AtomicBool::new(false),
+            connection_state: Arc::new(RwLock::new(STTConnectionState::Disconnected)),
+            audio_buffer: Arc::new(RwLock::new(Vec::with_capacity(MAX_AUDIO_BUFFER_SIZE))),
+            result_callback: Arc::new(RwLock::new(None)),
+            error_callback: Arc::new(RwLock::new(None)),
+        })
+    }
+
     /// Process buffered audio and get transcription.
     async fn process_audio(&self, audio_data: Vec<u8>) -> Result<String, STTError> {
         if audio_data.len() < MIN_AUDIO_BUFFER_SIZE {
@@ -76,7 +127,7 @@ impl ViettelStt {
         );
 
         // Build WAV header for raw PCM data
-        let wav_data = self.wrap_in_wav(&audio_data);
+        let wav_data = self.wrap_in_wav(&audio_data)?;
 
         // Create multipart form with audio file
         let part = Part::bytes(wav_data)
@@ -88,11 +139,22 @@ impl ViettelStt {
 
         let form = Form::new().part("file", part);
 
-        // Build request with headers
-        let mut request_builder = self
-            .http_client
-            .post(VIETTEL_STT_ENDPOINT)
-            .header("token", &self.config.api_key);
+        // Build request with headers. When `endpoint_override` is set (credential-free mock harness),
+        // its scheme://host replaces the production host; the decode_file path is preserved.
+        let url = match &self.config.endpoint_override {
+            Some(ov) => format!(
+                "{}/voice/api/asr/v1/rest/decode_file",
+                ov.trim_end_matches('/')
+            ),
+            None => VIETTEL_STT_ENDPOINT.to_string(),
+        };
+        let http_client = self.http_client.as_ref().ok_or_else(|| {
+            STTError::ConfigurationError(
+                "Viettel STT default HTTP client is unavailable; construct with ViettelStt::new or new_standard".to_string(),
+            )
+        })?;
+
+        let mut request_builder = http_client.post(&url).header("token", &self.config.api_key);
 
         // Add PCM format headers if needed
         request_builder = request_builder
@@ -176,38 +238,9 @@ impl ViettelStt {
     }
 
     /// Wrap raw PCM data in a WAV container.
-    fn wrap_in_wav(&self, pcm_data: &[u8]) -> Vec<u8> {
-        let sample_rate = self.config.sample_rate;
-        let channels = self.config.channels;
-        let bits_per_sample: u16 = 16;
-        let byte_rate = sample_rate * u32::from(channels) * u32::from(bits_per_sample) / 8;
-        let block_align = channels * bits_per_sample / 8;
-        let data_size = pcm_data.len() as u32;
-        let file_size = 36 + data_size;
-
-        let mut wav = Vec::with_capacity(44 + pcm_data.len());
-
-        // RIFF header
-        wav.extend_from_slice(b"RIFF");
-        wav.extend_from_slice(&file_size.to_le_bytes());
-        wav.extend_from_slice(b"WAVE");
-
-        // fmt chunk
-        wav.extend_from_slice(b"fmt ");
-        wav.extend_from_slice(&16u32.to_le_bytes()); // chunk size
-        wav.extend_from_slice(&1u16.to_le_bytes()); // audio format (PCM)
-        wav.extend_from_slice(&channels.to_le_bytes());
-        wav.extend_from_slice(&sample_rate.to_le_bytes());
-        wav.extend_from_slice(&byte_rate.to_le_bytes());
-        wav.extend_from_slice(&block_align.to_le_bytes());
-        wav.extend_from_slice(&bits_per_sample.to_le_bytes());
-
-        // data chunk
-        wav.extend_from_slice(b"data");
-        wav.extend_from_slice(&data_size.to_le_bytes());
-        wav.extend_from_slice(pcm_data);
-
-        wav
+    fn wrap_in_wav(&self, pcm_data: &[u8]) -> Result<Vec<u8>, STTError> {
+        stt_wav::encode_pcm16_wav(pcm_data, self.config.sample_rate, self.config.channels)
+            .map_err(|e| STTError::AudioProcessingError(format!("Invalid WAV parameters: {e}")))
     }
 
     /// Flush the audio buffer and get transcription.
@@ -256,7 +289,7 @@ impl Default for ViettelStt {
         Self {
             config: ViettelSttConfig::default(),
             base_config: None,
-            http_client: Client::new(),
+            http_client: default_viettel_stt_http_client(),
             is_ready: AtomicBool::new(false),
             connection_state: Arc::new(RwLock::new(STTConnectionState::Disconnected)),
             audio_buffer: Arc::new(RwLock::new(Vec::with_capacity(MAX_AUDIO_BUFFER_SIZE))),
@@ -272,12 +305,9 @@ impl BaseSTT for ViettelStt {
         let viettel_config = ViettelSttConfig::from_base(&config)?;
 
         let timeout_secs = viettel_config.request_timeout_secs;
-        let http_client = Client::builder()
-            .timeout(std::time::Duration::from_secs(timeout_secs))
-            .build()
-            .map_err(|e| {
-                STTError::ConfigurationError(format!("Failed to create HTTP client: {e}"))
-            })?;
+        let http_client = viettel_stt_http_client(timeout_secs).map_err(|e| {
+            STTError::ConfigurationError(format!("Failed to create HTTP client: {e}"))
+        })?;
 
         info!(
             "Viettel STT: Initialized with sample_rate={}, channels={}",
@@ -287,7 +317,7 @@ impl BaseSTT for ViettelStt {
         Ok(Self {
             config: viettel_config,
             base_config: Some(config),
-            http_client,
+            http_client: Some(http_client),
             is_ready: AtomicBool::new(false),
             connection_state: Arc::new(RwLock::new(STTConnectionState::Disconnected)),
             audio_buffer: Arc::new(RwLock::new(Vec::with_capacity(MAX_AUDIO_BUFFER_SIZE))),
@@ -427,8 +457,7 @@ impl BaseSTT for ViettelStt {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::future::Future;
-    use std::pin::Pin;
+
     use std::sync::atomic::AtomicUsize;
 
     fn make_test_config() -> STTConfig {
@@ -461,6 +490,47 @@ mod tests {
         }
     }
 
+    // W1 keystone: Viettel AI exposes no advanced-feature surface, so `new_standard` is a pure
+    // passthrough — even with features set, the standardized path must build the provider and
+    // carry the base config (api_key/sample_rate/channels) through into the provider-specific
+    // config unchanged. (Advanced features are documented capability gaps left at default.)
+    #[test]
+    fn test_viettel_new_standard_passes_base_through() {
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "viettel-ai".into(),
+                api_key: "test_token".into(),
+                sample_rate: 8000,
+                channels: 1,
+                ..Default::default()
+            },
+            features: SttFeatures {
+                diarization: Some(true),
+                word_timestamps: Some(true),
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+            translation: None,
+        };
+        let stt = ViettelStt::new_standard(&std).unwrap();
+        let cfg = stt.get_viettel_config();
+        assert_eq!(cfg.api_key, "test_token");
+        assert_eq!(cfg.sample_rate, 8000);
+        assert_eq!(cfg.channels, 1);
+    }
+
+    #[test]
+    fn test_viettel_new_standard_requires_api_key() {
+        use crate::core::stt::standard::StandardSTTConfig;
+        let std = StandardSTTConfig::from_base(STTConfig {
+            provider: "viettel-ai".into(),
+            api_key: String::new(),
+            ..Default::default()
+        });
+        assert!(ViettelStt::new_standard(&std).is_err());
+    }
+
     #[test]
     fn test_new_valid_config() {
         let config = make_test_config();
@@ -469,6 +539,71 @@ mod tests {
 
         let stt = result.unwrap();
         assert!(!stt.is_ready());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn viettel_stt_redirect_policy_rejects_private_hop() {
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local redirect test server");
+        let addr = listener.local_addr().expect("local addr");
+
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 1024];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 302 Found\r\n",
+                "Location: http://127.0.0.1:9/metadata\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n"
+            );
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await;
+        });
+
+        let stt = ViettelStt::new(make_test_config()).expect("construct Viettel STT");
+        let err = stt
+            .http_client
+            .as_ref()
+            .expect("strict constructor builds an HTTP client")
+            .get(format!("http://{addr}/start"))
+            .send()
+            .await
+            .expect_err("private redirect target must be rejected");
+        let mut error_chain = err.to_string();
+        let mut source = std::error::Error::source(&err);
+        while let Some(err) = source {
+            error_chain.push_str(": ");
+            error_chain.push_str(&err.to_string());
+            source = err.source();
+        }
+        assert!(error_chain.contains("SSRF protection"), "{error_chain}");
+    }
+
+    #[tokio::test]
+    async fn default_without_http_client_returns_typed_error_without_panic() {
+        let mut stt = ViettelStt::default();
+        stt.http_client = None;
+
+        let err = stt
+            .process_audio(vec![0; MIN_AUDIO_BUFFER_SIZE])
+            .await
+            .expect_err("inert default client must fail with a typed error");
+
+        match err {
+            STTError::ConfigurationError(msg) => {
+                assert!(msg.contains("default HTTP client"), "{msg}");
+            }
+            other => panic!("expected ConfigurationError, got {other:?}"),
+        }
     }
 
     #[test]

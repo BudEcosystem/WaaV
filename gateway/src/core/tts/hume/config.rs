@@ -41,6 +41,17 @@ use crate::core::tts::base::{TTSConfig, TTSError};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
+fn validate_hume_tts_endpoint(source: &str, endpoint: &str) -> Result<(), TTSError> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES).map_err(
+        |msg| TTSError::InvalidConfiguration(format!("{source} rejected (SSRF protection): {msg}")),
+    )
+}
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -241,8 +252,10 @@ impl Default for HumeOutputFormat {
 /// Users can also create custom voices via voice cloning.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum HumeVoice {
     /// Kora - Default female voice, warm and natural.
+    #[default]
     Kora,
     /// Custom voice by name.
     Custom(String),
@@ -263,12 +276,6 @@ impl HumeVoice {
             "kora" => Self::Kora,
             _ => Self::Custom(s.to_string()),
         }
-    }
-}
-
-impl Default for HumeVoice {
-    fn default() -> Self {
-        Self::Kora
     }
 }
 
@@ -341,9 +348,37 @@ pub struct HumeTTSConfig {
     /// Number of audio variations to generate (1-3).
     /// Higher values increase latency but provide options.
     pub num_generations: Option<u8>,
+
+    /// Voice library the voice name/id resolves against (`HUME_AI` or `CUSTOM_VOICE`).
+    /// Maps to the per-utterance `voice.provider` field. Audio-changing (selects the voice engine).
+    pub voice_provider: Option<String>,
+
+    /// Timestamp granularities to request (`"word"`/`"phoneme"`); top-level `include_timestamp_types`.
+    /// Pure metadata request: does NOT change the audio, so it is excluded from the cache key.
+    pub include_timestamp_types: Option<Vec<String>>,
+
+    /// Sampling temperature (top-level). Audio-changing.
+    pub temperature: Option<f32>,
+
+    /// Auto-split input into utterance segments (top-level `split_utterances`). Audio-changing.
+    pub split_utterances: Option<bool>,
+
+    /// Strip per-chunk audio headers on concatenation (top-level `strip_headers`).
+    /// Changes the returned byte framing, so it is part of the cache key.
+    pub strip_headers: Option<bool>,
+
+    /// Optional base URL override (scheme+host) for the synth HTTP endpoint; used by mock e2e tests.
+    pub endpoint_override: Option<String>,
 }
 
 impl HumeTTSConfig {
+    pub(crate) fn validate_endpoint_override(&self) -> Result<(), TTSError> {
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_hume_tts_endpoint("endpoint_override", endpoint)?;
+        }
+        Ok(())
+    }
+
     /// Creates a HumeTTSConfig from a base TTSConfig with default Hume settings.
     pub fn from_base(base: TTSConfig) -> Self {
         let sample_rate = base.sample_rate.unwrap_or(24000);
@@ -377,7 +412,81 @@ impl HumeTTSConfig {
             generation_id: None,
             output_format,
             num_generations: None,
+            voice_provider: None,
+            include_timestamp_types: None,
+            temperature: None,
+            split_utterances: None,
+            strip_headers: None,
+            endpoint_override: None,
         }
+    }
+
+    /// Build from the standardized TTS config (W1 keystone).
+    ///
+    /// Hume's differentiator is natural-language emotion control via `description`, so the
+    /// `instructions` / `emotion` features map there (clamped to `MAX_DESCRIPTION_LENGTH`).
+    /// `speed` maps to Hume's speed (clamped to `MIN_SPEED..=MAX_SPEED`) and `sample_rate`
+    /// overrides the output format rate. Provider-specific knobs (`generation_id`,
+    /// `num_generations`) are read from `extras`. Hume has no SSML / pitch / volume / stability
+    /// surface, so those features are skipped.
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> Self {
+        let f = &std.features;
+        let mut cfg = Self::from_base(std.base.clone());
+
+        // Natural-language acting instructions: prefer explicit `instructions`, fall back to
+        // `emotion` (Hume expresses emotion through the same free-form description field).
+        if let Some(desc) = f.instructions.as_ref().or(f.emotion.as_ref()) {
+            let desc = if desc.len() > MAX_DESCRIPTION_LENGTH {
+                desc[..MAX_DESCRIPTION_LENGTH].to_string()
+            } else {
+                desc.clone()
+            };
+            cfg.description = Some(desc);
+        }
+        if let Some(speed) = f.speed {
+            cfg.speed = Some(speed.clamp(MIN_SPEED, MAX_SPEED));
+        }
+        if let Some(rate) = f.sample_rate {
+            cfg.output_format.sample_rate = rate;
+        }
+
+        // Typed feature: timestamp granularities (top-level `include_timestamp_types`).
+        if let Some(types) = f.include_timestamp_types.as_ref() {
+            cfg.include_timestamp_types = Some(types.clone());
+        }
+
+        // Provider-specific passthrough.
+        if let Some(id) = std.extras.0.get("generation_id").and_then(|v| v.as_str()) {
+            cfg.generation_id = Some(id.to_string());
+        }
+        if let Some(num) = std.extras.0.get("num_generations").and_then(|v| v.as_u64()) {
+            cfg.num_generations = Some(num as u8);
+        }
+        // `voice_provider` -> per-utterance `voice.provider` (e.g. HUME_AI / CUSTOM_VOICE).
+        if let Some(p) = std.extras.0.get("voice_provider").and_then(|v| v.as_str()) {
+            cfg.voice_provider = Some(p.to_string());
+        }
+        // `temperature` -> top-level `temperature` (sampling variation).
+        if let Some(t) = std.extras.0.get("temperature").and_then(|v| v.as_f64()) {
+            cfg.temperature = Some(t as f32);
+        }
+        // `split_utterances` -> top-level `split_utterances`.
+        if let Some(s) = std
+            .extras
+            .0
+            .get("split_utterances")
+            .and_then(|v| v.as_bool())
+        {
+            cfg.split_utterances = Some(s);
+        }
+        // `strip_headers` -> top-level `strip_headers`.
+        if let Some(s) = std.extras.0.get("strip_headers").and_then(|v| v.as_bool()) {
+            cfg.strip_headers = Some(s);
+        }
+
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
+
+        cfg
     }
 
     /// Validates the configuration for API compatibility.
@@ -390,14 +499,14 @@ impl HumeTTSConfig {
         }
 
         // Validate description length
-        if let Some(desc) = &self.description {
-            if desc.len() > MAX_DESCRIPTION_LENGTH {
-                return Err(TTSError::InvalidConfiguration(format!(
-                    "Acting instructions (description) must be {} characters or less, got {}",
-                    MAX_DESCRIPTION_LENGTH,
-                    desc.len()
-                )));
-            }
+        if let Some(desc) = &self.description
+            && desc.len() > MAX_DESCRIPTION_LENGTH
+        {
+            return Err(TTSError::InvalidConfiguration(format!(
+                "Acting instructions (description) must be {} characters or less, got {}",
+                MAX_DESCRIPTION_LENGTH,
+                desc.len()
+            )));
         }
 
         // Validate speed range
@@ -424,17 +533,18 @@ impl HumeTTSConfig {
         }
 
         // Validate num_generations
-        if let Some(num) = self.num_generations {
-            if !(1..=3).contains(&num) {
-                return Err(TTSError::InvalidConfiguration(format!(
-                    "num_generations must be between 1 and 3, got {}",
-                    num
-                )));
-            }
+        if let Some(num) = self.num_generations
+            && !(1..=3).contains(&num)
+        {
+            return Err(TTSError::InvalidConfiguration(format!(
+                "num_generations must be between 1 and 3, got {}",
+                num
+            )));
         }
 
         // Validate output format
         self.output_format.validate()?;
+        self.validate_endpoint_override()?;
 
         Ok(())
     }
@@ -504,6 +614,12 @@ impl Default for HumeTTSConfig {
             generation_id: None,
             output_format: HumeOutputFormat::default(),
             num_generations: None,
+            voice_provider: None,
+            include_timestamp_types: None,
+            temperature: None,
+            split_utterances: None,
+            strip_headers: None,
+            endpoint_override: None,
         }
     }
 }
@@ -515,6 +631,110 @@ impl Default for HumeTTSConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone: the standardized features unlock Hume's natural-language emotion control
+    // (`description`), speed and output sample rate — plus generation_id / num_generations via
+    // the open extras passthrough — previously unreachable through the flat factory.
+    #[test]
+    fn from_standard_maps_instructions_speed_and_extras() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("generation_id".into(), serde_json::json!("gen-123"));
+        extras.insert("num_generations".into(), serde_json::json!(2));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "hume".into(),
+                api_key: "k".into(),
+                sample_rate: Some(24000),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                instructions: Some("warm, friendly, inviting".into()),
+                speed: Some(1.25),
+                sample_rate: Some(48000),
+                ssml: Some(true), // capability gap: Hume has no SSML, must be ignored
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+        let cfg = HumeTTSConfig::from_standard(&std);
+        assert_eq!(
+            cfg.description,
+            Some("warm, friendly, inviting".to_string())
+        );
+        assert_eq!(cfg.speed, Some(1.25));
+        assert_eq!(cfg.output_format.sample_rate, 48000);
+        assert_eq!(cfg.generation_id, Some("gen-123".to_string())); // extras passthrough
+        assert_eq!(cfg.num_generations, Some(2));
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = HumeTTSConfig::from_base(TTSConfig {
+            provider: "hume".into(),
+            api_key: "k".into(),
+            voice_id: Some("Kora".to_string()),
+            ..Default::default()
+        });
+
+        config.endpoint_override = Some("https://hume-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.to_string().contains("SSRF protection"));
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("file endpoint_override must be rejected");
+        assert!(err.to_string().contains("URL scheme"));
+
+        config.endpoint_override = Some("ws://hume-proxy.example.com".to_string());
+        let err = config
+            .validate()
+            .expect_err("WebSocket endpoint_override must be rejected for REST Hume");
+        assert!(err.to_string().contains("URL scheme"));
+
+        let std = crate::core::tts::standard::StandardTTSConfig::from_base(TTSConfig {
+            provider: "hume".into(),
+            api_key: "k".into(),
+            voice_id: Some("Kora".to_string()),
+            ..Default::default()
+        })
+        .with_endpoint_override("file:///tmp/socket");
+        let cfg = HumeTTSConfig::from_standard(&std);
+        assert!(cfg.validate_endpoint_override().is_err());
+    }
+
+    // Clamp parity: from_standard's instructions -> description mapping must truncate to
+    // MAX_DESCRIPTION_LENGTH (100) exactly like `HumeTTS::set_description` does, so an
+    // over-long instruction can't reach the wire and get rejected by the Hume API.
+    #[test]
+    fn from_standard_clamps_instructions_to_max_description_length() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "hume".into(),
+                api_key: "k".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                instructions: Some("a".repeat(150)),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let cfg = HumeTTSConfig::from_standard(&std);
+        let desc = cfg
+            .description
+            .expect("instructions must map to description");
+        assert_eq!(desc.len(), MAX_DESCRIPTION_LENGTH); // 150 chars -> clamped to 100
+        assert_eq!(desc, "a".repeat(MAX_DESCRIPTION_LENGTH));
+    }
 
     // =========================================================================
     // HumeAudioFormat Tests
