@@ -32,6 +32,30 @@ pub fn speech_url(api_base: &str) -> String {
     format!("{}/audio/speech", api_base.trim_end_matches('/'))
 }
 
+/// Canonical id plus every alias the plugin registry accepts for it.
+///
+/// MUST stay in step with the `.with_aliases(...)` list on the `self_hosted` registration in
+/// `plugin/builtin/mod.rs`. Kept here so the credential pre-check and the provider factory
+/// agree on what "self-hosted" means.
+pub const SELF_HOSTED_NAMES: &[&str] = &[
+    "self_hosted",
+    "self-hosted",
+    "waav_self_hosted",
+    "openai_compatible",
+];
+
+/// Whether a `voice_table` vendor names the self-hosted provider.
+///
+/// This exists because a bare `vendor != "self_hosted"` comparison was load-bearing in the
+/// credential pre-check, and the registry accepts three more spellings. Publishing any of
+/// them produced a keyless deployment that the factory would have served happily but the
+/// pre-check refused with "has no credential configured" -- an error naming the wrong
+/// problem entirely. Observed live against a deployment published as `waav_self_hosted`.
+pub fn is_self_hosted(vendor: &str) -> bool {
+    let v = vendor.trim().to_ascii_lowercase();
+    SELF_HOSTED_NAMES.iter().any(|n| *n == v)
+}
+
 /// Join a configured base URL with the OpenAI transcription path.
 ///
 /// Same trailing-slash discipline as [`speech_url`], for the same reason.
@@ -234,6 +258,19 @@ mod tests {
             speech_url("http://whisper.ns.svc:8000/v1///"),
             "http://whisper.ns.svc:8000/v1/audio/speech"
         );
+    }
+
+    #[test]
+    fn every_alias_the_registry_accepts_counts_as_self_hosted() {
+        // The pre-check and the factory must agree. If the registry gains an alias and this
+        // list does not, a keyless deployment published under it is refused for a missing
+        // credential it never needed.
+        for v in ["self_hosted", "self-hosted", "waav_self_hosted", "openai_compatible"] {
+            assert!(is_self_hosted(v), "{v} should be recognised as self-hosted");
+        }
+        assert!(is_self_hosted("  Self_Hosted  "), "matching must be lenient like the registry");
+        assert!(!is_self_hosted("deepgram"));
+        assert!(!is_self_hosted(""));
     }
 
     #[test]

@@ -104,7 +104,7 @@ pub async fn speech_handler(
     // A hosted vendor with no credential is a misconfiguration worth naming here, rather than a
     // 401 from the vendor several seconds later that mentions neither Bud nor the endpoint.
     let api_key = endpoint.credential.clone().unwrap_or_default();
-    if api_key.is_empty() && endpoint.vendor != "self_hosted" {
+    if api_key.is_empty() && !crate::core::tts::self_hosted::is_self_hosted(&endpoint.vendor) {
         return openai_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "api_error",
@@ -293,7 +293,7 @@ async fn transcription_inner(
     // decoding would impose WaaV's WAV-only limit on a backend that may well accept mp3, and
     // the settle heuristic exists only because streaming providers never say "done" -- an
     // HTTP backend answers once and is finished.
-    if endpoint.vendor == "self_hosted" {
+    if crate::core::tts::self_hosted::is_self_hosted(&endpoint.vendor) {
         let Some(api_base) = endpoint.api_base.clone() else {
             return openai_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -336,7 +336,7 @@ async fn transcription_inner(
         Err(e) => return translation_error(&e),
     };
 
-    if api_key.is_empty() && endpoint.vendor != "self_hosted" {
+    if api_key.is_empty() && !crate::core::tts::self_hosted::is_self_hosted(&endpoint.vendor) {
         return openai_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "api_error",
