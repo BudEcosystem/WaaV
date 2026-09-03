@@ -5,6 +5,7 @@ pub mod core;
 pub mod dag;
 pub mod docs;
 pub mod errors;
+pub mod observability;
 pub mod handlers;
 pub mod init;
 pub mod livekit;

@@ -1,0 +1,188 @@
+{
+  "_comment": "Span attributes VoiceTurnFact reads. WaaV EMITS these; budmetrics READS them. Neither repo can see the other at build time, so both assert against this file. A name changed on one side only is invisible: the column simply stays NULL, which looks exactly like a feature nobody uses.",
+  "_generated_from": "services/budmetrics/budmetrics/observability/voice_turn_fact_ddl.py",
+  "attributes": [
+    {
+      "column": "api_key_id",
+      "attribute": "bud.api_key_id",
+      "roles": [
+        "turn"
+      ]
+    },
+    {
+      "column": "endpoint_id",
+      "attribute": "bud.endpoint_id",
+      "roles": [
+        "turn"
+      ]
+    },
+    {
+      "column": "model_id",
+      "attribute": "bud.model_id",
+      "roles": [
+        "turn"
+      ]
+    },
+    {
+      "column": "project_id",
+      "attribute": "bud.project_id",
+      "roles": [
+        "turn"
+      ]
+    },
+    {
+      "column": "user_id",
+      "attribute": "bud.user_id",
+      "roles": [
+        "turn"
+      ]
+    },
+    {
+      "column": "audio_seconds",
+      "attribute": "bud.voice.audio_seconds",
+      "roles": [
+        "turn"
+      ]
+    },
+    {
+      "column": "barge_in",
+      "attribute": "bud.voice.barge_in",
+      "roles": [
+        "turn"
+      ]
+    },
+    {
+      "column": "capability",
+      "attribute": "bud.voice.capability",
+      "roles": [
+        "turn"
+      ]
+    },
+    {
+      "column": "characters_synthesized",
+      "attribute": "bud.voice.characters",
+      "roles": [
+        "turn"
+      ]
+    },
+    {
+      "column": "cost",
+      "attribute": "bud.voice.cost",
+      "roles": [
+        "turn"
+      ]
+    },
+    {
+      "column": "language",
+      "attribute": "bud.voice.language",
+      "roles": [
+        "turn"
+      ]
+    },
+    {
+      "column": "llm_duration_ms",
+      "attribute": "bud.voice.llm.duration_ms",
+      "roles": [
+        "leg"
+      ]
+    },
+    {
+      "column": "response_latency_ms",
+      "attribute": "bud.voice.response_latency_ms",
+      "roles": [
+        "turn"
+      ]
+    },
+    {
+      "column": "session_id",
+      "attribute": "bud.voice.session_id",
+      "roles": [
+        "turn"
+      ]
+    },
+    {
+      "column": "stt_duration_ms",
+      "attribute": "bud.voice.stt.duration_ms",
+      "roles": [
+        "leg"
+      ]
+    },
+    {
+      "column": "stt_ttfb_ms",
+      "attribute": "bud.voice.stt.ttfb_ms",
+      "roles": [
+        "leg"
+      ]
+    },
+    {
+      "column": "stt_vendor",
+      "attribute": "bud.voice.stt.vendor",
+      "roles": [
+        "leg"
+      ]
+    },
+    {
+      "column": "synthesis_input",
+      "attribute": "bud.voice.synthesis_input",
+      "roles": [
+        "turn"
+      ]
+    },
+    {
+      "column": "transcript",
+      "attribute": "bud.voice.transcript",
+      "roles": [
+        "turn"
+      ]
+    },
+    {
+      "column": "transport",
+      "attribute": "bud.voice.transport",
+      "roles": [
+        "turn"
+      ]
+    },
+    {
+      "column": "tts_duration_ms",
+      "attribute": "bud.voice.tts.duration_ms",
+      "roles": [
+        "leg"
+      ]
+    },
+    {
+      "column": "tts_ttfb_ms",
+      "attribute": "bud.voice.tts.ttfb_ms",
+      "roles": [
+        "leg"
+      ]
+    },
+    {
+      "column": "tts_vendor",
+      "attribute": "bud.voice.tts.vendor",
+      "roles": [
+        "leg"
+      ]
+    },
+    {
+      "column": "turn_detector",
+      "attribute": "bud.voice.turn_detector",
+      "roles": [
+        "turn"
+      ]
+    },
+    {
+      "column": "turn_index",
+      "attribute": "bud.voice.turn_index",
+      "roles": [
+        "turn"
+      ]
+    },
+    {
+      "column": "llm_model",
+      "attribute": "gen_ai.request.model",
+      "roles": [
+        "leg"
+      ]
+    }
+  ]
+}
