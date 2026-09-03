@@ -64,6 +64,61 @@ mod speak_url_tests {
     }
 }
 
+/// Deepgram's `encoding` + `container` pair for a requested audio format.
+///
+/// WAV is a CONTAINER in Deepgram's model, not an encoding. Sending `encoding=wav` is rejected
+/// outright with `INVALID_QUERY_PARAMETER`, so every `response_format: "wav"` request 502'd —
+/// on a working endpoint, with a working voice. WAV is the OpenAI audio API's most ordinary
+/// format, so this failed for the most conventional caller.
+///
+/// Returns `(encoding, container)`. `None` means leave the container unset and let Deepgram
+/// default it, which is what every compressed format wants.
+pub fn deepgram_encoding_and_container(format: &str) -> (&str, Option<&'static str>) {
+    match format {
+        // A WAV file is linear16 samples inside a RIFF container.
+        "wav" => ("linear16", Some("wav")),
+        // Container-less: an explicit "none" keeps a WAV header off raw samples, matching the
+        // WebSocket path which delivers bare frames.
+        "linear16" | "pcm" | "mulaw" | "ulaw" | "alaw" => (format, Some("none")),
+        other => (other, None),
+    }
+}
+
+#[cfg(test)]
+mod encoding_container_tests {
+    use super::deepgram_encoding_and_container;
+
+    #[test]
+    fn wav_is_a_container_around_linear16() {
+        // The live failure: response_format "wav" returned 502 INVALID_QUERY_PARAMETER.
+        assert_eq!(deepgram_encoding_and_container("wav"), ("linear16", Some("wav")));
+    }
+
+    #[test]
+    fn raw_formats_keep_an_explicit_none_container() {
+        // Without this a WAV header is prepended to what the caller asked to be raw samples.
+        for f in ["linear16", "pcm", "mulaw", "ulaw", "alaw"] {
+            assert_eq!(deepgram_encoding_and_container(f), (f, Some("none")), "{f}");
+        }
+    }
+
+    #[test]
+    fn compressed_formats_are_passed_through_untouched() {
+        // mp3 and opus work today; setting a container on them is what would break them.
+        for f in ["mp3", "opus", "aac", "flac"] {
+            assert_eq!(deepgram_encoding_and_container(f), (f, None), "{f}");
+        }
+    }
+
+    #[test]
+    fn wav_still_takes_a_sample_rate() {
+        // It resolves to linear16, which is container-less at the codec level, so the rate is
+        // both allowed and needed — the caller cannot play samples at an unknown rate.
+        let (enc, _) = deepgram_encoding_and_container("wav");
+        assert!(matches!(enc, "linear16"));
+    }
+}
+
 fn validate_deepgram_tts_endpoint(source: &str, endpoint: &str) -> TTSResult<()> {
     let endpoint = endpoint.trim();
     if endpoint.is_empty() {
@@ -159,17 +214,13 @@ impl TTSRequestBuilder for DeepgramRequestBuilder {
             params.push(("model", voice_id.clone()));
         }
 
-        // Encoding (default to raw linear PCM)
-        let encoding = self.config.audio_format.as_deref().unwrap_or("linear16");
+        // Encoding + container (default to raw linear PCM). WAV is a CONTAINER here, not an
+        // encoding: `encoding=wav` is rejected with INVALID_QUERY_PARAMETER.
+        let requested = self.config.audio_format.as_deref().unwrap_or("linear16");
+        let (encoding, container) = deepgram_encoding_and_container(requested);
         params.push(("encoding", encoding.to_string()));
-
-        // Ensure no container when requesting raw PCM to avoid WAV headers
-        // Aligns with WS behavior which delivers raw binary frames without headers
-        match encoding {
-            "linear16" | "pcm" | "mulaw" | "ulaw" | "alaw" => {
-                params.push(("container", "none".to_string()));
-            }
-            _ => {}
+        if let Some(container) = container {
+            params.push(("container", container.to_string()));
         }
 
         // `sample_rate` applies ONLY to container-less encodings. A compressed format carries
