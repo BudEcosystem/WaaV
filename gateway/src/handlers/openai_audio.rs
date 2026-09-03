@@ -314,11 +314,29 @@ async fn transcription_inner(
     } else {
         "audio_transcription"
     };
+    // The STT leg's span, mirroring the TTS one. `audio_seconds` is the billing dimension for
+    // transcription exactly as `characters` is for synthesis, and both are declared Empty
+    // because they are only known after the work: a field not declared at creation cannot be
+    // recorded later, and attempting it silently does nothing.
+    let turn_span = tracing::info_span!(
+        "voice.turn",
+        { voice_attrs::turn::CAPABILITY } = capability,
+        { voice_attrs::turn::TRANSPORT } = "http",
+        { voice_attrs::turn::ENDPOINT_ID } = %settings.endpoint,
+        { voice_attrs::turn::LANGUAGE } = settings.language.as_deref().unwrap_or(""),
+        { voice_attrs::turn::AUDIO_SECONDS } = tracing::field::Empty,
+        { voice_attrs::leg::STT_VENDOR } = tracing::field::Empty,
+        { voice_attrs::leg::STT_DURATION_MS } = tracing::field::Empty,
+    );
+
     let Some(endpoint) =
         state.resolve_voice_endpoint(&settings.endpoint, capability, bearer.as_deref())
     else {
         return model_not_found(&settings.endpoint, capability);
     };
+
+    turn_span.record(voice_attrs::leg::STT_VENDOR, endpoint.vendor.as_str());
+    let stt_started = std::time::Instant::now();
 
     let api_key = endpoint.credential.clone().unwrap_or_default();
 
@@ -353,9 +371,16 @@ async fn transcription_inner(
             &filename,
             &settings,
         )
+        .instrument(turn_span.clone())
         .await
         {
-            Ok(body) => passthrough_response(&settings.response_format, body),
+            Ok(body) => {
+                turn_span.record(
+                    voice_attrs::leg::STT_DURATION_MS,
+                    stt_started.elapsed().as_millis() as u64,
+                );
+                passthrough_response(&settings.response_format, body)
+            }
             Err(e) => {
                 warn!(endpoint = %settings.endpoint, error = %e, "self-hosted transcription failed");
                 openai_error(StatusCode::BAD_GATEWAY, "api_error", e, None)
@@ -402,9 +427,17 @@ async fn transcription_inner(
         model: endpoint.model.clone().unwrap_or_default(),
     };
 
-    match crate::handlers::transcribe::transcribe_once(&endpoint.vendor, stt_config, &audio).await
+    turn_span.record(voice_attrs::turn::AUDIO_SECONDS, audio.duration_secs());
+
+    match crate::handlers::transcribe::transcribe_once(&endpoint.vendor, stt_config, &audio)
+        .instrument(turn_span.clone())
+        .await
     {
         Ok(t) => {
+            turn_span.record(
+                voice_attrs::leg::STT_DURATION_MS,
+                stt_started.elapsed().as_millis() as u64,
+            );
             if t.truncated {
                 warn!(endpoint = %settings.endpoint, "returning a partial transcript");
             }
