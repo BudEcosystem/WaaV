@@ -8,6 +8,7 @@ pub mod bhashini;
 pub mod cartesia;
 pub mod cereproc;
 pub mod deepgram;
+pub mod self_hosted;
 pub mod elevenlabs;
 pub mod fpt_ai;
 pub mod gnani;

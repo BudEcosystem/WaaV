@@ -71,6 +71,7 @@ impl Default for GnaniTTSConfig {
                 pronunciations: Vec::new(),
                 request_pool_size: None,
                 emotion_config: None,
+                api_base: None,
             },
             token: String::new(),
             access_key: String::new(),

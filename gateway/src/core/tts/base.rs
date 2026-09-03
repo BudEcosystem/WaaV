@@ -207,6 +207,14 @@ pub struct TTSConfig {
     /// don't support emotions will log a warning and proceed with default synthesis.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub emotion_config: Option<EmotionConfig>,
+    /// Base URL of a self-hosted, OpenAI-compatible audio server.
+    ///
+    /// Only the `self_hosted` provider reads this. Every hosted vendor has a fixed endpoint
+    /// compiled in; a self-hosted deployment's address is chosen by the operator and arrives
+    /// from `voice_table.api_base`, so it has to travel with the config rather than being a
+    /// constant.
+    #[serde(default)]
+    pub api_base: Option<String>,
 }
 
 impl Default for TTSConfig {
@@ -224,6 +232,7 @@ impl Default for TTSConfig {
             pronunciations: Vec::new(),
             request_pool_size: Some(4),
             emotion_config: None,
+            api_base: None,
         }
     }
 }

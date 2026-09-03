@@ -617,6 +617,11 @@ fn nectec_stt_metadata() -> ProviderMetadata {
 // TTS Provider Metadata Functions
 // ============================================================================
 
+fn self_hosted_tts_metadata() -> ProviderMetadata {
+    ProviderMetadata::tts("self_hosted", "Self-hosted (OpenAI-compatible)")
+        .with_description("An audio server the operator runs, addressed by api_base")
+}
+
 fn deepgram_tts_metadata() -> ProviderMetadata {
     ProviderMetadata::tts("deepgram", "Deepgram Aura")
         .with_description("Real-time TTS with Aura voice models")
@@ -1402,6 +1407,12 @@ fn create_nectec_stt(config: STTConfig) -> Result<Box<dyn BaseSTT>, STTError> {
 // TTS Factory Functions
 // ============================================================================
 
+fn create_self_hosted_tts(config: TTSConfig) -> crate::core::tts::TTSResult<Box<dyn BaseTTS>> {
+    Ok(Box::new(
+        crate::core::tts::self_hosted::SelfHostedTTS::new(config)?,
+    ))
+}
+
 fn create_deepgram_tts(config: TTSConfig) -> crate::core::tts::TTSResult<Box<dyn BaseTTS>> {
     Ok(Box::new(DeepgramTTS::new(config)?))
 }
@@ -1724,6 +1735,11 @@ inventory::submit! {
 // ============================================================================
 // TTS Provider Registrations
 // ============================================================================
+
+inventory::submit! {
+    PluginConstructor::tts("self_hosted", self_hosted_tts_metadata, create_self_hosted_tts)
+        .with_aliases(&["self-hosted", "waav_self_hosted", "openai_compatible"])
+}
 
 inventory::submit! {
     PluginConstructor::tts("deepgram", deepgram_tts_metadata, create_deepgram_tts)

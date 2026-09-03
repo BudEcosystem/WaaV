@@ -272,6 +272,12 @@ impl TTSWebSocketConfig {
             pronunciations: self.pronunciations.clone(),
             request_pool_size: defaults.request_pool_size,
             emotion_config,
+            // Deliberately NOT taken from the socket config. `api_base` is the address WaaV
+            // sends vendor traffic to, so accepting it from the client would let a caller
+            // redirect synthesis (and any credential attached to it) to a host of their
+            // choosing. It is endpoint data, published by budapp into voice_table, and only
+            // the /v1/audio/speech path -- which resolves the endpoint server-side -- sets it.
+            api_base: None,
         }
     }
 

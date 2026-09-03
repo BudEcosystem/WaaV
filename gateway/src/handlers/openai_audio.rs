@@ -134,6 +134,10 @@ pub async fn speech_handler(
         // rejects a sample rate alongside a container that carries its own — Deepgram answers
         // `sample_rate is not applicable when encoding=mp3` and the whole request 400s.
         sample_rate: settings.format.accepts_sample_rate().then_some(24000),
+        // Only the self-hosted provider reads this; every hosted vendor compiles its URL in.
+        // It has to be threaded through here because it is per-ENDPOINT data, published by
+        // budapp into voice_table, not a property of the vendor.
+        api_base: endpoint.api_base.clone(),
         ..Default::default()
     };
 

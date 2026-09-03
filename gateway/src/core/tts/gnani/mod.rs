@@ -85,6 +85,7 @@ mod tests {
             pronunciations: Vec::new(),
             request_pool_size: None,
             emotion_config: None,
+            api_base: None,
         }
     }
 
