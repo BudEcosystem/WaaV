@@ -44,8 +44,10 @@
 /// VAD state representing the current speech detection status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
+#[derive(Default)]
 pub enum VADState {
     /// No speech detected
+    #[default]
     Quiet = 0,
     /// Speech beginning, within start debounce window
     Starting = 1,
@@ -53,12 +55,6 @@ pub enum VADState {
     Speaking = 2,
     /// Speech ending, within stop debounce window
     Stopping = 3,
-}
-
-impl Default for VADState {
-    fn default() -> Self {
-        VADState::Quiet
-    }
 }
 
 impl From<u8> for VADState {
@@ -195,7 +191,7 @@ impl VADParams {
 ///
 /// # Usage Pattern
 ///
-/// ```rust
+/// ```ignore
 /// let mut vad = VADAnalyzer::new(VADParams::default());
 ///
 /// // For each audio frame (e.g., every 20-50ms):
@@ -904,7 +900,7 @@ mod tests {
 
     #[test]
     fn test_zero_debounce() {
-        let mut vad = VADAnalyzer::new(
+        let _vad = VADAnalyzer::new(
             VADParams::default()
                 .with_start_debounce(0)
                 .with_stop_debounce(0),

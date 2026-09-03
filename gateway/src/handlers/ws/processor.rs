@@ -16,9 +16,23 @@ use super::{
     audio_handler::{handle_audio_end, handle_clear_message, handle_speak_message},
     command_handler::{handle_send_message, handle_sip_transfer},
     config_handler::handle_config_message,
-    messages::{IncomingMessage, MessageRoute, OutgoingMessage},
+    messages::{IncomingMessage, MessageClass, MessageRoute, OutgoingMessage, send_with_policy},
     state::ConnectionState,
 };
+
+async fn send_critical(message_tx: &mpsc::Sender<MessageRoute>, route: MessageRoute) {
+    send_with_policy(message_tx, route, MessageClass::Critical).await;
+}
+
+async fn send_error(message_tx: &mpsc::Sender<MessageRoute>, message: impl Into<String>) {
+    send_critical(
+        message_tx,
+        MessageRoute::Outgoing(OutgoingMessage::Error {
+            message: message.into(),
+        }),
+    )
+    .await;
+}
 
 /// Process incoming WebSocket message based on its type
 ///
@@ -52,13 +66,13 @@ pub async fn handle_incoming_message(
             // Only allow Auth messages when auth is pending
             if !matches!(msg, IncomingMessage::Auth { .. }) {
                 warn!("Received non-auth message while auth is pending, rejecting");
-                let _ = message_tx
-                    .send(MessageRoute::Outgoing(OutgoingMessage::Error {
-                        message: "Authentication required. Send auth message first.".to_string(),
-                    }))
-                    .await;
+                send_error(
+                    message_tx,
+                    "Authentication required. Send auth message first.",
+                )
+                .await;
                 // Close connection for security
-                let _ = message_tx.send(MessageRoute::Close).await;
+                send_critical(message_tx, MessageRoute::Close).await;
                 return false;
             }
         }
@@ -77,6 +91,8 @@ pub async fn handle_incoming_message(
             tts_config,
             livekit,
             dag_config,
+            conversation_config,
+            alias,
         } => {
             // Handle backward compatibility for audio_disabled field
             // Priority: audio field takes precedence if explicitly set
@@ -109,6 +125,8 @@ pub async fn handle_incoming_message(
                 tts_config,
                 livekit,
                 dag_config,
+                conversation_config,
+                alias,
                 state,
                 message_tx,
                 app_state,
@@ -166,20 +184,31 @@ pub enum WsAuthPath {
     Bud,
     /// Standalone WaaV: match against the configured API secret list.
     ApiSecret,
-    /// Neither is configured; there is nothing to authenticate against.
+    /// JWT-only deployment: validate against the external auth service, as `auth_middleware`
+    /// does for HTTP. Without this a JWT-only gateway advertises first-message auth and then
+    /// closes every socket, leaving `?token=` — which leaks the token into access logs — as the
+    /// only way in.
+    Jwt,
+    /// Nothing is configured; there is nothing to authenticate against.
     Unconfigured,
 }
 
-/// Bud mode wins whenever it is present.
+/// Bud mode wins whenever it is present, then API secrets, then JWT.
 ///
 /// Same precedence as `auth_middleware`, and for the same reason: when a control plane is
 /// configured it IS the deployment's identity source, and falling through to a secret list
 /// that a Bud chart never populates rejects valid credentials.
-pub fn ws_auth_path(bud_mode_present: bool, has_api_secrets: bool) -> WsAuthPath {
+pub fn ws_auth_path(
+    bud_mode_present: bool,
+    has_api_secrets: bool,
+    has_jwt_auth: bool,
+) -> WsAuthPath {
     if bud_mode_present {
         WsAuthPath::Bud
     } else if has_api_secrets {
         WsAuthPath::ApiSecret
+    } else if has_jwt_auth {
+        WsAuthPath::Jwt
     } else {
         WsAuthPath::Unconfigured
     }
@@ -194,6 +223,7 @@ async fn handle_auth_message(
     let path = ws_auth_path(
         app_state.bud_mode.is_some(),
         app_state.config.has_api_secret_auth(),
+        app_state.config.has_jwt_auth(),
     );
 
     let resolved: Option<String> = match path {
@@ -211,14 +241,40 @@ async fn handle_auth_message(
         WsAuthPath::ApiSecret => {
             match_api_secret_id(&token, &app_state.config.auth_api_secrets).map(str::to_string)
         }
+        WsAuthPath::Jwt => {
+            // Route a first-message token through the SAME external auth service the HTTP
+            // middleware uses (empty body/headers; the /ws upgrade context).
+            let Some(auth_client) = app_state.auth_client.as_ref() else {
+                warn!("First-message JWT auth attempted but auth client not initialized");
+                send_error(message_tx, "Authentication service unavailable").await;
+                send_critical(message_tx, MessageRoute::Close).await;
+                return false;
+            };
+            match auth_client
+                .validate_token(
+                    &token,
+                    &serde_json::Value::Object(serde_json::Map::new()),
+                    std::collections::HashMap::new(),
+                    "/ws",
+                    "GET",
+                )
+                .await
+            {
+                Ok(auth) => auth.id,
+                Err(e) => {
+                    warn!(error = %e, "First-message JWT authentication failed");
+                    None
+                }
+            }
+        }
         WsAuthPath::Unconfigured => {
             warn!("First-message auth attempted but no authenticator is configured");
-            let _ = message_tx
-                .send(MessageRoute::Outgoing(OutgoingMessage::Error {
-                    message: "Authentication is not configured on this gateway".to_string(),
-                }))
-                .await;
-            let _ = message_tx.send(MessageRoute::Close).await;
+            send_error(
+                message_tx,
+                "Authentication is not configured on this gateway",
+            )
+            .await;
+            send_critical(message_tx, MessageRoute::Close).await;
             return false;
         }
     };
@@ -229,52 +285,20 @@ async fn handle_auth_message(
             let mut conn_state = state.write().await;
             conn_state.auth = Auth::new(id.clone());
         }
-        let _ = message_tx
-            .send(MessageRoute::Outgoing(OutgoingMessage::Authenticated {
-                id: Some(id),
-            }))
-            .await;
+        // Send authenticated response
+        send_critical(
+            message_tx,
+            MessageRoute::Outgoing(OutgoingMessage::Authenticated { id: Some(id) }),
+        )
+        .await;
+
         true
     } else {
         warn!("First-message authentication failed: invalid token");
-        let _ = message_tx
-            .send(MessageRoute::Outgoing(OutgoingMessage::Error {
-                message: "Invalid authentication token".to_string(),
-            }))
-            .await;
-        let _ = message_tx.send(MessageRoute::Close).await;
+        send_error(message_tx, "Invalid authentication token").await;
+        // Close connection on auth failure
+        send_critical(message_tx, MessageRoute::Close).await;
         false
-    }
-}
-
-#[cfg(test)]
-mod ws_auth_path_tests {
-    use super::{WsAuthPath, ws_auth_path};
-
-    #[test]
-    fn bud_mode_is_consulted_whenever_it_is_configured() {
-        // THE regression. A Bud chart configures no auth_api_secrets, so consulting the
-        // secret list first refused every valid Bud credential on the deferred path.
-        assert_eq!(ws_auth_path(true, false), WsAuthPath::Bud);
-    }
-
-    #[test]
-    fn bud_mode_outranks_a_configured_secret_list() {
-        // Same precedence as auth_middleware: when a control plane exists it is the identity
-        // source, and a leftover secret must not shadow it.
-        assert_eq!(ws_auth_path(true, true), WsAuthPath::Bud);
-    }
-
-    #[test]
-    fn standalone_waav_still_uses_its_api_secrets() {
-        assert_eq!(ws_auth_path(false, true), WsAuthPath::ApiSecret);
-    }
-
-    #[test]
-    fn with_neither_configured_the_socket_is_refused_rather_than_admitted() {
-        // Fail CLOSED. An unconfigured gateway must not treat "nothing to check against" as
-        // "everything passes".
-        assert_eq!(ws_auth_path(false, false), WsAuthPath::Unconfigured);
     }
 }
 
@@ -308,11 +332,11 @@ async fn handle_custom_message(
             message_type = %message_type,
             "No handlers registered for custom message type"
         );
-        let _ = message_tx
-            .send(MessageRoute::Outgoing(OutgoingMessage::Error {
-                message: format!("Unknown custom message type: {}", message_type),
-            }))
-            .await;
+        send_error(
+            message_tx,
+            format!("Unknown custom message type: {}", message_type),
+        )
+        .await;
         return true;
     }
 
@@ -333,31 +357,33 @@ async fn handle_custom_message(
                 // Convert response to outgoing message
                 match response {
                     WSResponse::Json(json) => {
-                        let _ = message_tx
-                            .send(MessageRoute::Outgoing(OutgoingMessage::PluginResponse {
+                        send_critical(
+                            message_tx,
+                            MessageRoute::Outgoing(OutgoingMessage::PluginResponse {
                                 message_type: message_type.clone(),
                                 payload: json,
-                            }))
-                            .await;
+                            }),
+                        )
+                        .await;
                     }
                     WSResponse::Binary(data) => {
-                        let _ = message_tx.send(MessageRoute::Binary(data)).await;
+                        send_critical(message_tx, MessageRoute::Binary(data)).await;
                     }
                     WSResponse::Multiple(responses) => {
                         for resp in responses {
                             match resp {
                                 WSResponse::Json(json) => {
-                                    let _ = message_tx
-                                        .send(MessageRoute::Outgoing(
-                                            OutgoingMessage::PluginResponse {
-                                                message_type: message_type.clone(),
-                                                payload: json,
-                                            },
-                                        ))
-                                        .await;
+                                    send_critical(
+                                        message_tx,
+                                        MessageRoute::Outgoing(OutgoingMessage::PluginResponse {
+                                            message_type: message_type.clone(),
+                                            payload: json,
+                                        }),
+                                    )
+                                    .await;
                                 }
                                 WSResponse::Binary(data) => {
-                                    let _ = message_tx.send(MessageRoute::Binary(data)).await;
+                                    send_critical(message_tx, MessageRoute::Binary(data)).await;
                                 }
                                 WSResponse::Multiple(_) => {
                                     // Don't recurse into nested multiples
@@ -380,14 +406,62 @@ async fn handle_custom_message(
                     error = %e,
                     "Plugin handler failed"
                 );
-                let _ = message_tx
-                    .send(MessageRoute::Outgoing(OutgoingMessage::Error {
-                        message: format!("Plugin handler error: {}", e),
-                    }))
-                    .await;
+                send_error(message_tx, format!("Plugin handler error: {}", e)).await;
             }
         }
     }
 
     true
+}
+
+#[cfg(test)]
+mod ws_auth_path_tests {
+    use super::{WsAuthPath, ws_auth_path};
+
+    #[test]
+    fn bud_mode_is_consulted_whenever_it_is_configured() {
+        // THE regression. A Bud chart configures no auth_api_secrets, so consulting the
+        // secret list first refused every valid Bud credential on the deferred path.
+        assert_eq!(ws_auth_path(true, false, false), WsAuthPath::Bud);
+    }
+
+    #[test]
+    fn bud_mode_outranks_a_configured_secret_list() {
+        // Same precedence as auth_middleware: when a control plane exists it is the identity
+        // source, and a leftover secret must not shadow it.
+        assert_eq!(ws_auth_path(true, true, false), WsAuthPath::Bud);
+    }
+
+    #[test]
+    fn bud_mode_outranks_the_external_auth_service() {
+        // The merge hazard, pinned. Upstream fixed this same handler by routing first-message
+        // tokens to the external auth service; a Bud deployment configures BOTH (it has a
+        // control plane, and `has_jwt_auth()` is true), so resolving to Jwt here would send
+        // every Bud credential to a service that has never heard of it — the exact 401-on-a-
+        // valid-key outage the Bud path was added to fix.
+        assert_eq!(ws_auth_path(true, false, true), WsAuthPath::Bud);
+        assert_eq!(ws_auth_path(true, true, true), WsAuthPath::Bud);
+    }
+
+    #[test]
+    fn standalone_waav_still_uses_its_api_secrets() {
+        assert_eq!(ws_auth_path(false, true, false), WsAuthPath::ApiSecret);
+        // Secrets outrank JWT, matching the HTTP middleware's order.
+        assert_eq!(ws_auth_path(false, true, true), WsAuthPath::ApiSecret);
+    }
+
+    #[test]
+    fn a_jwt_only_gateway_authenticates_rather_than_closing_the_socket() {
+        // Upstream's G3 fix, kept. A browser cannot set an Authorization header on a WebSocket,
+        // so first-message auth is its only route in; refusing here left `?token=` as the sole
+        // alternative, which leaks the token into access logs.
+        assert_eq!(ws_auth_path(false, false, true), WsAuthPath::Jwt);
+    }
+
+    #[test]
+    fn with_nothing_configured_the_socket_is_refused_rather_than_admitted() {
+        // Fail CLOSED. An unconfigured gateway must not treat "nothing to check against" as
+        // "everything passes".
+        assert_eq!(ws_auth_path(false, false, false), WsAuthPath::Unconfigured);
+    }
 }

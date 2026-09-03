@@ -18,12 +18,47 @@ use serde_json::json;
 use xxhash_rust::xxh3::xxh3_128;
 
 use super::config::{AudioOutputFormat, OpenAITTSModel, OpenAIVoice};
-use crate::core::tts::base::{AudioCallback, BaseTTS, ConnectionState, TTSConfig, TTSResult};
+use crate::core::tts::base::{
+    AudioCallback, BaseTTS, ConnectionState, TTSConfig, TTSError, TTSResult,
+};
 use crate::core::tts::provider::{PronunciationReplacer, TTSProvider, TTSRequestBuilder};
 use crate::utils::req_manager::ReqManager;
 
-/// OpenAI TTS API endpoint
+/// OpenAI TTS API endpoint (default).
 pub const OPENAI_TTS_URL: &str = "https://api.openai.com/v1/audio/speech";
+const OPENAI_BASE_URL_ENV: &str = "OPENAI_BASE_URL";
+
+/// Resolve the OpenAI TTS endpoint, honoring the standard `OPENAI_BASE_URL` override (as the
+/// OpenAI SDKs do). This lets the provider target OpenAI-compatible speech endpoints (Azure
+/// OpenAI, a proxy, or a local server) and enables credential-free contract/e2e testing.
+#[inline]
+pub fn openai_tts_url() -> String {
+    resolve_openai_tts_url().unwrap_or_else(|e| {
+        tracing::error!(error = %e, "invalid OpenAI TTS endpoint override; using production endpoint for display-only URL");
+        OPENAI_TTS_URL.to_string()
+    })
+}
+
+fn openai_tts_url_from_base(source: &str, base: &str) -> Result<Option<String>, String> {
+    let base = base.trim().trim_end_matches('/');
+    if base.is_empty() {
+        return Ok(None);
+    }
+    crate::core::net::validate_url_for_ssrf(base, &["http", "https"])
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))?;
+    Ok(Some(format!("{base}/v1/audio/speech")))
+}
+
+fn resolve_openai_tts_url() -> Result<String, String> {
+    match std::env::var(OPENAI_BASE_URL_ENV) {
+        Ok(base) => Ok(openai_tts_url_from_base(OPENAI_BASE_URL_ENV, &base)?
+            .unwrap_or_else(|| OPENAI_TTS_URL.to_string())),
+        Err(std::env::VarError::NotPresent) => Ok(OPENAI_TTS_URL.to_string()),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err(format!("{OPENAI_BASE_URL_ENV} must be valid UTF-8"))
+        }
+    }
+}
 
 // =============================================================================
 // Request Builder
@@ -34,6 +69,8 @@ pub const OPENAI_TTS_URL: &str = "https://api.openai.com/v1/audio/speech";
 struct OpenAIRequestBuilder {
     /// Base TTS configuration
     config: TTSConfig,
+    /// Validated endpoint URL
+    endpoint_url: String,
     /// Parsed OpenAI model
     model: OpenAITTSModel,
     /// Parsed OpenAI voice
@@ -42,6 +79,8 @@ struct OpenAIRequestBuilder {
     response_format: AudioOutputFormat,
     /// Speaking speed (0.25 to 4.0)
     speed: f32,
+    /// Delivery/acting instructions (gpt-4o-mini-tts only; ignored by tts-1/tts-1-hd).
+    instructions: Option<String>,
     /// Pronunciation replacer
     pronunciation_replacer: Option<PronunciationReplacer>,
 }
@@ -62,8 +101,16 @@ impl TTSRequestBuilder for OpenAIRequestBuilder {
             body["speed"] = json!(self.speed);
         }
 
+        // gpt-4o-mini-tts accepts delivery/acting `instructions`; older tts-1/tts-1-hd models do
+        // not (sending it there would be rejected), so it is gated on the model. (Review S3.)
+        if let Some(instr) = &self.instructions
+            && matches!(self.model, OpenAITTSModel::Gpt4oMiniTts)
+        {
+            body["instructions"] = json!(instr);
+        }
+
         client
-            .post(OPENAI_TTS_URL)
+            .post(&self.endpoint_url)
             .header("Authorization", format!("Bearer {}", self.config.api_key))
             .header("Content-Type", "application/json")
             .json(&body)
@@ -162,6 +209,11 @@ pub struct OpenAITTS {
 impl OpenAITTS {
     /// Create a new OpenAI TTS instance
     pub fn new(config: TTSConfig) -> TTSResult<Self> {
+        let endpoint_url = resolve_openai_tts_url().map_err(TTSError::InvalidConfiguration)?;
+        Ok(Self::build(config, endpoint_url))
+    }
+
+    fn build(config: TTSConfig, endpoint_url: String) -> Self {
         // Parse model from config
         let model = if config.model.is_empty() {
             OpenAITTSModel::default()
@@ -196,20 +248,45 @@ impl OpenAITTS {
 
         let request_builder = OpenAIRequestBuilder {
             config: config.clone(),
+            endpoint_url,
             model,
             voice,
             response_format,
             speed,
+            instructions: None,
             pronunciation_replacer,
         };
 
         let config_hash = compute_tts_config_hash(&config, &model, &voice);
 
-        Ok(Self {
-            provider: TTSProvider::new()?,
+        Self {
+            provider: TTSProvider::new(),
             request_builder,
             config_hash,
-        })
+        }
+    }
+
+    /// Build from the standardized config (W1 keystone for TTS — uniform entry point).
+    ///
+    /// OpenAI's speech API exposes a narrow control surface (model, voice, format, speed, plus
+    /// `instructions` on gpt-4o-mini-tts). `speed` folds into `speaking_rate`; `instructions` maps
+    /// to the gpt-4o-mini-tts delivery/acting field (ignored on tts-1/tts-1-hd). The remaining
+    /// features (ElevenLabs voice settings, pitch/volume, emotion, ssml, word_timestamps,
+    /// streaming, seed, language, sample_rate) have no OpenAI parameter and are not mapped.
+    ///
+    /// [`TtsFeatures`]: crate::core::tts::standard::TtsFeatures
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
+        let f = &std.features;
+        let mut base = std.base.clone();
+        if let Some(speed) = f.speed {
+            base.speaking_rate = Some(speed);
+        }
+        let mut tts = OpenAITTS::new(base)?;
+        // gpt-4o-mini-tts delivery instructions (Review S3); gated to the right model in the body.
+        if let Some(instr) = &f.instructions {
+            tts.request_builder.instructions = Some(instr.clone());
+        }
+        Ok(tts)
     }
 
     /// Get the configured model
@@ -230,7 +307,11 @@ impl OpenAITTS {
 
 impl Default for OpenAITTS {
     fn default() -> Self {
-        Self::new(TTSConfig::default()).unwrap()
+        let config = TTSConfig::default();
+        match Self::new(config.clone()) {
+            Ok(tts) => tts,
+            Err(_) => Self::build(config, OPENAI_TTS_URL.to_string()),
+        }
     }
 }
 
@@ -246,7 +327,10 @@ impl BaseTTS for OpenAITTS {
 
     async fn connect(&mut self) -> TTSResult<()> {
         self.provider
-            .generic_connect_with_config(OPENAI_TTS_URL, &self.request_builder.config)
+            .generic_connect_with_config(
+                &self.request_builder.endpoint_url,
+                &self.request_builder.config,
+            )
             .await
     }
 
@@ -331,6 +415,39 @@ impl BaseTTS for OpenAITTS {
 mod tests {
     use super::*;
 
+    // W1 keystone (TTS): OpenAI exposes a narrow control surface, so `from_standard` maps only
+    // `speed` (→ speaking_rate → builder speed); every other feature is a capability gap. This
+    // asserts the mapped feature reaches the right field and the base config carries through.
+    #[tokio::test]
+    async fn from_standard_maps_speed() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "openai".into(),
+                api_key: "test_key".into(),
+                voice_id: Some("nova".into()),
+                model: "tts-1-hd".into(),
+                speaking_rate: Some(1.0),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(1.5),
+                // Capability gaps below are intentionally ignored by OpenAI.
+                stability: Some(0.7),
+                instructions: Some("speak cheerfully".into()),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let tts = OpenAITTS::from_standard(&std).unwrap();
+        // speed (1.5) folded into speaking_rate and applied to the builder.
+        assert!((tts.request_builder.speed - 1.5).abs() < 0.001);
+        // base carried through (api key, voice, model).
+        assert_eq!(tts.request_builder.config.api_key, "test_key");
+        assert_eq!(tts.voice(), OpenAIVoice::Nova);
+        assert_eq!(tts.model(), OpenAITTSModel::Tts1Hd);
+    }
+
     #[tokio::test]
     async fn test_openai_tts_creation() {
         let config = TTSConfig {
@@ -378,10 +495,12 @@ mod tests {
 
         let builder = OpenAIRequestBuilder {
             config,
+            endpoint_url: OPENAI_TTS_URL.to_string(),
             model: OpenAITTSModel::Tts1,
             voice: OpenAIVoice::Nova,
             response_format: AudioOutputFormat::Mp3,
             speed: 1.5,
+            instructions: None,
             pronunciation_replacer: None,
         };
 
@@ -398,6 +517,57 @@ mod tests {
 
         let content_type = built.headers().get("Content-Type").unwrap();
         assert_eq!(content_type, "application/json");
+    }
+
+    #[test]
+    fn test_openai_tts_url_override_is_ssrf_checked() {
+        let _env = crate::core::net::ssrf_env_lock();
+        assert_eq!(
+            openai_tts_url_from_base("OPENAI_BASE_URL", "https://openai-compatible.invalid/")
+                .unwrap()
+                .unwrap(),
+            "https://openai-compatible.invalid/v1/audio/speech"
+        );
+
+        let msg = openai_tts_url_from_base("OPENAI_BASE_URL", "http://127.0.0.1:8089/")
+            .expect_err("loopback endpoint override must be rejected")
+            .to_string();
+        assert!(
+            msg.contains("SSRF protection"),
+            "error names SSRF guard: {msg}"
+        );
+
+        let msg = openai_tts_url_from_base("OPENAI_BASE_URL", "file:///tmp/socket")
+            .expect_err("non-HTTP endpoint override must be rejected")
+            .to_string();
+        assert!(msg.contains("scheme"), "error names scheme contract: {msg}");
+    }
+
+    #[test]
+    fn openai_default_does_not_panic_on_invalid_base_url() {
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let previous = std::env::var_os(OPENAI_BASE_URL_ENV);
+
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::set_var(OPENAI_BASE_URL_ENV, "file:///tmp/socket") };
+        let result = std::panic::catch_unwind(OpenAITTS::default);
+
+        match previous {
+            Some(value) => {
+                // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+                unsafe { std::env::set_var(OPENAI_BASE_URL_ENV, value) };
+            }
+            None => {
+                // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+                unsafe { std::env::remove_var(OPENAI_BASE_URL_ENV) };
+            }
+        }
+
+        let tts = result.expect("OpenAITTS::default must not panic on invalid OPENAI_BASE_URL");
+        assert!(!tts.is_ready());
+        assert_eq!(tts.request_builder.endpoint_url, OPENAI_TTS_URL);
     }
 
     #[tokio::test]

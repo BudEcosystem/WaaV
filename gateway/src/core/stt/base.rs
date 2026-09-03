@@ -234,8 +234,24 @@ pub struct STTResult {
     pub is_final: bool,
     /// Whether this marks the end of a speech segment.
     pub is_speech_final: bool,
+    /// Whether the provider has explicitly FINALIZED this segment — i.e. it
+    /// has nothing more to send for it (e.g. Deepgram's `from_finalize` ack
+    /// to a `Finalize` message). Distinct from [`is_final`](Self::is_final)
+    /// ("this chunk is immutable, more may follow") and
+    /// [`is_speech_final`](Self::is_speech_final) ("end of utterance").
+    /// Downstream end-of-turn logic may short-circuit its STT-latency safety
+    /// wait when this is `true` (PIPECAT_FIX_PLAN A-G1/A-G2). Invariant:
+    /// `is_finalized ⇒ is_final`. Defaults to `false`; providers without a
+    /// finalize handshake never set it.
+    pub is_finalized: bool,
     /// Confidence score of the transcription (0.0 to 1.0).
     pub confidence: f32,
+    /// The FULL accumulated segment text on a `speech_final` result, when it
+    /// differs from `transcript` (which keeps the provider's raw last
+    /// fragment for client egress). Turn policy reads
+    /// [`turn_transcript`](Self::turn_transcript); clients keep seeing
+    /// exactly the per-fragment stream they always did.
+    pub segment_transcript: Option<String>,
 
     // =========================================================================
     // Rich Metadata Fields (Optional for backward compatibility)
@@ -283,6 +299,15 @@ pub struct STTResult {
 
     /// Duration of the audio segment that produced this result (in seconds).
     pub audio_duration: Option<f64>,
+
+    /// Uniform, provider-agnostic in-stream translations merged onto this
+    /// transcript (P5). One entry per target language; `lang` is the canonical
+    /// BCP-47 string and `text` the translated segment. Populated by providers
+    /// with streaming translation (Speechmatics `AddTranslation`, Gladia
+    /// `type:"translation"`, the Class-B EN fast path); empty for everyone else,
+    /// so the field is additive and the existing construction sites are
+    /// unaffected. The WS egress skips it when empty.
+    pub translations: Vec<crate::core::stt::standard::Translation>,
 }
 
 impl STTResult {
@@ -308,7 +333,9 @@ impl STTResult {
             transcript,
             is_final,
             is_speech_final,
+            is_finalized: false,
             confidence: confidence.clamp(0.0, 1.0),
+            segment_transcript: None,
             // Initialize all optional metadata fields to None for backward compatibility
             words: None,
             speakers: None,
@@ -318,7 +345,33 @@ impl STTResult {
             logprobs: None,
             detected_language: None,
             audio_duration: None,
+            translations: Vec::new(),
         }
+    }
+
+    /// Marks this result as provider-FINALIZED (the provider has nothing more
+    /// to send for this segment). Builder-style so the ~33 provider call
+    /// sites stay untouched; only providers with a real finalize handshake
+    /// call this on the terminal transcript.
+    ///
+    /// Invariant: a finalized result is always final (`is_finalized ⇒
+    /// is_final`) — enforced here rather than at every consumer.
+    /// The transcript TURN POLICY should act on: the full accumulated
+    /// segment when present, else the raw fragment. Client egress always
+    /// uses [`transcript`](Self::transcript) directly.
+    pub fn turn_transcript(&self) -> &str {
+        self.segment_transcript
+            .as_deref()
+            .unwrap_or(&self.transcript)
+    }
+
+    pub fn finalized(mut self) -> Self {
+        debug_assert!(
+            self.is_final,
+            "is_finalized requires is_final (finalized ⇒ final)"
+        );
+        self.is_finalized = true;
+        self
     }
 
     /// Creates a new STTResult with all fields specified.
@@ -343,7 +396,9 @@ impl STTResult {
             transcript,
             is_final,
             is_speech_final,
+            is_finalized: false,
             confidence: confidence.clamp(0.0, 1.0),
+            segment_transcript: None,
             words,
             speakers,
             entities,
@@ -352,6 +407,7 @@ impl STTResult {
             logprobs,
             detected_language,
             audio_duration,
+            translations: Vec::new(),
         }
     }
 
@@ -433,6 +489,71 @@ pub struct STTConfig {
     pub encoding: String,
     /// Model to use for transcription
     pub model: String,
+}
+
+/// Sparse mid-call settings delta (D-G6): `None` = not in the delta.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct SttSettingsDelta {
+    pub model: Option<String>,
+    pub language: Option<String>,
+    pub encoding: Option<String>,
+    pub sample_rate: Option<u32>,
+    pub punctuation: Option<bool>,
+    /// Provider-specific overflow (forwarded opaque; never
+    /// connection-relevant by itself).
+    #[serde(default)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
+}
+
+impl SttSettingsDelta {
+    /// The fields whose change requires a transport reconnect.
+    pub fn is_connection_relevant(field: &str) -> bool {
+        matches!(field, "model" | "language" | "encoding" | "sample_rate")
+    }
+
+    /// Merge into `base`, returning (merged, changed-field names). A field
+    /// present in the delta but EQUAL to the current value does not count
+    /// as changed (no spurious reconnects).
+    pub fn merge_into(
+        &self,
+        mut base: STTConfig,
+    ) -> (STTConfig, std::collections::HashSet<&'static str>) {
+        let mut changed = std::collections::HashSet::new();
+        if let Some(v) = &self.model
+            && *v != base.model
+        {
+            base.model = v.clone();
+            changed.insert("model");
+        }
+        if let Some(v) = &self.language
+            && *v != base.language
+        {
+            base.language = v.clone();
+            changed.insert("language");
+        }
+        if let Some(v) = &self.encoding
+            && *v != base.encoding
+        {
+            base.encoding = v.clone();
+            changed.insert("encoding");
+        }
+        if let Some(v) = self.sample_rate
+            && v != base.sample_rate
+        {
+            base.sample_rate = v;
+            changed.insert("sample_rate");
+        }
+        if let Some(v) = self.punctuation
+            && v != base.punctuation
+        {
+            base.punctuation = v;
+            changed.insert("punctuation");
+        }
+        if !self.extra.is_empty() {
+            changed.insert("extra");
+        }
+        (base, changed)
+    }
 }
 
 impl Default for STTConfig {
@@ -551,8 +672,66 @@ pub trait BaseSTT: Send + Sync {
     /// * `Result<(), STTError>` - Success or error
     async fn update_config(&mut self, config: STTConfig) -> Result<(), STTError>;
 
+    /// Apply a SPARSE mid-call settings delta (D-G6, Pipecat
+    /// `ServiceSettings` parity): merge ONLY the given fields into the
+    /// current config and reconnect ONLY when a connection-relevant field
+    /// (model/language/encoding/sample_rate) changed. Returns the set of
+    /// field names that actually changed. The merge/decide logic lives HERE
+    /// in the base (standardized for all providers); providers only execute
+    /// the resulting full-config update.
+    async fn apply_settings_delta(
+        &mut self,
+        delta: SttSettingsDelta,
+    ) -> Result<std::collections::HashSet<&'static str>, STTError> {
+        let Some(current) = self.get_config().cloned() else {
+            return Err(STTError::ConfigurationError(
+                "no current config to apply a settings delta to".into(),
+            ));
+        };
+        let (merged, changed) = delta.merge_into(current);
+        if changed.is_empty() {
+            return Ok(changed);
+        }
+        if changed
+            .iter()
+            .any(|f| SttSettingsDelta::is_connection_relevant(f))
+        {
+            // Full update (providers reconnect inside update_config).
+            self.update_config(merged).await?;
+        } else {
+            // Non-connection knob: store without touching the transport.
+            self.set_config_only(merged);
+        }
+        Ok(changed)
+    }
+
+    /// Store a merged config WITHOUT reconnecting (D-G6 non-connection
+    /// path). Default falls back to nothing (providers that can't update
+    /// in place simply keep serving with prior settings until reconnect);
+    /// providers with an owned config override to persist it.
+    fn set_config_only(&mut self, _config: STTConfig) {}
+
     /// Get provider-specific information
     fn get_provider_info(&self) -> &'static str;
+
+    /// The provider's measured speech-end → final-transcript p99 latency
+    /// (ms), when benchmarked (D-G8). Feeds the TTFS-aware end-of-turn wait
+    /// (A-G2): SLOW providers get a longer detection wait so their real
+    /// final isn't beaten by a forced fire. Default `None` = unknown — the
+    /// configured wait applies unchanged. Turn-based providers (server owns
+    /// the turn boundary) should also return `None`.
+    fn ttfs_p99_ms(&self) -> Option<u64> {
+        None
+    }
+
+    /// Inject the shared, process-global resilience handles (W-D2): the single reconnect
+    /// governor (storm control across all sessions) and this provider's shared circuit breaker
+    /// (a trip in one session is visible to every other session of the provider).
+    ///
+    /// Streaming providers that run a supervised reconnect loop (Deepgram, AssemblyAI, …)
+    /// override this to store the handles and use them in their connect path instead of
+    /// creating per-session ones. Non-streaming / one-shot providers use the default no-op.
+    fn set_resilience(&mut self, _resilience: crate::core::resilience::ResilienceHandles) {}
 }
 
 /// Factory trait for creating STT providers
@@ -622,11 +801,50 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    // --- A-G1: is_finalized fleet flag ---
+
+    #[test]
+    fn stt_result_finalized_defaults_false() {
+        let r = STTResult::new("hi".into(), true, true, 0.9);
+        assert!(!r.is_finalized);
+        let m = STTResult::with_metadata(
+            "hi".into(),
+            true,
+            true,
+            0.9,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(!m.is_finalized);
+    }
+
+    #[test]
+    fn finalized_builder_sets_flag_and_implies_final() {
+        let r = STTResult::new("done".into(), true, true, 1.0).finalized();
+        assert!(r.is_finalized);
+        assert!(r.is_final, "finalized ⇒ final invariant");
+    }
+
+    #[test]
+    #[should_panic(expected = "finalized ⇒ final")]
+    #[cfg(debug_assertions)]
+    fn finalized_on_interim_panics_in_debug() {
+        let _ = STTResult::new("part".into(), false, false, 0.5).finalized();
+    }
+
     // Mock implementation for testing
     struct MockSTT {
         config: Option<STTConfig>,
         connected: AtomicBool,
         callback: Option<STTResultCallback>,
+        /// D-G6 test instrumentation: full-config updates (= reconnects).
+        reconnects: std::sync::atomic::AtomicUsize,
     }
 
     #[async_trait::async_trait]
@@ -636,6 +854,7 @@ mod tests {
                 config: Some(config),
                 connected: AtomicBool::new(false),
                 callback: None,
+                reconnects: std::sync::atomic::AtomicUsize::new(0),
             })
         }
 
@@ -688,6 +907,8 @@ mod tests {
 
         async fn update_config(&mut self, config: STTConfig) -> Result<(), STTError> {
             if self.is_ready() {
+                self.reconnects
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 self.config = Some(config);
                 Ok(())
             } else {
@@ -695,9 +916,110 @@ mod tests {
             }
         }
 
+        fn set_config_only(&mut self, config: STTConfig) {
+            self.config = Some(config);
+        }
+
         fn get_provider_info(&self) -> &'static str {
             "MockSTT v1.0"
         }
+    }
+
+    // --- D-G6: sparse settings delta ---
+
+    fn base_cfg() -> STTConfig {
+        STTConfig {
+            model: "nova-3".to_string(),
+            provider: "mock".to_string(),
+            api_key: "k".to_string(),
+            language: "en-US".to_string(),
+            sample_rate: 16000,
+            channels: 1,
+            punctuation: true,
+            encoding: "linear16".to_string(),
+        }
+    }
+
+    #[test]
+    fn delta_merges_only_given_fields_and_returns_changed_set() {
+        let delta = SttSettingsDelta {
+            language: Some("hi".into()),
+            punctuation: Some(false),
+            ..Default::default()
+        };
+        let (merged, changed) = delta.merge_into(base_cfg());
+        assert_eq!(merged.language, "hi");
+        assert!(!merged.punctuation);
+        assert_eq!(merged.model, "nova-3", "absent fields untouched");
+        assert_eq!(merged.sample_rate, 16000);
+        assert_eq!(
+            changed,
+            ["language", "punctuation"]
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>()
+        );
+
+        // A field present but EQUAL to the current value is NOT a change.
+        let noop = SttSettingsDelta {
+            language: Some("en-US".into()),
+            ..Default::default()
+        };
+        let (_, changed) = noop.merge_into(base_cfg());
+        assert!(changed.is_empty(), "equal-value delta must be a no-op");
+    }
+
+    #[tokio::test]
+    async fn non_connection_field_does_not_reconnect() {
+        let mut stt = MockSTT::new(base_cfg()).unwrap();
+        stt.connect().await.unwrap();
+        let delta = SttSettingsDelta {
+            punctuation: Some(false),
+            ..Default::default()
+        };
+        let changed = stt.apply_settings_delta(delta).await.unwrap();
+        assert_eq!(changed.len(), 1);
+        assert_eq!(
+            stt.reconnects.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a non-connection knob must NOT reconnect"
+        );
+        assert!(
+            !stt.get_config().unwrap().punctuation,
+            "but it must be stored"
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_field_triggers_reconnect() {
+        let mut stt = MockSTT::new(base_cfg()).unwrap();
+        stt.connect().await.unwrap();
+        let delta = SttSettingsDelta {
+            language: Some("hi".into()),
+            ..Default::default()
+        };
+        let changed = stt.apply_settings_delta(delta).await.unwrap();
+        assert!(changed.contains("language"));
+        assert_eq!(
+            stt.reconnects.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "exactly ONE reconnect for a connection-relevant change"
+        );
+        assert_eq!(stt.get_config().unwrap().language, "hi");
+    }
+
+    #[test]
+    fn extra_overflow_roundtrips() {
+        let mut delta = SttSettingsDelta::default();
+        delta
+            .extra
+            .insert("keyterms".into(), serde_json::json!(["WaaV"]));
+        let json = serde_json::to_string(&delta).unwrap();
+        let back: SttSettingsDelta = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.extra["keyterms"], serde_json::json!(["WaaV"]));
+        // extra alone marks a change but is never connection-relevant.
+        let (_, changed) = back.merge_into(base_cfg());
+        assert_eq!(changed, ["extra"].into_iter().collect());
+        assert!(!SttSettingsDelta::is_connection_relevant("extra"));
     }
 
     #[tokio::test]

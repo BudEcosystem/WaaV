@@ -9,6 +9,45 @@
 use super::super::base::STTConfig;
 use serde::{Deserialize, Serialize};
 
+const OPENAI_BASE_URL_ENV: &str = "OPENAI_BASE_URL";
+const OPENAI_API_BASE_URL: &str = "https://api.openai.com";
+
+fn openai_audio_url_from_base(
+    source: &str,
+    base: &str,
+    path: &str,
+) -> Result<Option<String>, String> {
+    let base = base.trim().trim_end_matches('/');
+    if base.is_empty() {
+        return Ok(None);
+    }
+    crate::core::net::validate_url_for_ssrf(base, &["http", "https"])
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))?;
+    Ok(Some(format!("{base}{path}")))
+}
+
+fn resolve_openai_audio_url(endpoint_override: Option<&str>, path: &str) -> Result<String, String> {
+    if let Some(override_url) = endpoint_override
+        && let Some(url) = openai_audio_url_from_base("endpoint_override", override_url, path)?
+    {
+        return Ok(url);
+    }
+
+    match std::env::var(OPENAI_BASE_URL_ENV) {
+        Ok(base) => {
+            if let Some(url) = openai_audio_url_from_base(OPENAI_BASE_URL_ENV, &base, path)? {
+                return Ok(url);
+            }
+        }
+        Err(std::env::VarError::NotPresent) => {}
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(format!("{OPENAI_BASE_URL_ENV} must be valid UTF-8"));
+        }
+    }
+
+    Ok(format!("{OPENAI_API_BASE_URL}{path}"))
+}
+
 // =============================================================================
 // OpenAI STT Models
 // =============================================================================
@@ -377,15 +416,14 @@ impl DiarizationConfig {
     /// Validate the diarization configuration.
     pub fn validate(&self) -> Result<(), String> {
         // Validate chunking strategy threshold
-        if let Some(ref strategy) = self.chunking_strategy {
-            if let Some(threshold) = strategy.threshold {
-                if !(0.0..=1.0).contains(&threshold) {
-                    return Err(format!(
-                        "Chunking threshold must be between 0.0 and 1.0, got {}",
-                        threshold
-                    ));
-                }
-            }
+        if let Some(ref strategy) = self.chunking_strategy
+            && let Some(threshold) = strategy.threshold
+            && !(0.0..=1.0).contains(&threshold)
+        {
+            return Err(format!(
+                "Chunking threshold must be between 0.0 and 1.0, got {}",
+                threshold
+            ));
         }
 
         // Validate speaker references have both name and audio
@@ -511,6 +549,25 @@ pub struct OpenAISTTConfig {
     /// Only used when `response_format` is `DiarizedJson`.
     /// Requires `gpt-4o-transcribe` or `gpt-4o-mini-transcribe` model.
     pub diarization: DiarizationConfig,
+
+    /// Request streaming partial transcripts (server-sent events). Maps the standardized
+    /// `interim_results` feature onto OpenAI's `stream` form parameter. Only supported by the
+    /// `gpt-4o-transcribe`/`gpt-4o-mini-transcribe` models (`whisper-1` ignores it). Ref: OpenAI
+    /// `POST /v1/audio/transcriptions` `stream` field.
+    pub stream: bool,
+
+    /// Base endpoint override (scheme://host) from the standardized `endpoint_override` — points the
+    /// transcription POST at a mock/proxy host (credential-free e2e), taking precedence over the
+    /// `OPENAI_BASE_URL` env var. `None` falls back to the env var, then the production host.
+    /// Non-empty override values must pass the canonical SSRF gate before the client can dial them.
+    pub endpoint_override: Option<String>,
+
+    /// P5 translation (Class B): when `true`, POST to `/v1/audio/translations` (English-only)
+    /// instead of `/v1/audio/transcriptions`. Whisper's translations endpoint always outputs
+    /// English regardless of source language and takes no target/`language` param — so the
+    /// canonical translation block selects it via `translate_to_english` (arbitrary `target_languages`
+    /// are degraded to English with a `config_warning`). Mirrors the Groq reference impl.
+    pub translate_to_english: bool,
 }
 
 /// Configuration for silence detection.
@@ -558,6 +615,9 @@ impl Default for OpenAISTTConfig {
             max_file_size_bytes: 25 * 1024 * 1024, // 25MB (OpenAI limit)
             silence_detection: SilenceDetectionConfig::default(),
             diarization: DiarizationConfig::default(),
+            stream: false,
+            endpoint_override: None,
+            translate_to_english: false,
         }
     }
 }
@@ -573,17 +633,224 @@ impl OpenAISTTConfig {
             OpenAISTTModel::from_str_or_default(&base.model)
         };
 
-        Self {
+        let mut cfg = Self {
             base,
             model,
             ..Default::default()
+        };
+        cfg.coerce_response_format_for_model();
+        cfg
+    }
+
+    /// gpt-4o-transcribe / gpt-4o-mini-transcribe support ONLY `json`/`text`
+    /// response formats — `verbose_json` (the whisper-1 default, needed for word
+    /// timestamps) returns a 400 on them. Coerce `VerboseJson` → `Json` for those
+    /// models so the default (and any word-timestamp request) degrades safely
+    /// instead of erroring. Streaming (`stream=true`) is `json`-only too, and
+    /// only those models stream, so this covers it. `DiarizedJson` is untouched
+    /// (its own model path).
+    fn coerce_response_format_for_model(&mut self) {
+        if self.model != OpenAISTTModel::Whisper1
+            && self.response_format == ResponseFormat::VerboseJson
+        {
+            self.response_format = ResponseFormat::Json;
+            // Word-timestamp granularities require verbose_json — drop them too.
+            self.timestamp_granularities.clear();
         }
     }
 
+    /// Build from the standardized config (W1 keystone). OpenAI models its advanced features on
+    /// the `response_format` (diarization needs `DiarizedJson`, word timestamps need a JSON format
+    /// with word granularity), the free-form `prompt` (the documented spelling/vocabulary hint),
+    /// the `stream` flag (partial transcripts) and a set of diarization-side knobs. This maps:
+    /// - `diarization` → `DiarizedJson` response format,
+    /// - `word_timestamps` → word timestamp granularity (+ JSON format),
+    /// - `keyterms` → `prompt`,
+    /// - `interim_results` → `stream` (partial transcripts, gpt-4o models),
+    /// - extras `logprobs` (bool) → `include[]=logprobs` (token log probabilities),
+    /// - extras `chunking_strategy` (string `"auto"` or object) → `chunking_strategy` (server VAD),
+    /// - extras `known_speaker_names` (string array) → `known_speaker_names[]`,
+    /// - extras `known_speaker_references` (string array) → `known_speaker_references[]`.
+    ///
+    /// Features OpenAI cannot express (smart_format, profanity_filter, redaction, vad_events,
+    /// entity/language detection) are capability gaps and stay at default.
+    pub fn from_standard(std: &crate::core::stt::standard::StandardSTTConfig) -> Self {
+        let f = &std.features;
+        let mut cfg = Self::from_base(std.base.clone());
+        cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
+        // P5 translation (Class B — English-only fast path): select `/v1/audio/translations`.
+        if let Some(t) = &std.translation
+            && !t.is_noop()
+        {
+            cfg.translate_to_english = true;
+        }
+        if let Some(true) = f.diarization {
+            cfg.response_format = ResponseFormat::DiarizedJson;
+        }
+        if let Some(w) = f.word_timestamps {
+            cfg.timestamp_granularities = if w {
+                // Granularities are only sent for VerboseJson (client.rs guards on it). Ensure a
+                // word-timestamp request that isn't also a diarization request lands on VerboseJson
+                // so the granularities actually reach the wire. (Review S6.)
+                if cfg.response_format != ResponseFormat::DiarizedJson {
+                    cfg.response_format = ResponseFormat::VerboseJson;
+                }
+                vec![TimestampGranularity::Word]
+            } else {
+                Vec::new()
+            };
+        }
+        if let Some(k) = &f.keyterms
+            && !k.is_empty()
+        {
+            cfg.prompt = Some(k.join(", "));
+        }
+        // interim_results → stream (typed).
+        if let Some(s) = f.interim_results {
+            cfg.stream = s;
+        }
+        // Provider extras → diarization-side knobs (string keys not modeled by the typed vocab).
+        let e = &std.extras.0;
+        if let Some(b) = e.get("logprobs").and_then(|v| v.as_bool()) {
+            cfg.diarization.include_logprobs = b;
+        }
+        if let Some(arr) = e.get("known_speaker_names").and_then(|v| v.as_array()) {
+            cfg.diarization.known_speaker_names = arr
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect();
+        }
+        if let Some(arr) = e.get("known_speaker_references").and_then(|v| v.as_array()) {
+            // References are paired positionally with names: name[i] ↔ reference[i].
+            let names = &cfg.diarization.known_speaker_names;
+            cfg.diarization.speaker_references = arr
+                .iter()
+                .filter_map(|v| v.as_str())
+                .enumerate()
+                .map(|(i, audio)| {
+                    let name = names
+                        .get(i)
+                        .cloned()
+                        .unwrap_or_else(|| format!("speaker_{i}"));
+                    SpeakerReference::new(name, audio.to_string())
+                })
+                .collect();
+        }
+        if let Some(cs) = e.get("chunking_strategy") {
+            cfg.diarization.chunking_strategy =
+                serde_json::from_value::<ChunkingStrategy>(cs.clone())
+                    .ok()
+                    .or_else(|| {
+                        // A bare `"auto"`/`"server_vad"` string selects the default server-VAD strategy.
+                        cs.as_str()
+                            .filter(|s| !s.is_empty())
+                            .map(|_| ChunkingStrategy::default())
+                    });
+        }
+        // The word-timestamp branch above may have set VerboseJson; coerce back to
+        // Json for gpt-4o-transcribe / -mini (they reject verbose_json).
+        cfg.coerce_response_format_for_model();
+        cfg
+    }
+
+    /// Build the multipart text form fields (key/value pairs) that accompany the audio file part
+    /// on `POST /v1/audio/transcriptions`. This is the exact wire surface the client serializes
+    /// into the multipart body — extracted as a pure function so a test can assert each advanced
+    /// api_param actually reaches the request (the recurring "lives on the struct but never hits
+    /// the wire" bug class). The `file` part is added separately by the client.
+    ///
+    /// Repeated keys (`timestamp_granularities[]`, `include[]`, `known_speaker_names[]`,
+    /// `known_speaker_references[]`) appear once per value, matching OpenAI's array-form encoding.
+    pub fn transcription_text_fields(&self) -> Vec<(String, String)> {
+        let mut fields: Vec<(String, String)> = Vec::new();
+        fields.push(("model".into(), self.model.as_str().to_string()));
+        fields.push((
+            "response_format".into(),
+            self.response_format.as_str().to_string(),
+        ));
+
+        if !self.base.language.is_empty() {
+            fields.push(("language".into(), self.base.language.clone()));
+        }
+        if let Some(temp) = self.temperature {
+            fields.push(("temperature".into(), temp.to_string()));
+        }
+        if let Some(ref prompt) = self.prompt {
+            fields.push(("prompt".into(), prompt.clone()));
+        }
+
+        // Timestamp granularities only apply to verbose_json.
+        if self.response_format == ResponseFormat::VerboseJson {
+            for g in &self.timestamp_granularities {
+                fields.push(("timestamp_granularities[]".into(), g.as_str().to_string()));
+            }
+        }
+
+        // Partial transcripts (interim_results → stream).
+        if self.stream {
+            fields.push(("stream".into(), "true".into()));
+        }
+
+        // Token log probabilities (`include[]=logprobs`). OpenAI only honors `include[]` for the
+        // JSON response formats, so guard on a JSON format to avoid a 400.
+        if self.diarization.include_logprobs
+            && matches!(
+                self.response_format,
+                ResponseFormat::Json | ResponseFormat::VerboseJson | ResponseFormat::DiarizedJson
+            )
+        {
+            fields.push(("include[]".into(), "logprobs".into()));
+        }
+
+        // Server-side VAD chunking strategy. Sent as a JSON-encoded value (object), matching the
+        // OpenAI schema for `chunking_strategy`.
+        if let Some(ref cs) = self.diarization.chunking_strategy
+            && let Ok(json) = serde_json::to_string(cs)
+        {
+            fields.push(("chunking_strategy".into(), json));
+        }
+
+        // Known speaker names + reference audio (diarization speaker matching).
+        for name in &self.diarization.known_speaker_names {
+            fields.push(("known_speaker_names[]".into(), name.clone()));
+        }
+        for r in &self.diarization.speaker_references {
+            fields.push(("known_speaker_references[]".into(), r.audio.clone()));
+        }
+
+        fields
+    }
+
     /// Get the API endpoint URL.
+    ///
+    /// Honors the standard `OPENAI_BASE_URL` override (as the OpenAI SDKs do), so the provider
+    /// also works against OpenAI-compatible endpoints (Azure OpenAI, Groq, vLLM, a local
+    /// transcription server, or a proxy) — and enables credential-free contract/e2e testing.
     #[inline]
-    pub fn api_url(&self) -> &'static str {
-        "https://api.openai.com/v1/audio/transcriptions"
+    pub fn try_api_url(&self) -> Result<String, String> {
+        // P5 translation (Class B): the English-only fast path POSTs to `/audio/translations`.
+        let path = if self.translate_to_english {
+            "/v1/audio/translations"
+        } else {
+            "/v1/audio/transcriptions"
+        };
+        resolve_openai_audio_url(self.endpoint_override.as_deref(), path)
+    }
+
+    /// Get the API endpoint URL, falling back to the production host if an invalid process env
+    /// override appears after construction. Runtime send paths use [`Self::try_api_url`] so invalid
+    /// explicit config still fails closed with a typed configuration error.
+    #[inline]
+    pub fn api_url(&self) -> String {
+        self.try_api_url().unwrap_or_else(|e| {
+            tracing::error!(error = %e, "invalid OpenAI STT endpoint override; using production endpoint for display-only URL");
+            let path = if self.translate_to_english {
+                "/v1/audio/translations"
+            } else {
+                "/v1/audio/transcriptions"
+            };
+            format!("{OPENAI_API_BASE_URL}{path}")
+        })
     }
 
     /// Validate the configuration.
@@ -611,14 +878,14 @@ impl OpenAISTTConfig {
         // Validate diarization configuration
         self.diarization.validate()?;
 
+        self.try_api_url()?;
+
         // Validate that diarized_json format is only used with compatible models
-        if self.response_format == ResponseFormat::DiarizedJson {
-            if !self.supports_diarization() {
-                return Err(format!(
-                    "Diarized JSON format requires gpt-4o-transcribe or gpt-4o-mini-transcribe model, got {}",
-                    self.model
-                ));
-            }
+        if self.response_format == ResponseFormat::DiarizedJson && !self.supports_diarization() {
+            return Err(format!(
+                "Diarized JSON format requires gpt-4o-transcribe or gpt-4o-mini-transcribe model, got {}",
+                self.model
+            ));
         }
 
         Ok(())
@@ -643,6 +910,163 @@ impl OpenAISTTConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // WIRE-LEVEL (the recurring bug class): the advanced features mapped in `from_standard` must
+    // reach the multipart text fields the client serializes into the request body — not merely
+    // live on `DiarizationConfig`. This drives the standardized config through `from_standard`
+    // then through the SAME `transcription_text_fields()` the client posts, asserting each
+    // api_param (`stream`, `include[]=logprobs`, `chunking_strategy`, `known_speaker_names[]`,
+    // `known_speaker_references[]`) is present in the form body.
+    #[test]
+    fn gpt4o_transcribe_coerces_verbose_json_to_json() {
+        // Live-caught: gpt-4o-transcribe / -mini 400 on the verbose_json default.
+        for m in ["gpt-4o-transcribe", "gpt-4o-mini-transcribe"] {
+            let base = STTConfig {
+                model: m.to_string(),
+                ..Default::default()
+            };
+            let cfg = OpenAISTTConfig::from_base(base);
+            assert_eq!(
+                cfg.response_format,
+                ResponseFormat::Json,
+                "{m}: verbose_json must coerce to json"
+            );
+        }
+        // whisper-1 keeps the verbose_json default (it supports it).
+        let wcfg = OpenAISTTConfig::from_base(STTConfig {
+            model: "whisper-1".to_string(),
+            ..Default::default()
+        });
+        assert_eq!(wcfg.response_format, ResponseFormat::VerboseJson);
+    }
+
+    #[test]
+    fn advanced_features_reach_multipart_form_fields() {
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
+
+        let mut extras = serde_json::Map::new();
+        extras.insert("logprobs".into(), serde_json::json!(true));
+        extras.insert(
+            "chunking_strategy".into(),
+            serde_json::json!({"type": "server_vad", "threshold": 0.6}),
+        );
+        extras.insert(
+            "known_speaker_names".into(),
+            serde_json::json!(["Alice", "Bob"]),
+        );
+        extras.insert(
+            "known_speaker_references".into(),
+            serde_json::json!(["data:audio/wav;base64,AAA=", "data:audio/wav;base64,BBB="]),
+        );
+
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "openai".into(),
+                api_key: "test-key".into(),
+                model: "gpt-4o-transcribe".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                diarization: Some(true),
+                interim_results: Some(true),
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+            translation: None,
+        };
+
+        let cfg = OpenAISTTConfig::from_standard(&std);
+        // The mapped config must validate (diarization needs a gpt-4o model + DiarizedJson).
+        assert!(cfg.validate().is_ok(), "mapped config should validate");
+
+        let fields = cfg.transcription_text_fields();
+        let has = |k: &str, v: &str| fields.iter().any(|(fk, fv)| fk == k && fv == v);
+
+        // interim_results → stream=true (typed)
+        assert!(has("stream", "true"), "stream not in form: {fields:?}");
+        // logprobs → include[]=logprobs (extras)
+        assert!(
+            has("include[]", "logprobs"),
+            "include[]=logprobs not in form: {fields:?}"
+        );
+        // chunking_strategy (extras): JSON object carrying the server_vad type
+        let cs = fields
+            .iter()
+            .find(|(k, _)| k == "chunking_strategy")
+            .map(|(_, v)| v.clone())
+            .expect("chunking_strategy not in form");
+        assert!(cs.contains("server_vad"), "chunking_strategy wrong: {cs}");
+        // known_speaker_names[] (extras)
+        assert!(
+            has("known_speaker_names[]", "Alice"),
+            "name Alice missing: {fields:?}"
+        );
+        assert!(
+            has("known_speaker_names[]", "Bob"),
+            "name Bob missing: {fields:?}"
+        );
+        // known_speaker_references[] (extras) — paired positionally with names
+        assert!(
+            has("known_speaker_references[]", "data:audio/wav;base64,AAA="),
+            "reference AAA missing: {fields:?}"
+        );
+        assert!(
+            has("known_speaker_references[]", "data:audio/wav;base64,BBB="),
+            "reference BBB missing: {fields:?}"
+        );
+    }
+
+    // A config with no advanced features omits every new key (additive: unchanged wire shape).
+    #[test]
+    fn default_form_fields_omit_advanced_keys() {
+        let cfg = OpenAISTTConfig {
+            base: STTConfig {
+                api_key: "k".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let fields = cfg.transcription_text_fields();
+        for k in [
+            "stream",
+            "include[]",
+            "chunking_strategy",
+            "known_speaker_names[]",
+            "known_speaker_references[]",
+        ] {
+            assert!(
+                !fields.iter().any(|(fk, _)| fk == k),
+                "{k} should be omitted by default"
+            );
+        }
+        // The base fields are still present.
+        assert!(fields.iter().any(|(k, _)| k == "model"));
+        assert!(fields.iter().any(|(k, _)| k == "response_format"));
+    }
+
+    // W1 keystone: the standardized features unlock OpenAI's response-format-driven feature
+    // surface (diarization + word timestamps) — previously unreachable via the flat factory.
+    #[test]
+    fn from_standard_maps_features() {
+        use crate::core::stt::standard::{StandardSTTConfig, SttFeatures};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "openai".into(),
+                api_key: "test-key".into(),
+                model: "gpt-4o-transcribe".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                diarization: Some(true),
+                keyterms: Some(vec!["WaaV".into(), "OpenAI".into()]),
+                ..Default::default()
+            },
+            ..StandardSTTConfig::from_base(STTConfig::default())
+        };
+        let cfg = OpenAISTTConfig::from_standard(&std);
+        assert_eq!(cfg.response_format, ResponseFormat::DiarizedJson);
+        assert_eq!(cfg.prompt.as_deref(), Some("WaaV, OpenAI"));
+    }
 
     #[test]
     fn test_openai_stt_model_as_str() {

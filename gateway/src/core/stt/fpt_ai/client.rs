@@ -17,11 +17,13 @@
 //! - Channels: Mono
 //! - Encoding: Linear16 (PCM 16-bit)
 
+use super::super::http_resilience::HttpBreaker;
 use super::config::{FPT_STT_ENDPOINT, FptSttConfig, FptSttResponse};
 use crate::core::stt::base::{
     BaseSTT, STTConfig, STTConnectionState, STTError, STTErrorCallback, STTResult,
     STTResultCallback,
 };
+use crate::core::stt::wav as stt_wav;
 use bytes::Bytes;
 use reqwest::Client;
 use std::sync::Arc;
@@ -46,7 +48,7 @@ pub struct FptStt {
     /// Base STT configuration.
     base_config: Option<STTConfig>,
     /// HTTP client for REST API calls.
-    http_client: Client,
+    http_client: Option<Client>,
     /// Whether the client is ready to receive audio.
     is_ready: AtomicBool,
     /// Current connection state.
@@ -57,6 +59,29 @@ pub struct FptStt {
     result_callback: Arc<RwLock<Option<STTResultCallback>>>,
     /// Error callback.
     error_callback: Arc<RwLock<Option<STTErrorCallback>>>,
+    /// Shared per-provider circuit breaker for the REST transport (uniform with the WS fleet):
+    /// consulted before each upstream call, fed by the unified HTTP status classification.
+    /// Inert until `set_resilience` injects the process-global handles (W-D2).
+    resilience: HttpBreaker,
+}
+
+fn fpt_stt_http_client(timeout_secs: u64) -> Result<Client, reqwest::Error> {
+    crate::core::net::ssrf_protected_client_builder(crate::core::net::HTTP_URL_SCHEMES)
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .build()
+}
+
+fn default_fpt_stt_http_client() -> Option<Client> {
+    match fpt_stt_http_client(super::config::DEFAULT_REQUEST_TIMEOUT) {
+        Ok(client) => Some(client),
+        Err(err) => {
+            warn!(
+                error = %err,
+                "failed to create default FPT STT HTTP client; default instance is inert until rebuilt with a valid config"
+            );
+            None
+        }
+    }
 }
 
 impl FptStt {
@@ -74,20 +99,38 @@ impl FptStt {
         debug!("FPT STT: Processing {} bytes of audio", audio_data.len());
 
         // Build WAV header for raw PCM data
-        let wav_data = self.wrap_in_wav(&audio_data);
+        let wav_data = self.wrap_in_wav(&audio_data)?;
 
-        // Send to FPT.AI
-        let response = self
-            .http_client
-            .post(FPT_STT_ENDPOINT)
+        // Send to FPT.AI. When `endpoint_override` is set (credential-free mock harness), its
+        // scheme://host replaces the production host while the `/hmi/asr/general` path is preserved.
+        let url = match &self.config.endpoint_override {
+            Some(ov) => format!("{}/hmi/asr/general", ov.trim_end_matches('/')),
+            None => FPT_STT_ENDPOINT.to_string(),
+        };
+        let http_client = self.http_client.as_ref().ok_or_else(|| {
+            STTError::ConfigurationError(
+                "FPT STT default HTTP client is unavailable; construct with FptStt::new or new_standard".to_string(),
+            )
+        })?;
+
+        // Consult the shared per-provider breaker before paying the upstream round-trip: an
+        // open breaker fails fast with a typed classified refusal (uniform with the WS fleet).
+        self.resilience.check()?;
+
+        let response = http_client
+            .post(url)
             .header("api_key", &self.config.api_key)
             .header("Content-Type", "audio/wav")
             .body(wav_data)
             .send()
             .await
-            .map_err(|e| STTError::NetworkError(format!("Failed to send STT request: {e}")))?;
+            .map_err(|e| {
+                self.resilience.record_send_error();
+                STTError::NetworkError(format!("Failed to send STT request: {e}"))
+            })?;
 
         let status = response.status();
+        self.resilience.record_status(status);
 
         if !status.is_success() {
             let body = response
@@ -147,38 +190,9 @@ impl FptStt {
     }
 
     /// Wrap raw PCM data in a WAV container.
-    fn wrap_in_wav(&self, pcm_data: &[u8]) -> Vec<u8> {
-        let sample_rate = self.config.sample_rate;
-        let channels = self.config.channels;
-        let bits_per_sample: u16 = 16;
-        let byte_rate = sample_rate * u32::from(channels) * u32::from(bits_per_sample) / 8;
-        let block_align = channels * bits_per_sample / 8;
-        let data_size = pcm_data.len() as u32;
-        let file_size = 36 + data_size;
-
-        let mut wav = Vec::with_capacity(44 + pcm_data.len());
-
-        // RIFF header
-        wav.extend_from_slice(b"RIFF");
-        wav.extend_from_slice(&file_size.to_le_bytes());
-        wav.extend_from_slice(b"WAVE");
-
-        // fmt chunk
-        wav.extend_from_slice(b"fmt ");
-        wav.extend_from_slice(&16u32.to_le_bytes()); // chunk size
-        wav.extend_from_slice(&1u16.to_le_bytes()); // audio format (PCM)
-        wav.extend_from_slice(&channels.to_le_bytes());
-        wav.extend_from_slice(&sample_rate.to_le_bytes());
-        wav.extend_from_slice(&byte_rate.to_le_bytes());
-        wav.extend_from_slice(&block_align.to_le_bytes());
-        wav.extend_from_slice(&bits_per_sample.to_le_bytes());
-
-        // data chunk
-        wav.extend_from_slice(b"data");
-        wav.extend_from_slice(&data_size.to_le_bytes());
-        wav.extend_from_slice(pcm_data);
-
-        wav
+    fn wrap_in_wav(&self, pcm_data: &[u8]) -> Result<Vec<u8>, STTError> {
+        stt_wav::encode_pcm16_wav(pcm_data, self.config.sample_rate, self.config.channels)
+            .map_err(|e| STTError::AudioProcessingError(format!("Invalid WAV parameters: {e}")))
     }
 
     /// Flush the audio buffer and get transcription.
@@ -211,9 +225,39 @@ impl FptStt {
         Ok(transcription)
     }
 
+    /// W1 keystone — construct directly from the standardized config so the standardized entry
+    /// point is uniform across providers. FPT.AI exposes no advanced-feature surface (it is a
+    /// simple batch decode endpoint), so `from_standard` is a pure `from_base` passthrough and no
+    /// [`SttFeatures`](crate::core::stt::standard::SttFeatures) are mapped; only the base transport
+    /// knobs (api_key, sample_rate, channels) survive. Mirrors `DeepgramSTT::new_standard`.
+    pub fn new_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        let fpt_config = FptSttConfig::from_standard(std)?;
+
+        let timeout_secs = fpt_config.request_timeout_secs;
+        let http_client = fpt_stt_http_client(timeout_secs).map_err(|e| {
+            STTError::ConfigurationError(format!("Failed to create HTTP client: {e}"))
+        })?;
+
+        Ok(Self {
+            config: fpt_config,
+            base_config: Some(std.base.clone()),
+            http_client: Some(http_client),
+            ..Default::default()
+        })
+    }
+
     /// Get the FPT-specific configuration.
     pub fn get_fpt_config(&self) -> &FptSttConfig {
         &self.config
+    }
+
+    /// The shared circuit breaker this client feeds, if the process-global resilience handles
+    /// have been injected (W-D2). Two `FptStt` built from the same
+    /// [`crate::core::resilience::ResilienceRegistry`] return the *same* `Arc`.
+    pub fn resilience_breaker(&self) -> Option<&Arc<crate::core::resilience::CircuitBreaker>> {
+        self.resilience.breaker()
     }
 
     /// Get the current buffer size.
@@ -227,12 +271,13 @@ impl Default for FptStt {
         Self {
             config: FptSttConfig::default(),
             base_config: None,
-            http_client: Client::new(),
+            http_client: default_fpt_stt_http_client(),
             is_ready: AtomicBool::new(false),
             connection_state: Arc::new(RwLock::new(STTConnectionState::Disconnected)),
             audio_buffer: Arc::new(RwLock::new(Vec::with_capacity(MAX_AUDIO_BUFFER_SIZE))),
             result_callback: Arc::new(RwLock::new(None)),
             error_callback: Arc::new(RwLock::new(None)),
+            resilience: HttpBreaker::new("fpt_ai"),
         }
     }
 }
@@ -243,12 +288,9 @@ impl BaseSTT for FptStt {
         let fpt_config = FptSttConfig::from_base(&config)?;
 
         let timeout_secs = fpt_config.request_timeout_secs;
-        let http_client = Client::builder()
-            .timeout(std::time::Duration::from_secs(timeout_secs))
-            .build()
-            .map_err(|e| {
-                STTError::ConfigurationError(format!("Failed to create HTTP client: {e}"))
-            })?;
+        let http_client = fpt_stt_http_client(timeout_secs).map_err(|e| {
+            STTError::ConfigurationError(format!("Failed to create HTTP client: {e}"))
+        })?;
 
         info!(
             "FPT STT: Initialized with sample_rate={}, channels={}",
@@ -258,12 +300,13 @@ impl BaseSTT for FptStt {
         Ok(Self {
             config: fpt_config,
             base_config: Some(config),
-            http_client,
+            http_client: Some(http_client),
             is_ready: AtomicBool::new(false),
             connection_state: Arc::new(RwLock::new(STTConnectionState::Disconnected)),
             audio_buffer: Arc::new(RwLock::new(Vec::with_capacity(MAX_AUDIO_BUFFER_SIZE))),
             result_callback: Arc::new(RwLock::new(None)),
             error_callback: Arc::new(RwLock::new(None)),
+            resilience: HttpBreaker::new("fpt_ai"),
         })
     }
 
@@ -388,5 +431,93 @@ impl BaseSTT for FptStt {
 
     fn get_provider_info(&self) -> &'static str {
         "FPT.AI Speech-to-Text (FPT Corporation) - Vietnamese language recognition"
+    }
+
+    /// W-D2: attach the shared per-provider circuit breaker so every FPT.AI session trips
+    /// (and observes) the SAME breaker, uniform with the WS fleet. The REST transport consults
+    /// it before each upstream call and feeds it the unified HTTP status classification.
+    fn set_resilience(&mut self, resilience: crate::core::resilience::ResilienceHandles) {
+        self.resilience.set_handles(resilience);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_test_config() -> STTConfig {
+        STTConfig {
+            provider: "fpt-ai".to_string(),
+            api_key: "test_api_key".to_string(),
+            language: "vi".to_string(),
+            sample_rate: 16000,
+            channels: 1,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fpt_stt_redirect_policy_rejects_private_hop() {
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local redirect test server");
+        let addr = listener.local_addr().expect("local addr");
+
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 1024];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 302 Found\r\n",
+                "Location: http://127.0.0.1:9/metadata\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n"
+            );
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await;
+        });
+
+        let stt = FptStt::new(make_test_config()).expect("construct FPT STT");
+        let err = stt
+            .http_client
+            .as_ref()
+            .expect("strict constructor builds an HTTP client")
+            .get(format!("http://{addr}/start"))
+            .send()
+            .await
+            .expect_err("private redirect target must be rejected");
+        let mut error_chain = err.to_string();
+        let mut source = std::error::Error::source(&err);
+        while let Some(err) = source {
+            error_chain.push_str(": ");
+            error_chain.push_str(&err.to_string());
+            source = err.source();
+        }
+        assert!(error_chain.contains("SSRF protection"), "{error_chain}");
+    }
+
+    #[tokio::test]
+    async fn default_without_http_client_returns_typed_error_without_panic() {
+        let mut stt = FptStt::default();
+        stt.http_client = None;
+
+        let err = stt
+            .process_audio(vec![0; MIN_AUDIO_BUFFER_SIZE])
+            .await
+            .expect_err("inert default client must fail with a typed error");
+
+        match err {
+            STTError::ConfigurationError(msg) => {
+                assert!(msg.contains("default HTTP client"), "{msg}");
+            }
+            other => panic!("expected ConfigurationError, got {other:?}"),
+        }
     }
 }

@@ -1,0 +1,83 @@
+# cargo-deny configuration for WaaV (plan W-E1 / W-T1, exit E12).
+#
+# Run by the `supply-chain` CI job alongside cargo-audit and gitleaks. This file makes the
+# dependency policy explicit and stable so the job is deterministic:
+#   - advisories: fail on RUSTSEC vulnerabilities (cargo-audit overlaps; deny is the gate).
+#   - bans:       no wildcard versions; allow the known git/source for deep_filter.
+#   - licenses:   allow the permissive set the tree actually uses (Apache-2.0 crate).
+#   - sources:    only crates.io + the pinned DeepFilterNet git rev are permitted.
+#
+# Targets restrict graph evaluation to the platforms we actually ship/CI (Linux glibc +
+# the musl cross-compile target), so platform-specific advisories elsewhere don't add noise.
+
+[graph]
+targets = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-unknown-linux-musl",
+]
+all-features = true
+
+[output]
+feature-depth = 1
+
+# ---------------------------------------------------------------------------------------
+[advisories]
+# cargo-deny 0.16+ defaults `vulnerability`/`unmaintained` to deny; we keep that and pull
+# the latest advisory DB in CI.
+version = 2
+yanked = "deny"
+# Known, accepted advisories with no available upgrade path on the pinned tree. Each must
+# carry a justification; revisit when a dependency bump lands.
+ignore = [
+  # RSA "Marvin Attack" timing sidechannel. Pulled in transitively by some provider TLS/JWT
+  # stacks; no fixed release of `rsa` exists yet. Not exploitable in our usage (we do not
+  # perform RSA private-key decryption on attacker-controlled ciphertext on the hot path).
+  # Remove once `rsa` ships a patched release.
+  { id = "RUSTSEC-2023-0071", reason = "rsa Marvin timing sidechannel; no patched release; not on an exploitable path" },
+]
+
+# ---------------------------------------------------------------------------------------
+[bans]
+multiple-versions = "warn"     # duplicate-version churn is noise, not a merge blocker
+wildcard-dependencies = "deny" # forbid `*` version requirements (reproducibility, W11)
+allow-wildcard-paths = true    # ...except path deps (waav-plugin-api), which are intra-repo
+
+# ---------------------------------------------------------------------------------------
+[licenses]
+# Permissive licenses present in the dependency tree. The WaaV crate itself is Apache-2.0.
+allow = [
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "MIT",
+  "MIT-0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "MPL-2.0",
+  "CC0-1.0",
+  "0BSD",
+  "BSL-1.0",
+  "OpenSSL",
+]
+confidence-threshold = 0.9
+
+# DeepFilterNet (git) and a few crates ship LICENSE files without SPDX in Cargo.toml;
+# clarify the ones we depend on so the licenses gate is deterministic.
+[[licenses.clarify]]
+crate = "ring"
+expression = "MIT AND ISC AND OpenSSL"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+# ---------------------------------------------------------------------------------------
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# Only crates.io is allowed as a registry.
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# The only permitted git source: DeepFilterNet, pinned to an exact rev in Cargo.toml
+# (noise-filter feature). cargo-deny verifies the rev matches the lockfile.
+allow-git = ["https://github.com/Rikorose/DeepFilterNet"]

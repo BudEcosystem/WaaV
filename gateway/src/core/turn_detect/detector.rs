@@ -10,10 +10,10 @@ use crate::core::turn_detect::{
     config::TurnDetectorConfig, model_manager::ModelManager, tokenizer::Tokenizer,
 };
 
-// Static regex for text normalization
-static PUNCT_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"[^\w\s'-]").unwrap());
+// Static regex for text normalization.
+static PUNCT_REGEX: Lazy<Result<Regex, regex::Error>> = Lazy::new(|| Regex::new(r"[^\w\s'-]"));
 
-static WHITESPACE_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s+").unwrap());
+static WHITESPACE_REGEX: Lazy<Result<Regex, regex::Error>> = Lazy::new(|| Regex::new(r"\s+"));
 
 pub struct TurnDetector {
     model: Arc<tokio::sync::Mutex<ModelManager>>,
@@ -63,10 +63,10 @@ impl TurnDetector {
         let text = text.to_lowercase();
 
         // Remove all punctuation except apostrophes and hyphens
-        let text = PUNCT_REGEX.replace_all(&text, " ");
+        let text = replace_punctuation_for_turn_detection(&text);
 
         // Normalize whitespace
-        let text = WHITESPACE_REGEX.replace_all(&text, " ");
+        let text = normalize_turn_detection_whitespace(&text);
 
         text.trim().to_string()
     }
@@ -161,6 +161,48 @@ impl TurnDetector {
     }
 }
 
+fn replace_punctuation_for_turn_detection(text: &str) -> String {
+    match &*PUNCT_REGEX {
+        Ok(regex) => regex.replace_all(text, " ").into_owned(),
+        Err(err) => {
+            warn!(
+                error = %err,
+                "turn detector punctuation regex unavailable; using scalar fallback"
+            );
+            replace_punctuation_scalar(text)
+        }
+    }
+}
+
+fn normalize_turn_detection_whitespace(text: &str) -> String {
+    match &*WHITESPACE_REGEX {
+        Ok(regex) => regex.replace_all(text, " ").into_owned(),
+        Err(err) => {
+            warn!(
+                error = %err,
+                "turn detector whitespace regex unavailable; using scalar fallback"
+            );
+            normalize_whitespace_scalar(text)
+        }
+    }
+}
+
+fn replace_punctuation_scalar(text: &str) -> String {
+    text.chars()
+        .map(|ch| {
+            if ch.is_alphanumeric() || ch.is_whitespace() || ch == '_' || ch == '\'' || ch == '-' {
+                ch
+            } else {
+                ' '
+            }
+        })
+        .collect()
+}
+
+fn normalize_whitespace_scalar(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 pub struct TurnDetectorBuilder {
     config: TurnDetectorConfig,
 }
@@ -226,6 +268,32 @@ impl TurnDetectorBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_normalization_regexes_compile_without_unwrap() {
+        assert!(matches!(&*PUNCT_REGEX, Ok(_)));
+        assert!(matches!(&*WHITESPACE_REGEX, Ok(_)));
+    }
+
+    #[test]
+    fn test_normalize_text_removes_punctuation_and_collapses_whitespace() {
+        assert_eq!(
+            TurnDetector::normalize_text("Hello,   WORLD!!! it's fine-okay"),
+            "hello world it's fine-okay"
+        );
+    }
+
+    #[test]
+    fn test_scalar_normalization_fallbacks_match_common_regex_behavior() {
+        assert_eq!(
+            replace_punctuation_scalar("Hello, _world_ -- ok's"),
+            "Hello  _world_ -- ok's"
+        );
+        assert_eq!(
+            normalize_whitespace_scalar("  one\t two\n\nthree  "),
+            "one two three"
+        );
+    }
 
     #[tokio::test]
     async fn test_builder_pattern() {

@@ -118,6 +118,9 @@
 mod client;
 mod config;
 pub mod messages;
+// `pub(crate)` so the Hume EVI protocol (the per-provider RealtimeProtocol) is
+// reachable from the newtype client; not part of the public surface.
+pub(crate) mod protocol;
 
 pub use client::HumeEVI;
 pub use config::{EVIConfigError, EVIVersion, HumeEVIConfig};

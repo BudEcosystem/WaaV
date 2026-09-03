@@ -7,8 +7,17 @@ pub struct LiveKitConfig {
     pub token: String,
     /// Room name (extracted from token or provided separately)
     pub room_name: String,
-    /// Sample rate for audio publishing (from TTS config)
+    /// Sample rate for audio PUBLISHING (egress: bot audio to the room).
+    /// With `client_playback_rate` set this is the client rate (the bytes
+    /// fed to the track are resampled to it).
     pub sample_rate: u32,
+    /// Sample rate remote-participant (user) audio is DELIVERED at
+    /// (ingress: room mic -> STT/VAD). MUST match what the voice pipeline
+    /// declares downstream — the STT provider's configured rate — or
+    /// transcription receives time-stretched audio (review wf_85659e16 #1:
+    /// a single shared rate let the egress-only `client_playback_rate`
+    /// silently re-rate the user's microphone).
+    pub ingress_sample_rate: u32,
     /// Number of audio channels for publishing (typically 1 for mono)
     pub channels: u16,
     /// Enable noise filtering on incoming audio (default: enabled when the `noise-filter`

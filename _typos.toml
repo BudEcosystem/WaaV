@@ -1,0 +1,56 @@
+# typos (crate-ci/typos) configuration for WaaV (plan W-T1, exit E12).
+# Run by the `supply-chain` CI job. Catches spelling mistakes in code/docs/comments while
+# tolerating the domain vocabulary (provider names, audio/ML jargon, identifiers).
+
+[files]
+extend-exclude = [
+  "gateway/Cargo.lock",
+  "gateway/docs/openapi.yaml",   # generated artifact; checked by openapi-drift, not spell-checked
+  "**/*.wav",
+  "**/*.onnx",
+  "**/fixtures/**",
+  "**/cassettes/**",
+  "**/node_modules/**",
+  "**/target/**",
+  "**/*.min.js",
+]
+
+[default]
+# Don't try to correct inside base64/hex blobs and long identifiers.
+locale = "en-us"
+
+[default.extend-words]
+# Domain terms that look like typos but are intentional.
+ot = "ot"            # short ids in tests
+ser = "ser"          # serde ser/de
+nd = "nd"            # ndarray shorthand
+mut = "mut"
+crate = "crate"
+WaaV = "WaaV"
+waav = "waav"
+
+[default.extend-identifiers]
+# Provider / vendor / library identifiers that are not English words.
+Deepgram = "Deepgram"
+ElevenLabs = "ElevenLabs"
+Cartesia = "Cartesia"
+AssemblyAI = "AssemblyAI"
+Tinkoff = "Tinkoff"
+Sarvam = "Sarvam"
+Gnani = "Gnani"
+Tencent = "Tencent"
+LiveKit = "LiveKit"
+livekit = "livekit"
+tonic = "tonic"
+rhai = "rhai"
+petgraph = "petgraph"
+utoipa = "utoipa"
+onnxruntime = "onnxruntime"
+ort = "ort"
+tract = "tract"
+mels = "mels"
+mel = "mel"
+realfft = "realfft"
+rubato = "rubato"
+silero = "silero"
+Silero = "Silero"

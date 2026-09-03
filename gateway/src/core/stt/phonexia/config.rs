@@ -12,12 +12,14 @@ use super::{
     MAX_SAMPLE_RATE, MIN_CHANNELS, MIN_SAMPLE_RATE, WEBSOCKET_PATH,
 };
 
+const PHONEXIA_SERVER_URL_SCHEMES: &[&str] = &["http", "https"];
+
 // =============================================================================
 // Enums
 // =============================================================================
 
 /// Authentication method for Phonexia server
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum PhonexiaAuth {
     /// Token-based authentication (login first, then use X-SessionID)
     Token {
@@ -32,13 +34,8 @@ pub enum PhonexiaAuth {
         password: String,
     },
     /// No authentication (for testing or open servers)
+    #[default]
     None,
-}
-
-impl Default for PhonexiaAuth {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 /// Result type format for transcription
@@ -110,6 +107,13 @@ pub struct PhonexiaSTTConfig {
     /// Result type format
     pub result_type: PhonexiaResultType,
 
+    /// Multiple result types to request simultaneously (Phonexia `result_types[]`).
+    ///
+    /// When non-empty, the server returns every listed result type for each segment (e.g.
+    /// `one_best` + `n_best` + `confusion_network`) instead of only the single `result_type`.
+    /// Emitted as repeated `result_types[]=<type>` query params on the WebSocket URL.
+    pub result_types: Vec<PhonexiaResultType>,
+
     /// Number of N-best alternatives (when result_type is NBest)
     pub n_best_count: Option<u32>,
 
@@ -157,6 +161,7 @@ impl Default for PhonexiaSTTConfig {
             channels: DEFAULT_CHANNELS,
             audio_format: DEFAULT_AUDIO_FORMAT.to_string(),
             result_type: PhonexiaResultType::OneBest,
+            result_types: Vec::new(),
             n_best_count: None,
             preferred_phrases: Vec::new(),
             custom_words: Vec::new(),
@@ -274,14 +279,12 @@ impl PhonexiaSTTConfig {
             ));
         }
 
-        // Validate URL format
-        let url_lower = self.server_url.to_lowercase();
-        if !url_lower.starts_with("http://") && !url_lower.starts_with("https://") {
-            return Err(STTError::ConfigurationError(format!(
-                "Invalid server URL: {}. Must start with http:// or https://",
-                self.server_url
-            )));
-        }
+        crate::core::net::validate_url_for_ssrf(&self.server_url, PHONEXIA_SERVER_URL_SCHEMES)
+            .map_err(|msg| {
+                STTError::ConfigurationError(format!(
+                    "Phonexia server URL rejected (SSRF protection): {msg}"
+                ))
+            })?;
 
         // Validate sample rate
         if self.sample_rate < MIN_SAMPLE_RATE || self.sample_rate > MAX_SAMPLE_RATE {
@@ -357,12 +360,20 @@ impl PhonexiaSTTConfig {
             params.push(("language", self.language.clone()));
         }
 
-        // Build query string
+        // Multiple result types (Phonexia `result_types[]`): one repeated query param per type.
+        for rt in &self.result_types {
+            params.push(("result_types[]", rt.to_string()));
+        }
+
+        // Build query string. Both key and value are percent-encoded so keys carrying reserved
+        // characters (e.g. the `[]` in `result_types[]`) produce a well-formed URL. Plain keys
+        // (`frequency`/`channels`/`language`) are unaffected since they have no special chars.
         let query_string: String = params
             .iter()
             .map(|(k, v)| {
+                let key: String = form_urlencoded::byte_serialize(k.as_bytes()).collect();
                 let encoded: String = form_urlencoded::byte_serialize(v.as_bytes()).collect();
-                format!("{}={}", k, encoded)
+                format!("{}={}", key, encoded)
             })
             .collect::<Vec<_>>()
             .join("&");
@@ -412,14 +423,56 @@ impl PhonexiaSTTConfig {
             .with_channels(config.channels as u8);
 
         // Parse model field for result type
-        if !config.model.is_empty() {
-            if let Ok(result_type) = config.model.parse::<PhonexiaResultType>() {
-                phonexia_config = phonexia_config.with_result_type(result_type);
-            }
+        if !config.model.is_empty()
+            && let Ok(result_type) = config.model.parse::<PhonexiaResultType>()
+        {
+            phonexia_config = phonexia_config.with_result_type(result_type);
         }
 
         phonexia_config.validate()?;
         Ok(phonexia_config)
+    }
+
+    /// Build from the standardized config (W1 keystone — final batch). Phonexia is an
+    /// on-premises, batch-oriented engine with a narrow tunable surface, so this maps the
+    /// standardized features it can actually express: per-word timestamps (`enable_timestamps`)
+    /// and key terms / phrase hints (`preferred_phrases`), plus the provider extra
+    /// `multiple_result_types` (string array) → `result_types[]` (request several result types
+    /// at once). Features Phonexia can't express (diarization, smart_format, profanity_filter,
+    /// filler_words, interim_results, vad/endpointing, redaction, entity/language detection) are
+    /// capability gaps and stay at their defaults.
+    pub fn from_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(&std.base)?;
+        if let Some(w) = f.word_timestamps {
+            cfg.enable_timestamps = w;
+        }
+        if let Some(k) = &f.keyterms {
+            cfg.preferred_phrases = k.clone();
+        }
+        // Provider extra `multiple_result_types` → result_types[]. Each entry is parsed against
+        // the known result-type vocabulary; an unrecognized entry fails loudly (it would silently
+        // neutralize the feature otherwise — the open-passthrough contract in standard.rs).
+        if let Some(arr) = std
+            .extras
+            .0
+            .get("multiple_result_types")
+            .and_then(|v| v.as_array())
+        {
+            let mut types = Vec::with_capacity(arr.len());
+            for v in arr {
+                let s = v.as_str().ok_or_else(|| {
+                    STTError::ConfigurationError(
+                        "multiple_result_types must be an array of strings".to_string(),
+                    )
+                })?;
+                types.push(s.parse::<PhonexiaResultType>()?);
+            }
+            cfg.result_types = types;
+        }
+        Ok(cfg)
     }
 }
 
@@ -446,6 +499,94 @@ impl From<PhonexiaSTTConfig> for STTConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone (final batch): the standardized features map onto the two fields Phonexia can
+    // express — per-word timestamps (`enable_timestamps`) and phrase hints (`preferred_phrases`).
+    #[test]
+    fn from_standard_maps_features() {
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "phonexia".into(),
+                api_key: "https://phonexia.example.com".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                word_timestamps: Some(false),
+                keyterms: Some(vec!["WaaV".into(), "Phonexia".into()]),
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+            translation: None,
+        };
+        let cfg = PhonexiaSTTConfig::from_standard(&std).unwrap();
+        assert!(!cfg.enable_timestamps); // word_timestamps
+        assert_eq!(cfg.preferred_phrases, vec!["WaaV", "Phonexia"]); // keyterms
+        // base (server URL carried through the api_key field) survived from_base.
+        assert_eq!(cfg.server_url, "https://phonexia.example.com");
+    }
+
+    // WIRE-LEVEL (the recurring bug class): the `multiple_result_types` extra mapped in
+    // `from_standard` must reach the WebSocket URL the client connects with (`build_websocket_url`)
+    // — not just live on the config struct. This drives the standardized config through
+    // `from_standard` then through the SAME URL builder the client uses, asserting each
+    // `result_types[]=<type>` api_param is present in the query string.
+    #[test]
+    fn multiple_result_types_reach_websocket_url() {
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
+
+        let mut extras = serde_json::Map::new();
+        extras.insert(
+            "multiple_result_types".into(),
+            serde_json::json!(["one_best", "n_best", "confusion_network"]),
+        );
+
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "phonexia".into(),
+                api_key: "https://phonexia.example.com".into(),
+                language: "en-US".into(),
+                sample_rate: 16000,
+                channels: 1,
+                ..Default::default()
+            },
+            features: SttFeatures::default(),
+            extras: ProviderExtras(extras),
+            translation: None,
+        };
+
+        let cfg = PhonexiaSTTConfig::from_standard(&std).unwrap();
+        let url = cfg.build_websocket_url();
+
+        // Each requested result type lands on the wire as a repeated query param.
+        assert!(
+            url.contains("result_types%5B%5D=one_best"),
+            "one_best result_types[] not on the wire: {url}"
+        );
+        assert!(
+            url.contains("result_types%5B%5D=n_best"),
+            "n_best result_types[] not on the wire: {url}"
+        );
+        assert!(
+            url.contains("result_types%5B%5D=confusion_network"),
+            "confusion_network result_types[] not on the wire: {url}"
+        );
+    }
+
+    // A config with no `multiple_result_types` extra omits `result_types[]` (additive: unchanged
+    // wire shape).
+    #[test]
+    fn websocket_url_omits_result_types_when_unset() {
+        let config = PhonexiaSTTConfig::new("https://phonexia.example.com")
+            .with_sample_rate(16000)
+            .with_channels(1)
+            .with_language("en-US");
+        let url = config.build_websocket_url();
+        assert!(
+            !url.contains("result_types"),
+            "result_types[] should be omitted: {url}"
+        );
+    }
 
     #[test]
     fn test_phonexia_config_new() {
@@ -513,11 +654,33 @@ mod tests {
 
     #[test]
     fn test_phonexia_config_validate_invalid_url() {
+        let _env = crate::core::net::ssrf_env_lock();
         let config = PhonexiaSTTConfig::new("not-a-valid-url");
         let result = config.validate();
         assert!(result.is_err());
         if let Err(STTError::ConfigurationError(msg)) = result {
-            assert!(msg.contains("Must start with http://"));
+            assert!(msg.contains("SSRF protection"));
+            assert!(msg.contains("invalid URL"));
+        }
+    }
+
+    #[test]
+    fn test_phonexia_config_validate_rejects_ssrf_targets() {
+        let _env = crate::core::net::ssrf_env_lock();
+        for url in [
+            "http://127.0.0.1:8080",
+            "http://localhost:8080",
+            "http://169.254.169.254",
+            "file:///tmp/socket",
+        ] {
+            let err = PhonexiaSTTConfig::new(url)
+                .validate()
+                .expect_err("unsafe Phonexia server URL must be rejected");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("SSRF protection") || msg.contains("not allowed"),
+                "{url}: {msg}"
+            );
         }
     }
 

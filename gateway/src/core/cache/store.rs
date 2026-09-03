@@ -4,6 +4,12 @@
 //! memory and filesystem backends, optimized for high-performance
 //! concurrent access with zero-copy operations.
 
+// W-E1 hot-path unwrap audit: the cache sits on the request hot path. Forbid
+// silent runtime panics; runtime fallibility must be `?`/structured errors or an
+// explicit infallible fallback (`unwrap_or*`). Tests may use unwrap/expect
+// (allowed in the `#[cfg(test)]` module below).
+#![warn(clippy::unwrap_used, clippy::expect_used)]
+
 use async_trait::async_trait;
 use bytes::Bytes;
 use moka::future::{Cache as MokaCache, CacheBuilder as MokaCacheBuilder};
@@ -300,7 +306,7 @@ impl CacheBackend for FilesystemCacheBackend {
         // Write metadata
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default() // clock-before-epoch -> 0 instead of panicking the cache op
             .as_secs();
 
         let expires_at = ttl.or(self.default_ttl).map(|d| now + d.as_secs());
@@ -339,7 +345,7 @@ impl CacheBackend for FilesystemCacheBackend {
         if let Some(expires_at) = meta.expires_at {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default() // clock-before-epoch -> 0 instead of panicking the cache op
                 .as_secs();
 
             if now > expires_at {
@@ -373,7 +379,7 @@ impl CacheBackend for FilesystemCacheBackend {
         if let Some(expires_at) = meta.expires_at {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default() // clock-before-epoch -> 0 instead of panicking the cache op
                 .as_secs();
 
             if now > expires_at {
@@ -612,6 +618,8 @@ impl CacheStore {
 
 #[cfg(test)]
 mod tests {
+    // Tests may use unwrap/expect freely; the hot-path lint targets runtime code.
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
     use tempfile::TempDir;
 

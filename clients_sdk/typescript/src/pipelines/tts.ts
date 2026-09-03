@@ -46,6 +46,18 @@ export interface BudTTSConfig extends BasePipelineConfig {
   playerConfig?: PlayerConfig;
   /** Base URL for REST API (used for one-shot synthesis) */
   restBaseUrl?: string;
+  /**
+   * D2 gateway egress reframing: emit downlink audio in chunks of this many ms.
+   * Defaults to 20 when autoPlay (owns a player) so barge-in truncates within
+   * one server chunk and chunks arrive pre-sized for scheduled playout.
+   */
+  audioOutChunkMs?: number;
+  /**
+   * D2 gateway downlink resample target. Defaults to the player sample rate when
+   * autoPlay, so the gateway resamples downlink (continuous filter state) and
+   * the scheduled player does ZERO client-side resampling.
+   */
+  clientPlaybackRate?: number;
 }
 
 /**
@@ -61,12 +73,14 @@ export class BudTTS extends BasePipeline {
   private isProcessingQueue = false;
 
   constructor(config: BudTTSConfig) {
+    const sampleRate = config.sampleRate ?? 24000;
+    const autoPlay = config.autoPlay ?? true;
     const ttsConfig: TTSConfig = {
       provider: config.provider ?? 'deepgram',
       voice: config.voice,
       voiceId: config.voiceId,
       model: config.model,
-      sampleRate: config.sampleRate ?? 24000,
+      sampleRate,
       audioFormat: config.audioFormat ?? 'linear16',
       speed: config.speed,
       pitch: config.pitch,
@@ -77,6 +91,22 @@ export class BudTTS extends BasePipeline {
       useSpeakerBoost: config.useSpeakerBoost,
     };
 
+    // D2 gateway leverage: when we own a player, ask the gateway to (a) pre-frame
+    // egress into 20ms chunks so barge-in truncates within one server chunk and
+    // chunks arrive pre-sized for scheduled playout, and (b) resample downlink to
+    // our AudioContext sink rate so the player does ZERO client-side resampling.
+    // An explicit user value wins; otherwise default under autoPlay.
+    if (config.audioOutChunkMs !== undefined) {
+      ttsConfig.audioOutChunkMs = config.audioOutChunkMs;
+    } else if (autoPlay) {
+      ttsConfig.audioOutChunkMs = 20;
+    }
+    if (config.clientPlaybackRate !== undefined) {
+      ttsConfig.clientPlaybackRate = config.clientPlaybackRate;
+    } else if (autoPlay) {
+      ttsConfig.clientPlaybackRate = sampleRate;
+    }
+
     super({
       ...config,
       sessionConfig: {
@@ -85,7 +115,7 @@ export class BudTTS extends BasePipeline {
     });
 
     this.ttsConfig = ttsConfig;
-    this.autoPlay = config.autoPlay ?? true;
+    this.autoPlay = autoPlay;
 
     // Setup audio player if auto-play enabled
     if (this.autoPlay) {
@@ -118,7 +148,9 @@ export class BudTTS extends BasePipeline {
     this.emitter.emit('audio', event);
 
     if (this.autoPlay && this.player) {
-      this.player.addPCM(event.audio);
+      // Thread the gateway sequence number so the D9 jitter buffer (if enabled)
+      // can reorder out-of-order arrivals.
+      this.player.addPCM(event.audio, event.sequence);
     }
   }
 
@@ -250,7 +282,7 @@ export class BudTTS extends BasePipeline {
    * Stop current speech
    */
   stopSpeaking(): void {
-    this.session.interrupt();
+    this.session.clear();
     this.player?.stop();
     this.speakQueue = [];
     this.isSpeaking = false;

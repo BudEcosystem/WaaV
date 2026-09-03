@@ -22,10 +22,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::sync::Mutex;
 
-use waav_gateway::core::stt::{BaseSTT, STTConfig, STTError, create_stt_provider};
-use waav_gateway::core::tts::{
-    AudioCallback, AudioData, BaseTTS, TTSConfig, TTSError, create_tts_provider,
-};
+use waav_gateway::core::stt::{STTConfig, STTError, create_stt_provider};
+use waav_gateway::core::tts::{AudioCallback, AudioData, TTSConfig, TTSError, create_tts_provider};
 
 // ============================================================================
 // Test Helpers
@@ -186,6 +184,7 @@ fn test_gnani_stt_factory_case_insensitive() {
 #[test]
 fn test_gnani_tts_factory_creation() {
     let config = TTSConfig {
+        api_base: None,
         provider: "gnani".to_string(),
         api_key: "mock-token".to_string(),
         model: "default".to_string(),
@@ -214,6 +213,7 @@ fn test_gnani_tts_factory_aliases() {
 
     for alias in aliases {
         let config = TTSConfig {
+            api_base: None,
             provider: alias.to_string(),
             api_key: "mock-token".to_string(),
             model: "default".to_string(),
@@ -350,6 +350,7 @@ async fn test_gnani_stt_disconnect_not_connected() {
 #[test]
 fn test_gnani_tts_not_connected_initially() {
     let config = TTSConfig {
+        api_base: None,
         provider: "gnani".to_string(),
         api_key: "mock-token".to_string(),
         model: "default".to_string(),
@@ -364,7 +365,7 @@ fn test_gnani_tts_not_connected_initially() {
         emotion_config: None,
     };
 
-    let provider = create_tts_provider("gnani", config).unwrap();
+    let _provider = create_tts_provider("gnani", config).unwrap();
     // TTS providers may or may not have is_connected method
     // The key test is that speak fails without connect
 }
@@ -373,6 +374,7 @@ fn test_gnani_tts_not_connected_initially() {
 #[tokio::test]
 async fn test_gnani_tts_speak_fails_not_connected() {
     let config = TTSConfig {
+        api_base: None,
         provider: "gnani".to_string(),
         api_key: "mock-token".to_string(),
         model: "default".to_string(),
@@ -446,6 +448,7 @@ fn test_gnani_tts_all_languages() {
 
     for lang in languages {
         let config = TTSConfig {
+            api_base: None,
             provider: "gnani".to_string(),
             api_key: "mock-token".to_string(),
             model: "default".to_string(),

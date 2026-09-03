@@ -80,6 +80,8 @@ fn test_ibm_watson_stt_ibm_config_access() {
         api_key: "test_key".to_string(),
         language: "en-US".to_string(),
         sample_rate: 16000,
+        // No explicit model → selected by language (clear the Deepgram default "nova-3").
+        model: String::new(),
         ..Default::default()
     };
 
@@ -259,6 +261,8 @@ fn test_model_selection_by_language() {
     // English (US) -> EnUsMultimedia
     let config = STTConfig {
         language: "en-US".to_string(),
+        // No explicit model → selected by language (clear the Deepgram default "nova-3").
+        model: String::new(),
         ..Default::default()
     };
     let ibm_config = config::IbmWatsonSTTConfig::from_base(config, "test".to_string());
@@ -267,6 +271,8 @@ fn test_model_selection_by_language() {
     // German -> DeDeMultimedia
     let config = STTConfig {
         language: "de-DE".to_string(),
+        // No explicit model → selected by language (clear the Deepgram default "nova-3").
+        model: String::new(),
         ..Default::default()
     };
     let ibm_config = config::IbmWatsonSTTConfig::from_base(config, "test".to_string());
@@ -275,6 +281,8 @@ fn test_model_selection_by_language() {
     // Japanese -> JaJpMultimedia
     let config = STTConfig {
         language: "ja-JP".to_string(),
+        // No explicit model → selected by language (clear the Deepgram default "nova-3").
+        model: String::new(),
         ..Default::default()
     };
     let ibm_config = config::IbmWatsonSTTConfig::from_base(config, "test".to_string());
@@ -283,6 +291,8 @@ fn test_model_selection_by_language() {
     // Unknown language falls back to en-US
     let config = STTConfig {
         language: "xx-XX".to_string(),
+        // No explicit model → selected by language (clear the Deepgram default "nova-3").
+        model: String::new(),
         ..Default::default()
     };
     let ibm_config = config::IbmWatsonSTTConfig::from_base(config, "test".to_string());
@@ -294,6 +304,8 @@ fn test_encoding_selection() {
     // Linear16
     let config = STTConfig {
         encoding: "linear16".to_string(),
+        // No explicit model → selected by language (clear the Deepgram default "nova-3").
+        model: String::new(),
         ..Default::default()
     };
     let ibm_config = config::IbmWatsonSTTConfig::from_base(config, "test".to_string());
@@ -302,6 +314,8 @@ fn test_encoding_selection() {
     // Mulaw
     let config = STTConfig {
         encoding: "mulaw".to_string(),
+        // No explicit model → selected by language (clear the Deepgram default "nova-3").
+        model: String::new(),
         ..Default::default()
     };
     let ibm_config = config::IbmWatsonSTTConfig::from_base(config, "test".to_string());
@@ -310,6 +324,8 @@ fn test_encoding_selection() {
     // FLAC
     let config = STTConfig {
         encoding: "flac".to_string(),
+        // No explicit model → selected by language (clear the Deepgram default "nova-3").
+        model: String::new(),
         ..Default::default()
     };
     let ibm_config = config::IbmWatsonSTTConfig::from_base(config, "test".to_string());
@@ -678,4 +694,45 @@ fn test_custom_model() {
     assert_eq!(model.as_str(), "my-custom-model-v2");
     // Custom models default to 16kHz
     assert_eq!(model.recommended_sample_rate(), 16000);
+}
+
+// W1 keystone: IBM Watson's rich feature surface (diarization, word timestamps, smart
+// formatting, redaction) and its non-standard `instance_id` (via extras) must survive through
+// `new_standard` into the provider-specific config — previously dropped by the flat factory.
+#[test]
+fn new_standard_unlocks_advanced_features_and_instance_id() {
+    use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
+    let mut extras = serde_json::Map::new();
+    extras.insert("instance_id".into(), serde_json::json!("inst-123"));
+    let std = StandardSTTConfig {
+        base: STTConfig {
+            provider: "ibm-watson".into(),
+            api_key: "k".into(),
+            ..Default::default()
+        },
+        features: SttFeatures {
+            diarization: Some(true),
+            word_timestamps: Some(true),
+            smart_format: Some(true),
+            redaction: Some(vec!["pii".into()]),
+            ..Default::default()
+        },
+        extras: ProviderExtras(extras),
+        translation: None,
+    };
+    let stt = IbmWatsonSTT::new_standard(&std).expect("new_standard should succeed");
+    let cfg = stt.get_ibm_config().expect("ibm config should be set");
+    assert!(cfg.speaker_labels); // diarization
+    assert!(cfg.word_timestamps); // word_timestamps
+    assert!(cfg.smart_formatting); // smart_format
+    assert!(cfg.redaction); // redaction (non-empty)
+    assert_eq!(cfg.instance_id, "inst-123"); // from provider_extras passthrough
+
+    // Empty api_key is rejected through the standardized path too (parity with Deepgram).
+    let bad = StandardSTTConfig::from_base(STTConfig {
+        provider: "ibm-watson".into(),
+        api_key: String::new(),
+        ..Default::default()
+    });
+    assert!(IbmWatsonSTT::new_standard(&bad).is_err());
 }

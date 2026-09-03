@@ -1,0 +1,396 @@
+name: CI
+
+# Production CI for the WaaV gateway. Closes the "no CI" gap flagged in BRUTAL_REVIEW.md and
+# implements the plan W-T1 redesign (exit E8/E9/E12).
+# Design notes:
+#  - No job depends on paid-provider credentials EXCEPT `real-provider-e2e`, which is gated
+#    on repo secrets and only runs on the main branch / manual dispatch.
+#  - Build env follows BUILD.md: CUDA_HOME=/tmp/nocuda makes webrtc-sys skip the NVIDIA video
+#    codec (Gotcha 2); ORT_DYLIB_PATH points `ort` (load-dynamic) at ONNX Runtime 1.22 at
+#    RUNTIME (Gotcha 6) — required by every job that actually LOADS a neural model.
+#  - Local neural components (Silero VAD, Smart-Turn, Turn-Detect) run ONNX locally, so their
+#    accuracy gate needs NO secrets — only the ONNX runtime + model downloads (cached).
+#  - Feature-flag matrix is explicit because `default = []` ships VAD/turn-detect STUBS (S2).
+#  - New gating jobs (supply-chain, coverage, openapi-drift, accuracy-enforced) are aggregated
+#    into `required` so branch protection can require a single contexts.
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # ort downloads its own ONNX Runtime binaries for the build:
+  ORT_STRATEGY: download
+  # webrtc-sys build.rs enables the NVIDIA video codec when <CUDA_HOME>/include/cuda.h exists
+  # (BUILD.md Gotcha 2). Point CUDA_HOME at a dir with no cuda.h so the codec is skipped.
+  CUDA_HOME: /tmp/nocuda
+  # ONNX Runtime version `ort` rc.10 expects, provisioned at runtime for model-loading jobs.
+  ORT_VERSION: "1.22.0"
+  # Production feature set used by the gating jobs (clippy/coverage/openapi/accuracy).
+  PROD_FEATURES: dag-routing,turn-ensemble,noise-filter,openapi
+
+defaults:
+  run:
+    working-directory: gateway
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: rustfmt }
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy (deny warnings)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy }
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: gateway }
+      - name: prepare nocuda dir
+        run: mkdir -p /tmp/nocuda
+      - run: cargo clippy --all-targets --features ${{ env.PROD_FEATURES }} -- -D warnings
+
+  build-and-unit:
+    name: build+unit (${{ matrix.features }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - ""                                            # default build (must compile; ships VAD stubs)
+          - "dag-routing"
+          - "turn-ensemble"                               # silero-vad + smart-turn + turn-detect
+          - "noise-filter"
+          - "dag-routing,turn-ensemble,noise-filter,openapi"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: gateway, key: "${{ matrix.features }}" }
+      - name: prepare nocuda dir
+        run: mkdir -p /tmp/nocuda
+      - name: check
+        run: cargo check ${{ matrix.features && format('--features {0}', matrix.features) || '' }}
+      - name: unit tests
+        run: cargo test --lib ${{ matrix.features && format('--features {0}', matrix.features) || '' }}
+
+  # ---------------------------------------------------------------------------------------
+  # supply-chain (plan W-E1 / W-T1, exit E12): cargo-audit + cargo-deny + gitleaks + typos.
+  # gitleaks MUST pass — it BLOCKS re-introduction of the historically-leaked Deepgram key
+  # (commit 9e496de). Config lives in repo-root .gitleaks.toml / deny.toml / _typos.toml.
+  # ---------------------------------------------------------------------------------------
+  supply-chain:
+    name: supply-chain (audit/deny/gitleaks/typos)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # gitleaks needs full history to scan the pushed/PR commit range.
+          fetch-depth: 0
+
+      # --- gitleaks: secret-leak gate (MUST pass; blocks the leaked Deepgram key class) ---
+      # The gitleaks binary is invoked directly (not the marketplace action) so the gate has
+      # no org-license dependency and is fully deterministic. A non-zero exit (a leak) fails
+      # the job; the scan range is selected per-event in the next step.
+      - name: install gitleaks
+        run: |
+          GLV=8.21.2
+          curl -fsSL -o /tmp/gitleaks.tgz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GLV}/gitleaks_${GLV}_linux_x64.tar.gz"
+          tar -xzf /tmp/gitleaks.tgz -C /tmp gitleaks
+          sudo install /tmp/gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+      - name: gitleaks (secret scan — required)
+        working-directory: .
+        # Scan the INCREMENTAL commit range introduced by this push/PR (re-introduction gate),
+        # not full history. This is green on the current (pre-history-scrub) tree while still
+        # failing if a new commit adds a Deepgram/provider key. A full-history audit is run on
+        # workflow_dispatch so the operator can verify the eventual `git filter-repo` scrub.
+        run: |
+          set -euo pipefail
+          common_flags="--config .gitleaks.toml --redact --no-banner --verbose --exit-code 1"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "manual dispatch: scanning FULL history"
+            gitleaks detect --source . $common_flags
+          elif [ "${{ github.event_name }}" = "pull_request" ]; then
+            base='${{ github.event.pull_request.base.sha }}'
+            head='${{ github.event.pull_request.head.sha }}'
+            echo "PR: scanning ${base}..${head}"
+            gitleaks detect --source . $common_flags --log-opts="${base}..${head}"
+          else
+            before='${{ github.event.before }}'
+            after='${{ github.sha }}'
+            # On a new branch the `before` SHA is all-zeros; fall back to scanning HEAD only.
+            if [ -z "$before" ] || [ "$before" = "0000000000000000000000000000000000000000" ]; then
+              echo "push (new ref): scanning HEAD commit only"
+              gitleaks detect --source . $common_flags --log-opts="-1 ${after}"
+            else
+              echo "push: scanning ${before}..${after}"
+              gitleaks detect --source . $common_flags --log-opts="${before}..${after}"
+            fi
+          fi
+
+      # --- cargo-audit: RUSTSEC vulnerability scan over the committed lockfile ---
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: gateway }
+      - name: install cargo-audit + cargo-deny
+        run: |
+          cargo install --locked cargo-audit || cargo install cargo-audit
+          cargo install --locked cargo-deny || cargo install cargo-deny
+      - name: cargo audit
+        run: cargo audit --deny warnings
+      - name: cargo deny
+        # deny.toml lives at the repo root; check from there so it picks up the policy.
+        working-directory: .
+        run: cargo deny --all-features --manifest-path gateway/Cargo.toml check advisories bans licenses sources
+
+      # --- typos: spelling gate over code/docs (config: repo-root _typos.toml) ---
+      - name: typos
+        uses: crate-ci/typos@master
+        with:
+          config: _typos.toml
+
+  # ---------------------------------------------------------------------------------------
+  # coverage (plan W-T1, exit E8): cargo llvm-cov on the lib (production features), upload,
+  # and a NON-DECREASING ratchet vs the committed baseline (gateway/coverage-baseline.json).
+  # The numerator excludes #[ignore]/live_* tests: this runs the lib test set with no
+  # --ignored and no live cassettes, so only non-ignored lib tests count.
+  # ---------------------------------------------------------------------------------------
+  coverage:
+    name: coverage (llvm-cov + ratchet)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: llvm-tools-preview }
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: gateway, key: coverage }
+      - name: install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: provision ONNX Runtime (load-dynamic; BUILD.md Gotcha 6)
+        run: |
+          mkdir -p /tmp/nocuda
+          curl -fsSL -o /tmp/ort.tgz \
+            "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-${ORT_VERSION}.tgz"
+          tar -xzf /tmp/ort.tgz -C /tmp
+          echo "ORT_DYLIB_PATH=/tmp/onnxruntime-linux-x64-${ORT_VERSION}/lib/libonnxruntime.so" >> "$GITHUB_ENV"
+      - name: cargo llvm-cov (lib, production features)
+        # Excludes #[ignore]/live_* by construction (no --ignored, lib targets only).
+        run: |
+          cargo llvm-cov --no-report --lib --features ${{ env.PROD_FEATURES }}
+          # Machine-readable summary for the ratchet:
+          cargo llvm-cov report --summary-only --json --output-path llvm-cov-summary.json
+          # Human + Codecov-friendly LCOV upload artifact:
+          cargo llvm-cov report --lcov --output-path lcov.info
+      - name: coverage ratchet (non-decreasing vs committed baseline)
+        run: ./scripts/ci/coverage-ratchet.sh check llvm-cov-summary.json
+      - name: upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: gateway/lcov.info
+          if-no-files-found: error
+      - name: upload to Codecov (best-effort, never blocks)
+        uses: codecov/codecov-action@v4
+        continue-on-error: true
+        with:
+          files: gateway/lcov.info
+          flags: gateway-lib
+          fail_ci_if_error: false
+
+  # ---------------------------------------------------------------------------------------
+  # openapi-drift (plan W-K1 / W-T1, exit E9): the SDK phase's gate. Regenerates the OpenAPI
+  # spec in-memory from the wire structs and asserts byte-for-byte equality with the committed
+  # docs/openapi.yaml — so a renamed/added wire field cannot ship without regenerating the
+  # spec SDKs are generated from. Also re-exports via the CLI and asserts the tree is clean.
+  # ---------------------------------------------------------------------------------------
+  openapi-drift:
+    name: openapi drift (spec committed + unchanged)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: gateway, key: openapi }
+      - name: prepare nocuda dir
+        run: mkdir -p /tmp/nocuda
+      - name: drift test (in-memory regen == committed docs/openapi.yaml)
+        run: cargo test --features openapi --test openapi_drift -- --nocapture
+      - name: re-export via CLI and assert the committed artifact is unchanged
+        run: |
+          cargo run --features openapi -- openapi -f yaml -o docs/openapi.yaml
+          if ! git diff --exit-code -- docs/openapi.yaml; then
+            echo "::error::docs/openapi.yaml is out of date — regenerate and commit it:" >&2
+            echo "  (cd gateway && cargo run --features openapi -- openapi -f yaml -o docs/openapi.yaml)" >&2
+            exit 1
+          fi
+
+  # ---------------------------------------------------------------------------------------
+  # accuracy-enforced (plan W-T1, exit E8): the neural-accuracy job's thresholds used to be
+  # COMMENTS. The smart_turn/turn_detect tests now ASSERT the thresholds themselves, so this
+  # job just has to RUN them (with the ONNX runtime provisioned) and let the in-test asserts
+  # gate. #[ignore]d live-dataset tests are excluded by default (no --ignored).
+  # ---------------------------------------------------------------------------------------
+  accuracy-enforced:
+    name: VAD/turn accuracy (thresholds enforced, local ONNX)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: gateway, key: accuracy }
+      - name: cache ONNX models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/waav
+          key: waav-models-v1
+      - name: provision ONNX Runtime (load-dynamic; BUILD.md Gotcha 6)
+        run: |
+          mkdir -p /tmp/nocuda
+          curl -fsSL -o /tmp/ort.tgz \
+            "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-${ORT_VERSION}.tgz"
+          tar -xzf /tmp/ort.tgz -C /tmp
+          echo "ORT_DYLIB_PATH=/tmp/onnxruntime-linux-x64-${ORT_VERSION}/lib/libonnxruntime.so" >> "$GITHUB_ENV"
+      - name: provision turn-detect model
+        run: CACHE_PATH="$HOME/.cache/waav" cargo run --features turn-detect -- init || true
+      # The accuracy tests now assert precision/recall/F1 + latency thresholds internally
+      # (Silero clean >=0.95 / noisy >=0.85, Smart-Turn >=0.85, ensemble, turn p95 <=50ms).
+      # Running them (no --ignored) is the gate — a regression below threshold fails the test.
+      - name: smart-turn + turn-detect accuracy (thresholds asserted in-test)
+        run: cargo test --features turn-ensemble --release --test smart_turn_accuracy_test --test turn_detect_test -- --nocapture
+
+  integration-mock:
+    name: integration (mock providers, no secrets)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: gateway }
+      - name: prepare nocuda dir
+        run: mkdir -p /tmp/nocuda
+      # These exercise the gateway end-to-end against the in-repo mock providers
+      # (tests/mock_providers) — protocol-level coverage for all providers without paid keys.
+      - run: cargo test --features dag-routing --test e2e_mock_tests --test load_test_with_mocks --test server_startup --test ws_tests --test keystone_wire --test provider_keystone_completeness
+
+  server-smoke:
+    name: server boot + health
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: gateway }
+      - name: prepare nocuda dir
+        run: mkdir -p /tmp/nocuda
+      - run: cargo build --release
+      - name: boot and probe liveness/readiness/metrics
+        run: |
+          cp config.example.yaml config.yaml || true
+          ./target/release/waav-gateway -c config.yaml &
+          PID=$!
+          # Liveness: /livez must report {"status":"ok"} (lowercase — matches handlers::api::livez).
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:3001/livez | grep -q '"status":"ok"'; then echo "live"; break; fi
+            sleep 1
+            if [ "$i" -eq 30 ]; then echo "server did not become live"; kill $PID 2>/dev/null; exit 1; fi
+          done
+          # Readiness probe must exist and return a JSON report (200 ready or 503 not_ready).
+          # With no provider keys in config.example.yaml, no providers are enabled => ready (200).
+          curl -fsS http://localhost:3001/readyz | grep -q '"status"' || { echo "readyz missing"; kill $PID 2>/dev/null; exit 1; }
+          # Metrics endpoint must expose the Prometheus exposition with the WaaV provider series.
+          curl -fsS http://localhost:3001/metrics | grep -q 'waav_provider' || { echo "metrics missing waav_provider series"; kill $PID 2>/dev/null; exit 1; }
+          echo "healthy"; kill $PID 2>/dev/null; exit 0
+
+  cross-compile-musl:
+    name: cross-compile (musl, rustls)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: x86_64-unknown-linux-musl }
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: gateway }
+      - name: prepare nocuda dir
+        run: mkdir -p /tmp/nocuda
+      # Validates the rustls/no-OpenSSL cross-compilation claim (README). turn/noise features
+      # are excluded here because their native ONNX/tract deps complicate musl static linking.
+      - run: cargo check --target x86_64-unknown-linux-musl --features dag-routing
+
+  real-provider-e2e:
+    name: real-provider e2e (SECRET-GATED)
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    # Only runs where provider secrets exist. CANNOT run on forks/PRs by design.
+    env:
+      DEEPGRAM_API_KEY: ${{ secrets.DEEPGRAM_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
+      CARTESIA_API_KEY: ${{ secrets.CARTESIA_API_KEY }}
+      HUME_API_KEY: ${{ secrets.HUME_API_KEY }}
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: gateway }
+      - name: prepare nocuda dir
+        run: mkdir -p /tmp/nocuda
+      - name: run #[ignore]d real-provider tests for providers whose secret is present
+        run: cargo test --release --test real_provider_tests -- --ignored --test-threads=1
+
+  # ---------------------------------------------------------------------------------------
+  # required: single aggregate context for branch protection. It fails if ANY gating job
+  # failed or was skipped (e.g. a cancelled supply-chain), so requiring this one context in
+  # branch protection makes fmt/clippy/build-matrix/supply-chain/coverage/openapi-drift/
+  # accuracy-enforced/integration/server-smoke/cross-compile all effectively required.
+  # real-provider-e2e is intentionally NOT required (secret-gated, skipped on PRs).
+  # ---------------------------------------------------------------------------------------
+  required:
+    name: required (merge gate)
+    runs-on: ubuntu-latest
+    if: always()
+    needs:
+      - fmt
+      - clippy
+      - build-and-unit
+      - supply-chain
+      - coverage
+      - openapi-drift
+      - accuracy-enforced
+      - integration-mock
+      - server-smoke
+      - cross-compile-musl
+    steps:
+      - name: assert all required jobs succeeded
+        run: |
+          results='${{ join(needs.*.result, ",") }}'
+          echo "required job results: $results"
+          IFS=',' read -ra arr <<< "$results"
+          for r in "${arr[@]}"; do
+            if [ "$r" != "success" ]; then
+              echo "::error::a required job did not succeed (result=$r)"
+              exit 1
+            fi
+          done
+          echo "all required jobs succeeded"

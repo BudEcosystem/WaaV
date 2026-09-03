@@ -61,6 +61,7 @@ fn get_credentials_path() -> Option<String> {
 /// Returns None if credentials are not available.
 fn create_google_tts_config() -> Option<TTSConfig> {
     get_credentials_path().map(|creds_path| TTSConfig {
+        api_base: None,
         provider: "google".to_string(),
         api_key: creds_path,
         voice_id: Some("en-US-Wavenet-D".to_string()),

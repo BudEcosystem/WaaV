@@ -41,6 +41,42 @@ fn test_config_validation_empty_key() {
     assert!(err.contains("API key"));
 }
 
+// W1 keystone: advanced features Prosa.ai can express (interim_results -> include_partial,
+// filler_words -> include_filler, smart_format -> auto_punctuation) survive through the
+// provider-struct `new_standard` method to the provider-specific config.
+#[test]
+fn test_prosa_new_standard_unlocks_advanced_features() {
+    use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
+    let std = StandardSTTConfig {
+        base: STTConfig {
+            provider: "prosa-ai".into(),
+            api_key: "test_key".into(),
+            ..Default::default()
+        },
+        features: SttFeatures {
+            interim_results: Some(false),
+            filler_words: Some(true),
+            smart_format: Some(false),
+            ..Default::default()
+        },
+        extras: ProviderExtras::default(),
+        translation: None,
+    };
+    let stt = ProsaStt::new_standard(&std).expect("new_standard must succeed");
+    let cfg = stt.get_prosa_config();
+    assert!(!cfg.include_partial); // interim_results
+    assert!(cfg.include_filler); // filler_words
+    assert!(!cfg.auto_punctuation); // smart_format
+
+    // Missing api_key is rejected through the standardized path too.
+    let bad = StandardSTTConfig::from_base(STTConfig {
+        provider: "prosa-ai".into(),
+        api_key: String::new(),
+        ..Default::default()
+    });
+    assert!(ProsaStt::new_standard(&bad).is_err());
+}
+
 #[test]
 fn test_config_validation_zero_sample_rate() {
     let mut config = ProsaSttConfig::default();
@@ -181,8 +217,6 @@ fn test_model_display() {
 
 #[test]
 fn test_model_from_str_trait() {
-    use std::str::FromStr;
-
     let model: ProsaSttModel = "general".parse().unwrap();
     assert_eq!(model, ProsaSttModel::General);
 
@@ -686,6 +720,7 @@ fn test_stream_config_serialization() {
         model: "stt-general-online".to_string(),
         label: Some("test".to_string()),
         include_partial: Some(true),
+        include_filler: Some(false),
         audio: Some(ProsaSttAudioConfig {
             format: "wav".to_string(),
             channels: Some(1),

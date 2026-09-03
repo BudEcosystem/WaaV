@@ -7,6 +7,7 @@ import type { MetricsSummary } from '../types/metrics.js';
 import type { FeatureFlags } from '../types/features.js';
 import { WebSocketSession, type SessionConfig, type SessionState } from '../ws/session.js';
 import { SessionEventEmitter, type SessionEventMap, type SessionEventHandler } from '../ws/events.js';
+import type { ConnectGate } from '../ws/connect-gate.js';
 
 /**
  * Base pipeline configuration
@@ -22,6 +23,12 @@ export interface BasePipelineConfig {
   features?: FeatureFlags;
   /** Auto-connect on creation (default: false) */
   autoConnect?: boolean;
+  /**
+   * Shared WS connect-concurrency gate (D7), injected by {@link BudClient} so a
+   * burst of pipelines from one client paces its connects under the gateway's
+   * per-IP rate bucket. Absent for a directly-constructed pipeline.
+   */
+  connectGate?: ConnectGate;
 }
 
 /**
@@ -47,6 +54,9 @@ export abstract class BasePipeline {
       apiKey: config.apiKey,
       connectionTimeout: config.connectionTimeout,
       features: config.features,
+      // D7: pass the shared connect gate through so this session's connect is
+      // paced with the rest of the client's sessions.
+      ...(config.connectGate ? { connectGate: config.connectGate } : {}),
       autoConfig: true,
       ...config.sessionConfig,
     });
@@ -160,13 +170,13 @@ export abstract class BasePipeline {
    * Stop current operation
    */
   stop(): void {
-    this.session.stop();
+    this.session.clear();
   }
 
   /**
    * Interrupt current operation
    */
   interrupt(): void {
-    this.session.interrupt();
+    this.session.clear();
   }
 }

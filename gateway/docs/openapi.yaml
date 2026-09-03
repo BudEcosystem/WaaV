@@ -19,9 +19,10 @@ paths:
     get:
       tags:
       - health
-      summary: |-
-        Health check handler
-        Returns a simple JSON response indicating the server is running
+      summary: Back-compat health handler kept at `/`.
+      description: |-
+        Identical to [`livez`]; both report `{"status":"ok"}` so existing probes (and the CI smoke
+        check) keep working after the liveness/readiness split.
       operationId: health_check
       responses:
         '200':
@@ -261,11 +262,72 @@ paths:
           description: LiveKit service not configured or token generation failed
       security:
       - bearer_auth: []
+  /livez:
+    get:
+      tags:
+      - health
+      summary: Liveness handler (`/` and `/livez`).
+      description: |-
+        Answers only "is the process up and able to serve HTTP?". It performs NO upstream/provider
+        checks so an orchestrator never restarts a healthy pod just because a provider is degraded —
+        that signal belongs to `/readyz`. Returns `{"status":"ok"}`.
+      operationId: livez
+      responses:
+        '200':
+          description: Process is live
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+  /metrics:
+    get:
+      tags:
+      - observability
+      summary: Prometheus metrics handler (`/metrics`).
+      description: |-
+        Public (no auth, like the health endpoints) so a scraper can read it. Renders the
+        `metrics-exporter-prometheus` text exposition: `waav_provider_requests_total`,
+        `waav_provider_ttfb_ms`, `waav_provider_errors_total`, `waav_circuit_breaker_state`.
+      operationId: metrics_handler
+      responses:
+        '200':
+          description: Prometheus text exposition
+          content:
+            text/plain: {}
+  /readyz:
+    get:
+      tags:
+      - health
+      summary: Readiness handler (`/readyz`).
+      description: |-
+        Answers "should this instance receive traffic right now?". Evaluates config + each enabled
+        provider's credential presence + a cached TCP reachability probe. Returns `200` with the
+        per-provider breakdown when ready, or `503` with the same breakdown (naming the unready
+        providers) when not. This is the E13 contract: `/livez` != `/readyz`, and `/readyz` returns
+        503 when an enabled provider is unreachable.
+      operationId: readyz
+      responses:
+        '200':
+          description: Instance is ready to serve
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadinessReport'
+        '503':
+          description: Instance is not ready
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReadinessReport'
   /recording/{stream_id}:
     get:
       tags:
       - recordings
       summary: Download recording by stream ID from configured object storage
+      description: |-
+        When authentication is enabled, recordings are scoped to the authenticated
+        client's ID. Users can only download recordings that belong to their tenant.
+        The recording path includes auth_id prefix: `{prefix}/{auth_id}/{stream_id}/audio.ogg`
       operationId: download_recording
       parameters:
       - name: stream_id
@@ -548,6 +610,605 @@ paths:
       - bearer_auth: []
 components:
   schemas:
+    Age:
+      type: string
+      description: |-
+        Canonical voice age band. ElevenLabs uses exactly `young`/`middle_aged`/`old`;
+        Azure roles are `YoungAdult*`/`OlderAdult*`/`Senior*` (Senior folds into `Old`).
+      enum:
+      - young
+      - middle_aged
+      - old
+    AliasKind:
+      type: string
+      description: |-
+        The kind of session an alias is intended for. Advisory only (the splice merges
+        whatever blocks are present); echoed back in the ready-ack so a developer sees what
+        the alias was meant to be.
+      enum:
+      - stt
+      - tts
+      - realtime
+      - agent
+      - dag
+    AliasLlm:
+      type: object
+      description: |-
+        Sparse LLM / conversation-loop defaults carried by an alias (the `[aliases.x.llm]`
+        block). Maps onto the public knobs of [`ConversationWebSocketConfig`].
+
+        SECURITY: `base_url` here is TRUSTED server config (it can only be set in
+        `config.yaml`), but when spliced it lands in `conversation_config.base_url` and is
+        validated by the SAME SSRF guard the conversation orchestrator applies to a
+        client-supplied base url — no bypass.
+      properties:
+        base_url:
+          type:
+          - string
+          - 'null'
+          description: OpenAI-compatible base URL for the LLM.
+          default: null
+        model:
+          type:
+          - string
+          - 'null'
+          description: Model identifier.
+          default: null
+        provider_kind:
+          type:
+          - string
+          - 'null'
+          description: |-
+            LLM vendor wire format (`openai|anthropic|gemini`).
+
+            `value_type = Option<String>` for the OpenAPI schema because `AdapterKind` does
+            not derive `ToSchema` (same approach `ConversationWebSocketConfig` uses).
+          default: null
+          example: openai
+        reasoning_effort:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/ReasoningEffort'
+            description: Reasoning effort dial (`minimal|low|medium|high`).
+          default: null
+        reasoning_model:
+          type:
+          - string
+          - 'null'
+          description: Two-tier reasoning model (escalation tier).
+          default: null
+        system_prompt:
+          type:
+          - string
+          - 'null'
+          description: Optional system prompt.
+          default: null
+      additionalProperties: false
+    AliasStt:
+      type: object
+      description: |-
+        Sparse STT defaults carried by an alias (the `[aliases.x.stt]` block).
+
+        Every field is optional: an alias supplies only the knobs it wants to fix; a client
+        field always overrides. Mirrors the public, provider-agnostic shape of
+        [`STTWebSocketConfig`].
+      properties:
+        language:
+          type:
+          - string
+          - 'null'
+          description: Canonical language token (e.g. `en-US`); resolved by the P2 language mapper.
+          default: null
+        model:
+          type:
+          - string
+          - 'null'
+          description: Provider model (e.g. `nova-3`). Empty/None lets the provider pick its default.
+          default: null
+        provider:
+          type:
+          - string
+          - 'null'
+          description: STT provider name (e.g. `deepgram`).
+          default: null
+      additionalProperties: false
+    AliasTts:
+      type: object
+      description: |-
+        Sparse TTS defaults carried by an alias (the `[aliases.x.tts]` block).
+
+        Mirrors the public, provider-agnostic shape of [`TTSWebSocketConfig`]. `emotion` is
+        the canonical emotion token (resolved by the emotion mapper downstream).
+      properties:
+        emotion:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/Emotion'
+            description: Canonical emotion token (e.g. `friendly`); resolved by the emotion mapper.
+          default: null
+        model:
+          type:
+          - string
+          - 'null'
+          description: Provider model (e.g. `eleven_turbo_v2`).
+          default: null
+        provider:
+          type:
+          - string
+          - 'null'
+          description: TTS provider name (e.g. `elevenlabs`).
+          default: null
+        voice:
+          type:
+          - string
+          - 'null'
+          description: Provider voice id / name.
+          default: null
+      additionalProperties: false
+    BatchFeatures:
+      type: object
+      description: |-
+        Batch-capable features the streaming path drops (Deepgram prerecorded / AssemblyAI async /
+        OpenAI verbose_json). Every field `Option`, additive, defaults to "don't request".
+      properties:
+        alternatives:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          description: N-best alternatives — a STREAMING GAP for Deepgram, enabled here (Deepgram `alternatives=N`).
+          minimum: 0
+        detect_language:
+          type:
+          - boolean
+          - 'null'
+          description: |-
+            Spoken-language detection — a STREAMING GAP for Deepgram, enabled here (Deepgram
+            `detect_language` / AssemblyAI `language_detection` / OpenAI verbose_json returns `language`).
+        intents:
+          type:
+          - boolean
+          - 'null'
+          description: 'Intent detection (Deepgram `intents`). AssemblyAI: no equiv→warn. OpenAI: unsupported→warn.'
+        paragraphs:
+          type:
+          - boolean
+          - 'null'
+          description: Paragraph formatting (Deepgram `paragraphs` / AssemblyAI response paragraphs).
+        summarize:
+          type:
+          - boolean
+          - 'null'
+          description: 'Summarization (Deepgram `summarize=v2` / AssemblyAI `summarization`). OpenAI: unsupported→warn.'
+        topics:
+          type:
+          - boolean
+          - 'null'
+          description: 'Topic detection (Deepgram `topics` / AssemblyAI `iab_categories`). OpenAI: unsupported→warn.'
+        utterances:
+          type:
+          - boolean
+          - 'null'
+          description: Utterance segmentation (Deepgram `utterances` / AssemblyAI `utterances`).
+    BatchJob:
+      type: object
+      description: |-
+        A uniform batch job: the shape returned by `POST /transcribe/batch` (job created) and
+        `GET /transcribe/batch/{job_id}` (poll).
+      required:
+      - job_id
+      - status
+      properties:
+        config_warnings:
+          type: array
+          items:
+            type: string
+          description: Non-fatal config warnings (degraded/omitted features) surfaced to the caller (never a 400).
+        error:
+          type:
+          - string
+          - 'null'
+          description: Error detail, present on `Error`.
+        job_id:
+          type: string
+          description: Gateway-issued job id (maps to the provider `request_id`/transcript id).
+        result:
+          description: Canonical transcript + features, present once `Completed`.
+        status:
+          $ref: '#/components/schemas/BatchStatus'
+          description: Current status.
+    BatchStatus:
+      type: string
+      description: |-
+        Provider-agnostic batch-job status. The canonical superset is AssemblyAI-aligned; Deepgram
+        (which has no status enum) maps `request_id`→`job_id` and the callback POST flips to `Completed`.
+      enum:
+      - queued
+      - processing
+      - completed
+      - error
+    CanonicalLanguage:
+      type: string
+      description: |-
+        A canonical, provider-agnostic language token.
+
+        Each variant is a curated region-qualified BCP-47 locale (or [`Auto`] for
+        detection). A developer passes one of these (or any alias spelling — see
+        [`super::resolve`]) and the per-provider mapper renders the correct native
+        notation. Carries [`as_bcp47`](Self::as_bcp47) (`"en-US"`),
+        [`iso639_1`](Self::iso639_1) (`"en"`), [`region`](Self::region) (`"US"`),
+        and [`lang_subtag`](Self::lang_subtag) (`"en"`/`"cmn"`/`"yue"`).
+
+        [`Auto`]: Self::Auto
+      enum:
+      - auto
+      - en-US
+      - en-GB
+      - en-IN
+      - en-AU
+      - en-ZA
+      - en-NZ
+      - es-ES
+      - es-MX
+      - es-US
+      - fr-FR
+      - fr-CA
+      - pt-BR
+      - pt-PT
+      - de-DE
+      - it-IT
+      - nl-NL
+      - ru-RU
+      - tr-TR
+      - pl-PL
+      - sv-SE
+      - nb-NO
+      - da-DK
+      - fi-FI
+      - uk-UA
+      - cs-CZ
+      - el-GR
+      - ro-RO
+      - hu-HU
+      - ja-JP
+      - ko-KR
+      - cmn-CN
+      - cmn-TW
+      - yue-HK
+      - hi-IN
+      - bn-IN
+      - ta-IN
+      - te-IN
+      - gu-IN
+      - kn-IN
+      - ml-IN
+      - mr-IN
+      - pa-IN
+      - or-IN
+      - ar-SA
+      - vi-VN
+      - th-TH
+      - id-ID
+      - ms-MY
+      - he-IL
+    CloneConsent:
+      type: object
+      description: |-
+        Consent/verification block. MANDATORY for Speechify (`full_name` + `email`);
+        the `verified` flag gates the ElevenLabs-PVC / Resemble verification step.
+      properties:
+        email:
+          type:
+          - string
+          - 'null'
+          description: Email of the consenting voice owner (Speechify requires this).
+        full_name:
+          type:
+          - string
+          - 'null'
+          description: Full name of the consenting voice owner (Speechify requires this).
+        statement:
+          type:
+          - string
+          - 'null'
+          description: Optional consent statement text.
+        verified:
+          type: boolean
+          description: Whether the caller affirms they own/represent the voice (gates PVC/Resemble).
+    CloneLabels:
+      type: object
+      description: |-
+        Structured labels for a cloned voice (canonical; the flat `labels` HashMap is
+        still accepted for backward compatibility and merged with these).
+      properties:
+        accent:
+          type:
+          - string
+          - 'null'
+        age:
+          type:
+          - string
+          - 'null'
+        gender:
+          type:
+          - string
+          - 'null'
+        language:
+          type:
+          - string
+          - 'null'
+    CloneMode:
+      type: string
+      description: |-
+        Voice-clone mode: instant (near-immediate, usable now) vs professional
+        (high-fidelity, ASYNC — returns a queued/training status to poll).
+      enum:
+      - instant
+      - professional
+    CloneStatus:
+      type: string
+      description: Canonical voice-clone lifecycle status (returned + polled).
+      enum:
+      - ready
+      - verifying
+      - training
+      - queued
+      - failed
+    ConversationWebSocketConfig:
+      type: object
+      description: |-
+        Conversation-loop configuration for WebSocket messages (plan W-O2).
+
+        When present on a `config` message, the gateway wires up a built-in
+        automatic conversation loop: each finalized STT turn is sent to an
+        OpenAI-compatible LLM and the reply is streamed to TTS, with per-session
+        history and barge-in. When absent, the gateway keeps its raw STT/TTS
+        behavior (fully backward-compatible).
+      required:
+      - base_url
+      - model
+      properties:
+        allow_interruption:
+          type: boolean
+          description: Whether the bot's speech is interruptible / barge-in (default true).
+        api_key:
+          type:
+          - string
+          - 'null'
+          description: API key (literal or `${ENV_VAR}`); falls back to `OPENAI_API_KEY`.
+        barge_in_min_words:
+          type:
+          - integer
+          - 'null'
+          description: |-
+            MinWords barge-in gate (A-G3): while the bot is audibly speaking,
+            require ≥ N words to interrupt it (a single word suffices when the
+            bot is silent). Omitted/0 = legacy any-speech barge-in; values < 2
+            are clamped to 2.
+          minimum: 0
+        base_url:
+          type: string
+          description: OpenAI-compatible base URL for the LLM (e.g. `https://api.openai.com/v1`).
+          example: https://api.openai.com/v1
+        degradation_message:
+          type:
+          - string
+          - 'null'
+          description: |-
+            P1: the spoken line used when EVERY LLM tier fails — a graceful apology
+            instead of dead air. Omit for the built-in default.
+        eager_eot:
+          type: boolean
+          description: |-
+            Eager end-of-turn (P1.2b): start the LLM speculatively on a
+            turn-complete prediction, confirm/cancel on the provider final.
+            Opt-in — raises LLM call volume on resumed turns (default false).
+        latency_filler:
+          $ref: '#/components/schemas/LatencyFiller'
+          description: |-
+            D3 (REALTIME_REASONING.md §4.3): latency-masking mode —
+            `off | auto | aggressive`. `auto` (default) speaks ONE short action phrase
+            when first audio is slow (reasoning/RAG/tool), keeping the line alive while
+            the real answer streams in behind it — at most one masking utterance per
+            turn, codec- & language-correct, interruptible by barge-in.
+        latency_filler_after_ms:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: |-
+            D3: override the masking wait threshold in ms (mode default otherwise:
+            auto ~800, aggressive ~400). Keep well under the ~2s "feels broken" line.
+          example: 800
+          minimum: 0
+        latency_filler_phrases:
+          type: array
+          items:
+            type: string
+          description: |-
+            D3: custom masking phrases (action wording, e.g. "Let me check that order").
+            Empty = the built-in pool. Pre-rendered at session start at the call's rate.
+        max_history:
+          type: integer
+          description: Max retained history messages (default 20).
+          minimum: 0
+        max_llm_calls_per_turn:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          description: |-
+            P2: per-turn ceiling on LLM re-inference rounds (the tool-call loop — the
+            dominant spend multiplier on a billing gateway). Omit for the safe default
+            (8).
+          example: 8
+          minimum: 0
+        max_reasoning_tokens:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          description: |-
+            P2: hard ceiling on the reasoning tier's output tokens (thinking + answer)
+            — the most direct cost lever for reasoning models. Clamps the reasoning
+            tier's `max_tokens`; the fast tier is unaffected. Omit for no extra clamp.
+          example: 2048
+          minimum: 0
+        max_tokens:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          description: Max tokens per completion.
+          minimum: 0
+        model:
+          type: string
+          description: Model identifier.
+          example: gpt-4o-mini
+        mute_strategy:
+          type:
+          - string
+          - 'null'
+          description: |-
+            User-mute strategy (A-G5): while active, USER INPUT is suppressed
+            (bot/lifecycle signals always flow).
+            `"always_while_bot_speaks"` = no barge-in at all;
+            `"until_first_bot_complete"` = greeting/disclaimer guard;
+            `"first_speech_only"` = only the first user utterance passes.
+            Omitted = no muting (barge-in works normally).
+          example: until_first_bot_complete
+        provider_kind:
+          type:
+          - string
+          - 'null'
+          description: |-
+            LLM vendor wire format (B-G1): `"openai"` (default) | `"anthropic"` |
+            `"gemini"`. Omitted = OpenAI-compatible, with canonical-host inference.
+          example: anthropic
+        reasoning_api_key:
+          type:
+          - string
+          - 'null'
+          description: 'S1/S2: reasoning-tier API key (literal or `${ENV_VAR}`; defaults to `api_key`).'
+        reasoning_base_url:
+          type:
+          - string
+          - 'null'
+          description: |-
+            S1/S2: reasoning-tier base URL (defaults to `base_url` — one endpoint can
+            serve both a fast and a reasoning model).
+        reasoning_budget_ms:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: |-
+            P1+A7: reasoning-tier max-silence-gap budget (ms) — the longest the line
+            may go silent before first audio OR between audio chunks. If exceeded, a
+            reasoner with partial audio commits it (no restart) and one with none
+            degrades to the fast tier — the caller is never left in silence. Omit for
+            the safe default (15000); `0` disables. Ignored without a `reasoning_model`.
+          example: 15000
+          minimum: 0
+        reasoning_effort:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/ReasoningEffort'
+            description: |-
+              D1 (REALTIME_REASONING.md §4.1): reasoning/thinking-effort dial —
+              `off | minimal | low | medium | high`. One typed knob, mapped to each
+              vendor's native thinking control and clamped to the model's floor (an
+              adaptive-only model can't go below its floor; the applied/floor values
+              are echoed back in the config-ack). Omitted = vendor default. Keep a
+              FAST, non-reasoning model on the spoken path for realtime latency.
+        reasoning_model:
+          type:
+          - string
+          - 'null'
+          description: |-
+            S1/S2 (REALTIME_REASONING.md §5): optional slow REASONING tier. Set this
+            to a smart-but-slow model (e.g. `o3`, `deepseek-r1`) and keep `model` a
+            FAST model — complex turns escalate to the reasoning tier (sharing the
+            conversation history) while the fast model handles the rest and the D3
+            filler masks the latency. Omitted = single-tier. The ONE field that turns
+            two-tier on.
+          example: o3
+        reasoning_provider_kind:
+          type:
+          - string
+          - 'null'
+          description: 'S1/S2: reasoning-tier vendor wire format (defaults to `provider_kind`).'
+          example: openai
+        reasoning_route:
+          $ref: '#/components/schemas/RoutingMode'
+          description: |-
+            S2: route turns between tiers — `auto` (default; a heuristic escalates only
+            complex turns) or `always` (every turn uses the reasoning tier).
+        streaming:
+          type: boolean
+          description: Stream tokens to TTS as they arrive (default true).
+        strip_markdown:
+          type: boolean
+          description: |-
+            Strip markdown (bold/code/links/headings) from LLM sentences before
+            TTS (C-G4). Default true — spoken asterisks and URLs ruin voice
+            output.
+        summarize_target_tokens:
+          type: integer
+          description: |-
+            Token-aware context compaction (B-G6): when the session context's
+            estimated tokens cross this value, older messages are summarized
+            after the turn (system + recent turns kept verbatim). Omitted/0 =
+            off.
+          example: 6000
+          minimum: 0
+        system_prompt:
+          type:
+          - string
+          - 'null'
+          description: Optional system prompt seeding the conversation.
+        temperature:
+          type:
+          - number
+          - 'null'
+          format: float
+          description: Sampling temperature.
+        user_idle_timeout_ms:
+          type: integer
+          format: int64
+          description: |-
+            Idle re-engagement (A-G7): after this many ms of silence (no user
+            speech, no bot turn, bot not speaking), the bot gently checks in.
+            Omitted/0 = off.
+          example: 15000
+          minimum: 0
+    DAGWebSocketConfig:
+      type: object
+      description: |-
+        DAG configuration for WebSocket messages
+
+        Allows clients to specify a DAG pipeline for audio processing.
+        The DAG can be specified either by template name or inline definition.
+      properties:
+        definition:
+          description: Inline DAG definition (takes precedence over template)
+        enable_metrics:
+          type: boolean
+          description: Enable DAG metrics collection
+        template:
+          type:
+          - string
+          - 'null'
+          description: Name of a pre-registered DAG template to use
+          example: voice-assistant
+        timeout_ms:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: Maximum execution timeout in milliseconds
+          example: 30000
+          minimum: 0
     DeleteSipHooksRequest:
       type: object
       description: |-
@@ -565,27 +1226,290 @@ components:
           example:
           - example.com
           - other.com
+    DeliveryStyle:
+      type: string
+      description: |-
+        Delivery style modifiers for speech synthesis.
+
+        These styles can be combined with emotions to further customize
+        how the speech is delivered. They affect pacing, volume, and
+        prosodic patterns.
+
+        # Example
+
+        ```rust
+        use waav_gateway::core::emotion::DeliveryStyle;
+
+        let style = DeliveryStyle::Whispered;
+        assert_eq!(style.to_string(), "whispered");
+        ```
+      enum:
+      - normal
+      - whispered
+      - shouted
+      - rushed
+      - measured
+      - monotone
+      - expressive
+      - professional
+      - casual
+      - storytelling
+      - loud
+      - formal
+      - newscast
+      - newscast_casual
+      - newscast_formal
+      - customer_service
+      - assistant
+      - chat
+      - advertisement_upbeat
+      - sports_commentary
+      - sports_commentary_excited
+      - documentary_narration
+      - narration_professional
+      - narration_relaxed
+      - poetry_reading
+      - lyrical
+      - gentle
+    Emotion:
+      type: string
+      description: |-
+        Standardized emotions supported across TTS providers.
+
+        These emotions represent common emotional states that can be expressed
+        through speech synthesis. Different providers support different subsets
+        of these emotions, and the emotion mapper handles the translation.
+
+        # Provider Support Matrix
+
+        | Emotion | Hume | ElevenLabs | Azure | OpenAI |
+        |---------|------|------------|-------|--------|
+        | Neutral | Yes  | Yes (default) | Yes | Yes |
+        | Happy   | Yes  | Yes (low stability) | Yes (cheerful) | Yes |
+        | Sad     | Yes  | Yes (high stability) | Yes | Yes |
+        | Angry   | Yes  | Yes (low stability) | Yes | Yes |
+        | Fearful | Yes  | Partial | Yes (terrified) | Partial |
+        | Surprised | Yes | Partial | Yes | Partial |
+        | Excited | Yes | Yes | Yes (excited) | Yes |
+        | Calm    | Yes | Yes (high stability) | Yes (calm) | Yes |
+        | Sarcastic | Yes | Partial | Partial | Yes |
+
+        # Example
+
+        ```rust
+        use waav_gateway::core::emotion::Emotion;
+
+        let emotion = Emotion::Happy;
+        assert_eq!(emotion.to_string(), "happy");
+        assert!(emotion.is_widely_supported());
+        ```
+      enum:
+      - neutral
+      - happy
+      - sad
+      - angry
+      - fearful
+      - surprised
+      - disgusted
+      - excited
+      - calm
+      - anxious
+      - confident
+      - confused
+      - empathetic
+      - sarcastic
+      - hopeful
+      - disappointed
+      - curious
+      - grateful
+      - proud
+      - embarrassed
+      - content
+      - bored
+      - amazed
+      - amused
+      - affectionate
+      - intrigued
+      - flirtatious
+      - frustrated
+      - annoyed
+      - determined
+      - reassuring
+      - sympathetic
+      - nostalgic
+      - serene
+      - terrified
+      - ecstatic
+      - skeptical
+      - relieved
+      - panicked
+      - concerned
+      - apologetic
+      - resigned
+      - wistful
+      - contemplative
+    EmotionConfig:
+      type: object
+      description: |-
+        User-facing emotion configuration for TTS requests.
+
+        This configuration specifies the desired emotional expression
+        and delivery style for speech synthesis. It gets mapped to
+        provider-specific formats by the emotion mapper.
+
+        # Example
+
+        ```rust
+        use waav_gateway::core::emotion::{EmotionConfig, Emotion, DeliveryStyle, EmotionIntensity};
+
+        let config = EmotionConfig {
+            emotion: Some(Emotion::Happy),
+            intensity: Some(EmotionIntensity::from_f32(0.8)),
+            style: Some(DeliveryStyle::Expressive),
+            description: None,
+            context: Some("Customer support greeting".to_string()),
+        };
+        ```
+      properties:
+        context:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Speaking context hint for better inference.
+
+            Examples: "customer support", "news broadcast", "bedtime story"
+          example: customer support greeting
+        description:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Free-form description for providers that support it (e.g., Hume).
+
+            This takes precedence over `emotion` for Hume AI, allowing
+            natural language instructions like "warm, friendly, inviting".
+            Maximum 100 characters.
+          example: warm, friendly, inviting
+        emotion:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/Emotion'
+            description: |-
+              Primary emotion to express.
+
+              If `None`, the provider's default emotional expression is used.
+        intensity:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/EmotionIntensity'
+            description: |-
+              Intensity of the emotion (0.0 to 1.0, or named level).
+
+              Higher values mean more expressive delivery.
+        style:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/DeliveryStyle'
+            description: |-
+              Delivery style modifier.
+
+              Combines with emotion to affect pacing and prosody.
+    EmotionIntensity:
+      oneOf:
+      - type: number
+        format: float
+        description: Numeric intensity (0.0 to 1.0)
+      - $ref: '#/components/schemas/IntensityLevel'
+        description: Named intensity level
+      description: |-
+        Unified emotion intensity that supports both numeric and named levels.
+
+        This allows users to specify intensity either as a numeric value (0.0-1.0)
+        or as a named level (low, medium, high) for convenience.
+
+        # Example
+
+        ```rust
+        use waav_gateway::core::emotion::{EmotionIntensity, IntensityLevel};
+
+        // Numeric intensity
+        let intensity = EmotionIntensity::Numeric(0.8);
+        assert_eq!(intensity.as_f32(), 0.8);
+
+        // Named intensity
+        let intensity = EmotionIntensity::Named(IntensityLevel::High);
+        assert_eq!(intensity.as_f32(), 1.0);
+        ```
+    Gender:
+      type: string
+      description: |-
+        Canonical voice gender. Providers spell this `Female`/`Male`/`Neutral` (Google
+        `ssml_gender`), `"female"`/`"male"` (ElevenLabs labels), etc.
+      enum:
+      - male
+      - female
+      - neutral
     HealthResponse:
       type: object
-      description: Health check response
+      description: Health/liveness response.
       required:
       - status
       properties:
         status:
           type: string
-          description: Server status
-          example: OK
+          description: Process status. `"ok"` when the process is up and serving.
+          example: ok
     IncomingMessage:
       oneOf:
       - type: object
         required:
         - type
         properties:
+          alias:
+            type:
+            - string
+            - 'null'
+            description: |-
+              Optional server-side ALIAS name (P3). Resolves to a server-defined
+              `{stt, tts, llm}` / `dag_template` bundle BEFORE provider construction;
+              any explicit field above OVERRIDES the alias default. The client supplies
+              only the NAME — alias DEFINITIONS are server-config-only (`aliases:` in
+              `config.yaml`), so a client can never inject a backend url/credential
+              (SSRF-safe, mirroring `realtime_endpoint_overrides`). An unknown alias is
+              non-fatal: the session proceeds with the client config and a
+              `config_warning` (`alias_unknown`) is sent. The resolved concrete config is
+              echoed back on `ready` as `resolved_alias`.
+            example: support-bot
           audio:
             type:
             - boolean
             - 'null'
             description: Enable audio processing (STT/TTS). Defaults to true if not specified.
+          audio_disabled:
+            type:
+            - boolean
+            - 'null'
+            description: |-
+              DEPRECATED: Use `audio: false` instead. This field is for backward compatibility.
+              When `audio_disabled: true` is sent, it's equivalent to `audio: false`.
+              If both fields are present, `audio` takes precedence.
+          conversation_config:
+            oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/ConversationWebSocketConfig'
+              description: |-
+                Optional built-in conversation-loop configuration (plan W-O2).
+                When present, finalized STT turns drive an LLM→TTS reply with
+                per-session history and barge-in. When absent, raw STT/TTS behavior
+                is unchanged.
+          dag_config:
+            oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/DAGWebSocketConfig'
+              description: |-
+                Optional DAG routing configuration for custom audio pipelines
+                When configured, audio flows through the DAG instead of direct STT→TTS
           livekit:
             oneOf:
             - type: 'null'
@@ -694,7 +1618,124 @@ components:
             type: string
             enum:
             - sip_transfer
+      - type: object
+        description: |-
+          Browser-friendly authentication message.
+
+          This message type allows browser clients to authenticate after the WebSocket
+          connection is established, since browsers cannot set custom headers during
+          the WebSocket handshake. This must be the first message sent when using
+          first-message authentication.
+
+          # Authentication Flow
+          1. Client connects to `/ws` without Authorization header or query token
+          2. Server accepts connection with pending auth state
+          3. Client sends `{"type": "auth", "token": "<bearer_token>"}` as first message
+          4. Server validates token and either:
+             - Sends `{"type": "authenticated"}` on success
+             - Closes connection with 4001 code on failure
+
+          # Example
+          ```json
+          {"type": "auth", "token": "sk_test_my_api_key"}
+          ```
+        required:
+        - token
+        - type
+        properties:
+          token:
+            type: string
+            description: |-
+              Bearer token for authentication.
+              This should be the same token format as used in the Authorization header.
+            example: sk_test_my_api_key_123456
+          type:
+            type: string
+            enum:
+            - auth
+      - type: object
+        description: |-
+          Custom message type for plugin-defined message handlers.
+
+          This variant allows plugins to define and handle their own message types
+          without modifying the core gateway code. Plugins register handlers for
+          specific message types, and the gateway routes messages accordingly.
+
+          # Example
+          ```json
+          {"type": "custom", "message_type": "my_plugin_action", "payload": {"key": "value"}}
+          ```
+        required:
+        - message_type
+        - payload
+        - type
+        properties:
+          message_type:
+            type: string
+            description: |-
+              The plugin-defined message type identifier.
+              This is used to look up the appropriate handler in the plugin registry.
+            example: analytics_event
+          payload:
+            type: object
+            description: |-
+              The message payload as arbitrary JSON.
+              The plugin handler is responsible for parsing and validating this.
+          type:
+            type: string
+            enum:
+            - custom
+      - type: object
+        description: |-
+          Signal end of audio input stream.
+
+          This message tells the STT provider that audio transmission is complete
+          and it should finalize any pending transcripts. This is important for
+          getting `speech_final=true` from providers like Deepgram that need
+          an explicit stream closure signal.
+
+          # Behavior
+          1. Sends CloseStream message to STT provider
+          2. Waits briefly for final results
+          3. Provider sends final transcript with `speech_final=true`
+
+          # Example
+          ```json
+          {"type": "audio_end"}
+          ```
+        required:
+        - type
+        properties:
+          type:
+            type: string
+            enum:
+            - audio_end
       description: WebSocket message types for incoming messages
+    IntensityLevel:
+      type: string
+      description: |-
+        Named intensity levels for emotion expression.
+
+        These map to numeric values for providers that support intensity:
+        - Low: 0.3
+        - Medium: 0.6
+        - High: 1.0
+
+        Providers can also accept raw numeric intensity (0.0 to 1.0).
+      enum:
+      - low
+      - medium
+      - high
+    LatencyFiller:
+      type: string
+      description: |-
+        D3 (REALTIME_REASONING.md §4.3): the unified latency-masking mode. ONE knob
+        covering the action-preamble + pre-rendered gap-filler, deduped to at most one
+        masking utterance per turn.
+      enum:
+      - off
+      - auto
+      - aggressive
     ListRoomsResponse:
       type: object
       description: |-
@@ -837,9 +1878,29 @@ components:
       oneOf:
       - type: object
         required:
+        - protocol_version
         - stream_id
         - type
         properties:
+          audio_in_codec:
+            type:
+            - string
+            - 'null'
+            description: |-
+              D8 negotiated uplink transport codec ACTUALLY in effect (`linear16` | `opus`). Present
+              only when the client requested a non-default `stt_config.audio_in_codec`, so the SDK can
+              detect a downgrade: it asked `opus` but a gateway without the `opus-codec` feature echoes
+              `linear16` here (and emits a `config_warning`). Absent = linear16 (the default).
+            example: opus
+          audio_out_codec:
+            type:
+            - string
+            - 'null'
+            description: |-
+              D8 negotiated downlink transport codec ACTUALLY in effect (`linear16` | `opus`) for TTS
+              egress. Present only when the client requested a non-default `tts_config.audio_out_codec`.
+              Same downgrade semantics as [`Self::Ready::audio_in_codec`].
+            example: opus
           livekit_room_name:
             type:
             - string
@@ -850,16 +1911,28 @@ components:
             - string
             - 'null'
             description: Optional LiveKit URL to connect to
-          waav_participant_identity:
-            type:
-            - string
-            - 'null'
-            description: Optional identity of the AI agent participant in the room
-          waav_participant_name:
-            type:
-            - string
-            - 'null'
-            description: Optional display name of the AI agent participant
+          protocol_version:
+            type: string
+            description: |-
+              WebSocket wire-protocol version (see [`PROTOCOL_VERSION`]). SDKs assert this on
+              connect so a breaking change to the message contract surfaces as an explicit
+              version mismatch instead of silent field drift (plan W-K1 / exit E9). Always set
+              to [`PROTOCOL_VERSION`] by the gateway at construction.
+            example: '1.0'
+          resolved_alias:
+            oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/ResolvedAliasEcho'
+              description: |-
+                The CONCRETE config a server-side `alias` resolved to (P3), echoed so a
+                developer SEES what e.g. `support-bot` became (which STT/TTS/LLM providers)
+                and so SDK capability negotiation runs against the resolved providers.
+                Present only when the `config` message named an alias that was found. No
+                secrets are included (system prompt / api keys are omitted).
+
+                Boxed to keep the hot-path `OutgoingMessage` variants (stt_result / audio /
+                message) small — the echo is only ever present on the one-per-session
+                `ready` frame.
           stream_id:
             type: string
             description: |-
@@ -870,6 +1943,16 @@ components:
             type: string
             enum:
             - ready
+          waav_participant_identity:
+            type:
+            - string
+            - 'null'
+            description: Optional identity of the AI agent participant in the room
+          waav_participant_name:
+            type:
+            - string
+            - 'null'
+            description: Optional display name of the AI agent participant
       - type: object
         required:
         - transcript
@@ -888,9 +1971,31 @@ components:
           is_speech_final:
             type: boolean
             description: Whether speech has ended
+          segment_transcript:
+            type:
+            - string
+            - 'null'
+            description: |-
+              The FULL accumulated segment text, present only on a
+              `speech_final` whose segment spans multiple finals (or a
+              forced/timer fire, where `transcript` stays empty for
+              fragment-concatenating clients). Clients that DISPLAY per-final
+              text should prefer this when present (review wf_85659e16 — the
+              segment truth was previously not exposed on the wire at all).
           transcript:
             type: string
             description: Transcribed text
+          translations:
+            type: array
+            items:
+              $ref: '#/components/schemas/Translation'
+            description: |-
+              Uniform, provider-agnostic in-stream translations merged onto this
+              transcript (P5). One `{lang, text}` entry per target language — the
+              canonical shape the gateway folds Speechmatics `AddTranslation`,
+              Gladia `type:"translation"`, and the Class-B EN fast path into so
+              SDKs read ONE field. Skipped on the wire when empty (the common
+              no-translation case), so non-translation sessions see no change.
           type:
             type: string
             enum:
@@ -948,6 +2053,34 @@ components:
             - error
       - type: object
         description: |-
+          Non-fatal configuration advisory (D1 / REALTIME_REASONING.md §7.4).
+
+          Sent at config time when a setting is sub-optimal but the session still
+          starts — e.g. a reasoning model placed on the spoken path (high TTFT),
+          or a `reasoning_effort` clamped up to an adaptive-only model's floor. The
+          SDK can surface this to the developer; it never closes the session.
+        required:
+        - code
+        - message
+        - type
+        properties:
+          code:
+            type: string
+            description: |-
+              Stable machine code, e.g. `reasoning_model_on_voice_path`,
+              `reasoning_effort_clamped`.
+            example: reasoning_model_on_voice_path
+          detail:
+            description: Optional structured detail (applied/floor effort, measured TTFT, …).
+          message:
+            type: string
+            description: Human-readable explanation + the one-line fix.
+          type:
+            type: string
+            enum:
+            - config_warning
+      - type: object
+        description: |-
           SIP transfer specific error
 
           This message is sent when a SIP transfer operation fails.
@@ -964,6 +2097,58 @@ components:
             type: string
             enum:
             - sip_transfer_error
+      - type: object
+        description: |-
+          Authentication success response
+
+          Sent after successful first-message authentication to confirm
+          the client is now authenticated and can proceed with other commands.
+        required:
+        - type
+        properties:
+          id:
+            type:
+            - string
+            - 'null'
+            description: The authenticated identity (API key ID or user ID from JWT)
+          type:
+            type: string
+            enum:
+            - authenticated
+      - type: object
+        description: |-
+          Authentication required notification
+
+          Sent immediately after connection when authentication is required
+          but no token was provided via header or query parameter.
+          Client must send an `auth` message before any other commands.
+        required:
+        - type
+        properties:
+          type:
+            type: string
+            enum:
+            - auth_required
+      - type: object
+        description: |-
+          Plugin response message
+
+          Generic response from a plugin handler for custom messages.
+          Contains the message type for client routing and arbitrary JSON payload.
+        required:
+        - message_type
+        - payload
+        - type
+        properties:
+          message_type:
+            type: string
+            description: The message type this is a response to
+          payload:
+            description: Response payload from the plugin
+          type:
+            type: string
+            enum:
+            - plugin_response
       description: WebSocket message types for outgoing messages
     ParticipantDisconnectedInfo:
       type: object
@@ -1074,6 +2259,82 @@ components:
           type: string
           description: Word to replace
           example: API
+    ProviderExtras:
+      type: object
+      description: Open provider-specific passthrough (string→JSON value map). Keys not modeled by the typed feature vocabulary are forwarded verbatim.
+      additionalProperties: true
+    ProviderReadiness:
+      type: object
+      description: Per-provider readiness detail in the `/readyz` JSON breakdown.
+      required:
+      - provider
+      - credential_present
+      - ready
+      properties:
+        credential_present:
+          type: boolean
+          description: Whether a non-empty credential is configured for this provider.
+        detail:
+          type:
+          - string
+          - 'null'
+          description: Human-readable reason when `ready == false`.
+        provider:
+          type: string
+          description: Provider name (e.g. `deepgram`).
+        reachable:
+          type:
+          - boolean
+          - 'null'
+          description: |-
+            TCP reachability of the provider endpoint: `Some(true/false)` if probed, `None` if the
+            host could not be resolved/derived (treated as not-ready).
+        ready:
+          type: boolean
+          description: Whether this provider is fully ready (credential present AND reachable).
+    ReadinessReport:
+      type: object
+      description: The aggregate `/readyz` report.
+      required:
+      - status
+      - config_loaded
+      - providers
+      properties:
+        config_loaded:
+          type: boolean
+          description: Whether configuration is loaded (always true once `AppState` exists).
+        providers:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProviderReadiness'
+          description: Per-provider breakdown.
+        status:
+          type: string
+          description: '`"ready"` when every enabled provider is ready, else `"not_ready"`.'
+    ReasoningEffort:
+      type: string
+      description: |-
+        D1 (REALTIME_REASONING.md §4.1): the reasoning/thinking-effort dial — ONE
+        typed knob the adapter maps to each vendor's native control, clamped to the
+        model's floor. `Off` *minimizes* thinking; it is not always literally zero,
+        because some 2026 models are adaptive-thinking-only and have a floor — the
+        resolved value is echoed back to the client so the floor is observable.
+
+        Cascade (Chat-Completions) wire forms, AT MOST ONE param per vendor. `Off`/
+        `None` emit NOTHING on every vendor: a non-reasoning model 400s on any
+        thinking param (live-verified against ollama "does not support thinking"),
+        so the safe floor is to send no param at all rather than an explicit zero.
+        - OpenAI: flat string `reasoning_effort` (`Off`→omit);
+        - Anthropic: `thinking { type:"enabled", budget_tokens }` (`Off`→omit;
+          adaptive-only models that reject the param also omit);
+        - Gemini: `generationConfig.thinkingConfig.thinkingBudget` (`Off`→omit) —
+          never paired with `thinkingLevel` (that 400s).
+      enum:
+      - off
+      - minimal
+      - low
+      - medium
+      - high
     RemoveParticipantErrorResponse:
       type: object
       description: |-
@@ -1152,6 +2413,45 @@ components:
           type: string
           description: Status of the removal operation
           example: removed
+    ResolvedAliasEcho:
+      type: object
+      description: |-
+        The concrete config an alias splice produced, returned so the caller can ECHO it in
+        the ready-ack (a developer SEES what `support-bot` became) and so SDK capability
+        negotiation runs against the resolved providers.
+      required:
+      - name
+      properties:
+        dag_template:
+          type:
+          - string
+          - 'null'
+          description: Resolved DAG template name, if the alias routes through one.
+        kind:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/AliasKind'
+            description: The alias kind (if declared).
+        llm:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/AliasLlm'
+            description: |-
+              Resolved LLM provider/model (post-merge, client-wins). The base URL is echoed so
+              a developer can confirm the upstream; no secret is included.
+        name:
+          type: string
+          description: The alias name that was resolved.
+        stt:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/AliasStt'
+            description: Resolved STT provider/model/language (post-merge, client-wins).
+        tts:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/AliasTts'
+            description: Resolved TTS provider/voice/model/emotion (post-merge, client-wins).
     RoomDetailsResponse:
       type: object
       description: |-
@@ -1251,6 +2551,14 @@ components:
           description: Number of current participants in the room
           example: 2
           minimum: 0
+    RoutingMode:
+      type: string
+      description: |-
+        S2 (REALTIME_REASONING.md §5): when a `reasoning_model` is configured, how to
+        route each turn between the fast `model` and the slow reasoning tier.
+      enum:
+      - auto
+      - always
     SIPTransferErrorResponse:
       type: object
       description: |-
@@ -1351,16 +2659,31 @@ components:
           example: tel:+15551234567
     STTWebSocketConfig:
       type: object
-      description: STT configuration for WebSocket messages (without API key)
+      description: STT configuration for WebSocket messages (with optional API key)
       required:
       - provider
       - language
       - sample_rate
       - channels
       - punctuation
-      - encoding
-      - model
       properties:
+        api_key:
+          type:
+          - string
+          - 'null'
+          description: Optional API key for this provider (overrides server config)
+        audio_in_codec:
+          type:
+          - string
+          - 'null'
+          description: |-
+            D8 uplink TRANSPORT codec the gateway decodes BEFORE handing PCM to the provider:
+            `linear16` (default — raw PCM, no decode) | `opus` (one opus packet per WS binary frame,
+            decoded to PCM16 @ `sample_rate`). Distinct from `encoding`, which some providers
+            (Alibaba/Reverie) use to ACCEPT opus straight through — this one means "the GATEWAY decodes".
+            Negotiated: an `opus` request on a gateway built without the `opus-codec` feature degrades to
+            `linear16` (a `config_warning` is emitted) and the effective codec is echoed in `ready`.
+          example: opus
         channels:
           type: integer
           format: int32
@@ -1369,15 +2692,27 @@ components:
           minimum: 0
         encoding:
           type: string
-          description: Encoding of the audio
+          description: Encoding of the audio. Optional — defaults to `linear16` (16-bit PCM) when omitted.
           example: linear16
+        extras:
+          $ref: '#/components/schemas/ProviderExtras'
+          description: Open, typed passthrough for provider-specific parameters not modeled by `features`.
+        features:
+          $ref: '#/components/schemas/SttFeatures'
+          description: |-
+            Canonical, provider-agnostic advanced STT features (diarization, keyterms, redaction,
+            vad_events, …). Defaults to all-unset so existing clients are unaffected; carried across the
+            dispatch boundary via [`Self::to_standard_stt`] so providers with a `from_standard` mapping
+            (Deepgram first) honor them END-TO-END (W1 keystone, closing BRUTAL_REVIEW.md S1).
         language:
           type: string
           description: Language code for transcription (e.g., "en-US", "es-ES")
           example: en-US
         model:
           type: string
-          description: Model to use for transcription
+          description: |-
+            Model to use for transcription. Optional — defaults to empty, letting the provider pick its
+            own default model (each provider maps an empty model to its recommended default).
           example: nova-2
         provider:
           type: string
@@ -1393,6 +2728,27 @@ components:
           description: Sample rate of the audio in Hz
           example: 16000
           minimum: 0
+        translation:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/TranslationConfig'
+            description: |-
+              P5 canonical translation block: `{ target_languages: [CanonicalLanguage], translate_to_english?,
+              partials? }`. `None` = no translation. Threaded across the dispatch boundary via
+              [`Self::to_standard_stt`] so translation-capable providers (Speechmatics/Gladia side-channel,
+              OpenAI/Groq English fast path) emit `translations[]{lang,text}`; unsupported providers degrade
+              with a `config_warning`, never a 400.
+        turn_detection:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/TurnDetectionWsConfig'
+            description: |-
+              ML turn detection for this session (P1.2): runs the audio-based
+              smart-turn detector on the live frame path so end-of-turn is PREDICTED
+              instead of waiting out the provider's silence endpointing. Standardized
+              — provider-agnostic, applies to every STT provider. Requires a build
+              with the `smart-turn`/`silero-vad` features; otherwise the session
+              degrades LOUDLY (warn + waav_degraded_total) to timer fallback.
     SipHookEntry:
       type: object
       description: A single SIP hook entry.
@@ -1457,19 +2813,178 @@ components:
         tts_config:
           $ref: '#/components/schemas/TTSWebSocketConfig'
           description: TTS configuration (without API key)
+    SttFeatures:
+      type: object
+      description: |-
+        Canonical, provider-agnostic advanced STT features. Every field is `Option`, so `None`
+        means "don't request / use the provider default" and adding fields stays backward compatible.
+      properties:
+        alternatives:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          description: |-
+            Number of N-best alternative hypotheses to return (Deepgram / Google `alternatives` /
+            `maxAlternatives`).
+          minimum: 0
+        diarization:
+          type:
+          - boolean
+          - 'null'
+          description: Speaker diarization (who-spoke-when).
+        endpointing_ms:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          description: Silence (ms) after speech before finalizing an utterance.
+          minimum: 0
+        entity_detection:
+          type:
+          - boolean
+          - 'null'
+          description: Named-entity detection.
+        filler_words:
+          type:
+          - boolean
+          - 'null'
+          description: Include filler words ("uh", "um") rather than dropping them.
+        interim_results:
+          type:
+          - boolean
+          - 'null'
+          description: Emit interim (non-final) hypotheses as they are recognized.
+        keyterms:
+          type:
+          - array
+          - 'null'
+          items:
+            type: string
+          description: Key terms / phrases to boost (canonical; maps to keyterm / keywords / phrase hints).
+        language_detection:
+          type:
+          - boolean
+          - 'null'
+          description: Automatic spoken-language detection.
+        multichannel:
+          type:
+          - boolean
+          - 'null'
+          description: |-
+            Transcribe each audio channel independently, with per-channel speakers
+            (Deepgram / AssemblyAI `multichannel`).
+        numerals:
+          type:
+          - boolean
+          - 'null'
+          description: Convert spoken numbers to digits / numeric formatting (Deepgram `numerals`).
+        profanity_filter:
+          type:
+          - boolean
+          - 'null'
+          description: Profanity filtering / masking.
+        redaction:
+          type:
+          - array
+          - 'null'
+          items:
+            type: string
+          description: PII/PHI categories to redact (canonical category names).
+        sentiment:
+          type:
+          - boolean
+          - 'null'
+          description: Per-utterance sentiment analysis (Deepgram / AssemblyAI `sentiment`).
+        smart_format:
+          type:
+          - boolean
+          - 'null'
+          description: Provider "smart formatting" (dates, numbers, etc.).
+        speech_begin_event:
+          type:
+          - boolean
+          - 'null'
+          description: |-
+            Emit a discrete "speech started" event when the recognizer first detects speech
+            (IBM Watson `speech_begin_event`). Distinct from `vad_events` (which is the canonical
+            flag for continuous voice-activity/endpointing events): this requests the single
+            begin-of-speech marker IBM emits as a `speaker_begin`/`speech_begin` notification.
+        utterance_end_ms:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          description: Idle (ms) before emitting an utterance-end event.
+          minimum: 0
+        vad_events:
+          type:
+          - boolean
+          - 'null'
+          description: Emit explicit voice-activity / endpointing events.
+        word_timestamps:
+          type:
+          - boolean
+          - 'null'
+          description: Per-word start/end timestamps.
     TTSWebSocketConfig:
       type: object
-      description: TTS configuration for WebSocket messages (without API key)
+      description: TTS configuration for WebSocket messages (with optional API key)
       required:
       - provider
       - model
       properties:
+        api_key:
+          type:
+          - string
+          - 'null'
+          description: Optional API key for this provider (overrides server config)
         audio_format:
           type:
           - string
           - 'null'
           description: Audio format preference
           example: linear16
+        audio_out_chunk_ms:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          description: |-
+            WS egress re-framing (E-G2): when set, PCM TTS audio is sliced into
+            chunks of this many milliseconds before the WebSocket send, so a
+            barge-in clear truncates within ONE chunk instead of letting a whole
+            synthesis frame play out client-side. Omitted = verbatim frames
+            (legacy). LiveKit egress already frames at 10ms internally.
+          example: 20
+          minimum: 0
+        audio_out_codec:
+          type:
+          - string
+          - 'null'
+          description: |-
+            D8 downlink TRANSPORT codec for TTS egress: `linear16` (default — raw PCM16 frames) | `opus`
+            (the gateway encodes each normalized PCM16 chunk to one opus packet per WS binary frame; the
+            client decodes before playout). Encodes from the C-G5-normalized PCM16 stream and reuses
+            `audio_out_chunk_ms` as the opus frame size (default 20ms) + `client_playback_rate` as the opus
+            rate (constrained to {8,12,16,24,48}kHz; default 48000 when opus). A non-PCM provider stream
+            (mp3/ogg) falls back to passthrough + warns. Negotiated: an `opus` request on a gateway without
+            the `opus-codec` feature degrades to `linear16` (`config_warning`) and the effective codec is
+            echoed in `ready`.
+          example: opus
+        client_playback_rate:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          description: |-
+            Client playback rate (C-G5): when set, the gateway resamples PCM TTS
+            egress from the provider's rate to THIS rate before delivery (WS
+            binary and LiveKit), so clients with a fixed-rate audio sink never
+            resample provider-side or client-side. Identity (provider already at
+            this rate) is zero-cost; non-PCM formats pass through unchanged.
+          example: 48000
+          minimum: 0
         connection_timeout:
           type:
           - integer
@@ -1478,6 +2993,60 @@ components:
           description: Connection timeout in seconds
           example: 30
           minimum: 0
+        delivery_style:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/DeliveryStyle'
+            description: |-
+              Delivery style modifier for speech.
+
+              Affects pacing and prosody independently of emotion.
+              Examples: "whispered", "shouted", "rushed", "measured", "expressive"
+        emotion:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/Emotion'
+            description: |-
+              Emotion to express in speech synthesis.
+
+              Supported by: Hume AI (all), ElevenLabs (core set), Azure (SSML styles).
+              Providers without emotion support will synthesize speech normally with a warning.
+
+              Examples: "happy", "sad", "angry", "excited", "calm", "sarcastic"
+        emotion_description:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Free-form emotion description (for providers like Hume AI).
+
+            When provided, this takes precedence over the `emotion` field for Hume AI.
+            Maximum 100 characters.
+
+            Examples: "warm, friendly, inviting", "whispered fearfully", "sarcastic, dry"
+          example: warm, friendly, inviting
+        emotion_intensity:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/EmotionIntensity'
+            description: |-
+              Intensity of the emotion (0.0 to 1.0, or "low"/"medium"/"high").
+
+              - 0.0-0.3: Subtle expression
+              - 0.4-0.7: Moderate expression (default: 0.6)
+              - 0.8-1.0: Strong expression
+
+              Alternatively, use named levels: "low" (0.3), "medium" (0.6), "high" (1.0)
+        extras:
+          $ref: '#/components/schemas/ProviderExtras'
+          description: Open, typed passthrough for provider-specific parameters not modeled by `features`.
+        features:
+          $ref: '#/components/schemas/TtsFeatures'
+          description: |-
+            Canonical, provider-agnostic advanced TTS features (voice settings, instructions, SSML,
+            streaming, …). Defaults to all-unset so existing clients are unaffected; carried across the
+            dispatch boundary via [`Self::to_standard_tts`] so providers with a `from_standard` mapping
+            (Deepgram first) honor them END-TO-END (W1 keystone, closing BRUTAL_REVIEW.md S1/S5).
         model:
           type: string
           description: Model to use for TTS
@@ -1489,7 +3058,7 @@ components:
           description: Pronunciation replacements to apply before TTS
         provider:
           type: string
-          description: Provider name (e.g., "deepgram")
+          description: Provider name (e.g., "deepgram", "hume", "elevenlabs")
           example: deepgram
         request_timeout:
           type:
@@ -1514,11 +3083,24 @@ components:
           format: float
           description: Speaking rate (0.25 to 4.0, 1.0 is normal)
           example: 1.0
+        voice_descriptor:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/VoiceDescriptor'
+            description: |-
+              Canonical voice DESCRIPTOR (P4): `{gender, locale/accent, style, age,
+              name_hint}` resolved SERVER-SIDE to a provider `voice_id` over the `/voices`
+              catalog when no raw `voice_id` is given. No match → provider default +
+              `config_warning` (never a 400). The resolved id is echoed back to the client.
         voice_id:
           type:
           - string
           - 'null'
-          description: Voice ID or name to use for synthesis
+          description: |-
+            Voice ID or name to use for synthesis.
+
+            ESCAPE HATCH: when set, this raw provider id is used VERBATIM and the
+            [`Self::voice_descriptor`] resolution is skipped.
           example: aura-asteria-en
     TokenRequest:
       type: object
@@ -1586,6 +3168,221 @@ components:
           type: string
           description: The generated JWT token for LiveKit
           example: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+    Translation:
+      type: object
+      description: |-
+        One translated segment in the uniform gateway output (`translations: [{lang,text}]`).
+
+        `lang` is the canonical [`CanonicalLanguage`] BCP-47 string (e.g. `"es-ES"`); the gateway folds
+        Speechmatics `AddTranslation`/`AddPartialTranslation` (`.language` + `.results[].content`),
+        Gladia `type:"translation"` (`data.target_language` + `data.translated_utterance.text`), and
+        the Class-B `{text}` (lang = `"en-US"`) into this single shape so SDKs read ONE field.
+      required:
+      - lang
+      - text
+      properties:
+        is_partial:
+          type: boolean
+          description: '`true` if this is a partial (interim) translation, `false`/omitted if final.'
+        lang:
+          type: string
+          description: Canonical target-language BCP-47 string.
+        text:
+          type: string
+          description: The translated text for this segment.
+    TranslationConfig:
+      type: object
+      description: |-
+        Canonical, provider-agnostic in-stream / batch translation request (P5).
+
+        Reuses P2's [`CanonicalLanguage`] value space so a developer asks for translation with the
+        SAME language token (`es-ES`, `de-DE`, …) they use everywhere else, and the gateway maps it to
+        each provider's native code. `None` (the field is `Option<TranslationConfig>` on
+        [`StandardSTTConfig`]) means "no translation" — additive, so the existing construction sites
+        are unaffected, exactly like `features`/`extras` were added.
+
+        Two provider classes are folded into ONE canonical shape:
+          * **Class A** — arbitrary target languages via a side-channel (Speechmatics
+            `translation_config`, Gladia `realtime_processing.translation`, AssemblyAI batch).
+          * **Class B** — translate-the-whole-stream-to-ENGLISH fast path (OpenAI/Groq
+            `/audio/translations`); selected by [`translate_to_english`](Self::translate_to_english).
+
+        The gateway emits a uniform `translations: [{ lang, text }]` array merged onto the transcript
+        event regardless of provider. Unsupported providers **degrade with a `config_warning`, NEVER a
+        400** (see [`TranslationConfig::warnings_for`]).
+      properties:
+        partials:
+          type:
+          - boolean
+          - 'null'
+          description: |-
+            Emit partial (interim) translations where supported (Speechmatics `enable_partials`,
+            Gladia live). `None` = provider default (finals only).
+        target_languages:
+          type: array
+          items:
+            $ref: '#/components/schemas/CanonicalLanguage'
+          description: |-
+            Canonical target languages (region-qualified BCP-47 → provider-native via the per-provider
+            lang mappers / `.iso639_1()`). Capped per-provider (Speechmatics MAX 5 → warn + truncate).
+        translate_to_english:
+          type:
+          - boolean
+          - 'null'
+          description: |-
+            Fast path: translate the whole stream to ENGLISH (OpenAI/Groq `/audio/translations`
+            endpoint). When `Some(true)`, `target_languages` is ignored for Class-B providers; for
+            Class-A providers it is sugar for `target_languages = [en-US]`.
+    TtsFeatures:
+      type: object
+      description: Canonical, provider-agnostic advanced TTS features. Every field is `Option`.
+      properties:
+        emotion:
+          type:
+          - string
+          - 'null'
+          description: Emotion / delivery (e.g. "happy", "cheerful"); maps to provider emotion controls.
+        include_timestamp_types:
+          type:
+          - array
+          - 'null'
+          items:
+            type: string
+          description: |-
+            Request specific timestamp granularities in the response (Hume `include_timestamp_types`:
+            `"word"` and/or `"phoneme"`). Canonical superset of the boolean `word_timestamps` flag for
+            providers that expose per-type timestamp selection. Pure metadata request: does NOT change
+            the synthesized audio (so providers must NOT fold it into the audio cache key).
+        instructions:
+          type:
+          - string
+          - 'null'
+          description: Free-form delivery instructions (OpenAI gpt-4o-mini-tts `instructions`, Hume `description`).
+        language:
+          type:
+          - string
+          - 'null'
+          description: Synthesis language override.
+        optimize_streaming_latency:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          description: |-
+            Streaming latency-optimization tier 0-4, trading quality for lower TTFB
+            (ElevenLabs `optimize_streaming_latency`).
+          minimum: 0
+        pitch:
+          type:
+          - number
+          - 'null'
+          format: float
+          description: Pitch adjustment.
+        pitch_percentage:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          description: |-
+            Pitch adjustment as a signed percentage delta from the per-voice default
+            (IBM Watson `pitch_percentage`: 0 = normal, +50 = 50% higher, -50 = 50% lower).
+            Distinct from the absolute [`pitch`](Self::pitch): this is the provider's native
+            percentage-delta knob.
+        rate_percentage:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          description: |-
+            Speaking-rate adjustment as a signed percentage delta from the per-voice default
+            (IBM Watson `rate_percentage`: 0 = normal, +50 = 50% faster, -50 = 50% slower).
+            Distinct from the multiplicative [`speed`](Self::speed): this is the provider's native
+            percentage-delta knob so the value reaches the wire 1:1 without a lossy multiplier round-trip.
+        sample_rate:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          description: Output sample rate override.
+          minimum: 0
+        seed:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: Determinism seed where the provider supports it.
+          minimum: 0
+        similarity_boost:
+          type:
+          - number
+          - 'null'
+          format: float
+          description: ElevenLabs-style similarity boost.
+        speed:
+          type:
+          - number
+          - 'null'
+          format: float
+          description: Speaking speed multiplier / level (provider-specific range).
+        ssml:
+          type:
+          - boolean
+          - 'null'
+          description: Treat the input text as SSML (unlocks Azure `mstts:express-as`, etc.).
+        stability:
+          type:
+          - number
+          - 'null'
+          format: float
+          description: ElevenLabs-style voice stability.
+        streaming:
+          type:
+          - boolean
+          - 'null'
+          description: Prefer the provider's streaming endpoint (lower TTFB).
+        style:
+          type:
+          - number
+          - 'null'
+          format: float
+          description: ElevenLabs-style style exaggeration.
+        use_speaker_boost:
+          type:
+          - boolean
+          - 'null'
+          description: ElevenLabs-style speaker boost.
+        volume:
+          type:
+          - number
+          - 'null'
+          format: float
+          description: Volume / loudness adjustment.
+        word_timestamps:
+          type:
+          - boolean
+          - 'null'
+          description: Request word-level timestamps in the response.
+    TurnDetectionWsConfig:
+      type: object
+      description: Per-session ML turn-detection knobs (provider-agnostic).
+      required:
+      - enabled
+      properties:
+        eager:
+          type: boolean
+          description: |-
+            Eager end-of-turn: on a turn-complete prediction, start the LLM
+            speculatively (held + staged; see conversation_config.eager_eot which
+            must also be enabled). Default false.
+        enabled:
+          type: boolean
+          description: Master switch.
+        threshold:
+          type:
+          - number
+          - 'null'
+          format: float
+          description: Decision threshold (model-calibrated default when omitted).
     UnifiedMessage:
       type: object
       description: Unified message structure for all incoming messages from various sources
@@ -1653,6 +3450,197 @@ components:
           type: string
           description: URL to sample audio
           example: https://example.com/sample.mp3
+    VoiceCloneProvider:
+      type: string
+      description: Voice cloning provider selection.
+      enum:
+      - hume
+      - elevenlabs
+      - lmnt
+      - cartesia
+      - playht
+      - speechify
+      - resemble
+    VoiceCloneRequest:
+      type: object
+      description: Request body for voice cloning endpoint.
+      required:
+      - provider
+      - name
+      properties:
+        audio_samples:
+          type: array
+          items:
+            type: string
+          description: |-
+            Audio samples for voice cloning (base64-encoded).
+            ElevenLabs: Supports mp3, wav, m4a formats. 1-2 minutes recommended.
+            Hume: Optional - if provided, used for instant cloning; otherwise uses description.
+          example:
+          - base64_encoded_audio_data
+        base_voice_id:
+          type:
+          - string
+          - 'null'
+          description: 'Design-from-existing: the base voice to clone/derive from (provider-specific).'
+        consent:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/CloneConsent'
+            description: |-
+              Consent/verification block. MANDATORY for Speechify; the `verified` flag gates
+              the ElevenLabs-PVC / Resemble verification step.
+        description:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Description of the voice (used by Hume for voice design).
+            For ElevenLabs, this becomes the voice description label.
+          example: A warm, friendly voice with a slight accent
+        labels:
+          type:
+          - object
+          - 'null'
+          description: |-
+            Flat labels for the voice (ElevenLabs). Backward-compatible; merged with
+            the structured [`Self::structured_labels`].
+          additionalProperties:
+            type: string
+          propertyNames:
+            type: string
+        mode:
+          $ref: '#/components/schemas/CloneMode'
+          description: 'Clone MODE: `instant` (default) or `professional` (async high-fidelity).'
+        name:
+          type: string
+          description: Name for the cloned voice.
+          example: My Custom Voice
+        provider:
+          $ref: '#/components/schemas/VoiceCloneProvider'
+          description: Provider to use for voice cloning.
+        remove_background_noise:
+          type: boolean
+          description: Remove background noise from samples (ElevenLabs IVC / LMNT `enhance`).
+        sample_text:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Sample text for voice generation (Hume only).
+            Used when generating voice from description without audio samples.
+          example: Hello, this is a sample of my voice.
+        structured_labels:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/CloneLabels'
+            description: |-
+              Canonical structured labels `{language, accent, gender, age}` (preferred over
+              the flat `labels` map; the two are merged, structured winning on conflict).
+    VoiceCloneResponse:
+      type: object
+      description: Response from voice cloning endpoint.
+      required:
+      - voice_id
+      - name
+      - provider
+      - status
+      - created_at
+      properties:
+        created_at:
+          type: string
+          description: Timestamp when the voice was created.
+          example: 2026-01-06T12:00:00Z
+        metadata:
+          description: Additional metadata from the provider.
+        name:
+          type: string
+          description: Name of the cloned voice.
+          example: My Custom Voice
+        provider:
+          $ref: '#/components/schemas/VoiceCloneProvider'
+          description: Provider that created the voice.
+        requires_verification:
+          type:
+          - boolean
+          - 'null'
+          description: |-
+            Whether the provider flagged that this voice still needs verification before
+            it can be used (ElevenLabs IVC `requires_verification`).
+        status:
+          type: string
+          description: |-
+            Canonical lifecycle status: `ready` | `verifying` | `training` | `queued` |
+            `failed`. A `ready` voice_id is directly usable as a TTS `voice_id`.
+          example: ready
+        voice_id:
+          type: string
+          description: Unique identifier for the cloned voice.
+          example: voice_abc123
+    VoiceDescriptor:
+      type: object
+      description: |-
+        A canonical, provider-agnostic description of a desired voice. Resolved
+        SERVER-SIDE to a concrete provider `voice_id` over the `/voices` catalog.
+
+        All fields are optional; the resolver scores candidates on whichever are set.
+        The raw `TTSConfig.voice_id` (when present) ALWAYS wins — this descriptor only
+        drives resolution when no explicit `voice_id` was supplied.
+
+        # Example
+
+        ```rust
+        use waav_gateway::core::voice::{VoiceDescriptor, Gender};
+
+        let d = VoiceDescriptor {
+            gender: Some(Gender::Female),
+            locale: Some("en-US".to_string()),
+            style: Some("warm".to_string()),
+            ..Default::default()
+        };
+        assert!(d.is_set());
+        ```
+      properties:
+        accent:
+          type:
+          - string
+          - 'null'
+          description: Free accent string when no `locale` is given (`american`, `british`, …).
+          example: american
+        age:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/Age'
+            description: Desired age band.
+        gender:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/Gender'
+            description: Desired gender.
+        locale:
+          type:
+          - string
+          - 'null'
+          description: |-
+            BCP-47 locale (preferred): `en-US`, `en-GB`, `hi-IN`, … Used for exact-locale
+            and language-family scoring; the region also yields an accent string.
+          example: en-US
+        name_hint:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Optional preferred voice name (e.g. `asteria`, `jenny`). A substring match
+            against the voice name/id gives it the strongest score.
+          example: asteria
+        style:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Free descriptive timbre/style matched against provider metadata
+            (`warm`, `bright`, `deep`, `calm`, `confident`, `energetic`, …).
+          example: warm
   securitySchemes:
     bearer_auth:
       type: http

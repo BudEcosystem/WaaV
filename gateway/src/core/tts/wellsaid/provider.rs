@@ -4,13 +4,17 @@
 //! using HTTP streaming for real-time audio synthesis.
 
 use async_trait::async_trait;
-use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderValue};
+use reqwest::header::{ACCEPT, CONTENT_TYPE};
 use tracing::{debug, info};
 
 use super::WELLSAID_AVATARS_URL;
 use super::config::{WellSaidAvatar, WellSaidStreamRequest, WellSaidTtsConfig};
 use crate::core::tts::base::{BaseTTS, ConnectionState, TTSConfig, TTSError, TTSResult};
 use crate::core::tts::provider::{PronunciationReplacer, TTSProvider, TTSRequestBuilder};
+
+fn wellsaid_tts_http_client() -> Result<reqwest::Client, reqwest::Error> {
+    crate::core::net::ssrf_protected_client_builder(crate::core::net::HTTP_URL_SCHEMES).build()
+}
 
 // =============================================================================
 // Request Builder
@@ -58,29 +62,31 @@ impl TTSRequestBuilder for WellSaidRequestBuilder {
         // Build request body
         let request_body = WellSaidStreamRequest::from_config(&self.config, text);
 
-        // Build headers
-        // WellSaid uses X-Api-Key header (NOT Bearer token)
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "X-Api-Key",
-            HeaderValue::from_str(&self.config.api_key)
-                .unwrap_or_else(|_| HeaderValue::from_static("")),
-        );
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        headers.insert(ACCEPT, HeaderValue::from_static("audio/mpeg"));
-
         debug!(
-            "WellSaid TTS request: speaker_id={}, model={}, text_len={}",
+            "WellSaid TTS request: speaker_id={}, model={}, ssml={}, text_len={}",
             request_body.speaker_id,
             self.config.model,
+            self.config.ssml,
             text.len()
         );
 
-        // Build and return the request
-        client
-            .post(super::WELLSAID_TTS_STREAM_URL)
-            .headers(headers)
-            .json(&request_body)
+        // WellSaid uses X-Api-Key header (NOT Bearer token).
+        let mut request = client
+            .post(crate::core::tts::standard::override_rest_endpoint(
+                super::WELLSAID_TTS_STREAM_URL,
+                self.config.endpoint_override.as_deref(),
+            ))
+            .header("X-Api-Key", self.config.api_key.clone())
+            .header(CONTENT_TYPE, "application/json")
+            .header(ACCEPT, "audio/mpeg");
+
+        // SSML opt-in: when enabled, tell WellSaid to parse the body's `text` as SSML markup.
+        if self.config.ssml {
+            request = request.header("X-Enable-SSML", "true");
+        }
+
+        // Build and return the request.
+        request.json(&request_body)
     }
 
     fn get_config(&self) -> &TTSConfig {
@@ -147,7 +153,8 @@ impl WellSaidTts {
     /// # Returns
     /// * `TTSResult<Vec<WellSaidAvatar>>` - List of available voice avatars
     pub async fn list_avatars(api_key: &str) -> TTSResult<Vec<WellSaidAvatar>> {
-        let client = reqwest::Client::new();
+        let client = wellsaid_tts_http_client()
+            .map_err(|e| TTSError::NetworkError(format!("Failed to build HTTP client: {e}")))?;
 
         let response = client
             .get(WELLSAID_AVATARS_URL)
@@ -176,6 +183,26 @@ impl WellSaidTts {
     pub fn wellsaid_config(&self) -> &WellSaidTtsConfig {
         &self.wellsaid_config
     }
+
+    /// Build from the standardized TTS config (W1 keystone). Mirrors [`BaseTTS::new`] but derives
+    /// the WellSaid config via [`WellSaidTtsConfig::from_standard`] and keeps the standardized base
+    /// config as `base_config`. WellSaid's config only carries voice (`speaker_id`) and model
+    /// selection; every standardized prosody/voice feature is a capability gap and is skipped (the
+    /// Caruso AI Director is not represented as config state here).
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
+        let wellsaid_config = WellSaidTtsConfig::from_standard(std)?;
+
+        info!(
+            "Creating WellSaid TTS provider (standardized): speaker_id={}, model={}",
+            wellsaid_config.speaker_id, wellsaid_config.model
+        );
+
+        Ok(Self {
+            provider: TTSProvider::new(),
+            wellsaid_config,
+            base_config: std.base.clone(),
+        })
+    }
 }
 
 #[async_trait]
@@ -194,7 +221,7 @@ impl BaseTTS for WellSaidTts {
         );
 
         Ok(Self {
-            provider: TTSProvider::new()?,
+            provider: TTSProvider::new(),
             wellsaid_config,
             base_config: config,
         })
@@ -267,6 +294,7 @@ mod tests {
     use super::*;
     use crate::core::tts::base::Pronunciation;
     use crate::core::tts::wellsaid::config::WellSaidModel;
+    use std::io::ErrorKind;
 
     #[test]
     fn test_wellsaid_tts_creation() {
@@ -282,6 +310,101 @@ mod tests {
         let tts = tts.unwrap();
         assert_eq!(tts.wellsaid_config().speaker_id, 26);
         assert!(!tts.is_ready());
+    }
+
+    // W1 keystone (TTS): the struct-level `from_standard` builds a real `WellSaidTts` through the
+    // standardized path. WellSaid's config holds only voice/model selection (no prosody fields), so
+    // this is a passthrough: speaker_id (voice_id) and the Caruso model reach the provider, while
+    // standardized prosody features are capability gaps. Mirrors `DeepgramTTS::from_standard`.
+    #[test]
+    fn from_standard_builds_provider_with_voice_and_model() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        use crate::core::tts::wellsaid::config::WellSaidModel;
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "wellsaid".into(),
+                api_key: "test-key".into(),
+                voice_id: Some("26".into()),
+                model: "caruso".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(1.5), // capability gap: no prosody field, must be ignored
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let tts = WellSaidTts::from_standard(&std).unwrap();
+        assert_eq!(tts.wellsaid_config().speaker_id, 26);
+        assert_eq!(tts.wellsaid_config().model, WellSaidModel::Caruso);
+        assert_eq!(tts.wellsaid_config().api_key, "test-key");
+    }
+
+    #[test]
+    fn invalid_wellsaid_api_key_header_value_is_request_build_error() {
+        let config = TTSConfig {
+            api_key: "bad\nkey".to_string(),
+            voice_id: Some("26".to_string()),
+            ..Default::default()
+        };
+        let wellsaid_config = WellSaidTtsConfig::from_base(&config).unwrap();
+        let builder = WellSaidRequestBuilder::new(wellsaid_config, config);
+        let err = builder
+            .build_http_request(&reqwest::Client::new(), "hello")
+            .build()
+            .expect_err("malformed WellSaid API key must not become an empty X-Api-Key header");
+
+        assert!(err.is_builder(), "unexpected reqwest error: {err}");
+    }
+
+    #[tokio::test]
+    async fn wellsaid_tts_redirect_policy_rejects_private_hop() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) => {
+                if err.kind() == ErrorKind::PermissionDenied {
+                    eprintln!("Skipping wellsaid_tts_redirect_policy_rejects_private_hop: {err}");
+                    return;
+                }
+                panic!("Failed to bind redirect test server listener: {err}");
+            }
+        };
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 302 Found\r\n",
+                "Location: http://127.0.0.1:9/metadata\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n"
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+
+        let err = wellsaid_tts_http_client()
+            .unwrap()
+            .get(format!("http://{addr}/start"))
+            .send()
+            .await
+            .expect_err("private redirect target must be rejected");
+        let mut error_chain = err.to_string();
+        let mut source = std::error::Error::source(&err);
+        while let Some(error) = source {
+            error_chain.push_str(": ");
+            error_chain.push_str(&error.to_string());
+            source = error.source();
+        }
+        assert!(
+            error_chain.contains("redirect URL rejected"),
+            "unexpected redirect error: {error_chain}"
+        );
     }
 
     #[test]
@@ -313,6 +436,55 @@ mod tests {
         // Verify config
         assert_eq!(builder.wellsaid_config().speaker_id, 3);
         assert_eq!(builder.wellsaid_config().model, WellSaidModel::Legacy);
+    }
+
+    // WIRE-LEVEL guard: assert the `X-Enable-SSML` header actually reaches the built HTTP request
+    // when (and only when) the standardized `ssml` feature is set. The recurring bug class is
+    // asserting only the config struct, so this builds the real `reqwest::Request` and inspects its
+    // headers.
+    #[test]
+    fn ssml_feature_sets_x_enable_ssml_header_on_request() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+
+        let client = reqwest::Client::new();
+        let mk = |ssml: Option<bool>| {
+            let std = StandardTTSConfig {
+                base: TTSConfig {
+                    provider: "wellsaid".into(),
+                    api_key: "test-key".into(),
+                    voice_id: Some("26".into()),
+                    ..Default::default()
+                },
+                features: TtsFeatures {
+                    ssml,
+                    ..Default::default()
+                },
+                extras: Default::default(),
+            };
+            let cfg = WellSaidTtsConfig::from_standard(&std).unwrap();
+            let builder = WellSaidRequestBuilder::new(cfg, std.base.clone());
+            builder
+                .build_http_request(&client, "<speak>hi</speak>")
+                .build()
+                .unwrap()
+        };
+
+        // ssml = true: header present and equal to "true".
+        let req = mk(Some(true));
+        assert_eq!(
+            req.headers()
+                .get("X-Enable-SSML")
+                .map(|v| v.to_str().unwrap()),
+            Some("true"),
+            "X-Enable-SSML must be set when the ssml feature is on"
+        );
+
+        // ssml unset: header must be absent (API default = plain text).
+        let req_off = mk(None);
+        assert!(
+            req_off.headers().get("X-Enable-SSML").is_none(),
+            "X-Enable-SSML must be absent when the ssml feature is off"
+        );
     }
 
     #[test]

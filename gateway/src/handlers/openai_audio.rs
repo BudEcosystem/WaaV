@@ -419,7 +419,10 @@ async fn transcription_inner(
     let stt_config = crate::core::stt::STTConfig {
         provider: endpoint.vendor.clone(),
         api_key,
-        language: settings.language.clone().unwrap_or_else(|| "en-US".to_string()),
+        language: settings
+            .language
+            .clone()
+            .unwrap_or_else(|| "en-US".to_string()),
         sample_rate: audio.sample_rate,
         channels: 1,
         punctuation: true,
@@ -470,7 +473,11 @@ fn render_transcription(
         headers.insert(header::CONTENT_TYPE, ct);
     }
     match format {
-        F::Json => (StatusCode::OK, Json(serde_json::json!({ "text": result.text }))).into_response(),
+        F::Json => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "text": result.text })),
+        )
+            .into_response(),
         F::VerboseJson => (
             StatusCode::OK,
             Json(serde_json::json!({

@@ -17,13 +17,24 @@ use waav_gateway::core::realtime::{
     get_supported_realtime_providers,
 };
 
-/// Test that OpenAI and Hume are included in supported providers
+/// Test that OpenAI, Hume, and the OpenAI-protocol clones (Azure/Grok/Inworld)
+/// are included in supported providers.
 #[test]
 fn test_openai_in_supported_realtime_providers() {
     let providers = get_supported_realtime_providers();
     assert!(providers.contains(&"openai"));
     assert!(providers.contains(&"hume"));
-    assert_eq!(providers.len(), 2); // OpenAI and Hume realtime providers
+    assert!(providers.contains(&"azure"));
+    assert!(providers.contains(&"grok"));
+    assert!(providers.contains(&"inworld"));
+    assert!(providers.contains(&"deepgram"));
+    assert!(providers.contains(&"elevenlabs"));
+    assert!(providers.contains(&"gemini"));
+    assert!(providers.contains(&"ultravox"));
+    assert!(providers.contains(&"nova_sonic"));
+    assert!(providers.contains(&"speechmatics"));
+    assert!(providers.contains(&"yandex"));
+    assert_eq!(providers.len(), 12); // OpenAI, Hume + Azure/Grok/Inworld/Yandex clones + Deepgram VA + ElevenLabs ConvAI + Gemini Live + Ultravox + AWS Nova Sonic + Speechmatics Flow (S2S)
 }
 
 /// Test provider creation via string name
@@ -88,7 +99,7 @@ async fn test_openai_realtime_model_configuration() {
         ..Default::default()
     };
     let realtime = OpenAIRealtime::new(config).unwrap();
-    assert_eq!(realtime.model(), OpenAIRealtimeModel::Gpt4oRealtimePreview);
+    assert_eq!(realtime.model(), OpenAIRealtimeModel::GptRealtime);
 
     // Test mini model
     let config = RealtimeConfig {
@@ -163,7 +174,7 @@ fn test_openai_realtime_default_configuration() {
         realtime.get_connection_state(),
         ConnectionState::Disconnected
     );
-    assert_eq!(realtime.model(), OpenAIRealtimeModel::Gpt4oRealtimePreview);
+    assert_eq!(realtime.model(), OpenAIRealtimeModel::GptRealtime);
     assert_eq!(realtime.voice(), OpenAIRealtimeVoice::Alloy);
 }
 

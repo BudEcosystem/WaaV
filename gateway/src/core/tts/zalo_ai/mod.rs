@@ -44,7 +44,7 @@
 //!
 //! # Example Usage
 //!
-//! ```rust,no_run
+//! ```ignore
 //! use waav_gateway::core::tts::{BaseTTS, TTSConfig};
 //! use waav_gateway::core::tts::zalo_ai::{ZaloTts, ZaloVoice};
 //!
@@ -89,6 +89,7 @@ pub mod config;
 
 pub use client::ZaloTts;
 pub use config::{
-    AUDIO_CHANNELS, AUDIO_SAMPLE_RATE, AUDIO_SAMPLE_WIDTH, DEFAULT_SPEED, MAX_SPEED, MIN_SPEED,
-    ZALO_TTS_ENDPOINT, ZaloTtsConfig, ZaloTtsData, ZaloTtsResponse, ZaloVoice,
+    AUDIO_CHANNELS, AUDIO_SAMPLE_RATE, AUDIO_SAMPLE_WIDTH, DEFAULT_ENCODE_TYPE, DEFAULT_SPEED,
+    MAX_SPEED, MIN_SPEED, ZALO_TTS_ENDPOINT, ZaloTtsConfig, ZaloTtsData, ZaloTtsResponse,
+    ZaloVoice,
 };

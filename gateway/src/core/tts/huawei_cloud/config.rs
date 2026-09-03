@@ -16,6 +16,15 @@
 use crate::core::tts::base::{TTSConfig, TTSError};
 use serde::{Deserialize, Serialize};
 
+fn validate_huawei_tts_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -118,7 +127,7 @@ impl HuaweiCloudRegion {
 // =============================================================================
 
 /// Huawei Cloud TTS voice identifiers.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum HuaweiTtsVoice {
     // Standard Voices (普通发音人)
     /// 小琪 - Female, Standard
@@ -126,6 +135,7 @@ pub enum HuaweiTtsVoice {
     /// 小雯 - Female, Soft
     XiaoWen,
     /// 小燕 - Female, Gentle (default)
+    #[default]
     XiaoYan,
     /// 小倩 - Female, Mature
     XiaoQian,
@@ -152,12 +162,6 @@ pub enum HuaweiTtsVoice {
 
     /// Custom voice by property string
     Custom(String),
-}
-
-impl Default for HuaweiTtsVoice {
-    fn default() -> Self {
-        Self::XiaoYan
-    }
 }
 
 impl HuaweiTtsVoice {
@@ -378,9 +382,20 @@ pub struct HuaweiCloudTtsConfig {
     #[serde(default = "default_volume")]
     pub volume: u8,
 
+    /// Word/phoneme timestamps ("subtitle"). When enabled, Huawei SIS returns word-level timing
+    /// metadata alongside the audio. Maps to the SIS `subtitle` config field (integer 0=off, 1=on)
+    /// on BOTH the REST `/tts` config and the RTTS `/rtts` START config.
+    /// Doc: Huawei SIS Real-Time/Standard TTS — `config.subtitle`.
+    #[serde(default)]
+    pub subtitle: bool,
+
     /// TTS operation mode.
     #[serde(default)]
     pub mode: HuaweiTtsMode,
+
+    /// Optional endpoint base (scheme+host) redirecting the IAM token + synth POSTs to a mock/proxy.
+    #[serde(default)]
+    pub endpoint_override: Option<String>,
 }
 
 fn default_sample_rate() -> u32 {
@@ -405,7 +420,9 @@ impl Default for HuaweiCloudTtsConfig {
             speed: DEFAULT_SPEED,
             pitch: DEFAULT_PITCH,
             volume: DEFAULT_VOLUME,
+            subtitle: false,
             mode: HuaweiTtsMode::default(),
+            endpoint_override: None,
         }
     }
 }
@@ -478,6 +495,11 @@ impl HuaweiCloudTtsConfig {
             return Err(TTSError::InvalidConfiguration(
                 "Pitch adjustment is not supported for premium voices".to_string(),
             ));
+        }
+
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_huawei_tts_endpoint("endpoint_override", endpoint)
+                .map_err(TTSError::InvalidConfiguration)?;
         }
 
         Ok(())
@@ -556,17 +578,70 @@ impl HuaweiCloudTtsConfig {
             speed,
             pitch: DEFAULT_PITCH,
             volume: DEFAULT_VOLUME,
+            subtitle: false,
             mode: HuaweiTtsMode::default(),
+            endpoint_override: None,
         })
     }
 
+    /// Build from the standardized TTS config. Huawei SIS exposes prosody knobs directly, so this
+    /// maps `speed` -> `speed` (the same `speaking_rate`-style normalization into the -500..=500
+    /// range used by `from_base`), `pitch` -> `pitch` and `volume` -> `volume` (both clamped to the
+    /// SIS ranges), plus `sample_rate` -> `sample_rate`. The typed `word_timestamps` feature maps to
+    /// SIS `subtitle` (word/phoneme timing metadata), emitted on both the REST `/tts` and RTTS START
+    /// configs. Huawei's `region` (not a standard field) is read from the `extras` passthrough,
+    /// overriding the `model`-derived region. Features without a Huawei field (stability,
+    /// similarity_boost, style, use_speaker_boost, emotion, instructions, ssml, language, streaming,
+    /// seed) are skipped.
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> Result<Self, TTSError> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(std.base.clone())?;
+
+        if let Some(speed) = f.speed {
+            // Map: 0.25 -> -500, 1.0 -> 0, 4.0 -> 500 (same normalization as from_base).
+            let normalized = (speed - 1.0) / (4.0 - 0.25) * 1000.0;
+            cfg.speed = (normalized.round() as i16).clamp(-500, 500);
+        }
+        if let Some(pitch) = f.pitch {
+            cfg.pitch = (pitch.round() as i16).clamp(-500, 500);
+        }
+        if let Some(volume) = f.volume {
+            cfg.volume = (volume.round() as i64).clamp(0, 100) as u8;
+        }
+        if let Some(rate) = f.sample_rate {
+            cfg.sample_rate = rate;
+        }
+        // Word/phoneme timestamps → SIS `subtitle` (typed `word_timestamps`). Reaches the REST `/tts`
+        // and RTTS START configs as the integer `subtitle` field (0/1).
+        if let Some(ts) = f.word_timestamps {
+            cfg.subtitle = ts;
+        }
+
+        // Provider-specific passthrough: region override.
+        if let Some(region) = std.extras.0.get("region").and_then(|v| v.as_str()) {
+            cfg.region = HuaweiCloudRegion::from_str(region).unwrap_or(cfg.region);
+        }
+
+        // Endpoint override (W-T0 mock harness): redirects IAM token + synth POSTs to a mock/proxy.
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
+
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
     /// Get the standard TTS endpoint URL.
+    ///
+    /// Honors `endpoint_override` (scheme+host) when set, keeping the SIS path+query so the synth
+    /// POST can be redirected to a mock/proxy.
     pub fn get_tts_url(&self) -> String {
-        format!(
+        let url = format!(
             "https://{}/v1/{}/tts",
             self.region.sis_endpoint(),
             self.project_id
-        )
+        );
+        crate::core::tts::standard::override_rest_endpoint(&url, self.endpoint_override.as_deref())
     }
 
     /// Get the real-time TTS WebSocket URL.
@@ -678,6 +753,10 @@ pub struct HuaweiTtsRequestConfig {
     pub pitch: i16,
     /// Volume (0 to 100).
     pub volume: u8,
+    /// Word/phoneme timestamps ("subtitle"): SIS integer flag (0=off, 1=on). Omitted when off so
+    /// the default request shape is unchanged. Doc: Huawei SIS Standard TTS — `config.subtitle`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subtitle: Option<u8>,
 }
 
 impl HuaweiTtsRequest {
@@ -696,6 +775,7 @@ impl HuaweiTtsRequest {
                     0
                 },
                 volume: config.volume,
+                subtitle: if config.subtitle { Some(1) } else { None },
             },
         }
     }
@@ -740,15 +820,13 @@ impl HuaweiTtsResponse {
 
     /// Get error message if present.
     pub fn get_error(&self) -> Option<String> {
-        if let Some(code) = &self.error_code {
-            Some(format!(
+        self.error_code.as_ref().map(|code| {
+            format!(
                 "{}: {}",
                 code,
                 self.error_msg.as_deref().unwrap_or("Unknown error")
-            ))
-        } else {
-            None
-        }
+            )
+        })
     }
 
     /// Get audio data if present (base64-decoded).
@@ -794,6 +872,10 @@ pub struct HuaweiRttsConfig {
     /// Volume.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub volume: Option<u8>,
+    /// Word/phoneme timestamps ("subtitle"): SIS integer flag (0=off, 1=on). Omitted when off so the
+    /// default START shape is unchanged. Doc: Huawei SIS Real-Time TTS — `config.subtitle`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subtitle: Option<u8>,
 }
 
 impl HuaweiRttsStartCommand {
@@ -821,6 +903,7 @@ impl HuaweiRttsStartCommand {
                 } else {
                     None
                 },
+                subtitle: if config.subtitle { Some(1) } else { None },
             },
         }
     }
@@ -881,6 +964,142 @@ impl HuaweiRttsResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Maps speed -> speed (normalized into SIS -500..=500), pitch -> pitch, volume -> volume,
+    // sample_rate -> sample_rate, and demonstrates the extras passthrough (region override).
+    #[test]
+    fn from_standard_maps_prosody_and_region() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("region".into(), serde_json::json!("cn-east-3"));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "huawei-cloud".into(),
+                api_key: "user|pass|domain|project123".into(),
+                sample_rate: Some(16000),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(1.0),
+                pitch: Some(100.0),
+                volume: Some(80.0),
+                sample_rate: Some(8000),
+                ssml: Some(true), // capability gap: Huawei has no SSML, must be ignored
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+        let cfg = HuaweiCloudTtsConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.speed, 0); // 1.0x -> 0 (normal)
+        assert_eq!(cfg.pitch, 100);
+        assert_eq!(cfg.volume, 80);
+        assert_eq!(cfg.sample_rate, 8000);
+        assert_eq!(cfg.region, HuaweiCloudRegion::CnEast3); // from extras passthrough
+    }
+
+    // The typed `word_timestamps` feature maps to the SIS `subtitle` config flag.
+    #[test]
+    fn from_standard_maps_word_timestamps_to_subtitle() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "huawei-cloud".into(),
+                api_key: "user|pass|domain|project123".into(),
+                sample_rate: Some(16000),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                word_timestamps: Some(true),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let cfg = HuaweiCloudTtsConfig::from_standard(&std).unwrap();
+        assert!(cfg.subtitle);
+    }
+
+    // WIRE-LEVEL: `subtitle` reaches the SERIALIZED REST `/tts` request config (not just the config
+    // struct). Doc: Huawei SIS Standard TTS — `config.subtitle` (integer 0/1).
+    #[test]
+    fn word_timestamps_reach_serialized_rest_tts_body() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "huawei-cloud".into(),
+                api_key: "user|pass|domain|project123".into(),
+                sample_rate: Some(16000),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                word_timestamps: Some(true),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let cfg = HuaweiCloudTtsConfig::from_standard(&std).unwrap();
+        let json = HuaweiTtsRequest::new("hello", &cfg).to_json().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            v["config"]["subtitle"], 1,
+            "subtitle must be on the REST wire: {json}"
+        );
+    }
+
+    // WIRE-LEVEL: `subtitle` reaches the SERIALIZED RTTS START command config.
+    // Doc: Huawei SIS Real-Time TTS — `config.subtitle` (integer 0/1).
+    #[test]
+    fn word_timestamps_reach_serialized_rtts_start_command() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "huawei-cloud".into(),
+                api_key: "user|pass|domain|project123".into(),
+                sample_rate: Some(16000),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                word_timestamps: Some(true),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let cfg = HuaweiCloudTtsConfig::from_standard(&std).unwrap();
+        let json = HuaweiRttsStartCommand::new("hello", &cfg)
+            .to_json()
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["command"], "START");
+        assert_eq!(
+            v["config"]["subtitle"], 1,
+            "subtitle must be on the RTTS START wire: {json}"
+        );
+    }
+
+    // When word_timestamps is unset/false, `subtitle` is OMITTED from both wire shapes (no spurious
+    // 0 that would change the default request and could be rejected by stricter SIS validation).
+    #[test]
+    fn subtitle_omitted_from_wire_when_unset() {
+        let cfg = HuaweiCloudTtsConfig::from_base(TTSConfig {
+            provider: "huawei-cloud".into(),
+            api_key: "user|pass|domain|project123".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(!cfg.subtitle);
+        let rest: serde_json::Value =
+            serde_json::from_str(&HuaweiTtsRequest::new("hi", &cfg).to_json().unwrap()).unwrap();
+        assert!(
+            rest["config"].get("subtitle").is_none(),
+            "subtitle must be absent on REST when off"
+        );
+        let rtts: serde_json::Value =
+            serde_json::from_str(&HuaweiRttsStartCommand::new("hi", &cfg).to_json().unwrap())
+                .unwrap();
+        assert!(
+            rtts["config"].get("subtitle").is_none(),
+            "subtitle must be absent on RTTS when off"
+        );
+    }
 
     #[test]
     fn test_region_code() {
@@ -998,6 +1217,46 @@ mod tests {
             ..Default::default()
         };
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = HuaweiCloudTtsConfig {
+            username: "user".to_string(),
+            password: "pass".to_string(),
+            domain_name: "domain".to_string(),
+            project_id: "project123".to_string(),
+            endpoint_override: Some("https://gateway.example.com".to_string()),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:8080".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.to_string().contains("SSRF protection"));
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("file endpoint_override must be rejected");
+        assert!(err.to_string().contains("URL scheme"));
+
+        config.endpoint_override = Some("wss://gateway.example.com".to_string());
+        let err = config
+            .validate()
+            .expect_err("WebSocket endpoint_override must be rejected");
+        assert!(err.to_string().contains("URL scheme"));
+
+        let std = crate::core::tts::standard::StandardTTSConfig::from_base(TTSConfig {
+            provider: "huawei-cloud".to_string(),
+            api_key: "user|pass|domain|project123".to_string(),
+            ..Default::default()
+        })
+        .with_endpoint_override("file:///tmp/socket");
+        assert!(HuaweiCloudTtsConfig::from_standard(&std).is_err());
     }
 
     #[test]

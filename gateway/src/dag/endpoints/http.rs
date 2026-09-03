@@ -11,6 +11,11 @@ use crate::dag::definition::HttpMethod;
 use crate::dag::error::{DAGError, DAGResult};
 use crate::dag::nodes::DAGData;
 
+fn ssrf_protected_http_client() -> DAGResult<reqwest::Client> {
+    crate::core::net::ssrf_protected_client(crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|e| DAGError::ConfigError(format!("failed to build DAG HTTP adapter client: {e}")))
+}
+
 /// HTTP endpoint adapter
 pub struct HttpAdapter {
     id: String,
@@ -18,22 +23,46 @@ pub struct HttpAdapter {
     method: HttpMethod,
     headers: HashMap<String, String>,
     timeout: Duration,
-    client: reqwest::Client,
+    client: Option<reqwest::Client>,
+    http_client_init_error: Option<String>,
     connected: bool,
 }
 
 impl HttpAdapter {
     /// Create a new HTTP adapter
     pub fn new(id: impl Into<String>, url: impl Into<String>) -> Self {
+        let (client, http_client_init_error) = match ssrf_protected_http_client() {
+            Ok(client) => (Some(client), None),
+            Err(error) => (None, Some(error.to_string())),
+        };
+        let connected = client.is_some();
         Self {
             id: id.into(),
             url: url.into(),
             method: HttpMethod::POST,
             headers: HashMap::new(),
             timeout: Duration::from_secs(30),
-            client: reqwest::Client::new(),
-            connected: true, // HTTP is stateless, always "connected"
+            client,
+            http_client_init_error,
+            connected,
         }
+    }
+
+    /// Create a new HTTP adapter with SSRF URL validation.
+    pub fn try_new(id: impl Into<String>, url: impl Into<String>) -> DAGResult<Self> {
+        let url = url.into();
+        crate::core::net::validate_url_for_ssrf(&url, crate::core::net::HTTP_URL_SCHEMES)
+            .map_err(DAGError::ConfigError)?;
+        Ok(Self {
+            id: id.into(),
+            url,
+            method: HttpMethod::POST,
+            headers: HashMap::new(),
+            timeout: Duration::from_secs(30),
+            client: Some(ssrf_protected_http_client()?),
+            http_client_init_error: None,
+            connected: true,
+        })
     }
 
     /// Set HTTP method
@@ -71,6 +100,15 @@ impl EndpointAdapter for HttpAdapter {
     }
 
     async fn send(&self, data: DAGData, ctx: &DAGContext) -> DAGResult<DAGData> {
+        let Some(client) = &self.client else {
+            return Err(DAGError::HttpEndpointError {
+                url: self.url.clone(),
+                error: self
+                    .http_client_init_error
+                    .clone()
+                    .unwrap_or_else(|| "DAG HTTP adapter client was not initialized".to_string()),
+            });
+        };
         let payload = data.to_json();
 
         debug!(
@@ -80,8 +118,7 @@ impl EndpointAdapter for HttpAdapter {
             "HTTP request"
         );
 
-        let mut request = self
-            .client
+        let mut request = client
             .request(self.method.clone().into(), &self.url)
             .timeout(self.timeout)
             .header("Content-Type", "application/json")
@@ -129,10 +166,19 @@ impl EndpointAdapter for HttpAdapter {
     }
 
     fn is_connected(&self) -> bool {
-        self.connected
+        self.connected && self.client.is_some()
     }
 
     async fn connect(&mut self) -> DAGResult<()> {
+        if self.client.is_none() {
+            return Err(DAGError::HttpEndpointError {
+                url: self.url.clone(),
+                error: self
+                    .http_client_init_error
+                    .clone()
+                    .unwrap_or_else(|| "DAG HTTP adapter client was not initialized".to_string()),
+            });
+        }
         self.connected = true;
         Ok(())
     }
@@ -167,5 +213,40 @@ mod tests {
     fn test_http_adapter_default_connected() {
         let adapter = HttpAdapter::new("test", "https://api.example.com");
         assert!(adapter.is_connected());
+    }
+
+    #[test]
+    fn test_http_adapter_try_new_blocks_ssrf_and_ws_scheme() {
+        let _env = crate::core::net::ssrf_env_lock();
+        assert!(HttpAdapter::try_new("test", "https://api.example.com").is_ok());
+        assert!(HttpAdapter::try_new("test", "http://127.0.0.1:8080/admin").is_err());
+        assert!(HttpAdapter::try_new("test", "wss://api.example.com/socket").is_err());
+    }
+
+    #[tokio::test]
+    async fn http_adapter_client_init_failure_returns_typed_error() {
+        let adapter = HttpAdapter {
+            id: "http".to_string(),
+            url: "https://api.example.com".to_string(),
+            method: HttpMethod::POST,
+            headers: HashMap::new(),
+            timeout: Duration::from_secs(30),
+            client: None,
+            http_client_init_error: Some("client build failed".to_string()),
+            connected: false,
+        };
+        let ctx = DAGContext::new("client-init-failure");
+
+        let error = adapter
+            .send(DAGData::Text("payload".to_string()), &ctx)
+            .await
+            .expect_err("missing client must return an HTTP endpoint error");
+
+        match error {
+            DAGError::HttpEndpointError { error, .. } => {
+                assert!(error.contains("client build failed"), "{error}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 }

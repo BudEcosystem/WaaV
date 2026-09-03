@@ -28,6 +28,7 @@ use crate::utils::req_manager::ReqManager;
 use crate::utils::url_validation::validate_webhook_url;
 
 type HmacSha256 = Hmac<Sha256>;
+const SIP_WEBHOOK_REDIRECT_LIMIT: usize = 10;
 
 /// Participant information for SIP webhook events.
 ///
@@ -332,15 +333,18 @@ pub async fn handle_livekit_webhook(
             let state_clone = state.clone();
             let event_clone = event.clone();
             let hooks_state_clone = sip_hooks_state.clone();
-            tokio::spawn(async move {
-                if let Err(e) =
-                    forward_to_sip_hook(&state_clone, &hooks_state_clone, &event_clone).await
-                {
-                    // Log with appropriate severity based on error type
-                    let room_name = event_clone.room.as_ref().map(|r| r.name.as_str());
-                    e.log_with_context(&event_clone.id, room_name);
-                }
-            });
+            crate::core::observability::spawn_observed_detached(
+                "livekit.sip-hook-forwarder",
+                async move {
+                    if let Err(e) =
+                        forward_to_sip_hook(&state_clone, &hooks_state_clone, &event_clone).await
+                    {
+                        // Log with appropriate severity based on error type
+                        let room_name = event_clone.room.as_ref().map(|r| r.name.as_str());
+                        e.log_with_context(&event_clone.id, room_name);
+                    }
+                },
+            );
         }
     }
 
@@ -581,7 +585,8 @@ fn generate_webhook_signature(
 /// participant's `sip.h.to` attribute, looks up the corresponding hook configuration,
 /// and forwards a filtered SIPHookEvent payload with HMAC-SHA256 signing headers.
 ///
-/// Uses ReqManager for connection pooling and concurrency control.
+/// Uses ReqManager for per-hook concurrency control and a webhook-specific
+/// reqwest client that validates every redirect target.
 /// Does not block the main webhook handler - errors are logged but not propagated.
 ///
 /// # Arguments
@@ -720,22 +725,29 @@ async fn forward_to_sip_hook(
         generate_webhook_signature(&signing_secret, timestamp, &event.id, &payload)
             .map_err(|e| SipForwardingError::HttpClientError { error: e })?;
 
-    // Step 12: Get or create ReqManager for this hook host
+    // Step 12: Get or create ReqManager for this hook host. The manager is
+    // still used for per-hook concurrency control; the POST itself uses a
+    // redirect-validating client so every Location target is checked.
     let req_manager = get_or_create_hook_manager(state, &hook_url)
         .await
         .map_err(|e| SipForwardingError::HttpClientError { error: e })?;
+    let hook_client = reqwest::Client::builder()
+        .redirect(sip_hook_redirect_policy())
+        .build()
+        .map_err(|e| SipForwardingError::HttpClientError {
+            error: format!("Failed to create SSRF-protected webhook client: {e}"),
+        })?;
 
     // Step 13: Forward the webhook payload with signing headers
     let start = Instant::now();
-    let guard = req_manager
+    let _guard = req_manager
         .acquire()
         .await
         .map_err(|e| SipForwardingError::HttpClientError {
             error: e.to_string(),
         })?;
 
-    let mut request = guard
-        .client()
+    let mut request = hook_client
         .post(&hook_url)
         .header("Content-Type", "application/json");
 
@@ -784,6 +796,19 @@ async fn forward_to_sip_hook(
             body: truncated_body,
         })
     }
+}
+
+fn sip_hook_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() > SIP_WEBHOOK_REDIRECT_LIMIT {
+            return attempt.error("too many redirects");
+        }
+
+        match validate_webhook_url(attempt.url().as_str()) {
+            Ok(()) => attempt.follow(),
+            Err(e) => attempt.error(format!("redirect URL rejected (SSRF protection): {e}")),
+        }
+    })
 }
 
 /// Gets or creates a ReqManager instance for a specific hook URL.

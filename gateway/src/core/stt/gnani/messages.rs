@@ -192,7 +192,8 @@ impl TranscriptChunk {
                     if pos + 4 > buf.len() {
                         return Err(DecodeError::BufferTooShort);
                     }
-                    let bytes: [u8; 4] = buf[pos..pos + 4].try_into().unwrap();
+                    let mut bytes = [0u8; 4];
+                    bytes.copy_from_slice(&buf[pos..pos + 4]);
                     chunk.confidence = f32::from_le_bytes(bytes);
                     pos += 4;
                 }

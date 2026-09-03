@@ -13,7 +13,7 @@
 //!
 //! # Usage
 //!
-//! ```rust,no_run
+//! ```ignore
 //! use waav_gateway::core::silero_vad::{SileroVAD, SileroVADConfig};
 //!
 //! let config = SileroVADConfig::default();

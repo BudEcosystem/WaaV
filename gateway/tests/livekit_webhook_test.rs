@@ -32,6 +32,15 @@ fn create_test_config_with_livekit() -> ServerConfig {
         azure_speech_region: None,
         cartesia_api_key: None,
         openai_api_key: None,
+        azure_openai_api_key: None,
+        azure_openai_endpoint: None,
+        grok_api_key: None,
+        inworld_api_key: None,
+        gemini_api_key: None,
+        ultravox_api_key: None,
+        speechmatics_api_key: None,
+        yandex_api_key: None,
+        yandex_folder_id: None,
         assemblyai_api_key: None,
         hume_api_key: None,
         lmnt_api_key: None,
@@ -69,8 +78,10 @@ fn create_test_config_with_livekit() -> ServerConfig {
         ws_processing_timeout_secs: 10,
         realtime_processing_timeout_secs: 30,
         sip_max_participants: 3,
+        realtime_endpoint_overrides: Default::default(),
         plugins: PluginConfig::default(),
         dag_timeouts: DAGTimeoutsConfig::default(),
+        aliases: Default::default(),
     }
 }
 
@@ -91,6 +102,15 @@ fn create_test_config_without_livekit() -> ServerConfig {
         azure_speech_region: None,
         cartesia_api_key: None,
         openai_api_key: None,
+        azure_openai_api_key: None,
+        azure_openai_endpoint: None,
+        grok_api_key: None,
+        inworld_api_key: None,
+        gemini_api_key: None,
+        ultravox_api_key: None,
+        speechmatics_api_key: None,
+        yandex_api_key: None,
+        yandex_folder_id: None,
         assemblyai_api_key: None,
         hume_api_key: None,
         lmnt_api_key: None,
@@ -128,8 +148,10 @@ fn create_test_config_without_livekit() -> ServerConfig {
         ws_processing_timeout_secs: 10,
         realtime_processing_timeout_secs: 30,
         sip_max_participants: 3,
+        realtime_endpoint_overrides: Default::default(),
         plugins: PluginConfig::default(),
         dag_timeouts: DAGTimeoutsConfig::default(),
+        aliases: Default::default(),
     }
 }
 

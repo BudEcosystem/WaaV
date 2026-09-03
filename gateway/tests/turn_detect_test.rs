@@ -69,6 +69,26 @@ async fn test_end_to_end_turn_detection() -> Result<()> {
         }
     }
 
+    // Regression guard for the duplicate-input-name bug (the attention mask was pushed under
+    // the same "input_ids" name and overwrote the real token ids, so EVERY input returned
+    // ~0.0019). A clearly-complete sentence must score MUCH higher than an incomplete fragment.
+    let complete = detector
+        .predict_end_of_turn("what is the capital of france")
+        .await?;
+    let incomplete = detector.predict_end_of_turn("what is the").await?;
+    assert!(
+        complete > 0.5,
+        "complete sentence should score high, got {complete}"
+    );
+    assert!(
+        incomplete < 0.3,
+        "incomplete fragment should score low, got {incomplete}"
+    );
+    assert!(
+        complete > incomplete + 0.4,
+        "complete ({complete}) must clearly exceed incomplete ({incomplete})"
+    );
+
     Ok(())
 }
 

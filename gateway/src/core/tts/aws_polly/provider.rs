@@ -53,8 +53,11 @@ use aws_config::{BehaviorVersion, Region};
 use aws_credential_types::Credentials;
 use aws_sdk_polly::Client as PollyClient;
 use aws_sdk_polly::config::Builder as PollyConfigBuilder;
+use aws_sdk_polly::operation::synthesize_speech::builders::SynthesizeSpeechInputBuilder;
 use aws_sdk_polly::primitives::ByteStream;
-use aws_sdk_polly::types::{Engine, OutputFormat, TextType as PollyTextType, VoiceId};
+use aws_sdk_polly::types::{
+    Engine, OutputFormat, SpeechMarkType, TextType as PollyTextType, VoiceId,
+};
 use bytes::Bytes;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
@@ -260,6 +263,17 @@ impl AwsPollyTTS {
         })
     }
 
+    /// Build the provider from the standardized config (W1 keystone), mirroring
+    /// `DeepgramTTS::from_standard`. Delegates the feature mapping to
+    /// [`AwsPollyTTSConfig::from_standard`] (SSML input type, language override, output
+    /// sample_rate + voice/engine and the `region` extra) so advanced features reach the live
+    /// SynthesizeSpeech request through the standardized dispatch instead of being dropped at the
+    /// flat boundary.
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
+        let polly_config = AwsPollyTTSConfig::from_standard(std);
+        Self::new_from_polly_config(polly_config)
+    }
+
     /// Create a new Amazon Polly TTS instance from AwsPollyTTSConfig.
     ///
     /// Use this when you want full control over Polly-specific settings.
@@ -303,10 +317,19 @@ impl AwsPollyTTS {
                     Credentials::new(access_key, secret_key, None, None, "waav")
                 };
 
-                let polly_config = PollyConfigBuilder::new()
+                let mut builder = PollyConfigBuilder::new()
+                    // A behavior major version is mandatory; without it the SDK panics at request
+                    // time. The default-credential branch sets it via `aws_config::defaults`, but
+                    // this explicit-credential `Builder::new()` path must set it itself.
+                    .behavior_version(BehaviorVersion::latest())
                     .region(region)
-                    .credentials_provider(credentials)
-                    .build();
+                    .credentials_provider(credentials);
+                // Honor the raw endpoint base (e.g. http://127.0.0.1:PORT for a mock e2e harness);
+                // the SDK appends the operation path, so this is NOT override_rest_endpoint.
+                if let Some(ep) = self.config.endpoint_override.as_deref() {
+                    builder = builder.endpoint_url(ep);
+                }
+                let polly_config = builder.build();
 
                 return Ok(PollyClient::from_conf(polly_config));
             } else {
@@ -318,6 +341,62 @@ impl AwsPollyTTS {
             };
 
         Ok(PollyClient::new(&aws_config))
+    }
+
+    /// Build the `SynthesizeSpeech` request input from the resolved config.
+    ///
+    /// Factored out of [`Self::synthesize`] so the exact request that reaches the AWS wire can be
+    /// asserted in a unit test without a live API call (the recurring "config struct set but never
+    /// emitted" bug class). Maps every audio-affecting field — voice, engine, output format, text
+    /// type, sample rate, language, lexicons — and the `speech_mark_types` knob onto the SDK input
+    /// builder. When `speech_mark_types` is non-empty, Polly returns a JSON marks stream rather
+    /// than audio, so we force `OutputFormat::Json` on that request (AWS rejects audio + marks).
+    fn build_synthesize_input(&self, text: &str) -> TTSResult<SynthesizeSpeechInputBuilder> {
+        let speech_marks: Vec<SpeechMarkType> = self
+            .config
+            .speech_mark_types
+            .iter()
+            .map(|s| SpeechMarkType::from(s.as_str()))
+            .collect();
+
+        // Speech marks require the JSON output format (mutually exclusive with audio bytes).
+        let output_format = if speech_marks.is_empty() {
+            output_format_to_sdk(self.config.output_format)
+        } else {
+            OutputFormat::Json
+        };
+
+        let mut input =
+            aws_sdk_polly::operation::synthesize_speech::SynthesizeSpeechInput::builder()
+                .text(text)
+                .voice_id(voice_to_sdk(&self.config.voice))
+                .engine(engine_to_sdk(self.config.engine))
+                .output_format(output_format)
+                .text_type(text_type_to_sdk(self.config.text_type));
+
+        // Add sample rate if specified and supported
+        if let Some(sample_rate) = self.config.base.sample_rate {
+            input = input.sample_rate(sample_rate.to_string());
+        }
+
+        // Add language code if specified
+        if let Some(ref lang_code) = self.config.language_code {
+            input = input.language_code(lang_code.parse().map_err(|_| {
+                TTSError::InvalidConfiguration(format!("Invalid language code: {}", lang_code))
+            })?);
+        }
+
+        // Add lexicons
+        for lexicon in &self.config.lexicon_names {
+            input = input.lexicon_names(lexicon.clone());
+        }
+
+        // Speech marks (word / sentence / viseme / ssml timing & metadata).
+        if !speech_marks.is_empty() {
+            input = input.set_speech_mark_types(Some(speech_marks));
+        }
+
+        Ok(input)
     }
 
     /// Synthesize text to audio using Amazon Polly.
@@ -349,31 +428,19 @@ impl AwsPollyTTS {
             "Synthesizing text with Amazon Polly"
         );
 
-        // Build request
-        let mut request = client
+        // Build the request input (shared with the wire-assert test path).
+        let input = self.build_synthesize_input(text)?;
+        let request = client
             .synthesize_speech()
-            .text(text)
-            .voice_id(voice_to_sdk(&self.config.voice))
-            .engine(engine_to_sdk(self.config.engine))
-            .output_format(output_format_to_sdk(self.config.output_format))
-            .text_type(text_type_to_sdk(self.config.text_type));
-
-        // Add sample rate if specified and supported
-        if let Some(sample_rate) = self.config.base.sample_rate {
-            request = request.sample_rate(sample_rate.to_string());
-        }
-
-        // Add language code if specified
-        if let Some(ref lang_code) = self.config.language_code {
-            request = request.language_code(lang_code.parse().map_err(|_| {
-                TTSError::InvalidConfiguration(format!("Invalid language code: {}", lang_code))
-            })?);
-        }
-
-        // Add lexicons
-        for lexicon in &self.config.lexicon_names {
-            request = request.lexicon_names(lexicon.clone());
-        }
+            .set_text(input.get_text().clone())
+            .set_voice_id(input.get_voice_id().clone())
+            .set_engine(input.get_engine().clone())
+            .set_output_format(input.get_output_format().clone())
+            .set_text_type(input.get_text_type().clone())
+            .set_sample_rate(input.get_sample_rate().clone())
+            .set_language_code(input.get_language_code().clone())
+            .set_lexicon_names(input.get_lexicon_names().clone())
+            .set_speech_mark_types(input.get_speech_mark_types().clone());
 
         // Send request
         let response = request.send().await.map_err(|e| {
@@ -669,6 +736,118 @@ mod tests {
         assert_eq!(tts.voice(), PollyVoice::Joanna);
         assert_eq!(tts.engine(), PollyEngine::Neural);
         assert_eq!(tts.output_format(), PollyOutputFormat::Pcm);
+    }
+
+    // W1 keystone: a StandardTTSConfig advanced feature Polly supports (SSML input type, language
+    // override, output sample_rate) reaches the provider's resolved `polly_config` through the
+    // provider struct's `from_standard`, mirroring `DeepgramTTS::from_standard`.
+    #[tokio::test]
+    async fn from_standard_reaches_provider_config() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "aws-polly".into(),
+                voice_id: Some("Matthew".into()),
+                model: "neural".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                ssml: Some(true),
+                language: Some("en-GB".into()),
+                sample_rate: Some(16000), // valid for the default PCM output format
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let tts = AwsPollyTTS::from_standard(&std).unwrap();
+        assert_eq!(tts.polly_config().text_type, TextType::Ssml);
+        assert_eq!(tts.polly_config().language_code, Some("en-GB".to_string()));
+        assert_eq!(tts.polly_config().base.sample_rate, Some(16000));
+        assert_eq!(tts.voice(), PollyVoice::Matthew);
+        assert_eq!(tts.engine(), PollyEngine::Neural);
+    }
+
+    #[tokio::test]
+    async fn from_standard_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let std = crate::core::tts::standard::StandardTTSConfig::from_base(TTSConfig {
+            provider: "aws-polly".into(),
+            voice_id: Some("Joanna".to_string()),
+            sample_rate: Some(16000),
+            ..Default::default()
+        })
+        .with_endpoint_override("http://127.0.0.1:9000");
+
+        match AwsPollyTTS::from_standard(&std) {
+            Ok(_) => panic!("AWS Polly provider construction must reject unsafe endpoint_override"),
+            Err(err) => assert!(err.to_string().contains("SSRF protection")),
+        }
+    }
+
+    // WIRE-LEVEL: the `speech_mark_types` knob must reach the actual `SynthesizeSpeech` request
+    // input (not merely sit on the config struct — the recurring "set but never emitted" bug). We
+    // build the exact SDK input the live path sends and assert the marks are present, in order,
+    // and that the output format was flipped to JSON (AWS forbids audio + marks in one request).
+    #[tokio::test]
+    async fn speech_mark_types_reach_synthesize_request() {
+        use crate::core::stt::standard::ProviderExtras;
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert(
+            "speech_mark_types".into(),
+            serde_json::json!(["word", "sentence", "viseme", "ssml", "bogus"]),
+        );
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "aws-polly".into(),
+                voice_id: Some("Joanna".into()),
+                model: "neural".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                // PCM-valid rate so config validation (default output format = PCM) passes.
+                sample_rate: Some(16000),
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+        let tts = AwsPollyTTS::from_standard(&std).unwrap();
+        // The invalid "bogus" name is filtered; only the 4 valid AWS marks survive.
+        assert_eq!(
+            tts.polly_config().speech_mark_types,
+            vec!["word", "sentence", "viseme", "ssml"]
+        );
+
+        let input = tts.build_synthesize_input("Hello").unwrap();
+        let marks = input.get_speech_mark_types().clone().unwrap();
+        assert_eq!(
+            marks,
+            vec![
+                SpeechMarkType::Word,
+                SpeechMarkType::Sentence,
+                SpeechMarkType::Viseme,
+                SpeechMarkType::Ssml,
+            ],
+            "speech_mark_types must reach the SynthesizeSpeech request input"
+        );
+        // Marks force the JSON metadata stream, not audio bytes.
+        assert_eq!(input.get_output_format().clone(), Some(OutputFormat::Json));
+    }
+
+    // Without the knob, no marks are requested and the request stays an audio call.
+    #[tokio::test]
+    async fn no_speech_mark_types_keeps_audio_output() {
+        let config = TTSConfig {
+            provider: "aws-polly".into(),
+            voice_id: Some("Joanna".into()),
+            audio_format: Some("pcm".into()),
+            sample_rate: Some(16000),
+            ..Default::default()
+        };
+        let tts = AwsPollyTTS::new(config).unwrap();
+        let input = tts.build_synthesize_input("Hello").unwrap();
+        assert!(input.get_speech_mark_types().is_none());
+        assert_eq!(input.get_output_format().clone(), Some(OutputFormat::Pcm));
     }
 
     #[tokio::test]

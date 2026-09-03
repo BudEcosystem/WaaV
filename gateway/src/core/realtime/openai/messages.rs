@@ -28,8 +28,8 @@
 //! - response.audio.done - Audio generation complete
 //! - response.audio_transcript.delta - Transcript chunk
 //! - response.audio_transcript.done - Transcript complete
-//! - response.text.delta - Text chunk
-//! - response.text.done - Text complete
+//! - response.output_text.delta - Text chunk (GA)
+//! - response.output_text.done - Text complete (GA)
 //! - response.done - Response complete
 //! - error - Error occurred
 
@@ -40,52 +40,127 @@ use serde::{Deserialize, Serialize};
 // Session Configuration
 // =============================================================================
 
-/// Session configuration for OpenAI Realtime API.
+/// GA Realtime audio format descriptor, e.g. `{"type":"audio/pcm","rate":24000}`
+/// (Beta sent a bare string like `"pcm16"`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AudioFormat {
+    /// `"audio/pcm"` | `"audio/pcmu"` (G.711 µ-law) | `"audio/pcma"` (G.711 A-law).
+    #[serde(rename = "type")]
+    pub format_type: String,
+    /// Sample rate (24000 for PCM; omitted for G.711 — 8000 implied).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate: Option<u32>,
+}
+
+/// GA Realtime `session.audio.input` block.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AudioInput {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<AudioFormat>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transcription: Option<InputAudioTranscription>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub noise_reduction: Option<NoiseReduction>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_detection: Option<TurnDetection>,
+}
+
+/// GA Realtime `session.audio.output` block.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AudioOutput {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<AudioFormat>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub voice: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speed: Option<f32>,
+}
+
+/// GA Realtime `session.audio` block (nests the Beta-era flat audio fields).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AudioConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<AudioInput>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<AudioOutput>,
+}
+
+/// Session configuration for the OpenAI Realtime **GA** API (`gpt-realtime`).
+///
+/// Live-migrated from the retired Beta flat schema: `modalities`→`output_modalities`,
+/// `voice`/`input_audio_format`/`output_audio_format`/`turn_detection`/
+/// `input_audio_transcription`/`input_audio_noise_reduction` all nest under
+/// `audio.input`/`audio.output`, formats become `{type,rate}` objects, and
+/// `session.type` is now required. GA `gpt-realtime` exposes no session-level
+/// `temperature` or `reasoning`, so neither is emitted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionConfig {
-    /// Response modalities (text, audio)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub modalities: Option<Vec<String>>,
+    /// Always `"realtime"` for S2S sessions (GA requires `session.type`).
+    #[serde(rename = "type")]
+    pub session_type: String,
 
-    /// System instructions for the assistant
+    /// Output modalities (GA renamed Beta `modalities` → `output_modalities`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_modalities: Option<Vec<String>>,
+
+    /// System instructions for the assistant.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
 
-    /// Voice for audio output
+    /// Nested audio input/output config (format, voice, turn detection,
+    /// transcription, noise reduction).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub voice: Option<String>,
+    pub audio: Option<AudioConfig>,
 
-    /// Input audio format
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub input_audio_format: Option<String>,
-
-    /// Output audio format
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub output_audio_format: Option<String>,
-
-    /// Input audio transcription configuration
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub input_audio_transcription: Option<InputAudioTranscription>,
-
-    /// Turn detection configuration
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub turn_detection: Option<TurnDetection>,
-
-    /// Tool definitions
+    /// Tool definitions.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<ToolDef>>,
 
-    /// Tool choice strategy
+    /// Tool choice strategy.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<String>,
 
-    /// Temperature for response generation
+    /// Maximum response output tokens (GA renamed `max_response_output_tokens`
+    /// → `max_output_tokens`).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub temperature: Option<f32>,
+    pub max_output_tokens: Option<MaxTokens>,
+}
 
-    /// Maximum response output tokens
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_response_output_tokens: Option<MaxTokens>,
+/// Realtime input-audio noise-reduction strategy.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NoiseReduction {
+    /// `"near_field"` | `"far_field"`.
+    #[serde(rename = "type")]
+    pub reduction_type: String,
+}
+
+impl NoiseReduction {
+    /// Build from a config string; `None`/empty/`"off"`/`"none"` ⇒ no reduction.
+    pub fn from_opt(s: Option<&str>) -> Option<Self> {
+        match s.map(|v| v.to_ascii_lowercase()) {
+            Some(v) if v == "near_field" || v == "far_field" => Some(Self { reduction_type: v }),
+            _ => None,
+        }
+    }
+}
+
+/// S2S: native realtime reasoning control mapped from the cascade `ReasoningEffort`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RealtimeReasoning {
+    /// `"minimal" | "low" | "medium" | "high"` — never emitted for `Off`.
+    pub effort: String,
+}
+
+impl RealtimeReasoning {
+    /// Map the cascade dial to the realtime field. `Off`/`None` ⇒ `None` (send
+    /// nothing — a non-reasoning realtime model 400s on the field, exactly like
+    /// the cascade adapter's no-param rule for `Off`).
+    pub fn from_effort(effort: crate::core::llm::ReasoningEffort) -> Option<Self> {
+        use crate::core::llm::ReasoningEffort;
+        (effort != ReasoningEffort::Off).then(|| Self {
+            effort: effort.as_str().to_string(),
+        })
+    }
 }
 
 /// Maximum tokens configuration.
@@ -219,40 +294,41 @@ pub struct ContentPart {
 // Response Configuration
 // =============================================================================
 
-/// Response configuration for creating responses.
+/// Per-response config for the GA `response.create` `response` object.
+///
+/// GA-shaped (live-confirmed accepted): `output_modalities` (was Beta
+/// `modalities`), nested `audio.output` (voice/format, was flat `voice` /
+/// `output_audio_format`), `max_output_tokens` (was `max_response_output_tokens`).
+/// `conversation:"none"` makes the response out-of-band. Default ⇒ `{}` (no
+/// override), which GA accepts. GA `gpt-realtime` has no per-response
+/// `temperature`, so it is not modeled.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ResponseConfig {
-    /// Response modalities
+    /// Output modalities for this response (GA renamed Beta `modalities`).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub modalities: Option<Vec<String>>,
-    /// System instructions
+    pub output_modalities: Option<Vec<String>>,
+    /// Per-response system instructions.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
-    /// Voice for audio
+    /// Nested audio output (voice + format) for this response.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub voice: Option<String>,
-    /// Output audio format
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub output_audio_format: Option<String>,
-    /// Tools
+    pub audio: Option<AudioConfig>,
+    /// Tools.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<ToolDef>>,
-    /// Tool choice
+    /// Tool choice.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<String>,
-    /// Temperature
+    /// Max output tokens (GA renamed `max_response_output_tokens`).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub temperature: Option<f32>,
-    /// Max output tokens
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_response_output_tokens: Option<MaxTokens>,
-    /// Conversation to use
+    pub max_output_tokens: Option<MaxTokens>,
+    /// `"none"` ⇒ out-of-band response (not added to the default conversation).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conversation: Option<String>,
-    /// Metadata
+    /// Opaque metadata echoed back on the response.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
-    /// Input items to add
+    /// Input items to add for this response.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input: Option<Vec<ConversationItem>>,
 }
@@ -398,7 +474,7 @@ pub enum ServerEvent {
     InputAudioBufferCleared,
 
     /// Conversation item created
-    #[serde(rename = "conversation.item.created")]
+    #[serde(rename = "conversation.item.added")]
     ConversationItemCreated {
         /// Previous item ID
         previous_item_id: Option<String>,
@@ -513,7 +589,7 @@ pub enum ServerEvent {
     },
 
     /// Text delta
-    #[serde(rename = "response.text.delta")]
+    #[serde(rename = "response.output_text.delta")]
     TextDelta {
         /// Response ID
         response_id: String,
@@ -528,7 +604,7 @@ pub enum ServerEvent {
     },
 
     /// Text done
-    #[serde(rename = "response.text.done")]
+    #[serde(rename = "response.output_text.done")]
     TextDone {
         /// Response ID
         response_id: String,
@@ -543,7 +619,7 @@ pub enum ServerEvent {
     },
 
     /// Audio transcript delta
-    #[serde(rename = "response.audio_transcript.delta")]
+    #[serde(rename = "response.output_audio_transcript.delta")]
     AudioTranscriptDelta {
         /// Response ID
         response_id: String,
@@ -558,7 +634,7 @@ pub enum ServerEvent {
     },
 
     /// Audio transcript done
-    #[serde(rename = "response.audio_transcript.done")]
+    #[serde(rename = "response.output_audio_transcript.done")]
     AudioTranscriptDone {
         /// Response ID
         response_id: String,
@@ -573,7 +649,7 @@ pub enum ServerEvent {
     },
 
     /// Audio delta (audio data chunk)
-    #[serde(rename = "response.audio.delta")]
+    #[serde(rename = "response.output_audio.delta")]
     AudioDelta {
         /// Response ID
         response_id: String,
@@ -588,7 +664,7 @@ pub enum ServerEvent {
     },
 
     /// Audio done
-    #[serde(rename = "response.audio.done")]
+    #[serde(rename = "response.output_audio.done")]
     AudioDone {
         /// Response ID
         response_id: String,
@@ -811,24 +887,71 @@ mod tests {
 
     #[test]
     fn test_session_update_serialization() {
+        // GA shape: session.type + output_modalities + nested audio.output.voice.
         let event = ClientEvent::SessionUpdate {
             session: SessionConfig {
-                modalities: Some(vec!["text".to_string(), "audio".to_string()]),
-                voice: Some("alloy".to_string()),
+                session_type: "realtime".to_string(),
+                output_modalities: Some(vec!["audio".to_string()]),
                 instructions: None,
-                input_audio_format: None,
-                output_audio_format: None,
-                input_audio_transcription: None,
-                turn_detection: None,
+                audio: Some(AudioConfig {
+                    input: None,
+                    output: Some(AudioOutput {
+                        format: None,
+                        voice: Some("alloy".to_string()),
+                        speed: None,
+                    }),
+                }),
                 tools: None,
                 tool_choice: None,
-                temperature: None,
-                max_response_output_tokens: None,
+                max_output_tokens: None,
             },
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("session.update"));
-        assert!(json.contains("alloy"));
+        assert!(
+            json.contains("\"type\":\"realtime\""),
+            "GA session.type required"
+        );
+        assert!(json.contains("output_modalities"), "GA renamed modalities");
+        assert!(json.contains("alloy"), "voice nests under audio.output");
+        // GA gpt-realtime carries no session-level temperature/reasoning.
+        assert!(!json.contains("reasoning"));
+        assert!(!json.contains("temperature"));
+    }
+
+    #[test]
+    fn s2s_reasoning_effort_mapping_and_ga_session_omits_it() {
+        use crate::core::llm::ReasoningEffort;
+        // The effort→native mapping is retained for a future reasoning-capable
+        // realtime model; Off ⇒ None (fail-safe).
+        assert_eq!(RealtimeReasoning::from_effort(ReasoningEffort::Off), None);
+        assert_eq!(
+            RealtimeReasoning::from_effort(ReasoningEffort::Low),
+            Some(RealtimeReasoning {
+                effort: "low".to_string()
+            })
+        );
+        assert_eq!(
+            RealtimeReasoning::from_effort(ReasoningEffort::High),
+            Some(RealtimeReasoning {
+                effort: "high".to_string()
+            })
+        );
+        // But the GA session.update wire NEVER carries reasoning or temperature
+        // (gpt-realtime 400s on either) — the migration dropped both fields.
+        let cfg = SessionConfig {
+            session_type: "realtime".to_string(),
+            output_modalities: None,
+            instructions: None,
+            audio: None,
+            tools: None,
+            tool_choice: None,
+            max_output_tokens: None,
+        };
+        let json = serde_json::to_value(&cfg).unwrap();
+        assert!(json.get("reasoning").is_none());
+        assert!(json.get("temperature").is_none());
+        assert_eq!(json["type"], "realtime");
     }
 
     #[test]

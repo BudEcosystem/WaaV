@@ -2,10 +2,34 @@
 Async REST client for Bud WaaV Gateway
 """
 
+import asyncio
+import random
 from typing import Any, Optional
 import httpx
 
-from ..errors import APIError, ConnectionError, TimeoutError
+from ..errors import APIError, ConnectionError, RateLimitError, TimeoutError
+
+# REST connection-pool tuning (D7). httpx defaults are UNtuned (no explicit
+# limits / no keepalive expiry), so a memoized client still drops idle keepalive
+# connections unpredictably and a batch of sequential calls can re-do TLS. These
+# defaults keep a healthy warm pool so the SDK's typical sequential workload
+# (submit_batch -> poll, or list_voices/clone bursts) REUSES one TCP/TLS
+# connection instead of paying a handshake per call.
+#
+#   * max_keepalive_connections: idle sockets kept warm for reuse (per host).
+#   * max_connections: hard ceiling on concurrent sockets (backpressure, not a
+#     self-DDoS) — cooperates with the gateway's per-IP connection cap.
+#   * keepalive_expiry: how long an idle socket is kept before close; 90s
+#     comfortably spans a poll loop's inter-request gap.
+DEFAULT_MAX_KEEPALIVE_CONNECTIONS = 20
+DEFAULT_MAX_CONNECTIONS = 100
+DEFAULT_KEEPALIVE_EXPIRY = 90.0
+
+# Transient HTTP statuses the gateway returns under load. Both are RETRIABLE,
+# NOT fatal, and are handled identically to the WS connect path:
+#   * 429 — per-IP token bucket / tower_governor rate limit (carries Retry-After).
+#   * 503 — "Server at capacity" (global connection-limit saturation).
+_RETRYABLE_STATUSES = (429, 503)
 
 
 class RestClient:
@@ -16,6 +40,11 @@ class RestClient:
         base_url: str,
         api_key: Optional[str] = None,
         timeout: float = 30.0,
+        *,
+        max_keepalive_connections: int = DEFAULT_MAX_KEEPALIVE_CONNECTIONS,
+        max_connections: int = DEFAULT_MAX_CONNECTIONS,
+        keepalive_expiry: float = DEFAULT_KEEPALIVE_EXPIRY,
+        max_retries: int = 3,
     ):
         """
         Initialize REST client.
@@ -24,14 +53,31 @@ class RestClient:
             base_url: Base URL of the Bud WaaV gateway
             api_key: Optional API key for authentication
             timeout: Request timeout in seconds
+            max_keepalive_connections: Idle keepalive sockets kept warm for reuse
+                (D7 pooling). See module ``DEFAULT_*`` for the rationale.
+            max_connections: Hard ceiling on concurrent sockets.
+            keepalive_expiry: Seconds an idle socket is kept before close.
+            max_retries: Backoff retries on a transient 429/503 before giving up.
         """
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.timeout = timeout
+        self._limits = httpx.Limits(
+            max_keepalive_connections=max_keepalive_connections,
+            max_connections=max_connections,
+            keepalive_expiry=keepalive_expiry,
+        )
+        self._max_retries = max(0, max_retries)
         self._client: Optional[httpx.AsyncClient] = None
 
     async def _get_client(self) -> httpx.AsyncClient:
-        """Get or create the HTTP client."""
+        """Get or create the pooled HTTP client (D7).
+
+        The client is MEMOIZED and reused across every call so the tuned
+        keepalive pool actually persists — sequential batch/poll/voices/clone
+        calls share one warm TCP/TLS connection instead of re-handshaking. A new
+        client is built only on first use or after :meth:`close`.
+        """
         if self._client is None or self._client.is_closed:
             headers = {}
             if self.api_key:
@@ -42,6 +88,7 @@ class RestClient:
                 base_url=self.base_url,
                 headers=headers,
                 timeout=httpx.Timeout(self.timeout),
+                limits=self._limits,
             )
         return self._client
 
@@ -51,6 +98,48 @@ class RestClient:
             await self._client.aclose()
             self._client = None
 
+    async def warmup(self, timeout: float = 5.0) -> bool:
+        """Pre-resolve DNS + establish a TLS keepalive socket to the gateway (D6).
+
+        Sends one cheap request to the gateway origin so the TCP+TLS handshake is
+        paid NOW (e.g. at page-load / SDK init) and the resulting socket lands in
+        the keepalive pool — the first real call then attaches to an
+        already-warm connection instead of paying cold DNS+TLS (typically
+        100-400ms). Mirrors LiveKit ``Room.prepareConnection``.
+
+        A HEAD to ``/`` is preferred (no body); if the gateway rejects HEAD we
+        fall back to a GET so the socket still gets warmed. Best-effort: any
+        failure (gateway down, network) is swallowed and returns ``False`` — a
+        prewarm must never raise into the caller's init path.
+
+        Returns:
+            ``True`` if a request round-tripped (socket warmed), else ``False``.
+        """
+        try:
+            client = await self._get_client()
+            try:
+                await client.head("/", timeout=timeout)
+            except httpx.HTTPStatusError:
+                # Reached the server (warmed) but it returned an error status.
+                return True
+            except httpx.HTTPError:
+                # HEAD may be unsupported/blocked — try GET to still warm the pool.
+                await client.get("/", timeout=timeout)
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _parse_retry_after(headers: httpx.Headers) -> Optional[float]:
+        """Parse a numeric ``Retry-After`` (seconds) header, if present."""
+        ra = headers.get("retry-after")
+        if ra is None:
+            return None
+        try:
+            return float(ra)
+        except (TypeError, ValueError):
+            return None
+
     async def _request(
         self,
         method: str,
@@ -59,7 +148,14 @@ class RestClient:
         params: Optional[dict[str, Any]] = None,
     ) -> Any:
         """
-        Make an HTTP request.
+        Make an HTTP request, backing off on transient 429/503 (D7).
+
+        A 429 (rate limit) or 503 ("Server at capacity") is TRANSIENT, not fatal:
+        the call is retried with jittered backoff that honors ``Retry-After``
+        when the gateway supplies it (identical to the WS connect path). After
+        ``max_retries`` it is surfaced as a typed :class:`RateLimitError` (NOT an
+        opaque APIError) so the caller can back off deterministically. All other
+        ``>= 400`` responses raise :class:`APIError` immediately.
 
         Args:
             method: HTTP method (GET, POST, DELETE, etc.)
@@ -73,59 +169,84 @@ class RestClient:
         Raises:
             ConnectionError: If connection fails
             TimeoutError: If request times out
-            APIError: If API returns an error response
+            RateLimitError: If still throttled (429/503) after all retries
+            APIError: If API returns any other error response
         """
         client = await self._get_client()
+        url = f"{self.base_url}{endpoint}"
 
-        try:
-            response = await client.request(
-                method=method,
-                url=endpoint,
-                json=json,
-                params=params,
-            )
-        except httpx.ConnectError as e:
-            raise ConnectionError(
-                message=f"Failed to connect to {self.base_url}{endpoint}",
-                url=f"{self.base_url}{endpoint}",
-                cause=e,
-            ) from e
-        except httpx.TimeoutException as e:
-            raise TimeoutError(
-                message=f"Request timed out after {self.timeout}s",
-                timeout_ms=int(self.timeout * 1000),
-                operation=f"{method} {endpoint}",
-            ) from e
-        except httpx.HTTPError as e:
-            raise ConnectionError(
-                message=f"HTTP error: {e}",
-                url=f"{self.base_url}{endpoint}",
-                cause=e,
-            ) from e
-
-        if response.status_code >= 400:
+        attempt = 0
+        while True:
             try:
-                error_body = response.json()
-            except Exception:
-                error_body = response.text
+                response = await client.request(
+                    method=method,
+                    url=endpoint,
+                    json=json,
+                    params=params,
+                )
+            except httpx.ConnectError as e:
+                raise ConnectionError(
+                    message=f"Failed to connect to {url}",
+                    url=url,
+                    cause=e,
+                ) from e
+            except httpx.TimeoutException as e:
+                raise TimeoutError(
+                    message=f"Request timed out after {self.timeout}s",
+                    timeout_ms=int(self.timeout * 1000),
+                    operation=f"{method} {endpoint}",
+                ) from e
+            except httpx.HTTPError as e:
+                raise ConnectionError(
+                    message=f"HTTP error: {e}",
+                    url=url,
+                    cause=e,
+                ) from e
 
-            raise APIError.from_response(
-                status_code=response.status_code,
-                response_body=error_body,
-                url=f"{self.base_url}{endpoint}",
-                method=method,
-            )
+            # Transient saturation (429/503): back off and retry, do NOT treat as
+            # fatal. Honor Retry-After; else exponential base + jitter.
+            if response.status_code in _RETRYABLE_STATUSES:
+                retry_after = self._parse_retry_after(response.headers)
+                if attempt >= self._max_retries:
+                    label = (
+                        "Rate limited (429)"
+                        if response.status_code == 429
+                        else "Server at capacity (503)"
+                    )
+                    raise RateLimitError(
+                        message=f"{label} after {attempt + 1} attempt(s): {method} {endpoint}",
+                        retry_after=retry_after,
+                        url=url,
+                    )
+                base = retry_after if retry_after is not None else min(2 ** attempt, 15)
+                jitter = base * 0.2 * (random.random() * 2 - 1)
+                await asyncio.sleep(max(0.0, base + jitter))
+                attempt += 1
+                continue
 
-        if response.status_code == 204:
-            return None
+            if response.status_code >= 400:
+                try:
+                    error_body = response.json()
+                except Exception:
+                    error_body = response.text
 
-        content_type = response.headers.get("content-type", "")
-        if "application/json" in content_type:
-            return response.json()
-        elif "audio/" in content_type or "application/octet-stream" in content_type:
-            return response.content
-        else:
-            return response.text
+                raise APIError.from_response(
+                    status_code=response.status_code,
+                    response_body=error_body,
+                    url=url,
+                    method=method,
+                )
+
+            if response.status_code == 204:
+                return None
+
+            content_type = response.headers.get("content-type", "")
+            if "application/json" in content_type:
+                return response.json()
+            elif "audio/" in content_type or "application/octet-stream" in content_type:
+                return response.content
+            else:
+                return response.text
 
     async def get(
         self,
@@ -248,26 +369,28 @@ class RestClient:
         """
         Generate a LiveKit access token.
 
+        The gateway ``TokenRequest`` (handlers/livekit/token.rs) requires exactly
+        ``{room_name, participant_name, participant_identity}`` — the previous
+        ``identity``/``name`` field names were silently ignored and the call 422'd.
+        ``ttl``/``metadata`` are not part of the gateway contract and are not sent.
+
         Args:
             room_name: Room name to join
-            identity: Participant identity
-            name: Participant display name
-            ttl: Token TTL in seconds
-            metadata: Participant metadata
+            identity: Participant identity (sent as ``participant_identity``)
+            name: Participant display name (sent as ``participant_name``;
+                defaults to the identity when omitted — the field is required
+                by the gateway)
+            ttl: Deprecated/ignored — the gateway sets the token TTL server-side
+            metadata: Deprecated/ignored — not part of the gateway contract
 
         Returns:
             Token response with JWT and room info
         """
         payload: dict[str, Any] = {
             "room_name": room_name,
-            "identity": identity,
+            "participant_identity": identity,
+            "participant_name": name or identity,
         }
-        if name:
-            payload["name"] = name
-        if ttl:
-            payload["ttl"] = ttl
-        if metadata:
-            payload["metadata"] = metadata
 
         result: dict[str, Any] = await self.post("/livekit/token", json=payload)
         return result
@@ -311,18 +434,23 @@ class RestClient:
         webhook_url: str,
     ) -> dict[str, Any]:
         """
-        Create a SIP hook.
+        Create (or replace) a SIP hook.
+
+        The gateway ``SipHooksRequest`` (handlers/sip/hooks.rs) is an ENVELOPE:
+        ``{"hooks": [{"host": ..., "url": ...}]}``. Because ``hooks`` is
+        ``#[serde(default)]``, the previous flat ``{host, webhook_url}`` body
+        deserialized to an EMPTY hook list — a silent no-op (or destructive
+        replace-with-nothing). Hooks with a matching host are replaced.
 
         Args:
-            host: SIP host
-            webhook_url: Webhook URL for incoming calls
+            host: SIP host pattern (case-insensitive)
+            webhook_url: HTTPS URL to forward webhook events to (wire field: ``url``)
 
         Returns:
-            Created hook info
+            The updated hook list.
         """
-        payload: dict[str, str] = {
-            "host": host,
-            "webhook_url": webhook_url,
+        payload: dict[str, Any] = {
+            "hooks": [{"host": host, "url": webhook_url}],
         }
         result: dict[str, Any] = await self.post("/sip/hooks", json=payload)
         return result
@@ -350,47 +478,158 @@ class RestClient:
         return result
 
     # =========================================================================
+    # Batched / Async STT (P5)
+    # =========================================================================
+
+    async def submit_batch(
+        self,
+        *,
+        url: Optional[str] = None,
+        audio_base64: Optional[str] = None,
+        content_type: Optional[str] = None,
+        stt_config: Optional[dict[str, Any]] = None,
+        batch: Optional[dict[str, Any]] = None,
+        translation: Optional[dict[str, Any]] = None,
+        callback_url: Optional[str] = None,
+        callback_method: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Submit a batched/async transcription job (``POST /transcribe/batch``).
+
+        The canonical batch envelope WRAPS the streaming ``StandardSTTConfig``
+        VERBATIM (so the full typed ``SttFeatures`` — diarization/redaction/etc. —
+        are reused) plus the batch-only knobs that the streaming path intentionally
+        drops but ARE batch-capable (``alternatives`` / ``detect_language`` /
+        ``summarize`` / ``topics`` / ``intents`` / ``paragraphs`` / ``utterances``).
+
+        Supply audio as EITHER ``url`` OR ``audio_base64`` (+ optional
+        ``content_type``). When ``callback_url`` is set the gateway returns
+        ``{job_id, status:"queued"}`` immediately and POSTs the result to the
+        webhook; otherwise poll :meth:`get_batch` / use :meth:`transcribe_batch`.
+
+        Args:
+            url: Audio URL (Deepgram ``{"url"}`` / AssemblyAI ``audio_url``).
+            audio_base64: Inline base64 audio bytes (mutually exclusive with ``url``).
+            content_type: MIME type for inline bytes (e.g. ``audio/wav``).
+            stt_config: ``StandardSTTConfig`` fields (provider/language/model +
+                ``features{}`` + ``extras{}``), flattened onto the envelope.
+            batch: ``BatchFeatures`` dict (``paragraphs``/``utterances``/
+                ``summarize``/``topics``/``intents``/``detect_language``/
+                ``alternatives``).
+            translation: Canonical :class:`~bud_waav.types.TranslationConfig` dict
+                (batch enables AssemblyAI/Speechmatics/Gladia targets).
+            callback_url: Webhook for async delivery.
+            callback_method: ``POST`` (default) or ``PUT``.
+
+        Returns:
+            ``{job_id, status, ...}`` (and ``result`` when run synchronously).
+
+        Raises:
+            ValueError: If neither/both of ``url`` and ``audio_base64`` are given.
+        """
+        if (url is None) == (audio_base64 is None):
+            raise ValueError("Provide exactly one of `url` or `audio_base64`")
+
+        payload: dict[str, Any] = {}
+        if url is not None:
+            payload["url"] = url
+        else:
+            payload["audio_base64"] = audio_base64
+            if content_type is not None:
+                payload["content_type"] = content_type
+
+        # StandardSTTConfig is flattened onto the envelope (gateway #[serde(flatten)]).
+        if stt_config:
+            payload.update(stt_config)
+        if batch:
+            payload["batch"] = batch
+        if translation:
+            payload["translation"] = translation
+        if callback_url is not None:
+            payload["callback_url"] = callback_url
+        if callback_method is not None:
+            payload["callback_method"] = callback_method
+
+        result: dict[str, Any] = await self.post("/transcribe/batch", json=payload)
+        return result
+
+    async def get_batch(self, job_id: str) -> dict[str, Any]:
+        """Poll a batch job (``GET /transcribe/batch/{job_id}``).
+
+        Returns the canonical ``BatchJob``: ``{job_id, status, result?, error?}``
+        with ``status`` ∈ ``queued|processing|completed|error``.
+        """
+        result: dict[str, Any] = await self.get(f"/transcribe/batch/{job_id}")
+        return result
+
+    # =========================================================================
     # Voice Cloning Methods
     # =========================================================================
 
     async def clone_voice(
         self,
         name: str,
-        audio_files: list[bytes],
         provider: str = "elevenlabs",
+        audio_samples: Optional[list[str]] = None,
+        audio_files: Optional[list[bytes]] = None,
         description: Optional[str] = None,
         labels: Optional[dict[str, str]] = None,
+        mode: str = "instant",
+        base_voice_id: Optional[str] = None,
+        remove_background_noise: bool = False,
+        sample_text: Optional[str] = None,
     ) -> dict[str, Any]:
         """
-        Clone a voice from audio samples.
+        Clone a voice via the gateway's canonical ``POST /voices/clone`` body.
+
+        Mirrors the gateway ``VoiceCloneRequest`` (P4). Supply samples either as
+        already-encoded ``audio_samples`` (base64 strings or URLs) OR as raw
+        ``audio_files`` (bytes, base64-encoded here). Returns the gateway
+        ``VoiceCloneResponse`` dict: ``{voice_id, name, provider, status, ...}`` —
+        a ``ready`` voice_id is directly usable as a TTS ``voice_id``.
 
         Args:
-            name: Name for the cloned voice.
-            audio_files: List of audio file data (bytes).
-            provider: Voice cloning provider (elevenlabs, playht, resemble).
-            description: Optional description for the voice.
-            labels: Optional labels/tags for the voice.
+            name: Name for the cloned voice (required).
+            provider: Voice-clone provider (hume, elevenlabs, lmnt, cartesia,
+                playht, speechify, resemble).
+            audio_samples: Samples as base64 strings or URLs (canonical wire field).
+            audio_files: Raw audio bytes (convenience; base64-encoded into
+                ``audio_samples``). Merged with ``audio_samples`` if both given.
+            description: Optional description (Hume design / ElevenLabs label).
+            labels: Optional flat labels (ElevenLabs).
+            mode: ``instant`` (default) or ``professional`` (async).
+            base_voice_id: Base voice to design/derive from (provider-specific).
+            remove_background_noise: Strip background noise (ElevenLabs IVC / LMNT).
+            sample_text: Sample text for voice generation (Hume only).
 
         Returns:
-            Created voice information with voice_id.
+            Created voice information with ``voice_id`` and ``status``.
 
         Raises:
-            APIError: If cloning fails.
+            APIError: If cloning fails (e.g. 400 invalid request, 401 missing key).
         """
         import base64
 
-        # Convert audio files to base64
-        audio_base64 = [base64.b64encode(audio).decode("utf-8") for audio in audio_files]
+        samples: list[str] = list(audio_samples or [])
+        if audio_files:
+            samples.extend(
+                base64.b64encode(audio).decode("utf-8") for audio in audio_files
+            )
 
         payload: dict[str, Any] = {
-            "name": name,
             "provider": provider,
-            "audio_files": audio_base64,
+            "name": name,
+            "audio_samples": samples,
+            "mode": mode,
+            "remove_background_noise": remove_background_noise,
         }
         if description:
             payload["description"] = description
         if labels:
             payload["labels"] = labels
+        if base_voice_id:
+            payload["base_voice_id"] = base_voice_id
+        if sample_text:
+            payload["sample_text"] = sample_text
 
         result: dict[str, Any] = await self.post("/voices/clone", json=payload)
         return result
@@ -426,15 +665,19 @@ class RestClient:
         Delete a cloned voice.
 
         .. warning::
-            Gateway does not currently expose a DELETE /voices/{voice_id}
-            endpoint. This method will return a 404 until gateway support
-            is added. Use the provider's API directly in the meantime.
+            The gateway serves no ``DELETE /voices/{voice_id}`` route — this
+            raises a typed 501 ``APIError`` immediately (fail-fast, instead of
+            a confusing network 404). Use the provider's API directly.
 
         Args:
             voice_id: The voice ID to delete.
             provider: The voice cloning provider.
         """
-        await self.delete(f"/voices/{voice_id}", params={"provider": provider})
+        raise APIError(
+            f"delete_cloned_voice({voice_id!r}) is not supported: the gateway serves no "
+            "DELETE /voices/{id} route. Use the provider's API directly.",
+            status_code=501,
+        )
 
     async def get_cloned_voice(
         self,
@@ -445,9 +688,10 @@ class RestClient:
         Get information about a cloned voice.
 
         .. warning::
-            Gateway does not currently expose a GET /voices/{voice_id}
-            endpoint. This method will return a 404 until gateway support
-            is added. Use the provider's API directly in the meantime.
+            The gateway serves no ``GET /voices/{voice_id}`` route — this raises
+            a typed 501 ``APIError`` immediately (fail-fast, instead of a
+            confusing network 404). Use ``list_cloned_voices()`` and filter, or
+            the provider's API directly.
 
         Args:
             voice_id: The voice ID.
@@ -456,10 +700,11 @@ class RestClient:
         Returns:
             Voice information.
         """
-        result: dict[str, Any] = await self.get(
-            f"/voices/{voice_id}", params={"provider": provider}
+        raise APIError(
+            f"get_cloned_voice({voice_id!r}) is not supported: the gateway serves no "
+            "GET /voices/{id} route. Use list_cloned_voices() and filter client-side.",
+            status_code=501,
         )
-        return result
 
     # =========================================================================
     # Recording Methods
@@ -468,23 +713,23 @@ class RestClient:
     async def get_recording(
         self,
         stream_id: str,
-    ) -> dict[str, Any]:
+    ) -> bytes:
         """
         Get recording metadata by stream ID.
 
-        .. warning::
-            Gateway does not currently expose a metadata-only recording
-            endpoint. This method will return a 404 until gateway support
-            is added. Use ``download_recording()`` to retrieve the audio.
+        .. note::
+            The gateway serves recordings at ``GET /recording/{stream_id}``
+            (singular) as audio bytes; there is no metadata-only endpoint.
+            This method is a deprecated alias of ``download_recording()`` —
+            the previous ``/recordings/{id}`` (plural) path always 404'd.
 
         Args:
             stream_id: The stream/session ID.
 
         Returns:
-            Recording information including status, duration, format.
+            Audio data as bytes (OGG format) — same as ``download_recording()``.
         """
-        result: dict[str, Any] = await self.get(f"/recordings/{stream_id}")
-        return result
+        return await self.download_recording(stream_id)
 
     async def download_recording(
         self,
@@ -518,9 +763,10 @@ class RestClient:
         List recordings with optional filters.
 
         .. warning::
-            Gateway does not currently expose a GET /recordings list
-            endpoint. This method will return a 404 until gateway support
-            is added.
+            The gateway serves no ``GET /recordings`` list route — this raises
+            a typed 501 ``APIError`` immediately (fail-fast, instead of a
+            confusing network 404). Recordings are addressed by stream id via
+            ``download_recording()``.
 
         Args:
             limit: Maximum number of recordings to return.
@@ -532,19 +778,11 @@ class RestClient:
         Returns:
             Dictionary with recordings list and pagination info.
         """
-        params: dict[str, Any] = {
-            "limit": limit,
-            "offset": offset,
-        }
-        if status:
-            params["status"] = status
-        if from_date:
-            params["from_date"] = from_date
-        if to_date:
-            params["to_date"] = to_date
-
-        result: dict[str, Any] = await self.get("/recordings", params=params)
-        return result
+        raise APIError(
+            "list_recordings() is not supported: the gateway serves no GET /recordings "
+            "route. Recordings are addressed by stream id via download_recording().",
+            status_code=501,
+        )
 
     async def delete_recording(
         self,
@@ -554,14 +792,18 @@ class RestClient:
         Delete a recording.
 
         .. warning::
-            Gateway does not currently expose a DELETE /recordings/{stream_id}
-            endpoint. This method will return a 404 until gateway support
-            is added.
+            The gateway serves no ``DELETE /recordings/{stream_id}`` route —
+            this raises a typed 501 ``APIError`` immediately (fail-fast,
+            instead of a confusing network 404).
 
         Args:
             stream_id: The stream/session ID.
         """
-        await self.delete(f"/recordings/{stream_id}")
+        raise APIError(
+            f"delete_recording({stream_id!r}) is not supported: the gateway serves no "
+            "DELETE /recordings/{id} route.",
+            status_code=501,
+        )
 
     # =========================================================================
     # DAG Template Methods
@@ -693,21 +935,35 @@ class RestClient:
 
     async def sip_transfer(
         self,
-        stream_id: str,
+        room_name: str,
+        participant_identity: str,
         transfer_to: str,
     ) -> dict[str, Any]:
         """
-        Transfer an active SIP call to another number.
+        Transfer an active SIP call (SIP REFER) to another number.
+
+        The gateway endpoint is ``POST /sip/transfer`` with a JSON body of
+        ``{room_name, participant_identity, transfer_to}`` — the gateway
+        ``SIPTransferRequest`` (handlers/sip/transfer.rs) requires ALL THREE
+        fields (the previous ``stream_id`` payload was never a gateway field
+        and 422'd on every call). The room name is normalized with the auth
+        prefix server-side for tenant isolation.
 
         Args:
-            stream_id: Active stream/session ID.
-            transfer_to: Phone number or SIP URI to transfer to.
+            room_name: LiveKit room name where the SIP participant is connected.
+            participant_identity: Identity of the SIP participant to transfer
+                (obtainable by listing the room's participants).
+            transfer_to: Destination — international (``+1234567890``),
+                national (``07123456789``), or internal extension (``1234``).
 
         Returns:
-            Transfer result.
+            Transfer result: ``{status, room_name, participant_identity,
+            transfer_to}`` where ``status`` is ``"completed"`` or
+            ``"initiated"`` (confirmation timed out but likely succeeded).
         """
         payload: dict[str, Any] = {
-            "stream_id": stream_id,
+            "room_name": room_name,
+            "participant_identity": participant_identity,
             "transfer_to": transfer_to,
         }
         result: dict[str, Any] = await self.post("/sip/transfer", json=payload)
@@ -717,19 +973,74 @@ class RestClient:
     # Metrics Method
     # =========================================================================
 
-    async def get_metrics(self) -> dict[str, Any]:
+    async def get_metrics(self) -> str:
         """
         Get server performance metrics.
 
-        .. warning::
-            Gateway does not currently expose a GET /metrics endpoint.
-            This method will return a 404 until gateway support is added.
-            Use the SDK's local ``SessionMetrics`` for client-side metrics.
+        The gateway serves ``GET /metrics`` as a public **Prometheus text
+        exposition** (``text/plain``) — turn counters, frame latencies,
+        provider health, etc. The previous docstring claimed the endpoint
+        did not exist and the annotation claimed ``dict``; both were stale.
 
         Returns:
-            Server metrics including STT/TTS latency, connection counts, etc.
+            The Prometheus text exposition as a string (parse with a
+            Prometheus client library, or scrape directly).
         """
-        result: dict[str, Any] = await self.get("/metrics")
+        result: str = await self.get("/metrics")
+        return result
+
+    # =========================================================================
+    # Capability Discovery
+    # =========================================================================
+
+    async def fetch_language_capabilities(
+        self,
+        provider: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """
+        Fetch the LIVE unified-language support matrix from the gateway.
+
+        Calls ``GET /capabilities/languages`` (gateway
+        ``LanguageCapabilitiesResponse``, handlers/capabilities.rs) — the
+        authoritative, always-current counterpart to the SDK's static
+        :func:`bud_waav.types.language_capabilities` table::
+
+            {
+                "canonical_languages": [
+                    {"bcp47": "en-US", "lang_subtag": "en",
+                     "iso639_1": "en", "region": "US"},
+                    ...
+                ],
+                "providers": [
+                    {"provider": "deepgram", "notation": "bcp47",
+                     "supports_auto": true,
+                     "example_cmn_cn": "zh-CN", "example_en_us": "en-US"},
+                    ...
+                ],
+                "canonical_count": N,
+            }
+
+        The endpoint takes NO query parameters — when ``provider`` is given
+        the ``providers`` rows are filtered CLIENT-side (an unknown provider
+        yields an empty ``providers`` list; the canonical language list is
+        always returned in full).
+
+        Args:
+            provider: Optional provider id to filter the ``providers`` rows to.
+
+        Returns:
+            The capability matrix dict shown above.
+        """
+        result: dict[str, Any] = await self.get("/capabilities/languages")
+        if provider is not None and isinstance(result.get("providers"), list):
+            result = {
+                **result,
+                "providers": [
+                    row
+                    for row in result["providers"]
+                    if isinstance(row, dict) and row.get("provider") == provider
+                ],
+            }
         return result
 
     # =========================================================================

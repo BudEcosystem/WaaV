@@ -26,7 +26,7 @@ use reqwest::Client;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::RwLock;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// NECTEC TTS client.
 ///
@@ -38,7 +38,7 @@ pub struct NectecTts {
     /// Provider configuration.
     config: NectecTtsConfig,
     /// HTTP client for REST API calls.
-    http_client: Client,
+    http_client: Option<Client>,
     /// Whether the client is ready to receive requests.
     is_ready: AtomicBool,
     /// Audio callback for streaming audio to caller.
@@ -47,7 +47,52 @@ pub struct NectecTts {
     connection_state: Arc<RwLock<ConnectionState>>,
 }
 
+fn nectec_tts_http_client(timeout_secs: u64) -> Result<Client, reqwest::Error> {
+    crate::core::net::ssrf_protected_client_builder(crate::core::net::HTTP_URL_SCHEMES)
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .build()
+}
+
+fn default_nectec_tts_http_client() -> Option<Client> {
+    match nectec_tts_http_client(super::config::DEFAULT_REQUEST_TIMEOUT) {
+        Ok(client) => Some(client),
+        Err(err) => {
+            warn!(
+                error = %err,
+                "failed to create default NECTEC TTS HTTP client; default instance is inert until rebuilt with a valid config"
+            );
+            None
+        }
+    }
+}
+
 impl NectecTts {
+    /// Build from the standardized config (W1 keystone for TTS), mirroring
+    /// `DeepgramTTS::from_standard`. Delegates to the config-level
+    /// [`NectecTtsConfig::from_standard`]. VAJA9 exposes no prosody/emotion/SSML/sample-rate
+    /// surface, so the standardized [`TtsFeatures`] are a pure `from_base` passthrough (speaker
+    /// selection rides `base.voice_id`); only the non-standard `phrase_break`/`audiovisual` extras
+    /// are mapped. Assembles the REST client exactly like [`BaseTTS::new`].
+    ///
+    /// [`TtsFeatures`]: crate::core::tts::standard::TtsFeatures
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
+        let nectec_config =
+            NectecTtsConfig::from_standard(std).map_err(TTSError::InvalidConfiguration)?;
+
+        let timeout_secs = nectec_config.request_timeout_secs;
+        let http_client = nectec_tts_http_client(timeout_secs).map_err(|e| {
+            TTSError::InvalidConfiguration(format!("Failed to create HTTP client: {e}"))
+        })?;
+
+        Ok(Self {
+            config: nectec_config,
+            http_client: Some(http_client),
+            is_ready: AtomicBool::new(false),
+            audio_callback: Arc::new(RwLock::new(None)),
+            connection_state: Arc::new(RwLock::new(ConnectionState::Disconnected)),
+        })
+    }
+
     /// Synthesize text and return audio data.
     async fn synthesize(&self, text: &str) -> TTSResult<Vec<u8>> {
         if text.is_empty() {
@@ -95,9 +140,17 @@ impl NectecTts {
             self.config.voice
         );
 
-        let response = self
-            .http_client
-            .post(self.config.endpoint())
+        let http_client = self.http_client.as_ref().ok_or_else(|| {
+            TTSError::InvalidConfiguration(
+                "NECTEC TTS default HTTP client is unavailable; construct with NectecTts::new or from_standard".to_string(),
+            )
+        })?;
+
+        let response = http_client
+            .post(crate::core::tts::standard::override_rest_endpoint(
+                self.config.endpoint(),
+                self.config.endpoint_override.as_deref(),
+            ))
             .header(API_KEY_HEADER, &self.config.api_key)
             .header(LIB_HEADER, LIB_VALUE)
             .header("Content-Type", "application/json")
@@ -163,8 +216,18 @@ impl NectecTts {
 
     /// Download audio from the given URL.
     async fn download_audio(&self, url: &str) -> TTSResult<Vec<u8>> {
-        let response = self
-            .http_client
+        let url = crate::core::tts::standard::validate_provider_audio_url("NECTEC TTS", url)?;
+        let audio_client = crate::core::net::ssrf_protected_client_builder(
+            crate::core::tts::standard::PROVIDER_AUDIO_URL_SCHEMES,
+        )
+        .timeout(std::time::Duration::from_secs(
+            self.config.request_timeout_secs,
+        ))
+        .build()
+        .map_err(|e| {
+            TTSError::NetworkError(format!("Failed to create SSRF-protected audio client: {e}"))
+        })?;
+        let response = audio_client
             .get(url)
             .header(API_KEY_HEADER, &self.config.api_key)
             .send()
@@ -218,7 +281,7 @@ impl Default for NectecTts {
     fn default() -> Self {
         Self {
             config: NectecTtsConfig::default(),
-            http_client: Client::new(),
+            http_client: default_nectec_tts_http_client(),
             is_ready: AtomicBool::new(false),
             audio_callback: Arc::new(RwLock::new(None)),
             connection_state: Arc::new(RwLock::new(ConnectionState::Disconnected)),
@@ -230,15 +293,12 @@ impl Default for NectecTts {
 impl BaseTTS for NectecTts {
     fn new(config: TTSConfig) -> TTSResult<Self> {
         let nectec_config =
-            NectecTtsConfig::from_base(&config).map_err(|e| TTSError::InvalidConfiguration(e))?;
+            NectecTtsConfig::from_base(&config).map_err(TTSError::InvalidConfiguration)?;
 
         let timeout_secs = nectec_config.request_timeout_secs;
-        let http_client = Client::builder()
-            .timeout(std::time::Duration::from_secs(timeout_secs))
-            .build()
-            .map_err(|e| {
-                TTSError::InvalidConfiguration(format!("Failed to create HTTP client: {e}"))
-            })?;
+        let http_client = nectec_tts_http_client(timeout_secs).map_err(|e| {
+            TTSError::InvalidConfiguration(format!("Failed to create HTTP client: {e}"))
+        })?;
 
         info!(
             "NECTEC TTS: Initialized with voice='{}'",
@@ -247,7 +307,7 @@ impl BaseTTS for NectecTts {
 
         Ok(Self {
             config: nectec_config,
-            http_client,
+            http_client: Some(http_client),
             is_ready: AtomicBool::new(false),
             audio_callback: Arc::new(RwLock::new(None)),
             connection_state: Arc::new(RwLock::new(ConnectionState::Disconnected)),
@@ -481,6 +541,88 @@ mod tests {
         assert_eq!(tts.config.voice, NectecVoice::Female);
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn nectec_tts_redirect_policy_rejects_private_hop() {
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local redirect test server");
+        let addr = listener.local_addr().expect("local addr");
+
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 1024];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 302 Found\r\n",
+                "Location: http://127.0.0.1:9/metadata\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n"
+            );
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await;
+        });
+
+        let tts = NectecTts::new(make_test_config()).expect("construct NECTEC TTS");
+        let err = tts
+            .http_client
+            .as_ref()
+            .expect("strict constructor builds an HTTP client")
+            .get(format!("http://{addr}/start"))
+            .send()
+            .await
+            .expect_err("private redirect target must be rejected");
+        let mut error_chain = err.to_string();
+        let mut source = std::error::Error::source(&err);
+        while let Some(err) = source {
+            error_chain.push_str(": ");
+            error_chain.push_str(&err.to_string());
+            source = err.source();
+        }
+        assert!(error_chain.contains("SSRF protection"), "{error_chain}");
+    }
+
+    // W1 keystone: the struct-level `from_standard` (the dispatch entry point, mirroring
+    // `DeepgramTTS::from_standard`) must reach the live client's config. VAJA9 has no
+    // prosody/emotion/SSML surface, so the standardized features are a pure passthrough (the
+    // supported "voice settings" ride `base.voice_id`); the provider-specific
+    // `phrase_break`/`audiovisual` knobs flow through the extras passthrough.
+    #[test]
+    fn from_standard_reaches_provider_config() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+
+        let mut extras = serde_json::Map::new();
+        extras.insert("phrase_break".into(), serde_json::json!(2));
+        extras.insert("audiovisual".into(), serde_json::json!(1));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "nectec".into(),
+                api_key: "test_key".into(),
+                voice_id: Some("female".into()),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                // Capability gaps: NECTEC has no speed/ssml field, must be ignored.
+                speed: Some(1.5),
+                ssml: Some(true),
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+
+        let tts = NectecTts::from_standard(&std).unwrap();
+        assert_eq!(tts.config.api_key, "test_key"); // base carried through
+        assert_eq!(tts.config.voice, NectecVoice::Female); // voice setting carried through
+        assert_eq!(tts.config.phrase_break, 2); // extras passthrough
+        assert_eq!(tts.config.audiovisual, 1); // extras passthrough
+    }
+
     #[test]
     fn test_new_empty_api_key() {
         let config = TTSConfig {
@@ -532,6 +674,24 @@ mod tests {
         let tts = NectecTts::default();
         assert!(!tts.is_ready());
         assert_eq!(tts.get_connection_state(), ConnectionState::Disconnected);
+    }
+
+    #[tokio::test]
+    async fn default_without_http_client_returns_typed_error_without_panic() {
+        let mut tts = NectecTts::default();
+        tts.http_client = None;
+
+        let err = tts
+            .synthesize("hello")
+            .await
+            .expect_err("inert default client must fail with a typed error");
+
+        match err {
+            TTSError::InvalidConfiguration(msg) => {
+                assert!(msg.contains("default HTTP client"), "{msg}");
+            }
+            other => panic!("expected InvalidConfiguration, got {other:?}"),
+        }
     }
 
     #[test]

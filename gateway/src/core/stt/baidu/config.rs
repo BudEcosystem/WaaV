@@ -4,6 +4,16 @@
 
 use crate::core::stt::base::{STTConfig, STTError};
 use serde::{Deserialize, Serialize};
+use url::form_urlencoded;
+
+fn validate_baidu_stt_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, &["ws", "wss"])
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
 
 // =============================================================================
 // Constants
@@ -48,6 +58,14 @@ pub const RECOMMENDED_CHUNK_DURATION_MS: u32 = 160;
 
 /// Maximum time between audio frames before timeout (5 seconds).
 pub const MAX_FRAME_INTERVAL_SECS: u32 = 5;
+
+pub(crate) fn build_baidu_oauth_url(api_key: &str, secret_key: &str) -> String {
+    let mut serializer = form_urlencoded::Serializer::new(String::new());
+    serializer.append_pair("grant_type", "client_credentials");
+    serializer.append_pair("client_id", api_key);
+    serializer.append_pair("client_secret", secret_key);
+    format!("{BAIDU_OAUTH_URL}?{}", serializer.finish())
+}
 
 // =============================================================================
 // Recognition Models
@@ -251,6 +269,12 @@ pub struct BaiduSttConfig {
 
     /// Use real-time WebSocket API instead of REST.
     pub use_realtime: bool,
+
+    /// Carried from the standardized `endpoint_override` — points the realtime WS dial at the
+    /// in-repo mock/proxy (a local `ws://` server) for credential-free end-to-end tests; `None`
+    /// uses the production Baidu endpoint. Only scheme://host is swapped; the `?sn=` query is kept.
+    #[serde(skip)]
+    pub endpoint_override: Option<String>,
 }
 
 impl Default for BaiduSttConfig {
@@ -267,6 +291,7 @@ impl Default for BaiduSttConfig {
             lm_id: None,
             use_https: true,
             use_realtime: true,
+            endpoint_override: None,
         }
     }
 }
@@ -344,15 +369,15 @@ impl BaiduSttConfig {
         }
 
         // 8kHz is only supported for Mandarin
-        if self.sample_rate == BaiduSampleRate::Rate8000 {
-            if !matches!(
+        if self.sample_rate == BaiduSampleRate::Rate8000
+            && !matches!(
                 self.model,
                 BaiduSttModel::Mandarin | BaiduSttModel::MandarinNoPunctuation
-            ) {
-                return Err(STTError::ConfigurationError(
-                    "8kHz sample rate is only supported for Mandarin models".to_string(),
-                ));
-            }
+            )
+        {
+            return Err(STTError::ConfigurationError(
+                "8kHz sample rate is only supported for Mandarin models".to_string(),
+            ));
         }
 
         // Custom vocabulary only for Mandarin
@@ -362,15 +387,17 @@ impl BaiduSttConfig {
             ));
         }
 
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_baidu_stt_endpoint("endpoint_override", endpoint)
+                .map_err(STTError::ConfigurationError)?;
+        }
+
         Ok(())
     }
 
     /// Get the OAuth URL for token retrieval.
     pub fn get_oauth_url(&self) -> String {
-        format!(
-            "{}?grant_type=client_credentials&client_id={}&client_secret={}",
-            BAIDU_OAUTH_URL, self.api_key, self.secret_key
-        )
+        build_baidu_oauth_url(&self.api_key, &self.secret_key)
     }
 
     /// Get the REST API URL for short audio recognition.
@@ -382,9 +409,17 @@ impl BaiduSttConfig {
         }
     }
 
-    /// Get the WebSocket URL for real-time recognition.
+    /// Get the WebSocket URL for real-time recognition. Honors an `endpoint_override` (the in-repo
+    /// mock/proxy points this at a local `ws://` server) by swapping scheme://host while keeping the
+    /// `?sn=` session query; `None` uses the production Baidu realtime endpoint.
     pub fn get_realtime_url(&self, session_id: &str) -> String {
-        format!("{}?sn={}", BAIDU_REALTIME_ASR_URL, session_id)
+        // The override carries only scheme://host, so re-append the `/realtime_asr` path (a path-less
+        // URL fails the WS handshake).
+        let base = match self.endpoint_override.as_deref().filter(|o| !o.is_empty()) {
+            Some(o) => format!("{}/realtime_asr", o.trim_end_matches('/')),
+            None => BAIDU_REALTIME_ASR_URL.to_string(),
+        };
+        format!("{}?sn={}", base, session_id)
     }
 
     /// Calculate the recommended chunk size for WebSocket streaming.
@@ -466,6 +501,24 @@ impl BaiduSttConfig {
         baidu_config.validate()?;
         Ok(baidu_config)
     }
+
+    /// Build from the standardized config (W1 keystone). Baidu is a low-capability provider: it has
+    /// no boolean feature fields (no diarization / smart_format / profanity / interim toggles) and
+    /// no keyterm list, so those standardized features are capability gaps and stay at default. The
+    /// one knob it can honor is its custom vocabulary model id (`lm_id`, Mandarin only) — a numeric
+    /// model id rather than a keyterm `Vec`, so it is read from the `provider_extras` passthrough
+    /// (analogous to IBM's `instance_id`) instead of `SttFeatures`.
+    pub fn from_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        let mut cfg = Self::from_base(std.base.clone())?;
+        if let Some(lm_id) = std.extras.0.get("lm_id").and_then(|v| v.as_u64()) {
+            cfg.lm_id = Some(lm_id as u32);
+        }
+        cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
+        cfg.validate()?;
+        Ok(cfg)
+    }
 }
 
 // =============================================================================
@@ -508,6 +561,56 @@ pub struct BaiduOAuthError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone: Baidu has no boolean feature fields, so its only honorable knob is the custom
+    // vocabulary model id read from provider_extras (`lm_id`). This asserts both that extra and a
+    // base-derived field (model) reach the right config fields.
+    #[test]
+    fn from_standard_maps_features() {
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("lm_id".into(), serde_json::json!(98765));
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "baidu".into(),
+                api_key: "my_api_key|my_secret_key".into(),
+                model: "mandarin".into(),
+                ..Default::default()
+            },
+            features: SttFeatures::default(),
+            extras: ProviderExtras(extras),
+            translation: None,
+        };
+        let cfg = BaiduSttConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.lm_id, Some(98765)); // custom vocabulary model id from provider_extras
+        assert_eq!(cfg.model, BaiduSttModel::Mandarin); // base-derived field
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
+
+        let mk = |endpoint: &str| {
+            StandardSTTConfig {
+                base: STTConfig {
+                    provider: "baidu".into(),
+                    api_key: "my_api_key|my_secret_key".into(),
+                    model: "mandarin".into(),
+                    ..Default::default()
+                },
+                features: SttFeatures::default(),
+                extras: ProviderExtras::default(),
+                translation: None,
+            }
+            .with_endpoint_override(endpoint)
+        };
+
+        assert!(BaiduSttConfig::from_standard(&mk("wss://baidu-proxy.example.com")).is_ok());
+        assert!(BaiduSttConfig::from_standard(&mk("ws://127.0.0.1:9000")).is_err());
+        assert!(BaiduSttConfig::from_standard(&mk("file:///tmp/socket")).is_err());
+        assert!(BaiduSttConfig::from_standard(&mk("https://baidu-proxy.example.com")).is_err());
+    }
 
     #[test]
     fn test_model_parsing() {
@@ -612,6 +715,48 @@ mod tests {
         assert!(url.contains("grant_type=client_credentials"));
         assert!(url.contains("client_id=my_api_key"));
         assert!(url.contains("client_secret=my_secret_key"));
+    }
+
+    #[test]
+    fn test_oauth_url_encodes_credentials() {
+        let config = BaiduSttConfig::new("my_api_key&client_secret=evil", "my secret&scope=all");
+        let url = config.get_oauth_url();
+        assert!(url.contains("client_id=my_api_key%26client_secret%3Devil"));
+        assert!(url.contains("client_secret=my+secret%26scope%3Dall"));
+
+        let parsed = url::Url::parse(&url).expect("Baidu OAuth URL should parse");
+        let query_pairs = parsed.query_pairs().into_owned().collect::<Vec<_>>();
+
+        assert!(
+            query_pairs
+                .iter()
+                .any(|(key, value)| key == "grant_type" && value == "client_credentials")
+        );
+        assert_eq!(
+            query_pairs
+                .iter()
+                .filter(|(key, _)| key == "client_id")
+                .count(),
+            1
+        );
+        assert!(
+            query_pairs
+                .iter()
+                .any(|(key, value)| key == "client_id" && value == "my_api_key&client_secret=evil")
+        );
+        assert_eq!(
+            query_pairs
+                .iter()
+                .filter(|(key, _)| key == "client_secret")
+                .count(),
+            1
+        );
+        assert!(
+            query_pairs
+                .iter()
+                .any(|(key, value)| key == "client_secret" && value == "my secret&scope=all")
+        );
+        assert!(!query_pairs.iter().any(|(key, _)| key == "scope"));
     }
 
     #[test]

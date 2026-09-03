@@ -26,6 +26,12 @@ use crate::dag::{compiler::CompiledDAG, context::DAGContext, executor::DAGExecut
 /// - Optimized for the common case: many reads, few writes
 pub struct ConnectionState {
     pub voice_manager: Option<Arc<VoiceManager>>,
+    /// D-G10: per-session pipeline liveness heartbeat (env-gated, off by
+    /// default). Held here so it is aborted when the connection drops.
+    pub heartbeat: Option<crate::core::observability::HeartbeatMonitor>,
+    /// D-G4: registry of session-lifetime tasks (sender, LiveKit forwarder, DAG
+    /// drain). Audited at teardown — any still running is warned + aborted.
+    pub task_tracker: Arc<crate::core::observability::SessionTaskTracker>,
     pub livekit_client: Option<Arc<RwLock<LiveKitClient>>>,
     /// Operation queue for non-blocking LiveKit operations
     pub livekit_operation_queue: Option<OperationQueue>,
@@ -41,6 +47,13 @@ pub struct ConnectionState {
     pub recording_egress_id: Option<String>,
     /// Auth context for this connection (used for room name normalization)
     pub auth: Auth,
+
+    /// D8 uplink opus decoder (feature `opus-codec`): `Some` only when the session negotiated
+    /// `stt_config.audio_in_codec = opus`. Each client WS binary frame is one opus packet decoded
+    /// to PCM16 (at the negotiated rate) BEFORE STT. `tokio::sync::Mutex` for `&mut` access under
+    /// the connection read-lock on the audio hot path.
+    #[cfg(feature = "opus-codec")]
+    pub opus_decoder: Option<tokio::sync::Mutex<crate::core::audio::opus_codec::OpusStreamDecoder>>,
 
     // DAG routing state (feature-gated)
     /// Compiled DAG for this connection
@@ -67,6 +80,8 @@ impl ConnectionState {
     pub fn new() -> Self {
         Self {
             voice_manager: None,
+            heartbeat: None,
+            task_tracker: Arc::new(crate::core::observability::SessionTaskTracker::new()),
             livekit_client: None,
             livekit_operation_queue: None,
             audio_enabled: AtomicBool::new(false),
@@ -75,6 +90,8 @@ impl ConnectionState {
             livekit_local_identity: None,
             recording_egress_id: None,
             auth: Auth::empty(),
+            #[cfg(feature = "opus-codec")]
+            opus_decoder: None,
             #[cfg(feature = "dag-routing")]
             compiled_dag: None,
             #[cfg(feature = "dag-routing")]
@@ -90,6 +107,8 @@ impl ConnectionState {
     pub fn with_auth(auth: Auth) -> Self {
         Self {
             voice_manager: None,
+            heartbeat: None,
+            task_tracker: Arc::new(crate::core::observability::SessionTaskTracker::new()),
             livekit_client: None,
             livekit_operation_queue: None,
             audio_enabled: AtomicBool::new(false),
@@ -98,6 +117,8 @@ impl ConnectionState {
             livekit_local_identity: None,
             recording_egress_id: None,
             auth,
+            #[cfg(feature = "opus-codec")]
+            opus_decoder: None,
             #[cfg(feature = "dag-routing")]
             compiled_dag: None,
             #[cfg(feature = "dag-routing")]
@@ -157,6 +178,35 @@ mod tests {
 
         state.stream_id = Some("test-stream-123".to_string());
         assert_eq!(state.stream_id, Some("test-stream-123".to_string()));
+    }
+
+    #[tokio::test]
+    async fn task_tracker_is_wired_and_cancels_session_tasks() {
+        // D-G4: every ConnectionState owns a task tracker; a recv/sleep-blocked
+        // session loop registered on it is cancelled at teardown — and, because
+        // it cancels cleanly, is NOT counted as dangling. (The actual-cancel and
+        // dangling-detection behaviours are proven in task_tracker's own tests.)
+        let state = ConnectionState::new();
+        let handle = tokio::spawn(async {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            }
+        });
+        state.task_tracker.track("forever", handle);
+        assert_eq!(state.task_tracker.tracked_count(), 1);
+        assert_eq!(
+            state
+                .task_tracker
+                .abort_and_audit(std::time::Duration::from_millis(100))
+                .await,
+            0,
+            "a cancellable session loop is stopped without being flagged dangling"
+        );
+        assert_eq!(
+            state.task_tracker.tracked_count(),
+            0,
+            "audit drains the tracker"
+        );
     }
 
     #[test]

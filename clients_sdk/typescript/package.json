@@ -16,7 +16,7 @@
     "dist"
   ],
   "scripts": {
-    "build": "rollup -c",
+    "build": "npm run typecheck && rollup -c",
     "dev": "rollup -c -w",
     "test": "vitest run",
     "test:watch": "vitest",

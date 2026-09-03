@@ -4,7 +4,7 @@
 //! using HTTP streaming for real-time audio synthesis.
 
 use async_trait::async_trait;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use tracing::{debug, info};
 
 use super::config::{UnrealSpeechStreamRequest, UnrealSpeechTtsConfig};
@@ -64,16 +64,8 @@ impl TTSRequestBuilder for UnrealSpeechRequestBuilder {
         // Build request body
         let request_body = UnrealSpeechStreamRequest::from_config(&self.config, text);
 
-        // Build headers
-        let mut headers = HeaderMap::new();
-
-        // Unreal Speech uses Bearer token authentication
+        // Unreal Speech uses Bearer token authentication.
         let auth_value = format!("Bearer {}", self.config.api_key);
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&auth_value).unwrap_or_else(|_| HeaderValue::from_static("")),
-        );
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
         debug!(
             "Unreal Speech TTS request: voice={}, bitrate={}, speed={}, pitch={}, codec={}, url={}",
@@ -87,8 +79,12 @@ impl TTSRequestBuilder for UnrealSpeechRequestBuilder {
 
         // Build and return the request
         client
-            .post(self.streaming_url())
-            .headers(headers)
+            .post(crate::core::tts::standard::override_rest_endpoint(
+                self.streaming_url(),
+                self.config.endpoint_override.as_deref(),
+            ))
+            .header(AUTHORIZATION, auth_value)
+            .header(CONTENT_TYPE, "application/json")
             .json(&request_body)
     }
 
@@ -150,6 +146,32 @@ impl UnrealSpeechTts {
         UnrealSpeechRequestBuilder::new(self.unrealspeech_config.clone(), self.base_config.clone())
     }
 
+    /// Build from the standardized config (W1 keystone for TTS), mirroring
+    /// `DeepgramTTS::from_standard`. Delegates the feature mapping to the config-level
+    /// [`UnrealSpeechTtsConfig::from_standard`] (which maps `speed`→`speed` offset, `pitch`→`pitch`
+    /// multiplier, and the non-standard `bitrate` extra), so the mapped Unreal Speech settings are
+    /// honored end-to-end through the dispatch path. The matching flat base config is kept for the
+    /// generic provider's connect layer.
+    ///
+    /// [`UnrealSpeechTtsConfig::from_standard`]: super::config::UnrealSpeechTtsConfig::from_standard
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
+        let unrealspeech_config = UnrealSpeechTtsConfig::from_standard(std)?;
+
+        info!(
+            "Creating Unreal Speech TTS provider: voice={}, bitrate={}, speed={}, pitch={}",
+            unrealspeech_config.voice,
+            unrealspeech_config.bitrate,
+            unrealspeech_config.speed,
+            unrealspeech_config.pitch
+        );
+
+        Ok(Self {
+            provider: TTSProvider::new(),
+            unrealspeech_config,
+            base_config: std.base.clone(),
+        })
+    }
+
     /// Get the Unreal Speech-specific configuration
     pub fn unrealspeech_config(&self) -> &UnrealSpeechTtsConfig {
         &self.unrealspeech_config
@@ -180,7 +202,7 @@ impl BaseTTS for UnrealSpeechTts {
         );
 
         Ok(Self {
-            provider: TTSProvider::new()?,
+            provider: TTSProvider::new(),
             unrealspeech_config,
             base_config: config,
         })
@@ -255,6 +277,77 @@ impl BaseTTS for UnrealSpeechTts {
 mod tests {
     use super::*;
     use crate::core::tts::unrealspeech::{UnrealSpeechBitrate, UnrealSpeechVoice};
+
+    // W1 keystone: the standardized dispatch path reaches the provider STRUCT's `from_standard`,
+    // building the real provider with the mapped speed offset + pitch multiplier (plus the bitrate
+    // extra), all previously unreachable through the flat factory.
+    #[test]
+    fn from_standard_builds_provider_with_mapped_speed_pitch_bitrate() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("bitrate".into(), serde_json::json!(320));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "unrealspeech".into(),
+                api_key: "test-key".into(),
+                voice_id: Some("Dan".into()),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(0.5),
+                pitch: Some(1.2),
+                ssml: Some(true), // capability gap: ignored
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+        let tts = UnrealSpeechTts::from_standard(&std).unwrap();
+        assert_eq!(tts.unrealspeech_config().speed, 0.5);
+        assert_eq!(tts.unrealspeech_config().pitch, 1.2);
+        assert_eq!(
+            tts.unrealspeech_config().bitrate,
+            UnrealSpeechBitrate::Bitrate320k
+        );
+        assert_eq!(tts.unrealspeech_config().voice, UnrealSpeechVoice::Dan);
+    }
+
+    #[test]
+    fn invalid_unrealspeech_api_key_header_value_is_request_build_error() {
+        let config = TTSConfig {
+            api_key: "bad\nkey".to_string(),
+            voice_id: Some("Dan".to_string()),
+            ..Default::default()
+        };
+        let unrealspeech_config = UnrealSpeechTtsConfig::from_base(&config).unwrap();
+        let builder = UnrealSpeechRequestBuilder::new(unrealspeech_config, config);
+        let err = builder
+            .build_http_request(&reqwest::Client::new(), "hello")
+            .build()
+            .expect_err(
+                "malformed Unreal Speech API key must not become an empty Authorization header",
+            );
+
+        assert!(err.is_builder(), "unexpected reqwest error: {err}");
+    }
+
+    #[test]
+    fn from_standard_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let std = crate::core::tts::standard::StandardTTSConfig::from_base(TTSConfig {
+            provider: "unrealspeech".into(),
+            api_key: "test-key".into(),
+            voice_id: Some("Dan".into()),
+            ..Default::default()
+        })
+        .with_endpoint_override("http://127.0.0.1:9000");
+
+        match UnrealSpeechTts::from_standard(&std) {
+            Ok(_) => {
+                panic!("UnrealSpeech provider construction must reject unsafe endpoint_override")
+            }
+            Err(err) => assert!(err.to_string().contains("SSRF protection")),
+        }
+    }
 
     #[test]
     fn test_unrealspeech_tts_creation() {

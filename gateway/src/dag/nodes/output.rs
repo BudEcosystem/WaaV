@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tracing::{debug, warn};
 
 use super::{DAGData, DAGNode, NodeCapability, TTSAudioData};
-use crate::dag::context::DAGContext;
+use crate::dag::context::{DAGContext, DagOutput};
 use crate::dag::definition::OutputDestination;
 use crate::dag::error::{DAGError, DAGResult};
 
@@ -96,10 +96,6 @@ impl DAGNode for AudioOutputNode {
             }
         };
 
-        // The actual routing to WebSocket/LiveKit is handled by the executor
-        // based on the destination configuration. Here we just validate and
-        // prepare the data.
-
         debug!(
             node_id = %self.id,
             destination = ?self.destination,
@@ -108,11 +104,27 @@ impl DAGNode for AudioOutputNode {
             "Routing audio to output"
         );
 
-        // Store destination info in context for executor
+        // Store destination info in context for downstream consumers (drain task can
+        // honor LiveKit vs WS routing; Discard means side-effect-only).
         ctx.metadata.insert(
             "output_destination".to_string(),
             format!("{:?}", self.destination),
         );
+
+        // W-O1: deliver the audio out-of-band through the context's output sink so it
+        // actually reaches the client. The drain task in the WS handler maps
+        // `DagOutput::Audio` → LiveKit (operation queue) or WS binary. `Discard` is
+        // intentionally not delivered.
+        if !matches!(self.destination, OutputDestination::Discard)
+            && !audio_data.data.is_empty()
+            && !ctx.emit_output(DagOutput::Audio(audio_data.clone())).await
+        {
+            warn!(
+                node_id = %self.id,
+                "Audio output node has no output sink attached; audio not delivered \
+                 (DAG executed without a StreamDriver drain task)"
+            );
+        }
 
         Ok(DAGData::TTSAudio(audio_data))
     }
@@ -212,7 +224,7 @@ impl DAGNode for TextOutputNode {
             "Routing text to output"
         );
 
-        // Store destination info in context for executor
+        // Store destination info in context for downstream consumers.
         ctx.metadata.insert(
             "output_destination".to_string(),
             format!("{:?}", self.destination),
@@ -220,6 +232,17 @@ impl DAGNode for TextOutputNode {
         if let Some(ref msg_type) = self.message_type {
             ctx.metadata
                 .insert("message_type".to_string(), msg_type.clone());
+        }
+
+        // W-O1: deliver the text out-of-band through the context's output sink.
+        if !matches!(self.destination, OutputDestination::Discard)
+            && !text.is_empty()
+            && !ctx.emit_output(DagOutput::Text(text.clone())).await
+        {
+            debug!(
+                node_id = %self.id,
+                "Text output node has no output sink attached; text returned only as result"
+            );
         }
 
         Ok(DAGData::Text(text))
@@ -245,7 +268,8 @@ pub struct WebhookOutputNode {
     /// Whether to wait for response
     fire_and_forget: bool,
     /// Pooled HTTP client for connection reuse
-    client: reqwest::Client,
+    client: Option<reqwest::Client>,
+    http_client_init_error: Option<String>,
 }
 
 impl std::fmt::Debug for WebhookOutputNode {
@@ -266,14 +290,41 @@ impl WebhookOutputNode {
     /// The HTTP client is created once during construction with default settings
     /// for connection pooling and keep-alive.
     pub fn new(id: impl Into<String>, url: impl Into<String>) -> Self {
+        let (client, http_client_init_error) =
+            super::endpoint::optional_ssrf_protected_http_client();
         Self {
             id: id.into(),
             url: url.into(),
             headers: std::collections::HashMap::new(),
             timeout_ms: 5000,
             fire_and_forget: true,
-            client: reqwest::Client::new(),
+            client,
+            http_client_init_error,
         }
+    }
+
+    /// Create a webhook output node with SSRF validation.
+    ///
+    /// SECURITY (S6): DAG definitions (including webhook URLs) are accepted inline from
+    /// authenticated WS clients, so a tenant could otherwise point a webhook at internal
+    /// services (`169.254.169.254`, loopback, RFC1918). This rejects those, matching the
+    /// `try_new` protection already on the HTTP/WebSocket endpoint nodes. The compiler MUST
+    /// use this (not `new`) for client-supplied URLs.
+    pub fn try_new(
+        id: impl Into<String>,
+        url: impl Into<String>,
+    ) -> crate::dag::error::DAGResult<Self> {
+        let url_str: String = url.into();
+        super::endpoint::validate_http_url_for_ssrf(&url_str)?;
+        Ok(Self {
+            id: id.into(),
+            url: url_str,
+            headers: std::collections::HashMap::new(),
+            timeout_ms: 5000,
+            fire_and_forget: true,
+            client: Some(super::endpoint::ssrf_protected_http_client()?),
+            http_client_init_error: None,
+        })
     }
 
     /// Add a header to the webhook request
@@ -324,6 +375,15 @@ impl DAGNode for WebhookOutputNode {
     }
 
     async fn execute(&self, input: DAGData, ctx: &mut DAGContext) -> DAGResult<DAGData> {
+        let Some(client) = &self.client else {
+            return Err(DAGError::WebhookDeliveryError {
+                url: self.url.clone(),
+                error: self
+                    .http_client_init_error
+                    .clone()
+                    .unwrap_or_else(|| "DAG webhook HTTP client was not initialized".to_string()),
+            });
+        };
         // Convert input to JSON for webhook payload
         let payload = input.to_json();
 
@@ -335,8 +395,7 @@ impl DAGNode for WebhookOutputNode {
         );
 
         // Use the pre-created pooled client for connection reuse
-        let mut request = self
-            .client
+        let mut request = client
             .post(&self.url)
             .timeout(std::time::Duration::from_millis(self.timeout_ms))
             .header("Content-Type", "application/json")
@@ -358,7 +417,7 @@ impl DAGNode for WebhookOutputNode {
             // Spawn task and don't wait
             let url = self.url.clone();
             let node_id = self.id.clone();
-            tokio::spawn(async move {
+            crate::core::observability::spawn_observed_detached("dag.webhook-output", async move {
                 match request.send().await {
                     Ok(response) => {
                         if !response.status().is_success() {
@@ -474,6 +533,49 @@ mod tests {
         assert!(node.headers().contains_key("Authorization"));
         assert_eq!(node.timeout_ms, 10000);
         assert!(!node.fire_and_forget);
+    }
+
+    // SECURITY (S6): webhook URLs come from client-supplied DAG defs; try_new must reject
+    // SSRF targets (loopback, link-local cloud metadata, RFC1918) and accept public URLs.
+    #[test]
+    fn test_webhook_try_new_blocks_ssrf() {
+        let _env = crate::core::net::ssrf_env_lock();
+        assert!(
+            WebhookOutputNode::try_new("w", "http://169.254.169.254/latest/meta-data").is_err()
+        );
+        assert!(WebhookOutputNode::try_new("w", "http://127.0.0.1:8080/admin").is_err());
+        assert!(WebhookOutputNode::try_new("w", "http://localhost/internal").is_err());
+        assert!(WebhookOutputNode::try_new("w", "http://10.0.0.5/").is_err());
+        assert!(WebhookOutputNode::try_new("w", "http://192.168.1.1/").is_err());
+        assert!(WebhookOutputNode::try_new("w", "wss://example.com/hook").is_err());
+        // Public URL is allowed.
+        assert!(WebhookOutputNode::try_new("w", "https://example.com/hook").is_ok());
+    }
+
+    #[tokio::test]
+    async fn webhook_output_client_init_failure_returns_typed_error() {
+        let node = WebhookOutputNode {
+            id: "webhook".to_string(),
+            url: "https://hooks.example.com".to_string(),
+            headers: std::collections::HashMap::new(),
+            timeout_ms: 5000,
+            fire_and_forget: true,
+            client: None,
+            http_client_init_error: Some("client build failed".to_string()),
+        };
+        let mut ctx = DAGContext::new("client-init-failure");
+
+        let error = node
+            .execute(DAGData::Text("payload".to_string()), &mut ctx)
+            .await
+            .expect_err("missing client must return a webhook delivery error");
+
+        match error {
+            DAGError::WebhookDeliveryError { error, .. } => {
+                assert!(error.contains("client build failed"), "{error}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     #[test]

@@ -6,6 +6,15 @@
 use crate::core::stt::base::{STTConfig, STTError};
 use serde::{Deserialize, Serialize};
 
+fn validate_fpt_http_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -46,6 +55,10 @@ pub struct FptSttConfig {
 
     /// Request timeout in seconds.
     pub request_timeout_secs: u64,
+
+    /// Base endpoint override (scheme://host) from the standardized `endpoint_override` — points the
+    /// batch POST at an in-repo mock/proxy for credential-free e2e; `None` uses the production host.
+    pub endpoint_override: Option<String>,
 }
 
 impl Default for FptSttConfig {
@@ -55,6 +68,7 @@ impl Default for FptSttConfig {
             sample_rate: DEFAULT_SAMPLE_RATE,
             channels: DEFAULT_CHANNELS,
             request_timeout_secs: DEFAULT_REQUEST_TIMEOUT,
+            endpoint_override: None,
         }
     }
 }
@@ -87,7 +101,25 @@ impl FptSttConfig {
             sample_rate,
             channels,
             request_timeout_secs: DEFAULT_REQUEST_TIMEOUT,
+            endpoint_override: None,
         })
+    }
+
+    /// Build from the standardized config (W1 keystone). FPT.AI is a simple batch decode endpoint
+    /// whose config only carries transport knobs (api_key, sample_rate, channels, request_timeout)
+    /// — it exposes no advanced-feature surface. None of the standardized
+    /// [`SttFeatures`](crate::core::stt::standard::SttFeatures) (diarization, word_timestamps,
+    /// smart_format, profanity_filter, filler_words, interim_results, vad_events, endpointing,
+    /// utterance_end, keyterms, redaction, entity_detection, language_detection) map to a real
+    /// field here, so this is a pure `from_base` passthrough: a uniform standardized entry point
+    /// with no feature mapping.
+    pub fn from_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        let mut cfg = Self::from_base(&std.base)?;
+        cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
+        cfg.validate().map_err(STTError::ConfigurationError)?;
+        Ok(cfg)
     }
 
     /// Validate the configuration.
@@ -108,6 +140,10 @@ impl FptSttConfig {
                 "Only mono audio is supported, got {} channels",
                 self.channels
             ));
+        }
+
+        if let Some(endpoint) = &self.endpoint_override {
+            validate_fpt_http_endpoint("endpoint_override", endpoint)?;
         }
 
         Ok(())
@@ -175,6 +211,34 @@ impl FptSttResponse {
 mod tests {
     use super::*;
 
+    // W1 keystone: FPT.AI exposes no advanced-feature surface, so `from_standard` is a pure
+    // `from_base` passthrough. Even with features set, it must succeed and carry the base
+    // (api_key/sample_rate/channels) through unchanged.
+    #[test]
+    fn from_standard_passes_base_through() {
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "fpt_ai".into(),
+                api_key: "test_key".into(),
+                sample_rate: 8000,
+                channels: 1,
+                ..Default::default()
+            },
+            features: SttFeatures {
+                diarization: Some(true),
+                word_timestamps: Some(true),
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+            translation: None,
+        };
+        let cfg = FptSttConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.api_key, "test_key");
+        assert_eq!(cfg.sample_rate, 8000);
+        assert_eq!(cfg.channels, 1);
+    }
+
     #[test]
     fn test_config_default() {
         let config = FptSttConfig::default();
@@ -222,6 +286,30 @@ mod tests {
         config.sample_rate = 8000;
 
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = FptSttConfig {
+            api_key: "test_key".to_string(),
+            ..Default::default()
+        };
+
+        config.endpoint_override = Some("https://fpt-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.contains("SSRF protection"), "{err}");
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("non-HTTP endpoint_override must be rejected");
+        assert!(err.contains("not allowed"), "{err}");
     }
 
     #[test]

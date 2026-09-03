@@ -18,6 +18,7 @@
 //! drop function. When the adapter is dropped, each callback is freed using its correct
 //! type, preventing heap corruption from size/alignment mismatches.
 
+use crate::core::observability::spawn_observed_detached;
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::sync::{Arc, Mutex};
@@ -268,7 +269,7 @@ impl BaseSTT for FFISTTAdapter {
 
                 let callback = &*(user_data as *const STTResultCallback);
                 let future = callback(rust_result);
-                tokio::spawn(future);
+                spawn_observed_detached("plugin.stt.result_callback", future);
             }
         }
 
@@ -319,7 +320,7 @@ impl BaseSTT for FFISTTAdapter {
 
                 let callback = &*(user_data as *const STTErrorCallback);
                 let future = callback(error);
-                tokio::spawn(future);
+                spawn_observed_detached("plugin.stt.error_callback", future);
             }
         }
 
@@ -529,7 +530,7 @@ impl BaseTTS for FFITTSAdapter {
 
                 let callback = &*(user_data as *const Arc<dyn AudioCallback>);
                 let future = callback.on_audio(rust_audio);
-                tokio::spawn(future);
+                spawn_observed_detached("plugin.tts.audio_callback", future);
             }
         }
 
@@ -548,7 +549,7 @@ impl BaseTTS for FFITTSAdapter {
 
                 let callback = &*(user_data as *const Arc<dyn AudioCallback>);
                 let future = callback.on_error(error);
-                tokio::spawn(future);
+                spawn_observed_detached("plugin.tts.error_callback", future);
             }
         }
 
@@ -560,7 +561,7 @@ impl BaseTTS for FFITTSAdapter {
             unsafe {
                 let callback = &*(user_data as *const Arc<dyn AudioCallback>);
                 let future = callback.on_complete();
-                tokio::spawn(future);
+                spawn_observed_detached("plugin.tts.complete_callback", future);
             }
         }
 
@@ -832,7 +833,7 @@ impl BaseRealtime for FFIRealtimeAdapter {
 
                 let callback = &*(user_data as *const TranscriptCallback);
                 let future = callback(rust_result);
-                tokio::spawn(future);
+                spawn_observed_detached("plugin.realtime.transcript_callback", future);
             }
         }
 
@@ -875,7 +876,7 @@ impl BaseRealtime for FFIRealtimeAdapter {
 
                 let callback = &*(user_data as *const AudioOutputCallback);
                 let future = callback(rust_audio);
-                tokio::spawn(future);
+                spawn_observed_detached("plugin.realtime.audio_callback", future);
             }
         }
 
@@ -922,7 +923,7 @@ impl BaseRealtime for FFIRealtimeAdapter {
 
                 let callback = &*(user_data as *const RealtimeErrorCallback);
                 let future = callback(error);
-                tokio::spawn(future);
+                spawn_observed_detached("plugin.realtime.error_callback", future);
             }
         }
 

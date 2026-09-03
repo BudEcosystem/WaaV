@@ -12,6 +12,16 @@ use super::{
     STT_STREAM_APPNAME,
 };
 
+fn validate_reverie_stt_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+
+    crate::core::net::validate_url_for_ssrf(endpoint, &["ws", "wss"])
+        .map_err(|e| format!("{source} rejected (SSRF protection): {e}"))
+}
+
 // =============================================================================
 // Language Enum
 // =============================================================================
@@ -309,6 +319,12 @@ pub struct ReverieSTTConfig {
     /// Extra query parameters
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_params: Vec<(String, String)>,
+
+    /// Carried from the standardized `endpoint_override` — points the dial at the in-repo mock/proxy
+    /// (a local `ws://` server) for credential-free end-to-end integration tests; `None` uses the
+    /// production Reverie endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_override: Option<String>,
 }
 
 fn default_domain() -> String {
@@ -348,6 +364,7 @@ impl ReverieSTTConfig {
             continuous: false,
             sample_rate: None,
             extra_params: Vec::new(),
+            endpoint_override: None,
         }
     }
 
@@ -446,7 +463,18 @@ impl ReverieSTTConfig {
             .collect::<Vec<_>>()
             .join("&");
 
-        format!("{}?{}", REVERIE_STREAM_URL, query)
+        // Base endpoint: honor an `endpoint_override` (scheme://host[:port]) for the in-repo
+        // mock/proxy; the Reverie stream path is re-appended (a path-less URL fails the WS handshake).
+        let base = match self
+            .endpoint_override
+            .as_deref()
+            .map(str::trim)
+            .filter(|o| !o.is_empty())
+        {
+            Some(o) => format!("{}/stream", o.trim_end_matches('/')),
+            None => REVERIE_STREAM_URL.to_string(),
+        };
+        format!("{}?{}", base, query)
     }
 
     /// Validate the configuration
@@ -468,6 +496,9 @@ impl ReverieSTTConfig {
                 "Punctuation not supported for language: {}",
                 self.language
             ));
+        }
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_reverie_stt_endpoint("endpoint_override", endpoint)?;
         }
         Ok(())
     }
@@ -519,6 +550,21 @@ impl ReverieSTTConfig {
         cfg.validate()?;
         Ok(cfg)
     }
+
+    /// Build from the standardized config (W1 keystone). Reverie is a streaming Indian-language
+    /// ASR provider whose query-parameter surface exposes no advanced-feature knobs — none of the
+    /// standardized features (interim_results, diarization, word_timestamps, smart_format,
+    /// profanity_filter, filler_words, vad_events, endpointing, utterance_end, keyterms, redaction,
+    /// entity_detection, language_detection) maps to a real field on this config. So this is a pure
+    /// passthrough: a uniform standardized entry point that simply delegates to `from_base`.
+    pub fn from_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, String> {
+        let mut cfg = Self::from_base(&std.base)?;
+        // Standardized endpoint override (mock/proxy host) for credential-free integration tests.
+        cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
+        Ok(cfg)
+    }
 }
 
 impl Default for ReverieSTTConfig {
@@ -536,6 +582,7 @@ impl Default for ReverieSTTConfig {
             continuous: false,
             sample_rate: None,
             extra_params: Vec::new(),
+            endpoint_override: None,
         }
     }
 }
@@ -547,6 +594,35 @@ impl Default for ReverieSTTConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone: Reverie maps zero standardized features (streaming ASR provider with no advanced
+    // knobs), so from_standard is a pure from_base passthrough — assert it succeeds and the base
+    // (api_key + app_id parsed from the model field) carries through unchanged.
+    #[test]
+    fn from_standard_passthrough_carries_base() {
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "reverie".into(),
+                api_key: "test-api-key".into(),
+                language: "hi".into(),
+                model: "test-app-id".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                // None of these can map to a real Reverie field; they must be ignored.
+                diarization: Some(true),
+                word_timestamps: Some(true),
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+            translation: None,
+        };
+        let cfg = ReverieSTTConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.api_key, "test-api-key");
+        assert_eq!(cfg.app_id, "test-app-id");
+        assert_eq!(cfg.language, ReverieLanguage::Hindi);
+    }
 
     #[test]
     fn test_language_codes() {
@@ -634,6 +710,52 @@ mod tests {
 
         let config = ReverieSTTConfig::new("key", "app");
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let previous = std::env::var_os("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
+
+        let mut config = ReverieSTTConfig {
+            endpoint_override: Some("wss://reverie-proxy.example.com".to_string()),
+            ..ReverieSTTConfig::new("key", "app")
+        };
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("ws://reverie-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("ws://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.contains("SSRF protection"), "{err}");
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("non-WebSocket endpoint_override must be rejected");
+        assert!(err.contains("not allowed"), "{err}");
+
+        config.endpoint_override = Some("https://reverie-proxy.example.com".to_string());
+        let err = config
+            .validate()
+            .expect_err("HTTP endpoint_override must be rejected for Reverie WebSocket dial");
+        assert!(err.contains("not allowed"), "{err}");
+
+        // SAFETY: restore the process env before releasing the test env lock.
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", previous);
+            } else {
+                std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+            }
+        }
     }
 
     #[test]

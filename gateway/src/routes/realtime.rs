@@ -97,6 +97,10 @@ mod route_tests {
         seen.sort_unstable();
         let before = seen.len();
         seen.dedup();
-        assert_eq!(before, seen.len(), "duplicate path: axum panics on construction");
+        assert_eq!(
+            before,
+            seen.len(),
+            "duplicate path: axum panics on construction"
+        );
     }
 }

@@ -6,6 +6,16 @@
 use crate::core::tts::base::TTSConfig;
 use serde::{Deserialize, Serialize};
 
+fn validate_tinkoff_tts_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 /// Tinkoff TTS provider-specific configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TinkoffTtsConfig {
@@ -45,6 +55,12 @@ pub struct TinkoffTtsConfig {
     #[serde(default)]
     pub volume_gain_db: f32,
 
+    /// Treat synthesis input as SSML. When set, the gRPC `SynthesisInput.ssml` oneof field is
+    /// populated instead of `SynthesisInput.text`, unlocking `<speak>`/`<prosody>` markup on the
+    /// `tinkoff.cloud.tts.v1.TextToSpeech` Synthesize / StreamingSynthesize RPCs.
+    #[serde(default)]
+    pub ssml: bool,
+
     /// Connection timeout in seconds
     #[serde(default = "default_connection_timeout")]
     pub connection_timeout_secs: u64,
@@ -52,6 +68,10 @@ pub struct TinkoffTtsConfig {
     /// Request timeout in seconds
     #[serde(default = "default_request_timeout")]
     pub request_timeout_secs: u64,
+
+    /// Override gRPC endpoint (plaintext, no TLS) — used by mock e2e tests.
+    #[serde(default, skip_serializing)]
+    pub endpoint_override: Option<String>,
 }
 
 fn default_sample_rate() -> u32 {
@@ -82,8 +102,10 @@ impl Default for TinkoffTtsConfig {
             speaking_rate: default_speaking_rate(),
             pitch: 0.0,
             volume_gain_db: 0.0,
+            ssml: false,
             connection_timeout_secs: default_connection_timeout(),
             request_timeout_secs: default_request_timeout(),
+            endpoint_override: None,
         }
     }
 }
@@ -91,13 +113,19 @@ impl Default for TinkoffTtsConfig {
 impl TinkoffTtsConfig {
     /// Create TinkoffTtsConfig from base TTSConfig
     pub fn from_base(base: TTSConfig) -> Result<Self, String> {
-        // Get credentials from environment
+        // Credentials: env vars take priority; otherwise the standardized `api_key` carries both as
+        // `api_key|secret_key` (Tinkoff needs both to sign the JWT, but the keystone exposes a single
+        // credential field). A bare `api_key` (no `|`) leaves `secret_key` to the env vars.
+        let (base_api_key, base_secret_key) = match base.api_key.split_once('|') {
+            Some((a, s)) => (a.to_string(), s.to_string()),
+            None => (base.api_key.clone(), String::new()),
+        };
         let api_key = std::env::var("TINKOFF_API_KEY")
             .or_else(|_| std::env::var("TINKOFF_VOICEKIT_API_KEY"))
-            .unwrap_or_else(|_| base.api_key.clone());
+            .unwrap_or(base_api_key);
         let secret_key = std::env::var("TINKOFF_SECRET_KEY")
             .or_else(|_| std::env::var("TINKOFF_VOICEKIT_SECRET_KEY"))
-            .unwrap_or_default();
+            .unwrap_or(base_secret_key);
 
         // Parse voice
         let voice = base
@@ -134,9 +162,71 @@ impl TinkoffTtsConfig {
             speaking_rate: default_speaking_rate(),
             pitch: 0.0,
             volume_gain_db: 0.0,
+            ssml: false,
             connection_timeout_secs: default_connection_timeout(),
             request_timeout_secs: default_request_timeout(),
+            endpoint_override: None,
         })
+    }
+
+    /// Build from the standardized TTS config. Tinkoff exposes three direct prosody knobs, so this
+    /// maps `speed` -> `speaking_rate` (both are 1.0-is-normal multipliers, clamped to the API's
+    /// 0.25-4.0 range), `pitch` -> `pitch` (direct semitone offset, clamped to -20.0..=20.0), and
+    /// `volume` -> `volume_gain_db` (direct dB gain, clamped to -96.0..=16.0). `sample_rate`
+    /// overrides the output sample rate (clamped to the API's 1000-48000 Hz range). `ssml` flips
+    /// the input oneof so synthesis input is sent as `SynthesisInput.ssml` instead of `.text`
+    /// (the VoiceKit `TextToSpeech` API accepts SSML on both Synthesize and StreamingSynthesize).
+    /// Tinkoff's non-standard `connection_timeout_secs` / `request_timeout_secs` knobs are read
+    /// from the `extras` passthrough. Features without a Tinkoff field (stability, similarity_boost,
+    /// style, use_speaker_boost, emotion, instructions, language, word_timestamps, streaming, seed)
+    /// are skipped.
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> Result<Self, String> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(std.base.clone())?;
+
+        if let Some(speed) = f.speed {
+            // Both are 1.0-is-normal multipliers; clamp to Tinkoff's 0.25-4.0 range.
+            cfg.speaking_rate = speed.clamp(0.25, 4.0);
+        }
+        if let Some(pitch) = f.pitch {
+            // Tinkoff pitch is a direct semitone offset.
+            cfg.pitch = pitch.clamp(-20.0, 20.0);
+        }
+        if let Some(volume) = f.volume {
+            // Tinkoff volume is a direct dB gain.
+            cfg.volume_gain_db = volume.clamp(-96.0, 16.0);
+        }
+        if let Some(rate) = f.sample_rate {
+            cfg.sample_rate = rate.clamp(1000, 48000);
+        }
+        if let Some(ssml) = f.ssml {
+            // Flip the SynthesisInput oneof from `.text` to `.ssml` (audio-changing).
+            cfg.ssml = ssml;
+        }
+
+        // Provider-specific passthrough.
+        if let Some(secs) = std
+            .extras
+            .0
+            .get("connection_timeout_secs")
+            .and_then(|v| v.as_u64())
+        {
+            cfg.connection_timeout_secs = secs;
+        }
+        if let Some(secs) = std
+            .extras
+            .0
+            .get("request_timeout_secs")
+            .and_then(|v| v.as_u64())
+        {
+            cfg.request_timeout_secs = secs;
+        }
+
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
+
+        Ok(cfg)
     }
 
     /// Validate the configuration
@@ -181,6 +271,10 @@ impl TinkoffTtsConfig {
                 "Invalid volume gain: {}. Must be between -96.0 and 16.0 dB",
                 self.volume_gain_db
             ));
+        }
+
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_tinkoff_tts_endpoint("endpoint_override", endpoint)?;
         }
 
         Ok(())
@@ -317,6 +411,73 @@ impl TinkoffAudioEncoding {
 mod tests {
     use super::*;
 
+    // Maps speed -> speaking_rate (1.0-is-normal multiplier), pitch -> pitch (direct semitones),
+    // volume -> volume_gain_db (direct dB), sample_rate -> sample_rate, and demonstrates the extras
+    // passthrough (connection_timeout_secs / request_timeout_secs).
+    #[test]
+    fn from_standard_maps_prosody_and_extras() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("connection_timeout_secs".into(), serde_json::json!(20));
+        extras.insert("request_timeout_secs".into(), serde_json::json!(45));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "tinkoff".into(),
+                api_key: "test".into(),
+                // The shared TTSConfig default voice_id ("aura-asteria-en") is a Deepgram voice
+                // that Tinkoff rejects; pin a valid Tinkoff voice so from_base/from_standard resolve.
+                voice_id: Some("alyona".into()),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(2.0),
+                pitch: Some(5.0),
+                volume: Some(-6.0),
+                sample_rate: Some(48000),
+                ssml: Some(true), // now wired: flips the SynthesisInput oneof to `.ssml`
+                ..Default::default()
+            },
+            extras: crate::core::stt::standard::ProviderExtras(extras),
+        };
+        let cfg = TinkoffTtsConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.speaking_rate, 2.0); // 1.0-is-normal multiplier, passed through
+        assert_eq!(cfg.pitch, 5.0); // direct semitone offset
+        assert_eq!(cfg.volume_gain_db, -6.0); // direct dB gain
+        assert_eq!(cfg.sample_rate, 48000);
+        assert!(cfg.ssml); // features.ssml -> config.ssml
+        assert_eq!(cfg.connection_timeout_secs, 20); // from extras passthrough
+        assert_eq!(cfg.request_timeout_secs, 45);
+    }
+
+    // `features.ssml` toggles the typed config flag that selects the SynthesisInput.ssml oneof;
+    // when unset it stays false so the plain-text path is preserved.
+    #[test]
+    fn from_standard_maps_ssml_flag() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let base = TTSConfig {
+            provider: "tinkoff".into(),
+            api_key: "test".into(),
+            voice_id: Some("alyona".into()),
+            ..Default::default()
+        };
+        let with_ssml = StandardTTSConfig {
+            base: base.clone(),
+            features: TtsFeatures {
+                ssml: Some(true),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        assert!(TinkoffTtsConfig::from_standard(&with_ssml).unwrap().ssml);
+
+        let without = StandardTTSConfig {
+            base,
+            features: TtsFeatures::default(),
+            extras: Default::default(),
+        };
+        assert!(!TinkoffTtsConfig::from_standard(&without).unwrap().ssml);
+    }
+
     #[test]
     fn test_tinkoff_voice_from_str() {
         assert_eq!(
@@ -399,6 +560,41 @@ mod tests {
         let result = config.validate();
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("secret key"));
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = TinkoffTtsConfig {
+            api_key: "test-api-key".to_string(),
+            secret_key: "test-secret-key".to_string(),
+            ..Default::default()
+        };
+
+        config.endpoint_override = Some("https://tinkoff-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("SSRF protection"), "unexpected error: {err}");
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("URL scheme"), "unexpected error: {err}");
+
+        config.endpoint_override = Some("ws://tinkoff-proxy.example.com".to_string());
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("URL scheme"), "unexpected error: {err}");
+
+        let std = crate::core::tts::standard::StandardTTSConfig::from_base(TTSConfig {
+            provider: "tinkoff".into(),
+            api_key: "test-api-key|test-secret-key".into(),
+            voice_id: Some("alyona".into()),
+            ..Default::default()
+        })
+        .with_endpoint_override("file:///tmp/socket");
+        let cfg = TinkoffTtsConfig::from_standard(&std).unwrap();
+        assert!(cfg.validate().is_err());
     }
 
     #[test]

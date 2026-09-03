@@ -17,6 +17,17 @@
 use crate::core::stt::base::{STTConfig, STTError};
 use serde::{Deserialize, Serialize};
 
+fn validate_tencent_stt_endpoint(source: &str, endpoint: &str) -> Result<(), STTError> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+
+    crate::core::net::validate_url_for_ssrf(endpoint, &["ws", "wss"]).map_err(|e| {
+        STTError::ConfigurationError(format!("{source} rejected (SSRF protection): {e}"))
+    })
+}
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -519,6 +530,25 @@ pub struct TencentSttConfig {
 
     /// Filter empty result callbacks.
     pub filter_empty_result: bool,
+
+    // -------------------------------------------------------------------------
+    // Provider-extras passthrough params (Tencent Real-Time ASR query params not modeled by the
+    // typed `SttFeatures` vocabulary). All optional; `None` => omitted from the URL (provider
+    // default). Carried verbatim from `StandardSTTConfig::extras`.
+    // -------------------------------------------------------------------------
+    /// Noise filter threshold (`noise_threshold`, float in -1.0..=1.0; higher filters more noise,
+    /// lower keeps more audio). Tencent Real-Time ASR `noise_threshold` query param.
+    pub noise_threshold: Option<f64>,
+
+    /// Sample rate of the *input* audio (`input_sample_rate`) for engines that accept a different
+    /// input rate than their nominal model rate. Tencent Real-Time ASR `input_sample_rate` param.
+    pub input_sample_rate: Option<u32>,
+
+    /// Carried from the standardized `endpoint_override` — points the dial at the in-repo mock/proxy
+    /// (a local `ws://` server) for credential-free end-to-end integration tests; `None` uses the
+    /// production Tencent endpoint. The HMAC signature is still computed over the real host (the mock
+    /// ignores it); only the dialed scheme://host is swapped.
+    pub endpoint_override: Option<String>,
 }
 
 impl Default for TencentSttConfig {
@@ -542,6 +572,9 @@ impl Default for TencentSttConfig {
             convert_num_mode: TencentNumeralMode::default(),
             customization_id: None,
             filter_empty_result: false,
+            noise_threshold: None,
+            input_sample_rate: None,
+            endpoint_override: None,
         }
     }
 }
@@ -673,33 +706,33 @@ impl TencentSttConfig {
         }
 
         // Validate VAD silence time
-        if let Some(vad_time) = self.vad_silence_time {
-            if vad_time < VAD_SILENCE_TIME_MIN || vad_time > VAD_SILENCE_TIME_MAX {
-                return Err(STTError::ConfigurationError(format!(
-                    "VAD silence time must be between {} and {} ms",
-                    VAD_SILENCE_TIME_MIN, VAD_SILENCE_TIME_MAX
-                )));
-            }
+        if let Some(vad_time) = self.vad_silence_time
+            && (!(VAD_SILENCE_TIME_MIN..=VAD_SILENCE_TIME_MAX).contains(&vad_time))
+        {
+            return Err(STTError::ConfigurationError(format!(
+                "VAD silence time must be between {} and {} ms",
+                VAD_SILENCE_TIME_MIN, VAD_SILENCE_TIME_MAX
+            )));
         }
 
         // Validate max speak time
-        if let Some(max_speak) = self.max_speak_time {
-            if max_speak < MAX_SPEAK_TIME_MIN || max_speak > MAX_SPEAK_TIME_MAX {
-                return Err(STTError::ConfigurationError(format!(
-                    "Max speak time must be between {} and {} ms",
-                    MAX_SPEAK_TIME_MIN, MAX_SPEAK_TIME_MAX
-                )));
-            }
+        if let Some(max_speak) = self.max_speak_time
+            && (!(MAX_SPEAK_TIME_MIN..=MAX_SPEAK_TIME_MAX).contains(&max_speak))
+        {
+            return Err(STTError::ConfigurationError(format!(
+                "Max speak time must be between {} and {} ms",
+                MAX_SPEAK_TIME_MIN, MAX_SPEAK_TIME_MAX
+            )));
         }
 
         // Validate hotword list size
-        if let Some(ref list) = self.hotword_list {
-            if list.len() > MAX_HOTWORD_LIST_SIZE {
-                return Err(STTError::ConfigurationError(format!(
-                    "Hotword list must not exceed {} terms",
-                    MAX_HOTWORD_LIST_SIZE
-                )));
-            }
+        if let Some(ref list) = self.hotword_list
+            && list.len() > MAX_HOTWORD_LIST_SIZE
+        {
+            return Err(STTError::ConfigurationError(format!(
+                "Hotword list must not exceed {} terms",
+                MAX_HOTWORD_LIST_SIZE
+            )));
         }
 
         // Validate reinforce_hotword is only used with compatible models
@@ -710,6 +743,10 @@ impl TencentSttConfig {
                     "reinforce_hotword is only supported for 8k_zh and 16k_zh models".to_string(),
                 ));
             }
+        }
+
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_tencent_stt_endpoint("endpoint_override", endpoint)?;
         }
 
         Ok(())
@@ -784,6 +821,63 @@ impl TencentSttConfig {
         tencent_config.validate()?;
         Ok(tencent_config)
     }
+
+    /// Build from the standardized config (W1 keystone). Tencent ASR models its advanced features
+    /// as enum/bool knobs, so this maps the standardized features whose meaning matches an existing
+    /// Tencent field: word timestamps (`word_info`), profanity filtering (`filter_dirty`), filler
+    /// words (`filter_modal` — modal-particle filtering, whose sense is inverted: keeping fillers
+    /// means *not* filtering modal particles), VAD events (`needvad`), endpointing
+    /// (`vad_silence_time`) and key terms (`hotword_list`). Features Tencent can't express
+    /// (diarization, smart_format, interim_results, redaction, entity/language detection) are
+    /// capability gaps and stay at their defaults.
+    pub fn from_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(std.base.clone())?;
+        if let Some(w) = f.word_timestamps {
+            cfg.word_info = if w {
+                TencentWordInfo::Basic
+            } else {
+                TencentWordInfo::None
+            };
+        }
+        if let Some(p) = f.profanity_filter {
+            cfg.filter_dirty = if p {
+                TencentFilterDirtyMode::Filter
+            } else {
+                TencentFilterDirtyMode::Off
+            };
+        }
+        if let Some(filler) = f.filler_words {
+            cfg.filter_modal = if filler {
+                TencentFilterModalMode::Off
+            } else {
+                TencentFilterModalMode::Strict
+            };
+        }
+        if let Some(v) = f.vad_events {
+            cfg.needvad = v;
+        }
+        if let Some(ms) = f.endpointing_ms {
+            cfg.vad_silence_time = Some(ms.clamp(VAD_SILENCE_TIME_MIN, VAD_SILENCE_TIME_MAX));
+        }
+        if let Some(k) = &f.keyterms {
+            cfg.hotword_list = Some(k.iter().take(MAX_HOTWORD_LIST_SIZE).cloned().collect());
+        }
+        // Provider extras → Tencent Real-Time ASR query params not modeled by the typed vocabulary.
+        // Keys not present stay `None` and are omitted from the URL (provider default).
+        let e = &std.extras.0;
+        if let Some(v) = e.get("noise_threshold").and_then(|v| v.as_f64()) {
+            cfg.noise_threshold = Some(v);
+        }
+        if let Some(v) = e.get("input_sample_rate").and_then(|v| v.as_u64()) {
+            cfg.input_sample_rate = Some(v as u32);
+        }
+        // Standardized endpoint override (mock/proxy host) for credential-free integration tests.
+        cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
+        Ok(cfg)
+    }
 }
 
 // =============================================================================
@@ -793,6 +887,33 @@ impl TencentSttConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone: maps the standardized features Tencent can express (profanity filter +
+    // key terms) onto its own config fields.
+    #[test]
+    fn from_standard_maps_features() {
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "tencent".into(),
+                api_key: "id|key|app".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                profanity_filter: Some(true),
+                keyterms: Some(vec!["WaaV".into(), "Tencent".into()]),
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+            translation: None,
+        };
+        let cfg = TencentSttConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.filter_dirty, TencentFilterDirtyMode::Filter); // profanity_filter
+        assert_eq!(
+            cfg.hotword_list,
+            Some(vec!["WaaV".to_string(), "Tencent".to_string()])
+        ); // keyterms
+    }
 
     // =========================================================================
     // Engine Model Tests
@@ -1107,6 +1228,52 @@ mod tests {
     fn test_config_validation_valid() {
         let config = TencentSttConfig::new("secret_id", "secret_key", "app_id");
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let previous = std::env::var_os("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
+
+        let mut config = TencentSttConfig {
+            endpoint_override: Some("wss://tencent-proxy.example.com".to_string()),
+            ..TencentSttConfig::new("secret_id", "secret_key", "app_id")
+        };
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("ws://tencent-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("ws://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.to_string().contains("SSRF protection"), "{err}");
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("non-WebSocket endpoint_override must be rejected");
+        assert!(err.to_string().contains("not allowed"), "{err}");
+
+        config.endpoint_override = Some("https://tencent-proxy.example.com".to_string());
+        let err = config
+            .validate()
+            .expect_err("HTTP endpoint_override must be rejected for Tencent WebSocket dial");
+        assert!(err.to_string().contains("not allowed"), "{err}");
+
+        // SAFETY: restore the process env before releasing the test env lock.
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", previous);
+            } else {
+                std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+            }
+        }
     }
 
     #[test]

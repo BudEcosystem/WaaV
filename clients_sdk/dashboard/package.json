@@ -9,7 +9,8 @@
     "lint": "npx eslint js/*.js --env browser --env es2022 --parser-options=sourceType:module",
     "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js",
     "test:watch": "node --experimental-vm-modules node_modules/jest/bin/jest.js --watch",
-    "test:coverage": "node --experimental-vm-modules node_modules/jest/bin/jest.js --coverage"
+    "test:coverage": "node --experimental-vm-modules node_modules/jest/bin/jest.js --coverage",
+    "test:e2e": "node --experimental-vm-modules node_modules/jest/bin/jest.js tests/plugin-explorer.test.js --testPathIgnorePatterns=/node_modules/"
   },
   "devDependencies": {
     "jest": "^29.7.0",
@@ -20,10 +21,24 @@
   },
   "jest": {
     "testEnvironment": "jsdom",
-    "moduleFileExtensions": ["js", "mjs"],
+    "moduleFileExtensions": [
+      "js",
+      "mjs"
+    ],
     "transform": {},
-    "testMatch": ["**/tests/**/*.test.js"],
-    "setupFilesAfterEnv": ["./tests/setup.js"],
-    "collectCoverageFrom": ["js/**/*.js", "!js/components/**"]
+    "testMatch": [
+      "**/tests/**/*.test.js"
+    ],
+    "setupFilesAfterEnv": [
+      "./tests/setup.js"
+    ],
+    "collectCoverageFrom": [
+      "js/**/*.js",
+      "!js/components/**"
+    ],
+    "testPathIgnorePatterns": [
+      "/node_modules/",
+      "tests/plugin-explorer.test.js"
+    ]
   }
 }

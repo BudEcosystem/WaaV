@@ -59,6 +59,15 @@ const TOKEN_REFRESH_MARGIN: Duration = Duration::from_secs(86400);
 /// User-Agent header value.
 const USER_AGENT: &str = "WaaV-Gateway/1.0 (Baidu-TTS)";
 
+fn baidu_tts_http_client() -> Result<Client, reqwest::Error> {
+    crate::core::net::ssrf_protected_client_builder(crate::core::net::HTTP_URL_SCHEMES)
+        .user_agent(USER_AGENT)
+        .timeout(REQUEST_TIMEOUT)
+        .pool_max_idle_per_host(4)
+        .pool_idle_timeout(Duration::from_secs(60))
+        .build()
+}
+
 // =============================================================================
 // Token Manager
 // =============================================================================
@@ -75,17 +84,25 @@ struct TokenManager {
     secret_key: String,
     /// HTTP client.
     client: Client,
+    /// Test-only base URL override for the OAuth token-fetch endpoint.
+    endpoint_override: Option<String>,
 }
 
 impl TokenManager {
     /// Create a new token manager.
-    fn new(api_key: String, secret_key: String, client: Client) -> Self {
+    fn new(
+        api_key: String,
+        secret_key: String,
+        client: Client,
+        endpoint_override: Option<String>,
+    ) -> Self {
         Self {
             access_token: RwLock::new(None),
             expires_at: RwLock::new(None),
             api_key,
             secret_key,
             client,
+            endpoint_override,
         }
     }
 
@@ -96,10 +113,10 @@ impl TokenManager {
             let token = self.access_token.read().await;
             let expires_at = self.expires_at.read().await;
 
-            if let (Some(t), Some(exp)) = (token.as_ref(), expires_at.as_ref()) {
-                if *exp > Instant::now() + TOKEN_REFRESH_MARGIN {
-                    return Ok(t.clone());
-                }
+            if let (Some(t), Some(exp)) = (token.as_ref(), expires_at.as_ref())
+                && *exp > Instant::now() + TOKEN_REFRESH_MARGIN
+            {
+                return Ok(t.clone());
             }
         }
 
@@ -111,9 +128,13 @@ impl TokenManager {
     async fn refresh_token(&self) -> Result<String, TTSError> {
         debug!("Refreshing Baidu OAuth access token...");
 
+        let oauth_base = crate::core::tts::standard::override_rest_endpoint(
+            BAIDU_OAUTH_URL,
+            self.endpoint_override.as_deref(),
+        );
         let url = format!(
             "{}?grant_type=client_credentials&client_id={}&client_secret={}",
-            BAIDU_OAUTH_URL, self.api_key, self.secret_key
+            oauth_base, self.api_key, self.secret_key
         );
 
         let response = self
@@ -233,15 +254,20 @@ impl BaiduTts {
     /// Create a new Baidu TTS provider (internal).
     fn create_internal(config: TTSConfig) -> TTSResult<Self> {
         let baidu_config = BaiduTtsConfig::from_base(config.clone())?;
+        Self::create_from_baidu_config(config, baidu_config)
+    }
+
+    /// Assemble the provider from a base config and an already-resolved Baidu config. Shared by the
+    /// flat `create_internal` (`from_base`) and the standardized `from_standard` paths so the
+    /// HTTP/token-manager wiring stays in one place.
+    fn create_from_baidu_config(
+        base_config: TTSConfig,
+        baidu_config: BaiduTtsConfig,
+    ) -> TTSResult<Self> {
         baidu_config.validate()?;
 
         // Create HTTP client with connection pooling
-        let client = Client::builder()
-            .user_agent(USER_AGENT)
-            .timeout(REQUEST_TIMEOUT)
-            .pool_max_idle_per_host(4)
-            .pool_idle_timeout(Duration::from_secs(60))
-            .build()
+        let client = baidu_tts_http_client()
             .map_err(|e| TTSError::InternalError(format!("Failed to create HTTP client: {}", e)))?;
 
         // Create token manager
@@ -249,10 +275,11 @@ impl BaiduTts {
             baidu_config.api_key.clone(),
             baidu_config.secret_key.clone(),
             client.clone(),
+            baidu_config.endpoint_override.clone(),
         ));
 
         Ok(Self {
-            base_config: config,
+            base_config,
             config: baidu_config,
             token_manager,
             client,
@@ -261,6 +288,19 @@ impl BaiduTts {
             bytes_synthesized: Arc::new(AtomicU64::new(0)),
             requests_count: Arc::new(AtomicU64::new(0)),
         })
+    }
+
+    /// Build from the standardized config (W1 keystone). Mirrors [`DeepgramTTS::from_standard`]:
+    /// the provider struct (not just the config) is the dispatch entry point. Baidu maps `speed`,
+    /// `pitch` and `volume` onto its 0-15 prosody knobs (plus the `cuid` / `use_https` extras
+    /// passthrough) via [`BaiduTtsConfig::from_standard`]; the resulting Baidu config — which
+    /// `synthesize_chunk` reads `spd`/`pit`/`vol` from — is what the provider stores. Features
+    /// Baidu can't express are skipped (capability gaps).
+    ///
+    /// [`DeepgramTTS::from_standard`]: crate::core::tts::deepgram::DeepgramTTS::from_standard
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
+        let baidu_config = BaiduTtsConfig::from_standard(std)?;
+        Self::create_from_baidu_config(std.base.clone(), baidu_config)
     }
 
     /// Prepare text for TTS request.
@@ -312,7 +352,10 @@ impl BaiduTts {
 
         // Build request form data
         let prepared_text = Self::prepare_text(text);
-        let endpoint = self.config.get_endpoint_url();
+        let endpoint = crate::core::tts::standard::override_rest_endpoint(
+            self.config.get_endpoint_url(),
+            self.config.endpoint_override.as_deref(),
+        );
 
         let form_data = [
             ("tex", prepared_text.as_str()),
@@ -578,6 +621,7 @@ impl BaseTTS for BaiduTts {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::ErrorKind;
 
     fn create_test_config() -> TTSConfig {
         TTSConfig {
@@ -594,6 +638,83 @@ mod tests {
         let config = create_test_config();
         let result = BaiduTts::new(config);
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn baidu_tts_redirect_policy_rejects_private_hop() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) => {
+                if err.kind() == ErrorKind::PermissionDenied {
+                    eprintln!("Skipping baidu_tts_redirect_policy_rejects_private_hop: {err}");
+                    return;
+                }
+                panic!("Failed to bind redirect test server listener: {err}");
+            }
+        };
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 302 Found\r\n",
+                "Location: http://127.0.0.1:9/metadata\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n"
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+
+        let err = baidu_tts_http_client()
+            .unwrap()
+            .get(format!("http://{addr}/start"))
+            .send()
+            .await
+            .expect_err("private redirect target must be rejected");
+        let mut error_chain = err.to_string();
+        let mut source = std::error::Error::source(&err);
+        while let Some(error) = source {
+            error_chain.push_str(": ");
+            error_chain.push_str(&error.to_string());
+            source = error.source();
+        }
+        assert!(
+            error_chain.contains("redirect URL rejected"),
+            "unexpected redirect error: {error_chain}"
+        );
+    }
+
+    // The provider STRUCT's `from_standard` (the dispatch entry point) carries Baidu's expressible
+    // advanced features — the 0-15 speed/pitch/volume prosody knobs — onto the stored Baidu config
+    // that `synthesize_chunk` reads `spd`/`pit`/`vol` from.
+    #[test]
+    fn from_standard_carries_prosody_to_provider() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "baidu".into(),
+                api_key: "test_api_key|test_secret_key".into(),
+                voice_id: Some("0".into()),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(4.0), // maps to 15 (max)
+                pitch: Some(8.0),
+                volume: Some(12.0),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let tts = BaiduTts::from_standard(&std).unwrap();
+        assert_eq!(tts.config.speed, 15);
+        assert_eq!(tts.config.pitch, 8);
+        assert_eq!(tts.config.volume, 12);
     }
 
     #[test]

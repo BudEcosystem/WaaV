@@ -36,7 +36,7 @@ mod env;
 mod merge;
 pub mod pricing;
 mod sip;
-mod utils;
+pub(crate) mod utils;
 mod validation;
 mod yaml;
 
@@ -176,6 +176,38 @@ pub struct ServerConfig {
     pub cartesia_api_key: Option<String>,
     /// OpenAI API key for STT (Whisper), TTS, and Realtime API
     pub openai_api_key: Option<String>,
+    /// Azure OpenAI Realtime API key (sent as the `api-key` header). The realtime
+    /// wire is the OpenAI GA wire reused by delegation; only the endpoint + auth
+    /// differ. Distinct from `azure_speech_subscription_key` (Speech Services).
+    pub azure_openai_api_key: Option<String>,
+    /// Azure OpenAI resource/endpoint for the Realtime API — either a bare
+    /// resource name (`my-resource`) or a full host/URL
+    /// (`https://my-resource.openai.azure.com`). Required for the `azure` realtime provider.
+    pub azure_openai_endpoint: Option<String>,
+    /// Grok / xAI Realtime API key (Bearer auth). OpenAI GA-compatible wire.
+    pub grok_api_key: Option<String>,
+    /// Inworld Realtime API key (Bearer auth). OpenAI GA wire reused by delegation.
+    pub inworld_api_key: Option<String>,
+    /// Google Gemini API key (used for the Gemini Live BidiGenerateContent S2S
+    /// realtime provider; passed as the `?key=` query param). Distinct from
+    /// `google_credentials` (the service-account JSON used by Google STT/TTS).
+    pub gemini_api_key: Option<String>,
+    /// Ultravox API key (used for the Ultravox hosted S2S realtime provider; sent
+    /// as the `X-API-Key` header on the REST create-call that mints the WS join url).
+    pub ultravox_api_key: Option<String>,
+    /// Speechmatics API key (a JWT / temporary token). Shared by Speechmatics STT,
+    /// TTS, and the Flow (Voice AI) realtime provider; for Flow it is passed as the
+    /// `Authorization: Bearer <token>` value. Also read from `SPEECHMATICS_API_KEY`.
+    pub speechmatics_api_key: Option<String>,
+    /// Yandex Cloud AI Studio Realtime API key — a Yandex IAM token or a static API
+    /// key, sent as the `Authorization: Bearer <token>` value. Used by the `yandex`
+    /// realtime provider (an OpenAI-protocol clone). Read from `YANDEX_API_KEY`.
+    pub yandex_api_key: Option<String>,
+    /// Yandex Cloud folder id (the `<FOLDER_ID>` in the `gpt://<FOLDER_ID>/<model>`
+    /// model URI) for the `yandex` realtime provider. Required for `yandex`; the
+    /// realtime handler injects it into the provider's `endpoint` slot (mirroring
+    /// the Azure resource injection). Read from `YANDEX_FOLDER_ID`.
+    pub yandex_folder_id: Option<String>,
     /// AssemblyAI API key for streaming STT
     pub assemblyai_api_key: Option<String>,
     /// Hume AI API key for TTS (Octave) and EVI (Empathic Voice Interface)
@@ -275,6 +307,32 @@ pub struct ServerConfig {
     /// DAG timeout configuration for pipeline execution (optional)
     /// Only used when the `dag-routing` feature is enabled
     pub dag_timeouts: DAGTimeoutsConfig,
+
+    /// SERVER-SIDE realtime upstream URL overrides, keyed by realtime provider
+    /// name (`openai`, `azure`, `grok`, `inworld`, `deepgram`, `elevenlabs`,
+    /// `gemini`, `ultravox`, `hume`, `speechmatics`). Read at config load from the
+    /// `<PROVIDER>_REALTIME_URL` env vars (e.g. `OPENAI_REALTIME_URL`). When a
+    /// provider has an entry whose value starts with `ws://`/`wss://`, the realtime
+    /// handler injects it into that session's
+    /// [`RealtimeConfig::realtime_endpoint_override`](crate::core::realtime::RealtimeConfig::realtime_endpoint_override)
+    /// and the provider's `connect_spec` dials it VERBATIM instead of its default
+    /// host. Use cases: a PROXY, a SELF-HOSTED / GOV-CLOUD deployment, or a local
+    /// MOCK upstream for credential-free testing.
+    ///
+    /// SECURITY: this is TRUSTED server configuration only. It is NEVER derived
+    /// from a client's `RealtimeSessionConfig` (clients cannot set an endpoint at
+    /// all — the field does not exist on the client message), so a connecting
+    /// client cannot point the gateway at an attacker-chosen upstream (no SSRF).
+    /// Not a secret (URLs), so it is not zeroized on drop.
+    pub realtime_endpoint_overrides: HashMap<String, String>,
+
+    /// SERVER-SIDE alias registry (P3): logical name → resolved `{stt, tts, llm}` /
+    /// `dag_template` bundle. Loaded from the `aliases:` section of `config.yaml` and
+    /// registered into [`crate::core::alias::global_aliases`] at startup. A client may
+    /// only NAME an alias on its `config` message, never DEFINE one, so it cannot
+    /// inject a backend url/credential (SSRF-safe, the same trust model as
+    /// [`Self::realtime_endpoint_overrides`]). Not a secret, so not zeroized on drop.
+    pub aliases: crate::core::alias::AliasConfig,
 }
 
 /// Implement Drop to zeroize all secret fields when ServerConfig is dropped.
@@ -306,6 +364,27 @@ impl Drop for ServerConfig {
             key.zeroize();
         }
         if let Some(ref mut key) = self.openai_api_key {
+            key.zeroize();
+        }
+        if let Some(ref mut key) = self.azure_openai_api_key {
+            key.zeroize();
+        }
+        if let Some(ref mut key) = self.grok_api_key {
+            key.zeroize();
+        }
+        if let Some(ref mut key) = self.inworld_api_key {
+            key.zeroize();
+        }
+        if let Some(ref mut key) = self.gemini_api_key {
+            key.zeroize();
+        }
+        if let Some(ref mut key) = self.ultravox_api_key {
+            key.zeroize();
+        }
+        if let Some(ref mut key) = self.speechmatics_api_key {
+            key.zeroize();
+        }
+        if let Some(ref mut key) = self.yandex_api_key {
             key.zeroize();
         }
         if let Some(ref mut key) = self.assemblyai_api_key {
@@ -453,7 +532,13 @@ impl ServerConfig {
     ///
     /// Returns true if both AUTH_SERVICE_URL and AUTH_SIGNING_KEY_PATH are set
     pub fn has_jwt_auth(&self) -> bool {
-        self.auth_service_url.is_some() && self.auth_signing_key_path.is_some()
+        self.auth_service_url
+            .as_ref()
+            .is_some_and(|u| !u.trim().is_empty())
+            && self
+                .auth_signing_key_path
+                .as_ref()
+                .is_some_and(|p| !p.as_os_str().is_empty())
     }
 
     /// Check if API secret authentication is configured
@@ -492,6 +577,22 @@ impl ServerConfig {
     /// # }
     /// ```
     pub fn get_api_key(&self, provider: &str) -> Result<String, String> {
+        let key = self.get_api_key_inner(provider)?;
+        // Defense in depth: merge-time filtering already drops placeholder YAML
+        // values, but a placeholder can still arrive via env/direct construction.
+        // Never hand a placeholder to a provider (observed live: Deepgram 401
+        // with the literal "your-deepgram-api-key"). Google is exempt — empty
+        // means Application Default Credentials there.
+        if provider.to_lowercase() != "google" && utils::is_placeholder_credential(&key) {
+            return Err(format!(
+                "{provider} API key is a placeholder/empty — set the real key \
+                 (see the # ENV comments in config.yaml)"
+            ));
+        }
+        Ok(key)
+    }
+
+    fn get_api_key_inner(&self, provider: &str) -> Result<String, String> {
         match provider.to_lowercase().as_str() {
             "deepgram" => {
                 self.deepgram_api_key.as_ref().cloned().ok_or_else(|| {
@@ -729,6 +830,15 @@ mod tests {
             azure_speech_region: None,
             cartesia_api_key: None,
             openai_api_key: None,
+            azure_openai_api_key: None,
+            azure_openai_endpoint: None,
+            grok_api_key: None,
+            inworld_api_key: None,
+            gemini_api_key: None,
+            ultravox_api_key: None,
+            speechmatics_api_key: None,
+            yandex_api_key: None,
+            yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -766,6 +876,8 @@ mod tests {
             ws_processing_timeout_secs: 10,
             realtime_processing_timeout_secs: 30,
             sip_max_participants: 3,
+            realtime_endpoint_overrides: Default::default(),
+            aliases: Default::default(),
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
         }
@@ -803,6 +915,15 @@ mod tests {
             azure_speech_region: None,
             cartesia_api_key: None,
             openai_api_key: None,
+            azure_openai_api_key: None,
+            azure_openai_endpoint: None,
+            grok_api_key: None,
+            inworld_api_key: None,
+            gemini_api_key: None,
+            ultravox_api_key: None,
+            speechmatics_api_key: None,
+            yandex_api_key: None,
+            yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -840,6 +961,8 @@ mod tests {
             ws_processing_timeout_secs: 10,
             realtime_processing_timeout_secs: 30,
             sip_max_participants: 3,
+            realtime_endpoint_overrides: Default::default(),
+            aliases: Default::default(),
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
         };
@@ -866,6 +989,15 @@ mod tests {
             azure_speech_region: None,
             cartesia_api_key: None,
             openai_api_key: None,
+            azure_openai_api_key: None,
+            azure_openai_endpoint: None,
+            grok_api_key: None,
+            inworld_api_key: None,
+            gemini_api_key: None,
+            ultravox_api_key: None,
+            speechmatics_api_key: None,
+            yandex_api_key: None,
+            yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -903,6 +1035,8 @@ mod tests {
             ws_processing_timeout_secs: 10,
             realtime_processing_timeout_secs: 30,
             sip_max_participants: 3,
+            realtime_endpoint_overrides: Default::default(),
+            aliases: Default::default(),
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
         };
@@ -932,6 +1066,15 @@ mod tests {
             azure_speech_region: None,
             cartesia_api_key: None,
             openai_api_key: None,
+            azure_openai_api_key: None,
+            azure_openai_endpoint: None,
+            grok_api_key: None,
+            inworld_api_key: None,
+            gemini_api_key: None,
+            ultravox_api_key: None,
+            speechmatics_api_key: None,
+            yandex_api_key: None,
+            yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -969,6 +1112,8 @@ mod tests {
             ws_processing_timeout_secs: 10,
             realtime_processing_timeout_secs: 30,
             sip_max_participants: 3,
+            realtime_endpoint_overrides: Default::default(),
+            aliases: Default::default(),
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
         };
@@ -998,6 +1143,15 @@ mod tests {
             azure_speech_region: None,
             cartesia_api_key: None,
             openai_api_key: None,
+            azure_openai_api_key: None,
+            azure_openai_endpoint: None,
+            grok_api_key: None,
+            inworld_api_key: None,
+            gemini_api_key: None,
+            ultravox_api_key: None,
+            speechmatics_api_key: None,
+            yandex_api_key: None,
+            yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1035,6 +1189,8 @@ mod tests {
             ws_processing_timeout_secs: 10,
             realtime_processing_timeout_secs: 30,
             sip_max_participants: 3,
+            realtime_endpoint_overrides: Default::default(),
+            aliases: Default::default(),
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
         };
@@ -1070,6 +1226,15 @@ mod tests {
             azure_speech_region: None,
             cartesia_api_key: None,
             openai_api_key: None,
+            azure_openai_api_key: None,
+            azure_openai_endpoint: None,
+            grok_api_key: None,
+            inworld_api_key: None,
+            gemini_api_key: None,
+            ultravox_api_key: None,
+            speechmatics_api_key: None,
+            yandex_api_key: None,
+            yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1107,6 +1272,8 @@ mod tests {
             ws_processing_timeout_secs: 10,
             realtime_processing_timeout_secs: 30,
             sip_max_participants: 3,
+            realtime_endpoint_overrides: Default::default(),
+            aliases: Default::default(),
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
         };
@@ -1129,6 +1296,15 @@ mod tests {
             azure_speech_region: None,
             cartesia_api_key: None,
             openai_api_key: None,
+            azure_openai_api_key: None,
+            azure_openai_endpoint: None,
+            grok_api_key: None,
+            inworld_api_key: None,
+            gemini_api_key: None,
+            ultravox_api_key: None,
+            speechmatics_api_key: None,
+            yandex_api_key: None,
+            yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1166,11 +1342,19 @@ mod tests {
             ws_processing_timeout_secs: 10,
             realtime_processing_timeout_secs: 30,
             sip_max_participants: 3,
+            realtime_endpoint_overrides: Default::default(),
+            aliases: Default::default(),
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
         };
 
         assert!(!config_without_jwt.has_jwt_auth());
+
+        let mut config_with_blank_jwt_url = config_without_jwt;
+        config_with_blank_jwt_url.auth_service_url = Some("   ".to_string());
+        config_with_blank_jwt_url.auth_signing_key_path = Some(PathBuf::from("test_key.pem"));
+
+        assert!(!config_with_blank_jwt_url.has_jwt_auth());
     }
 
     #[test]
@@ -1190,6 +1374,15 @@ mod tests {
             azure_speech_region: None,
             cartesia_api_key: None,
             openai_api_key: None,
+            azure_openai_api_key: None,
+            azure_openai_endpoint: None,
+            grok_api_key: None,
+            inworld_api_key: None,
+            gemini_api_key: None,
+            ultravox_api_key: None,
+            speechmatics_api_key: None,
+            yandex_api_key: None,
+            yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1230,6 +1423,8 @@ mod tests {
             ws_processing_timeout_secs: 10,
             realtime_processing_timeout_secs: 30,
             sip_max_participants: 3,
+            realtime_endpoint_overrides: Default::default(),
+            aliases: Default::default(),
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
         };
@@ -1252,6 +1447,15 @@ mod tests {
             azure_speech_region: None,
             cartesia_api_key: None,
             openai_api_key: None,
+            azure_openai_api_key: None,
+            azure_openai_endpoint: None,
+            grok_api_key: None,
+            inworld_api_key: None,
+            gemini_api_key: None,
+            ultravox_api_key: None,
+            speechmatics_api_key: None,
+            yandex_api_key: None,
+            yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1289,6 +1493,8 @@ mod tests {
             ws_processing_timeout_secs: 10,
             realtime_processing_timeout_secs: 30,
             sip_max_participants: 3,
+            realtime_endpoint_overrides: Default::default(),
+            aliases: Default::default(),
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
         };
@@ -1313,6 +1519,15 @@ mod tests {
             azure_speech_region: None,
             cartesia_api_key: None,
             openai_api_key: None,
+            azure_openai_api_key: None,
+            azure_openai_endpoint: None,
+            grok_api_key: None,
+            inworld_api_key: None,
+            gemini_api_key: None,
+            ultravox_api_key: None,
+            speechmatics_api_key: None,
+            yandex_api_key: None,
+            yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1359,6 +1574,8 @@ mod tests {
             ws_processing_timeout_secs: 10,
             realtime_processing_timeout_secs: 30,
             sip_max_participants: 3,
+            realtime_endpoint_overrides: Default::default(),
+            aliases: Default::default(),
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
         };
@@ -1384,6 +1601,15 @@ mod tests {
             azure_speech_region: None,
             cartesia_api_key: None,
             openai_api_key: None,
+            azure_openai_api_key: None,
+            azure_openai_endpoint: None,
+            grok_api_key: None,
+            inworld_api_key: None,
+            gemini_api_key: None,
+            ultravox_api_key: None,
+            speechmatics_api_key: None,
+            yandex_api_key: None,
+            yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1421,6 +1647,8 @@ mod tests {
             ws_processing_timeout_secs: 10,
             realtime_processing_timeout_secs: 30,
             sip_max_participants: 3,
+            realtime_endpoint_overrides: Default::default(),
+            aliases: Default::default(),
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
         };
@@ -1449,6 +1677,15 @@ mod tests {
             azure_speech_region: None,
             cartesia_api_key: None,
             openai_api_key: None,
+            azure_openai_api_key: None,
+            azure_openai_endpoint: None,
+            grok_api_key: None,
+            inworld_api_key: None,
+            gemini_api_key: None,
+            ultravox_api_key: None,
+            speechmatics_api_key: None,
+            yandex_api_key: None,
+            yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1486,6 +1723,8 @@ mod tests {
             ws_processing_timeout_secs: 10,
             realtime_processing_timeout_secs: 30,
             sip_max_participants: 3,
+            realtime_endpoint_overrides: Default::default(),
+            aliases: Default::default(),
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
         };
@@ -1513,6 +1752,15 @@ mod tests {
             azure_speech_region: None,
             cartesia_api_key: None,
             openai_api_key: None,
+            azure_openai_api_key: None,
+            azure_openai_endpoint: None,
+            grok_api_key: None,
+            inworld_api_key: None,
+            gemini_api_key: None,
+            ultravox_api_key: None,
+            speechmatics_api_key: None,
+            yandex_api_key: None,
+            yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1550,6 +1798,8 @@ mod tests {
             ws_processing_timeout_secs: 10,
             realtime_processing_timeout_secs: 30,
             sip_max_participants: 3,
+            realtime_endpoint_overrides: Default::default(),
+            aliases: Default::default(),
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
         };
@@ -1577,6 +1827,15 @@ mod tests {
             azure_speech_region: None,
             cartesia_api_key: None,
             openai_api_key: None,
+            azure_openai_api_key: None,
+            azure_openai_endpoint: None,
+            grok_api_key: None,
+            inworld_api_key: None,
+            gemini_api_key: None,
+            ultravox_api_key: None,
+            speechmatics_api_key: None,
+            yandex_api_key: None,
+            yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1614,6 +1873,8 @@ mod tests {
             ws_processing_timeout_secs: 10,
             realtime_processing_timeout_secs: 30,
             sip_max_participants: 3,
+            realtime_endpoint_overrides: Default::default(),
+            aliases: Default::default(),
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
         };
@@ -1646,6 +1907,15 @@ mod tests {
             azure_speech_region: Some("westus2".to_string()),
             cartesia_api_key: None,
             openai_api_key: None,
+            azure_openai_api_key: None,
+            azure_openai_endpoint: None,
+            grok_api_key: None,
+            inworld_api_key: None,
+            gemini_api_key: None,
+            ultravox_api_key: None,
+            speechmatics_api_key: None,
+            yandex_api_key: None,
+            yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1683,6 +1953,8 @@ mod tests {
             ws_processing_timeout_secs: 10,
             realtime_processing_timeout_secs: 30,
             sip_max_participants: 3,
+            realtime_endpoint_overrides: Default::default(),
+            aliases: Default::default(),
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
         };
@@ -1709,6 +1981,15 @@ mod tests {
             azure_speech_region: None,
             cartesia_api_key: None,
             openai_api_key: None,
+            azure_openai_api_key: None,
+            azure_openai_endpoint: None,
+            grok_api_key: None,
+            inworld_api_key: None,
+            gemini_api_key: None,
+            ultravox_api_key: None,
+            speechmatics_api_key: None,
+            yandex_api_key: None,
+            yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1746,6 +2027,8 @@ mod tests {
             ws_processing_timeout_secs: 10,
             realtime_processing_timeout_secs: 30,
             sip_max_participants: 3,
+            realtime_endpoint_overrides: Default::default(),
+            aliases: Default::default(),
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
         };
@@ -1775,6 +2058,15 @@ mod tests {
             azure_speech_region: Some("westeurope".to_string()),
             cartesia_api_key: None,
             openai_api_key: None,
+            azure_openai_api_key: None,
+            azure_openai_endpoint: None,
+            grok_api_key: None,
+            inworld_api_key: None,
+            gemini_api_key: None,
+            ultravox_api_key: None,
+            speechmatics_api_key: None,
+            yandex_api_key: None,
+            yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1812,6 +2104,8 @@ mod tests {
             ws_processing_timeout_secs: 10,
             realtime_processing_timeout_secs: 30,
             sip_max_participants: 3,
+            realtime_endpoint_overrides: Default::default(),
+            aliases: Default::default(),
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
         };
@@ -1836,6 +2130,15 @@ mod tests {
             azure_speech_region: None,
             cartesia_api_key: None,
             openai_api_key: None,
+            azure_openai_api_key: None,
+            azure_openai_endpoint: None,
+            grok_api_key: None,
+            inworld_api_key: None,
+            gemini_api_key: None,
+            ultravox_api_key: None,
+            speechmatics_api_key: None,
+            yandex_api_key: None,
+            yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
             lmnt_api_key: None,
@@ -1873,6 +2176,8 @@ mod tests {
             ws_processing_timeout_secs: 10,
             realtime_processing_timeout_secs: 30,
             sip_max_participants: 3,
+            realtime_endpoint_overrides: Default::default(),
+            aliases: Default::default(),
             plugins: PluginConfig::default(),
             dag_timeouts: DAGTimeoutsConfig::default(),
         };
@@ -1972,6 +2277,108 @@ providers:
         assert_eq!(config.port, 8080);
 
         cleanup_env_vars();
+    }
+
+    /// P0.2: a PLACEHOLDER credential in YAML (the shipped config style) must
+    /// fall through to the env var — previously the placeholder was returned
+    /// verbatim and sent to the provider (observed live as a Deepgram 401).
+    #[test]
+    #[serial]
+    fn test_yaml_placeholder_credential_falls_through_to_env() {
+        cleanup_env_vars();
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.yaml");
+        fs::write(
+            &config_path,
+            "providers:\n  deepgram_api_key: \"your-deepgram-api-key\"\n",
+        )
+        .unwrap();
+        unsafe {
+            env::set_var("DEEPGRAM_API_KEY", "env-real-key");
+        }
+
+        let config = ServerConfig::from_file(&config_path).unwrap();
+        assert_eq!(
+            config.deepgram_api_key,
+            Some("env-real-key".to_string()),
+            "placeholder YAML credential must be treated as unset so env applies"
+        );
+        assert_eq!(config.get_api_key("deepgram").unwrap(), "env-real-key");
+
+        cleanup_env_vars();
+    }
+
+    /// P0.2: a placeholder with NO env var is "not configured" — a clear error,
+    /// never a credential handed to a provider.
+    #[test]
+    #[serial]
+    fn test_placeholder_credential_alone_is_not_configured() {
+        cleanup_env_vars();
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.yaml");
+        fs::write(
+            &config_path,
+            "providers:\n  deepgram_api_key: \"your-deepgram-api-key\"\n",
+        )
+        .unwrap();
+
+        let config = ServerConfig::from_file(&config_path).unwrap();
+        assert_eq!(
+            config.deepgram_api_key, None,
+            "placeholder must not survive the merge as a configured credential"
+        );
+        let err = config.get_api_key("deepgram").unwrap_err();
+        assert!(
+            err.contains("not configured") || err.contains("placeholder"),
+            "error must say the key is missing/placeholder, got: {err}"
+        );
+
+        cleanup_env_vars();
+    }
+
+    /// A placeholder credential is rejected via BOTH seams (review: empty/
+    /// placeholder-key consistency):
+    ///
+    /// 1. `from_env` now filters empty/placeholder env values to `None` (the same
+    ///    `is_placeholder_credential` filter the YAML/merge path uses — the env
+    ///    path used to leak the placeholder/`Some("")` through), so the env
+    ///    placeholder surfaces as "not configured" (unset).
+    /// 2. Defense-in-depth: a placeholder reaching `get_api_key` by ANOTHER route
+    ///    (e.g. a directly-constructed `ServerConfig` that bypasses `from_env`)
+    ///    is STILL rejected with a "placeholder" error — never handed to a
+    ///    provider (observed live: Deepgram 401 with the literal placeholder).
+    #[test]
+    #[serial]
+    fn test_get_api_key_rejects_placeholder_value() {
+        cleanup_env_vars();
+
+        // (1) Env placeholder ⇒ filtered to None ⇒ "not configured" (now uniform
+        // with the merge path; previously this returned a "placeholder" error
+        // because the env value was passed through unfiltered).
+        unsafe {
+            env::set_var("DEEPGRAM_API_KEY", "your-deepgram-api-key");
+        }
+        let config = ServerConfig::from_env().unwrap();
+        assert_eq!(
+            config.deepgram_api_key, None,
+            "env placeholder credential must resolve to None (filtered, not leaked)"
+        );
+        let err = config.get_api_key("deepgram").unwrap_err();
+        assert!(
+            err.contains("not configured") || err.contains("placeholder"),
+            "env placeholder ⇒ key unset, got: {err}"
+        );
+        cleanup_env_vars();
+
+        // (2) Defense-in-depth: a placeholder that bypasses `from_env`/merge
+        // filtering (direct field set) is still caught by `get_api_key`.
+        let mut direct = test_config();
+        direct.deepgram_api_key = Some("your-deepgram-api-key".to_string());
+        let err = direct.get_api_key("deepgram").unwrap_err();
+        assert!(
+            err.contains("placeholder"),
+            "directly-injected placeholder must be rejected by get_api_key, got: {err}"
+        );
     }
 
     #[test]

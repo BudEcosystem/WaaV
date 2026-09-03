@@ -10,6 +10,17 @@
 //! - WebSocket API (legacy SPE): `/input_stream/websocket` with RAW s16le audio
 //! - gRPC API (Speech Platform 4): High-performance streaming (not implemented here)
 //!
+//! # Resilience (W-D1) — intentionally NOT on the `ReconnectableStream` supervisor
+//!
+//! Every other streaming STT provider drives the generic reconnect supervisor so a mid-stream
+//! socket drop auto-recovers. Phonexia is deliberately excluded: its WebSocket protocol here is
+//! UNVERIFIED against any real Phonexia server (the product exposes gRPC/REST, not this generic
+//! `/ws` + `X-SessionID` shape), so `connect()` FAILS CLOSED by default (see `client.rs`, opt-in
+//! via `WAAV_PHONEXIA_ALLOW_UNVERIFIED=1`). Adding auto-reconnect to a disabled, fabricated-protocol
+//! path that cannot be validated against a live endpoint would add risk without value. This is an
+//! explicit, documented decision (tracked by PRODUCTION_PLAN.md W3), not a silent gap — when the
+//! real gRPC client lands it should adopt the supervisor like the rest of the fleet.
+//!
 //! # Authentication
 //!
 //! - Token-based: Login via `/login` endpoint, use X-SessionID header

@@ -306,8 +306,11 @@ cache:
 # Authentication configuration
 auth:
   required: false                             # ENV: AUTH_REQUIRED (true/false/1/0/yes/no)
-  service_url: "https://auth.example.com"     # ENV: AUTH_SERVICE_URL
-  signing_key_path: "/path/to/key.pem"        # ENV: AUTH_SIGNING_KEY_PATH
+  # Leave service_url + signing_key_path BLANK unless you actually enable JWT auth.
+  # (Non-existent placeholder paths previously caused a fatal startup error even with
+  #  required: false, which broke the quickstart.) Set BOTH together to enable JWT auth.
+  service_url: ""                             # ENV: AUTH_SERVICE_URL  e.g. https://auth.example.com
+  signing_key_path: ""                        # ENV: AUTH_SIGNING_KEY_PATH  e.g. /etc/waav/key.pem
   # ENV: AUTH_API_SECRETS_JSON (JSON array of {id, secret})
   api_secrets:
     - id: "default"

@@ -10,6 +10,12 @@ use reqwest::Client;
 
 use crate::livekit::LiveKitError;
 
+fn sip_api_http_client() -> Result<Client, LiveKitError> {
+    crate::core::net::ssrf_protected_client(crate::core::net::HTTP_URL_SCHEMES).map_err(|e| {
+        LiveKitError::ConnectionFailed(format!("Failed to create SIP API HTTP client: {e}"))
+    })
+}
+
 /// Options for creating an inbound SIP trunk via the raw Twirp API.
 #[derive(Default, Clone)]
 pub struct SIPInboundTrunkOptions {
@@ -41,14 +47,14 @@ impl SIPApiClient {
         host: impl Into<String>,
         api_key: impl Into<String>,
         api_secret: impl Into<String>,
-    ) -> Self {
+    ) -> Result<Self, LiveKitError> {
         let host = Self::normalize_host(host.into());
-        Self {
+        Ok(Self {
             host,
             api_key: api_key.into(),
             api_secret: api_secret.into(),
-            client: Client::new(),
-        }
+            client: sip_api_http_client()?,
+        })
     }
 
     fn normalize_host(host: String) -> String {
@@ -159,6 +165,83 @@ impl SIPApiClient {
         }
     }
 
+    /// Create a SIP dispatch rule WITH `room_config` (max_participants etc.) set at creation.
+    ///
+    /// livekit-api 0.4.9's `CreateSIPDispatchRuleOptions` wrapper drops `room_config` entirely
+    /// (its request builder uses `..Default::default()`), even though the pinned
+    /// livekit-protocol 0.5.1 `CreateSipDispatchRuleRequest` carries the field — so the
+    /// configured `max_participants` was silently ignored and had to be set through the LiveKit
+    /// dashboard afterwards. This raw twirp call closes that gap (the same pattern as
+    /// [`create_sip_inbound_trunk`](Self::create_sip_inbound_trunk)).
+    pub async fn create_sip_dispatch_rule_with_room_config(
+        &self,
+        name: String,
+        rule: proto::sip_dispatch_rule::Rule,
+        trunk_ids: Vec<String>,
+        max_participants: u32,
+    ) -> Result<proto::SipDispatchRuleInfo, LiveKitError> {
+        let url = self.twirp_endpoint("SIP", "CreateSIPDispatchRule");
+
+        let room_config = (max_participants > 0).then(|| proto::RoomConfiguration {
+            max_participants,
+            ..Default::default()
+        });
+        // The top-level name/rule/trunk_ids/room_config fields are DEPRECATED in livekit-protocol
+        // 0.5.1 in favor of the `dispatch_rule: SipDispatchRuleInfo` envelope — populate the
+        // envelope (servers accept either; the envelope is the forward-compatible shape).
+        let request = proto::CreateSipDispatchRuleRequest {
+            dispatch_rule: Some(proto::SipDispatchRuleInfo {
+                name,
+                rule: Some(proto::SipDispatchRule { rule: Some(rule) }),
+                trunk_ids,
+                room_config,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let auth_header = self
+            .auth_header(SIPGrants {
+                admin: true,
+                ..Default::default()
+            })
+            .map_err(|e| {
+                LiveKitError::ConnectionFailed(format!("Failed to create auth token: {e}"))
+            })?;
+
+        let mut buf = Vec::new();
+        request.encode(&mut buf).map_err(|e| {
+            LiveKitError::ConnectionFailed(format!("Failed to encode SIP request: {e}"))
+        })?;
+
+        let resp = self
+            .client
+            .post(url)
+            .header(CONTENT_TYPE, "application/protobuf")
+            .header(AUTHORIZATION, auth_header)
+            .body(buf)
+            .send()
+            .await
+            .map_err(|e| {
+                LiveKitError::ConnectionFailed(format!("Failed to send SIP request: {e}"))
+            })?;
+
+        if resp.status().is_success() {
+            let bytes = resp.bytes().await.map_err(|e| {
+                LiveKitError::ConnectionFailed(format!("Failed to read SIP response: {e}"))
+            })?;
+            proto::SipDispatchRuleInfo::decode(bytes.as_ref()).map_err(|e| {
+                LiveKitError::ConnectionFailed(format!("Failed to decode SIP response: {e}"))
+            })
+        } else {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            Err(LiveKitError::ConnectionFailed(format!(
+                "LiveKit SIP returned {status}: {body}"
+            )))
+        }
+    }
+
     /// Transfer a SIP participant to a new destination.
     ///
     /// This initiates a SIP REFER to transfer the call to the specified destination.
@@ -257,5 +340,63 @@ impl SIPApiClient {
                 "LiveKit SIP transfer returned {status}: {body}"
             )))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::ErrorKind;
+
+    #[tokio::test]
+    async fn sip_api_http_client_redirect_policy_rejects_private_hop() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) => {
+                if err.kind() == ErrorKind::PermissionDenied {
+                    eprintln!(
+                        "Skipping sip_api_http_client_redirect_policy_rejects_private_hop: {err}"
+                    );
+                    return;
+                }
+                panic!("Failed to bind redirect test server listener: {err}");
+            }
+        };
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 302 Found\r\n",
+                "Location: http://127.0.0.1:9/metadata\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n"
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+
+        let err = sip_api_http_client()
+            .unwrap()
+            .get(format!("http://{addr}/start"))
+            .send()
+            .await
+            .expect_err("private redirect target must be rejected");
+        let mut error_chain = err.to_string();
+        let mut source = std::error::Error::source(&err);
+        while let Some(error) = source {
+            error_chain.push_str(": ");
+            error_chain.push_str(&error.to_string());
+            source = error.source();
+        }
+        assert!(
+            error_chain.contains("redirect URL rejected"),
+            "unexpected redirect error: {error_chain}"
+        );
     }
 }

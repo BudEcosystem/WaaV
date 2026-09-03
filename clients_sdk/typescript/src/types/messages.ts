@@ -5,11 +5,19 @@
  * - OutgoingMessage: Messages the CLIENT sends TO the server
  * - IncomingMessage: Messages the CLIENT receives FROM the server
  *
- * Note: This is the opposite of Sayna's (server) naming convention in messages.rs
+ * Note: This is the opposite of the gateway (server) naming convention in messages.rs
  * where IncomingMessage = what server receives and OutgoingMessage = what server sends.
  */
 
 import type { STTConfig, TTSConfig, LiveKitConfig, Emotion, DeliveryStyle, EmotionIntensityLevel } from './config.js';
+
+/**
+ * The WebSocket wire-protocol version this SDK is built against. The gateway
+ * sends its own `protocol_version` on the `ready` message; the SDK asserts the
+ * two match so a breaking contract change surfaces as an explicit mismatch
+ * warning instead of silent field drift. Mirrors gateway PROTOCOL_VERSION.
+ */
+export const PROTOCOL_VERSION = '1.0';
 
 // ============================================================================
 // Outgoing Messages (Client -> Server)
@@ -51,8 +59,8 @@ export interface ConfigMessage {
   livekit?: {
     room_name: string;
     enable_recording?: boolean;
-    sayna_participant_identity?: string;
-    sayna_participant_name?: string;
+    waav_participant_identity?: string;
+    waav_participant_name?: string;
     listen_participants?: string[];
   };
 }
@@ -91,10 +99,18 @@ export interface SpeakMessage {
 }
 
 /**
- * Clear message to stop current TTS playback
+ * Clear message to stop current TTS playback (barge-in / cancel).
  */
 export interface ClearMessage {
   type: 'clear';
+}
+
+/**
+ * Audio-end message: signals the gateway that the inbound audio stream has
+ * ended so it finalizes any pending transcript.
+ */
+export interface AudioEndMessage {
+  type: 'audio_end';
 }
 
 /**
@@ -128,6 +144,7 @@ export type OutgoingMessage =
   | ConfigMessage
   | SpeakMessage
   | ClearMessage
+  | AudioEndMessage
   | SendMessageMessage
   | SIPTransferMessage;
 
@@ -141,6 +158,12 @@ export type OutgoingMessage =
  */
 export interface ReadyMessage {
   type: 'ready';
+  /**
+   * WebSocket wire-protocol version (gateway PROTOCOL_VERSION, e.g. "1.0").
+   * SDKs assert this on connect so a breaking change to the message contract
+   * surfaces as an explicit version mismatch instead of silent field drift.
+   */
+  protocol_version?: string;
   /** Unique identifier for this WebSocket session */
   stream_id: string;
   /** LiveKit room name that was created */
@@ -148,9 +171,56 @@ export interface ReadyMessage {
   /** LiveKit URL to connect to */
   livekit_url?: string;
   /** Identity of the AI agent participant in the room */
-  sayna_participant_identity?: string;
+  waav_participant_identity?: string;
   /** Display name of the AI agent participant */
-  sayna_participant_name?: string;
+  waav_participant_name?: string;
+  /**
+   * P3 proxy/alias echo: the concrete providers the gateway resolved an `alias`
+   * to (no secrets). Present only when an `alias` was sent and recognized. Lets a
+   * developer SEE what e.g. "support-bot" became — and re-point it server-side
+   * with zero client change.
+   */
+  resolved_alias?: ResolvedAlias;
+  /** D8 negotiated uplink transport codec in effect (`linear16` | `opus`); present only on request. */
+  audio_in_codec?: string;
+  /** D8 negotiated downlink transport codec in effect (`linear16` | `opus`); present only on request. */
+  audio_out_codec?: string;
+}
+
+/**
+ * The post-merge concrete bundle a server-defined `alias` resolved to (P3),
+ * echoed on `ready`. No secrets (system prompts / API keys are omitted).
+ */
+export interface ResolvedAlias {
+  /** The alias name that was resolved. */
+  name?: string;
+  /** Resolution kind: stt | tts | realtime | agent | dag. */
+  kind?: string;
+  /** Resolved STT provider/model/language. */
+  stt?: Record<string, unknown>;
+  /** Resolved TTS provider/voice/emotion. */
+  tts?: Record<string, unknown>;
+  /** Resolved LLM/conversation settings. */
+  llm?: Record<string, unknown>;
+  /** Resolved DAG template name, when the alias routes to a DAG. */
+  dag_template?: string;
+}
+
+/**
+ * One translated segment in the uniform gateway `translations` array (P5).
+ *
+ * The gateway folds Speechmatics `AddTranslation` / Gladia `type:"translation"` /
+ * the OpenAI-Groq English fast path into this single `{lang, text}` shape so the
+ * SDK reads ONE field regardless of provider. Mirrors gateway `Translation`
+ * (gateway/src/core/stt/standard.rs).
+ */
+export interface Translation {
+  /** Canonical target-language BCP-47 string (e.g. `es-ES`). */
+  lang: string;
+  /** The translated text for this segment. */
+  text: string;
+  /** `true` if this is a partial (interim) translation, `false`/omitted if final. */
+  is_partial?: boolean;
 }
 
 /**
@@ -158,7 +228,7 @@ export interface ReadyMessage {
  */
 export interface STTResultMessage {
   type: 'stt_result';
-  /** Transcribed text */
+  /** Transcribed text (gateway field `transcript`, NOT `text`) */
   transcript: string;
   /** Whether this is the final version of the transcript */
   is_final: boolean;
@@ -166,6 +236,18 @@ export interface STTResultMessage {
   is_speech_final: boolean;
   /** Confidence score (0.0 to 1.0) */
   confidence: number;
+  /**
+   * The FULL accumulated segment text, present only on a speech_final whose
+   * segment spans multiple finals (or a forced/timer fire). Clients that DISPLAY
+   * per-final text should prefer this when present.
+   */
+  segment_transcript?: string;
+  /**
+   * Uniform, provider-agnostic in-stream translations merged onto this transcript
+   * (P5). Empty/absent unless a translation-capable provider returned a
+   * `translations:[{lang,text}]` array on this stt_result frame.
+   */
+  translations?: Translation[];
 }
 
 /**
@@ -295,6 +377,22 @@ export interface SIPTransferErrorMessage {
 }
 
 /**
+ * Non-fatal gateway config advisory (gateway OutgoingMessage::ConfigWarning,
+ * handlers/ws/messages.rs). Emitted when a config is accepted but something was
+ * silently degraded (unknown/misnested key, emotion ignored by provider,
+ * reasoning model on the voice path, ...). NEVER closes the session.
+ */
+export interface ConfigWarningMessage {
+  type: 'config_warning';
+  /** Stable machine code (e.g. "unknown_config_keys"). */
+  code: string;
+  /** Human-readable explanation + a one-line fix hint. */
+  message: string;
+  /** Optional free-form JSON detail (e.g. { ignored_keys: [...] }). */
+  detail?: Record<string, unknown>;
+}
+
+/**
  * Union type for all incoming messages (received by client from server)
  */
 export type IncomingMessage =
@@ -307,17 +405,21 @@ export type IncomingMessage =
   | PongMessage
   | SessionUpdateMessage
   | ErrorMessage
-  | SIPTransferErrorMessage;
+  | SIPTransferErrorMessage
+  | ConfigWarningMessage;
 
 /**
  * Common message type identifier
  */
 export type MessageType =
+  // Outgoing (client -> server)
   | 'config'
   | 'speak'
   | 'clear'
+  | 'audio_end'
   | 'send_message'
   | 'sip_transfer'
+  // Incoming (server -> client)
   | 'ready'
   | 'stt_result'
   | 'message'
@@ -328,15 +430,7 @@ export type MessageType =
   | 'session_update'
   | 'error'
   | 'sip_transfer_error'
-  | 'ping'
-  | 'audio'
-  | 'stop'
-  | 'flush'
-  | 'interrupt'
-  | 'speaking_started'
-  | 'speaking_finished'
-  | 'listening_started'
-  | 'listening_stopped';
+  | 'config_warning';
 
 // ============================================================================
 // Message Serialization Helpers
@@ -364,19 +458,19 @@ export function toConfigMessage(
   if (sttConfig) {
     msg.stt_config = {
       provider: sttConfig.provider,
-      language: sttConfig.language,
+      language: sttConfig.language ?? 'en-US',
       sample_rate: sttConfig.sampleRate ?? 16000,
       channels: sttConfig.channels ?? 1,
       punctuation: sttConfig.punctuation ?? true,
       encoding: sttConfig.encoding ?? 'linear16',
-      model: sttConfig.model,
+      model: sttConfig.model ?? '',
     };
   }
 
   if (ttsConfig) {
     msg.tts_config = {
       provider: ttsConfig.provider,
-      model: ttsConfig.model,
+      model: ttsConfig.model ?? '',
       voice_id: ttsConfig.voiceId,
       speaking_rate: ttsConfig.speakingRate,
       audio_format: ttsConfig.audioFormat,
@@ -391,8 +485,8 @@ export function toConfigMessage(
     msg.livekit = {
       room_name: livekitConfig.roomName,
       enable_recording: livekitConfig.enableRecording,
-      sayna_participant_identity: livekitConfig.saynaParticipantIdentity,
-      sayna_participant_name: livekitConfig.saynaParticipantName,
+      waav_participant_identity: livekitConfig.waavParticipantIdentity,
+      waav_participant_name: livekitConfig.waavParticipantName,
       listen_participants: livekitConfig.listenParticipants,
     };
   }

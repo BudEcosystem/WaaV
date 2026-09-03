@@ -321,39 +321,84 @@ fn json_value_to_string(value: &serde_json::Value) -> String {
     }
 }
 
-/// Populate Rhai scope from JSON object
-fn populate_scope_from_json(scope: &mut Scope, prefix: &str, value: &serde_json::Value) {
+/// Convert an arbitrary JSON value into a Rhai [`Dynamic`] (arrays → Rhai arrays,
+/// objects → Rhai maps, numbers → i64 where exact else f64). Nothing is dropped —
+/// the router previously skipped arrays and nested objects entirely, so a condition
+/// like `user.tier == "pro"` or `tags.contains("vip")` silently saw `()` and
+/// mis-routed with no diagnostic.
+fn json_to_dynamic(value: &serde_json::Value) -> rhai::Dynamic {
     match value {
+        serde_json::Value::String(s) => rhai::Dynamic::from(s.clone()),
+        serde_json::Value::Bool(b) => rhai::Dynamic::from(*b),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                rhai::Dynamic::from(i)
+            } else if let Some(f) = n.as_f64() {
+                rhai::Dynamic::from(f)
+            } else {
+                rhai::Dynamic::UNIT
+            }
+        }
+        serde_json::Value::Null => rhai::Dynamic::UNIT,
+        serde_json::Value::Array(items) => {
+            let arr: rhai::Array = items.iter().map(json_to_dynamic).collect();
+            rhai::Dynamic::from(arr)
+        }
         serde_json::Value::Object(map) => {
-            for (key, val) in map {
-                let full_key = if prefix.is_empty() {
-                    key.clone()
-                } else {
-                    format!("{}_{}", prefix, key)
-                };
+            let mut m = rhai::Map::new();
+            for (k, v) in map {
+                m.insert(k.as_str().into(), json_to_dynamic(v));
+            }
+            rhai::Dynamic::from(m)
+        }
+    }
+}
 
-                match val {
-                    serde_json::Value::String(s) => {
-                        scope.push_constant(full_key, s.clone());
+/// Populate Rhai scope from JSON object.
+///
+/// Scalars keep the historical flattened `prefix_key` binding. Nested objects are ALSO
+/// bound whole as Rhai maps (so `user.tier` works property-style) and recursed into
+/// (so the flattened `user_tier` convention keeps working); arrays are bound as Rhai
+/// arrays (`tags[0]`, `tags.contains(..)`, `tags.len()`).
+fn populate_scope_from_json(scope: &mut Scope, prefix: &str, value: &serde_json::Value) {
+    if let serde_json::Value::Object(map) = value {
+        for (key, val) in map {
+            let full_key = if prefix.is_empty() {
+                key.clone()
+            } else {
+                format!("{}_{}", prefix, key)
+            };
+
+            match val {
+                serde_json::Value::String(s) => {
+                    scope.push_constant(full_key, s.clone());
+                }
+                serde_json::Value::Bool(b) => {
+                    scope.push_constant(full_key, *b);
+                }
+                serde_json::Value::Number(n) => {
+                    if let Some(i) = n.as_i64() {
+                        scope.push_constant(full_key, i);
+                    } else if let Some(f) = n.as_f64() {
+                        scope.push_constant(full_key, f);
                     }
-                    serde_json::Value::Bool(b) => {
-                        scope.push_constant(full_key, *b);
-                    }
-                    serde_json::Value::Number(n) => {
-                        if let Some(i) = n.as_i64() {
-                            scope.push_constant(full_key, i);
-                        } else if let Some(f) = n.as_f64() {
-                            scope.push_constant(full_key, f);
-                        }
-                    }
-                    serde_json::Value::Null => {
-                        scope.push_constant(full_key, ());
-                    }
-                    _ => {} // Skip arrays and nested objects for now
+                }
+                serde_json::Value::Null => {
+                    scope.push_constant(full_key, ());
+                }
+                serde_json::Value::Array(_) => {
+                    // push_constant_dynamic: a Dynamic pushed via the generic push_constant
+                    // would be double-wrapped and the variable lookup misses it.
+                    scope.push_constant_dynamic(full_key, json_to_dynamic(val));
+                }
+                serde_json::Value::Object(_) => {
+                    // whole-map binding (property-style access) + recursive flattening
+                    // (the pre-existing underscore convention).
+                    scope.push_constant_dynamic(full_key.clone(), json_to_dynamic(val));
+                    populate_scope_from_json(scope, &full_key, val);
                 }
             }
         }
-        _ => {}
     }
 }
 
@@ -382,6 +427,46 @@ mod tests {
         let data = json!({ "is_final": false, "transcript": "hello" });
         let result = evaluator.evaluate(&condition, &data, &ctx).unwrap();
         assert!(!result);
+    }
+
+    /// G7: nested objects and arrays must be visible to routing conditions — they were
+    /// previously skipped entirely, so `user.tier == "pro"` silently saw `()` and mis-routed.
+    #[test]
+    fn test_expression_evaluation_nested_object_and_array() {
+        let evaluator = ConditionEvaluator::with_default_engine();
+        let ctx = DAGContext::new("stream-123");
+        let data = json!({
+            "user": { "tier": "pro", "quota": { "used": 3 } },
+            "tags": ["vip", "beta"],
+        });
+
+        // property-style access on the whole-map binding (top-level data prefix is `data_`)
+        let cond = evaluator
+            .compile_expression(r#"data_user.tier == "pro""#)
+            .unwrap();
+        assert!(evaluator.evaluate(&cond, &data, &ctx).unwrap());
+
+        // recursive flattened binding (the historical underscore convention)
+        let cond = evaluator
+            .compile_expression("data_user_quota_used == 3")
+            .unwrap();
+        assert!(evaluator.evaluate(&cond, &data, &ctx).unwrap());
+
+        // arrays: membership + indexing + len
+        let cond = evaluator
+            .compile_expression(r#"data_tags.contains("vip")"#)
+            .unwrap();
+        assert!(evaluator.evaluate(&cond, &data, &ctx).unwrap());
+        let cond = evaluator
+            .compile_expression(r#"data_tags[1] == "beta" && data_tags.len() == 2"#)
+            .unwrap();
+        assert!(evaluator.evaluate(&cond, &data, &ctx).unwrap());
+
+        // negative: a non-matching nested value routes false, not error
+        let cond = evaluator
+            .compile_expression(r#"data_user.tier == "free""#)
+            .unwrap();
+        assert!(!evaluator.evaluate(&cond, &data, &ctx).unwrap());
     }
 
     #[test]

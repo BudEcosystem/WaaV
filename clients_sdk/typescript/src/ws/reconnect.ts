@@ -7,7 +7,11 @@
  * Reconnection configuration
  */
 export interface ReconnectConfig {
-  /** Initial delay in milliseconds (default: 1000) */
+  /**
+   * Initial / first-hop delay in milliseconds (default: 200). D4 lowers this
+   * from the old 1000ms so a transient blip recovers in well under 300ms; the
+   * decorrelated-jitter backoff + 30s ceiling still bound a sustained outage.
+   */
   initialDelay?: number;
   /** Maximum delay in milliseconds (default: 30000) */
   maxDelay?: number;
@@ -19,18 +23,34 @@ export interface ReconnectConfig {
   maxAttempts?: number;
   /** Reset delay after successful connection lasting this long in ms (default: 60000) */
   resetAfter?: number;
+  /**
+   * D4 quick-failure breaker: a connection that SURVIVES less than this many ms
+   * after opening is counted as a "quick failure" (default: 5000). A doomed
+   * config (bad key/unfixable error) still handshakes successfully, so survival
+   * time — not handshake success — is what detects it.
+   */
+  minStableMs?: number;
+  /**
+   * D4 quick-failure breaker: after this many CONSECUTIVE quick failures, stop
+   * reconnecting and surface a typed FATAL "gateway unreachable / likely
+   * unrecoverable" error instead of storming (default: 3). Ports Pipecat
+   * websocket_service.py _MAX_CONSECUTIVE_QUICK_FAILURES.
+   */
+  maxQuickFailures?: number;
 }
 
 /**
  * Default reconnection configuration
  */
 export const DEFAULT_RECONNECT_CONFIG: Required<ReconnectConfig> = {
-  initialDelay: 1000,
+  initialDelay: 200,
   maxDelay: 30000,
   multiplier: 1.5,
   jitter: 0.2,
   maxAttempts: Infinity,
   resetAfter: 60000,
+  minStableMs: 5000,
+  maxQuickFailures: 3,
 };
 
 /**
@@ -47,6 +67,10 @@ export interface ReconnectState {
   reconnecting: boolean;
   /** Whether max attempts has been reached */
   exhausted: boolean;
+  /** D4: consecutive quick (sub-minStableMs) failures observed. */
+  consecutiveQuickFailures: number;
+  /** D4: the quick-failure breaker tripped — reconnection has been abandoned. */
+  fatal: boolean;
 }
 
 /**
@@ -61,6 +85,12 @@ export interface ReconnectHandlers {
   onReconnectFailed?: (error: Error, state: ReconnectState) => void;
   /** Called when all reconnection attempts exhausted */
   onReconnectExhausted?: (state: ReconnectState) => void;
+  /**
+   * D4: called when the quick-failure breaker trips (>= maxQuickFailures
+   * consecutive sub-minStableMs survivals). Reconnection is abandoned; the host
+   * should surface a typed FATAL error. NOT recoverable by further retries.
+   */
+  onReconnectFatal?: (state: ReconnectState) => void;
 }
 
 /**
@@ -72,6 +102,10 @@ export class ReconnectStrategy {
   private handlers: ReconnectHandlers = {};
   private timeoutId: ReturnType<typeof setTimeout> | null = null;
   private aborted = false;
+  /** D4: wall-clock time the current socket opened, for survival measurement. */
+  private connectedAt: number | null = null;
+  /** D4: one-shot "reset-after-stable" timer armed on each markConnected(). */
+  private stableTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(config: ReconnectConfig = {}) {
     this.config = { ...DEFAULT_RECONNECT_CONFIG, ...config };
@@ -88,6 +122,8 @@ export class ReconnectStrategy {
       lastConnectedAt: null,
       reconnecting: false,
       exhausted: false,
+      consecutiveQuickFailures: 0,
+      fatal: false,
     };
   }
 
@@ -106,20 +142,39 @@ export class ReconnectStrategy {
   }
 
   /**
-   * Calculate next delay with jitter
+   * Calculate the next delay using DECORRELATED jitter (AWS "Exponential
+   * Backoff And Jitter"): sleep = min(cap, random_between(base, prev * 3)).
+   * This spreads retries far better than `2^attempt ± jitter` (which compounds
+   * into a synchronized storm) while keeping the 30s ceiling, and never drops
+   * below the fast first-hop `initialDelay`. D4(b).
    */
   private calculateNextDelay(): number {
-    // Apply exponential backoff
-    const baseDelay = Math.min(
-      this.state.delay * this.config.multiplier,
-      this.config.maxDelay
-    );
+    const base = this.config.initialDelay;
+    const prev = this.state.delay;
+    const upper = Math.max(base, prev * 3);
+    // Uniformly sample in [base, upper], then clamp to the ceiling.
+    const sampled = base + Math.random() * (upper - base);
+    return Math.round(Math.min(this.config.maxDelay, Math.max(base, sampled)));
+  }
 
-    // Apply jitter (random variation to prevent thundering herd)
-    const jitterRange = baseDelay * this.config.jitter;
-    const jitter = (Math.random() - 0.5) * 2 * jitterRange;
-
-    return Math.round(Math.max(this.config.initialDelay, baseDelay + jitter));
+  /**
+   * D4 quick-failure breaker: record that the live socket just closed. If it
+   * survived less than `minStableMs`, count a consecutive quick failure; a
+   * stable-enough connection resets the counter. Must be called by the host on
+   * EVERY post-open close, BEFORE scheduling the next reconnect, so the breaker
+   * can gate the fast path. Returns the updated consecutive-quick-failure count.
+   */
+  noteConnectionClosed(): number {
+    if (this.connectedAt !== null) {
+      const survived = Date.now() - this.connectedAt;
+      if (survived < this.config.minStableMs) {
+        this.state.consecutiveQuickFailures++;
+      } else {
+        this.state.consecutiveQuickFailures = 0;
+      }
+      this.connectedAt = null;
+    }
+    return this.state.consecutiveQuickFailures;
   }
 
   /**
@@ -136,6 +191,18 @@ export class ReconnectStrategy {
 
       if (this.state.exhausted) {
         throw new Error('Reconnection attempts exhausted');
+      }
+
+      // D4 quick-failure breaker (gates the fast path too): if too many
+      // consecutive connections died almost immediately, the config is likely
+      // doomed (bad key / unfixable). STOP storming and surface a FATAL error.
+      if (this.state.consecutiveQuickFailures >= this.config.maxQuickFailures) {
+        this.state.fatal = true;
+        this.state.reconnecting = false;
+        this.handlers.onReconnectFatal?.(this.getState());
+        throw new Error(
+          `Reconnection abandoned after ${this.state.consecutiveQuickFailures} consecutive quick failures (connection unstable < ${this.config.minStableMs}ms each); the gateway is likely unreachable or the config is unrecoverable.`
+        );
       }
 
       // Check if we should reset based on last connection time
@@ -216,35 +283,62 @@ export class ReconnectStrategy {
       clearTimeout(this.timeoutId);
       this.timeoutId = null;
     }
+    if (this.stableTimer) {
+      clearTimeout(this.stableTimer);
+      this.stableTimer = null;
+    }
     this.state.reconnecting = false;
   }
 
   /**
-   * Reset state for fresh reconnection series
+   * Reset state for fresh reconnection series (also clears the quick-failure
+   * breaker counters and the survival/stable timers).
    */
   reset(): void {
     this.aborted = false;
+    this.connectedAt = null;
     this.state = this.createInitialState();
     if (this.timeoutId) {
       clearTimeout(this.timeoutId);
       this.timeoutId = null;
     }
+    if (this.stableTimer) {
+      clearTimeout(this.stableTimer);
+      this.stableTimer = null;
+    }
   }
 
   /**
-   * Mark successful connection (call after manual connect succeeds)
+   * Mark a successful (re)connection — call from the host's open handler. Starts
+   * the survival clock for the quick-failure breaker and arms a one-shot
+   * "reset-after-stable" timer: if THIS connection lives at least `minStableMs`,
+   * the consecutive-quick-failure counter is cleared (a genuinely recovered
+   * link should not inherit a near-trip count). The host clears the timer on
+   * close via noteConnectionClosed()/markDisconnected() implicitly (a new
+   * markConnected re-arms it; abort()/reset() cancel it).
    */
   markConnected(): void {
     this.state.lastConnectedAt = Date.now();
+    this.connectedAt = Date.now();
     this.state.reconnecting = false;
     this.state.delay = this.config.initialDelay;
+
+    if (this.stableTimer) clearTimeout(this.stableTimer);
+    this.stableTimer = setTimeout(() => {
+      this.stableTimer = null;
+      // Still up after minStableMs -> the link is healthy; forgive prior quick
+      // failures so a later unrelated blip starts from a clean breaker.
+      if (this.connectedAt !== null) {
+        this.state.consecutiveQuickFailures = 0;
+      }
+    }, this.config.minStableMs);
   }
 
   /**
    * Check if should attempt reconnection
    */
   shouldReconnect(): boolean {
-    return !this.aborted && !this.state.exhausted;
+    return !this.aborted && !this.state.exhausted && !this.state.fatal;
   }
 
   /**

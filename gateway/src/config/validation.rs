@@ -12,12 +12,22 @@ pub fn validate_jwt_auth(
     auth_service_url: &Option<String>,
     auth_signing_key_path: &Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Treat empty / whitespace-only values as unset. Config files (e.g. config.example.yaml)
+    // ship blank placeholders that deserialize to Some("")/Some(PathBuf::from("")), not None.
+    // Without this normalization the server refuses to start even when auth is disabled.
+    let url_set = auth_service_url
+        .as_ref()
+        .is_some_and(|u| !u.trim().is_empty());
+    let key_set = auth_signing_key_path
+        .as_ref()
+        .is_some_and(|p| !p.as_os_str().is_empty());
+
     // If either is set, both must be set
-    if auth_service_url.is_some() || auth_signing_key_path.is_some() {
-        if auth_service_url.is_none() {
+    if url_set || key_set {
+        if !url_set {
             return Err("AUTH_SERVICE_URL is required when AUTH_SIGNING_KEY_PATH is set".into());
         }
-        if auth_signing_key_path.is_none() {
+        if !key_set {
             return Err("AUTH_SIGNING_KEY_PATH is required when AUTH_SERVICE_URL is set".into());
         }
 
@@ -130,7 +140,12 @@ pub fn validate_auth_required(
         return Ok(());
     }
 
-    let has_jwt_auth = auth_service_url.is_some() && auth_signing_key_path.is_some();
+    let has_jwt_auth = auth_service_url
+        .as_ref()
+        .is_some_and(|u| !u.trim().is_empty())
+        && auth_signing_key_path
+            .as_ref()
+            .is_some_and(|p| !p.as_os_str().is_empty());
     let has_api_secret = !auth_api_secrets.is_empty();
     // FRD-018: Bud mode resolves credentials from the control plane, so it is a complete auth
     // configuration on its own. Without this arm the validator demands settings bud mode never
@@ -364,6 +379,34 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    // Regression: blank auth placeholders (as shipped in config.example.yaml) parse as
+    // Some("")/Some(PathBuf::from("")), not None, and must NOT fail startup when auth is
+    // effectively unset. Before the fix the server refused to boot with the example config:
+    // "AUTH_SIGNING_KEY_PATH file does not exist: ".
+    #[test]
+    fn test_validate_jwt_auth_empty_strings_treated_as_unset() {
+        // Both empty -> auth not configured -> OK
+        assert!(validate_jwt_auth(&Some(String::new()), &Some(PathBuf::from(""))).is_ok());
+        // Whitespace-only URL also counts as unset
+        assert!(validate_jwt_auth(&Some("   ".to_string()), &None).is_ok());
+        // Truly unset -> OK
+        assert!(validate_jwt_auth(&None, &None).is_ok());
+    }
+
+    #[test]
+    fn test_validate_jwt_auth_partial_config_still_rejected() {
+        // A real URL with no key is still a misconfiguration.
+        assert!(validate_jwt_auth(&Some("https://auth.example".to_string()), &None).is_err());
+        // A real (non-empty) key path that doesn't exist is still rejected when a URL is set.
+        assert!(
+            validate_jwt_auth(
+                &Some("https://auth.example".to_string()),
+                &Some(PathBuf::from("/nonexistent/key.pem")),
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn test_validate_auth_api_secrets_valid() {
         let secrets = vec![
@@ -460,6 +503,31 @@ mod tests {
             &auth_service_url,
             &auth_signing_key_path,
             &auth_api_secrets,
+        );
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("AUTH_REQUIRED=true")
+        );
+    }
+
+    #[test]
+    fn test_validate_auth_required_blank_jwt_url_is_unset() {
+        let auth_service_url = Some("   ".to_string());
+        let auth_signing_key_path = Some(PathBuf::from("key.pem"));
+        let auth_api_secrets: Vec<AuthApiSecret> = Vec::new();
+
+        let result = validate_auth_required(
+            true,
+            &auth_service_url,
+            &auth_signing_key_path,
+            &auth_api_secrets,
+            // Not a Bud deployment: this case is about a blank JWT URL, and the control plane
+            // being absent is what makes the "no authenticator configured" verdict correct.
+            false,
         );
 
         assert!(result.is_err());

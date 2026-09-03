@@ -1,16 +1,26 @@
-//! Hume EVI WebSocket client implementation.
+//! Hume EVI WebSocket client — a thin newtype over the shared S2S scaffold.
 //!
-//! This module implements the `BaseRealtime` trait for Hume's Empathic Voice
-//! Interface (EVI), providing full-duplex audio streaming with emotional
-//! intelligence.
+//! All the provider-specific wire mapping (EVI session settings, server-event
+//! lowering, base64 audio input, the dual text+binary inbound path) lives in
+//! [`HumeProtocol`](super::protocol::HumeProtocol); all the shared machinery
+//! (reconnect supervisor + backoff + breaker/governor storm control, barge-in,
+//! conversation replay, callback dispatch) now lives ONCE in the generic
+//! [`RealtimeSession`](crate::core::realtime::scaffold::RealtimeSession) driver.
+//!
+//! `HumeEVI` is therefore just `RealtimeSession<HumeProtocol>` plus the
+//! Hume-specific inherent accessors (`get_chat_id`/`get_chat_group_id`/
+//! `resilience_breaker`) and the rich `get_provider_info()` JSON the public API
+//! guarantees. The ~580-line bespoke struct + single-connection message loop +
+//! `handle_server_message` are DELETED — Hume GAINS automatic reconnect + the
+//! shared barge-in path for free.
 //!
 //! # Features
 //!
-//! - Real-time bidirectional audio streaming
-//! - 48-dimension prosody (emotion) analysis
+//! - Real-time bidirectional audio streaming (base64 JSON in, JSON+binary out)
+//! - 48-dimension prosody (emotion) analysis (deserialized in `messages.rs`)
 //! - Empathic response generation
 //! - Function calling support
-//! - Automatic reconnection
+//! - Automatic reconnection (NEW — inherited from the scaffold)
 //!
 //! # Example
 //!
@@ -24,7 +34,7 @@
 //!     let config = HumeEVIConfig::new("your-api-key")
 //!         .with_config_id("your-config-id");
 //!
-//!     let mut evi = HumeEVI::new(config).unwrap();
+//!     let mut evi = HumeEVI::from_hume_config(config).unwrap();
 //!     evi.connect().await.unwrap();
 //!
 //!     // Register callbacks
@@ -39,27 +49,15 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures_util::{SinkExt, StreamExt};
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::net::TcpStream;
-use tokio::sync::{RwLock, mpsc};
-use tokio::time::timeout;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
-use tracing::{debug, error, info, trace, warn};
 
 use super::config::HumeEVIConfig;
-use super::messages::{
-    AudioInput, AudioSettings, EVIClientMessage, EVIServerMessage, HUME_EVI_DEFAULT_SAMPLE_RATE,
-    SessionSettings, StopAssistant, TextInput, ToolResponse, deserialize_server_message,
-    serialize_client_message,
-};
+use super::protocol::HumeProtocol;
 use crate::core::realtime::base::{
-    AudioOutputCallback, BaseRealtime, ConnectionState, FunctionCallCallback, FunctionCallRequest,
-    RealtimeAudioData, RealtimeConfig, RealtimeError, RealtimeErrorCallback, RealtimeResult,
-    ReconnectionCallback, ResponseDoneCallback, SpeechEvent, SpeechEventCallback,
-    TranscriptCallback, TranscriptResult, TranscriptRole,
+    AudioOutputCallback, BaseRealtime, ConnectionState, FunctionCallCallback, RealtimeConfig,
+    RealtimeErrorCallback, RealtimeResult, ReconnectionCallback, ReplayConversationItem,
+    ResponseDoneCallback, SpeechEventCallback, TranscriptCallback,
 };
+use crate::core::realtime::scaffold::RealtimeSession;
 
 // =============================================================================
 // HumeEVI Client
@@ -67,632 +65,184 @@ use crate::core::realtime::base::{
 
 /// Hume EVI (Empathic Voice Interface) realtime client.
 ///
-/// This client implements full-duplex audio streaming with Hume's EVI,
-/// which provides emotional intelligence through prosody analysis.
-pub struct HumeEVI {
-    /// Configuration for this EVI session.
-    config: HumeEVIConfig,
-
-    /// Current connection state.
-    state: Arc<RwLock<ConnectionState>>,
-
-    /// WebSocket sender for outgoing messages.
-    ws_sender: Option<mpsc::UnboundedSender<EVIClientMessage>>,
-
-    /// Chat metadata from connection.
-    chat_metadata: Arc<RwLock<Option<ChatMetadataInfo>>>,
-
-    /// Current response ID being generated.
-    current_response_id: Arc<RwLock<Option<String>>>,
-
-    // Callbacks
-    transcript_callback: Option<TranscriptCallback>,
-    audio_callback: Option<AudioOutputCallback>,
-    error_callback: Option<RealtimeErrorCallback>,
-    function_call_callback: Option<FunctionCallCallback>,
-    speech_event_callback: Option<SpeechEventCallback>,
-    response_done_callback: Option<ResponseDoneCallback>,
-    reconnection_callback: Option<ReconnectionCallback>,
-
-    /// Handle to the message processing task.
-    task_handle: Option<tokio::task::JoinHandle<()>>,
-}
-
-/// Chat metadata information.
-#[derive(Debug, Clone)]
-struct ChatMetadataInfo {
-    chat_id: String,
-    chat_group_id: String,
-}
+/// A newtype over the generic [`RealtimeSession`] driver parameterized by
+/// [`HumeProtocol`]. Every [`BaseRealtime`] method delegates to the driver; the
+/// inherent accessors (`get_chat_id`/`get_chat_group_id`/`resilience_breaker`)
+/// and the rich `get_provider_info()` are preserved for the existing public API +
+/// tests.
+pub struct HumeEVI(RealtimeSession<HumeProtocol>);
 
 impl HumeEVI {
-    /// Create a new HumeEVI client from HumeEVIConfig.
+    /// Create a new HumeEVI client from a [`HumeEVIConfig`].
+    ///
+    /// Validates the config (api key + EVI version + audio params) EXACTLY as
+    /// before, then builds the scaffold session around the parsed config.
     pub fn from_hume_config(config: HumeEVIConfig) -> RealtimeResult<Self> {
-        config
-            .validate()
-            .map_err(|e| RealtimeError::InvalidConfiguration(e.to_string()))?;
+        let protocol = HumeProtocol::from_hume_config(config.clone())?;
+        // The scaffold's generic config drives only reconnection + the (overridden)
+        // generic provider_info; carry the EVI config's reconnection + api key so
+        // reconnect behavior is config-honored.
+        let generic = RealtimeConfig {
+            provider: "hume".to_string(),
+            api_key: config.api_key.clone(),
+            voice: config.voice_id.clone(),
+            instructions: config.system_prompt.clone(),
+            reconnection: config.reconnection.clone(),
+            ..Default::default()
+        };
+        Ok(Self(RealtimeSession::from_parts(protocol, generic)?))
+    }
 
-        Ok(Self {
-            config,
-            state: Arc::new(RwLock::new(ConnectionState::Disconnected)),
-            ws_sender: None,
-            chat_metadata: Arc::new(RwLock::new(None)),
-            current_response_id: Arc::new(RwLock::new(None)),
-            transcript_callback: None,
-            audio_callback: None,
-            error_callback: None,
-            function_call_callback: None,
-            speech_event_callback: None,
-            response_done_callback: None,
-            reconnection_callback: None,
-            task_handle: None,
-        })
+    /// The shared circuit breaker this session feeds, if injected (for metrics/tests).
+    pub fn resilience_breaker(
+        &self,
+    ) -> Option<&std::sync::Arc<crate::core::resilience::CircuitBreaker>> {
+        self.0.resilience_breaker()
     }
 
     /// Get the chat ID for the current session.
+    ///
+    /// Sourced from the EVI `chat_metadata` event (lowered to the scaffold's
+    /// session id). `None` until the server sends it post-connect.
     pub async fn get_chat_id(&self) -> Option<String> {
-        self.chat_metadata
-            .read()
-            .await
-            .as_ref()
-            .map(|m| m.chat_id.clone())
+        self.0.session_id().await
     }
 
     /// Get the chat group ID for resuming conversations.
+    ///
+    /// NOTE: the shared scaffold carries a single session identity (the chat id,
+    /// surfaced by [`get_chat_id`](Self::get_chat_id)); the EVI `chat_group_id` is
+    /// not separately tracked by the generic driver. Resuming a prior conversation
+    /// is still driven config-side via
+    /// [`HumeEVIConfig::with_chat_group`](super::config::HumeEVIConfig::with_chat_group)
+    /// (the `resumed_chat_group_id` query param), which is unaffected.
     pub async fn get_chat_group_id(&self) -> Option<String> {
-        self.chat_metadata
-            .read()
-            .await
-            .as_ref()
-            .map(|m| m.chat_group_id.clone())
-    }
-
-    /// Connect to Hume EVI WebSocket.
-    async fn connect_internal(&mut self) -> RealtimeResult<()> {
-        // Build WebSocket URL with query parameters
-        let url = self.config.build_websocket_url();
-        debug!(
-            "Connecting to Hume EVI: {}",
-            url.split('?').next().unwrap_or(&url)
-        );
-
-        // Update state to connecting
-        *self.state.write().await = ConnectionState::Connecting;
-
-        // Connect with timeout
-        let connect_timeout = Duration::from_secs(self.config.connection_timeout_seconds);
-        let connect_result = timeout(connect_timeout, connect_async(&url)).await;
-
-        let (ws_stream, response) = match connect_result {
-            Ok(Ok((stream, response))) => (stream, response),
-            Ok(Err(e)) => {
-                *self.state.write().await = ConnectionState::Failed;
-                return Err(RealtimeError::ConnectionFailed(format!(
-                    "WebSocket connection failed: {e}"
-                )));
-            }
-            Err(_) => {
-                *self.state.write().await = ConnectionState::Failed;
-                return Err(RealtimeError::Timeout("Connection timed out".to_string()));
-            }
-        };
-
-        info!("Connected to Hume EVI (status: {})", response.status());
-
-        // Split the WebSocket stream
-        let (ws_write, ws_read) = ws_stream.split();
-
-        // Create channel for outgoing messages
-        let (tx, rx) = mpsc::unbounded_channel();
-        self.ws_sender = Some(tx);
-
-        // Clone state and callbacks for the processing task
-        let state = self.state.clone();
-        let chat_metadata = self.chat_metadata.clone();
-        let current_response_id = self.current_response_id.clone();
-        let transcript_cb = self.transcript_callback.clone();
-        let audio_cb = self.audio_callback.clone();
-        let error_cb = self.error_callback.clone();
-        let function_call_cb = self.function_call_callback.clone();
-        let speech_event_cb = self.speech_event_callback.clone();
-        let response_done_cb = self.response_done_callback.clone();
-
-        // Spawn message processing task
-        let handle = tokio::spawn(async move {
-            Self::message_loop(
-                ws_write,
-                ws_read,
-                rx,
-                state,
-                chat_metadata,
-                current_response_id,
-                transcript_cb,
-                audio_cb,
-                error_cb,
-                function_call_cb,
-                speech_event_cb,
-                response_done_cb,
-            )
-            .await;
-        });
-
-        self.task_handle = Some(handle);
-
-        // Send session settings if needed
-        if self.config.input_encoding != super::messages::AudioEncoding::default()
-            || self.config.sample_rate != super::messages::HUME_EVI_DEFAULT_SAMPLE_RATE
-            || self.config.system_prompt.is_some()
-        {
-            self.send_session_settings().await?;
-        }
-
-        // Update state to connected
-        *self.state.write().await = ConnectionState::Connected;
-
-        Ok(())
-    }
-
-    /// Send session settings message.
-    async fn send_session_settings(&self) -> RealtimeResult<()> {
-        let settings = SessionSettings {
-            audio: Some(AudioSettings {
-                encoding: self.config.input_encoding,
-                sample_rate: Some(self.config.sample_rate),
-                channels: Some(self.config.channels),
-            }),
-            system_prompt: self.config.system_prompt.clone(),
-            context: None,
-        };
-
-        self.send_message(EVIClientMessage::SessionSettings(settings))
-            .await
-    }
-
-    /// Send a client message through the WebSocket.
-    async fn send_message(&self, msg: EVIClientMessage) -> RealtimeResult<()> {
-        let sender = self.ws_sender.as_ref().ok_or(RealtimeError::NotConnected)?;
-
-        sender
-            .send(msg)
-            .map_err(|e| RealtimeError::WebSocketError(format!("Failed to queue message: {e}")))?;
-
-        Ok(())
-    }
-
-    /// Main message processing loop.
-    async fn message_loop(
-        mut ws_write: futures_util::stream::SplitSink<
-            WebSocketStream<MaybeTlsStream<TcpStream>>,
-            Message,
-        >,
-        mut ws_read: futures_util::stream::SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
-        mut rx: mpsc::UnboundedReceiver<EVIClientMessage>,
-        state: Arc<RwLock<ConnectionState>>,
-        chat_metadata: Arc<RwLock<Option<ChatMetadataInfo>>>,
-        current_response_id: Arc<RwLock<Option<String>>>,
-        transcript_cb: Option<TranscriptCallback>,
-        audio_cb: Option<AudioOutputCallback>,
-        error_cb: Option<RealtimeErrorCallback>,
-        function_call_cb: Option<FunctionCallCallback>,
-        speech_event_cb: Option<SpeechEventCallback>,
-        response_done_cb: Option<ResponseDoneCallback>,
-    ) {
-        loop {
-            tokio::select! {
-                // Handle outgoing messages
-                Some(msg) = rx.recv() => {
-                    match serialize_client_message(&msg) {
-                        Ok(json) => {
-                            trace!("Sending EVI message: {}", json.chars().take(100).collect::<String>());
-                            if let Err(e) = ws_write.send(Message::Text(json.into())).await {
-                                error!("Failed to send WebSocket message: {e}");
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            error!("Failed to serialize message: {e}");
-                        }
-                    }
-                }
-
-                // Handle incoming messages
-                Some(result) = ws_read.next() => {
-                    match result {
-                        Ok(Message::Text(text)) => {
-                            trace!("Received EVI message: {}", text.chars().take(100).collect::<String>());
-                            Self::handle_server_message(
-                                &text,
-                                &chat_metadata,
-                                &current_response_id,
-                                &transcript_cb,
-                                &audio_cb,
-                                &error_cb,
-                                &function_call_cb,
-                                &speech_event_cb,
-                                &response_done_cb,
-                            ).await;
-                        }
-                        Ok(Message::Binary(data)) => {
-                            // Binary messages are typically audio output
-                            debug!("Received binary message: {} bytes", data.len());
-                            if let Some(ref cb) = audio_cb {
-                                let audio_data = RealtimeAudioData {
-                                    data: Bytes::from(data.to_vec()),
-                                    sample_rate: HUME_EVI_DEFAULT_SAMPLE_RATE,
-                                    item_id: None,
-                                    response_id: current_response_id.read().await.clone(),
-                                };
-                                cb(audio_data).await;
-                            }
-                        }
-                        Ok(Message::Close(frame)) => {
-                            info!("WebSocket closed: {:?}", frame);
-                            break;
-                        }
-                        Ok(Message::Ping(data)) => {
-                            let _ = ws_write.send(Message::Pong(data)).await;
-                        }
-                        Ok(_) => {}
-                        Err(e) => {
-                            error!("WebSocket error: {e}");
-                            break;
-                        }
-                    }
-                }
-
-                else => break,
-            }
-        }
-
-        // Connection closed
-        *state.write().await = ConnectionState::Disconnected;
-        info!("Hume EVI message loop ended");
-    }
-
-    /// Handle a server message.
-    async fn handle_server_message(
-        text: &str,
-        chat_metadata: &Arc<RwLock<Option<ChatMetadataInfo>>>,
-        current_response_id: &Arc<RwLock<Option<String>>>,
-        transcript_cb: &Option<TranscriptCallback>,
-        audio_cb: &Option<AudioOutputCallback>,
-        error_cb: &Option<RealtimeErrorCallback>,
-        function_call_cb: &Option<FunctionCallCallback>,
-        speech_event_cb: &Option<SpeechEventCallback>,
-        response_done_cb: &Option<ResponseDoneCallback>,
-    ) {
-        let msg = match deserialize_server_message(text) {
-            Ok(m) => m,
-            Err(e) => {
-                warn!("Failed to deserialize EVI message: {e}");
-                return;
-            }
-        };
-
-        match msg {
-            EVIServerMessage::ChatMetadata(meta) => {
-                info!(
-                    "EVI chat metadata: chat_id={}, chat_group_id={}",
-                    meta.chat_id, meta.chat_group_id
-                );
-                *chat_metadata.write().await = Some(ChatMetadataInfo {
-                    chat_id: meta.chat_id,
-                    chat_group_id: meta.chat_group_id,
-                });
-            }
-
-            EVIServerMessage::UserMessage(user_msg) => {
-                debug!(
-                    "User message: {} (interim: {:?})",
-                    user_msg.message.content, user_msg.interim
-                );
-
-                if let Some(cb) = transcript_cb {
-                    let transcript = TranscriptResult {
-                        text: user_msg.message.content,
-                        role: TranscriptRole::User,
-                        is_final: user_msg.interim != Some(true),
-                        item_id: Some(user_msg.id),
-                    };
-                    cb(transcript).await;
-                }
-
-                // If prosody data is available, could emit as speech event
-                if let Some(models) = user_msg.models {
-                    if let Some(prosody) = models.prosody {
-                        if let Some(dominant) = prosody.scores.dominant_emotion() {
-                            trace!("User emotion: {} ({:.2})", dominant.0, dominant.1);
-                        }
-                    }
-                }
-            }
-
-            EVIServerMessage::UserInterruption(interruption) => {
-                debug!("User interruption at {:?}ms", interruption.time);
-                if let Some(cb) = speech_event_cb {
-                    cb(SpeechEvent::Started {
-                        audio_start_ms: interruption.time.unwrap_or(0),
-                        item_id: None,
-                    })
-                    .await;
-                }
-            }
-
-            EVIServerMessage::AssistantMessage(asst_msg) => {
-                debug!("Assistant message: {}", asst_msg.message.content);
-
-                // Store current response ID
-                *current_response_id.write().await = Some(asst_msg.id.clone());
-
-                if let Some(cb) = transcript_cb {
-                    let transcript = TranscriptResult {
-                        text: asst_msg.message.content,
-                        role: TranscriptRole::Assistant,
-                        is_final: true,
-                        item_id: Some(asst_msg.id),
-                    };
-                    cb(transcript).await;
-                }
-            }
-
-            EVIServerMessage::AssistantProsody(prosody) => {
-                trace!("Assistant prosody for message {}", prosody.id);
-                // Prosody data for assistant's voice
-                if let Some(p) = prosody.models.prosody {
-                    if let Some(dominant) = p.scores.dominant_emotion() {
-                        trace!("Assistant emotion: {} ({:.2})", dominant.0, dominant.1);
-                    }
-                }
-            }
-
-            EVIServerMessage::AudioOutput(output) => {
-                if let Some(cb) = audio_cb {
-                    match output.decode_audio() {
-                        Ok(audio_bytes) => {
-                            let audio_data = RealtimeAudioData {
-                                data: Bytes::from(audio_bytes),
-                                sample_rate: HUME_EVI_DEFAULT_SAMPLE_RATE,
-                                item_id: Some(output.id),
-                                response_id: current_response_id.read().await.clone(),
-                            };
-                            cb(audio_data).await;
-                        }
-                        Err(e) => {
-                            warn!("Failed to decode audio output: {e}");
-                        }
-                    }
-                }
-            }
-
-            EVIServerMessage::AssistantEnd(end) => {
-                debug!("Assistant response ended: {:?}", end.id);
-
-                if let Some(cb) = response_done_cb {
-                    cb(end.id.unwrap_or_default()).await;
-                }
-
-                // Clear current response ID
-                *current_response_id.write().await = None;
-            }
-
-            EVIServerMessage::ToolCall(call) => {
-                debug!("Tool call: {} ({})", call.name, call.tool_call_id);
-
-                if let Some(cb) = function_call_cb {
-                    let request = FunctionCallRequest {
-                        call_id: call.tool_call_id,
-                        name: call.name,
-                        arguments: call.parameters,
-                        item_id: call.id,
-                    };
-                    cb(request).await;
-                }
-            }
-
-            EVIServerMessage::ToolError(err) => {
-                warn!(
-                    "Tool error for {}: {} ({:?})",
-                    err.tool_call_id, err.error, err.code
-                );
-                if let Some(cb) = error_cb {
-                    cb(RealtimeError::ProviderError(format!(
-                        "Tool error: {}",
-                        err.error
-                    )))
-                    .await;
-                }
-            }
-
-            EVIServerMessage::Error(err) => {
-                error!("EVI error: {} - {}", err.code, err.message);
-                if let Some(cb) = error_cb {
-                    cb(RealtimeError::ProviderError(format!(
-                        "{}: {}",
-                        err.code, err.message
-                    )))
-                    .await;
-                }
-            }
-
-            EVIServerMessage::WebSocketError(err) => {
-                error!("WebSocket error: {:?} - {:?}", err.code, err.reason);
-                if let Some(cb) = error_cb {
-                    cb(RealtimeError::WebSocketError(
-                        err.reason.unwrap_or_else(|| "Unknown error".to_string()),
-                    ))
-                    .await;
-                }
-            }
-
-            EVIServerMessage::Unknown => {
-                trace!("Unknown message type received");
-            }
-        }
+        None
     }
 }
 
-// =============================================================================
-// BaseRealtime Implementation
-// =============================================================================
-
 #[async_trait]
 impl BaseRealtime for HumeEVI {
-    fn new(config: RealtimeConfig) -> RealtimeResult<Self>
-    where
-        Self: Sized,
-    {
-        // Convert RealtimeConfig to HumeEVIConfig
-        let hume_config = HumeEVIConfig {
-            api_key: config.api_key,
-            config_id: None,
-            resumed_chat_group_id: None,
-            evi_version: super::config::EVIVersion::V3,
-            voice_id: config.voice,
-            verbose_transcription: false,
-            input_encoding: super::messages::AudioEncoding::Linear16,
-            sample_rate: HUME_EVI_DEFAULT_SAMPLE_RATE,
-            channels: 1,
-            system_prompt: config.instructions,
-            websocket_url: super::messages::HUME_EVI_WEBSOCKET_URL.to_string(),
-            connection_timeout_seconds: 30,
-            reconnection: config.reconnection,
-        };
-
-        Self::from_hume_config(hume_config)
+    fn new(config: RealtimeConfig) -> RealtimeResult<Self> {
+        Ok(Self(RealtimeSession::<HumeProtocol>::new(config)?))
     }
 
     async fn connect(&mut self) -> RealtimeResult<()> {
-        self.connect_internal().await
+        self.0.connect().await
     }
 
     async fn disconnect(&mut self) -> RealtimeResult<()> {
-        // Close the WebSocket sender
-        self.ws_sender.take();
-
-        // Abort the message processing task
-        if let Some(handle) = self.task_handle.take() {
-            handle.abort();
-        }
-
-        *self.state.write().await = ConnectionState::Disconnected;
-        info!("Disconnected from Hume EVI");
-
-        Ok(())
+        self.0.disconnect().await
     }
 
     fn is_ready(&self) -> bool {
-        self.ws_sender.is_some()
+        self.0.is_ready()
     }
 
     fn get_connection_state(&self) -> ConnectionState {
-        // Can't await in sync function, so we use try_read
-        self.state
-            .try_read()
-            .map(|s| *s)
-            .unwrap_or(ConnectionState::Disconnected)
+        self.0.get_connection_state()
     }
 
     async fn send_audio(&mut self, audio_data: Bytes) -> RealtimeResult<()> {
-        let input = AudioInput::from_bytes(&audio_data);
-        self.send_message(EVIClientMessage::AudioInput(input)).await
+        self.0.send_audio(audio_data).await
     }
 
     async fn send_text(&mut self, text: &str) -> RealtimeResult<()> {
-        let input = TextInput {
-            text: text.to_string(),
-        };
-        self.send_message(EVIClientMessage::TextInput(input)).await
+        self.0.send_text(text).await
     }
 
     async fn create_response(&mut self) -> RealtimeResult<()> {
-        // EVI automatically generates responses based on turn detection
-        // This is a no-op for EVI
-        Ok(())
+        self.0.create_response().await
     }
 
     async fn cancel_response(&mut self) -> RealtimeResult<()> {
-        self.send_message(EVIClientMessage::StopAssistant(StopAssistant::default()))
-            .await
+        self.0.cancel_response().await
     }
 
     async fn commit_audio_buffer(&mut self) -> RealtimeResult<()> {
-        // EVI doesn't have a separate commit concept - it uses turn detection
-        Ok(())
+        self.0.commit_audio_buffer().await
     }
 
     async fn clear_audio_buffer(&mut self) -> RealtimeResult<()> {
-        // EVI doesn't expose audio buffer clearing
-        Ok(())
+        self.0.clear_audio_buffer().await
     }
 
     fn on_transcript(&mut self, callback: TranscriptCallback) -> RealtimeResult<()> {
-        self.transcript_callback = Some(callback);
-        Ok(())
+        self.0.on_transcript(callback)
     }
 
     fn on_audio(&mut self, callback: AudioOutputCallback) -> RealtimeResult<()> {
-        self.audio_callback = Some(callback);
-        Ok(())
+        self.0.on_audio(callback)
     }
 
     fn on_error(&mut self, callback: RealtimeErrorCallback) -> RealtimeResult<()> {
-        self.error_callback = Some(callback);
-        Ok(())
+        self.0.on_error(callback)
     }
 
     fn on_function_call(&mut self, callback: FunctionCallCallback) -> RealtimeResult<()> {
-        self.function_call_callback = Some(callback);
-        Ok(())
+        self.0.on_function_call(callback)
     }
 
     fn on_speech_event(&mut self, callback: SpeechEventCallback) -> RealtimeResult<()> {
-        self.speech_event_callback = Some(callback);
-        Ok(())
+        self.0.on_speech_event(callback)
     }
 
     fn on_response_done(&mut self, callback: ResponseDoneCallback) -> RealtimeResult<()> {
-        self.response_done_callback = Some(callback);
-        Ok(())
+        self.0.on_response_done(callback)
     }
 
     fn on_reconnection(&mut self, callback: ReconnectionCallback) -> RealtimeResult<()> {
-        self.reconnection_callback = Some(callback);
-        Ok(())
+        self.0.on_reconnection(callback)
     }
 
     async fn update_session(&mut self, config: RealtimeConfig) -> RealtimeResult<()> {
-        // Update system prompt if provided
-        if let Some(instructions) = config.instructions {
-            let settings = SessionSettings {
-                audio: None,
-                system_prompt: Some(instructions),
-                context: None,
-            };
-            self.send_message(EVIClientMessage::SessionSettings(settings))
-                .await?;
-        }
-        Ok(())
+        self.0.update_session(config).await
     }
 
     async fn submit_function_result(&mut self, call_id: &str, result: &str) -> RealtimeResult<()> {
-        let response = ToolResponse {
-            tool_call_id: call_id.to_string(),
-            content: result.to_string(),
-            tool_name: None,
-        };
-        self.send_message(EVIClientMessage::ToolResponse(response))
-            .await
+        self.0.submit_function_result(call_id, result).await
     }
 
+    /// Rich provider info (preserved verbatim — the existing provider-info test
+    /// asserts this exact shape; the generic driver's minimal info is intentionally
+    /// overridden here).
     fn get_provider_info(&self) -> serde_json::Value {
+        let c = self.0.protocol().evi_config();
         serde_json::json!({
             "provider": "hume",
             "product": "evi",
-            "evi_version": self.config.evi_version.as_str(),
-            "sample_rate": self.config.sample_rate,
-            "channels": self.config.channels,
-            "encoding": format!("{:?}", self.config.input_encoding),
+            "evi_version": c.evi_version.as_str(),
+            "sample_rate": c.sample_rate,
+            "channels": c.channels,
+            "encoding": format!("{:?}", c.input_encoding),
         })
+    }
+
+    fn set_resilience(&mut self, resilience: crate::core::resilience::ResilienceHandles) {
+        self.0.set_resilience(resilience)
+    }
+
+    fn emits_user_turn_frames(&self) -> bool {
+        self.0.emits_user_turn_frames()
+    }
+
+    async fn truncate_response(&mut self, item_id: &str, audio_end_ms: u64) -> RealtimeResult<()> {
+        self.0.truncate_response(item_id, audio_end_ms).await
+    }
+
+    async fn truncate_current_response(&mut self) -> RealtimeResult<Option<(String, u64)>> {
+        self.0.truncate_current_response().await
+    }
+
+    async fn replay_user_audio_preroll(&mut self) -> RealtimeResult<()> {
+        self.0.replay_user_audio_preroll().await
+    }
+
+    async fn replay_conversation(
+        &mut self,
+        items: &[ReplayConversationItem],
+    ) -> RealtimeResult<()> {
+        self.0.replay_conversation(items).await
     }
 }
 
@@ -703,6 +253,8 @@ impl BaseRealtime for HumeEVI {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::realtime::base::{RealtimeError, ReconnectionConfig};
+    use std::sync::Arc;
 
     #[test]
     fn test_hume_evi_creation() {
@@ -730,10 +282,14 @@ mod tests {
         let evi = HumeEVI::new(config);
         assert!(evi.is_ok());
 
+        // The bespoke struct's private `config` fields moved into the protocol;
+        // assert the SAME values through the scaffold's protocol accessor (the
+        // EVI config the protocol parsed from the RealtimeConfig).
         let evi = evi.unwrap();
-        assert_eq!(evi.config.api_key, "test-key");
-        assert_eq!(evi.config.voice_id, Some("kora".to_string()));
-        assert_eq!(evi.config.system_prompt, Some("Be helpful".to_string()));
+        let c = evi.0.protocol().evi_config();
+        assert_eq!(c.api_key, "test-key");
+        assert_eq!(c.voice_id, Some("kora".to_string()));
+        assert_eq!(c.system_prompt, Some("Be helpful".to_string()));
     }
 
     #[test]
@@ -808,5 +364,61 @@ mod tests {
 
         let result = evi.clear_audio_buffer().await;
         assert!(result.is_ok());
+    }
+
+    /// NEW: Hume GAINS automatic reconnection for free from the scaffold (the
+    /// bespoke single-connection loop had NONE). Prove the reconnection config is
+    /// honored end-to-end: a custom `ReconnectionConfig` set on the source config
+    /// reaches the scaffold's reconnect machinery (the same wiring the supervisor
+    /// reconnect loop reads), and `set_resilience` (the shared breaker/governor
+    /// storm-control path the reconnect dials consult) is wired through.
+    #[tokio::test]
+    async fn test_hume_evi_gains_reconnect_and_resilience() {
+        // Custom reconnection config flows from HumeEVIConfig → scaffold.
+        let config = HumeEVIConfig::new("test-key").with_config_id("cfg");
+        let custom = ReconnectionConfig {
+            enabled: true,
+            max_attempts: 9,
+            initial_delay_ms: 250,
+            max_delay_ms: 30_000,
+            backoff_multiplier: 2.0,
+            jitter: false,
+        };
+        let mut with_recon = config.clone();
+        with_recon.reconnection = Some(custom);
+
+        let mut evi = HumeEVI::from_hume_config(with_recon).unwrap();
+        // The scaffold honors the reconnection config (Hume previously could not
+        // reconnect at all).
+        let cfg = evi.0.config().reconnection.clone().unwrap();
+        assert!(cfg.enabled, "reconnect is enabled");
+        assert_eq!(cfg.max_attempts, 9, "custom max_attempts honored");
+        assert!(cfg.should_retry(0), "retry path is wired");
+        assert!(!cfg.should_retry(9), "respects the attempt cap");
+
+        // The shared resilience handles (breaker + governor) the reconnect dials
+        // consult are wired through `set_resilience` — Hume now participates in the
+        // fleet storm-control path it gained from the scaffold.
+        assert!(
+            evi.resilience_breaker().is_none(),
+            "no breaker until injected"
+        );
+        let handles = crate::core::resilience::ResilienceRegistry::new(4).handles_for("hume");
+        evi.set_resilience(handles);
+        assert!(
+            evi.resilience_breaker().is_some(),
+            "set_resilience wires the shared breaker"
+        );
+
+        // A default-config Hume defaults reconnection ON (scaffold default) —
+        // another capability the bespoke client lacked.
+        let default_evi = HumeEVI::from_hume_config(HumeEVIConfig::new("k")).unwrap();
+        let dcfg = default_evi
+            .0
+            .config()
+            .reconnection
+            .clone()
+            .unwrap_or_default();
+        assert!(dcfg.enabled, "scaffold default reconnection is ON for Hume");
     }
 }

@@ -15,7 +15,7 @@
 
 use super::config::{
     AUDIO_SAMPLE_RATE, MAX_SPEED, MIN_SPEED, VIETTEL_TTS_ENDPOINT, ViettelTtsConfig,
-    ViettelTtsRequest, ViettelVoice,
+    ViettelTtsRequest, ViettelTtsResponse, ViettelVoice,
 };
 use crate::core::tts::base::{
     AudioCallback, AudioData, BaseTTS, ConnectionState, TTSConfig, TTSError, TTSResult,
@@ -24,7 +24,7 @@ use reqwest::Client;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::RwLock;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// Viettel AI TTS client.
 ///
@@ -35,7 +35,7 @@ pub struct ViettelTts {
     /// Provider configuration.
     config: ViettelTtsConfig,
     /// HTTP client for REST API calls.
-    http_client: Client,
+    http_client: Option<Client>,
     /// Whether the client is ready to receive requests.
     is_ready: AtomicBool,
     /// Audio callback for streaming audio to caller.
@@ -44,6 +44,25 @@ pub struct ViettelTts {
     connection_state: Arc<RwLock<ConnectionState>>,
     /// Request counter for generating unique IDs.
     request_counter: AtomicU64,
+}
+
+fn viettel_tts_http_client(timeout_secs: u64) -> Result<Client, reqwest::Error> {
+    crate::core::net::ssrf_protected_client_builder(crate::core::net::HTTP_URL_SCHEMES)
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .build()
+}
+
+fn default_viettel_tts_http_client() -> Option<Client> {
+    match viettel_tts_http_client(super::config::DEFAULT_REQUEST_TIMEOUT) {
+        Ok(client) => Some(client),
+        Err(err) => {
+            warn!(
+                error = %err,
+                "failed to create default Viettel TTS HTTP client; default instance is inert until rebuilt with a valid config"
+            );
+            None
+        }
+    }
 }
 
 impl ViettelTts {
@@ -77,9 +96,17 @@ impl ViettelTts {
         };
 
         // Send request
-        let response = self
-            .http_client
-            .post(VIETTEL_TTS_ENDPOINT)
+        let http_client = self.http_client.as_ref().ok_or_else(|| {
+            TTSError::InvalidConfiguration(
+                "Viettel TTS default HTTP client is unavailable; construct with ViettelTts::new or from_standard".to_string(),
+            )
+        })?;
+
+        let response = http_client
+            .post(crate::core::tts::standard::override_rest_endpoint(
+                VIETTEL_TTS_ENDPOINT,
+                self.config.endpoint_override.as_deref(),
+            ))
             .header("Content-Type", "application/json")
             .header("token", &self.config.api_key)
             .json(&request_body)
@@ -120,7 +147,8 @@ impl ViettelTts {
             };
         }
 
-        // Response is binary audio data (WAV)
+        // Response is either binary audio data (default) or a JSON envelope
+        // containing a provider-hosted audio URL when tts_return_option=1.
         let audio_data = response
             .bytes()
             .await
@@ -134,22 +162,102 @@ impl ViettelTts {
             ));
         }
 
-        // Check if response is JSON error (not audio)
         if audio_data.starts_with(b"{") {
-            // Try to parse as error JSON
-            if let Ok(error_str) = std::str::from_utf8(&audio_data) {
-                if error_str.contains("error") || error_str.contains("message") {
-                    return Err(TTSError::ProviderError(format!(
-                        "API returned error: {}",
-                        error_str
-                    )));
-                }
+            let response: ViettelTtsResponse =
+                serde_json::from_slice(&audio_data).map_err(|e| {
+                    TTSError::ProviderError(format!(
+                        "Failed to parse Viettel TTS JSON response: {e}"
+                    ))
+                })?;
+
+            if !response.is_success() {
+                return Err(TTSError::ProviderError(
+                    response.status_message().to_string(),
+                ));
             }
+
+            if response.audio_url.trim().is_empty() {
+                return Err(TTSError::ProviderError(
+                    "Viettel TTS returned JSON response without audio_url".to_string(),
+                ));
+            }
+
+            return self.download_audio(&response.audio_url).await;
         }
 
         info!("Viettel TTS: Received {} bytes of audio", audio_data.len());
 
         Ok(audio_data)
+    }
+
+    /// Download audio from a Viettel-hosted URL response.
+    async fn download_audio(&self, url: &str) -> TTSResult<Vec<u8>> {
+        let url = crate::core::tts::standard::validate_provider_audio_url("Viettel TTS", url)?;
+        let audio_client = crate::core::net::ssrf_protected_client_builder(
+            crate::core::tts::standard::PROVIDER_AUDIO_URL_SCHEMES,
+        )
+        .timeout(std::time::Duration::from_secs(
+            self.config.request_timeout_secs,
+        ))
+        .build()
+        .map_err(|e| {
+            TTSError::NetworkError(format!("Failed to create SSRF-protected audio client: {e}"))
+        })?;
+
+        let response = audio_client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| TTSError::NetworkError(format!("Failed to download audio: {e}")))?;
+
+        if !response.status().is_success() {
+            return Err(TTSError::ProviderError(format!(
+                "Failed to download audio: status {}",
+                response.status()
+            )));
+        }
+
+        let audio_data = response
+            .bytes()
+            .await
+            .map_err(|e| TTSError::NetworkError(format!("Failed to read downloaded audio: {e}")))?
+            .to_vec();
+
+        if audio_data.is_empty() {
+            return Err(TTSError::ProviderError(
+                "Received empty downloaded audio data".to_string(),
+            ));
+        }
+
+        Ok(audio_data)
+    }
+
+    /// Build from the standardized TTS config (W1 keystone). Mirrors [`BaseTTS::new`] but maps the
+    /// standardized features via [`ViettelTtsConfig::from_standard`] (which honors `speed` and the
+    /// `without_filter` / `tts_return_option` extras) before constructing the timeout-bounded HTTP
+    /// client. Features Viettel cannot express stay at provider defaults (capability gaps).
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
+        let viettel_config = ViettelTtsConfig::from_standard(std)?;
+
+        let timeout_secs = viettel_config.request_timeout_secs;
+        let http_client = viettel_tts_http_client(timeout_secs).map_err(|e| {
+            TTSError::InvalidConfiguration(format!("Failed to create HTTP client: {e}"))
+        })?;
+
+        info!(
+            "Viettel TTS: Initialized (standardized) with voice='{}', speed={}",
+            viettel_config.voice.display_name(),
+            viettel_config.speed
+        );
+
+        Ok(Self {
+            config: viettel_config,
+            http_client: Some(http_client),
+            is_ready: AtomicBool::new(false),
+            audio_callback: Arc::new(RwLock::new(None)),
+            connection_state: Arc::new(RwLock::new(ConnectionState::Disconnected)),
+            request_counter: AtomicU64::new(1),
+        })
     }
 
     /// Get the Viettel-specific configuration.
@@ -177,7 +285,7 @@ impl Default for ViettelTts {
     fn default() -> Self {
         Self {
             config: ViettelTtsConfig::default(),
-            http_client: Client::new(),
+            http_client: default_viettel_tts_http_client(),
             is_ready: AtomicBool::new(false),
             audio_callback: Arc::new(RwLock::new(None)),
             connection_state: Arc::new(RwLock::new(ConnectionState::Disconnected)),
@@ -192,12 +300,9 @@ impl BaseTTS for ViettelTts {
         let viettel_config = ViettelTtsConfig::from_base(config)?;
 
         let timeout_secs = viettel_config.request_timeout_secs;
-        let http_client = Client::builder()
-            .timeout(std::time::Duration::from_secs(timeout_secs))
-            .build()
-            .map_err(|e| {
-                TTSError::InvalidConfiguration(format!("Failed to create HTTP client: {e}"))
-            })?;
+        let http_client = viettel_tts_http_client(timeout_secs).map_err(|e| {
+            TTSError::InvalidConfiguration(format!("Failed to create HTTP client: {e}"))
+        })?;
 
         info!(
             "Viettel TTS: Initialized with voice='{}', speed={}",
@@ -207,7 +312,7 @@ impl BaseTTS for ViettelTts {
 
         Ok(Self {
             config: viettel_config,
-            http_client,
+            http_client: Some(http_client),
             is_ready: AtomicBool::new(false),
             audio_callback: Arc::new(RwLock::new(None)),
             connection_state: Arc::new(RwLock::new(ConnectionState::Disconnected)),
@@ -447,6 +552,178 @@ mod tests {
         assert!(!tts.is_ready());
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn viettel_tts_redirect_policy_rejects_private_hop() {
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local redirect test server");
+        let addr = listener.local_addr().expect("local addr");
+
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 1024];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 302 Found\r\n",
+                "Location: http://127.0.0.1:9/metadata\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n"
+            );
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await;
+        });
+
+        let tts = ViettelTts::new(make_test_config()).expect("construct Viettel TTS");
+        let err = tts
+            .http_client
+            .as_ref()
+            .expect("strict constructor builds an HTTP client")
+            .get(format!("http://{addr}/start"))
+            .send()
+            .await
+            .expect_err("private redirect target must be rejected");
+        let mut error_chain = err.to_string();
+        let mut source = std::error::Error::source(&err);
+        while let Some(err) = source {
+            error_chain.push_str(": ");
+            error_chain.push_str(&err.to_string());
+            source = err.source();
+        }
+        assert!(error_chain.contains("SSRF protection"), "{error_chain}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn provider_audio_url_rejects_unsafe_targets() {
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        struct RestoreLoopbackFlag(Option<String>);
+        impl Drop for RestoreLoopbackFlag {
+            fn drop(&mut self) {
+                // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+                unsafe {
+                    if let Some(previous) = self.0.take() {
+                        std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", previous);
+                    } else {
+                        std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+                    }
+                }
+            }
+        }
+        let _restore_loopback =
+            RestoreLoopbackFlag(std::env::var("WAAV_ALLOW_LOOPBACK_ENDPOINTS").ok());
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
+
+        let tts = ViettelTts::new(make_test_config()).expect("construct Viettel TTS");
+        let err = tts
+            .download_audio("http://127.0.0.1:9000/audio.wav")
+            .await
+            .expect_err("provider-returned loopback audio URL must be rejected");
+        assert!(
+            err.to_string().contains("SSRF protection"),
+            "unexpected error: {err}"
+        );
+
+        let err = tts
+            .download_audio("file:///tmp/audio.wav")
+            .await
+            .expect_err("provider-returned file audio URL must be rejected");
+        assert!(
+            err.to_string().contains("URL scheme"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn url_return_json_without_audio_url_is_not_treated_as_audio() {
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        struct RestoreLoopbackFlag(Option<String>);
+        impl Drop for RestoreLoopbackFlag {
+            fn drop(&mut self) {
+                // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+                unsafe {
+                    if let Some(previous) = self.0.take() {
+                        std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", previous);
+                    } else {
+                        std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+                    }
+                }
+            }
+        }
+        let _restore_loopback =
+            RestoreLoopbackFlag(std::env::var("WAAV_ALLOW_LOOPBACK_ENDPOINTS").ok());
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1") };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local Viettel JSON mock");
+        let addr = listener.local_addr().expect("local addr");
+
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 2048];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+            let body = r#"{"status":0,"audio_url":"","message":""}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await;
+        });
+
+        let mut tts = ViettelTts::new(make_test_config()).expect("construct Viettel TTS");
+        tts.config.endpoint_override = Some(format!("http://{addr}"));
+        tts.config.tts_return_option = 1;
+
+        let err = tts
+            .synthesize("Xin chao")
+            .await
+            .expect_err("JSON envelope without audio_url must not be emitted as audio bytes");
+        assert!(
+            err.to_string().contains("without audio_url"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // W1 keystone (TTS): the struct-level `from_standard` builds a real `ViettelTts` through the
+    // standardized path, carrying the `speed` feature (Viettel's only prosody knob) onto the
+    // provider config the request builder reads. Mirrors `DeepgramTTS::from_standard`.
+    #[test]
+    fn from_standard_builds_provider_with_speed() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "viettel_ai".into(),
+                api_key: "test_token".into(),
+                voice_id: Some("doanngocle".into()),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(1.5),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let tts = ViettelTts::from_standard(&std).unwrap();
+        assert!((tts.config.speed - 1.5).abs() < f32::EPSILON);
+        assert_eq!(tts.config.voice, ViettelVoice::DoanNgocLe);
+        assert_eq!(tts.config.api_key, "test_token");
+    }
+
     #[test]
     fn test_new_empty_api_key() {
         let config = TTSConfig {
@@ -480,6 +757,24 @@ mod tests {
     fn test_default_state() {
         let tts = ViettelTts::default();
         assert!(!tts.is_ready());
+    }
+
+    #[tokio::test]
+    async fn default_without_http_client_returns_typed_error_without_panic() {
+        let mut tts = ViettelTts::default();
+        tts.http_client = None;
+
+        let err = tts
+            .synthesize("Xin chao")
+            .await
+            .expect_err("inert default client must fail with a typed error");
+
+        match err {
+            TTSError::InvalidConfiguration(msg) => {
+                assert!(msg.contains("default HTTP client"), "{msg}");
+            }
+            other => panic!("expected InvalidConfiguration, got {other:?}"),
+        }
     }
 
     #[test]

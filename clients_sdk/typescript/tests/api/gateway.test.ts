@@ -1,6 +1,9 @@
 import { describe, it, expect, beforeAll, beforeEach } from 'vitest';
 
-const BASE_URL = 'http://localhost:3001';
+// Env-overridable so the suite can target any gateway. WAAV_GATEWAY_URL may be
+// http(s) or ws(s); normalise to http for these REST probes.
+const RAW_URL = process.env.WAAV_GATEWAY_URL ?? 'http://127.0.0.1:3009';
+const BASE_URL = RAW_URL.replace(/^ws:\/\//, 'http://').replace(/^wss:\/\//, 'https://');
 
 // Helper to add delay between requests to avoid rate limiting
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
@@ -52,7 +55,8 @@ describe('WaaV Gateway API Tests', () => {
     const response = await fetchWithRetry(`${BASE_URL}/`);
     expect(response.ok).toBe(true);
     const data = await response.json();
-    expect(data.status).toBe('OK');
+    // Gateway returns lowercase "ok".
+    expect(data.status).toBe('ok');
   });
 
   it('should return voices list', async () => {

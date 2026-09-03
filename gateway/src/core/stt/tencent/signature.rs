@@ -130,6 +130,12 @@ pub struct TencentSignatureBuilder {
 
     /// Filter empty result callbacks (0=off, 1=on).
     filter_empty_result: Option<u32>,
+
+    /// Noise filter threshold (float in -1.0..=1.0).
+    noise_threshold: Option<f64>,
+
+    /// Sample rate of the input audio when it differs from the engine's nominal rate.
+    input_sample_rate: Option<u32>,
 }
 
 impl TencentSignatureBuilder {
@@ -159,6 +165,8 @@ impl TencentSignatureBuilder {
             convert_num_mode: None,
             customization_id: None,
             filter_empty_result: None,
+            noise_threshold: None,
+            input_sample_rate: None,
         }
     }
 
@@ -308,6 +316,18 @@ impl TencentSignatureBuilder {
         self
     }
 
+    /// Set the noise filter threshold (float in -1.0..=1.0).
+    pub fn with_noise_threshold(mut self, threshold: f64) -> Self {
+        self.noise_threshold = Some(threshold);
+        self
+    }
+
+    /// Set the input audio sample rate (`input_sample_rate`).
+    pub fn with_input_sample_rate(mut self, rate: u32) -> Self {
+        self.input_sample_rate = Some(rate);
+        self
+    }
+
     /// Build the sorted parameter map.
     fn build_params(&self) -> BTreeMap<String, String> {
         let mut params = BTreeMap::new();
@@ -383,6 +403,17 @@ impl TencentSignatureBuilder {
             );
         }
 
+        if let Some(noise_threshold) = self.noise_threshold {
+            params.insert("noise_threshold".to_string(), noise_threshold.to_string());
+        }
+
+        if let Some(input_sample_rate) = self.input_sample_rate {
+            params.insert(
+                "input_sample_rate".to_string(),
+                input_sample_rate.to_string(),
+            );
+        }
+
         params
     }
 
@@ -409,7 +440,7 @@ impl TencentSignatureBuilder {
 
         // Base64 encode
         let signature_base64 =
-            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &signature_bytes);
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, signature_bytes);
 
         Ok(signature_base64)
     }
@@ -461,9 +492,44 @@ impl TencentSignatureBuilder {
         Ok((query_string, signature))
     }
 
-    /// Build the complete WebSocket URL with app_id and signature.
+    /// Build the canonical Tencent ASR string-to-sign.
+    ///
+    /// Per the Tencent real-time ASR spec the signature is computed over the request URL
+    /// WITHOUT the scheme: `asr.cloud.tencent.com/asr/v2/{app_id}?{sorted_params}` (the
+    /// `signature` param itself is NOT included). Signing only the param string (the previous
+    /// behaviour) is rejected server-side with an authentication failure, which made every
+    /// Tencent STT connection fail.
+    fn build_string_to_sign(base_url: &str, app_id: &str, param_string: &str) -> String {
+        let host_path = base_url
+            .trim_start_matches("wss://")
+            .trim_start_matches("ws://")
+            .trim_start_matches("https://")
+            .trim_start_matches("http://");
+        format!("{}/{}?{}", host_path, app_id, param_string)
+    }
+
+    /// Build the complete WebSocket URL with app_id and a correctly-prefixed signature.
     pub fn build_url(&self, base_url: &str, app_id: &str) -> Result<String, SignatureError> {
-        let (query_string, _) = self.build()?;
+        // Validate required fields.
+        if self.secret_id.is_empty() {
+            return Err(SignatureError::MissingParameter("secret_id".to_string()));
+        }
+        if self.secret_key.is_empty() {
+            return Err(SignatureError::MissingParameter("secret_key".to_string()));
+        }
+        if self.voice_id.is_empty() {
+            return Err(SignatureError::MissingParameter("voice_id".to_string()));
+        }
+
+        let params = self.build_params();
+        let param_string = Self::build_param_string(&params);
+
+        // Sign over host+path+app_id+params (NOT just the params — that is the bug fix).
+        let string_to_sign = Self::build_string_to_sign(base_url, app_id, &param_string);
+        let signature = self.calculate_signature(&string_to_sign)?;
+        let signature_encoded = Self::url_encode(&signature);
+
+        let query_string = format!("{}&signature={}", param_string, signature_encoded);
         Ok(format!("{}/{}?{}", base_url, app_id, query_string))
     }
 
@@ -793,6 +859,44 @@ mod tests {
         assert!(url.starts_with("wss://asr.cloud.tencent.com/asr/v2/12345678?"));
         assert!(url.contains("secretid=test_id"));
         assert!(url.contains("signature="));
+    }
+
+    // Regression: the Tencent ASR signature MUST be computed over the scheme-less
+    // host+path+app_id+params, not the bare param string. Signing params-only was rejected
+    // server-side, making every Tencent STT connection fail.
+    #[test]
+    fn test_signature_includes_host_path_prefix() {
+        let builder = TencentSignatureBuilder::new("test_id", "test_key")
+            .with_voice_id("test_voice_id_ab")
+            .with_timestamp(1609459200)
+            .with_nonce(123456789);
+
+        let params = builder.build_params();
+        let param_string = TencentSignatureBuilder::build_param_string(&params);
+
+        // Canonical string-to-sign has no scheme and is prefixed with host/path/app_id.
+        let sts = TencentSignatureBuilder::build_string_to_sign(
+            "wss://asr.cloud.tencent.com/asr/v2",
+            "12345678",
+            &param_string,
+        );
+        assert_eq!(
+            sts,
+            format!("asr.cloud.tencent.com/asr/v2/12345678?{param_string}")
+        );
+
+        // The signature in the URL must be over the prefixed string, not params-only.
+        let sig_correct = builder.calculate_signature(&sts).unwrap();
+        let sig_params_only = builder.calculate_signature(&param_string).unwrap();
+        assert_ne!(
+            sig_correct, sig_params_only,
+            "signature must incorporate the host+path prefix"
+        );
+
+        let url = builder
+            .build_url("wss://asr.cloud.tencent.com/asr/v2", "12345678")
+            .unwrap();
+        assert!(url.contains(&TencentSignatureBuilder::url_encode(&sig_correct)));
     }
 
     // =========================================================================

@@ -18,7 +18,7 @@ const DEFAULT_SPEAK_TIMEOUT_SECS: u64 = 30;
 const MAX_TEXT_LENGTH: usize = 10 * 1024;
 
 use crate::core::tts::{AudioCallback, AudioData, TTSError, create_tts_provider};
-use crate::handlers::ws::config::TTSWebSocketConfig;
+use crate::handlers::ws::config::{TTSWebSocketConfig, client_api_key};
 use crate::state::AppState;
 
 /// Request body for the speak endpoint
@@ -45,13 +45,15 @@ pub struct SpeakRequest {
 /// The bypass is refused rather than ignored: a key that is silently dropped looks like it
 /// worked until the vendor answers 401, naming neither WaaV nor the field that caused it.
 fn vet_speak_api_key(
-    client_key: Option<&String>,
+    client_key: Option<&str>,
     allow_client_keys: bool,
 ) -> Result<Option<String>, String> {
-    // An empty string is how several clients serialize "unset". It cannot bypass anything, so
-    // it falls back instead of failing the request.
-    match client_key.filter(|key| !key.is_empty()) {
-        Some(key) if allow_client_keys => Ok(Some(key.clone())),
+    // Normalisation is delegated so this gate and the WebSocket path agree on what counts as a
+    // supplied key. `client_api_key` treats None, empty AND whitespace-only as "unset" — the
+    // whitespace case matters here, because refusing "   " as a BYOK attempt would fail a
+    // request that was not trying to bypass anything.
+    match client_api_key(client_key) {
+        Some(key) if allow_client_keys => Ok(Some(key)),
         // `/speak` takes no endpoint name -- `resolve_voice_endpoint` is reached only from
         // /v1/audio/speech -- so the message must not tell the caller to use one here.
         Some(_) => Err(
@@ -74,6 +76,11 @@ struct AudioCollector {
     error: Arc<Mutex<Option<TTSError>>>,
     /// Notification for completion - more efficient than polling
     notify: Arc<Notify>,
+    /// Request start instant, used to compute time-to-first-byte for metrics.
+    start: std::time::Instant,
+    /// TTFB in nanoseconds since `start`, set when the first audio chunk arrives
+    /// (`u64::MAX` = not yet observed). Lock-free so the audio callback stays cheap.
+    first_byte_ns: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl AudioCollector {
@@ -85,6 +92,20 @@ impl AudioCollector {
             completed: Arc::new(Mutex::new(false)),
             error: Arc::new(Mutex::new(None)),
             notify: Arc::new(Notify::new()),
+            start: std::time::Instant::now(),
+            first_byte_ns: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
+        }
+    }
+
+    /// The measured time-to-first-byte, if any audio was received.
+    fn ttfb(&self) -> Option<std::time::Duration> {
+        let ns = self
+            .first_byte_ns
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if ns == u64::MAX {
+            None
+        } else {
+            Some(std::time::Duration::from_nanos(ns))
         }
     }
 
@@ -121,15 +142,25 @@ impl AudioCollector {
         }
 
         let audio = self.audio_data.lock().await.clone();
-        let format = self
-            .format
-            .lock()
-            .await
-            .clone()
-            .unwrap_or_else(|| "linear16".to_string());
-        let sample_rate = self.sample_rate.lock().await.unwrap_or(24000);
+        if audio.is_empty() {
+            return Err(TTSError::AudioGenerationFailed(
+                "TTS synthesis completed without audio".to_string(),
+            ));
+        }
+        let format = self.format.lock().await.clone().ok_or_else(|| {
+            TTSError::InternalError("TTS audio completed without format metadata".to_string())
+        })?;
+        let sample_rate = self.sample_rate.lock().await.ok_or_else(|| {
+            TTSError::InternalError("TTS audio completed without sample_rate metadata".to_string())
+        })?;
 
         Ok((audio, format, sample_rate))
+    }
+
+    async fn fail(&self, error: TTSError) {
+        *self.error.lock().await = Some(error);
+        *self.completed.lock().await = true;
+        self.notify.notify_waiters();
     }
 }
 
@@ -139,11 +170,71 @@ impl AudioCallback for AudioCollector {
         audio_data: AudioData,
     ) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
-            // Store format and sample rate from first chunk
-            if self.format.lock().await.is_none() {
-                *self.format.lock().await = Some(audio_data.format.clone());
-                *self.sample_rate.lock().await = Some(audio_data.sample_rate);
+            if *self.completed.lock().await || self.error.lock().await.is_some() {
+                return;
             }
+
+            if audio_data.sample_rate == 0 {
+                self.fail(TTSError::ProviderError(
+                    "TTS provider emitted audio with zero sample_rate".to_string(),
+                ))
+                .await;
+                return;
+            }
+            if audio_data.format.trim().is_empty() {
+                self.fail(TTSError::ProviderError(
+                    "TTS provider emitted audio with empty format".to_string(),
+                ))
+                .await;
+                return;
+            }
+
+            // Record time-to-first-byte exactly once (first chunk with data wins).
+            if !audio_data.data.is_empty() {
+                use std::sync::atomic::Ordering;
+                let elapsed = self.start.elapsed().as_nanos() as u64;
+                // Only set if still unset (u64::MAX sentinel); ignore the race loser.
+                let _ = self.first_byte_ns.compare_exchange(
+                    u64::MAX,
+                    elapsed,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                );
+            }
+
+            // Store format and sample rate from first chunk; every later chunk must agree.
+            let mut format = self.format.lock().await;
+            let mut sample_rate = self.sample_rate.lock().await;
+            match (&*format, *sample_rate) {
+                (None, None) => {
+                    *format = Some(audio_data.format.clone());
+                    *sample_rate = Some(audio_data.sample_rate);
+                }
+                (Some(existing_format), Some(existing_rate))
+                    if existing_format == &audio_data.format
+                        && existing_rate == audio_data.sample_rate => {}
+                (Some(existing_format), Some(existing_rate)) => {
+                    let message = format!(
+                        "TTS provider emitted inconsistent audio metadata: first format={existing_format:?}, sample_rate={existing_rate}; later format={:?}, sample_rate={}",
+                        audio_data.format, audio_data.sample_rate
+                    );
+                    drop(sample_rate);
+                    drop(format);
+                    self.fail(TTSError::ProviderError(message)).await;
+                    return;
+                }
+                _ => {
+                    drop(sample_rate);
+                    drop(format);
+                    self.fail(TTSError::InternalError(
+                        "TTS collector metadata state became inconsistent".to_string(),
+                    ))
+                    .await;
+                    return;
+                }
+            }
+            drop(sample_rate);
+            drop(format);
 
             // Accumulate audio data
             self.audio_data
@@ -237,7 +328,7 @@ pub async fn speak_handler(
     // Get API key: a client-provided key takes priority over server config (BYOK pattern),
     // except under the Bud control plane, which owns the tenant's credentials
     let client_key = match vet_speak_api_key(
-        request.tts_config.api_key.as_ref(),
+        request.tts_config.api_key.as_deref(),
         state.allows_client_supplied_keys(),
     ) {
         Ok(key) => key,
@@ -345,6 +436,11 @@ pub async fn speak_handler(
     // Synthesize speech
     if let Err(e) = tts_provider.speak(&processed_text, true).await {
         error!("Failed to synthesize speech: {:?}", e);
+        state
+            .core_state
+            .metrics
+            .provider(&tts_config.provider, crate::core::metrics::channel::TTS)
+            .record_outcome(false, collector.ttfb(), collector.start.elapsed());
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
@@ -394,6 +490,15 @@ pub async fn speak_handler(
         format,
         sample_rate
     );
+
+    // Record provider metrics (W-C1): total request time + TTFB feed both the in-memory
+    // snapshot and the Prometheus exposition served at /metrics
+    // (waav_provider_requests_total / waav_provider_ttfb_ms).
+    state
+        .core_state
+        .metrics
+        .provider(&tts_config.provider, crate::core::metrics::channel::TTS)
+        .record_outcome(true, collector.ttfb(), collector.start.elapsed());
 
     // Determine content type
     let content_type = match format.as_str() {
@@ -495,9 +600,7 @@ mod tests {
 
     #[test]
     fn test_client_api_key_refused_when_bud_owns_credentials() {
-        let client_key = "sk-caller-owned".to_string();
-
-        let message = vet_speak_api_key(Some(&client_key), false)
+        let message = vet_speak_api_key(Some("sk-caller-owned"), false)
             .expect_err("a client key must not resolve under Bud mode");
 
         assert!(
@@ -512,25 +615,109 @@ mod tests {
 
     #[test]
     fn test_client_api_key_honoured_in_standalone_mode() {
-        let client_key = "sk-caller-owned".to_string();
+        let resolved = vet_speak_api_key(Some("sk-caller-owned"), true).unwrap();
 
-        let resolved = vet_speak_api_key(Some(&client_key), true).unwrap();
+        assert_eq!(resolved.as_deref(), Some("sk-caller-owned"));
+    }
+
+    #[test]
+    fn test_client_api_key_is_trimmed_in_standalone_mode() {
+        // Normalisation is delegated to `client_api_key`; this pins that the delegation is
+        // actually in effect, so `/speak` and the WebSocket path cannot disagree about what a
+        // supplied key is.
+        let resolved = vet_speak_api_key(Some("  sk-caller-owned  "), true).unwrap();
 
         assert_eq!(resolved.as_deref(), Some("sk-caller-owned"));
     }
 
     #[test]
     fn test_empty_client_api_key_falls_back_under_bud_mode() {
-        let empty = String::new();
-
-        let resolved = vet_speak_api_key(Some(&empty), false)
+        let resolved = vet_speak_api_key(Some(""), false)
             .expect("an empty key bypasses nothing and must not fail the request");
 
         assert_eq!(resolved, None, "an empty key falls back to server config");
     }
 
     #[test]
+    fn test_whitespace_client_api_key_falls_back_rather_than_being_refused() {
+        // A whitespace-only value is "unset" spelled badly, not an attempt to bypass the
+        // control plane. Refusing it would fail a request that was not doing anything wrong —
+        // the case the pre-merge `!key.is_empty()` check got wrong.
+        let resolved = vet_speak_api_key(Some("   "), false)
+            .expect("a whitespace-only key bypasses nothing and must not fail the request");
+
+        assert_eq!(resolved, None);
+    }
+
+    #[test]
     fn test_absent_client_api_key_falls_back_under_bud_mode() {
         assert_eq!(vet_speak_api_key(None, false).unwrap(), None);
+    }
+
+    fn chunk(data: &[u8], sample_rate: u32, format: &str) -> AudioData {
+        AudioData {
+            data: data.to_vec(),
+            sample_rate,
+            format: format.to_string(),
+            duration_ms: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn audio_collector_rejects_completion_without_audio_instead_of_default_headers() {
+        let collector = AudioCollector::new();
+
+        collector.on_complete().await;
+        let err = collector
+            .get_result()
+            .await
+            .expect_err("empty completion must not default to linear16/24000");
+
+        assert!(
+            matches!(err, TTSError::AudioGenerationFailed(ref message) if message.contains("without audio")),
+            "unexpected empty-audio error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn audio_collector_rejects_zero_sample_rate_before_accumulating_audio() {
+        let collector = AudioCollector::new();
+
+        collector.on_audio(chunk(&[1, 2, 3], 0, "linear16")).await;
+        let err = collector
+            .get_result()
+            .await
+            .expect_err("zero sample-rate metadata must fail");
+
+        assert!(
+            matches!(err, TTSError::ProviderError(ref message) if message.contains("zero sample_rate")),
+            "unexpected zero-rate error: {err:?}"
+        );
+        assert!(
+            collector.audio_data.lock().await.is_empty(),
+            "invalid zero-rate audio must not be appended"
+        );
+    }
+
+    #[tokio::test]
+    async fn audio_collector_rejects_mixed_chunk_metadata_before_flattening() {
+        let collector = AudioCollector::new();
+
+        collector.on_audio(chunk(&[1, 2], 24_000, "linear16")).await;
+        collector.on_audio(chunk(&[3, 4], 44_100, "linear16")).await;
+        let err = collector
+            .get_result()
+            .await
+            .expect_err("mixed sample-rate chunks must fail");
+
+        assert!(
+            matches!(err, TTSError::ProviderError(ref message) if message.contains("inconsistent audio metadata")),
+            "unexpected mixed-metadata error: {err:?}"
+        );
+        assert_eq!(
+            collector.audio_data.lock().await.as_slice(),
+            &[1, 2],
+            "the invalid second chunk must not be appended"
+        );
     }
 }

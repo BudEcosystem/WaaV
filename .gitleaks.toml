@@ -1,0 +1,102 @@
+# gitleaks configuration for WaaV (plan W-E1 / W-T1, exit E12).
+#
+# Why this file exists: a live Deepgram API key was historically committed to this repo
+# (4 scripts + a report; commit 9e496de) and scrubbed from the working tree, but it
+# survives in git history. The `supply-chain` CI job runs gitleaks and MUST pass — its
+# job is to BLOCK re-introduction of that (or any other) provider secret on a PR/push.
+#
+# We extend the upstream default ruleset (not replace it) and add WaaV-specific rules for
+# the provider key shapes this gateway handles, plus a focused rule for the exact
+# Deepgram-key shape that leaked.
+#
+# Scope note: gitleaks in CI runs in "protect" mode over the pushed/PR commit range
+# (--no-banner --redact), so it gates *new* leaks. A full historical scrub of 9e496de is
+# an operator-coordinated `git filter-repo`/BFG action (rewrites history) tracked
+# separately — this config keeps history clean going forward.
+
+title = "WaaV gitleaks config"
+
+# Inherit gitleaks' built-in rules (AWS, GCP, generic high-entropy, JWT, Slack, etc.).
+[extend]
+useDefault = true
+
+# ---------------------------------------------------------------------------------------
+# WaaV provider-specific rules
+# ---------------------------------------------------------------------------------------
+
+# Deepgram API key: 40-char lowercase hex, conventionally sent as `Token <key>`.
+# This is the exact shape of the key that leaked (commit 9e496de). Keyword-anchored so it
+# does not fire on unrelated 40-hex blobs (git SHAs, etc.).
+[[rules]]
+id = "waav-deepgram-api-key"
+description = "Deepgram API key (40-char hex) — the historically-leaked secret class"
+regex = '''(?i)(?:deepgram|dg)[a-z0-9_\-\.]{0,25}['"\s:=]{1,3}\b([a-f0-9]{40})\b'''
+secretGroup = 1
+keywords = ["deepgram", "dg_"]
+tags = ["provider", "deepgram", "key"]
+
+# Deepgram `Token <hex40>` Authorization header literal (covers a key pasted into a header
+# string even without the word "deepgram" nearby — the form used in deepgram.rs:641).
+[[rules]]
+id = "waav-deepgram-token-header"
+description = "Deepgram `Token <40-hex>` Authorization header"
+regex = '''(?i)\bToken\s+([a-f0-9]{40})\b'''
+secretGroup = 1
+keywords = ["token"]
+tags = ["provider", "deepgram", "header"]
+
+# ElevenLabs API key (sk_<32+ hex/alnum>) — live-validated provider, key present in CI.
+[[rules]]
+id = "waav-elevenlabs-api-key"
+description = "ElevenLabs API key"
+regex = '''\b(sk_[a-f0-9]{40,})\b'''
+secretGroup = 1
+keywords = ["sk_", "elevenlabs", "xi-api-key"]
+tags = ["provider", "elevenlabs", "key"]
+
+# OpenAI / OpenAI-compatible keys (sk-..., sk-proj-...). Catches OpenAI, Groq-via-OpenAI,
+# and any OPENAI_BASE_URL-pointed provider secrets.
+[[rules]]
+id = "waav-openai-api-key"
+description = "OpenAI / OpenAI-compatible API key"
+regex = '''\b(sk-(?:proj-)?[A-Za-z0-9_\-]{20,})\b'''
+secretGroup = 1
+keywords = ["sk-", "openai"]
+tags = ["provider", "openai", "key"]
+
+# Generic provider api_key assignment carrying a high-entropy value. Anchored on the many
+# `*_API_KEY = "..."` env/config shapes across the 69 providers so a pasted real key in a
+# config/script trips the gate; the allowlist below excludes obvious placeholders.
+[[rules]]
+id = "waav-generic-provider-api-key"
+description = "Generic <PROVIDER>_API_KEY assignment with a secret-looking value"
+regex = '''(?i)\b([A-Z0-9_]{0,24}API_KEY|api[_-]?key|access[_-]?token|secret[_-]?key)\b\s*[:=]\s*['"]([A-Za-z0-9_\-\.\/+]{24,})['"]'''
+secretGroup = 2
+keywords = ["api_key", "apikey", "access_token", "secret_key"]
+tags = ["provider", "generic", "key"]
+
+# ---------------------------------------------------------------------------------------
+# Allowlist: placeholders, examples, fixtures, and the in-repo mock providers (which use
+# obviously-fake keys). Real keys must never match these patterns.
+# ---------------------------------------------------------------------------------------
+[allowlist]
+description = "Placeholders, env-var references, examples, mocks, and vendored fixtures"
+paths = [
+  '''(^|/)\.env\.example$''',
+  '''(^|/)config\.example\.ya?ml$''',
+  '''(^|/)README\.md$''',
+  '''gateway/tests/mock_providers/.*''',
+  '''gateway/tests/fixtures/.*''',
+  '''clients_sdk/.*/(README|example|examples)\b.*''',
+]
+regexes = [
+  # Placeholder / templated values.
+  '''(?i)\b(your|my|example|placeholder|dummy|fake|test|sample|xxx+|changeme|redacted|\.\.\.|<[^>]+>|\$\{?[A-Z0-9_]+\}?)\b''',
+  # `os.environ[...]`, `${VAR}`, `process.env.X`, `secrets.X` references (post-scrub form).
+  '''(?i)(os\.environ|process\.env|getenv|env\[|secrets\.)''',
+  # All-zero / repeated-char obvious non-secrets.
+  '''\b(0{20,}|a{20,}|x{20,})\b''',
+]
+# Never flag git commit SHAs by themselves (the 40-hex Deepgram rule is keyword-anchored,
+# so a bare SHA in a doc/lockfile is not a finding).
+commits = []

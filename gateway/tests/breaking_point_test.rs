@@ -10,13 +10,6 @@
 
 mod mock_providers;
 
-use mock_providers::{
-    ChaosConfig, LatencyProfile,
-    http_mock::{HttpMockState, spawn_http_mock},
-    websocket_mock::{WebSocketMockState, spawn_stt_websocket_mock, spawn_tts_websocket_mock},
-};
-
-use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
@@ -281,10 +274,10 @@ impl BreakingPointSaver {
 
     async fn write_summary(&self, summary: &BreakingPointSummary) {
         let path = self.output_dir.join("summary.json");
-        if let Ok(json) = serde_json::to_string_pretty(summary) {
-            if let Ok(mut file) = File::create(&path) {
-                let _ = file.write_all(json.as_bytes());
-            }
+        if let Ok(json) = serde_json::to_string_pretty(summary)
+            && let Ok(mut file) = File::create(&path)
+        {
+            let _ = file.write_all(json.as_bytes());
         }
 
         // Also write human-readable report
@@ -299,7 +292,7 @@ impl BreakingPointSaver {
 fn generate_report(summary: &BreakingPointSummary) -> String {
     let mut report = String::new();
 
-    report.push_str("\n");
+    report.push('\n');
     report
         .push_str("╔══════════════════════════════════════════════════════════════════════════╗\n");
     report
@@ -404,7 +397,7 @@ async fn run_iteration(
     // Spawn workers
     let mut handles = Vec::with_capacity(vus as usize);
 
-    for _ in 0..vus {
+    for worker_id in 0..vus {
         let client = client.clone();
         let stats = stats.clone();
         let semaphore = semaphore.clone();
@@ -423,7 +416,7 @@ async fn run_iteration(
             }
         });
 
-        handles.push(handle);
+        handles.push((worker_id, handle));
     }
 
     // Run for duration
@@ -431,8 +424,10 @@ async fn run_iteration(
     running.store(false, Ordering::Relaxed);
 
     // Wait for workers
-    for handle in handles {
-        let _ = handle.await;
+    for (worker_id, handle) in handles {
+        handle.await.unwrap_or_else(|err| {
+            panic!("breaking point worker {worker_id}/{vus} failed to join: {err}")
+        });
     }
 
     stats.to_result(vus).await
@@ -495,6 +490,7 @@ fn get_hardware_info() -> HardwareInfo {
 
 /// Find the breaking point of the gateway by escalating load
 #[tokio::test]
+#[ignore = "load/breaking-point test: escalates to 50k VUs (~65min). Run explicitly: cargo test --test breaking_point_test --release -- --ignored --nocapture"]
 async fn test_find_breaking_point() {
     println!("\n{}", "=".repeat(70));
     println!("WaaV Gateway Breaking Point Test");
@@ -538,7 +534,7 @@ async fn test_find_breaking_point() {
     println!("  Error threshold: {}%", ERROR_THRESHOLD_PERCENT);
     println!("  VU increment: {}", VU_INCREMENT);
     println!("  Iteration duration: {}s", ITERATION_DURATION_SECS);
-    println!("");
+    println!();
 
     while current_vus <= MAX_VUS {
         println!(
@@ -629,6 +625,7 @@ async fn test_find_breaking_point() {
 
 /// Quick breaking point test (shorter iterations)
 #[tokio::test]
+#[ignore = "load test: 50k-permit semaphore stress. Run explicitly: cargo test --test breaking_point_test --release -- --ignored --nocapture"]
 async fn test_quick_breaking_point() {
     println!("\n{}", "=".repeat(70));
     println!("WaaV Gateway Quick Breaking Point Test (10s iterations)");

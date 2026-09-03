@@ -18,6 +18,7 @@
 //! - Sample rates: 8000, 16000, 22050, 24000, 44100, or 48000 Hz
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -25,13 +26,22 @@ use futures::{SinkExt, StreamExt};
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use super::config::CartesiaSTTConfig;
-use super::messages::CartesiaMessage;
+use super::messages::{CartesiaCommand, CartesiaMessage};
+use crate::core::resilience::connect::{WS_CONNECT_TIMEOUT, with_timeout};
 use crate::core::stt::base::{
     BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback,
 };
+use crate::core::websocket::ReconnectionConfig;
+use crate::core::websocket::reconnectable_stream::{
+    ReconnectOutcome, ReconnectableStream, ReconnectableStreamConfig, RestoreError, StreamError,
+    WsTransport,
+};
+use futures::stream::{SplitSink, SplitStream};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 // =============================================================================
 // Constants
@@ -40,6 +50,159 @@ use crate::core::stt::base::{
 /// Per-message idle timeout for WebSocket message reception.
 /// Resets after each successful message. Catches stuck/dead connections.
 const WS_MESSAGE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The concrete WebSocket stream type Cartesia dials.
+type CartesiaWs = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+
+enum CartesiaOutbound {
+    Audio(Bytes),
+    Command(CartesiaCommand),
+}
+
+/// A [`WsTransport`] that adapts Cartesia's streaming event loop to the generic
+/// [`ReconnectableStream`] supervisor (W-D1 fleet adoption). Like ElevenLabs, Cartesia carries
+/// every feature (model, encoding, sample rate, endpointing, language, auth) in the connect URL,
+/// so [`restore_session`](WsTransport::restore_session) is a no-op — a fresh dial already restored
+/// the featured session. [`run`](WsTransport::run) IS the original `select!` loop, now returning a
+/// [`ReconnectOutcome`] so a mid-stream transport drop reconnects instead of ending the session.
+struct CartesiaTransport {
+    ws_sink: SplitSink<CartesiaWs, Message>,
+    ws_stream: SplitStream<CartesiaWs>,
+    /// Shared outbound receiver (single-consumer; locked for the duration of `run`).
+    outbound_rx: Arc<Mutex<mpsc::Receiver<CartesiaOutbound>>>,
+    /// Shared shutdown token (fires once; an intentional close must not reconnect).
+    shutdown_token: CancellationToken,
+    result_tx: mpsc::Sender<STTResult>,
+    error_tx: mpsc::Sender<STTError>,
+    /// Fires once on the first successful connect, unblocking `start_connection`.
+    connected_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+}
+
+impl CartesiaTransport {
+    async fn send_done(ws_sink: &mut SplitSink<CartesiaWs, Message>) {
+        let done_message = Message::Text(
+            serde_json::to_string(&CartesiaCommand::Done)
+                .unwrap_or_else(|_| "\"done\"".to_string())
+                .into(),
+        );
+        if let Err(e) = ws_sink.send(done_message).await {
+            warn!("Failed to send done command: {}", e);
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl WsTransport for CartesiaTransport {
+    async fn restore_session(&mut self) -> Result<(), RestoreError> {
+        // Cartesia puts every feature in the connect URL, so a fresh dial already restored the
+        // featured session — nothing to re-send. Signal the waiting connect() exactly once.
+        if let Some(tx) = self.connected_tx.lock().await.take() {
+            let _ = tx.send(());
+        }
+        Ok(())
+    }
+
+    async fn run(&mut self) -> ReconnectOutcome {
+        let mut outbound_rx = self.outbound_rx.lock().await;
+        let shutdown_token = self.shutdown_token.clone();
+        loop {
+            if shutdown_token.is_cancelled() {
+                info!("Received shutdown signal for Cartesia STT");
+                Self::send_done(&mut self.ws_sink).await;
+                return ReconnectOutcome::Completed;
+            }
+
+            tokio::select! {
+                // Handle outgoing audio data and control commands.
+                Some(outbound) = outbound_rx.recv() => {
+                    let send_result = match outbound {
+                        CartesiaOutbound::Audio(audio_data) => {
+                            // Send audio as raw binary (NOT base64 encoded).
+                            self.ws_sink.send(Message::Binary(audio_data)).await
+                        }
+                        CartesiaOutbound::Command(command) => {
+                            let command_name = format!("{command:?}");
+                            match serde_json::to_string(&command) {
+                                Ok(json) => self.ws_sink.send(Message::Text(json.into())).await,
+                                Err(e) => {
+                                    let stt_error = STTError::ProviderError(format!(
+                                        "Failed to serialize Cartesia command {command_name}: {e}"
+                                    ));
+                                    error!("{}", stt_error);
+                                    let _ = self.error_tx.try_send(stt_error);
+                                    return ReconnectOutcome::Fatal(StreamError::new(
+                                        "command serialization failed",
+                                    ));
+                                }
+                            }
+                        }
+                    };
+                    if let Err(e) = send_result {
+                        let stt_error = STTError::NetworkError(format!(
+                            "Failed to send WebSocket message: {e}"
+                        ));
+                        error!("{}", stt_error);
+                        let _ = self.error_tx.try_send(stt_error);
+                        return ReconnectOutcome::Reconnectable(StreamError::new("websocket send failed"));
+                    }
+                }
+
+                // Handle incoming messages with idle timeout
+                message = timeout(WS_MESSAGE_TIMEOUT, self.ws_stream.next()) => {
+                    match message {
+                        Ok(Some(Ok(msg))) => {
+                            match CartesiaSTT::handle_websocket_message(
+                                msg,
+                                &self.result_tx,
+                                &self.error_tx,
+                            ) {
+                                Ok(should_close) => {
+                                    if should_close {
+                                        // `Done`/`Close` is the provider signalling end-of-session —
+                                        // an intentional completion, NOT a transport drop.
+                                        debug!("Closing Cartesia WebSocket connection as requested");
+                                        return ReconnectOutcome::Completed;
+                                    }
+                                }
+                                Err(e) => {
+                                    // A provider error frame is typically fatal (bad config) — don't
+                                    // hammer it with reconnects.
+                                    error!("Streaming error from Cartesia: {}", e);
+                                    return ReconnectOutcome::Fatal(StreamError::new("provider error frame"));
+                                }
+                            }
+                        }
+                        Ok(Some(Err(e))) => {
+                            let stt_error = STTError::NetworkError(format!("WebSocket error: {e}"));
+                            error!("{}", stt_error);
+                            let _ = self.error_tx.try_send(stt_error);
+                            return ReconnectOutcome::Reconnectable(StreamError::new("websocket error"));
+                        }
+                        Ok(None) => {
+                            info!("Cartesia WebSocket stream ended");
+                            return ReconnectOutcome::Reconnectable(StreamError::new("stream ended"));
+                        }
+                        Err(_elapsed) => {
+                            let stt_error = STTError::NetworkError(
+                                "WebSocket idle timeout - no message for 60 seconds".into()
+                            );
+                            error!("Cartesia STT idle timeout: {}", stt_error);
+                            let _ = self.error_tx.try_send(stt_error);
+                            return ReconnectOutcome::Reconnectable(StreamError::new("idle timeout"));
+                        }
+                    }
+                }
+
+                // Handle shutdown signal (intentional close — must NOT reconnect)
+                _ = shutdown_token.cancelled() => {
+                    info!("Received shutdown signal for Cartesia STT");
+                    Self::send_done(&mut self.ws_sink).await;
+                    return ReconnectOutcome::Completed;
+                }
+            }
+        }
+    }
+}
 
 // =============================================================================
 // Type Aliases
@@ -132,11 +295,16 @@ pub struct CartesiaSTT {
     /// State change notification.
     state_notify: Arc<Notify>,
 
-    /// WebSocket sender for audio data (bounded channel for backpressure).
-    ws_sender: Option<mpsc::Sender<Bytes>>,
+    /// WebSocket sender for audio data and control commands (bounded channel for backpressure).
+    ws_sender: Option<mpsc::Sender<CartesiaOutbound>>,
 
-    /// Shutdown signal sender.
-    shutdown_tx: Option<oneshot::Sender<()>>,
+    /// Shutdown signal token.
+    shutdown_token: Option<CancellationToken>,
+
+    /// Intentional-disconnect flag shared with the reconnect supervisor (W-D1). Cleared on
+    /// `connect()`, set in `disconnect()` before cancelling `shutdown_token`, so a client close racing a
+    /// server-side close can never trigger a spurious reconnect.
+    intentional_disconnect: Arc<AtomicBool>,
 
     /// Result channel sender.
     result_tx: Option<mpsc::Sender<STTResult>>,
@@ -158,9 +326,46 @@ pub struct CartesiaSTT {
 
     /// Error callback storage for streaming errors.
     error_callback: Arc<Mutex<Option<AsyncErrorCallback>>>,
+
+    /// Shared, process-global resilience handles (W-D2): the single reconnect governor + this
+    /// provider's shared circuit breaker, injected by the VoiceManager from CoreState and driven
+    /// by the generic [`ReconnectableStream`](crate::core::websocket::ReconnectableStream)
+    /// supervisor. `None` before `set_resilience` (a direct unit-test construction) → the
+    /// supervisor uses its own per-session governor/breaker default.
+    resilience: Option<crate::core::resilience::ResilienceHandles>,
 }
 
 impl CartesiaSTT {
+    /// W1 keystone — construct directly from the standardized config so the one advanced feature
+    /// Cartesia can express (endpointing: `endpointing_ms` -> `max_silence_duration_secs`) is
+    /// honored END-TO-END. The flat `BaseSTT::new` path uses `from_base` (defaults only); this is
+    /// the reachable standardized path. Capabilities Cartesia lacks stay at their defaults.
+    pub fn new_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        // Auth is satisfied by EITHER a long-lived api_key OR a short-lived `access_token`
+        // (extras); require at least one so the connect URL always carries a credential.
+        let has_access_token = std
+            .extras
+            .0
+            .get("access_token")
+            .and_then(|v| v.as_str())
+            .is_some_and(|t| !t.is_empty());
+        if std.base.api_key.is_empty() && !has_access_token {
+            return Err(STTError::AuthenticationFailed(
+                "API key or access_token is required for Cartesia STT".to_string(),
+            ));
+        }
+        // `Self` implements `Drop`, so the struct-update (`..Default::default()`) move is illegal;
+        // start from the Default value and overwrite only the config.
+        let cartesia_config = CartesiaSTTConfig::from_standard(std);
+        cartesia_config.validate()?;
+
+        let mut stt = Self::default();
+        stt.config = Some(cartesia_config);
+        Ok(stt)
+    }
+
     /// Handle incoming WebSocket messages and convert to STTResult.
     ///
     /// This is optimized for the hot path:
@@ -238,11 +443,15 @@ impl CartesiaSTT {
         // Validate configuration before connecting
         config.validate()?;
 
+        // Fresh session: clear any intent left over from a prior disconnect so the supervisor
+        // does not immediately complete.
+        self.intentional_disconnect.store(false, Ordering::SeqCst);
+
         let ws_url = config.build_websocket_url(&config.base.api_key);
 
         // Create channels for communication (bounded for backpressure on audio)
-        let (ws_tx, mut ws_rx) = mpsc::channel::<Bytes>(32);
-        let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+        let (ws_tx, ws_rx) = mpsc::channel::<CartesiaOutbound>(32);
+        let shutdown_token = CancellationToken::new();
         // Bounded channels for backpressure - 256 should handle bursts while preventing memory exhaustion
         let (result_tx, mut result_rx) = mpsc::channel::<STTResult>(256);
         let (error_tx, mut error_rx) = mpsc::channel::<STTError>(64);
@@ -250,106 +459,74 @@ impl CartesiaSTT {
 
         // Store channels
         self.ws_sender = Some(ws_tx);
-        self.shutdown_tx = Some(shutdown_tx);
+        self.shutdown_token = Some(shutdown_token.clone());
         self.result_tx = Some(result_tx.clone());
         self.error_tx = Some(error_tx.clone());
 
-        // Clone error_tx for the connection task
-        let error_tx_for_task = error_tx.clone();
+        // Shared state the supervised transport re-uses across reconnect attempts: a single-
+        // consumer outbound receiver + shutdown token and the one-shot connected
+        // signal that fires on the first successful connect.
+        let outbound_rx = Arc::new(Mutex::new(ws_rx));
+        let connected_tx = Arc::new(Mutex::new(Some(connected_tx)));
 
-        // Start the connection task
-        let connection_handle = tokio::spawn(async move {
-            // Connect to Cartesia WebSocket
-            let (ws_stream, _) = match connect_async(&ws_url).await {
-                Ok(result) => result,
-                Err(e) => {
-                    let stt_error =
-                        STTError::ConnectionFailed(format!("Failed to connect to Cartesia: {e}"));
-                    error!("{}", stt_error);
-                    let _ = error_tx_for_task.send(stt_error);
-                    return;
-                }
-            };
-
-            info!("Connected to Cartesia WebSocket");
-
-            // Signal successful connection
-            let _ = connected_tx.send(());
-
-            let (mut ws_sink, mut ws_stream) = ws_stream.split();
-
-            // Main event loop
-            loop {
-                tokio::select! {
-                    // Handle outgoing audio data
-                    Some(audio_data) = ws_rx.recv() => {
-                        // Send audio as raw binary (NOT base64 encoded)
-                        let message = Message::Binary(audio_data);
-                        if let Err(e) = ws_sink.send(message).await {
-                            let stt_error = STTError::NetworkError(format!(
-                                "Failed to send WebSocket message: {e}"
-                            ));
-                            error!("{}", stt_error);
-                            let _ = error_tx.try_send(stt_error);
-                            break;
-                        }
-                    }
-
-                    // Handle incoming messages with idle timeout
-                    message = timeout(WS_MESSAGE_TIMEOUT, ws_stream.next()) => {
-                        match message {
-                            Ok(Some(Ok(msg))) => {
-                                match Self::handle_websocket_message(msg, &result_tx, &error_tx) {
-                                    Ok(should_close) => {
-                                        if should_close {
-                                            debug!("Closing WebSocket connection as requested");
-                                            break;
-                                        }
-                                    }
-                                    Err(e) => {
-                                        error!("Streaming error from Cartesia: {}", e);
-                                        break;
-                                    }
-                                }
-                            }
-                            Ok(Some(Err(e))) => {
-                                let stt_error = STTError::NetworkError(format!(
-                                    "WebSocket error: {e}"
-                                ));
-                                error!("{}", stt_error);
-                                let _ = error_tx.try_send(stt_error);
-                                break;
-                            }
-                            Ok(None) => {
-                                info!("WebSocket stream ended");
-                                break;
-                            }
-                            Err(_elapsed) => {
-                                // Idle timeout - no message received for 60s
-                                let stt_error = STTError::NetworkError(
-                                    "WebSocket idle timeout - no message for 60 seconds".into()
-                                );
-                                error!("Cartesia STT idle timeout: {}", stt_error);
-                                let _ = error_tx.try_send(stt_error);
-                                break;
-                            }
-                        }
-                    }
-
-                    // Handle shutdown signal
-                    _ = &mut shutdown_rx => {
-                        info!("Received shutdown signal");
-                        // Send "done" command to gracefully close the session
-                        let done_message = Message::Text("\"done\"".into());
-                        if let Err(e) = ws_sink.send(done_message).await {
-                            warn!("Failed to send done command: {}", e);
-                        }
-                        break;
-                    }
-                }
+        // Storm control + provider breaker: drive the GENERIC ReconnectableStream supervisor (the
+        // same one the chaos tests exercise) with the shared process-global handles from CoreState
+        // (W-D1/W-D2 fleet adoption). When no handles were injected (a direct unit-test
+        // construction), the supervisor uses its own per-session governor/breaker default.
+        let reconnection = ReconnectionConfig::aggressive();
+        let disconnect_flag = Arc::clone(&self.intentional_disconnect);
+        let supervisor = match self.resilience.clone() {
+            Some(r) => ReconnectableStream::with_breaker_and_governor(
+                ReconnectableStreamConfig::new("cartesia", reconnection),
+                r.breaker,
+                (*r.governor).clone(),
+            ),
+            None => {
+                ReconnectableStream::new(ReconnectableStreamConfig::new("cartesia", reconnection))
             }
+        }
+        .with_disconnect_flag(disconnect_flag);
 
-            info!("Cartesia WebSocket connection closed");
+        // Start the connection task: the supervisor owns the outer reconnect loop; the `connect`
+        // closure dials the *featured* URL (every feature is in the URL) and hands back a transport
+        // whose `run()` is the original Cartesia event loop.
+        let connection_handle = tokio::spawn(async move {
+            let exit = supervisor
+                .run(|| {
+                    let ws_url = ws_url.clone();
+                    let outbound_rx = Arc::clone(&outbound_rx);
+                    let shutdown_token = shutdown_token.clone();
+                    let connected_tx = Arc::clone(&connected_tx);
+                    let result_tx = result_tx.clone();
+                    let error_tx = error_tx.clone();
+                    async move {
+                        let (ws_stream, _) =
+                            with_timeout(WS_CONNECT_TIMEOUT, connect_async(&ws_url))
+                                .await
+                                .map_err(|_| {
+                                    StreamError::new(format!(
+                                        "connect to Cartesia timed out after {}s",
+                                        WS_CONNECT_TIMEOUT.as_secs()
+                                    ))
+                                })?
+                                .map_err(|e| {
+                                    StreamError::new(format!("Failed to connect to Cartesia: {e}"))
+                                })?;
+                        info!("Connected to Cartesia WebSocket");
+                        let (ws_sink, ws_stream) = ws_stream.split();
+                        Ok(CartesiaTransport {
+                            ws_sink,
+                            ws_stream,
+                            outbound_rx,
+                            shutdown_token,
+                            result_tx,
+                            error_tx,
+                            connected_tx,
+                        })
+                    }
+                })
+                .await;
+            info!("Cartesia WebSocket connection closed (supervisor exit: {exit:?})");
         });
 
         self.connection_handle = Some(connection_handle);
@@ -412,14 +589,6 @@ impl CartesiaSTT {
         }
     }
 
-    /// Send a finalize command to flush buffered audio.
-    ///
-    /// This triggers Cartesia to finalize any pending transcription
-    /// without closing the connection.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(())` if the command was sent, or an error if not connected.
     #[allow(dead_code)]
     pub async fn finalize(&mut self) -> Result<(), STTError> {
         if !self.is_ready() {
@@ -428,16 +597,13 @@ impl CartesiaSTT {
             ));
         }
 
-        // The finalize command is sent as a text message
-        // We'll send it through a separate channel or directly
-        // For now, we can use the ws_sender with a special marker
-        // But since ws_sender only accepts Bytes (audio), we need
-        // to handle this differently.
-        //
-        // Note: In a full implementation, we might want a separate
-        // command channel. For now, this is left as a TODO for
-        // advanced use cases.
-        warn!("finalize() is not yet fully implemented - consider disconnecting and reconnecting");
+        let ws_sender = self.ws_sender.as_ref().ok_or_else(|| {
+            STTError::ConnectionFailed("Not connected to Cartesia STT".to_string())
+        })?;
+        ws_sender
+            .send(CartesiaOutbound::Command(CartesiaCommand::Finalize))
+            .await
+            .map_err(|e| STTError::NetworkError(format!("Failed to send finalize command: {e}")))?;
         Ok(())
     }
 }
@@ -449,7 +615,8 @@ impl Default for CartesiaSTT {
             state: ConnectionState::Disconnected,
             state_notify: Arc::new(Notify::new()),
             ws_sender: None,
-            shutdown_tx: None,
+            shutdown_token: None,
+            intentional_disconnect: Arc::new(AtomicBool::new(false)),
             result_tx: None,
             error_tx: None,
             connection_handle: None,
@@ -457,6 +624,7 @@ impl Default for CartesiaSTT {
             error_forward_handle: None,
             result_callback: Arc::new(Mutex::new(None)),
             error_callback: Arc::new(Mutex::new(None)),
+            resilience: None,
         }
     }
 }
@@ -486,7 +654,8 @@ impl BaseSTT for CartesiaSTT {
             state: ConnectionState::Disconnected,
             state_notify: Arc::new(Notify::new()),
             ws_sender: None,
-            shutdown_tx: None,
+            shutdown_token: None,
+            intentional_disconnect: Arc::new(AtomicBool::new(false)),
             result_tx: None,
             error_tx: None,
             connection_handle: None,
@@ -494,6 +663,7 @@ impl BaseSTT for CartesiaSTT {
             error_forward_handle: None,
             result_callback: Arc::new(Mutex::new(None)),
             error_callback: Arc::new(Mutex::new(None)),
+            resilience: None,
         })
     }
 
@@ -508,26 +678,41 @@ impl BaseSTT for CartesiaSTT {
     }
 
     async fn disconnect(&mut self) -> Result<(), STTError> {
+        // Record the intent BEFORE firing shutdown so the supervisor sees it even if the
+        // transport's run() just reported a reconnectable drop (the disconnect-vs-close race).
+        self.intentional_disconnect.store(true, Ordering::SeqCst);
+
         // Send shutdown signal
-        if let Some(shutdown_tx) = self.shutdown_tx.take() {
-            let _ = shutdown_tx.send(());
+        if let Some(shutdown_token) = self.shutdown_token.take() {
+            shutdown_token.cancel();
         }
 
         // Wait for connection task to finish with timeout
         if let Some(handle) = self.connection_handle.take() {
-            let _ = timeout(Duration::from_secs(5), handle).await;
+            crate::core::observability::await_task_shutdown(
+                "cartesia-stt-connection",
+                handle,
+                Duration::from_secs(5),
+            )
+            .await;
         }
 
         // Clean up result forwarding task
         if let Some(handle) = self.result_forward_handle.take() {
-            handle.abort();
-            let _ = handle.await;
+            crate::core::observability::abort_and_await_task(
+                "cartesia-stt-result-forwarder",
+                handle,
+            )
+            .await;
         }
 
         // Clean up error forwarding task
         if let Some(handle) = self.error_forward_handle.take() {
-            handle.abort();
-            let _ = handle.await;
+            crate::core::observability::abort_and_await_task(
+                "cartesia-stt-error-forwarder",
+                handle,
+            )
+            .await;
         }
 
         // Clean up channels and callbacks
@@ -561,7 +746,7 @@ impl BaseSTT for CartesiaSTT {
 
             // Zero-copy - Bytes passed directly to WebSocket
             ws_sender
-                .send(audio_data)
+                .send(CartesiaOutbound::Audio(audio_data))
                 .await
                 .map_err(|e| STTError::NetworkError(format!("Failed to send audio data: {e}")))?;
 
@@ -612,6 +797,22 @@ impl BaseSTT for CartesiaSTT {
     fn get_provider_info(&self) -> &'static str {
         "Cartesia STT (ink-whisper)"
     }
+
+    fn set_resilience(&mut self, resilience: crate::core::resilience::ResilienceHandles) {
+        // Store the shared, process-global handles so `start_connection` drives the generic
+        // ReconnectableStream supervisor with them — every Cartesia session trips the same breaker
+        // and shares the one process-wide reconnect cap (W-D2).
+        self.resilience = Some(resilience);
+    }
+}
+
+impl CartesiaSTT {
+    /// The shared circuit breaker this session feeds into the generic supervisor, if the
+    /// process-global resilience handles have been injected (W-D1/W-D2). Two `CartesiaSTT` built
+    /// from the same [`crate::core::resilience::ResilienceRegistry`] return the *same* `Arc`.
+    pub fn resilience_breaker(&self) -> Option<&Arc<crate::core::resilience::CircuitBreaker>> {
+        self.resilience.as_ref().map(|r| &r.breaker)
+    }
 }
 
 // =============================================================================
@@ -620,9 +821,10 @@ impl BaseSTT for CartesiaSTT {
 
 impl Drop for CartesiaSTT {
     fn drop(&mut self) {
+        self.intentional_disconnect.store(true, Ordering::SeqCst);
         // Send shutdown signal if still connected
-        if let Some(shutdown_tx) = self.shutdown_tx.take() {
-            let _ = shutdown_tx.send(());
+        if let Some(shutdown_token) = self.shutdown_token.take() {
+            shutdown_token.cancel();
         }
 
         // Abort any running tasks
@@ -645,6 +847,76 @@ impl Drop for CartesiaSTT {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone: Cartesia's one mappable advanced feature (endpointing) survives through
+    // new_standard onto the stored provider config (ms -> seconds); the flat factory path drops it.
+    #[test]
+    fn new_standard_carries_endpointing_to_config() {
+        use crate::core::stt::standard::{StandardSTTConfig, SttFeatures};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "cartesia".into(),
+                api_key: "test_key".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                endpointing_ms: Some(500),
+                ..Default::default()
+            },
+            extras: Default::default(),
+            translation: None,
+        };
+        let stt = CartesiaSTT::new_standard(&std).unwrap();
+        assert_eq!(
+            stt.config.as_ref().unwrap().max_silence_duration_secs,
+            Some(0.5)
+        );
+
+        // Missing key is rejected through the standardized path too.
+        let bad = StandardSTTConfig::from_base(STTConfig {
+            api_key: String::new(),
+            ..Default::default()
+        });
+        assert!(CartesiaSTT::new_standard(&bad).is_err());
+    }
+
+    #[test]
+    fn new_standard_rejects_ssrf_endpoint_override() {
+        use crate::core::stt::standard::StandardSTTConfig;
+
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let previous = std::env::var_os("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
+
+        let mk = |endpoint: &str| {
+            StandardSTTConfig::from_base(STTConfig {
+                provider: "cartesia".into(),
+                api_key: "test_key".into(),
+                language: "en".into(),
+                sample_rate: 16000,
+                encoding: "pcm_s16le".into(),
+                model: "ink-whisper".into(),
+                ..Default::default()
+            })
+            .with_endpoint_override(endpoint)
+        };
+
+        assert!(CartesiaSTT::new_standard(&mk("wss://cartesia-proxy.example.com")).is_ok());
+        assert!(CartesiaSTT::new_standard(&mk("ws://127.0.0.1:9000")).is_err());
+        assert!(CartesiaSTT::new_standard(&mk("file:///tmp/socket")).is_err());
+
+        // SAFETY: restore the process env before releasing the test env lock.
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", previous);
+            } else {
+                std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+            }
+        }
+    }
     use tokio::time::Duration;
 
     #[tokio::test]
@@ -737,6 +1009,32 @@ mod tests {
         // Disconnect should succeed even when not connected
         let result = stt.disconnect().await;
         assert!(result.is_ok());
+    }
+
+    // W-D1: disconnect() must record intent on the supervisor-shared flag so a client close racing
+    // a server-side close can never trigger a spurious reconnect (the supervisor's loop-top guard
+    // observes this same `Arc<AtomicBool>`). Before this wiring the flag was the supervisor's own
+    // and disconnect() never set it.
+    #[tokio::test]
+    async fn disconnect_sets_intentional_flag_for_supervisor() {
+        let config = STTConfig {
+            provider: "cartesia".to_string(),
+            api_key: "test_key".to_string(),
+            language: "en".to_string(),
+            sample_rate: 16000,
+            channels: 1,
+            punctuation: true,
+            encoding: "linear16".to_string(),
+            model: "ink-whisper".to_string(),
+        };
+
+        let mut stt = <CartesiaSTT as BaseSTT>::new(config).unwrap();
+        assert!(!stt.intentional_disconnect.load(Ordering::SeqCst));
+        stt.disconnect().await.unwrap();
+        assert!(
+            stt.intentional_disconnect.load(Ordering::SeqCst),
+            "disconnect() must set the supervisor-shared intentional-disconnect flag",
+        );
     }
 
     #[tokio::test]

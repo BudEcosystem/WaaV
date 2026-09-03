@@ -8,6 +8,17 @@ use std::str::FromStr;
 
 use crate::core::tts::base::{TTSConfig, TTSError, TTSResult};
 
+fn validate_speechmatics_tts_endpoint(source: &str, endpoint: &str) -> TTSResult<()> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES).map_err(
+        |msg| TTSError::InvalidConfiguration(format!("{source} rejected (SSRF protection): {msg}")),
+    )
+}
+
 // =============================================================================
 // Voice Enum
 // =============================================================================
@@ -171,7 +182,7 @@ impl FromStr for SpeechmaticsOutputFormat {
 // =============================================================================
 
 /// Speechmatics TTS-specific configuration
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SpeechmaticsTtsConfig {
     /// API key for authentication
     pub api_key: String,
@@ -179,6 +190,8 @@ pub struct SpeechmaticsTtsConfig {
     pub voice: SpeechmaticsVoice,
     /// Output audio format
     pub output_format: SpeechmaticsOutputFormat,
+    /// Override base (scheme+host) for the synth POST, used to redirect to a mock in tests.
+    pub endpoint_override: Option<String>,
 }
 
 impl SpeechmaticsTtsConfig {
@@ -188,6 +201,7 @@ impl SpeechmaticsTtsConfig {
             api_key: api_key.into(),
             voice: SpeechmaticsVoice::default(),
             output_format: SpeechmaticsOutputFormat::default(),
+            endpoint_override: None,
         }
     }
 
@@ -229,17 +243,18 @@ impl SpeechmaticsTtsConfig {
                     .to_string(),
             ));
         }
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_speechmatics_tts_endpoint("endpoint_override", endpoint)?;
+        }
         Ok(())
     }
 
     /// Create from base TTSConfig
     pub fn from_base(config: &TTSConfig) -> TTSResult<Self> {
         // Get API key
-        let api_key = if !config.api_key.is_empty() {
-            config.api_key.clone()
-        } else {
-            std::env::var("SPEECHMATICS_API_KEY").unwrap_or_default()
-        };
+        let api_key = crate::core::credentials::explicit_api_key(&config.api_key)
+            .or_else(|| crate::core::credentials::env_api_key("SPEECHMATICS_API_KEY"))
+            .unwrap_or_default();
 
         if api_key.is_empty() {
             return Err(TTSError::InvalidConfiguration(
@@ -270,8 +285,26 @@ impl SpeechmaticsTtsConfig {
             api_key,
             voice,
             output_format,
+            endpoint_override: None,
         };
 
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Build from the standardized config (W1 keystone). Speechmatics' generate endpoint only
+    /// accepts a voice (path segment) and an `output_format` query parameter — both already
+    /// derived from the base config by [`from_base`] — and its request body carries nothing but the
+    /// text. The two supported formats are fixed at 16 kHz mono, so there is no prosody, voice
+    /// settings, emotion, instructions, SSML, language, timestamp, streaming, seed or even
+    /// adjustable sample-rate surface to map. Every standardized [`TtsFeatures`] field is therefore
+    /// a capability gap, and this is a pure `from_base` passthrough.
+    ///
+    /// [`from_base`]: Self::from_base
+    /// [`TtsFeatures`]: crate::core::tts::standard::TtsFeatures
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
+        let mut cfg = Self::from_base(&std.base)?;
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
         cfg.validate()?;
         Ok(cfg)
     }
@@ -285,16 +318,6 @@ impl SpeechmaticsTtsConfig {
             )));
         }
         Ok(())
-    }
-}
-
-impl Default for SpeechmaticsTtsConfig {
-    fn default() -> Self {
-        Self {
-            api_key: String::new(),
-            voice: SpeechmaticsVoice::default(),
-            output_format: SpeechmaticsOutputFormat::default(),
-        }
     }
 }
 
@@ -328,6 +351,47 @@ impl SpeechmaticsGenerateRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone (TTS): Speechmatics exposes only voice + output_format (both from the base) and a
+    // text-only body, so `from_standard` is a pure `from_base` passthrough — every standardized
+    // feature is a capability gap and must be ignored while the base voice/format still flow through.
+    #[test]
+    fn from_standard_passes_base_through_ignoring_features() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+
+        let mut extras = serde_json::Map::new();
+        extras.insert("unsupported".into(), serde_json::json!("ignored"));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "speechmatics".into(),
+                api_key: "test-api-key".into(),
+                voice_id: Some("jack".into()),
+                audio_format: Some("pcm".into()),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                // None of these have a Speechmatics surface — all must be ignored.
+                speed: Some(1.5),
+                pitch: Some(2.0),
+                volume: Some(80.0),
+                emotion: Some("cheerful".into()),
+                instructions: Some("speak slowly".into()),
+                ssml: Some(true),
+                language: Some("en".into()),
+                sample_rate: Some(48000),
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+
+        let cfg = SpeechmaticsTtsConfig::from_standard(&std).unwrap();
+        // Base-derived fields still flow through unchanged.
+        assert_eq!(cfg.api_key, "test-api-key");
+        assert_eq!(cfg.voice, SpeechmaticsVoice::Jack);
+        assert_eq!(cfg.output_format, SpeechmaticsOutputFormat::Pcm16000);
+        // Output stays fixed at 16 kHz: the sample_rate feature has no field to land in.
+        assert_eq!(cfg.output_format.sample_rate(), 16000);
+    }
 
     #[test]
     fn test_voice_as_str() {
@@ -488,6 +552,42 @@ mod tests {
     fn test_config_validate_valid() {
         let config = SpeechmaticsTtsConfig::new("test-key");
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = SpeechmaticsTtsConfig::new("test-key");
+
+        config.endpoint_override = Some("https://speechmatics-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.to_string().contains("SSRF protection"));
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("file endpoint_override must be rejected");
+        assert!(err.to_string().contains("URL scheme"));
+
+        config.endpoint_override = Some("ws://speechmatics-proxy.example.com".to_string());
+        let err = config
+            .validate()
+            .expect_err("WebSocket endpoint_override must be rejected for REST Speechmatics");
+        assert!(err.to_string().contains("URL scheme"));
+
+        let std = crate::core::tts::standard::StandardTTSConfig::from_base(TTSConfig {
+            provider: "speechmatics".into(),
+            api_key: "test-key".into(),
+            voice_id: Some("jack".into()),
+            ..Default::default()
+        })
+        .with_endpoint_override("file:///tmp/socket");
+        assert!(SpeechmaticsTtsConfig::from_standard(&std).is_err());
     }
 
     #[test]

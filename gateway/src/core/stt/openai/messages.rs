@@ -392,6 +392,35 @@ impl TranscriptionResult {
 /// OpenAI Whisper API requires properly formatted audio files.
 /// This module helps package raw PCM audio into WAV format.
 pub mod wav {
+    /// WAV creation error.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum WavError {
+        /// Sample rate cannot be zero.
+        ZeroSampleRate,
+        /// Channels cannot be zero.
+        ZeroChannels,
+        /// Bits per sample cannot be zero.
+        ZeroBitsPerSample,
+        /// PCM data size exceeds maximum WAV file size.
+        DataTooLarge,
+        /// WAV header arithmetic overflowed.
+        HeaderOverflow,
+    }
+
+    impl std::fmt::Display for WavError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::ZeroSampleRate => write!(f, "Sample rate cannot be zero"),
+                Self::ZeroChannels => write!(f, "Number of channels cannot be zero"),
+                Self::ZeroBitsPerSample => write!(f, "Bits per sample cannot be zero"),
+                Self::DataTooLarge => write!(f, "PCM data exceeds maximum WAV file size"),
+                Self::HeaderOverflow => write!(f, "WAV header arithmetic overflowed"),
+            }
+        }
+    }
+
+    impl std::error::Error for WavError {}
+
     /// Create a WAV file header for PCM audio.
     ///
     /// # Arguments
@@ -408,9 +437,37 @@ pub mod wav {
         channels: u16,
         bits_per_sample: u16,
     ) -> [u8; 44] {
-        let byte_rate = sample_rate * u32::from(channels) * u32::from(bits_per_sample) / 8;
-        let block_align = channels * bits_per_sample / 8;
-        let file_size = 36 + data_size; // File size minus 8 bytes for RIFF header
+        try_create_header(data_size, sample_rate, channels, bits_per_sample)
+            .expect("Invalid WAV header parameters")
+    }
+
+    /// Create a WAV file header for PCM audio with checked geometry.
+    pub fn try_create_header(
+        data_size: u32,
+        sample_rate: u32,
+        channels: u16,
+        bits_per_sample: u16,
+    ) -> Result<[u8; 44], WavError> {
+        if sample_rate == 0 {
+            return Err(WavError::ZeroSampleRate);
+        }
+        if channels == 0 {
+            return Err(WavError::ZeroChannels);
+        }
+        if bits_per_sample == 0 {
+            return Err(WavError::ZeroBitsPerSample);
+        }
+
+        let byte_rate = sample_rate
+            .checked_mul(u32::from(channels))
+            .and_then(|value| value.checked_mul(u32::from(bits_per_sample)))
+            .map(|value| value / 8)
+            .ok_or(WavError::HeaderOverflow)?;
+        let block_align = channels
+            .checked_mul(bits_per_sample)
+            .map(|value| value / 8)
+            .ok_or(WavError::HeaderOverflow)?;
+        let file_size = 36u32.checked_add(data_size).ok_or(WavError::DataTooLarge)?;
 
         let mut header = [0u8; 44];
 
@@ -433,7 +490,7 @@ pub mod wav {
         header[36..40].copy_from_slice(b"data");
         header[40..44].copy_from_slice(&data_size.to_le_bytes());
 
-        header
+        Ok(header)
     }
 
     /// Create a complete WAV file from raw PCM data.
@@ -446,11 +503,28 @@ pub mod wav {
     /// # Returns
     /// Complete WAV file as bytes
     pub fn create_wav(pcm_data: &[u8], sample_rate: u32, channels: u16) -> Vec<u8> {
-        let header = create_header(pcm_data.len() as u32, sample_rate, channels, 16);
-        let mut wav = Vec::with_capacity(44 + pcm_data.len());
+        try_create_wav(pcm_data, sample_rate, channels).expect("Invalid WAV parameters")
+    }
+
+    /// Create a complete WAV file from raw PCM data with checked geometry.
+    pub fn try_create_wav(
+        pcm_data: &[u8],
+        sample_rate: u32,
+        channels: u16,
+    ) -> Result<Vec<u8>, WavError> {
+        if pcm_data.len() > (u32::MAX as usize).saturating_sub(36) {
+            return Err(WavError::DataTooLarge);
+        }
+
+        let data_size = u32::try_from(pcm_data.len()).map_err(|_| WavError::DataTooLarge)?;
+        let header = try_create_header(data_size, sample_rate, channels, 16)?;
+        let capacity = 44usize
+            .checked_add(pcm_data.len())
+            .ok_or(WavError::DataTooLarge)?;
+        let mut wav = Vec::with_capacity(capacity);
         wav.extend_from_slice(&header);
         wav.extend_from_slice(pcm_data);
-        wav
+        Ok(wav)
     }
 }
 
@@ -585,6 +659,30 @@ mod tests {
         let wav = wav::create_wav(&pcm_data, 16000, 1);
         assert_eq!(wav.len(), 44 + 100); // Header + data
         assert_eq!(&wav[0..4], b"RIFF");
+    }
+
+    #[test]
+    fn try_wav_rejects_invalid_geometry_without_panicking() {
+        assert_eq!(
+            wav::try_create_wav(&[0, 0], 0, 1),
+            Err(wav::WavError::ZeroSampleRate)
+        );
+        assert_eq!(
+            wav::try_create_wav(&[0, 0], 16_000, 0),
+            Err(wav::WavError::ZeroChannels)
+        );
+        assert_eq!(
+            wav::try_create_header(10, 16_000, 1, 0),
+            Err(wav::WavError::ZeroBitsPerSample)
+        );
+        assert_eq!(
+            wav::try_create_header(u32::MAX, 16_000, 1, 16),
+            Err(wav::WavError::DataTooLarge)
+        );
+        assert_eq!(
+            wav::try_create_wav(&[0, 0], u32::MAX, u16::MAX),
+            Err(wav::WavError::HeaderOverflow)
+        );
     }
 
     #[test]

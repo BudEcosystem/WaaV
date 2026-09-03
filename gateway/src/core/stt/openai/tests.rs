@@ -20,6 +20,8 @@ use std::sync::Arc;
 mod config_tests {
     use super::*;
 
+    static OPENAI_BASE_URL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_model_serialization() {
         // Test model enum serialization
@@ -190,11 +192,53 @@ mod config_tests {
 
     #[test]
     fn test_config_api_url() {
+        let _guard = OPENAI_BASE_URL_ENV_LOCK.lock().unwrap();
         let config = OpenAISTTConfig::default();
+
+        // SAFETY (edition 2024): set/remove_var are unsafe; this test is single-threaded over the
+        // env it touches and restores OPENAI_BASE_URL to unset before returning.
+        unsafe { std::env::remove_var("OPENAI_BASE_URL") };
         assert_eq!(
             config.api_url(),
             "https://api.openai.com/v1/audio/transcriptions"
         );
+
+        // The override lets the provider target OpenAI-compatible endpoints
+        // (Azure OpenAI / Groq / vLLM / proxy); trailing slashes are normalized.
+        unsafe { std::env::set_var("OPENAI_BASE_URL", "https://openai-compatible.invalid/") };
+        assert_eq!(
+            config.try_api_url().unwrap(),
+            "https://openai-compatible.invalid/v1/audio/transcriptions"
+        );
+
+        unsafe { std::env::remove_var("OPENAI_BASE_URL") };
+        assert_eq!(
+            config.api_url(),
+            "https://api.openai.com/v1/audio/transcriptions"
+        );
+    }
+
+    #[test]
+    fn test_config_api_url_rejects_ssrf_targets() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = OpenAISTTConfig::default();
+
+        config.endpoint_override = Some("http://127.0.0.1:8089/".to_string());
+        let msg = config
+            .try_api_url()
+            .expect_err("loopback endpoint override must be rejected")
+            .to_string();
+        assert!(
+            msg.contains("SSRF protection"),
+            "error names SSRF guard: {msg}"
+        );
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let msg = config
+            .try_api_url()
+            .expect_err("non-HTTP endpoint override must be rejected")
+            .to_string();
+        assert!(msg.contains("scheme"), "error names scheme contract: {msg}");
     }
 }
 
@@ -402,7 +446,7 @@ mod wav_tests {
 
     #[test]
     fn test_wav_file_size_field() {
-        let pcm_data = vec![0u8; 1000];
+        let _pcm_data = vec![0u8; 1000];
         let header = wav::create_header(1000, 16000, 1, 16);
 
         // File size at bytes 4-8 (should be 36 + data_size)
@@ -623,6 +667,73 @@ mod client_tests {
         assert_eq!(config.response_format, ResponseFormat::VerboseJson);
         assert_eq!(config.temperature, Some(0.3));
         assert_eq!(config.base.language, "fr");
+    }
+
+    // W1 keystone: standardized advanced features OpenAI can express (diarization → DiarizedJson,
+    // keyterms → prompt) survive through `new_standard` onto the provider config — proving the
+    // standardized path doesn't drop them.
+    #[tokio::test]
+    async fn test_openai_new_standard_unlocks_features() {
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "openai".into(),
+                api_key: "sk-test-key".into(),
+                model: "gpt-4o-transcribe".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                diarization: Some(true),
+                keyterms: Some(vec!["WaaV".into(), "OpenAI".into()]),
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+            translation: None,
+        };
+        let stt = OpenAISTT::new_standard(&std).unwrap();
+        let config = stt.config.as_ref().unwrap();
+        assert_eq!(config.response_format, ResponseFormat::DiarizedJson); // diarization survived
+        assert_eq!(config.prompt.as_deref(), Some("WaaV, OpenAI")); // keyterms survived
+
+        // Missing key is rejected through the standardized path too.
+        let bad = StandardSTTConfig::from_base(STTConfig {
+            api_key: String::new(),
+            ..Default::default()
+        });
+        assert!(OpenAISTT::new_standard(&bad).is_err());
+    }
+
+    #[test]
+    fn from_standard_translation_flips_to_translations_endpoint() {
+        // P5 (Class B): the canonical translation block selects the English-only
+        // `/v1/audio/translations` endpoint (Whisper translations always output English).
+        use crate::core::stt::standard::{StandardSTTConfig, TranslationConfig};
+        let mut std = StandardSTTConfig::from_base(STTConfig {
+            provider: "openai".into(),
+            api_key: "sk-test-key".into(),
+            ..Default::default()
+        });
+        // Even an arbitrary target list degrades to the English endpoint (warn handled upstream).
+        std.translation = Some(TranslationConfig {
+            translate_to_english: Some(true),
+            ..Default::default()
+        });
+        let cfg = OpenAISTTConfig::from_standard(&std);
+        assert!(cfg.translate_to_english);
+        assert!(
+            cfg.api_url().ends_with("/v1/audio/translations"),
+            "endpoint should flip to translations: {}",
+            cfg.api_url()
+        );
+
+        // Without translation it stays on transcriptions.
+        let plain = OpenAISTTConfig::from_standard(&StandardSTTConfig::from_base(STTConfig {
+            provider: "openai".into(),
+            api_key: "sk-test-key".into(),
+            ..Default::default()
+        }));
+        assert!(!plain.translate_to_english);
+        assert!(plain.api_url().ends_with("/v1/audio/transcriptions"));
     }
 }
 

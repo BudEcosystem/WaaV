@@ -1,14 +1,21 @@
 # syntax=docker/dockerfile:1
-# The pin was 1.88.0 and the image had drifted out of buildability behind it: cargo-chef's
-# own tree now needs 1.91, and the gateway's locked dependencies need 1.96 (kstring 2.0.4,
-# aws-types 1.5.0). 1.96.0 is also the stable the crates were verified on locally, so the
-# image and a local `cargo build` now agree on the compiler.
-ARG RUST_VERSION=1.96.0
-# Restored. These stopped compiling because `ort = "2.0.0-rc.10"` is a caret range that
-# resolved to rc.13, which made Session::inputs/outputs private and dropped Send + Sync from
-# its error type. Pinning ort to an exact rc.10 in gateway/Cargo.toml brings both features
-# back rather than shipping an image quietly missing Smart Turn detection and DeepFilterNet.
-ARG CARGO_BUILD_FEATURES="--no-default-features --features turn-detect,noise-filter"
+# 1.88.0 is upstream's pin and it holds again now that `gateway/Cargo.lock` is committed.
+# This branch had bumped it to 1.96.0 because an UNLOCKED resolve pulled kstring 2.0.4 and
+# aws-types 1.5.0, whose MSRVs sit above 1.88. The committed lock pins those at 2.0.2 and
+# 1.3.16, so that drift can no longer happen — the fix was the lockfile, not a newer
+# compiler — and staying on 1.88 keeps the image on the toolchain CI actually gates.
+#
+# The same lock pins `ort` at 2.0.0-rc.10, which is what this branch's `=2.0.0-rc.10` pin in
+# gateway/Cargo.toml was defending (a caret resolved to rc.13, which made Session::inputs
+# private and dropped Send + Sync from its error type, silently disabling Smart Turn and
+# DeepFilterNet). That defence is now redundant but harmless, so it stays.
+ARG RUST_VERSION=1.88.0
+# Production feature set — must match CI's PROD_FEATURES (.github/workflows/ci.yml) so the shipped
+# binary is exactly what CI gates. Ships the DAG orchestration engine (dag-routing) and the full
+# neural turn-detection ensemble (turn-ensemble = smart-turn + turn-detect + silero-vad) — NOT just
+# basic turn-detect. smart-turn/silero ONNX models lazy-download on first use (cached thereafter);
+# turn-detect assets are pre-baked by the `init` stage below.
+ARG CARGO_BUILD_FEATURES="--no-default-features --features dag-routing,turn-ensemble,noise-filter,openapi"
 ARG ONNX_VERSION=1.23.2
 
 # ==================== Chef Base ====================

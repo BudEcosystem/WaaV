@@ -52,7 +52,6 @@ use crate::core::tts::base::{
 const PROVIDER_INFO: &str = "iFlytek TTS WebSocket v2.0 (科大讯飞)";
 
 /// WebSocket connection timeout.
-const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// WebSocket message timeout.
 const WS_MESSAGE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -121,12 +120,19 @@ impl IFlytekTts {
     /// Create a new iFlytek TTS provider (internal).
     fn create_internal(config: TTSConfig) -> TTSResult<Self> {
         let iflytek_config = IFlytekTtsConfig::from_base(config.clone())?;
+        Self::create_from_iflytek_config(config, iflytek_config)
+    }
 
+    /// Create a provider from a pre-built iFlytek-specific config (shared by `from_standard`).
+    fn create_from_iflytek_config(
+        base_config: TTSConfig,
+        iflytek_config: IFlytekTtsConfig,
+    ) -> TTSResult<Self> {
         // Validate configuration
         iflytek_config.validate()?;
 
         Ok(Self {
-            base_config: config,
+            base_config,
             config: iflytek_config,
             connected: AtomicBool::new(false),
             text_sender: None,
@@ -136,6 +142,15 @@ impl IFlytekTts {
             audio_callback: Arc::new(Mutex::new(None)),
             bytes_synthesized: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
+    }
+
+    /// Build from the standardized TTS config (W1 keystone), mirroring `DeepgramTTS::from_standard`.
+    /// Delegates feature mapping to [`IFlytekTtsConfig::from_standard`] (speed/pitch/volume as
+    /// iFlytek 0-100 levels, sample_rate, plus the `background_sound` extras passthrough) so
+    /// advanced prosody reaches the provider config the WebSocket request reads.
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
+        let iflytek_config = IFlytekTtsConfig::from_standard(std)?;
+        Self::create_from_iflytek_config(std.base.clone(), iflytek_config)
     }
 
     /// Handle incoming WebSocket message.
@@ -223,6 +238,12 @@ impl IFlytekTts {
             .map_err(|e| {
                 TTSError::ConnectionFailed(format!("Failed to build signed URL: {}", e))
             })?;
+        // W-T0: redirect the signed WS connect to a localhost mock host when overridden,
+        // preserving the signed path+query (passthrough when no override is set).
+        let ws_url = crate::core::tts::standard::override_rest_endpoint(
+            &ws_url,
+            self.config.endpoint_override.as_deref(),
+        );
 
         debug!("Connecting to iFlytek TTS: {}", ws_url);
 
@@ -248,13 +269,21 @@ impl IFlytekTts {
         let background_sound = self.config.background_sound;
         let english_pronunciation = self.config.english_pronunciation;
         let number_pronunciation = self.config.number_pronunciation;
+        let streaming_mp3_return = self.config.streaming_mp3_return;
         let format = self.config.encoding.content_type().to_string();
         let _bytes_counter = self.bytes_synthesized.clone();
 
         // Start connection task
         let connection_handle = tokio::spawn(async move {
             // Connect to WebSocket
-            let ws_stream = match timeout(WS_CONNECT_TIMEOUT, connect_async(&ws_url)).await {
+            // 10s dial bound (provider-historical; tighter than the canonical 15s),
+            // via the shared resilience::connect helper.
+            let ws_stream = match crate::core::resilience::connect::with_timeout(
+                Duration::from_secs(10),
+                connect_async(&ws_url),
+            )
+            .await
+            {
                 Ok(Ok((stream, _))) => stream,
                 Ok(Err(e)) => {
                     error!("iFlytek TTS WebSocket connection failed: {}", e);
@@ -289,6 +318,7 @@ impl IFlytekTts {
                             background_sound,
                             english_pronunciation,
                             number_pronunciation,
+                            streaming_mp3_return,
                             &text,
                         );
 
@@ -382,7 +412,7 @@ impl IFlytekTts {
         self.audio_forward_handle = Some(audio_forward_handle);
 
         // Wait for connection to be established
-        match timeout(WS_CONNECT_TIMEOUT, connected_rx).await {
+        match timeout(Duration::from_secs(10), connected_rx).await {
             Ok(Ok(())) => {
                 self.connected.store(true, Ordering::SeqCst);
                 info!("iFlytek TTS connected successfully");
@@ -450,13 +480,18 @@ impl BaseTTS for IFlytekTts {
 
         // Wait for connection task to finish
         if let Some(handle) = self.connection_handle.take() {
-            let _ = timeout(Duration::from_secs(5), handle).await;
+            crate::core::observability::await_task_shutdown(
+                "iflytek-tts-connection",
+                handle,
+                Duration::from_secs(5),
+            )
+            .await;
         }
 
         // Clean up forwarding task
         if let Some(handle) = self.audio_forward_handle.take() {
-            handle.abort();
-            let _ = handle.await;
+            crate::core::observability::abort_and_await_task("iflytek-tts-audio-forwarder", handle)
+                .await;
         }
 
         // Clear state
@@ -586,6 +621,94 @@ mod tests {
 
         let tts = result.unwrap();
         assert!(!tts.is_ready());
+    }
+
+    // WIRE-LEVEL: the `streaming_mp3_return` extra must reach the serialized WS request body as the
+    // business `sfl` param (not merely sit on the config struct — the recurring "config-only" bug).
+    // We reconstruct the exact `TtsRequest` the connection task sends (provider.rs `start_connection`
+    // builds it from these same config fields) and assert the wire JSON carries `"sfl":1`.
+    #[test]
+    fn streaming_mp3_return_reaches_ws_request_body_sfl() {
+        use super::super::messages::TtsRequest;
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+
+        let mut extras = serde_json::Map::new();
+        extras.insert("streaming_mp3_return".into(), serde_json::json!(true));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "iflytek".into(),
+                api_key: create_test_api_key(),
+                audio_format: Some("mp3".into()), // aue=lame, which `sfl` pairs with
+                sample_rate: Some(16000),         // iFlytek only allows 8000/16000
+                ..Default::default()
+            },
+            features: TtsFeatures::default(),
+            extras: ProviderExtras(extras),
+        };
+        let tts = IFlytekTts::from_standard(&std).unwrap();
+        // Sanity: the config carries it.
+        assert_eq!(tts.config.streaming_mp3_return, Some(1));
+
+        // Build the WS request body exactly as `start_connection` does and serialize it to the wire.
+        let request = TtsRequest::new(
+            &tts.config.auth.app_id,
+            tts.config.voice.as_code(),
+            tts.config.encoding.as_str(),
+            tts.config.sample_rate,
+            tts.config.text_encoding.as_str(),
+            tts.config.speed,
+            tts.config.volume,
+            tts.config.pitch,
+            tts.config.background_sound,
+            tts.config.english_pronunciation,
+            tts.config.number_pronunciation,
+            tts.config.streaming_mp3_return,
+            "你好",
+        );
+        let json = request.to_json().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        // The wire body's business section MUST carry sfl=1 paired with aue=lame.
+        assert_eq!(
+            v["business"]["sfl"], 1,
+            "sfl must reach the WS request body"
+        );
+        assert_eq!(v["business"]["aue"], "lame");
+    }
+
+    // When `streaming_mp3_return` is absent, `sfl` must be omitted from the wire body entirely
+    // (skip_serializing_if), so the default behavior is unchanged.
+    #[test]
+    fn sfl_omitted_when_not_requested() {
+        use super::super::messages::TtsRequest;
+        let request = TtsRequest::simple("app", "xiaoyan", "hi");
+        let v: serde_json::Value = serde_json::from_str(&request.to_json().unwrap()).unwrap();
+        assert!(
+            v["business"].get("sfl").is_none(),
+            "sfl must be omitted when not requested"
+        );
+    }
+
+    // W1 keystone: the provider struct's `from_standard` maps prosody (speed/pitch/volume as
+    // iFlytek 0-100 levels) through onto the provider config the WebSocket request reads.
+    #[test]
+    fn from_standard_maps_prosody_to_provider_config() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let std = StandardTTSConfig {
+            base: create_test_config(),
+            features: TtsFeatures {
+                speed: Some(1.0), // 1.0 multiplier * 50 -> 50 (normal) on iFlytek's 0-100 scale
+                pitch: Some(70.0),
+                volume: Some(80.0),
+                sample_rate: Some(16000),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let tts = IFlytekTts::from_standard(&std).unwrap();
+        assert_eq!(tts.config.speed, 50);
+        assert_eq!(tts.config.pitch, 70);
+        assert_eq!(tts.config.volume, 80);
+        assert_eq!(tts.config.sample_rate, 16000);
     }
 
     #[test]
@@ -815,7 +938,6 @@ mod tests {
     // Constants tests
     #[test]
     fn test_constants() {
-        assert_eq!(WS_CONNECT_TIMEOUT, Duration::from_secs(10));
         assert_eq!(WS_MESSAGE_TIMEOUT, Duration::from_secs(60));
         assert_eq!(TEXT_CHANNEL_BUFFER, 32);
         assert_eq!(AUDIO_CHANNEL_BUFFER, 128);

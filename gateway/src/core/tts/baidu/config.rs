@@ -19,6 +19,15 @@
 use crate::core::tts::base::{TTSConfig, TTSError};
 use serde::{Deserialize, Serialize};
 
+fn validate_baidu_tts_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -355,6 +364,10 @@ pub struct BaiduTtsConfig {
     /// Use HTTPS endpoint.
     #[serde(default = "default_use_https")]
     pub use_https: bool,
+
+    /// Test-only base URL override; redirects token-fetch and synth HTTP calls to a mock.
+    #[serde(default)]
+    pub endpoint_override: Option<String>,
 }
 
 fn default_speed() -> u8 {
@@ -372,7 +385,7 @@ fn default_volume() -> u8 {
 fn default_cuid() -> String {
     format!(
         "waav_gateway_{}",
-        uuid::Uuid::new_v4().to_string().replace('-', "")[..16].to_string()
+        &uuid::Uuid::new_v4().to_string().replace('-', "")[..16]
     )
 }
 
@@ -392,6 +405,7 @@ impl Default for BaiduTtsConfig {
             volume: DEFAULT_VOLUME,
             cuid: default_cuid(),
             use_https: true,
+            endpoint_override: None,
         }
     }
 }
@@ -433,6 +447,11 @@ impl BaiduTtsConfig {
             return Err(TTSError::InvalidConfiguration(
                 "CUID must be between 1 and 60 characters".to_string(),
             ));
+        }
+
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_baidu_tts_endpoint("endpoint_override", endpoint)
+                .map_err(TTSError::InvalidConfiguration)?;
         }
 
         Ok(())
@@ -506,7 +525,48 @@ impl BaiduTtsConfig {
             volume: DEFAULT_VOLUME,
             cuid: default_cuid(),
             use_https: true,
+            endpoint_override: None,
         })
+    }
+
+    /// Build from the standardized TTS config. Baidu exposes three 0-15 prosody knobs, so this maps
+    /// `speed` -> `speed` (reusing `from_base`'s 0.25-4.0 -> 0-15 mapping for consistency) and the
+    /// direct 0-15 levels `pitch` -> `pitch` and `volume` -> `volume` (clamped). Baidu's non-standard
+    /// `cuid` and `use_https` knobs are read from the `extras` passthrough. Features without a Baidu
+    /// field (stability, similarity_boost, style, use_speaker_boost, emotion, instructions, ssml,
+    /// language, word_timestamps, streaming, seed, sample_rate) are skipped.
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> Result<Self, TTSError> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(std.base.clone())?;
+
+        if let Some(speed) = f.speed {
+            // Reuse from_base's 0.25-4.0 -> 0-15 mapping for consistency.
+            let mapped = ((speed - 0.25) / (4.0 - 0.25) * 15.0).round() as u8;
+            cfg.speed = mapped.min(15);
+        }
+        if let Some(pitch) = f.pitch {
+            // Baidu pitch is a direct 0-15 level.
+            cfg.pitch = (pitch.round() as u8).min(15);
+        }
+        if let Some(volume) = f.volume {
+            // Baidu volume is a direct 0-15 level.
+            cfg.volume = (volume.round() as u8).min(15);
+        }
+
+        // Provider-specific passthrough.
+        if let Some(cuid) = std.extras.0.get("cuid").and_then(|v| v.as_str()) {
+            cfg.cuid = cuid.to_string();
+        }
+        if let Some(use_https) = std.extras.0.get("use_https").and_then(|v| v.as_bool()) {
+            cfg.use_https = use_https;
+        }
+
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
+
+        cfg.validate()?;
+        Ok(cfg)
     }
 
     /// Get list of supported voices.
@@ -542,6 +602,61 @@ impl BaiduTtsConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Maps speed -> speed (0.25-4.0 -> 0-15), pitch -> pitch and volume -> volume (direct 0-15
+    // levels), and demonstrates the extras passthrough (cuid / use_https).
+    #[test]
+    fn from_standard_maps_prosody_and_extras() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("cuid".into(), serde_json::json!("device-123"));
+        extras.insert("use_https".into(), serde_json::json!(false));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "baidu".into(),
+                api_key: "test_api_key|test_secret_key".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(4.0),
+                pitch: Some(8.0),
+                volume: Some(12.0),
+                ssml: Some(true), // capability gap: Baidu has no SSML, must be ignored
+                ..Default::default()
+            },
+            extras: crate::core::stt::standard::ProviderExtras(extras),
+        };
+        let cfg = BaiduTtsConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.speed, 15); // 4.0 -> 15
+        assert_eq!(cfg.pitch, 8);
+        assert_eq!(cfg.volume, 12);
+        assert_eq!(cfg.cuid, "device-123"); // from extras passthrough
+        assert!(!cfg.use_https);
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+
+        let mk = |endpoint: &str| {
+            StandardTTSConfig {
+                base: TTSConfig {
+                    provider: "baidu".into(),
+                    api_key: "test_api_key|test_secret_key".into(),
+                    ..Default::default()
+                },
+                features: TtsFeatures::default(),
+                extras: ProviderExtras::default(),
+            }
+            .with_endpoint_override(endpoint)
+        };
+
+        assert!(BaiduTtsConfig::from_standard(&mk("https://baidu-proxy.example.com")).is_ok());
+        assert!(BaiduTtsConfig::from_standard(&mk("http://127.0.0.1:9000")).is_err());
+        assert!(BaiduTtsConfig::from_standard(&mk("file:///tmp/socket")).is_err());
+        assert!(BaiduTtsConfig::from_standard(&mk("wss://baidu-proxy.example.com")).is_err());
+    }
 
     #[test]
     fn test_config_default() {

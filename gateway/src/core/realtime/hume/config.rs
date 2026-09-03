@@ -26,6 +26,8 @@ use super::messages::{
 };
 use crate::core::realtime::base::ReconnectionConfig;
 
+const HUME_WEBSOCKET_URL_SCHEMES: &[&str] = &["ws", "wss"];
+
 // =============================================================================
 // Error Types
 // =============================================================================
@@ -55,6 +57,9 @@ pub enum EVIConfigError {
     /// Invalid channel count.
     #[error("Channels must be greater than 0")]
     InvalidChannels,
+    /// WebSocket URL is invalid or blocked by SSRF protection.
+    #[error("Hume EVI websocket_url rejected: {0}")]
+    InvalidWebsocketUrl(String),
 }
 
 // =============================================================================
@@ -399,6 +404,9 @@ impl HumeEVIConfig {
             return Err(EVIConfigError::InvalidChannels);
         }
 
+        crate::core::net::validate_url_for_ssrf(&self.websocket_url, HUME_WEBSOCKET_URL_SCHEMES)
+            .map_err(EVIConfigError::InvalidWebsocketUrl)?;
+
         Ok(())
     }
 }
@@ -647,6 +655,37 @@ mod tests {
             result.unwrap_err(),
             EVIConfigError::InvalidChannels
         ));
+    }
+
+    #[test]
+    fn test_validate_websocket_url_ssrf_checked() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let public = HumeEVIConfig {
+            api_key: "test".to_string(),
+            websocket_url: "wss://hume-proxy.invalid/v0/evi/chat".to_string(),
+            ..Default::default()
+        };
+        assert!(public.validate().is_ok());
+
+        let loopback = HumeEVIConfig {
+            api_key: "test".to_string(),
+            websocket_url: "ws://127.0.0.1:9000/evi".to_string(),
+            ..Default::default()
+        };
+        let err = loopback
+            .validate()
+            .expect_err("loopback websocket_url must be rejected");
+        assert!(err.to_string().contains("SSRF protection"), "{err}");
+
+        let non_ws = HumeEVIConfig {
+            api_key: "test".to_string(),
+            websocket_url: "https://api.hume.ai/v0/evi/chat".to_string(),
+            ..Default::default()
+        };
+        let err = non_ws
+            .validate()
+            .expect_err("non-WS websocket_url must be rejected");
+        assert!(err.to_string().contains("not allowed"), "{err}");
     }
 
     #[test]

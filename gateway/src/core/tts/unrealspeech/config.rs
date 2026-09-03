@@ -7,6 +7,17 @@ use std::fmt;
 
 use crate::core::tts::base::{TTSConfig, TTSError, TTSResult};
 
+fn validate_unrealspeech_tts_endpoint(source: &str, endpoint: &str) -> TTSResult<()> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES).map_err(
+        |msg| TTSError::InvalidConfiguration(format!("{source} rejected (SSRF protection): {msg}")),
+    )
+}
+
 // =============================================================================
 // Voice Types
 // =============================================================================
@@ -172,6 +183,11 @@ pub enum UnrealSpeechCodec {
     Mp3,
     /// PCM mu-law codec
     PcmMulaw,
+    /// Signed 16-bit little-endian linear PCM (`pcm_s16le`) — raw 16-bit samples, the codec a
+    /// telephony/streaming pipeline needs for direct playback. Reaches the V8 `/stream` request's
+    /// `Codec` field (docs/providers/unrealspeech.md §2.1; the V8 endpoint accepts `pcm_s16le`
+    /// alongside the documented `libmp3lame`/`pcm_mulaw`).
+    PcmS16le,
 }
 
 impl UnrealSpeechCodec {
@@ -180,6 +196,7 @@ impl UnrealSpeechCodec {
         match self {
             Self::Mp3 => "libmp3lame",
             Self::PcmMulaw => "pcm_mulaw",
+            Self::PcmS16le => "pcm_s16le",
         }
     }
 
@@ -188,6 +205,7 @@ impl UnrealSpeechCodec {
         match self {
             Self::Mp3 => "audio/mpeg",
             Self::PcmMulaw => "audio/basic",
+            Self::PcmS16le => "audio/L16",
         }
     }
 }
@@ -205,8 +223,12 @@ impl std::str::FromStr for UnrealSpeechCodec {
         match s.to_lowercase().as_str() {
             "libmp3lame" | "mp3" | "mpeg" => Ok(Self::Mp3),
             "pcm_mulaw" | "pcmmulaw" | "mulaw" | "ulaw" => Ok(Self::PcmMulaw),
+            // Only UnrealSpeech's literal codec token (and close spellings) — deliberately NOT
+            // `linear16`/`pcm`, which are the gateway's generic defaults and must keep falling back
+            // to the Mp3 default rather than silently selecting s16le.
+            "pcm_s16le" | "pcms16le" | "s16le" => Ok(Self::PcmS16le),
             _ => Err(TTSError::InvalidConfiguration(format!(
-                "Unknown Unreal Speech codec: '{}'. Valid codecs: libmp3lame (mp3), pcm_mulaw",
+                "Unknown Unreal Speech codec: '{}'. Valid codecs: libmp3lame (mp3), pcm_mulaw, pcm_s16le",
                 s
             ))),
         }
@@ -359,6 +381,11 @@ pub struct UnrealSpeechStreamRequest {
     /// Audio codec
     #[serde(rename = "Codec")]
     pub codec: String,
+
+    /// Sampling temperature controlling voice variation (V8 `Temperature`, ~0.1..=1.0). Omitted
+    /// from the body when unset so the API default applies.
+    #[serde(rename = "Temperature", skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
 }
 
 impl UnrealSpeechStreamRequest {
@@ -371,6 +398,7 @@ impl UnrealSpeechStreamRequest {
             speed: config.speed,
             pitch: config.pitch,
             codec: config.codec.as_str().to_string(),
+            temperature: config.temperature,
         }
     }
 }
@@ -399,6 +427,13 @@ pub struct UnrealSpeechTtsConfig {
 
     /// Audio codec
     pub codec: UnrealSpeechCodec,
+
+    /// Optional sampling temperature (V8 `Temperature`, ~0.1..=1.0). `None` lets the API default
+    /// apply. Sourced from the standardized `extras` passthrough (UnrealSpeech-specific knob).
+    pub temperature: Option<f32>,
+
+    /// Optional base URL override (scheme+host) for redirecting synth HTTP POSTs to a mock in tests.
+    pub endpoint_override: Option<String>,
 }
 
 impl Default for UnrealSpeechTtsConfig {
@@ -410,6 +445,8 @@ impl Default for UnrealSpeechTtsConfig {
             speed: super::DEFAULT_SPEED,
             pitch: super::DEFAULT_PITCH,
             codec: UnrealSpeechCodec::default(),
+            temperature: None,
+            endpoint_override: None,
         }
     }
 }
@@ -423,11 +460,9 @@ impl UnrealSpeechTtsConfig {
     /// Create configuration from base TTSConfig
     pub fn from_base(config: &TTSConfig) -> TTSResult<Self> {
         // Get API key from config or environment
-        let api_key = if !config.api_key.is_empty() {
-            config.api_key.clone()
-        } else {
-            std::env::var("UNREALSPEECH_API_KEY").unwrap_or_default()
-        };
+        let api_key = crate::core::credentials::explicit_api_key(&config.api_key)
+            .or_else(|| crate::core::credentials::env_api_key("UNREALSPEECH_API_KEY"))
+            .unwrap_or_default();
 
         if api_key.is_empty() {
             return Err(TTSError::InvalidConfiguration(
@@ -460,7 +495,58 @@ impl UnrealSpeechTtsConfig {
             speed: super::DEFAULT_SPEED,
             pitch: super::DEFAULT_PITCH,
             codec,
+            temperature: None,
+            endpoint_override: None,
         })
+    }
+
+    /// Build from the standardized config (W1 keystone). Maps the TTS features Unreal Speech can
+    /// express to its real request fields: [`TtsFeatures::speed`] becomes the `speed` offset
+    /// (`0.0` is normal, clamped to Unreal Speech's `-1.0..=1.0` range — same range
+    /// [`validate_speed`] enforces) and [`TtsFeatures::pitch`] becomes the `pitch` multiplier
+    /// (`1.0` is normal, clamped to `0.5..=1.5` per [`validate_pitch`]). The output `codec` (incl.
+    /// the new `pcm_s16le`) is carried on the typed base config's `audio_format` and parsed by
+    /// `from_base`. The non-standard `bitrate` and `temperature` knobs are read from the `extras`
+    /// passthrough (`bitrate`: numeric kbps or a string like `"320k"`; `temperature`: a float that
+    /// reaches the V8 `Temperature` body field). Unreal Speech has no field for volume,
+    /// ElevenLabs-style voice settings, emotion, instructions, SSML, language, word timestamps,
+    /// streaming, seed or sample rate, so those features are skipped.
+    ///
+    /// [`TtsFeatures::speed`]: crate::core::tts::standard::TtsFeatures::speed
+    /// [`TtsFeatures::pitch`]: crate::core::tts::standard::TtsFeatures::pitch
+    /// [`validate_speed`]: Self::validate_speed
+    /// [`validate_pitch`]: Self::validate_pitch
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(&std.base)?;
+
+        if let Some(speed) = f.speed {
+            // Unreal Speech's speed is a 0.0-is-normal offset in -1.0..=1.0.
+            cfg.speed = speed.clamp(-1.0, 1.0);
+        }
+        if let Some(pitch) = f.pitch {
+            // Unreal Speech's pitch is a 1.0-is-normal multiplier in 0.5..=1.5.
+            cfg.pitch = pitch.clamp(0.5, 1.5);
+        }
+
+        // Provider-specific passthrough.
+        if let Some(bitrate) = std.extras.0.get("bitrate") {
+            if let Some(kbps) = bitrate.as_u64() {
+                cfg.bitrate = format!("{}k", kbps).parse().unwrap_or_default();
+            } else if let Some(s) = bitrate.as_str() {
+                cfg.bitrate = s.parse().unwrap_or_default();
+            }
+        }
+        // `Temperature` is a V8-only knob with no standardized counterpart: pass it through extras
+        // so it reaches the request body's `Temperature` field.
+        if let Some(temperature) = std.extras.0.get("temperature").and_then(|v| v.as_f64()) {
+            cfg.temperature = Some(temperature as f32);
+        }
+
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
+        cfg.validate()?;
+
+        Ok(cfg)
     }
 
     /// Validate text length for stream endpoint
@@ -519,6 +605,9 @@ impl UnrealSpeechTtsConfig {
 
         Self::validate_speed(self.speed)?;
         Self::validate_pitch(self.pitch)?;
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_unrealspeech_tts_endpoint("endpoint_override", endpoint)?;
+        }
 
         Ok(())
     }
@@ -585,6 +674,8 @@ impl UnrealSpeechTtsConfigBuilder {
             speed: self.speed.unwrap_or(super::DEFAULT_SPEED),
             pitch: self.pitch.unwrap_or(super::DEFAULT_PITCH),
             codec: self.codec.unwrap_or_default(),
+            temperature: None,
+            endpoint_override: None,
         };
 
         config.validate()?;
@@ -599,6 +690,88 @@ impl UnrealSpeechTtsConfigBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone: the standardized features unlock Unreal Speech's speed offset and pitch
+    // multiplier — plus the bitrate knob via the open extras passthrough — previously unreachable
+    // through the flat factory (which always defaulted speed/pitch/bitrate).
+    #[test]
+    fn from_standard_maps_speed_pitch_and_bitrate_extras() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("bitrate".into(), serde_json::json!(320));
+        extras.insert("temperature".into(), serde_json::json!(0.35));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "unrealspeech".into(),
+                api_key: "test-key".into(),
+                voice_id: Some("Dan".into()),
+                // pcm_s16le codec reaches via the typed base `audio_format`.
+                audio_format: Some("pcm_s16le".into()),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(0.5),
+                pitch: Some(1.2),
+                ssml: Some(true), // capability gap: Unreal Speech has no SSML, must be ignored
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+        let cfg = UnrealSpeechTtsConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.speed, 0.5); // -1.0..=1.0 offset, passed through
+        assert_eq!(cfg.pitch, 1.2); // 0.5..=1.5 multiplier, passed through
+        assert_eq!(cfg.bitrate, UnrealSpeechBitrate::Bitrate320k); // extras passthrough
+        assert_eq!(cfg.codec, UnrealSpeechCodec::PcmS16le); // typed audio_format -> codec
+        assert_eq!(cfg.temperature, Some(0.35)); // extras passthrough
+        assert_eq!(cfg.voice, UnrealSpeechVoice::Dan); // base passthrough preserved
+    }
+
+    // WIRE-LEVEL guard: the recurring bug class is asserting only the config struct. This serializes
+    // the actual `/stream` request body and asserts the `Codec` field carries `pcm_s16le` and the
+    // `Temperature` field carries the extras value — i.e. the features reach the wire, not just the
+    // config. Also asserts `Temperature` is OMITTED from the body when unset (API default applies).
+    #[test]
+    fn temperature_and_pcm_s16le_codec_reach_stream_request_body() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("temperature".into(), serde_json::json!(0.35));
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "unrealspeech".into(),
+                api_key: "test-key".into(),
+                voice_id: Some("Dan".into()),
+                audio_format: Some("pcm_s16le".into()),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(0.5),
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+        let cfg = UnrealSpeechTtsConfig::from_standard(&std).unwrap();
+        let body =
+            serde_json::to_string(&UnrealSpeechStreamRequest::from_config(&cfg, "hi")).unwrap();
+        assert!(
+            body.contains("\"Codec\":\"pcm_s16le\""),
+            "codec missing from body: {body}"
+        );
+        assert!(
+            body.contains("\"Temperature\":0.35"),
+            "temperature missing from body: {body}"
+        );
+
+        // Default config (no temperature): the `Temperature` field must be omitted entirely.
+        let default_body = serde_json::to_string(&UnrealSpeechStreamRequest::from_config(
+            &UnrealSpeechTtsConfig::default(),
+            "hi",
+        ))
+        .unwrap();
+        assert!(
+            !default_body.contains("Temperature"),
+            "Temperature must be omitted when unset: {default_body}"
+        );
+    }
 
     #[test]
     fn test_voice_enum_standard() {
@@ -780,6 +953,48 @@ mod tests {
     }
 
     #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = UnrealSpeechTtsConfig {
+            api_key: "test-key".to_string(),
+            voice: UnrealSpeechVoice::Scarlett,
+            speed: 0.0,
+            pitch: 1.0,
+            ..Default::default()
+        };
+
+        config.endpoint_override = Some("https://unrealspeech-proxy.example.com".to_string());
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.to_string().contains("SSRF protection"));
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("file endpoint_override must be rejected");
+        assert!(err.to_string().contains("URL scheme"));
+
+        config.endpoint_override = Some("ws://unrealspeech-proxy.example.com".to_string());
+        let err = config
+            .validate()
+            .expect_err("WebSocket endpoint_override must be rejected for REST UnrealSpeech");
+        assert!(err.to_string().contains("URL scheme"));
+
+        let std = crate::core::tts::standard::StandardTTSConfig::from_base(TTSConfig {
+            provider: "unrealspeech".into(),
+            api_key: "test-key".into(),
+            voice_id: Some("Dan".into()),
+            ..Default::default()
+        })
+        .with_endpoint_override("file:///tmp/socket");
+        assert!(UnrealSpeechTtsConfig::from_standard(&std).is_err());
+    }
+
+    #[test]
     fn test_config_speed_validation() {
         // Valid speed
         assert!(UnrealSpeechTtsConfig::validate_speed(0.0).is_ok());
@@ -852,6 +1067,8 @@ mod tests {
             speed: 0.0,
             pitch: 1.0,
             codec: UnrealSpeechCodec::Mp3,
+            temperature: None,
+            endpoint_override: None,
         };
 
         let request = UnrealSpeechStreamRequest::from_config(&config, "Hello world");
@@ -873,6 +1090,8 @@ mod tests {
             speed: 0.5,
             pitch: 0.92,
             codec: UnrealSpeechCodec::Mp3,
+            temperature: None,
+            endpoint_override: None,
         };
 
         let request = UnrealSpeechStreamRequest::from_config(&config, "Test text");

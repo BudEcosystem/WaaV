@@ -570,7 +570,7 @@ mod tests {
             let delay = config.calculate_delay(1);
             // With ±25% jitter, delay should be 750-1250
             assert!(
-                delay >= 750 && delay <= 1250,
+                (750..=1250).contains(&delay),
                 "Delay {} should be within 750-1250",
                 delay
             );

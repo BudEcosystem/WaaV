@@ -28,6 +28,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::core::stt::base::STTConfig;
 
+fn validate_aws_transcribe_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 // =============================================================================
 // AWS Regions
 // =============================================================================
@@ -474,6 +483,48 @@ pub struct AwsTranscribeSTTConfig {
     #[serde(default)]
     pub preferred_language: Vec<String>,
 
+    /// Candidate language list for language identification (`LanguageOptions`,
+    /// wire header `x-amzn-transcribe-language-options`). A comma-separated list of
+    /// language codes the identifier should choose between. Carried via `ProviderExtras`
+    /// (`language_options`). Only meaningful when `identify_language` /
+    /// `identify_multiple_languages` is on.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub language_options: Vec<String>,
+
+    /// Multi-language (code-switching) identification (`IdentifyMultipleLanguages`,
+    /// wire header `x-amzn-transcribe-identify-multiple-languages`). When true, Transcribe
+    /// detects multiple languages within a single stream. Carried via `ProviderExtras`
+    /// (`identify_multiple_languages`).
+    #[serde(default)]
+    pub identify_multiple_languages: bool,
+
+    /// Custom vocabulary names for language-ID mode (`VocabularyNames`, wire header
+    /// `x-amzn-transcribe-vocabulary-names`). A comma-separated list of custom vocabularies,
+    /// one per candidate language. Distinct from the single-language `vocabulary_name`.
+    /// Carried via `ProviderExtras` (`vocabulary_names`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vocabulary_names: Option<String>,
+
+    /// Custom vocabulary filter names for language-ID mode (`VocabularyFilterNames`, wire header
+    /// `x-amzn-transcribe-vocabulary-filter-names`). Comma-separated, one per candidate language.
+    /// Distinct from the single-language `vocabulary_filter_name`. Carried via `ProviderExtras`
+    /// (`vocabulary_filter_names`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vocabulary_filter_names: Option<String>,
+
+    /// Session resume window in minutes (`SessionResumeWindow`, wire header
+    /// `x-amzn-transcribe-session-resume-window`). How long a dropped session may be resumed.
+    /// Carried via `ProviderExtras` (`session_resume_window`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_resume_window: Option<i32>,
+
+    /// PII content identification — FLAG (not redact) mode (`ContentIdentificationType`,
+    /// wire header `x-amzn-transcribe-content-identification-type`). Tags PII in the
+    /// transcript instead of masking it (distinct from `enable_content_redaction`). The only
+    /// accepted value is `PII`. Carried via `ProviderExtras` (`content_identification_type`).
+    #[serde(default)]
+    pub enable_content_identification: bool,
+
     /// Enable content redaction (e.g., PII masking)
     #[serde(default)]
     pub enable_content_redaction: bool,
@@ -493,6 +544,12 @@ pub struct AwsTranscribeSTTConfig {
     /// Audio chunk duration in milliseconds (50-200 recommended)
     #[serde(default = "default_chunk_duration")]
     pub chunk_duration_ms: u32,
+
+    /// Override the AWS Transcribe Streaming endpoint base URL (e.g. a localhost mock for e2e
+    /// tests). When set, the AWS SDK config loader is pointed at this URL via `.endpoint_url(..)`
+    /// instead of the resolved regional endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_override: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -533,16 +590,123 @@ impl Default for AwsTranscribeSTTConfig {
             language_model_name: None,
             identify_language: false,
             preferred_language: Vec::new(),
+            language_options: Vec::new(),
+            identify_multiple_languages: false,
+            vocabulary_names: None,
+            vocabulary_filter_names: None,
+            session_resume_window: None,
+            enable_content_identification: false,
             enable_content_redaction: false,
             content_redaction_types: Vec::new(),
             pii_entity_types: Vec::new(),
             session_id: None,
             chunk_duration_ms: DEFAULT_CHUNK_DURATION_MS,
+            endpoint_override: None,
         }
     }
 }
 
 impl AwsTranscribeSTTConfig {
+    /// Build from the standardized config (W1 keystone — 4th provider). Unlocks the diarization
+    /// AND content-redaction that the flat factory hardcoded off (BRUTAL_REVIEW.md flagged both),
+    /// plus partial-results stabilization, through the standardized API.
+    pub fn from_standard(std: &crate::core::stt::standard::StandardSTTConfig) -> Self {
+        let f = &std.features;
+        let ex = &std.extras.0;
+        let mut cfg = Self {
+            base: std.base.clone(),
+            ..Default::default()
+        };
+        if let Some(d) = f.diarization {
+            cfg.show_speaker_label = d;
+            if d && cfg.max_speaker_labels.is_none() {
+                cfg.max_speaker_labels = Some(10); // AWS max
+            }
+        }
+        if let Some(i) = f.interim_results {
+            cfg.enable_partial_results_stabilization = i;
+        }
+        if let Some(r) = &f.redaction {
+            cfg.enable_content_redaction = true;
+            cfg.pii_entity_types = r.clone();
+        }
+
+        // --- Newly-wired StartStreamTranscription features (all provider-specific → extras) ----
+        // These have no canonical typed `SttFeatures` field, so they ride the open
+        // `ProviderExtras` passthrough. Each maps to a documented `x-amzn-transcribe-*` request
+        // header serialized by the aws-sdk-transcribestreaming `StartStreamTranscriptionInput`
+        // (confirmed against the SDK protocol_serde header serializer, June 2026).
+
+        // `language_options` (x-amzn-transcribe-language-options): comma-separated string OR JSON
+        // array of language codes. Accept either form so callers can pass a list or a string.
+        cfg.language_options = match ex.get("language_options") {
+            Some(serde_json::Value::String(s)) => s
+                .split(',')
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .collect(),
+            Some(serde_json::Value::Array(a)) => a
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect(),
+            _ => Vec::new(),
+        };
+
+        // `identify_multiple_languages` (x-amzn-transcribe-identify-multiple-languages).
+        cfg.identify_multiple_languages = ex
+            .get("identify_multiple_languages")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        // `vocabulary_names` (x-amzn-transcribe-vocabulary-names): comma-separated list for
+        // language-ID mode (distinct from the single-language `vocabulary_name`).
+        cfg.vocabulary_names = ex
+            .get("vocabulary_names")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        // `vocabulary_filter_names` (x-amzn-transcribe-vocabulary-filter-names): language-ID mode.
+        cfg.vocabulary_filter_names = ex
+            .get("vocabulary_filter_names")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        // `session_resume_window` (x-amzn-transcribe-session-resume-window): minutes.
+        cfg.session_resume_window = ex
+            .get("session_resume_window")
+            .and_then(|v| v.as_i64())
+            .map(|n| n as i32);
+
+        // `content_identification_type` (x-amzn-transcribe-content-identification-type): PII FLAG
+        // mode (not redaction). Accept a bool toggle or the literal "PII" string.
+        cfg.enable_content_identification = match ex.get("content_identification_type") {
+            Some(serde_json::Value::Bool(b)) => *b,
+            Some(serde_json::Value::String(s)) => s.eq_ignore_ascii_case("pii"),
+            _ => false,
+        };
+
+        // Endpoint override (mock harness): point the AWS SDK Transcribe client at a localhost mock.
+        cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
+        // AWS credentials + region flow through the standardized path via the `extras` passthrough;
+        // without this the standard path could never authenticate against an explicit-credential
+        // endpoint (the explicit-credential branch in `start_connection` is otherwise unreachable
+        // from `from_standard`). Mirrors aws_polly TTS.
+        if let Some(k) = ex.get("aws_access_key_id").and_then(|v| v.as_str()) {
+            cfg.aws_access_key_id = Some(k.to_string());
+        }
+        if let Some(k) = ex.get("aws_secret_access_key").and_then(|v| v.as_str()) {
+            cfg.aws_secret_access_key = Some(k.to_string());
+        }
+        if let Some(k) = ex.get("aws_session_token").and_then(|v| v.as_str()) {
+            cfg.aws_session_token = Some(k.to_string());
+        }
+        if let Some(r) = ex.get("region").and_then(|v| v.as_str()) {
+            cfg.region = AwsRegion::from_str_or_default(r);
+        }
+
+        cfg
+    }
+
     /// Create a new configuration with the given language code.
     pub fn with_language(language_code: &str) -> Self {
         let mut config = Self::default();
@@ -603,6 +767,10 @@ impl AwsTranscribeSTTConfig {
             );
         }
 
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_aws_transcribe_endpoint("endpoint_override", endpoint)?;
+        }
+
         Ok(())
     }
 
@@ -637,6 +805,32 @@ impl AwsTranscribeSTTConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone (4th provider): unlocks AWS diarization + content redaction — both hardcoded
+    // off by the flat factory per BRUTAL_REVIEW.md.
+    #[test]
+    fn from_standard_unlocks_aws_diarization_and_redaction() {
+        use crate::core::stt::standard::{StandardSTTConfig, SttFeatures};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "aws-transcribe".into(),
+                api_key: "k".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                diarization: Some(true),
+                redaction: Some(vec!["NAME".into(), "PHONE".into()]),
+                ..Default::default()
+            },
+            extras: Default::default(),
+            translation: None,
+        };
+        let cfg = AwsTranscribeSTTConfig::from_standard(&std);
+        assert!(cfg.show_speaker_label);
+        assert_eq!(cfg.max_speaker_labels, Some(10));
+        assert!(cfg.enable_content_redaction);
+        assert_eq!(cfg.pii_entity_types, vec!["NAME", "PHONE"]);
+    }
 
     #[test]
     fn test_aws_region_as_str() {
@@ -720,6 +914,49 @@ mod tests {
     fn test_config_validation_valid() {
         let config = AwsTranscribeSTTConfig::default();
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let previous = std::env::var_os("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
+
+        let mut config = AwsTranscribeSTTConfig {
+            endpoint_override: Some("https://transcribe-proxy.example.com".to_string()),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:9000".to_string());
+        let err = config
+            .validate()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.contains("SSRF protection"), "{err}");
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate()
+            .expect_err("non-HTTP endpoint_override must be rejected");
+        assert!(err.contains("not allowed"), "{err}");
+
+        config.endpoint_override = Some("ws://transcribe-proxy.example.com".to_string());
+        let err = config
+            .validate()
+            .expect_err("WebSocket endpoint_override must be rejected for AWS SDK HTTP endpoint");
+        assert!(err.contains("not allowed"), "{err}");
+
+        // SAFETY: restore the process env before releasing the test env lock.
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", previous);
+            } else {
+                std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+            }
+        }
     }
 
     #[test]

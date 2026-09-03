@@ -6,20 +6,43 @@ use anyhow::{Context, Result};
 use ndarray::{Array1, Array2, Array3};
 use ort::session::{Session, builder::SessionBuilder};
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, trace};
 
 use super::config::SileroVADConfig;
 
+use crate::core::model_integrity::skip_model_hash_check_from_env;
 // Import SIMD-optimized operations
 use crate::utils::simd_ops;
 
 /// Default URL for downloading the Silero VAD model.
 const SILERO_VAD_MODEL_URL: &str =
     "https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.onnx";
+const SILERO_VAD_MODEL_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Silero VAD v5 model dimensions.
-const SILERO_V5_HIDDEN_SIZE: usize = 64;
+/// Silero v5 uses a single unified recurrent `state` tensor of shape [2, 1, 128]
+/// (NOT the v4-style separate h/c tensors of [2,1,64] each, and NOT inputs named "h"/"c").
+/// Feeding v4 inputs to the v5 model fails at inference with `Invalid input name: h`.
+const SILERO_V5_STATE_SIZE: usize = 128;
+
+fn validate_audio_chunk_len(audio_len: usize, expected_len: usize) -> Result<()> {
+    if audio_len != expected_len {
+        anyhow::bail!(
+            "Audio chunk must be exactly {} samples, got {}",
+            expected_len,
+            audio_len
+        );
+    }
+    Ok(())
+}
+
+fn silero_vad_model_http_client() -> Result<reqwest::Client> {
+    crate::core::net::ssrf_protected_client_builder(crate::core::net::HTTP_URL_SCHEMES)
+        .timeout(SILERO_VAD_MODEL_DOWNLOAD_TIMEOUT)
+        .build()
+        .context("Failed to create Silero VAD model download HTTP client")
+}
 
 /// Result of VAD processing for a single chunk.
 #[derive(Debug, Clone, Copy)]
@@ -48,13 +71,8 @@ pub struct SileroVAD {
     /// Configuration
     config: SileroVADConfig,
 
-    /// LSTM hidden state (h)
-    /// Shape: [2, 1, 64] for Silero v5
-    state_h: Array3<f32>,
-
-    /// LSTM cell state (c)
-    /// Shape: [2, 1, 64] for Silero v5
-    state_c: Array3<f32>,
+    /// Unified Silero v5 recurrent state. Shape: [2, 1, 128].
+    state: Array3<f32>,
 
     /// Sample rate tensor (constant)
     /// Shape: [1]
@@ -115,8 +133,7 @@ impl SileroVAD {
         .context("Failed to create ONNX session")?;
 
         // Initialize state tensors
-        let state_h = Array3::zeros((2, 1, SILERO_V5_HIDDEN_SIZE));
-        let state_c = Array3::zeros((2, 1, SILERO_V5_HIDDEN_SIZE));
+        let state = Array3::zeros((2, 1, SILERO_V5_STATE_SIZE));
         let sample_rate_tensor = Array1::from_vec(vec![config.sample_rate as i64]);
         let input_buffer = Array2::zeros((1, config.chunk_size));
 
@@ -128,8 +145,7 @@ impl SileroVAD {
         Ok(Self {
             session,
             config,
-            state_h,
-            state_c,
+            state,
             sample_rate_tensor,
             input_buffer,
             speech_frames: 0,
@@ -142,10 +158,14 @@ impl SileroVAD {
 
     /// Creates an ONNX session for the model.
     fn create_session(model_path: &Path, num_threads: usize) -> Result<Session> {
-        let session = SessionBuilder::new()?
+        let builder = SessionBuilder::new()?
             .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)?
             .with_intra_threads(num_threads)?
-            .with_inter_threads(1)?
+            .with_inter_threads(1)?;
+
+        // Hardware EP policy (MASTER_PLAN §7 H): single policy point, honors
+        // WAAV_ORT_EP, CPU is the guaranteed fallback.
+        let session = crate::core::onnx::apply_execution_providers(builder)?
             .commit_from_file(model_path)
             .context("Failed to load Silero VAD model")?;
 
@@ -192,14 +212,48 @@ impl SileroVAD {
 
         info!("Downloading Silero VAD model to {:?}", model_path);
 
-        let response = reqwest::get(SILERO_VAD_MODEL_URL)
+        let response = silero_vad_model_http_client()?
+            .get(SILERO_VAD_MODEL_URL)
+            .send()
             .await
-            .context("Failed to download Silero VAD model")?;
+            .context("Failed to download Silero VAD model")?
+            .error_for_status()
+            .context("Silero VAD model download returned an error status")?;
 
         let bytes = response
             .bytes()
             .await
             .context("Failed to read model bytes")?;
+
+        // Supply-chain integrity: the downloaded ONNX blob is executed by the
+        // runtime, so verify it against the pinned SHA-256 of the official
+        // snakers4/silero-vad v5 model (same fail-closed policy as
+        // turn_detect/assets.rs). `WAAV_SKIP_MODEL_HASH_CHECK=1` opts out for
+        // intentionally-updated models.
+        const SILERO_VAD_MODEL_SHA256: &str =
+            "1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3";
+        let skip_check = skip_model_hash_check_from_env()?;
+        let actual = {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(&bytes);
+            format!("{:x}", h.finalize())
+        };
+        if actual != SILERO_VAD_MODEL_SHA256 {
+            if skip_check {
+                tracing::warn!(
+                    expected = SILERO_VAD_MODEL_SHA256,
+                    actual = %actual,
+                    "Silero VAD model hash mismatch — loading anyway (WAAV_SKIP_MODEL_HASH_CHECK set)"
+                );
+            } else {
+                anyhow::bail!(
+                    "Silero VAD model hash mismatch (expected {SILERO_VAD_MODEL_SHA256}, got \
+                     {actual}); refusing to load an unverified ONNX model. Set \
+                     WAAV_SKIP_MODEL_HASH_CHECK=1 to override for an intentional update."
+                );
+            }
+        }
 
         tokio::fs::write(&model_path, &bytes)
             .await
@@ -226,17 +280,8 @@ impl SileroVAD {
     /// based on the `state_reset_interval_secs` configuration to prevent
     /// state drift in long conversations.
     ///
-    /// # Panics
-    ///
-    /// Panics if `audio.len() != config.chunk_size`.
     pub fn process(&mut self, audio: &[f32]) -> Result<SileroVADResult> {
-        assert_eq!(
-            audio.len(),
-            self.config.chunk_size,
-            "Audio chunk must be exactly {} samples, got {}",
-            self.config.chunk_size,
-            audio.len()
-        );
+        validate_audio_chunk_len(audio.len(), self.config.chunk_size)?;
 
         let start = Instant::now();
 
@@ -248,8 +293,9 @@ impl SileroVAD {
         let input_slice = self
             .input_buffer
             .as_slice_mut()
-            .expect("Input buffer should be contiguous");
-        simd_ops::copy_to_tensor_simd(audio, input_slice);
+            .context("Silero VAD input buffer is not contiguous")?;
+        simd_ops::copy_to_tensor_simd(audio, input_slice)
+            .context("Silero VAD input buffer is smaller than the validated audio chunk")?;
 
         // Run inference
         let probability = self.run_inference()?;
@@ -291,8 +337,7 @@ impl SileroVAD {
         let elapsed = self.last_state_reset.elapsed().as_secs_f32();
         if elapsed >= self.config.state_reset_interval_secs {
             // Reset only the LSTM states, not the speech/silence tracking
-            self.state_h.fill(0.0);
-            self.state_c.fill(0.0);
+            self.state.fill(0.0);
             self.last_state_reset = Instant::now();
 
             if self.config.debug_logging {
@@ -306,9 +351,10 @@ impl SileroVAD {
 
     /// Runs ONNX inference and returns the speech probability.
     fn run_inference(&mut self) -> Result<f32> {
-        // Prepare input tensors using ort 2.0 API
-        // Silero VAD v5 expects: input, sr, h, c
-        // Must create Tensor objects from raw data (shape, data) tuples
+        // Prepare input tensors using ort 2.0 API.
+        // Silero VAD v5 expects: `input`, `state` (unified [2,1,128]), `sr`.
+        // (The v4 model used `input`, `sr`, `h`, `c`; feeding those to v5 fails with
+        //  `Invalid input name: h` — confirmed live.)
 
         // Input audio: shape [1, chunk_size]
         let input_data: Vec<f32> = self.input_buffer.iter().copied().collect();
@@ -317,35 +363,26 @@ impl SileroVAD {
             input_data.into_boxed_slice(),
         ))?;
 
-        // Sample rate: shape [1]
-        let sr_data: Vec<i64> = self.sample_rate_tensor.iter().copied().collect();
-        let sr_tensor = ort::value::Tensor::from_array(([1usize], sr_data.into_boxed_slice()))?;
+        // Sample rate: scalar i64 (shape []). v5 expects a rank-0 / single-element sr.
+        let sr_value = self.sample_rate_tensor[0];
+        let sr_tensor =
+            ort::value::Tensor::from_array(([1usize], vec![sr_value].into_boxed_slice()))?;
 
-        // Hidden state h: shape [2, 1, 64]
-        let h_data: Vec<f32> = self.state_h.iter().copied().collect();
-        let h_tensor = ort::value::Tensor::from_array((
-            [2usize, 1usize, SILERO_V5_HIDDEN_SIZE],
-            h_data.into_boxed_slice(),
-        ))?;
-
-        // Cell state c: shape [2, 1, 64]
-        let c_data: Vec<f32> = self.state_c.iter().copied().collect();
-        let c_tensor = ort::value::Tensor::from_array((
-            [2usize, 1usize, SILERO_V5_HIDDEN_SIZE],
-            c_data.into_boxed_slice(),
+        // Unified recurrent state: shape [2, 1, 128]
+        let state_data: Vec<f32> = self.state.iter().copied().collect();
+        let state_tensor = ort::value::Tensor::from_array((
+            [2usize, 1usize, SILERO_V5_STATE_SIZE],
+            state_data.into_boxed_slice(),
         ))?;
 
         // Run inference
         let outputs = self.session.run(ort::inputs![
             "input" => input_tensor,
+            "state" => state_tensor,
             "sr" => sr_tensor,
-            "h" => h_tensor,
-            "c" => c_tensor,
         ])?;
 
-        // Extract outputs using ort 2.0 API
-        // try_extract_tensor returns (&Shape, &[T]) tuple
-        // output: probability, hn: new hidden state, cn: new cell state
+        // output: speech probability [1,1]; stateN: updated recurrent state [2,1,128].
         let probability = {
             let output_tensor = outputs
                 .get("output")
@@ -353,33 +390,17 @@ impl SileroVAD {
             let (_shape, data) = output_tensor
                 .try_extract_tensor::<f32>()
                 .context("Failed to extract output tensor")?;
-            // Probability is at index 0 (shape is [1, 1])
             data[0]
         };
 
-        // Update hidden states
-        if let Some(hn) = outputs.get("hn") {
-            let (_shape, hn_data) = hn
+        // Carry the updated state forward for the next chunk.
+        if let Some(state_n) = outputs.get("stateN") {
+            let (_shape, sn_data) = state_n
                 .try_extract_tensor::<f32>()
-                .context("Failed to extract hn tensor")?;
-            // Shape is [2, 1, 64], stored in row-major order
+                .context("Failed to extract stateN tensor")?;
             for i in 0..2 {
-                for j in 0..SILERO_V5_HIDDEN_SIZE {
-                    // Linear index: i * (1 * 64) + 0 * 64 + j = i * 64 + j
-                    self.state_h[[i, 0, j]] = hn_data[i * SILERO_V5_HIDDEN_SIZE + j];
-                }
-            }
-        }
-
-        if let Some(cn) = outputs.get("cn") {
-            let (_shape, cn_data) = cn
-                .try_extract_tensor::<f32>()
-                .context("Failed to extract cn tensor")?;
-            // Shape is [2, 1, 64], stored in row-major order
-            for i in 0..2 {
-                for j in 0..SILERO_V5_HIDDEN_SIZE {
-                    // Linear index: i * (1 * 64) + 0 * 64 + j = i * 64 + j
-                    self.state_c[[i, 0, j]] = cn_data[i * SILERO_V5_HIDDEN_SIZE + j];
+                for j in 0..SILERO_V5_STATE_SIZE {
+                    self.state[[i, 0, j]] = sn_data[i * SILERO_V5_STATE_SIZE + j];
                 }
             }
         }
@@ -450,8 +471,7 @@ impl SileroVAD {
     ///
     /// Call this when starting a new conversation or after a long pause.
     pub fn reset(&mut self) {
-        self.state_h.fill(0.0);
-        self.state_c.fill(0.0);
+        self.state.fill(0.0);
         self.speech_frames = 0;
         self.silence_frames = 0;
         self.in_speech = false;
@@ -489,9 +509,45 @@ impl SileroVAD {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::ErrorKind;
 
     // Note: Most tests require the ONNX model file.
     // These are integration tests that should be run with the model available.
+
+    // Live test: confirms the Silero model actually LOADS and RUNS. The review predicted the
+    // v5 model URL (master) would fail against the v4-style h/c/sr tensor I/O. Run with the
+    // ONNX Runtime available: ORT_DYLIB_PATH=.../libonnxruntime.so cargo test --features
+    // silero-vad live_silero_loads_and_runs -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "downloads silero model + runs ONNX inference (needs ORT_DYLIB_PATH)"]
+    async fn live_silero_loads_and_runs() {
+        let mut vad = SileroVAD::new(SileroVADConfig::default())
+            .await
+            .expect("Silero VAD must load + initialize state");
+        let chunk = SileroVADConfig::default().chunk_size;
+
+        let silence = vec![0.0f32; chunk];
+        let r = vad.process(&silence).expect("process silence");
+        assert!(
+            (0.0..=1.0).contains(&r.probability),
+            "probability out of range: {}",
+            r.probability
+        );
+        eprintln!(
+            "SILERO_SILENCE prob={:.4} is_speech={} ({}us)",
+            r.probability, r.is_speech, r.inference_time_us
+        );
+
+        // A loud tone burst must produce a valid, and typically higher, speech probability —
+        // proving the recurrent state actually updates (not a degenerate constant output).
+        let tone: Vec<f32> = (0..chunk).map(|i| (i as f32 * 0.25).sin() * 0.6).collect();
+        let r2 = vad.process(&tone).expect("process tone");
+        assert!((0.0..=1.0).contains(&r2.probability));
+        eprintln!(
+            "SILERO_TONE    prob={:.4} is_speech={} ({}us)",
+            r2.probability, r2.is_speech, r2.inference_time_us
+        );
+    }
 
     #[test]
     fn test_vad_result_struct() {
@@ -512,6 +568,70 @@ mod tests {
         // 512 samples at 16kHz = 32ms
         let duration = config.chunk_duration_ms();
         assert!((duration - 32.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_validate_audio_chunk_len_returns_error_instead_of_panicking() {
+        assert!(validate_audio_chunk_len(512, 512).is_ok());
+
+        let error = validate_audio_chunk_len(511, 512).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Audio chunk must be exactly 512 samples, got 511"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn silero_vad_model_http_client_rejects_private_redirect() {
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) => {
+                if err.kind() == ErrorKind::PermissionDenied {
+                    eprintln!(
+                        "Skipping silero_vad_model_http_client_rejects_private_redirect: {err}"
+                    );
+                    return;
+                }
+                panic!("Failed to bind redirect test server listener: {err}");
+            }
+        };
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 302 Found\r\n",
+                "Location: http://127.0.0.1:9/metadata\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n"
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+
+        let err = silero_vad_model_http_client()
+            .unwrap()
+            .get(format!("http://{addr}/start"))
+            .send()
+            .await
+            .expect_err("private redirect target must be rejected");
+        let mut error_chain = err.to_string();
+        let mut source = std::error::Error::source(&err);
+        while let Some(error) = source {
+            error_chain.push_str(": ");
+            error_chain.push_str(&error.to_string());
+            source = error.source();
+        }
+        assert!(
+            error_chain.contains("redirect URL rejected"),
+            "unexpected redirect error: {error_chain}"
+        );
     }
 
     // Integration tests (require model file)

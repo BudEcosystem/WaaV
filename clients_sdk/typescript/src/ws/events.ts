@@ -3,29 +3,40 @@
  * Type-safe event definitions for session callbacks
  */
 
-import type { STTResultMessage, ErrorMessage, TTSAudioMessage, ReadyMessage } from '../types/messages.js';
+import type { STTResultMessage, ErrorMessage, TTSAudioMessage, ReadyMessage, ResolvedAlias, ConfigWarningMessage } from '../types/messages.js';
 import type { MetricsSummary } from '../types/metrics.js';
 import type { ReconnectState } from './reconnect.js';
+
+export type { ConfigWarningEvent, ConfigWarningCode } from '../types/warnings.js';
+import type { ConfigWarningEvent } from '../types/warnings.js';
 
 /**
  * STT transcript event
  */
 export interface TranscriptEvent {
-  /** Transcribed text */
+  /** Transcribed text (gateway `transcript` field) */
   text: string;
   /** Whether this is a final result */
   isFinal: boolean;
+  /** Whether speech has ended (gateway `is_speech_final`) */
+  isSpeechFinal: boolean;
   /** Confidence score (0-1) */
   confidence?: number;
-  /** Speaker ID for diarization */
+  /**
+   * The FULL accumulated segment text, present only on a speech_final whose
+   * segment spans multiple finals. Prefer this over `text` when displaying
+   * per-final text (gateway `segment_transcript`).
+   */
+  segmentTranscript?: string;
+  /** Speaker ID for diarization (reserved; not yet emitted on /ws) */
   speakerId?: number;
-  /** Detected language */
+  /** Detected language (reserved; not yet emitted on /ws) */
   language?: string;
-  /** Start time in seconds */
+  /** Start time in seconds (reserved; not yet emitted on /ws) */
   startTime?: number;
-  /** End time in seconds */
+  /** End time in seconds (reserved; not yet emitted on /ws) */
   endTime?: number;
-  /** Word-level details */
+  /** Word-level details (reserved; not yet emitted on /ws) */
   words?: Array<{
     word: string;
     start: number;
@@ -33,6 +44,13 @@ export interface TranscriptEvent {
     confidence?: number;
     speakerId?: number;
   }>;
+  /**
+   * Uniform in-stream translations merged onto this transcript (P5). Empty
+   * unless a translation-capable provider (Speechmatics/Gladia/OpenAI EN fast
+   * path) returned a `translations:[{lang,text}]` array on this stt_result frame
+   * (gateway `translations`).
+   */
+  translations: Array<{ lang: string; text: string; isPartial?: boolean }>;
   /** Original message for advanced use */
   raw: STTResultMessage;
 }
@@ -61,18 +79,40 @@ export interface AudioEvent {
  * Session ready event
  */
 export interface ReadyEvent {
-  /** Session ID */
-  sessionId?: string;
-  /** Whether STT is ready */
-  sttReady: boolean;
-  /** Whether TTS is ready */
-  ttsReady: boolean;
-  /** Whether LiveKit is connected */
-  livekitConnected: boolean;
-  /** Server version */
-  serverVersion?: string;
-  /** Available capabilities */
-  capabilities: string[];
+  /** Unique stream/session identifier assigned by the gateway */
+  streamId: string;
+  /**
+   * Wire-protocol version reported by the gateway (e.g. "1.0"). The SDK
+   * asserts this matches its own PROTOCOL_VERSION and emits a typed error
+   * event on mismatch.
+   */
+  protocolVersion?: string;
+  /** LiveKit room name that was created (if LiveKit was requested) */
+  livekitRoomName?: string;
+  /** LiveKit URL to connect to (if LiveKit was requested) */
+  livekitUrl?: string;
+  /** Identity of the AI agent participant in the room */
+  waavParticipantIdentity?: string;
+  /** Display name of the AI agent participant */
+  waavParticipantName?: string;
+  /**
+   * P3 proxy/alias echo: the concrete providers the gateway resolved an `alias`
+   * to (no secrets), e.g. `{ name: 'support-bot', tts: { provider: 'cartesia' } }`.
+   * Present only when an `alias` was sent and recognized.
+   */
+  resolvedAlias?: ResolvedAlias;
+  /**
+   * D8 negotiated UPLINK transport codec actually in effect (`'linear16' | 'opus'`). Present only
+   * when the client requested a non-default `stt_config.audio_in_codec`. If you asked for `opus` and
+   * this comes back `'linear16'`, the gateway downgraded (e.g. built without opus) — send linear16.
+   */
+  audioInCodec?: string;
+  /**
+   * D8 negotiated DOWNLINK transport codec for TTS egress (`'linear16' | 'opus'`). Present only when
+   * the client requested a non-default `tts_config.audio_out_codec`. Same downgrade semantics as
+   * {@link audioInCodec} — decode opus only when this is `'opus'`.
+   */
+  audioOutCodec?: string;
   /** Original message for advanced use */
   raw: ReadyMessage;
 }
@@ -148,6 +188,20 @@ export interface ListeningEvent {
 }
 
 /**
+ * D10 mic-silence event: the microphone has been below the silence threshold
+ * for the configured window (likely muted/dead) — or has recovered. Mirrors
+ * Pipecat base_input's mic-timeout signal.
+ */
+export interface MicSilenceEvent {
+  /** True when the mic went silent, false when audio returned. */
+  silent: boolean;
+  /** How long the mic was silent in ms (only meaningful when `silent` is true). */
+  silentForMs?: number;
+  /** Timestamp */
+  timestamp: number;
+}
+
+/**
  * Session event map for type-safe event handling
  */
 export interface SessionEventMap {
@@ -159,6 +213,13 @@ export interface SessionEventMap {
   audio: AudioEvent;
   /** Error occurred */
   error: SessionErrorEvent;
+  /**
+   * Non-fatal gateway config advisory (e.g. an unknown/misnested key, an
+   * emotion the provider ignores, a reasoning model on the voice path). The
+   * session keeps running; this surfaces a silent server-side degrade so a
+   * developer can see and fix it.
+   */
+  configWarning: ConfigWarningEvent;
   /** Connection state changed */
   connectionState: ConnectionStateEvent;
   /** Metrics updated */
@@ -169,6 +230,8 @@ export interface SessionEventMap {
   speaking: SpeakingEvent;
   /** Listening state changed */
   listening: ListeningEvent;
+  /** D10: mic went silent (likely muted/dead) or recovered. */
+  micSilent: MicSilenceEvent;
   /** Session closed */
   close: { code: number; reason: string };
   /** Ping/pong roundtrip */

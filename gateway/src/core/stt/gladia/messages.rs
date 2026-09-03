@@ -5,7 +5,8 @@
 use serde::{Deserialize, Serialize};
 
 use super::config::{
-    GladiaLanguageConfig, GladiaMessagesConfig, GladiaPreProcessing, GladiaRealtimeProcessing,
+    GladiaLanguageConfig, GladiaMessagesConfig, GladiaPostProcessing, GladiaPreProcessing,
+    GladiaRealtimeProcessing,
 };
 
 // =============================================================================
@@ -41,6 +42,9 @@ pub struct InitSessionRequest {
     /// Realtime processing configuration
     #[serde(skip_serializing_if = "Option::is_none")]
     pub realtime_processing: Option<GladiaRealtimeProcessing>,
+    /// Post-processing configuration (summarization, chapterization)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub post_processing: Option<GladiaPostProcessing>,
     /// Messages configuration
     #[serde(skip_serializing_if = "Option::is_none")]
     pub messages_config: Option<GladiaMessagesConfig>,
@@ -62,6 +66,7 @@ impl Default for InitSessionRequest {
             language_config: None,
             pre_processing: None,
             realtime_processing: None,
+            post_processing: None,
             messages_config: None,
             custom_metadata: None,
         }
@@ -215,6 +220,43 @@ pub struct WordData {
 }
 
 // =============================================================================
+// Translation Message (Server -> Client, P5)
+// =============================================================================
+
+/// Real-time translation message received from Gladia (`type:"translation"`).
+///
+/// Emitted for each target language when `realtime_processing.translation` is on.
+/// The translated text is `data.translated_utterance.text`; the target language is
+/// `data.target_language` (ISO-639-1). The gateway folds this into the uniform
+/// `translations:[{lang,text}]` array. P5.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TranslationMessage {
+    /// Message type (always "translation").
+    #[serde(rename = "type")]
+    pub message_type: String,
+    /// Session ID.
+    #[serde(default)]
+    pub session_id: String,
+    /// Translation payload.
+    pub data: TranslationDataPayload,
+}
+
+/// Payload of a Gladia `type:"translation"` message.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TranslationDataPayload {
+    /// Whether the translated utterance is final.
+    #[serde(default)]
+    pub is_final: bool,
+    /// The source language the utterance was translated FROM (ISO-639-1).
+    #[serde(default)]
+    pub original_language: Option<String>,
+    /// The target language this translation is IN (ISO-639-1, e.g. "es", "de").
+    pub target_language: String,
+    /// The translated utterance (reuses the transcript utterance shape: `text` etc.).
+    pub translated_utterance: UtteranceData,
+}
+
+// =============================================================================
 // Error Response
 // =============================================================================
 
@@ -260,6 +302,8 @@ pub struct GenericMessage {
 pub enum ServerMessage {
     /// Transcript message (partial or final)
     Transcript(TranscriptMessage),
+    /// Real-time translation message (P5; `type:"translation"`).
+    Translation(TranslationMessage),
     /// Error message
     Error(GladiaError),
     /// Unknown message type
@@ -276,6 +320,10 @@ impl ServerMessage {
             "transcript" => {
                 let msg: TranscriptMessage = serde_json::from_str(json)?;
                 Ok(ServerMessage::Transcript(msg))
+            }
+            "translation" => {
+                let msg: TranslationMessage = serde_json::from_str(json)?;
+                Ok(ServerMessage::Translation(msg))
             }
             "error" => {
                 let err: GladiaError = serde_json::from_str(json)?;
@@ -491,6 +539,38 @@ mod tests {
         assert!(matches!(msg, ServerMessage::Transcript(_)));
         assert!(msg.is_final_transcript());
         assert!(!msg.is_partial_transcript());
+    }
+
+    #[test]
+    fn test_server_message_from_json_translation() {
+        // P5: a Gladia `type:"translation"` frame must parse into ServerMessage::Translation
+        // with the target language + translated utterance text.
+        let json = r#"{
+            "type": "translation",
+            "session_id": "test",
+            "created_at": "2025-01-13T10:00:00.000Z",
+            "data": {
+                "is_final": true,
+                "original_language": "en",
+                "target_language": "es",
+                "translated_utterance": {
+                    "text": "hola mundo",
+                    "language": "es",
+                    "start": 0.0,
+                    "end": 0.5
+                }
+            }
+        }"#;
+
+        let msg = ServerMessage::from_json(json).unwrap();
+        match msg {
+            ServerMessage::Translation(t) => {
+                assert_eq!(t.data.target_language, "es");
+                assert_eq!(t.data.translated_utterance.text, "hola mundo");
+                assert!(t.data.is_final);
+            }
+            _ => panic!("expected ServerMessage::Translation"),
+        }
     }
 
     #[test]

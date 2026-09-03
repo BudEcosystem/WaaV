@@ -3,7 +3,7 @@
 **Date:** 2026-02-04
 **Gateway:** ws://localhost:3001/ws
 **Provider:** Deepgram (nova-2 for STT, aura-asteria-en for TTS)
-**API Key:** a89c460d1b43a8b5d67beea50545650ed62eb030
+**API Key:** <REDACTED-revoke-this-deepgram-key>
 
 ## Executive Summary
 

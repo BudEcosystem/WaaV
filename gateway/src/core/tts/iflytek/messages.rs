@@ -66,6 +66,10 @@ pub struct TtsRequestBusiness {
     /// Number pronunciation mode (0=auto, 1=digit, 2=value, 3=auto v2).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rdn: Option<i32>,
+
+    /// Streaming MP3 return (`sfl`): combine with `aue=lame` to stream MP3 audio. Value `1` = on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sfl: Option<u32>,
 }
 
 /// Data section of the TTS request.
@@ -106,6 +110,7 @@ impl TtsRequest {
         background_sound: bool,
         english_pronunciation: u32,
         number_pronunciation: u32,
+        streaming_mp3_return: Option<u32>,
         text: &str,
     ) -> Self {
         Self {
@@ -123,6 +128,7 @@ impl TtsRequest {
                 bgs: if background_sound { Some(1) } else { Some(0) },
                 reg: Some(english_pronunciation as i32),
                 rdn: Some(number_pronunciation as i32),
+                sfl: streaming_mp3_return,
             },
             data: TtsRequestData {
                 status: 2, // Single complete request
@@ -137,7 +143,8 @@ impl TtsRequest {
             app_id, voice, "raw", 16000, "UTF8", 50, // Normal speed
             50, // Normal volume
             50, // Normal pitch
-            false, 0, 0, text,
+            false, 0, 0, None, // no streaming MP3 return
+            text,
         )
     }
 
@@ -249,6 +256,7 @@ mod tests {
             false,
             0,
             0,
+            None,
             "你好世界",
         );
 
@@ -385,11 +393,18 @@ mod tests {
     #[test]
     fn test_tts_request_business_params() {
         let request = TtsRequest::new(
-            "app_id", "xiaoyan", "lame", 8000, "GBK", 30, // Slow
+            "app_id",
+            "xiaoyan",
+            "lame",
+            8000,
+            "GBK",
+            30, // Slow
             80, // Loud
             70, // High pitch
-            true, 1, // Letter by letter
-            2, // Read as value
+            true,
+            1,       // Letter by letter
+            2,       // Read as value
+            Some(1), // streaming MP3 return on
             "Test",
         );
 
@@ -402,5 +417,6 @@ mod tests {
         assert_eq!(request.business.bgs, Some(1));
         assert_eq!(request.business.reg, Some(1));
         assert_eq!(request.business.rdn, Some(2));
+        assert_eq!(request.business.sfl, Some(1));
     }
 }

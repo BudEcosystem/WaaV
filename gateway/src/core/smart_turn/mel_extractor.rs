@@ -412,11 +412,7 @@ impl MelExtractor {
 
             // Keep the LAST max_frames (most recent audio) if we have too many
             let max_frames = self.config.max_frames();
-            let start_frame = if num_frames > max_frames {
-                num_frames - max_frames
-            } else {
-                0
-            };
+            let start_frame = num_frames.saturating_sub(max_frames);
 
             // Transpose from (n_mels, n_frames) to (n_frames, n_mels)
             self.mel_frames.reserve(num_frames - start_frame);
@@ -603,7 +599,7 @@ impl MelExtractor {
         if self.total_extraction_time_us == 0 {
             0.0
         } else {
-            let audio_duration_us = (self.audio_duration_secs() * 1_000_000.0) as f32;
+            let audio_duration_us = self.audio_duration_secs() * 1_000_000.0;
             audio_duration_us / self.total_extraction_time_us as f32
         }
     }
@@ -613,6 +609,12 @@ impl MelExtractor {
         self.mel_frames.clear();
         self.audio_buffer.clear();
         self.resample_input_buffer.clear();
+        // Drop the sinc delay line too (C-G5 stale-tail fix): without this,
+        // the next utterance inherits the previous one's filter tail — a
+        // click/energy-leak source at utterance boundaries.
+        if let Some(r) = self.resampler.as_mut() {
+            r.reset();
+        }
     }
 
     /// Resets the extractor to initial state.
@@ -620,6 +622,9 @@ impl MelExtractor {
         self.mel_frames.clear();
         self.audio_buffer.clear();
         self.resample_input_buffer.clear();
+        if let Some(r) = self.resampler.as_mut() {
+            r.reset();
+        }
         self.total_samples = 0;
         self.total_extraction_time_us = 0;
     }

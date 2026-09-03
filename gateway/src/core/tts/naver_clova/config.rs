@@ -21,6 +21,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::core::tts::base::{TTSConfig, TTSError};
 
+pub(crate) const CUSTOM_ENDPOINT_EXTRA_KEY: &str = "custom_endpoint";
+const HTTP_ENDPOINT_SCHEMES: &[&str] = &["http", "https"];
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -312,6 +315,10 @@ pub struct NaverClovaTtsConfig {
     /// Output audio format.
     pub format: NaverClovaTtsFormat,
 
+    /// Output sampling rate in Hz (8000, 16000, 24000, 48000). CLOVA Voice Premium honors the
+    /// `sampling-rate` parameter for WAV output only (MP3 is fixed); `None` keeps the API default.
+    pub sampling_rate: Option<u32>,
+
     /// Alpha (timbre) adjustment (-5 to 5, default 0).
     pub alpha: i8,
 
@@ -323,6 +330,9 @@ pub struct NaverClovaTtsConfig {
 
     /// Custom endpoint URL (for enterprise deployments).
     pub custom_endpoint: Option<String>,
+
+    /// Standardized endpoint base override (scheme+host) for the synth POST; e.g. redirect to a mock.
+    pub endpoint_override: Option<String>,
 }
 
 impl Default for NaverClovaTtsConfig {
@@ -337,10 +347,12 @@ impl Default for NaverClovaTtsConfig {
             emotion: 0,
             emotion_strength: 1,
             format: NaverClovaTtsFormat::default(),
+            sampling_rate: None,
             alpha: 0,
             end_pitch: 0,
             request_timeout_secs: 30,
             custom_endpoint: None,
+            endpoint_override: None,
         }
     }
 }
@@ -416,11 +428,78 @@ impl NaverClovaTtsConfig {
             emotion: 0,
             emotion_strength: 1,
             format,
+            sampling_rate: None,
             alpha: 0,
             end_pitch: 0,
             request_timeout_secs,
             custom_endpoint: None,
+            endpoint_override: None,
         })
+    }
+
+    /// Build from the standardized TTS config (W1 keystone).
+    ///
+    /// CLOVA Voice exposes prosody as integer deltas in -5..=5, so this maps the matching
+    /// standardized features onto those fields:
+    /// - [`TtsFeatures::speed`] -> `speed` (a 0.25..4.0 multiplier folded onto -5..=5, same
+    ///   curve as [`from_base`])
+    /// - [`TtsFeatures::pitch`] -> `pitch` (clamped to -5..=5)
+    /// - [`TtsFeatures::volume`] -> `volume` (clamped to -5..=5)
+    ///
+    /// - [`TtsFeatures::sample_rate`] -> `sampling_rate` (CLOVA's `sampling-rate` form param; the
+    ///   API honors it for WAV output only, so it is emitted on the wire only when `format == wav`)
+    ///
+    /// CLOVA's `custom_endpoint` (not a standard field) is read from the `extras` passthrough.
+    /// Features without a CLOVA field — `emotion` (CLOVA's emotion is a numeric intensity, not a
+    /// free-text label), `ssml`, `stability`, `similarity_boost`, `style`,
+    /// `use_speaker_boost`, `instructions`, `language`, `word_timestamps`, `streaming`, `seed` —
+    /// are skipped.
+    ///
+    /// [`TtsFeatures::speed`]: crate::core::tts::standard::TtsFeatures::speed
+    /// [`TtsFeatures::pitch`]: crate::core::tts::standard::TtsFeatures::pitch
+    /// [`TtsFeatures::volume`]: crate::core::tts::standard::TtsFeatures::volume
+    /// [`from_base`]: Self::from_base
+    pub fn from_standard(
+        std: &crate::core::tts::standard::StandardTTSConfig,
+    ) -> Result<Self, TTSError> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(std.base.clone())?;
+
+        if let Some(rate) = f.speed {
+            // Same 0.25..4.0 multiplier -> -5..=5 curve used by `from_base` (1.0 = 0).
+            let clamped = rate.clamp(0.25, 4.0);
+            cfg.speed = if clamped < 1.0 {
+                ((clamped - 0.25) / 0.75 * 5.0 - 5.0) as i8
+            } else {
+                ((clamped - 1.0) / 3.0 * 5.0) as i8
+            };
+        }
+        if let Some(pitch) = f.pitch {
+            cfg.pitch = (pitch as i32).clamp(-5, 5) as i8;
+        }
+        if let Some(volume) = f.volume {
+            cfg.volume = (volume as i32).clamp(-5, 5) as i8;
+        }
+        if let Some(sample_rate) = f.sample_rate {
+            // Reaches the wire as `sampling-rate` (WAV-only) in `build_request_body`.
+            cfg.sampling_rate = Some(sample_rate);
+        }
+
+        // Provider-specific passthrough.
+        if let Some(endpoint) = std
+            .extras
+            .0
+            .get(CUSTOM_ENDPOINT_EXTRA_KEY)
+            .and_then(|v| v.as_str())
+        {
+            cfg.custom_endpoint = Some(endpoint.to_string());
+        }
+
+        cfg.endpoint_override = std.endpoint_override().map(String::from);
+
+        cfg.validate()?;
+
+        Ok(cfg)
     }
 
     /// Validate the configuration.
@@ -462,6 +541,17 @@ impl NaverClovaTtsConfig {
             ));
         }
 
+        if let Some(endpoint) = &self.custom_endpoint {
+            validate_custom_endpoint(endpoint)?;
+        }
+
+        if let Some(endpoint) = &self.endpoint_override {
+            let endpoint = endpoint.trim();
+            if !endpoint.is_empty() {
+                validate_http_endpoint("endpoint_override", endpoint)?;
+            }
+        }
+
         Ok(())
     }
 
@@ -497,6 +587,14 @@ impl NaverClovaTtsConfig {
             params.push(format!("emotion-strength={}", self.emotion_strength));
         }
 
+        // CLOVA Voice Premium honors `sampling-rate` for WAV output only (MP3 is fixed by the
+        // codec), so emit it only when the requested format is WAV — otherwise the API rejects it.
+        if let Some(sampling_rate) = self.sampling_rate
+            && self.format == NaverClovaTtsFormat::Wav
+        {
+            params.push(format!("sampling-rate={}", sampling_rate));
+        }
+
         if self.alpha != 0 {
             params.push(format!("alpha={}", self.alpha));
         }
@@ -517,6 +615,22 @@ impl NaverClovaTtsConfig {
     }
 }
 
+fn validate_custom_endpoint(endpoint: &str) -> Result<(), TTSError> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Err(TTSError::InvalidConfiguration(
+            "custom_endpoint must not be empty".to_string(),
+        ));
+    }
+    validate_http_endpoint("custom_endpoint", endpoint)
+}
+
+fn validate_http_endpoint(source: &str, endpoint: &str) -> Result<(), TTSError> {
+    crate::core::net::validate_url_for_ssrf(endpoint, HTTP_ENDPOINT_SCHEMES).map_err(|msg| {
+        TTSError::InvalidConfiguration(format!("{source} rejected (SSRF protection): {msg}"))
+    })
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -524,6 +638,105 @@ impl NaverClovaTtsConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone: the standardized features reach CLOVA's integer prosody deltas
+    // (speed/pitch/volume in -5..=5), plus custom_endpoint via the open extras passthrough.
+    #[test]
+    fn from_standard_maps_prosody_and_extras() {
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig, TtsFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert(
+            CUSTOM_ENDPOINT_EXTRA_KEY.into(),
+            serde_json::json!("https://enterprise.example.com/tts"),
+        );
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "naver-clova".into(),
+                api_key: "client_id|client_secret".into(),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(4.0), // max multiplier -> +5
+                pitch: Some(3.0),
+                volume: Some(-2.0),
+                ssml: Some(true), // capability gap: CLOVA has no SSML, must be ignored
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+        };
+        let cfg = NaverClovaTtsConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.speed, 5); // 4.0x -> +5
+        assert_eq!(cfg.pitch, 3);
+        assert_eq!(cfg.volume, -2);
+        assert_eq!(
+            cfg.custom_endpoint,
+            Some("https://enterprise.example.com/tts".to_string())
+        ); // extras passthrough
+    }
+
+    #[test]
+    fn custom_endpoint_extra_is_ssrf_checked() {
+        let _env = crate::core::net::ssrf_env_lock();
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig};
+
+        fn mk(endpoint: &str) -> StandardTTSConfig {
+            let mut extras = serde_json::Map::new();
+            extras.insert(
+                CUSTOM_ENDPOINT_EXTRA_KEY.into(),
+                serde_json::json!(endpoint),
+            );
+            StandardTTSConfig {
+                base: TTSConfig {
+                    provider: "naver-clova".into(),
+                    api_key: "client_id|client_secret".into(),
+                    ..Default::default()
+                },
+                features: Default::default(),
+                extras: ProviderExtras(extras),
+            }
+        }
+
+        assert!(
+            NaverClovaTtsConfig::from_standard(&mk("https://enterprise.example.com/tts")).is_ok()
+        );
+
+        let err = NaverClovaTtsConfig::from_standard(&mk("http://127.0.0.1:9000/tts"))
+            .expect_err("loopback custom_endpoint must be rejected");
+        assert!(err.to_string().contains("SSRF protection"), "{err}");
+
+        let err = NaverClovaTtsConfig::from_standard(&mk("file:///tmp/socket"))
+            .expect_err("non-HTTP custom_endpoint must be rejected");
+        assert!(err.to_string().contains("not allowed"), "{err}");
+    }
+
+    #[test]
+    fn endpoint_override_is_ssrf_checked() {
+        let _env = crate::core::net::ssrf_env_lock();
+        use crate::core::tts::standard::{ProviderExtras, StandardTTSConfig};
+
+        let mk = |endpoint: &str| {
+            StandardTTSConfig {
+                base: TTSConfig {
+                    provider: "naver-clova".into(),
+                    api_key: "client_id|client_secret".into(),
+                    ..Default::default()
+                },
+                features: Default::default(),
+                extras: ProviderExtras::default(),
+            }
+            .with_endpoint_override(endpoint)
+        };
+
+        assert!(NaverClovaTtsConfig::from_standard(&mk("https://enterprise.example.com")).is_ok());
+
+        let err = NaverClovaTtsConfig::from_standard(&mk("http://127.0.0.1:9000"))
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.to_string().contains("SSRF protection"), "{err}");
+
+        let err = NaverClovaTtsConfig::from_standard(&mk("file:///tmp/socket"))
+            .expect_err("non-HTTP endpoint_override must be rejected");
+        assert!(err.to_string().contains("not allowed"), "{err}");
+    }
 
     #[test]
     fn test_voice_speaker_id() {

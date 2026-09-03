@@ -90,6 +90,20 @@ fn build_recording_filepath(prefix: &str, auth_id: Option<&str>, stream_id: &str
 ///
 /// This struct provides methods to create LiveKit rooms and generate JWT tokens
 /// for participants with different permission levels.
+/// TTL for END-USER LiveKit tokens (browser participants). Short: a captured token expires
+/// within the hour instead of the SDK's ~6 h default; the SDK reconnect path re-requests a
+/// fresh token via `POST /livekit/token`.
+pub const USER_TOKEN_TTL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// TTL for AGENT/SERVER LiveKit tokens (the gateway's own participant + SIP admin). Longer
+/// than the user TTL (a server-side call may legitimately run for hours) but still bounded.
+pub const AGENT_TOKEN_TTL: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+
+/// Default participant capacity for a conversation room created by the WS flow: caller +
+/// the WaaV agent + one SIP/observer leg. Callers needing more pass an explicit capacity
+/// via [`LiveKitRoomHandler::create_room_with_capacity`].
+pub const DEFAULT_ROOM_MAX_PARTICIPANTS: u32 = 3;
+
 pub struct LiveKitRoomHandler {
     /// LiveKit server URL (e.g., "http://localhost:7880")
     url: String,
@@ -157,28 +171,28 @@ impl LiveKitRoomHandler {
     /// # Returns
     /// * `VideoGrants` - Configured video grants with permissions
     ///
-    /// Permissions granted:
-    /// - room_join: Join the room
-    /// - room_admin: Admin privileges (if requested)
-    /// - room_record: Record the room
-    /// - room_list: List rooms
-    /// - can_publish: Publish audio/video tracks
-    /// - can_subscribe: Subscribe to other participants' tracks
-    /// - can_publish_data: Send data messages
-    /// - can_update_own_metadata: Update own participant metadata
-    /// - room_create: Create new rooms
+    /// Permissions granted (LEAST-PRIVILEGE split — S2.5):
+    ///
+    /// Every token gets the in-room media set: `room_join`, `can_publish`, `can_subscribe`,
+    /// `can_publish_data`, `can_update_own_metadata`.
+    ///
+    /// The CROSS-ROOM administrative grants — `room_record`, `room_list`, `room_create`, plus
+    /// `room_admin` — are issued ONLY to agent/server tokens (`room_admin = true`). They were
+    /// previously granted to every end-user token from the public `POST /livekit/token` path,
+    /// so a leaked browser token could enumerate, create, and record arbitrary rooms across
+    /// tenants. A user token is now scoped to exactly its one room's media.
     fn token_permissions(&self, room_name: &str, room_admin: bool) -> VideoGrants {
         VideoGrants {
             room: room_name.to_string(),
             room_join: true,
             room_admin,
-            room_record: true,
-            room_list: true,
+            room_record: room_admin,
+            room_list: room_admin,
             can_publish: true,
             can_subscribe: true,
             can_publish_data: true,
             can_update_own_metadata: true,
-            room_create: true,
+            room_create: room_admin,
             ..Default::default()
         }
     }
@@ -219,6 +233,7 @@ impl LiveKitRoomHandler {
             .with_identity(identity)
             .with_name(name)
             .with_grants(self.token_permissions(room_name, false))
+            .with_ttl(USER_TOKEN_TTL)
             .to_jwt()
             .map_err(|e| {
                 LiveKitError::ConnectionFailed(format!("Failed to generate user token: {e}"))
@@ -263,6 +278,7 @@ impl LiveKitRoomHandler {
             .with_identity(identity)
             .with_name(name)
             .with_grants(self.token_permissions(room_name, true))
+            .with_ttl(AGENT_TOKEN_TTL)
             .to_jwt()
             .map_err(|e| {
                 LiveKitError::ConnectionFailed(format!("Failed to generate agent token: {e}"))
@@ -286,6 +302,7 @@ impl LiveKitRoomHandler {
             .with_identity(identity)
             .with_name(name)
             .with_grants(self.token_permissions(room_name, true))
+            .with_ttl(AGENT_TOKEN_TTL)
             .with_sip_grants(SIPGrants {
                 admin: true,
                 ..Default::default()
@@ -325,8 +342,21 @@ impl LiveKitRoomHandler {
     /// # }
     /// ```
     pub async fn create_room(&self, room_name: &str) -> Result<(), LiveKitError> {
+        self.create_room_with_capacity(room_name, DEFAULT_ROOM_MAX_PARTICIPANTS)
+            .await
+    }
+
+    /// Create a room with an explicit participant capacity (0 = LiveKit unlimited). The
+    /// no-argument [`create_room`](Self::create_room) uses [`DEFAULT_ROOM_MAX_PARTICIPANTS`];
+    /// callers with a configured capacity (e.g. multi-listener conversations) pass it here —
+    /// the previous hard-coded `3` silently dropped extra participants under multi-party load.
+    pub async fn create_room_with_capacity(
+        &self,
+        room_name: &str,
+        max_participants: u32,
+    ) -> Result<(), LiveKitError> {
         let options = CreateRoomOptions {
-            max_participants: 3,
+            max_participants,
             ..Default::default()
         };
 
@@ -760,6 +790,11 @@ mod tests {
         assert!(!grants.room_admin);
         assert!(grants.can_publish);
         assert!(grants.can_subscribe);
+        // Least-privilege (S2.5): a USER token must carry NO cross-room administrative grants —
+        // a leaked browser token must not be able to enumerate/create/record rooms.
+        assert!(!grants.room_record, "user token must not grant room_record");
+        assert!(!grants.room_list, "user token must not grant room_list");
+        assert!(!grants.room_create, "user token must not grant room_create");
     }
 
     #[test]
@@ -778,6 +813,10 @@ mod tests {
         assert!(grants.room_admin);
         assert!(grants.can_publish);
         assert!(grants.can_subscribe);
+        // The agent/server token keeps the elevated set (it drives recording/room lifecycle).
+        assert!(grants.room_record);
+        assert!(grants.room_list);
+        assert!(grants.room_create);
     }
 
     #[test]

@@ -7,15 +7,31 @@
  * Detects when a speaker has finished speaking.
  */
 export interface TurnDetectionConfig {
-  /** Enable turn detection */
+  /** Enable turn detection (gateway `enabled`, required when this block is sent). */
   enabled: boolean;
-  /** Detection threshold (0.0-1.0) */
+  /** Detection threshold (0.0-1.0) (gateway `threshold`). */
   threshold?: number;
-  /** Silence duration in ms to trigger turn end */
+  /**
+   * Eager end-of-turn: let the gateway start the LLM speculatively on a
+   * turn-complete prediction (gateway `eager`, default false). Pairs with
+   * `conversation_config.eager_eot` (the gateway requires both for eager EoT).
+   */
+  eager?: boolean;
+  /**
+   * Silence duration in ms to trigger turn end.
+   * @remarks Client-side VAD hint only — NOT a `TurnDetectionWsConfig` wire
+   * field; not serialized into `stt_config.turn_detection`.
+   */
   silenceMs?: number;
-  /** Padding before speech in ms */
+  /**
+   * Padding before speech in ms.
+   * @remarks Client-side VAD hint only — NOT serialized to the wire.
+   */
   prefixPaddingMs?: number;
-  /** Delay before creating response in ms */
+  /**
+   * Delay before creating response in ms.
+   * @remarks Client-side VAD hint only — NOT serialized to the wire.
+   */
   createResponseMs?: number;
 }
 

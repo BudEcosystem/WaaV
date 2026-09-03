@@ -79,3 +79,6 @@ warn_unused_configs = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "e2e: live end-to-end tests against a running gateway (skip with -k 'not e2e')",
+]

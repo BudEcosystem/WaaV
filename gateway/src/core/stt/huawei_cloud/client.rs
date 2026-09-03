@@ -39,6 +39,7 @@
 //! 3. Include X-Auth-Token header in WebSocket handshake
 
 use bytes::Bytes;
+use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -46,9 +47,10 @@ use std::time::Duration;
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use tokio::time::timeout;
 use tokio_tungstenite::{
-    connect_async_with_config,
-    tungstenite::{http::Request, protocol::Message},
+    MaybeTlsStream, WebSocketStream, connect_async_with_config,
+    tungstenite::{client::IntoClientRequest, protocol::Message},
 };
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use super::auth::HuaweiTokenManager;
@@ -57,8 +59,14 @@ use super::messages::{
     HuaweiEndFrame, HuaweiRealtimeResponse, HuaweiShortAsrRequest, HuaweiShortAsrResponse,
     HuaweiStartFrame,
 };
+use crate::core::resilience::connect::{WS_CONNECT_TIMEOUT, with_timeout};
 use crate::core::stt::base::{
     BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback,
+};
+use crate::core::websocket::ReconnectionConfig;
+use crate::core::websocket::reconnectable_stream::{
+    ReconnectOutcome, ReconnectableStream, ReconnectableStreamConfig, RestoreError, StreamError,
+    WsTransport,
 };
 
 // =============================================================================
@@ -68,11 +76,18 @@ use crate::core::stt::base::{
 /// Provider information string.
 const PROVIDER_INFO: &str = "Huawei Cloud Speech (华为云语音)";
 
-/// WebSocket connection timeout.
-const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Per-message idle timeout for WebSocket message reception. Resets after each successful
+/// message; catches stuck/dead connections so the supervisor can reconnect.
+const WS_MESSAGE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// HTTP request timeout for REST API.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn huawei_stt_http_client() -> Result<reqwest::Client, reqwest::Error> {
+    crate::core::net::ssrf_protected_client_builder(crate::core::net::HTTP_URL_SCHEMES)
+        .timeout(HTTP_TIMEOUT)
+        .build()
+}
 
 /// Channel buffer size for audio frames.
 const AUDIO_CHANNEL_BUFFER: usize = 64;
@@ -100,6 +115,150 @@ type AsyncErrorCallback = Box<
         + Send
         + Sync,
 >;
+
+/// The concrete WebSocket stream type Huawei dials.
+type HuaweiWs = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+
+// =============================================================================
+// Reconnect transport (W-D1 fleet adoption)
+// =============================================================================
+
+/// A [`WsTransport`] that adapts Huawei Cloud RASR's event loop to the generic
+/// [`ReconnectableStream`] supervisor. One is built per (re)connect by the supervisor's `connect`
+/// closure. Only the WebSocket modes (Streaming/Continuous) flow through here; the ShortSentence
+/// REST mode has no persistent stream and is unaffected.
+///
+/// Like Azure (config carried in a **post-handshake message**, not the URL), Huawei opens its
+/// featured session with a `START` command (model, audio format, word-info, punctuation, …) sent
+/// after the handshake. So [`restore_session`](WsTransport::restore_session) re-sends that command
+/// on the fresh socket — without it a reconnect would resume as a *bare* session. [`run`](WsTransport::run)
+/// replaces the original split send/recv tasks with a single `select!` loop that returns a
+/// [`ReconnectOutcome`] so a mid-stream transport drop reconnects instead of silently ending the
+/// session.
+struct HuaweiTransport {
+    ws_sink: SplitSink<HuaweiWs, Message>,
+    ws_stream: SplitStream<HuaweiWs>,
+    /// Shared inbound audio receiver (single-consumer; locked for the duration of `run`).
+    audio_rx: Arc<Mutex<mpsc::Receiver<Bytes>>>,
+    /// Shared shutdown token (an intentional close must not reconnect).
+    shutdown_token: CancellationToken,
+    result_tx: mpsc::Sender<STTResult>,
+    error_tx: mpsc::Sender<STTError>,
+    /// Fires once after the featured session is (re)established, unblocking `connect`.
+    connected_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    /// Shared session-ready flag (set on the `STARTED` response, cleared on `ENDED`). Reset on
+    /// every restore so a reconnect re-waits for the fresh session's `STARTED`.
+    session_ready: Arc<AtomicBool>,
+    /// The pre-serialized `START` command JSON, re-sent on every restore so reconnects keep the
+    /// featured session (model, format, word-info, punctuation, digit-norm, vocabulary).
+    start_frame_json: String,
+}
+
+impl HuaweiTransport {
+    async fn shutdown_gracefully(ws_sink: &mut SplitSink<HuaweiWs, Message>) -> ReconnectOutcome {
+        if let Ok(end_json) = HuaweiEndFrame::new().to_json() {
+            let _ = ws_sink.send(Message::Text(end_json.into())).await;
+        }
+        ReconnectOutcome::Completed
+    }
+}
+
+#[async_trait::async_trait]
+impl WsTransport for HuaweiTransport {
+    async fn restore_session(&mut self) -> Result<(), RestoreError> {
+        // A reconnect starts a fresh recognition turn: clear session-ready until this socket's
+        // `STARTED` arrives.
+        self.session_ready.store(false, Ordering::SeqCst);
+
+        // Re-send the featured `START` command on this fresh socket. A reconnect must NOT resume
+        // as a bare session.
+        self.ws_sink
+            .send(Message::Text(self.start_frame_json.clone().into()))
+            .await
+            .map_err(|e| RestoreError::new(format!("failed to send Huawei START frame: {e}")))?;
+
+        // The featured session is established on the wire: signal the waiting connect() exactly
+        // once (the `STARTED` confirmation then flips `session_ready`).
+        if let Some(tx) = self.connected_tx.lock().await.take() {
+            let _ = tx.send(());
+        }
+        Ok(())
+    }
+
+    async fn run(&mut self) -> ReconnectOutcome {
+        let shutdown_token = self.shutdown_token.clone();
+        if shutdown_token.is_cancelled() {
+            debug!("Received shutdown signal for Huawei Cloud STT");
+            return Self::shutdown_gracefully(&mut self.ws_sink).await;
+        }
+        let mut audio_rx = self.audio_rx.lock().await;
+        loop {
+            tokio::select! {
+                // Handle outgoing audio data (raw binary frames)
+                Some(audio) = audio_rx.recv() => {
+                    if let Err(e) = self.ws_sink.send(Message::Binary(audio.to_vec().into())).await {
+                        let stt_error = STTError::NetworkError(format!(
+                            "Failed to send audio to Huawei Cloud: {e}"
+                        ));
+                        error!("{}", stt_error);
+                        let _ = self.error_tx.try_send(stt_error);
+                        return ReconnectOutcome::Reconnectable(StreamError::new("audio send failed"));
+                    }
+                }
+
+                // Handle incoming messages with idle timeout
+                message = timeout(WS_MESSAGE_TIMEOUT, self.ws_stream.next()) => {
+                    match message {
+                        Ok(Some(Ok(Message::Text(text)))) => {
+                            HuaweiCloudStt::handle_realtime_response(
+                                &text,
+                                &self.result_tx,
+                                &self.error_tx,
+                                &self.session_ready,
+                            );
+                        }
+                        Ok(Some(Ok(Message::Close(_)))) => {
+                            // The provider signalled end-of-session — an intentional completion,
+                            // NOT a transport drop.
+                            debug!("Huawei Cloud WebSocket closed by server");
+                            return ReconnectOutcome::Completed;
+                        }
+                        Ok(Some(Ok(Message::Ping(_)))) => {
+                            debug!("Received ping from Huawei Cloud");
+                        }
+                        Ok(Some(Ok(_))) => {
+                            // Binary/Pong/Frame — ignore.
+                        }
+                        Ok(Some(Err(e))) => {
+                            let stt_error = STTError::ConnectionFailed(e.to_string());
+                            error!("Huawei Cloud WebSocket error: {}", stt_error);
+                            let _ = self.error_tx.try_send(stt_error);
+                            return ReconnectOutcome::Reconnectable(StreamError::new("websocket error"));
+                        }
+                        Ok(None) => {
+                            info!("Huawei Cloud WebSocket stream ended");
+                            return ReconnectOutcome::Reconnectable(StreamError::new("stream ended"));
+                        }
+                        Err(_elapsed) => {
+                            let stt_error = STTError::NetworkError(
+                                "Huawei Cloud WebSocket idle timeout - no message for 60 seconds".into()
+                            );
+                            error!("{}", stt_error);
+                            let _ = self.error_tx.try_send(stt_error);
+                            return ReconnectOutcome::Reconnectable(StreamError::new("idle timeout"));
+                        }
+                    }
+                }
+
+                // Handle shutdown signal (intentional close — must NOT reconnect)
+                _ = shutdown_token.cancelled() => {
+                    debug!("Received shutdown signal for Huawei Cloud STT");
+                    return Self::shutdown_gracefully(&mut self.ws_sink).await;
+                }
+            }
+        }
+    }
+}
 
 // =============================================================================
 // Huawei Cloud STT Client
@@ -143,14 +302,19 @@ pub struct HuaweiCloudStt {
     /// Connection state.
     connected: Arc<AtomicBool>,
 
+    /// Intentional-disconnect flag shared with the reconnect supervisor (W-D1). Cleared on
+    /// `connect()`, set in `disconnect()` before cancelling the shutdown token, so a client close
+    /// racing a server-side close can never trigger a spurious reconnect.
+    intentional_disconnect: Arc<AtomicBool>,
+
     /// State change notification.
     state_notify: Arc<Notify>,
 
     /// WebSocket sender for audio data.
     ws_sender: Option<mpsc::Sender<Bytes>>,
 
-    /// Shutdown signal sender.
-    shutdown_tx: Option<oneshot::Sender<()>>,
+    /// Shutdown token shared with supervised transports.
+    shutdown_token: Option<CancellationToken>,
 
     /// Connection task handle.
     connection_handle: Option<tokio::task::JoinHandle<()>>,
@@ -175,53 +339,97 @@ pub struct HuaweiCloudStt {
 
     /// Session ready flag.
     session_ready: Arc<AtomicBool>,
+
+    /// Shared, process-global resilience handles (W-D2): the single reconnect governor + this
+    /// provider's shared circuit breaker, injected by the VoiceManager from CoreState and driven
+    /// by the generic [`ReconnectableStream`] supervisor. `None` before `set_resilience` (a direct
+    /// unit-test construction) → the supervisor uses its own per-session governor/breaker default.
+    resilience: Option<crate::core::resilience::ResilienceHandles>,
 }
 
 impl HuaweiCloudStt {
-    /// Create a new Huawei Cloud STT client.
-    pub fn new(config: STTConfig) -> Result<Self, STTError> {
-        let huawei_config = HuaweiCloudSttConfig::from_base(config.clone())?;
+    /// W1 keystone — construct directly from the standardized config so Huawei's mappable
+    /// recognition knobs (word-level timing `need_word_info`, smart formatting `add_punctuation`)
+    /// are honored END-TO-END. Mirrors `DeepgramSTT::new_standard`: the provider config is built
+    /// from `HuaweiCloudSttConfig::from_standard` (which parses+validates the pipe-separated
+    /// credential in `api_key`); features Huawei can't express stay at default.
+    pub fn new_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        let huawei_config = HuaweiCloudSttConfig::from_standard(std)?;
         huawei_config.validate()?;
+        let http_client = huawei_stt_http_client().map_err(|e| {
+            STTError::ConfigurationError(format!("Failed to create HTTP client: {e}"))
+        })?;
 
         Ok(Self {
-            base_config: config,
+            base_config: std.base.clone(),
             config: huawei_config,
-            token_manager: Arc::new(HuaweiTokenManager::new()),
+            token_manager: Arc::new(HuaweiTokenManager::with_client(http_client.clone())),
             connected: Arc::new(AtomicBool::new(false)),
+            intentional_disconnect: Arc::new(AtomicBool::new(false)),
             state_notify: Arc::new(Notify::new()),
             ws_sender: None,
-            shutdown_tx: None,
+            shutdown_token: None,
             connection_handle: None,
             result_forward_handle: None,
             error_forward_handle: None,
             result_callback: Arc::new(Mutex::new(None)),
             error_callback: Arc::new(Mutex::new(None)),
-            http_client: reqwest::Client::builder()
-                .timeout(HTTP_TIMEOUT)
-                .build()
-                .unwrap_or_default(),
+            http_client,
             audio_buffer: Arc::new(Mutex::new(Vec::new())),
             session_ready: Arc::new(AtomicBool::new(false)),
+            resilience: None,
+        })
+    }
+
+    /// Create a new Huawei Cloud STT client.
+    pub fn new(config: STTConfig) -> Result<Self, STTError> {
+        let huawei_config = HuaweiCloudSttConfig::from_base(config.clone())?;
+        huawei_config.validate()?;
+        let http_client = huawei_stt_http_client().map_err(|e| {
+            STTError::ConfigurationError(format!("Failed to create HTTP client: {e}"))
+        })?;
+
+        Ok(Self {
+            base_config: config,
+            config: huawei_config,
+            token_manager: Arc::new(HuaweiTokenManager::with_client(http_client.clone())),
+            connected: Arc::new(AtomicBool::new(false)),
+            intentional_disconnect: Arc::new(AtomicBool::new(false)),
+            state_notify: Arc::new(Notify::new()),
+            ws_sender: None,
+            shutdown_token: None,
+            connection_handle: None,
+            result_forward_handle: None,
+            error_forward_handle: None,
+            result_callback: Arc::new(Mutex::new(None)),
+            error_callback: Arc::new(Mutex::new(None)),
+            http_client,
+            audio_buffer: Arc::new(Mutex::new(Vec::new())),
+            session_ready: Arc::new(AtomicBool::new(false)),
+            resilience: None,
         })
     }
 
     /// Get the IAM token, fetching if necessary.
+    ///
+    /// Passes `endpoint_override` so the credential-free mock harness can redirect the IAM token
+    /// POST (scheme+host) to a localhost mock; `None` in production hits the real IAM endpoint.
     async fn get_token(&self) -> Result<String, STTError> {
         self.token_manager
-            .get_token(
+            .get_token_with_override(
                 &self.config.username,
                 &self.config.password,
                 &self.config.domain_name,
                 self.config.region,
+                self.config.endpoint_override.as_deref(),
             )
             .await
     }
 
     /// Connect using WebSocket real-time mode.
     async fn connect_realtime(&mut self) -> Result<(), STTError> {
-        // Get IAM token first
-        let token = self.get_token().await?;
-
         // Get WebSocket URL
         let url = self.config.get_realtime_url().ok_or_else(|| {
             STTError::ConfigurationError("WebSocket URL not available for this mode".to_string())
@@ -229,150 +437,161 @@ impl HuaweiCloudStt {
 
         info!("Connecting to Huawei Cloud RASR: {}", url);
 
-        // Build WebSocket request with auth header
-        let request = Request::builder()
-            .uri(&url)
-            .header("X-Auth-Token", &token)
-            .header("Host", self.config.region.sis_endpoint())
-            .header("Upgrade", "websocket")
-            .header("Connection", "Upgrade")
-            .header("Sec-WebSocket-Key", generate_ws_key())
-            .header("Sec-WebSocket-Version", "13")
-            .body(())
-            .map_err(|e| STTError::ConnectionFailed(format!("Failed to build request: {}", e)))?;
-
-        // Connect with timeout
-        let (ws_stream, _) = match timeout(
-            WS_CONNECT_TIMEOUT,
-            connect_async_with_config(request, None, false),
-        )
-        .await
-        {
-            Ok(Ok(result)) => result,
-            Ok(Err(e)) => {
-                return Err(STTError::ConnectionFailed(format!(
-                    "WebSocket connection failed: {}",
-                    e
-                )));
-            }
-            Err(_) => {
-                return Err(STTError::ConnectionFailed("Connection timeout".to_string()));
-            }
-        };
-
-        info!("Connected to Huawei Cloud RASR");
-
-        // Split stream
-        let (mut write, mut read) = ws_stream.split();
+        // Validate the IAM token can be obtained up-front so `connect()` fails fast on bad
+        // credentials (the supervisor's connect closure re-fetches per attempt, which is cheap
+        // since the token manager caches — and a reconnect after token expiry re-fetches).
+        let _ = self.get_token().await?;
 
         // Create channels
-        let (audio_tx, mut audio_rx) = mpsc::channel::<Bytes>(AUDIO_CHANNEL_BUFFER);
+        let (audio_tx, audio_rx) = mpsc::channel::<Bytes>(AUDIO_CHANNEL_BUFFER);
         let (result_tx, mut result_rx) = mpsc::channel::<STTResult>(RESULT_CHANNEL_BUFFER);
         let (error_tx, mut error_rx) = mpsc::channel::<STTError>(ERROR_CHANNEL_BUFFER);
-        let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+        let shutdown_token = CancellationToken::new();
+        let (connected_tx, connected_rx) = oneshot::channel::<()>();
 
         self.ws_sender = Some(audio_tx);
-        self.shutdown_tx = Some(shutdown_tx);
+        self.shutdown_token = Some(shutdown_token.clone());
 
-        // Send START frame
-        let start_frame = HuaweiStartFrame::new(
-            self.config.audio_format.as_str(),
-            self.config.model.as_str(),
-            self.config.add_punctuation,
-            self.config.digit_norm,
-            self.config.vocabulary_id.as_deref(),
-            self.config.need_word_info,
-        );
-
-        let start_json = start_frame.to_json().map_err(|e| {
+        // Build the featured `START` command once (re-sent verbatim on every restore by the
+        // supervised transport). A reconnect must restore the featured session, not a bare one.
+        let start_frame = HuaweiStartFrame::from_config(&self.config);
+        let start_frame_json = start_frame.to_json().map_err(|e| {
             STTError::ConnectionFailed(format!("Failed to serialize START frame: {}", e))
         })?;
 
-        write
-            .send(Message::Text(start_json.into()))
-            .await
-            .map_err(|e| {
-                STTError::ConnectionFailed(format!("Failed to send START frame: {}", e))
-            })?;
+        // Shared state the supervised transport re-uses across reconnect attempts.
+        let audio_rx = Arc::new(Mutex::new(audio_rx));
+        let connected_tx = Arc::new(Mutex::new(Some(connected_tx)));
 
-        debug!("Sent Huawei Cloud START frame");
+        // Per-attempt dial inputs (the IAM token is re-fetched inside the closure so a reconnect
+        // after a 24h token expiry transparently re-authenticates).
+        let token_manager = self.token_manager.clone();
+        let username = self.config.username.clone();
+        let password = self.config.password.clone();
+        let domain_name = self.config.domain_name.clone();
+        let region = self.config.region;
+        let host = self.config.region.sis_endpoint();
+        let iam_override = self.config.endpoint_override.clone();
+        let session_ready = self.session_ready.clone();
 
-        // Set connected state
+        // Storm control + provider breaker: drive the GENERIC ReconnectableStream supervisor with
+        // the shared process-global handles from CoreState (W-D1/W-D2 fleet adoption). When no
+        // handles were injected (a direct unit-test construction), the supervisor uses its own
+        // per-session governor/breaker default.
+        let reconnection = ReconnectionConfig::aggressive();
+        let disconnect_flag = Arc::clone(&self.intentional_disconnect);
+        let supervisor = match self.resilience.clone() {
+            Some(r) => ReconnectableStream::with_breaker_and_governor(
+                ReconnectableStreamConfig::new("huawei_cloud", reconnection),
+                r.breaker,
+                (*r.governor).clone(),
+            ),
+            None => ReconnectableStream::new(ReconnectableStreamConfig::new(
+                "huawei_cloud",
+                reconnection,
+            )),
+        }
+        .with_disconnect_flag(disconnect_flag);
+
+        // Set connected state (the BaseSTT contract: `connect()` returns once the session is
+        // accepted; the supervisor owns the durable reconnect loop from here on).
         self.connected.store(true, Ordering::SeqCst);
         self.state_notify.notify_waiters();
 
-        // Clone for tasks
-        let connected = self.connected.clone();
-        let state_notify = self.state_notify.clone();
-        let session_ready = self.session_ready.clone();
-        let result_tx_clone = result_tx.clone();
-        let error_tx_clone = error_tx.clone();
-
-        // Spawn connection handler task
+        // Start the connection task: the supervisor owns the outer reconnect loop; the `connect`
+        // closure re-fetches the IAM token, dials with the `X-Auth-Token` header, and hands back a
+        // transport whose `restore_session` re-sends the `START` command and whose `run()` is the
+        // Huawei event loop.
         let connection_handle = tokio::spawn(async move {
-            let send_task = tokio::spawn(async move {
-                while let Some(audio) = audio_rx.recv().await {
-                    // Send binary audio data
-                    if write
-                        .send(Message::Binary(audio.to_vec().into()))
+            let exit = supervisor
+                .run(|| {
+                    let url = url.clone();
+                    let host = host.clone();
+                    let token_manager = token_manager.clone();
+                    let username = username.clone();
+                    let password = password.clone();
+                    let domain_name = domain_name.clone();
+                    let iam_override = iam_override.clone();
+                    let start_frame_json = start_frame_json.clone();
+                    let audio_rx = Arc::clone(&audio_rx);
+                    let shutdown_token = shutdown_token.clone();
+                    let connected_tx = Arc::clone(&connected_tx);
+                    let session_ready = Arc::clone(&session_ready);
+                    let result_tx = result_tx.clone();
+                    let error_tx = error_tx.clone();
+                    async move {
+                        // Re-fetch the IAM token (cached; re-authenticates on expiry). Passes
+                        // `endpoint_override` so a reconnect's token POST honors the mock redirect.
+                        let token = token_manager
+                            .get_token_with_override(
+                                &username,
+                                &password,
+                                &domain_name,
+                                region,
+                                iam_override.as_deref(),
+                            )
+                            .await
+                            .map_err(|e| StreamError::new(format!("IAM token error: {e}")))?;
+
+                        // Build the upgrade request via `into_client_request` (repo convention):
+                        // it derives the 5 mandatory WS handshake headers (`Host`, `Connection`,
+                        // `Upgrade`, `Sec-WebSocket-Version`, `Sec-WebSocket-Key`) from the dial
+                        // URL; only Huawei's `X-Auth-Token` rides on top. The explicit `Host` is
+                        // then pinned to the regional SIS endpoint: identical to the URL-derived
+                        // value in production, and it preserves the historical behavior of keeping
+                        // the production Host when an `endpoint_override` redirects the dial to a
+                        // local mock.
+                        let mut request = url.as_str().into_client_request().map_err(|e| {
+                            StreamError::new(format!("Failed to build request: {e}"))
+                        })?;
+                        let headers = request.headers_mut();
+                        headers.insert(
+                            "X-Auth-Token",
+                            token.parse().map_err(|e| {
+                                StreamError::new(format!("Failed to build request: {e}"))
+                            })?,
+                        );
+                        headers.insert(
+                            "Host",
+                            host.parse().map_err(|e| {
+                                StreamError::new(format!("Failed to build request: {e}"))
+                            })?,
+                        );
+
+                        // Deadline-bounded dial via the shared resilience helper (canonical 15s).
+                        let (ws_stream, _) = match with_timeout(
+                            WS_CONNECT_TIMEOUT,
+                            connect_async_with_config(request, None, false),
+                        )
                         .await
-                        .is_err()
-                    {
-                        break;
+                        {
+                            Ok(Ok(s)) => s,
+                            Ok(Err(e)) => {
+                                return Err(StreamError::new(format!(
+                                    "WebSocket connection failed: {e}"
+                                )));
+                            }
+                            Err(_) => {
+                                return Err(StreamError::new("Connection timeout".to_string()));
+                            }
+                        };
+                        info!("Connected to Huawei Cloud RASR");
+                        let (ws_sink, ws_stream) = ws_stream.split();
+                        Ok(HuaweiTransport {
+                            ws_sink,
+                            ws_stream,
+                            audio_rx,
+                            shutdown_token,
+                            result_tx,
+                            error_tx,
+                            connected_tx,
+                            session_ready,
+                            start_frame_json,
+                        })
                     }
-                }
-
-                // Send END frame
-                let end_frame = HuaweiEndFrame::new();
-                if let Ok(end_json) = end_frame.to_json() {
-                    let _ = write.send(Message::Text(end_json.into())).await;
-                }
-
-                write
-            });
-
-            let recv_task = tokio::spawn(async move {
-                while let Some(msg_result) = read.next().await {
-                    match msg_result {
-                        Ok(Message::Text(text)) => {
-                            Self::handle_realtime_response(
-                                &text,
-                                &result_tx_clone,
-                                &error_tx_clone,
-                                &session_ready,
-                            );
-                        }
-                        Ok(Message::Close(_)) => {
-                            debug!("Huawei Cloud WebSocket closed");
-                            break;
-                        }
-                        Ok(Message::Ping(_)) => {
-                            debug!("Received ping from Huawei Cloud");
-                        }
-                        Err(e) => {
-                            error!("Huawei Cloud WebSocket error: {}", e);
-                            let _ =
-                                error_tx_clone.try_send(STTError::ConnectionFailed(e.to_string()));
-                            break;
-                        }
-                        _ => {}
-                    }
-                }
-            });
-
-            // Wait for shutdown or completion
-            tokio::select! {
-                _ = &mut shutdown_rx => {
-                    debug!("Huawei Cloud shutdown signal received");
-                }
-                _ = recv_task => {
-                    debug!("Huawei Cloud receive task completed");
-                }
-            }
-
-            send_task.abort();
-            connected.store(false, Ordering::SeqCst);
-            state_notify.notify_waiters();
+                })
+                .await;
+            info!("Huawei Cloud WebSocket connection closed (supervisor exit: {exit:?})");
         });
 
         self.connection_handle = Some(connection_handle);
@@ -403,7 +622,20 @@ impl HuaweiCloudStt {
 
         self.error_forward_handle = Some(error_forward_handle);
 
-        Ok(())
+        // Wait for the featured session to be established (first restore) with a timeout.
+        match timeout(Duration::from_secs(15), connected_rx).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => {
+                self.connected.store(false, Ordering::SeqCst);
+                Err(STTError::ConnectionFailed(
+                    "Connection channel closed before confirmation".to_string(),
+                ))
+            }
+            Err(_) => {
+                self.connected.store(false, Ordering::SeqCst);
+                Err(STTError::ConnectionFailed("Connection timeout".to_string()))
+            }
+        }
     }
 
     /// Handle real-time WebSocket response.
@@ -571,6 +803,9 @@ impl BaseSTT for HuaweiCloudStt {
         if self.connected.load(Ordering::SeqCst) {
             return Ok(());
         }
+        // Fresh session: clear any intent left over from a prior disconnect so the supervisor
+        // does not immediately complete.
+        self.intentional_disconnect.store(false, Ordering::SeqCst);
 
         match self.config.mode {
             HuaweiCloudAsrMode::ShortSentence => {
@@ -589,32 +824,46 @@ impl BaseSTT for HuaweiCloudStt {
     }
 
     async fn disconnect(&mut self) -> Result<(), STTError> {
-        if !self.connected.load(Ordering::SeqCst) {
-            return Ok(());
-        }
+        // Record the intent BEFORE the connected-guard so the supervisor sees it even if the
+        // transport's run() just reported a reconnectable drop (the disconnect-vs-close race).
+        self.intentional_disconnect.store(true, Ordering::SeqCst);
 
-        info!("Disconnecting from Huawei Cloud STT...");
+        if self.connected.load(Ordering::SeqCst) {
+            info!("Disconnecting from Huawei Cloud STT...");
+        }
 
         // Drop audio sender to signal end
         self.ws_sender.take();
 
-        // Send shutdown signal
-        if let Some(tx) = self.shutdown_tx.take() {
-            let _ = tx.send(());
+        if let Some(shutdown_token) = self.shutdown_token.take() {
+            shutdown_token.cancel();
         }
 
         // Wait for connection task to complete
         if let Some(handle) = self.connection_handle.take() {
-            let _ = timeout(Duration::from_secs(5), handle).await;
+            crate::core::observability::await_task_shutdown(
+                "huawei-cloud-stt-connection",
+                handle,
+                Duration::from_secs(5),
+            )
+            .await;
         }
 
         // Abort forwarding tasks
         if let Some(handle) = self.result_forward_handle.take() {
-            handle.abort();
+            crate::core::observability::abort_and_await_task(
+                "huawei-cloud-stt-result-forwarder",
+                handle,
+            )
+            .await;
         }
 
         if let Some(handle) = self.error_forward_handle.take() {
-            handle.abort();
+            crate::core::observability::abort_and_await_task(
+                "huawei-cloud-stt-error-forwarder",
+                handle,
+            )
+            .await;
         }
 
         // Clear audio buffer
@@ -703,43 +952,14 @@ impl BaseSTT for HuaweiCloudStt {
     fn get_provider_info(&self) -> &'static str {
         PROVIDER_INFO
     }
-}
 
-// =============================================================================
-// Helper Functions
-// =============================================================================
-
-/// Generate a random WebSocket key for the Sec-WebSocket-Key header.
-fn generate_ws_key() -> String {
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    // Use timestamp and a counter for uniqueness
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-
-    let bytes: [u8; 16] = [
-        (timestamp >> 120) as u8,
-        (timestamp >> 112) as u8,
-        (timestamp >> 104) as u8,
-        (timestamp >> 96) as u8,
-        (timestamp >> 88) as u8,
-        (timestamp >> 80) as u8,
-        (timestamp >> 72) as u8,
-        (timestamp >> 64) as u8,
-        (timestamp >> 56) as u8,
-        (timestamp >> 48) as u8,
-        (timestamp >> 40) as u8,
-        (timestamp >> 32) as u8,
-        (timestamp >> 24) as u8,
-        (timestamp >> 16) as u8,
-        (timestamp >> 8) as u8,
-        timestamp as u8,
-    ];
-
-    STANDARD.encode(bytes)
+    fn set_resilience(&mut self, resilience: crate::core::resilience::ResilienceHandles) {
+        // Store the shared, process-global handles so `connect_realtime` drives the generic
+        // ReconnectableStream supervisor with them — every Huawei RASR session trips the same
+        // breaker and shares the one process-wide reconnect cap (W-D2). The ShortSentence REST
+        // mode has no persistent stream and is unaffected.
+        self.resilience = Some(resilience);
+    }
 }
 
 // =============================================================================
@@ -749,6 +969,7 @@ fn generate_ws_key() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::ErrorKind;
 
     fn create_test_config() -> STTConfig {
         STTConfig {
@@ -766,6 +987,58 @@ mod tests {
         let config = create_test_config();
         let result = HuaweiCloudStt::new(config);
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn huawei_cloud_stt_redirect_policy_rejects_private_hop() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) => {
+                if err.kind() == ErrorKind::PermissionDenied {
+                    eprintln!(
+                        "Skipping huawei_cloud_stt_redirect_policy_rejects_private_hop: {err}"
+                    );
+                    return;
+                }
+                panic!("Failed to bind redirect test server listener: {err}");
+            }
+        };
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 302 Found\r\n",
+                "Location: http://127.0.0.1:9/metadata\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n"
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+
+        let err = huawei_stt_http_client()
+            .unwrap()
+            .get(format!("http://{addr}/start"))
+            .send()
+            .await
+            .expect_err("private redirect target must be rejected");
+        let mut error_chain = err.to_string();
+        let mut source = std::error::Error::source(&err);
+        while let Some(error) = source {
+            error_chain.push_str(": ");
+            error_chain.push_str(&error.to_string());
+            source = error.source();
+        }
+        assert!(
+            error_chain.contains("redirect URL rejected"),
+            "unexpected redirect error: {error_chain}"
+        );
     }
 
     #[test]
@@ -851,6 +1124,22 @@ mod tests {
 
         let result = stt.disconnect().await;
         assert!(result.is_ok());
+    }
+
+    // W-D1: disconnect() must record intent on the supervisor-shared flag so a client close racing
+    // a server-side close can never trigger a spurious reconnect (the supervisor's loop-top guard
+    // observes this same `Arc<AtomicBool>`). Before this wiring the flag was the supervisor's own
+    // and disconnect() never set it.
+    #[tokio::test]
+    async fn disconnect_sets_intentional_flag_for_supervisor() {
+        let config = create_test_config();
+        let mut stt = HuaweiCloudStt::new(config).unwrap();
+        assert!(!stt.intentional_disconnect.load(Ordering::SeqCst));
+        stt.disconnect().await.unwrap();
+        assert!(
+            stt.intentional_disconnect.load(Ordering::SeqCst),
+            "disconnect() must set the supervisor-shared intentional-disconnect flag",
+        );
     }
 
     #[tokio::test]
@@ -983,20 +1272,6 @@ mod tests {
         HuaweiCloudStt::handle_realtime_response(json, &result_tx, &error_tx, &session_ready);
 
         assert!(!session_ready.load(Ordering::SeqCst));
-    }
-
-    #[test]
-    fn test_generate_ws_key() {
-        let key1 = generate_ws_key();
-        let key2 = generate_ws_key();
-
-        // Keys should be base64 encoded
-        assert!(!key1.is_empty());
-        assert!(!key2.is_empty());
-
-        // Keys should be unique (with high probability)
-        // Note: Rapid successive calls might generate same key in rare cases
-        // due to timestamp resolution, but this is acceptable for testing
     }
 
     #[test]

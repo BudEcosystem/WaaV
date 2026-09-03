@@ -32,6 +32,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// Default duration in seconds for the ring buffer (8 seconds for Smart Turn)
 pub const DEFAULT_BUFFER_DURATION_SECS: usize = 8;
 
+const MIN_BUFFER_CAPACITY_SAMPLES: usize = 1;
+/// Upper allocation bound: 60 seconds at 192 kHz mono, stored as f32 samples.
+const MAX_BUFFER_CAPACITY_SAMPLES: usize = 192_000 * 60;
+
 /// Pre-allocated ring buffer for storing audio samples.
 ///
 /// The buffer is designed for a single-producer, multiple-consumer pattern where:
@@ -102,7 +106,7 @@ impl AudioRingBuffer {
     ///
     /// A new `AudioRingBuffer` with the specified capacity.
     pub fn with_duration(sample_rate: u32, duration_secs: usize) -> Self {
-        let capacity = sample_rate as usize * duration_secs;
+        let capacity = capacity_for_duration(sample_rate, duration_secs);
 
         // Pre-allocate and zero-initialize the buffer
         let data = vec![0.0f32; capacity].into_boxed_slice();
@@ -146,6 +150,9 @@ impl AudioRingBuffer {
     /// Returns the duration of valid audio in the buffer in seconds.
     #[inline]
     pub fn duration_secs(&self) -> f32 {
+        if self.sample_rate == 0 {
+            return 0.0;
+        }
         self.len() as f32 / self.sample_rate as f32
     }
 
@@ -363,6 +370,13 @@ unsafe impl Send for AudioRingBuffer {}
 // Readers use atomic loads, single writer uses atomic stores
 unsafe impl Sync for AudioRingBuffer {}
 
+fn capacity_for_duration(sample_rate: u32, duration_secs: usize) -> usize {
+    (sample_rate as usize)
+        .checked_mul(duration_secs)
+        .unwrap_or(MAX_BUFFER_CAPACITY_SAMPLES)
+        .clamp(MIN_BUFFER_CAPACITY_SAMPLES, MAX_BUFFER_CAPACITY_SAMPLES)
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -395,6 +409,30 @@ mod tests {
         // 5 seconds * 48000 Hz = 240000 samples
         assert_eq!(buffer.capacity(), 240000);
         assert_eq!(buffer.sample_rate(), 48000);
+    }
+
+    #[test]
+    fn test_capacity_for_duration_never_returns_zero_or_overflows() {
+        assert_eq!(capacity_for_duration(0, 0), MIN_BUFFER_CAPACITY_SAMPLES);
+        assert_eq!(
+            capacity_for_duration(16_000, 0),
+            MIN_BUFFER_CAPACITY_SAMPLES
+        );
+        assert_eq!(
+            capacity_for_duration(u32::MAX, usize::MAX),
+            MAX_BUFFER_CAPACITY_SAMPLES
+        );
+    }
+
+    #[test]
+    fn test_zero_rate_or_duration_buffer_remains_usable() {
+        let buffer = AudioRingBuffer::with_duration(0, 0);
+
+        assert_eq!(buffer.capacity(), MIN_BUFFER_CAPACITY_SAMPLES);
+        assert_eq!(buffer.duration_secs(), 0.0);
+        assert_eq!(buffer.push(&[1.0, 2.0]), 2);
+        assert_eq!(buffer.len(), 1);
+        assert_eq!(buffer.get_all(), vec![2.0]);
     }
 
     #[test]

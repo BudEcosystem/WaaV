@@ -59,6 +59,18 @@ pub enum RecognitionStatus {
 }
 
 impl RecognitionStatus {
+    fn from_wire_status(s: &str) -> Self {
+        match s {
+            "Success" => Self::Success,
+            "NoMatch" => Self::NoMatch,
+            "InitialSilenceTimeout" => Self::InitialSilenceTimeout,
+            "BabbleTimeout" => Self::BabbleTimeout,
+            "Error" => Self::Error,
+            "EndOfDictation" => Self::EndOfDictation,
+            _ => Self::Unknown(s.to_string()),
+        }
+    }
+
     /// Check if this status represents a successful recognition.
     #[inline]
     pub fn is_success(&self) -> bool {
@@ -82,16 +94,7 @@ impl std::str::FromStr for RecognitionStatus {
     type Err = std::convert::Infallible;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let status = match s {
-            "Success" => Self::Success,
-            "NoMatch" => Self::NoMatch,
-            "InitialSilenceTimeout" => Self::InitialSilenceTimeout,
-            "BabbleTimeout" => Self::BabbleTimeout,
-            "Error" => Self::Error,
-            "EndOfDictation" => Self::EndOfDictation,
-            _ => Self::Unknown(s.to_string()),
-        };
-        Ok(status)
+        Ok(Self::from_wire_status(s))
     }
 }
 
@@ -101,7 +104,7 @@ impl<'de> Deserialize<'de> for RecognitionStatus {
         D: serde::Deserializer<'de>,
     {
         let s = String::deserialize(deserializer)?;
-        Ok(s.parse().unwrap())
+        Ok(Self::from_wire_status(&s))
     }
 }
 
@@ -674,6 +677,20 @@ mod tests {
         if let RecognitionStatus::Unknown(s) = status {
             assert_eq!(s, "SomeNewStatus");
         }
+    }
+
+    #[test]
+    fn test_recognition_status_deserialize_unknown() {
+        let json = r#"{
+            "RecognitionStatus": "SomeFutureStatus",
+            "Offset": 0,
+            "Duration": 0
+        }"#;
+        let phrase: SpeechPhrase = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            phrase.recognition_status,
+            RecognitionStatus::Unknown("SomeFutureStatus".to_string())
+        );
     }
 
     #[test]

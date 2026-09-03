@@ -37,18 +37,52 @@ impl Default for TinkoffTts {
 }
 
 impl TinkoffTts {
+    /// Build from the standardized TTS config (W1 keystone), mirroring `DeepgramTTS::from_standard`.
+    /// Delegates the feature mapping to the config-level [`TinkoffTtsConfig::from_standard`] (which
+    /// maps `speed`→`speaking_rate`, `pitch`→`pitch`, `volume`→`volume_gain_db`, `sample_rate`, and
+    /// the `connection_timeout_secs`/`request_timeout_secs` extras), then constructs the provider so
+    /// the mapped prosody is honored end-to-end through the dispatch path.
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
+        let tinkoff_config =
+            TinkoffTtsConfig::from_standard(std).map_err(TTSError::InvalidConfiguration)?;
+        tinkoff_config
+            .validate()
+            .map_err(TTSError::InvalidConfiguration)?;
+
+        Ok(Self {
+            config: Some(tinkoff_config),
+            state: ConnectionState::Disconnected,
+            state_notify: Arc::new(Notify::new()),
+            client: None,
+            audio_callback: Arc::new(RwLock::new(None)),
+        })
+    }
+
     /// Create synthesis request from text
     fn create_synthesis_request(&self, text: &str) -> Result<SynthesizeSpeechRequest, TTSError> {
         let config = self.config.as_ref().ok_or_else(|| {
             TTSError::InvalidConfiguration("No configuration available".to_string())
         })?;
 
-        Ok(SynthesizeSpeechRequest::new(
-            text,
-            config.voice.as_str(),
-            config.encoding,
-            config.sample_rate,
-        ))
+        // When `ssml` is set, populate the `SynthesisInput.ssml` oneof (proto field 2) instead of
+        // `.text` (proto field 1) so the VoiceKit `TextToSpeech` Synthesize / StreamingSynthesize
+        // RPCs interpret the input as SSML markup. Both RPCs take the same SynthesizeSpeechRequest.
+        let request = if config.ssml {
+            SynthesizeSpeechRequest::with_ssml(
+                text,
+                config.voice.as_str(),
+                config.encoding,
+                config.sample_rate,
+            )
+        } else {
+            SynthesizeSpeechRequest::new(
+                text,
+                config.voice.as_str(),
+                config.encoding,
+                config.sample_rate,
+            )
+        };
+        Ok(request)
     }
 
     /// Synthesize text using non-streaming API
@@ -321,6 +355,57 @@ mod tests {
         }
     }
 
+    // W1 keystone: the standardized dispatch path reaches the provider STRUCT's `from_standard`,
+    // building the real provider with mapped prosody. Tinkoff supports speed/pitch/volume/
+    // sample_rate, so this asserts those reach the provider's config.
+    #[test]
+    fn from_standard_builds_provider_with_mapped_prosody() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "tinkoff".into(),
+                api_key: "test-api-key|test-secret-key".into(),
+                voice_id: Some("alyona".into()),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                speed: Some(2.0),
+                pitch: Some(5.0),
+                volume: Some(-6.0),
+                sample_rate: Some(48000),
+                ssml: Some(true), // capability gap: ignored
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let tts = TinkoffTts::from_standard(&std).unwrap();
+        let cfg = tts.config.as_ref().unwrap();
+        assert_eq!(cfg.speaking_rate, 2.0);
+        assert_eq!(cfg.pitch, 5.0);
+        assert_eq!(cfg.volume_gain_db, -6.0);
+        assert_eq!(cfg.sample_rate, 48000);
+    }
+
+    #[test]
+    fn from_standard_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let std = crate::core::tts::standard::StandardTTSConfig::from_base(TTSConfig {
+            provider: "tinkoff".into(),
+            api_key: "test-api-key|test-secret-key".into(),
+            voice_id: Some("alyona".into()),
+            ..Default::default()
+        })
+        .with_endpoint_override("http://127.0.0.1:9000");
+
+        match TinkoffTts::from_standard(&std) {
+            Ok(_) => panic!("unsafe endpoint override should be rejected"),
+            Err(err) => assert!(
+                err.to_string().contains("SSRF protection"),
+                "unexpected error: {err}"
+            ),
+        }
+    }
+
     #[test]
     fn test_tinkoff_tts_new() {
         let config = create_test_config();
@@ -367,6 +452,64 @@ mod tests {
         let request = request.unwrap();
         let encoded = request.encode();
         assert!(!encoded.is_empty());
+    }
+
+    /// Extract the `input` submessage (outer field 1, tag `0x0a`) from an encoded
+    /// SynthesizeSpeechRequest so the test can inspect which `SynthesisInput` oneof was set.
+    fn extract_input_submessage(encoded: &[u8]) -> &[u8] {
+        assert_eq!(encoded[0], 0x0a, "outer field 1 (input) must be first");
+        let len = encoded[1] as usize; // small messages: single-byte varint length
+        &encoded[2..2 + len]
+    }
+
+    // WIRE-LEVEL: with `ssml` set, the synthesis input must reach the gRPC request as the
+    // `SynthesisInput.ssml` oneof (inner proto field 2, tag 0x12) — NOT the `.text` field
+    // (tag 0x0a). This asserts on the ENCODED protobuf bytes the RPC actually sends, guarding
+    // the "config set but never serialized to the wire" bug class.
+    #[test]
+    fn ssml_input_reaches_synthesis_input_ssml_oneof_on_the_wire() {
+        let mut config = create_test_config();
+        let mut tinkoff = TinkoffTtsConfig::from_base(config.clone()).unwrap();
+        tinkoff.ssml = true;
+        // Rebuild the provider with the ssml-enabled config.
+        let mut tts = TinkoffTts::new(config.clone()).unwrap();
+        tts.config = Some(tinkoff);
+        let _ = &mut config; // silence unused-mut on the clone scaffold
+
+        let markup = "<speak>Привет</speak>";
+        let request = tts.create_synthesis_request(markup).unwrap();
+        let encoded = request.encode();
+        let input = extract_input_submessage(&encoded);
+
+        // The input oneof must lead with the SSML tag (0x12), not the text tag (0x0a).
+        assert_eq!(
+            input[0], 0x12,
+            "ssml input must use SynthesisInput field 2 (ssml)"
+        );
+        // And the SSML markup bytes must be present in the wire body.
+        assert!(
+            encoded
+                .windows(markup.len())
+                .any(|w| w == markup.as_bytes()),
+            "SSML markup must reach the wire body"
+        );
+    }
+
+    // WIRE-LEVEL counterpart: with `ssml` unset (default), the input must stay on the `.text`
+    // oneof (inner proto field 1, tag 0x0a) so plain text keeps working unchanged.
+    #[test]
+    fn plain_text_input_uses_synthesis_input_text_oneof_on_the_wire() {
+        let config = create_test_config();
+        let tts = TinkoffTts::new(config).unwrap();
+
+        let request = tts.create_synthesis_request("Привет").unwrap();
+        let encoded = request.encode();
+        let input = extract_input_submessage(&encoded);
+
+        assert_eq!(
+            input[0], 0x0a,
+            "plain text must use SynthesisInput field 1 (text)"
+        );
     }
 
     #[tokio::test]

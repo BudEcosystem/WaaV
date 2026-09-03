@@ -62,6 +62,9 @@ pub enum PluginLoadError {
 
     #[error("Plugin manifest invalid: {0}")]
     ManifestInvalid(String),
+
+    #[error("Loaded plugin missing from registry after insert: {0}")]
+    LoadedPluginMissing(String),
 }
 
 impl From<LibraryError> for PluginLoadError {
@@ -278,7 +281,13 @@ impl DynamicPluginLoader {
             "Successfully loaded plugin"
         );
 
-        Ok(self.loaded_plugins.get(&id).unwrap())
+        self.loaded_plugin_by_id(&id)
+    }
+
+    fn loaded_plugin_by_id(&self, id: &str) -> Result<&LoadedPlugin, PluginLoadError> {
+        self.loaded_plugins
+            .get(id)
+            .ok_or_else(|| PluginLoadError::LoadedPluginMissing(id.to_string()))
     }
 
     /// Check if a plugin is compatible with the current gateway version
@@ -642,5 +651,16 @@ mod tests {
             .discover(Path::new("/nonexistent/path/to/plugins"))
             .unwrap();
         assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn loaded_plugin_by_id_returns_typed_error_for_missing_plugin() {
+        let loader = DynamicPluginLoader::new();
+
+        match loader.loaded_plugin_by_id("ghost") {
+            Err(PluginLoadError::LoadedPluginMissing(id)) => assert_eq!(id, "ghost"),
+            Err(other) => panic!("expected LoadedPluginMissing, got {other}"),
+            Ok(_) => panic!("expected LoadedPluginMissing, got loaded plugin"),
+        }
     }
 }

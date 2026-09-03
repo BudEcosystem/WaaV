@@ -285,7 +285,7 @@ mod tests {
         };
 
         let remaining = token.remaining_secs();
-        assert!(remaining >= 299 && remaining <= 301);
+        assert!((299..=301).contains(&remaining));
     }
 
     #[test]

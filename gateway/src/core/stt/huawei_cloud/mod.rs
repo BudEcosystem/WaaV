@@ -252,6 +252,46 @@ mod tests {
         assert!(info.contains("Huawei") || info.contains("华为"));
     }
 
+    // W1 keystone: Huawei's mappable recognition knobs (word-level timing + smart
+    // formatting/punctuation) must survive through `new_standard` into the provider-specific
+    // config — previously dropped by the flat factory.
+    #[test]
+    fn new_standard_unlocks_recognition_features() {
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "huawei_cloud".into(),
+                api_key: "user|pass|domain|project123".into(),
+                model: "chinese_16k_general".into(),
+                encoding: "pcm16k16bit".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                word_timestamps: Some(true),
+                smart_format: Some(false),
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+            translation: None,
+        };
+        // `new_standard` builds the provider from exactly this config, so asserting the mapping
+        // here proves the features it carries reach the constructed client (the config field is
+        // private to the client module, so we verify via the same `from_standard` it uses).
+        let cfg = HuaweiCloudSttConfig::from_standard(&std).unwrap();
+        assert!(cfg.need_word_info); // word_timestamps feature
+        assert!(!cfg.add_punctuation); // smart_format feature
+        assert_eq!(cfg.project_id, "project123");
+        assert!(HuaweiCloudStt::new_standard(&std).is_ok());
+
+        // A malformed credential is rejected through the standardized path too.
+        let bad = StandardSTTConfig::from_base(STTConfig {
+            provider: "huawei_cloud".into(),
+            api_key: "incomplete".into(),
+            ..Default::default()
+        });
+        assert!(HuaweiCloudStt::new_standard(&bad).is_err());
+    }
+
     #[test]
     fn test_supported_models() {
         let models = HuaweiCloudSttConfig::supported_models();
@@ -359,6 +399,10 @@ mod tests {
             true,
             None,
             false,
+            true,
+            None,
+            None,
+            None,
         );
 
         let json = frame.to_json().unwrap();

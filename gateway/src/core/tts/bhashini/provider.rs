@@ -37,6 +37,7 @@ const BASE_RETRY_DELAY_MS: u64 = 500;
 
 /// User-Agent header value for API requests.
 const USER_AGENT: &str = concat!("WaaV-Gateway/", env!("CARGO_PKG_VERSION"));
+const BHASHINI_CALLBACK_URL_SCHEMES: &[&str] = &["http", "https"];
 
 /// Cached pipeline configuration for TTS.
 #[derive(Debug, Clone)]
@@ -149,6 +150,15 @@ impl TtsPipelineComputeResponse {
             .and_then(|r| r.audio.first())
             .and_then(|a| a.audio_content.as_deref())
     }
+
+    /// Get the audio URI from the response when inline audio content is not returned.
+    fn audio_uri(&self) -> Option<&str> {
+        self.pipeline_response
+            .iter()
+            .find(|r| r.task_type.as_deref() == Some("tts"))
+            .and_then(|r| r.audio.first())
+            .and_then(|a| a.audio_uri.as_deref())
+    }
 }
 
 /// Error response from Bhashini API.
@@ -187,28 +197,54 @@ pub struct BhashiniTts {
     audio_callback: Arc<Mutex<Option<Arc<dyn AudioCallback>>>>,
 }
 
+fn bhashini_tts_http_client() -> Result<Client, reqwest::Error> {
+    crate::core::net::ssrf_protected_client_builder(crate::core::net::HTTP_URL_SCHEMES)
+        .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
+        .connect_timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS))
+        .user_agent(USER_AGENT)
+        .build()
+}
+
 impl BhashiniTts {
     /// Create a new Bhashini TTS provider (internal).
     fn create_internal(config: TTSConfig) -> TTSResult<Self> {
         let bhashini_config = BhashiniTtsConfig::from_base(config.clone())?;
+        Self::create_from_bhashini_config(config, bhashini_config)
+    }
 
-        let client = Client::builder()
-            .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
-            .connect_timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS))
-            .user_agent(USER_AGENT)
-            .build()
-            .map_err(|e| {
-                TTSError::ConnectionFailed(format!("Failed to create HTTP client: {}", e))
-            })?;
+    /// Assemble the provider from a base config and an already-resolved Bhashini config. Shared by
+    /// the flat `create_internal` (`from_base`) and the standardized `from_standard` paths so the
+    /// HTTP-client wiring stays in one place.
+    fn create_from_bhashini_config(
+        base_config: TTSConfig,
+        bhashini_config: BhashiniTtsConfig,
+    ) -> TTSResult<Self> {
+        let client = bhashini_tts_http_client().map_err(|e| {
+            TTSError::ConnectionFailed(format!("Failed to create HTTP client: {}", e))
+        })?;
 
         Ok(Self {
-            base_config: config,
+            base_config,
             config: bhashini_config,
             client,
             pipeline_config: Arc::new(Mutex::new(None)),
             connected: AtomicBool::new(false),
             audio_callback: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// Build from the standardized config (W1 keystone). Mirrors [`DeepgramTTS::from_standard`]:
+    /// the provider struct (not just the config) is the dispatch entry point. Bhashini maps
+    /// `sample_rate` → output rate and `language` → the Bhashini language (plus the
+    /// `custom_callback_url` / `custom_service_id` extras passthrough) via
+    /// [`BhashiniTtsConfig::from_standard`]; the resulting Bhashini config is what the provider
+    /// stores and reads at synthesis time. Features Bhashini can't express are skipped (capability
+    /// gaps).
+    ///
+    /// [`DeepgramTTS::from_standard`]: crate::core::tts::deepgram::DeepgramTTS::from_standard
+    pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
+        let bhashini_config = BhashiniTtsConfig::from_standard(std)?;
+        Self::create_from_bhashini_config(std.base.clone(), bhashini_config)
     }
 
     /// Fetch pipeline configuration for TTS.
@@ -225,7 +261,10 @@ impl BhashiniTts {
 
         let response = self
             .client
-            .post(BHASHINI_CONFIG_URL)
+            .post(crate::core::tts::standard::override_rest_endpoint(
+                BHASHINI_CONFIG_URL,
+                self.config.endpoint_override.as_deref(),
+            ))
             .header("userID", &self.config.user_id)
             .header("ulcaApiKey", &self.config.ulca_api_key)
             .header("Content-Type", "application/json")
@@ -265,6 +304,7 @@ impl BhashiniTts {
             .ok_or_else(|| {
                 TTSError::ProviderError("No callback URL in pipeline config response".to_string())
             })?;
+        let callback_url = validate_compute_callback_url(&callback_url)?;
 
         // Extract inference API key
         let (auth_header_name, auth_header_value) = config_response
@@ -370,8 +410,17 @@ impl BhashiniTts {
         pipeline_config: &CachedTtsPipelineConfig,
         request: &TtsPipelineComputeRequest,
     ) -> TTSResult<Vec<u8>> {
-        let response = self
-            .client
+        let callback_client =
+            crate::core::net::ssrf_protected_client_builder(BHASHINI_CALLBACK_URL_SCHEMES)
+                .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
+                .connect_timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS))
+                .build()
+                .map_err(|e| {
+                    TTSError::NetworkError(format!(
+                        "Failed to create SSRF-protected callback client: {e}"
+                    ))
+                })?;
+        let response = callback_client
             .post(&pipeline_config.callback_url)
             .header(
                 &pipeline_config.auth_header_name,
@@ -404,14 +453,62 @@ impl BhashiniTts {
             TTSError::ProviderError(format!("Failed to parse compute response: {}", e))
         })?;
 
-        // Extract and decode audio
-        let audio_base64 = compute_response.audio_content().ok_or_else(|| {
-            TTSError::AudioGenerationFailed("No audio content in response".to_string())
-        })?;
+        // Extract and decode inline audio first; Bhashini may alternatively return an audioUri.
+        let audio_data = if let Some(audio_base64) = compute_response.audio_content() {
+            BASE64.decode(audio_base64).map_err(|e| {
+                TTSError::AudioGenerationFailed(format!("Failed to decode audio: {}", e))
+            })?
+        } else if let Some(audio_uri) = compute_response.audio_uri() {
+            Self::download_audio_uri(audio_uri).await?
+        } else {
+            return Err(TTSError::AudioGenerationFailed(
+                "No audio content or audio URI in response".to_string(),
+            ));
+        };
 
-        let audio_data = BASE64.decode(audio_base64).map_err(|e| {
-            TTSError::AudioGenerationFailed(format!("Failed to decode audio: {}", e))
-        })?;
+        if audio_data.is_empty() {
+            return Err(TTSError::AudioGenerationFailed(
+                "Received empty audio data".to_string(),
+            ));
+        }
+
+        Ok(audio_data)
+    }
+
+    async fn download_audio_uri(url: &str) -> TTSResult<Vec<u8>> {
+        let url = crate::core::tts::standard::validate_provider_audio_url("Bhashini TTS", url)?;
+        let client = crate::core::net::ssrf_protected_client_builder(
+            crate::core::tts::standard::PROVIDER_AUDIO_URL_SCHEMES,
+        )
+        .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
+        .connect_timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS))
+        .build()
+        .map_err(|e| TTSError::NetworkError(format!("Failed to build HTTP client: {e}")))?;
+
+        let response = client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| TTSError::NetworkError(format!("Failed to download audio: {e}")))?;
+
+        if !response.status().is_success() {
+            return Err(TTSError::ProviderError(format!(
+                "Failed to download audio: status {}",
+                response.status()
+            )));
+        }
+
+        let audio_data = response
+            .bytes()
+            .await
+            .map_err(|e| TTSError::NetworkError(format!("Failed to read downloaded audio: {e}")))?
+            .to_vec();
+
+        if audio_data.is_empty() {
+            return Err(TTSError::AudioGenerationFailed(
+                "Received empty downloaded audio data".to_string(),
+            ));
+        }
 
         Ok(audio_data)
     }
@@ -554,6 +651,23 @@ impl BaseTTS for BhashiniTts {
     }
 }
 
+fn validate_compute_callback_url(url: &str) -> TTSResult<String> {
+    let url = url.trim();
+    if url.is_empty() {
+        return Err(TTSError::ProviderError(
+            "Bhashini TTS callback URL rejected (SSRF protection): empty URL".to_string(),
+        ));
+    }
+
+    crate::core::net::validate_url_for_ssrf(url, BHASHINI_CALLBACK_URL_SCHEMES)
+        .map(|_| url.to_string())
+        .map_err(|msg| {
+            TTSError::ProviderError(format!(
+                "Bhashini TTS callback URL rejected (SSRF protection): {msg}"
+            ))
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -568,10 +682,113 @@ mod tests {
     }
 
     #[test]
+    fn compute_callback_url_is_ssrf_checked() {
+        let _env = crate::core::net::ssrf_env_lock();
+        assert_eq!(
+            validate_compute_callback_url(" https://compute.example.com/tts ").unwrap(),
+            "https://compute.example.com/tts"
+        );
+
+        let err = validate_compute_callback_url("file:///tmp/compute")
+            .expect_err("non-HTTP callback URL must be rejected");
+        assert!(err.to_string().contains("not allowed"), "{err}");
+
+        let err =
+            validate_compute_callback_url("   ").expect_err("empty callback URL must be rejected");
+        assert!(err.to_string().contains("empty URL"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn provider_audio_uri_rejects_unsafe_targets() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let err = BhashiniTts::download_audio_uri("http://127.0.0.1:9000/audio.wav")
+            .await
+            .expect_err("loopback audioUri must be rejected");
+        assert!(err.to_string().contains("SSRF protection"), "{err}");
+
+        let err = BhashiniTts::download_audio_uri("file:///tmp/audio.wav")
+            .await
+            .expect_err("non-HTTP audioUri must be rejected");
+        assert!(err.to_string().contains("not allowed"), "{err}");
+    }
+
+    #[test]
     fn test_bhashini_tts_creation() {
         let config = create_test_config();
         let result = BhashiniTts::new(config);
         assert!(result.is_ok());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn bhashini_tts_redirect_policy_rejects_private_hop() {
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local redirect test server");
+        let addr = listener.local_addr().expect("local addr");
+
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 1024];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 302 Found\r\n",
+                "Location: http://127.0.0.1:9/metadata\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n"
+            );
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await;
+        });
+
+        let tts = BhashiniTts::new(create_test_config()).expect("construct Bhashini TTS");
+        let err = tts
+            .client
+            .get(format!("http://{addr}/start"))
+            .send()
+            .await
+            .expect_err("private redirect target must be rejected");
+        let mut error_chain = err.to_string();
+        let mut source = std::error::Error::source(&err);
+        while let Some(err) = source {
+            error_chain.push_str(": ");
+            error_chain.push_str(&err.to_string());
+            source = err.source();
+        }
+        assert!(error_chain.contains("SSRF protection"), "{error_chain}");
+    }
+
+    // The provider STRUCT's `from_standard` (the dispatch entry point) carries Bhashini's
+    // expressible advanced features — output sample_rate and the language override — onto the
+    // stored Bhashini config used at synthesis time.
+    #[test]
+    fn from_standard_carries_sample_rate_and_language_to_provider() {
+        use crate::core::tts::bhashini::BhashiniLanguage;
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "bhashini".into(),
+                api_key: "test_user|test_key".into(),
+                voice_id: Some("hi".into()),
+                sample_rate: Some(22050),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                sample_rate: Some(16000),
+                language: Some("ta".into()),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let tts = BhashiniTts::from_standard(&std).unwrap();
+        assert_eq!(tts.config.sample_rate, 16000);
+        assert_eq!(tts.config.language, BhashiniLanguage::Tamil);
     }
 
     #[test]
@@ -656,5 +873,27 @@ mod tests {
 
         let response: TtsPipelineComputeResponse = serde_json::from_str(json).unwrap();
         assert_eq!(response.audio_content(), Some("SGVsbG8gV29ybGQ="));
+        assert_eq!(response.audio_uri(), None);
+    }
+
+    #[test]
+    fn test_tts_compute_response_audio_uri_parsing() {
+        let json = r#"{
+            "pipelineResponse": [
+                {
+                    "taskType": "tts",
+                    "audio": [
+                        {"audioUri": "https://audio.example.com/bhashini.wav"}
+                    ]
+                }
+            ]
+        }"#;
+
+        let response: TtsPipelineComputeResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.audio_content(), None);
+        assert_eq!(
+            response.audio_uri(),
+            Some("https://audio.example.com/bhashini.wav")
+        );
     }
 }

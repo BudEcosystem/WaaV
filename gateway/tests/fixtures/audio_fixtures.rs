@@ -43,9 +43,6 @@ pub fn generate_silence_bytes(duration_samples: usize) -> Vec<u8> {
 
 /// Generate white noise with specified amplitude (0.0 - 1.0)
 pub fn generate_white_noise(duration_samples: usize, amplitude: f32) -> Vec<i16> {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
     let mut samples = Vec::with_capacity(duration_samples);
     let max_amplitude = (amplitude * i16::MAX as f32) as i16;
 
@@ -113,7 +110,7 @@ pub fn generate_chirp(
         .map(|i| {
             let t = i as f32 / SAMPLE_RATE as f32;
             // Linear chirp
-            let freq = start_freq + (end_freq - start_freq) * t / duration_secs;
+            let _freq = start_freq + (end_freq - start_freq) * t / duration_secs;
             let phase =
                 2.0 * PI * (start_freq * t + 0.5 * (end_freq - start_freq) * t * t / duration_secs);
             let sample = phase.sin() * max_amplitude;
@@ -145,7 +142,7 @@ pub fn generate_speech_pattern(duration_samples: usize) -> Vec<i16> {
     // Create envelope that simulates speech patterns (variable amplitude)
     let mut state: u64 = 54321;
     let mut envelope = 0.0f32;
-    let envelope_smoothing = 0.001;
+    let _envelope_smoothing = 0.001;
 
     for i in 0..duration_samples {
         // Update envelope occasionally to simulate syllables

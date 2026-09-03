@@ -37,20 +37,26 @@ const GRPC_SERVICE_PATH: &str = "/Listener/DoSpeechToText";
 /// This establishes a secure connection to Gnani's ASR service using the
 /// provided SSL certificate for server verification.
 pub async fn create_gnani_channel(config: &GnaniSTTConfig) -> Result<Channel, STTError> {
-    // Load the certificate
-    let cert_pem = config
-        .load_certificate()
-        .map_err(STTError::ConfigurationError)?;
-
-    // Create TLS configuration with the CA certificate
-    let tls_config = ClientTlsConfig::new()
-        .ca_certificate(Certificate::from_pem(&cert_pem))
-        .domain_name("asr.gnani.ai");
+    // With an endpoint override set (mock e2e), connect PLAINTEXT — no cert is loaded, no TLS.
+    // Otherwise use the production cert + TLS path.
+    let endpoint = if let Some(ep) = config.endpoint_override.as_deref() {
+        Endpoint::from_shared(ep.to_string()).map_err(|e| {
+            STTError::ConfigurationError(format!("Invalid endpoint override: {}", e))
+        })?
+    } else {
+        let cert_pem = config
+            .load_certificate()
+            .map_err(STTError::ConfigurationError)?;
+        let tls_config = ClientTlsConfig::new()
+            .ca_certificate(Certificate::from_pem(&cert_pem))
+            .domain_name("asr.gnani.ai");
+        Endpoint::from_static(GNANI_GRPC_ENDPOINT)
+            .tls_config(tls_config)
+            .map_err(|e| STTError::ConfigurationError(format!("TLS config error: {}", e)))?
+    };
 
     // Build and connect the channel
-    let channel = Endpoint::from_static(GNANI_GRPC_ENDPOINT)
-        .tls_config(tls_config)
-        .map_err(|e| STTError::ConfigurationError(format!("TLS config error: {}", e)))?
+    let channel = endpoint
         .connect_timeout(Duration::from_secs(config.connection_timeout_secs))
         .timeout(Duration::from_secs(config.request_timeout_secs))
         .connect()
@@ -88,6 +94,20 @@ pub fn create_gnani_metadata(
         parse_header_value(&config.base.encoding, "encoding")?,
     );
 
+    // Optional per-request headers (omitted entirely when not set, so the default request is
+    // byte-for-byte unchanged). Both are documented Gnani request-config headers.
+    if let Some(sensitive) = config.sensitive {
+        metadata.insert(
+            "sensitive",
+            parse_header_value(if sensitive { "true" } else { "false" }, "sensitive")?,
+        );
+    }
+    if let Some(ref filename) = config.filename
+        && !filename.is_empty()
+    {
+        metadata.insert("filename", parse_header_value(filename, "filename")?);
+    }
+
     Ok(metadata)
 }
 
@@ -115,9 +135,44 @@ impl GnaniGrpcClient {
         Self { channel, config }
     }
 
+    /// Open a fresh bidirectional `DoSpeechToText` stream over the given audio receiver.
+    ///
+    /// The featured session is re-established intrinsically by opening a new stream: the request
+    /// metadata (token/accesskey/lang/audioformat/encoding + optional sensitive/filename) is rebuilt
+    /// from config, and [`AudioChunkStream`] sends the first chunk with the auth-bearing
+    /// `SpeechChunk::new` head. This is what the supervised transport calls per (re)connect, so a
+    /// reconnect restores the *featured* session rather than a bare one. Returns the raw response
+    /// stream for the caller to drain; a connection-level failure here is classified as
+    /// reconnectable vs fatal by [`classify_grpc_outcome`].
+    pub(super) async fn open_stream(
+        &self,
+        audio_rx: mpsc::Receiver<Bytes>,
+    ) -> Result<Streaming<Bytes>, Status> {
+        // Create the request stream (re-yields the featured first chunk + auth metadata).
+        let request_stream = AudioChunkStream::new(
+            audio_rx,
+            self.config.token.clone(),
+            self.config.base.language.clone(),
+        );
+
+        // Create metadata
+        let metadata = create_gnani_metadata(&self.config)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+
+        // Create the gRPC request with metadata
+        let mut request = Request::new(request_stream);
+        *request.metadata_mut() = metadata;
+
+        // Clone channel for the streaming call
+        let channel = self.channel.clone();
+        do_speech_to_text(channel, request).await
+    }
+
     /// Start a bidirectional streaming session
     ///
     /// Returns a sender for audio chunks and a receiver for transcription results.
+    #[allow(dead_code)] // Retained for the non-supervised path / tests; the supervised transport
+    // drives `open_stream` directly.
     pub async fn start_streaming(
         &self,
     ) -> Result<
@@ -169,6 +224,28 @@ impl GnaniGrpcClient {
     }
 }
 
+/// Map a gRPC status to a [`ReconnectOutcome`](crate::core::websocket::reconnectable_stream::ReconnectOutcome):
+/// transient transport failures (Unavailable, DeadlineExceeded, Internal, Cancelled, Aborted,
+/// ResourceExhausted) are reconnectable; auth/permission/argument errors are fatal (retrying would
+/// fail identically).
+pub(super) fn classify_grpc_outcome(
+    status: tonic::Status,
+) -> crate::core::websocket::reconnectable_stream::ReconnectOutcome {
+    use crate::core::websocket::reconnectable_stream::{ReconnectOutcome, StreamError};
+    use tonic::Code;
+    match status.code() {
+        Code::Unavailable
+        | Code::DeadlineExceeded
+        | Code::Internal
+        | Code::Cancelled
+        | Code::Aborted
+        | Code::ResourceExhausted => {
+            ReconnectOutcome::Reconnectable(StreamError::new(format!("grpc {}", status.code())))
+        }
+        _ => ReconnectOutcome::Fatal(StreamError::new(format!("grpc {}", status.code()))),
+    }
+}
+
 /// Perform the DoSpeechToText gRPC call using tonic's low-level Grpc client
 async fn do_speech_to_text<S>(
     channel: Channel,
@@ -188,7 +265,7 @@ where
         .map_err(|e| Status::unavailable(format!("Service not ready: {}", e)))?;
 
     // Create the codec
-    let codec = GnaniCodec::default();
+    let codec = GnaniCodec;
 
     // Parse the path
     let path = PathAndQuery::from_static(GRPC_SERVICE_PATH);
@@ -444,5 +521,93 @@ mod tests {
     fn test_parse_header_value() {
         assert!(parse_header_value("valid-token", "token").is_ok());
         assert!(parse_header_value("en-IN", "lang").is_ok());
+    }
+
+    // ===================== WIRE-LEVEL feature tests (gRPC request metadata) =====================
+    //
+    // Gnani sends per-request config as gRPC metadata headers (alongside token/lang/encoding),
+    // which is the actual request wire. These assert the newly-wired `sensitive` and `filename`
+    // features reach that MetadataMap — not just the config struct.
+
+    use super::super::config::GnaniSTTConfig;
+
+    fn base_cfg() -> GnaniSTTConfig {
+        GnaniSTTConfig {
+            token: "tok".into(),
+            access_key: "ak".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn wire_sensitive_header_reaches_metadata() {
+        let mut cfg = base_cfg();
+        cfg.sensitive = Some(true);
+        let md = create_gnani_metadata(&cfg).expect("metadata");
+        assert_eq!(
+            md.get("sensitive").map(|v| v.to_str().unwrap()),
+            Some("true"),
+            "sensitive header must reach the gRPC request metadata"
+        );
+    }
+
+    #[test]
+    fn wire_filename_header_reaches_metadata() {
+        let mut cfg = base_cfg();
+        cfg.filename = Some("call-123.wav".into());
+        let md = create_gnani_metadata(&cfg).expect("metadata");
+        assert_eq!(
+            md.get("filename").map(|v| v.to_str().unwrap()),
+            Some("call-123.wav"),
+            "filename header must reach the gRPC request metadata"
+        );
+    }
+
+    #[test]
+    fn wire_sensitive_and_filename_absent_by_default() {
+        // Defaults must NOT add the optional headers (no accidental always-on wiring).
+        let md = create_gnani_metadata(&base_cfg()).expect("metadata");
+        assert!(
+            md.get("sensitive").is_none(),
+            "sensitive must be omitted by default"
+        );
+        assert!(
+            md.get("filename").is_none(),
+            "filename must be omitted by default"
+        );
+    }
+
+    #[test]
+    fn wire_from_standard_extras_reach_metadata() {
+        use crate::core::stt::base::STTConfig;
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "gnani".into(),
+                language: "hi-IN".into(),
+                ..Default::default()
+            },
+            features: Default::default(),
+            extras: ProviderExtras(
+                serde_json::json!({
+                    "token": "t", "access_key": "k",
+                    "sensitive": true, "filename": "debug.wav"
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ),
+            translation: None,
+        };
+        let cfg = GnaniSTTConfig::from_standard(&std).expect("from_standard");
+        let md = create_gnani_metadata(&cfg).expect("metadata");
+        assert_eq!(
+            md.get("sensitive").map(|v| v.to_str().unwrap()),
+            Some("true")
+        );
+        assert_eq!(
+            md.get("filename").map(|v| v.to_str().unwrap()),
+            Some("debug.wav")
+        );
     }
 }

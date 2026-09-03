@@ -64,6 +64,9 @@
 mod client;
 mod config;
 mod messages;
+// `pub(crate)` so the OpenAI-PROTOCOL CLONES (Azure / Grok / Inworld realtime)
+// can embed `OpenAiProtocol` and delegate the GA wire to it.
+pub(crate) mod protocol;
 
 pub use client::OpenAIRealtime;
 pub use config::{
@@ -118,8 +121,13 @@ mod tests {
             OpenAIRealtimeModel::Gpt4oMiniRealtimePreview
         );
         assert_eq!(
+            OpenAIRealtimeModel::from_str_or_default("gpt-realtime"),
+            OpenAIRealtimeModel::GptRealtime
+        );
+        // Default is now the GA gpt-realtime.
+        assert_eq!(
             OpenAIRealtimeModel::from_str_or_default("unknown"),
-            OpenAIRealtimeModel::Gpt4oRealtimePreview
+            OpenAIRealtimeModel::GptRealtime
         );
     }
 

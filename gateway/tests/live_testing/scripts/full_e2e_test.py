@@ -1,3 +1,4 @@
+import os
 #!/usr/bin/env python3
 """
 WaaV Gateway Full End-to-End Pipeline Test
@@ -41,7 +42,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 GATEWAY_URL = "ws://localhost:3001/ws"
-DEEPGRAM_API_KEY = "a89c460d1b43a8b5d67beea50545650ed62eb030"
+DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY", "")
 SAMPLE_RATE = 16000
 
 

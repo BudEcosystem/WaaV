@@ -155,7 +155,7 @@ impl SelfHostedTTS {
             None
         };
         Ok(Self {
-            provider: TTSProvider::new()?,
+            provider: TTSProvider::new(),
             request_builder: SelfHostedRequestBuilder {
                 config: config.clone(),
                 pronunciation_replacer,
@@ -265,10 +265,18 @@ mod tests {
         // The pre-check and the factory must agree. If the registry gains an alias and this
         // list does not, a keyless deployment published under it is refused for a missing
         // credential it never needed.
-        for v in ["self_hosted", "self-hosted", "waav_self_hosted", "openai_compatible"] {
+        for v in [
+            "self_hosted",
+            "self-hosted",
+            "waav_self_hosted",
+            "openai_compatible",
+        ] {
             assert!(is_self_hosted(v), "{v} should be recognised as self-hosted");
         }
-        assert!(is_self_hosted("  Self_Hosted  "), "matching must be lenient like the registry");
+        assert!(
+            is_self_hosted("  Self_Hosted  "),
+            "matching must be lenient like the registry"
+        );
         assert!(!is_self_hosted("deepgram"));
         assert!(!is_self_hosted(""));
     }
@@ -361,7 +369,10 @@ mod tests {
             },
             pronunciation_replacer: None,
         };
-        let req = builder.build_http_request(&client, "hello").build().unwrap();
+        let req = builder
+            .build_http_request(&client, "hello")
+            .build()
+            .unwrap();
         assert!(
             req.headers().get(reqwest::header::AUTHORIZATION).is_none(),
             "an empty api_key must send no Authorization header at all"
@@ -379,7 +390,10 @@ mod tests {
             },
             pronunciation_replacer: None,
         };
-        let req = builder.build_http_request(&client, "hello").build().unwrap();
+        let req = builder
+            .build_http_request(&client, "hello")
+            .build()
+            .unwrap();
         assert_eq!(
             req.headers()
                 .get(reqwest::header::AUTHORIZATION)

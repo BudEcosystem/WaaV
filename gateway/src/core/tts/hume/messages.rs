@@ -46,23 +46,46 @@ pub enum HumeVoiceSpec {
     ByName {
         /// Voice name (e.g., "Kora")
         name: String,
+        /// Voice library the name resolves against (`HUME_AI` or `CUSTOM_VOICE`). Omitted -> Hume
+        /// default. Serialized as a sibling `provider` key on the voice object per the Hume API.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
     },
     /// Use a custom voice by ID.
     ById {
         /// Custom voice UUID
         id: String,
+        /// Voice library the id resolves against (`HUME_AI` or `CUSTOM_VOICE`).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
     },
 }
 
 impl HumeVoiceSpec {
     /// Create a voice spec by name.
     pub fn by_name(name: impl Into<String>) -> Self {
-        Self::ByName { name: name.into() }
+        Self::ByName {
+            name: name.into(),
+            provider: None,
+        }
     }
 
     /// Create a voice spec by ID.
     pub fn by_id(id: impl Into<String>) -> Self {
-        Self::ById { id: id.into() }
+        Self::ById {
+            id: id.into(),
+            provider: None,
+        }
+    }
+
+    /// Set the voice `provider` (library) the name/id resolves against (`HUME_AI`/`CUSTOM_VOICE`).
+    pub fn with_provider(mut self, provider: impl Into<String>) -> Self {
+        match &mut self {
+            Self::ByName { provider: p, .. } | Self::ById { provider: p, .. } => {
+                *p = Some(provider.into());
+            }
+        }
+        self
     }
 }
 
@@ -220,6 +243,23 @@ pub struct HumeTTSRequest {
     /// Context from previous conversation (for continuity).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context: Option<HumeContext>,
+
+    /// Timestamp granularities to include in the response (`"word"` and/or `"phoneme"`).
+    /// Top-level field per the Hume API (Octave 2 only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include_timestamp_types: Option<Vec<String>>,
+
+    /// Sampling temperature (top-level): higher -> more variation. Audio-changing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+
+    /// Whether to automatically split the input into utterance segments (top-level, default true).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub split_utterances: Option<bool>,
+
+    /// Whether to strip per-chunk audio headers when concatenating (top-level, default false).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strip_headers: Option<bool>,
 }
 
 impl HumeTTSRequest {
@@ -232,6 +272,10 @@ impl HumeTTSRequest {
             num_generations: None,
             generation_id: None,
             context: None,
+            include_timestamp_types: None,
+            temperature: None,
+            split_utterances: None,
+            strip_headers: None,
         }
     }
 
@@ -244,6 +288,10 @@ impl HumeTTSRequest {
             num_generations: None,
             generation_id: None,
             context: None,
+            include_timestamp_types: None,
+            temperature: None,
+            split_utterances: None,
+            strip_headers: None,
         }
     }
 
@@ -274,6 +322,30 @@ impl HumeTTSRequest {
     /// Set context for continuity.
     pub fn with_context(mut self, context: HumeContext) -> Self {
         self.context = Some(context);
+        self
+    }
+
+    /// Request specific timestamp granularities (`"word"`/`"phoneme"`).
+    pub fn with_include_timestamp_types(mut self, types: Vec<String>) -> Self {
+        self.include_timestamp_types = Some(types);
+        self
+    }
+
+    /// Set the sampling temperature.
+    pub fn with_temperature(mut self, temperature: f32) -> Self {
+        self.temperature = Some(temperature);
+        self
+    }
+
+    /// Set whether the input is auto-split into utterance segments.
+    pub fn with_split_utterances(mut self, split: bool) -> Self {
+        self.split_utterances = Some(split);
+        self
+    }
+
+    /// Set whether per-chunk audio headers are stripped on concatenation.
+    pub fn with_strip_headers(mut self, strip: bool) -> Self {
+        self.strip_headers = Some(strip);
         self
     }
 }
@@ -365,7 +437,7 @@ mod tests {
     fn test_voice_spec_by_name() {
         let spec = HumeVoiceSpec::by_name("Kora");
         match spec {
-            HumeVoiceSpec::ByName { name } => assert_eq!(name, "Kora"),
+            HumeVoiceSpec::ByName { name, .. } => assert_eq!(name, "Kora"),
             _ => panic!("Expected ByName variant"),
         }
     }
@@ -374,7 +446,7 @@ mod tests {
     fn test_voice_spec_by_id() {
         let spec = HumeVoiceSpec::by_id("uuid-123");
         match spec {
-            HumeVoiceSpec::ById { id } => assert_eq!(id, "uuid-123"),
+            HumeVoiceSpec::ById { id, .. } => assert_eq!(id, "uuid-123"),
             _ => panic!("Expected ById variant"),
         }
     }
@@ -383,7 +455,7 @@ mod tests {
     fn test_voice_spec_default() {
         let spec = HumeVoiceSpec::default();
         match spec {
-            HumeVoiceSpec::ByName { name } => assert_eq!(name, "Kora"),
+            HumeVoiceSpec::ByName { name, .. } => assert_eq!(name, "Kora"),
             _ => panic!("Expected ByName variant"),
         }
     }
@@ -426,7 +498,7 @@ mod tests {
     fn test_utterance_with_voice_name() {
         let utterance = HumeUtterance::new("Hello").with_voice_name("Kora");
         match utterance.voice {
-            Some(HumeVoiceSpec::ByName { name }) => assert_eq!(name, "Kora"),
+            Some(HumeVoiceSpec::ByName { name, .. }) => assert_eq!(name, "Kora"),
             _ => panic!("Expected ByName variant"),
         }
     }

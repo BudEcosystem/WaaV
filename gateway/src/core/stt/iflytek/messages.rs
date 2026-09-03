@@ -202,6 +202,34 @@ pub struct SttRequestBusiness {
     /// Number conversion mode (0=off, 1=on).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nunum: Option<i32>,
+
+    /// Word-level frame-offset info (per-word start/end timing). iFlytek `vinfo` (1=on).
+    /// Maps the standardized `word_timestamps` feature. The recognizer returns a `vad`/word
+    /// offset block when this is set. Ref: iFlytek IAT/IST business params (`vinfo`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vinfo: Option<i32>,
+
+    /// Sentence-level N-best alternatives (1–5). iFlytek `nbest`. Maps the standardized
+    /// `alternatives` feature. Ref: iFlytek IAT business params (`nbest`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nbest: Option<i32>,
+
+    /// Word-level N-best alternatives (1–5). iFlytek `wbest`. Maps the
+    /// `word_alternatives` extra. Ref: iFlytek IAT business params (`wbest`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wbest: Option<i32>,
+
+    /// Personalization domain / vertical (e.g. "game", "health", "shopping", "trip").
+    /// iFlytek `pd`. Maps the `domain_personalization` extra. Ref: iFlytek IAT business
+    /// params (`pd`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pd: Option<String>,
+
+    /// Result character set / language variant (e.g. "zh-cn" simplified vs traditional).
+    /// iFlytek `rlang`. Maps the `result_character_set` extra. Ref: iFlytek IAT business
+    /// params (`rlang`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rlang: Option<String>,
 }
 
 /// Data section of the request.
@@ -233,8 +261,28 @@ pub struct SttRequest {
     pub data: SttRequestData,
 }
 
+/// Advanced iFlytek business parameters that map standardized/extras features onto the wire
+/// `business` block. Every field is `Option`/empty by default so a `..Default::default()`
+/// first frame is unchanged. These are the params surfaced by the W2 feature-wiring pass:
+/// `vinfo` (word timestamps), `nbest`/`wbest` (sentence/word N-best), `pd` (domain
+/// personalization), `rlang` (result character set / language variant).
+#[derive(Debug, Clone, Default)]
+pub struct IFlytekBusinessExtras {
+    /// `vinfo` — word-level frame-offset info (word timestamps). `Some(true)` ⇒ `vinfo=1`.
+    pub word_timestamps: Option<bool>,
+    /// `nbest` — sentence-level N-best alternatives (1–5).
+    pub nbest: Option<u8>,
+    /// `wbest` — word-level N-best alternatives (1–5).
+    pub wbest: Option<u8>,
+    /// `pd` — personalization domain / vertical.
+    pub pd: Option<String>,
+    /// `rlang` — result character set / language variant.
+    pub rlang: Option<String>,
+}
+
 impl SttRequest {
     /// Create a new first frame request.
+    #[allow(clippy::too_many_arguments)]
     pub fn first_frame(
         app_id: &str,
         language: &str,
@@ -247,6 +295,40 @@ impl SttRequest {
         audio_format: &str,
         encoding: &str,
         audio_data: &[u8],
+    ) -> Self {
+        Self::first_frame_with_extras(
+            app_id,
+            language,
+            domain,
+            accent,
+            vad_eos_ms,
+            dynamic_correction,
+            punctuation,
+            convert_numbers,
+            audio_format,
+            encoding,
+            audio_data,
+            &IFlytekBusinessExtras::default(),
+        )
+    }
+
+    /// Create a first frame request including the advanced `business` parameters
+    /// (`vinfo`/`nbest`/`wbest`/`pd`/`rlang`). The base `first_frame` delegates here with empty
+    /// extras, so the wire shape is identical when no advanced feature is requested.
+    #[allow(clippy::too_many_arguments)]
+    pub fn first_frame_with_extras(
+        app_id: &str,
+        language: &str,
+        domain: &str,
+        accent: Option<&str>,
+        vad_eos_ms: u32,
+        dynamic_correction: bool,
+        punctuation: bool,
+        convert_numbers: bool,
+        audio_format: &str,
+        encoding: &str,
+        audio_data: &[u8],
+        extras: &IFlytekBusinessExtras,
     ) -> Self {
         Self {
             common: SttRequestCommon {
@@ -264,6 +346,11 @@ impl SttRequest {
                 },
                 ptt: Some(if punctuation { 1 } else { 0 }),
                 nunum: Some(if convert_numbers { 1 } else { 0 }),
+                vinfo: extras.word_timestamps.map(|b| if b { 1 } else { 0 }),
+                nbest: extras.nbest.map(|n| n as i32),
+                wbest: extras.wbest.map(|n| n as i32),
+                pd: extras.pd.clone(),
+                rlang: extras.rlang.clone(),
             },
             data: SttRequestData {
                 status: 0, // First frame
@@ -293,6 +380,11 @@ impl SttRequest {
                 dwa: None,
                 ptt: None,
                 nunum: None,
+                vinfo: None,
+                nbest: None,
+                wbest: None,
+                pd: None,
+                rlang: None,
             },
             data: SttRequestData {
                 status: 1, // Continue frame
@@ -317,6 +409,11 @@ impl SttRequest {
                 dwa: None,
                 ptt: None,
                 nunum: None,
+                vinfo: None,
+                nbest: None,
+                wbest: None,
+                pd: None,
+                rlang: None,
             },
             data: SttRequestData {
                 status: 2, // Last frame

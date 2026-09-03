@@ -13,9 +13,12 @@ use super::config::{
     MAX_AUDIO_DURATION_SECONDS, NAVER_CSR_ENDPOINT, NaverClovaAudioFormat, NaverClovaSttConfig,
     NaverClovaSttResponse,
 };
+use crate::core::stt::http_resilience::HttpBreaker;
+
 use crate::core::stt::base::{
     BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback,
 };
+use crate::core::stt::wav as stt_wav;
 use bytes::Bytes;
 use reqwest::Client;
 use std::sync::Arc;
@@ -42,9 +45,52 @@ pub struct NaverClovaStt {
     error_callback: Arc<Mutex<Option<STTErrorCallback>>>,
     /// Original STT config for get_config()
     original_config: STTConfig,
+    /// Shared per-provider circuit breaker for the REST transport (uniform with the WS fleet):
+    /// consulted before each upstream call, fed by the unified HTTP status classification.
+    /// Inert until `set_resilience` injects the process-global handles (W-D2).
+    resilience: HttpBreaker,
+}
+
+fn naver_clova_stt_http_client() -> Result<Client, reqwest::Error> {
+    crate::core::net::ssrf_protected_client_builder(crate::core::net::HTTP_URL_SCHEMES)
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
 }
 
 impl NaverClovaStt {
+    /// W1 keystone — construct from the standardized config. NAVER CLOVA CSR is a batch (REST)
+    /// recognizer whose config exposes none of the standardized advanced features, so this is a
+    /// uniform standardized entry point that delegates to `from_standard` (a pure `from_base`
+    /// passthrough): the base config is carried through unchanged and every advanced feature is a
+    /// capability gap left at default.
+    pub fn new_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        let naver_config = NaverClovaSttConfig::from_standard(std)?;
+
+        let http_client = naver_clova_stt_http_client().map_err(|e| {
+            STTError::ConfigurationError(format!("Failed to create HTTP client: {e}"))
+        })?;
+
+        Ok(Self {
+            config: naver_config,
+            http_client,
+            audio_buffer: Arc::new(Mutex::new(Vec::new())),
+            is_ready: AtomicBool::new(false),
+            result_callback: Arc::new(Mutex::new(None)),
+            error_callback: Arc::new(Mutex::new(None)),
+            original_config: std.base.clone(),
+            resilience: HttpBreaker::new("naver_clova"),
+        })
+    }
+
+    /// The shared circuit breaker this client feeds, if the process-global resilience handles
+    /// have been injected (W-D2). Two `NaverClovaStt` built from the same
+    /// [`crate::core::resilience::ResilienceRegistry`] return the *same* `Arc`.
+    pub fn resilience_breaker(&self) -> Option<&Arc<crate::core::resilience::CircuitBreaker>> {
+        self.resilience.breaker()
+    }
+
     /// Calculate the maximum audio buffer size in bytes based on configuration.
     fn max_buffer_bytes(&self) -> usize {
         // Calculate max bytes for 60 seconds of audio
@@ -54,13 +100,16 @@ impl NaverClovaStt {
         self.config.sample_rate as usize * bytes_per_sample * channels * MAX_AUDIO_DURATION_SECONDS
     }
 
-    /// Build the API endpoint URL with language parameter.
+    /// Build the API endpoint URL with language parameter. When `endpoint_override` is set (the
+    /// standardized override, used by the credential-free mock harness), its scheme://host replaces
+    /// the production host while the `/recog/v1/stt` path and `?lang=` query are preserved.
     fn build_endpoint_url(&self) -> String {
-        format!(
-            "{}?lang={}",
-            NAVER_CSR_ENDPOINT,
-            self.config.language.code()
-        )
+        let base = if let Some(ref ov) = self.config.endpoint_override {
+            format!("{}/recog/v1/stt", ov.trim_end_matches('/'))
+        } else {
+            NAVER_CSR_ENDPOINT.to_string()
+        };
+        format!("{base}?lang={}", self.config.language.code())
     }
 
     /// Transcribe the buffered audio using the REST API.
@@ -86,7 +135,7 @@ impl NaverClovaStt {
         // Add WAV header if format is PCM (CSR expects raw audio with proper content-type)
         let audio_data = match self.config.audio_format {
             NaverClovaAudioFormat::Pcm => buffer,
-            NaverClovaAudioFormat::Wav => self.add_wav_header(&buffer),
+            NaverClovaAudioFormat::Wav => self.add_wav_header(&buffer)?,
             NaverClovaAudioFormat::Mp3 => buffer,
         };
 
@@ -98,6 +147,10 @@ impl NaverClovaStt {
             url, content_type
         );
 
+        // Consult the shared per-provider breaker before paying the upstream round-trip: an
+        // open breaker fails fast with a typed classified refusal (uniform with the WS fleet).
+        self.resilience.check()?;
+
         let response = self
             .http_client
             .post(&url)
@@ -107,9 +160,13 @@ impl NaverClovaStt {
             .body(audio_data)
             .send()
             .await
-            .map_err(|e| STTError::NetworkError(format!("Failed to send audio: {e}")))?;
+            .map_err(|e| {
+                self.resilience.record_send_error();
+                STTError::NetworkError(format!("Failed to send audio: {e}"))
+            })?;
 
         let status = response.status();
+        self.resilience.record_status(status);
         let body = response
             .text()
             .await
@@ -167,38 +224,9 @@ impl NaverClovaStt {
     }
 
     /// Add a WAV header to raw PCM data.
-    fn add_wav_header(&self, pcm_data: &[u8]) -> Vec<u8> {
-        let sample_rate = self.config.sample_rate;
-        let bits_per_sample = 16u16;
-        let channels = 1u16;
-        let byte_rate = sample_rate * (bits_per_sample / 8) as u32 * channels as u32;
-        let block_align = channels * (bits_per_sample / 8);
-        let data_size = pcm_data.len() as u32;
-        let file_size = 36 + data_size;
-
-        let mut wav = Vec::with_capacity(44 + pcm_data.len());
-
-        // RIFF header
-        wav.extend_from_slice(b"RIFF");
-        wav.extend_from_slice(&file_size.to_le_bytes());
-        wav.extend_from_slice(b"WAVE");
-
-        // fmt subchunk
-        wav.extend_from_slice(b"fmt ");
-        wav.extend_from_slice(&16u32.to_le_bytes()); // Subchunk1Size (PCM = 16)
-        wav.extend_from_slice(&1u16.to_le_bytes()); // AudioFormat (PCM = 1)
-        wav.extend_from_slice(&channels.to_le_bytes());
-        wav.extend_from_slice(&sample_rate.to_le_bytes());
-        wav.extend_from_slice(&byte_rate.to_le_bytes());
-        wav.extend_from_slice(&block_align.to_le_bytes());
-        wav.extend_from_slice(&bits_per_sample.to_le_bytes());
-
-        // data subchunk
-        wav.extend_from_slice(b"data");
-        wav.extend_from_slice(&data_size.to_le_bytes());
-        wav.extend_from_slice(pcm_data);
-
-        wav
+    fn add_wav_header(&self, pcm_data: &[u8]) -> Result<Vec<u8>, STTError> {
+        stt_wav::encode_pcm16_wav(pcm_data, self.config.sample_rate, 1)
+            .map_err(|e| STTError::AudioProcessingError(format!("Invalid WAV parameters: {e}")))
     }
 
     /// Clear the audio buffer.
@@ -213,12 +241,9 @@ impl BaseSTT for NaverClovaStt {
     fn new(config: STTConfig) -> Result<Self, STTError> {
         let naver_config = NaverClovaSttConfig::from_base(config.clone())?;
 
-        let http_client = Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .map_err(|e| {
-                STTError::ConfigurationError(format!("Failed to create HTTP client: {e}"))
-            })?;
+        let http_client = naver_clova_stt_http_client().map_err(|e| {
+            STTError::ConfigurationError(format!("Failed to create HTTP client: {e}"))
+        })?;
 
         info!(
             "NAVER CLOVA STT: Initialized with language={}, sample_rate={}",
@@ -234,6 +259,7 @@ impl BaseSTT for NaverClovaStt {
             result_callback: Arc::new(Mutex::new(None)),
             error_callback: Arc::new(Mutex::new(None)),
             original_config: config,
+            resilience: HttpBreaker::new("naver_clova"),
         })
     }
 
@@ -372,6 +398,13 @@ impl BaseSTT for NaverClovaStt {
     fn get_provider_info(&self) -> &'static str {
         "NAVER CLOVA CSR (네이버 클로바) v1.0"
     }
+
+    /// W-D2: attach the shared per-provider circuit breaker so every NAVER CLOVA session trips
+    /// (and observes) the SAME breaker, uniform with the WS fleet. The REST transport consults
+    /// it before each upstream call and feeds it the unified HTTP status classification.
+    fn set_resilience(&mut self, resilience: crate::core::resilience::ResilienceHandles) {
+        self.resilience.set_handles(resilience);
+    }
 }
 
 #[cfg(test)]
@@ -403,6 +436,30 @@ mod tests {
         assert!(stt.get_config().is_some());
     }
 
+    // W1 keystone: NAVER CLOVA CSR exposes no mappable advanced features, so the meaningful
+    // assertion is that the base config survives through `new_standard` onto the provider config
+    // (credentials parsed, language mapped) even when advanced features are requested (they are
+    // capability gaps, intentionally dropped) — proving the standardized path is wired.
+    #[test]
+    fn test_naver_clova_new_standard_carries_base() {
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
+        let std = StandardSTTConfig {
+            base: make_test_config(),
+            // Advanced features the provider cannot express; must not break the standardized path.
+            features: SttFeatures {
+                diarization: Some(true),
+                interim_results: Some(true),
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+            translation: None,
+        };
+        let stt = NaverClovaStt::new_standard(&std).unwrap();
+        assert_eq!(stt.config.client_id, "test_client_id"); // base api_key survived
+        assert_eq!(stt.config.client_secret, "test_client_secret");
+        assert_eq!(stt.config.language, NaverClovaLanguage::Korean); // base language survived
+    }
+
     #[test]
     fn test_new_invalid_api_key() {
         let config = STTConfig {
@@ -423,6 +480,20 @@ mod tests {
 
         let result = NaverClovaStt::new(config);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_new_rejects_pathological_sample_rate_before_runtime_math() {
+        let config = STTConfig {
+            sample_rate: u32::MAX,
+            ..make_test_config()
+        };
+
+        let err = match NaverClovaStt::new(config) {
+            Ok(_) => panic!("constructor must reject pathological sample rates"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("at most"), "{err}");
     }
 
     #[tokio::test]
@@ -464,6 +535,51 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn naver_clova_stt_redirect_policy_rejects_private_hop() {
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local redirect test server");
+        let addr = listener.local_addr().expect("local addr");
+
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 1024];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 302 Found\r\n",
+                "Location: http://127.0.0.1:9/metadata\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n"
+            );
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await;
+        });
+
+        let stt = NaverClovaStt::new(make_test_config()).expect("construct NAVER CLOVA STT");
+        let err = stt
+            .http_client
+            .get(format!("http://{addr}/start"))
+            .send()
+            .await
+            .expect_err("private redirect target must be rejected");
+        let mut error_chain = err.to_string();
+        let mut source = std::error::Error::source(&err);
+        while let Some(err) = source {
+            error_chain.push_str(": ");
+            error_chain.push_str(&err.to_string());
+            source = err.source();
+        }
+        assert!(error_chain.contains("SSRF protection"), "{error_chain}");
+    }
+
     #[tokio::test]
     async fn test_buffer_accumulation() {
         let config = make_test_config();
@@ -488,7 +604,7 @@ mod tests {
         let stt = NaverClovaStt::new(config).unwrap();
 
         // 16kHz * 2 bytes * 1 channel * 60 seconds = 1,920,000 bytes
-        let expected = 16000 * 2 * 1 * 60;
+        let expected = (16000 * 2) * 60;
         assert_eq!(stt.max_buffer_bytes(), expected);
     }
 
@@ -508,7 +624,7 @@ mod tests {
         let stt = NaverClovaStt::new(config).unwrap();
 
         let pcm_data = vec![0u8; 1000];
-        let wav_data = stt.add_wav_header(&pcm_data);
+        let wav_data = stt.add_wav_header(&pcm_data).expect("valid WAV header");
 
         // WAV header is 44 bytes
         assert_eq!(wav_data.len(), 44 + 1000);

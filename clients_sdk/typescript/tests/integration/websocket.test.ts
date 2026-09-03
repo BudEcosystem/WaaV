@@ -5,7 +5,9 @@
 import { describe, it, expect } from 'vitest';
 import { WebSocket } from 'ws';
 
-const BASE_URL = 'ws://localhost:3001';
+// Env-overridable; normalise http(s) -> ws(s). Default to the live gateway port.
+const RAW_URL = process.env.WAAV_GATEWAY_URL ?? 'ws://127.0.0.1:3001';
+const BASE_URL = RAW_URL.replace(/^http:\/\//, 'ws://').replace(/^https:\/\//, 'wss://').replace(/\/ws$/, '');
 
 describe('WebSocket Endpoint Tests', () => {
   it('should connect to /ws endpoint and receive ready or error', async () => {

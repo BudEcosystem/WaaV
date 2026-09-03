@@ -563,6 +563,85 @@ mod message_helper_tests {
 mod client_tests {
     use super::*;
 
+    // W1 keystone: an advanced feature set on the standardized config must survive through
+    // `new_standard` into the provider-specific config (previously dropped by the flat factory).
+    #[test]
+    fn new_standard_propagates_advanced_features() {
+        use crate::core::stt::standard::{StandardSTTConfig, SttFeatures};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "elevenlabs".into(),
+                api_key: "test-key".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                diarization: Some(true),
+                keyterms: Some(vec!["WaaV".into(), "ElevenLabs".into()]),
+                ..Default::default()
+            },
+            ..StandardSTTConfig::from_base(STTConfig::default())
+        };
+        let stt = ElevenLabsSTT::new_standard(&std).expect("new_standard should succeed");
+        // `ElevenLabsSTT` implements `Drop`, so borrow the config rather than move it out.
+        let cfg = stt.config.as_ref().expect("config should be set");
+        assert_eq!(cfg.enable_diarization, Some(true));
+        assert_eq!(
+            cfg.keyterms,
+            Some(vec!["WaaV".to_string(), "ElevenLabs".to_string()])
+        );
+
+        // Missing key is rejected through the standardized path too.
+        let bad = StandardSTTConfig::from_base(STTConfig {
+            provider: "elevenlabs".into(),
+            api_key: String::new(),
+            ..Default::default()
+        });
+        assert!(ElevenLabsSTT::new_standard(&bad).is_err());
+    }
+
+    #[test]
+    fn test_new_standard_rejects_ssrf_endpoint_override() {
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
+
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let previous = std::env::var_os("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") };
+
+        let mk = |endpoint: &str| {
+            StandardSTTConfig {
+                base: STTConfig {
+                    provider: "elevenlabs".into(),
+                    api_key: "test-key".into(),
+                    language: "en".into(),
+                    sample_rate: 16000,
+                    encoding: "pcm_s16le".into(),
+                    ..Default::default()
+                },
+                features: SttFeatures::default(),
+                extras: ProviderExtras::default(),
+                translation: None,
+            }
+            .with_endpoint_override(endpoint)
+        };
+
+        assert!(ElevenLabsSTT::new_standard(&mk("wss://elevenlabs-proxy.example.com")).is_ok());
+        assert!(ElevenLabsSTT::new_standard(&mk("ws://127.0.0.1:9000")).is_err());
+        assert!(ElevenLabsSTT::new_standard(&mk("file:///tmp/socket")).is_err());
+        assert!(ElevenLabsSTT::new_standard(&mk("https://elevenlabs-proxy.example.com")).is_err());
+
+        // SAFETY: restore the process env before releasing the test env lock.
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", previous);
+            } else {
+                std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+            }
+        }
+    }
+
     #[test]
     fn test_default() {
         let stt = ElevenLabsSTT::default();
@@ -630,6 +709,18 @@ mod client_tests {
     }
 
     #[test]
+    fn test_build_websocket_url_trims_endpoint_override() {
+        let stt = ElevenLabsSTT::default();
+        let config = ElevenLabsSTTConfig {
+            endpoint_override: Some(" wss://elevenlabs-proxy.example.com/ ".to_string()),
+            ..Default::default()
+        };
+
+        let url = stt.build_websocket_url(&config).unwrap();
+        assert!(url.starts_with("wss://elevenlabs-proxy.example.com/v1/speech-to-text/realtime?"));
+    }
+
+    #[test]
     fn test_url_building_us_region() {
         let stt = ElevenLabsSTT::default();
         let config = ElevenLabsSTTConfig {
@@ -656,21 +747,15 @@ mod client_tests {
     }
 
     #[test]
-    fn test_get_host_from_region() {
+    fn test_region_host() {
+        assert_eq!(ElevenLabsRegion::Default.host(), "api.elevenlabs.io");
+        assert_eq!(ElevenLabsRegion::Us.host(), "api.us.elevenlabs.io");
         assert_eq!(
-            ElevenLabsSTT::get_host_from_region(&ElevenLabsRegion::Default),
-            "api.elevenlabs.io"
-        );
-        assert_eq!(
-            ElevenLabsSTT::get_host_from_region(&ElevenLabsRegion::Us),
-            "api.us.elevenlabs.io"
-        );
-        assert_eq!(
-            ElevenLabsSTT::get_host_from_region(&ElevenLabsRegion::Eu),
+            ElevenLabsRegion::Eu.host(),
             "api.eu.residency.elevenlabs.io"
         );
         assert_eq!(
-            ElevenLabsSTT::get_host_from_region(&ElevenLabsRegion::India),
+            ElevenLabsRegion::India.host(),
             "api.in.residency.elevenlabs.io"
         );
     }
@@ -1611,5 +1696,54 @@ mod advanced_features_tests {
         assert!(!msg.has_entities());
         assert!(!msg.has_speaker_turns());
         assert!(msg.has_sensitive_data());
+    }
+}
+
+// =============================================================================
+// W-D1/W-D2: generic ReconnectableStream adoption + shared resilience wiring
+// =============================================================================
+
+mod resilience_wiring_tests {
+    use super::*;
+    use crate::core::resilience::{CircuitState, ResilienceRegistry};
+    use crate::core::stt::standard::StandardSTTConfig;
+
+    /// Build an ElevenLabs session the way the VoiceManager does for a live session: construct
+    /// from a standardized config, then inject the shared resilience handles from the registry.
+    fn session_from_registry(reg: &ResilienceRegistry) -> ElevenLabsSTT {
+        let std = StandardSTTConfig::from_base(STTConfig {
+            provider: "elevenlabs".to_string(),
+            api_key: "test-key".to_string(),
+            ..Default::default()
+        });
+        let mut stt = ElevenLabsSTT::new_standard(&std).expect("build elevenlabs session");
+        stt.set_resilience(reg.handles_for("elevenlabs"));
+        stt
+    }
+
+    #[tokio::test]
+    async fn two_elevenlabs_sessions_share_one_breaker_via_the_generic_supervisor() {
+        // The generic ReconnectableStream now drives ElevenLabs in production; this proves the
+        // shared (CoreState-owned) breaker is what it uses — a trip in one session is visible to
+        // the other (provider-level tripping across sessions).
+        let reg = ResilienceRegistry::new(8);
+        let a = session_from_registry(&reg);
+        let b = session_from_registry(&reg);
+
+        let breaker_a = a.resilience_breaker().expect("A has shared breaker");
+        let breaker_b = b.resilience_breaker().expect("B has shared breaker");
+        assert!(
+            Arc::ptr_eq(breaker_a, breaker_b),
+            "both ElevenLabs sessions must share the one provider breaker"
+        );
+
+        for _ in 0..10 {
+            breaker_a.record_failure();
+        }
+        assert_eq!(breaker_a.state(), CircuitState::Open);
+        assert!(
+            !breaker_b.allow_request(),
+            "a trip in session A must be visible to session B (shared provider breaker)"
+        );
     }
 }

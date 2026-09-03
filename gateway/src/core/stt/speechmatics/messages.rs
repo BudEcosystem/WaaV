@@ -59,11 +59,62 @@ impl AudioFormat {
 }
 
 /// Speaker diarization configuration.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct SpeakerDiarizationConfig {
     /// Maximum number of speakers to detect
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_speakers: Option<u8>,
+    /// Sensitivity of speaker detection (0.0-1.0). Higher detects more distinct speakers.
+    /// Speechmatics `speaker_diarization_config.speaker_sensitivity`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speaker_sensitivity: Option<f32>,
+    /// Bias the diarizer toward attributing ambiguous words to the current speaker.
+    /// Speechmatics `speaker_diarization_config.prefer_current_speaker`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefer_current_speaker: Option<bool>,
+}
+
+/// Conversation/turn-detection configuration.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConversationConfig {
+    /// Seconds of silence after speech before an end-of-turn is triggered.
+    /// Speechmatics `conversation_config.end_of_utterance_silence_trigger`.
+    pub end_of_utterance_silence_trigger: f32,
+}
+
+/// Punctuation behaviour overrides.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct PunctuationOverrides {
+    /// The set of punctuation marks the recognizer is permitted to emit
+    /// (Speechmatics `punctuation_overrides.permitted_marks`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permitted_marks: Option<Vec<String>>,
+    /// Punctuation sensitivity (0.0-1.0). Higher inserts more punctuation.
+    /// Speechmatics `punctuation_overrides.sensitivity`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sensitivity: Option<f32>,
+}
+
+/// A single find-and-replace rule for the transcript.
+#[derive(Debug, Clone, Serialize)]
+pub struct Replacement {
+    /// The literal/pattern to match (Speechmatics `from`).
+    pub from: String,
+    /// The replacement text (Speechmatics `to`).
+    pub to: String,
+}
+
+/// Transcript post-filtering configuration (disfluency removal + word replacements).
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct TranscriptFilteringConfig {
+    /// Remove disfluencies ("uh", "um", false starts) from the transcript.
+    /// Speechmatics `transcript_filtering_config.remove_disfluencies`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remove_disfluencies: Option<bool>,
+    /// Word/phrase find-and-replace rules.
+    /// Speechmatics `transcript_filtering_config.replacements`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replacements: Option<Vec<Replacement>>,
 }
 
 /// Custom vocabulary word with optional phonetic hints.
@@ -111,7 +162,7 @@ pub struct TranscriptionConfig {
     /// Enable entity recognition
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enable_entities: Option<bool>,
-    /// Diarization mode: "none", "speaker", "channel"
+    /// Diarization mode: "none", "speaker", "channel", "channel_and_speaker"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diarization: Option<String>,
     /// Speaker diarization settings
@@ -120,6 +171,24 @@ pub struct TranscriptionConfig {
     /// Custom vocabulary
     #[serde(skip_serializing_if = "Option::is_none")]
     pub additional_vocab: Option<Vec<AdditionalVocabWord>>,
+    /// Conversation/turn-detection configuration (end-of-utterance silence trigger)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversation_config: Option<ConversationConfig>,
+    /// Transcript post-filtering (disfluency removal + find-and-replace)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transcript_filtering_config: Option<TranscriptFilteringConfig>,
+    /// Punctuation overrides (permitted marks + sensitivity)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub punctuation_overrides: Option<PunctuationOverrides>,
+    /// Output locale (regional spelling/formatting variant, e.g. "en-US")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_locale: Option<String>,
+    /// Domain language pack (e.g. "finance", "bilingual-en")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    /// Max-delay mode: "flexible" or "fixed"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_delay_mode: Option<String>,
 }
 
 impl TranscriptionConfig {
@@ -134,6 +203,12 @@ impl TranscriptionConfig {
             diarization: None,
             speaker_diarization_config: None,
             additional_vocab: None,
+            conversation_config: None,
+            transcript_filtering_config: None,
+            punctuation_overrides: None,
+            output_locale: None,
+            domain: None,
+            max_delay_mode: None,
         }
     }
 
@@ -161,6 +236,7 @@ impl TranscriptionConfig {
         if let Some(max) = max_speakers {
             self.speaker_diarization_config = Some(SpeakerDiarizationConfig {
                 max_speakers: Some(max.clamp(1, 20)),
+                ..Default::default()
             });
         }
         self
@@ -171,6 +247,76 @@ impl TranscriptionConfig {
         self.additional_vocab = Some(words.into_iter().map(AdditionalVocabWord::new).collect());
         self
     }
+
+    /// Add custom vocabulary as already-structured words (carrying optional `sounds_like` hints).
+    pub fn with_vocab_words(mut self, words: Vec<AdditionalVocabWord>) -> Self {
+        if !words.is_empty() {
+            self.additional_vocab = Some(words);
+        }
+        self
+    }
+
+    /// Set the diarization mode verbatim ("speaker", "channel", "channel_and_speaker", "none").
+    pub fn with_diarization_mode(mut self, mode: impl Into<String>) -> Self {
+        self.diarization = Some(mode.into());
+        self
+    }
+
+    /// Set the speaker diarization sub-config (sensitivity / prefer-current-speaker / max-speakers).
+    pub fn with_speaker_diarization_config(mut self, cfg: SpeakerDiarizationConfig) -> Self {
+        self.speaker_diarization_config = Some(cfg);
+        self
+    }
+
+    /// Set the end-of-utterance silence trigger (seconds) — turn detection.
+    pub fn with_end_of_utterance_silence_trigger(mut self, seconds: f32) -> Self {
+        self.conversation_config = Some(ConversationConfig {
+            end_of_utterance_silence_trigger: seconds,
+        });
+        self
+    }
+
+    /// Set the transcript filtering config (disfluency removal + replacements).
+    pub fn with_transcript_filtering_config(mut self, cfg: TranscriptFilteringConfig) -> Self {
+        self.transcript_filtering_config = Some(cfg);
+        self
+    }
+
+    /// Set the punctuation overrides (permitted marks + sensitivity).
+    pub fn with_punctuation_overrides(mut self, overrides: PunctuationOverrides) -> Self {
+        self.punctuation_overrides = Some(overrides);
+        self
+    }
+
+    /// Set the output locale (regional variant).
+    pub fn with_output_locale(mut self, locale: impl Into<String>) -> Self {
+        self.output_locale = Some(locale.into());
+        self
+    }
+
+    /// Set the domain language pack.
+    pub fn with_domain(mut self, domain: impl Into<String>) -> Self {
+        self.domain = Some(domain.into());
+        self
+    }
+
+    /// Set the max-delay mode ("flexible" | "fixed").
+    pub fn with_max_delay_mode(mut self, mode: impl Into<String>) -> Self {
+        self.max_delay_mode = Some(mode.into());
+        self
+    }
+}
+
+/// P5 translation config — the `translation_config` PEER object (a sibling of
+/// `transcription_config` on `StartRecognition`, NOT nested inside it). Speechmatics emits
+/// `AddTranslation`/`AddPartialTranslation` messages for these targets.
+#[derive(Debug, Clone, Serialize)]
+pub struct SpeechmaticsTranslationConfig {
+    /// Target languages (ISO-639-1). Speechmatics accepts at most 5.
+    pub target_languages: Vec<String>,
+    /// Emit partial (interim) translations.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enable_partials: Option<bool>,
 }
 
 /// StartRecognition message to initialize a transcription session.
@@ -182,6 +328,10 @@ pub struct StartRecognitionMessage {
     pub audio_format: AudioFormat,
     /// Transcription configuration
     pub transcription_config: TranscriptionConfig,
+    /// P5 translation: the `translation_config` PEER object (sibling of `transcription_config`).
+    /// Omitted when no translation was requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub translation_config: Option<SpeechmaticsTranslationConfig>,
 }
 
 impl StartRecognitionMessage {
@@ -195,6 +345,7 @@ impl StartRecognitionMessage {
             message: "StartRecognition".to_string(),
             audio_format: AudioFormat::raw(encoding, sample_rate),
             transcription_config: TranscriptionConfig::new(language),
+            translation_config: None,
         }
     }
 
@@ -207,7 +358,23 @@ impl StartRecognitionMessage {
             message: "StartRecognition".to_string(),
             audio_format,
             transcription_config,
+            translation_config: None,
         }
+    }
+
+    /// P5: attach the `translation_config` peer object (no-op when `target_languages` is empty).
+    pub fn with_translation(
+        mut self,
+        target_languages: Vec<String>,
+        enable_partials: Option<bool>,
+    ) -> Self {
+        if !target_languages.is_empty() {
+            self.translation_config = Some(SpeechmaticsTranslationConfig {
+                target_languages,
+                enable_partials,
+            });
+        }
+        self
     }
 }
 
@@ -381,6 +548,62 @@ impl AddTranscriptMessage {
     /// Get words only (excluding punctuation)
     pub fn words(&self) -> impl Iterator<Item = &TranscriptResult> {
         self.results.iter().filter(|r| r.is_word())
+    }
+}
+
+/// One translated segment within an `AddTranslation`/`AddPartialTranslation` frame.
+///
+/// Speechmatics emits a `results` array per target language; each element carries
+/// the translated `content` plus timing. The gateway concatenates the `content`
+/// values (in order) into the single translated string for that language.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TranslationResult {
+    /// Start time in seconds from audio start.
+    #[serde(default)]
+    pub start_time: f64,
+    /// End time in seconds from audio start.
+    #[serde(default)]
+    pub end_time: f64,
+    /// The translated text fragment for this segment.
+    #[serde(default)]
+    pub content: String,
+    /// Speaker label (for diarization), when present.
+    #[serde(default)]
+    pub speaker: Option<String>,
+}
+
+/// `AddTranslation` (final) / `AddPartialTranslation` (interim) message.
+///
+/// The `language` field is the ISO-639-1 target code Speechmatics translated to
+/// (matching what the gateway requested via `translation_config.target_languages`).
+/// The translated string is `results[].content` joined in order. P5.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AddTranslationMessage {
+    /// Message type identifier ("AddTranslation" or "AddPartialTranslation").
+    pub message: String,
+    /// API format version.
+    #[serde(default)]
+    pub format: Option<String>,
+    /// The target language this translation is in (ISO-639-1, e.g. "de", "es").
+    pub language: String,
+    /// Translated result segments.
+    #[serde(default)]
+    pub results: Vec<TranslationResult>,
+}
+
+impl AddTranslationMessage {
+    /// The full translated text for this frame (`results[].content` joined).
+    pub fn text(&self) -> String {
+        self.results
+            .iter()
+            .map(|r| r.content.as_str())
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    /// `true` for `AddPartialTranslation` (interim), `false` for `AddTranslation` (final).
+    pub fn is_partial(&self) -> bool {
+        self.message == "AddPartialTranslation"
     }
 }
 

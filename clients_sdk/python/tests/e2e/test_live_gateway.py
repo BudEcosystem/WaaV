@@ -2,7 +2,7 @@
 End-to-end live tests against a running WaaV Gateway.
 
 These tests require:
-  - Gateway running on localhost:3001
+  - Gateway running at ``WAAV_GATEWAY_URL`` (default ws://127.0.0.1:3009)
   - Valid Deepgram API key configured in gateway .env
   - Real audio fixtures in gateway/tests/live_testing/audio/
 
@@ -35,8 +35,10 @@ from bud_waav.ws.session import ReconnectConfig
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-BASE_URL = "http://localhost:3001"
-WS_URL = "ws://localhost:3001/ws"
+# Env-configurable gateway URL (plan P0 item 5); default to the live port 3009.
+_WS_BASE = os.environ.get("WAAV_GATEWAY_URL", "ws://127.0.0.1:3009").rstrip("/")
+BASE_URL = _WS_BASE.replace("ws://", "http://").replace("wss://", "https://")
+WS_URL = f"{_WS_BASE}/ws"
 AUDIO_DIR = Path(__file__).resolve().parents[4] / "gateway" / "tests" / "live_testing" / "audio"
 
 # Timeouts
@@ -74,7 +76,7 @@ def _check_audio() -> bool:
     return (AUDIO_DIR / "cmu_bdl_arctic_a0001.wav").exists()
 
 
-skip_no_gateway = pytest.mark.skipif(not _check_gateway(), reason="Gateway not running on localhost:3001")
+skip_no_gateway = pytest.mark.skipif(not _check_gateway(), reason=f"Gateway not running at {BASE_URL}")
 skip_no_audio = pytest.mark.skipif(not _check_audio(), reason="Audio fixtures not found")
 
 
@@ -163,7 +165,8 @@ class TestRESTEndpoints:
             try:
                 result = await client.health()
                 assert result is not None
-                assert result.get("status") == "OK"
+                # Gateway returns lowercase "ok" (messages.rs); accept any case.
+                assert (result.get("status") or "").lower() == "ok"
                 print(f"  Health: {result}")
                 break
             except APIError as e:
@@ -766,7 +769,7 @@ class TestBudClientIntegration:
             for attempt in range(3):
                 try:
                     health = await bud.health()
-                    assert health.get("status") == "OK"
+                    assert (health.get("status") or "").lower() == "ok"
                     break
                 except APIError as e:
                     if "429" in str(e) and attempt < 2:

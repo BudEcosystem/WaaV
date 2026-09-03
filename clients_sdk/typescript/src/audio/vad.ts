@@ -13,11 +13,40 @@ export interface VADConfig {
   sampleRate?: number;
   /** Frame size in milliseconds (default: 30) */
   frameSizeMs?: number;
-  /** Energy threshold in dB for speech detection (default: -35) */
+  /**
+   * Single energy threshold in dB (default: -35). LEGACY/back-compat: when the
+   * D3b hysteresis thresholds (`startThresholdDb`/`stopThresholdDb`) are not set,
+   * this seeds them — start at this level, stop ~6dB below — so existing callers
+   * get hysteresis for free. An explicit start/stop pair overrides it.
+   */
   energyThresholdDb?: number;
-  /** Minimum speech duration in ms to trigger (default: 250) */
+  /**
+   * D3b hysteresis — energy (dB) the SMOOTHED level must EXCEED to enter speech
+   * (the higher rail). Defaults to `energyThresholdDb`. Keeping this above
+   * `stopThresholdDb` stops a noisy room hovering at one threshold from rapidly
+   * mis-segmenting (the single-threshold bug). Mirrors Pipecat min_volume/start.
+   */
+  startThresholdDb?: number;
+  /**
+   * D3b hysteresis — energy (dB) the SMOOTHED level must FALL BELOW to leave
+   * speech (the lower rail). Defaults to `energyThresholdDb` − `hysteresisDb`.
+   */
+  stopThresholdDb?: number;
+  /**
+   * D3b hysteresis gap in dB between the start and stop rails when they are
+   * derived from the single `energyThresholdDb` (default: 6). Wider = more
+   * resistant to flapping in noise; narrower = snappier.
+   */
+  hysteresisDb?: number;
+  /**
+   * D3b absolute minimum volume floor (linear RMS 0..1, default 0). Below this
+   * a frame is NEVER speech regardless of the dB thresholds — a hard noise gate
+   * (Pipecat `min_volume`). 0 disables the floor.
+   */
+  minVolume?: number;
+  /** Minimum speech duration in ms to trigger (default: 250). ≈ Pipecat start_secs. */
   minSpeechDurationMs?: number;
-  /** Minimum silence duration in ms to end speech (default: 500) */
+  /** Minimum silence duration in ms to end speech (default: 500). ≈ Pipecat stop_secs. */
   minSilenceDurationMs?: number;
   /** Smoothing factor for energy calculation (default: 0.95) */
   smoothingFactor?: number;
@@ -77,10 +106,23 @@ export class VAD {
   private frameSizeSamples: number;
 
   constructor(config: VADConfig = {}) {
+    const energyThresholdDb = config.energyThresholdDb ?? -35;
+    const hysteresisDb = config.hysteresisDb ?? 6;
+    // D3b: derive the two hysteresis rails. Explicit start/stop win; otherwise
+    // start at the single threshold and stop `hysteresisDb` below it. Guard
+    // against an inverted pair (stop must not exceed start).
+    const startThresholdDb = config.startThresholdDb ?? energyThresholdDb;
+    let stopThresholdDb = config.stopThresholdDb ?? energyThresholdDb - hysteresisDb;
+    if (stopThresholdDb > startThresholdDb) stopThresholdDb = startThresholdDb;
+
     this.config = {
       sampleRate: config.sampleRate ?? 16000,
       frameSizeMs: config.frameSizeMs ?? 30,
-      energyThresholdDb: config.energyThresholdDb ?? -35,
+      energyThresholdDb,
+      startThresholdDb,
+      stopThresholdDb,
+      hysteresisDb,
+      minVolume: config.minVolume ?? 0,
       minSpeechDurationMs: config.minSpeechDurationMs ?? 250,
       minSilenceDurationMs: config.minSilenceDurationMs ?? 500,
       smoothingFactor: config.smoothingFactor ?? 0.95,
@@ -120,8 +162,17 @@ export class VAD {
                           (1 - this.config.smoothingFactor) * rms;
     const smoothedEnergyDb = AudioProcessor.linearToDb(this.smoothedEnergy);
 
-    // Determine if this frame is speech or silence
-    const isSpeechFrame = smoothedEnergyDb > this.config.energyThresholdDb;
+    // D3b HYSTERESIS: use the HIGHER `startThresholdDb` to ENTER speech (when in
+    // silence/uncertain) and the LOWER `stopThresholdDb` to STAY in speech (when
+    // already speaking). The gap between them stops a noisy room whose level
+    // hovers near one threshold from rapidly flip-flopping start/stop — the
+    // single-threshold bug. A `minVolume` floor hard-gates sub-floor frames to
+    // never-speech regardless of dB.
+    const activeThresholdDb = this.state === 'speech'
+      ? this.config.stopThresholdDb
+      : this.config.startThresholdDb;
+    const aboveFloor = this.config.minVolume <= 0 || this.smoothedEnergy >= this.config.minVolume;
+    const isSpeechFrame = aboveFloor && smoothedEnergyDb > activeThresholdDb;
 
     const now = Date.now();
     let speechStart = false;
@@ -273,18 +324,36 @@ export class VAD {
   }
 
   /**
-   * Update threshold dynamically
-   * @param thresholdDb New threshold in dB
+   * Update threshold dynamically. D3b: re-derives BOTH hysteresis rails — start
+   * at `thresholdDb`, stop `hysteresisDb` below it — so dynamic threshold tuning
+   * keeps the anti-flap gap.
+   * @param thresholdDb New (start) threshold in dB
    */
   setThreshold(thresholdDb: number): void {
     this.config.energyThresholdDb = thresholdDb;
+    this.config.startThresholdDb = thresholdDb;
+    this.config.stopThresholdDb = thresholdDb - this.config.hysteresisDb;
   }
 
   /**
-   * Get current threshold
+   * Set the D3b hysteresis rails explicitly (start must be ≥ stop; an inverted
+   * pair is clamped so stop = start).
+   */
+  setHysteresis(startThresholdDb: number, stopThresholdDb: number): void {
+    this.config.startThresholdDb = startThresholdDb;
+    this.config.stopThresholdDb = Math.min(stopThresholdDb, startThresholdDb);
+  }
+
+  /**
+   * Get current (start) threshold in dB.
    */
   getThreshold(): number {
-    return this.config.energyThresholdDb;
+    return this.config.startThresholdDb;
+  }
+
+  /** Get the D3b hysteresis rails `{ startDb, stopDb }`. */
+  getHysteresis(): { startDb: number; stopDb: number } {
+    return { startDb: this.config.startThresholdDb, stopDb: this.config.stopThresholdDb };
   }
 
   /**

@@ -420,6 +420,7 @@ pub mod audio_handler;
 pub mod command_handler;
 pub mod config;
 pub mod config_handler;
+pub mod config_lint;
 pub mod error;
 pub mod handler;
 pub mod messages;
@@ -430,7 +431,9 @@ pub mod state;
 mod tests;
 
 // Re-export commonly used items
-pub use config::{LiveKitWebSocketConfig, STTWebSocketConfig, TTSWebSocketConfig};
+pub use config::{
+    ConversationWebSocketConfig, LiveKitWebSocketConfig, STTWebSocketConfig, TTSWebSocketConfig,
+};
 pub use handler::ws_voice_handler;
 pub use messages::{IncomingMessage, OutgoingMessage, ParticipantDisconnectedInfo, UnifiedMessage};
 pub use state::ConnectionState;

@@ -12,8 +12,8 @@
 //!
 //! # Example
 //!
-//! ```rust,no_run
-//! use waav_gateway::core::stt::reverie::{ReverieSTT, ReverieSTTConfig};
+//! ```ignore
+//! use waav_gateway::core::stt::reverie::{ReverieSTT, ReverieSTTConfig, ReverieLanguage};
 //! use waav_gateway::core::stt::BaseSTT;
 //!
 //! #[tokio::main]

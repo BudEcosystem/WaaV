@@ -106,10 +106,10 @@ impl PhonexiaResult {
         }
 
         // Try n_best (get first alternative)
-        if let Some(ref n_best) = self.n_best {
-            if let Some(first) = n_best.first() {
-                return first.text.clone();
-            }
+        if let Some(ref n_best) = self.n_best
+            && let Some(first) = n_best.first()
+        {
+            return first.text.clone();
         }
 
         // Fall back to segments
@@ -127,10 +127,10 @@ impl PhonexiaResult {
             return one_best.average_confidence();
         }
 
-        if let Some(ref n_best) = self.n_best {
-            if let Some(first) = n_best.first() {
-                return first.confidence.unwrap_or(0.0);
-            }
+        if let Some(ref n_best) = self.n_best
+            && let Some(first) = n_best.first()
+        {
+            return first.confidence.unwrap_or(0.0);
         }
 
         let words: Vec<&TranscriptWord> =

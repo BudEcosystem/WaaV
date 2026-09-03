@@ -13,6 +13,7 @@ use tokio_tungstenite::{
 };
 use tracing::{debug, error, info, trace, warn};
 
+use crate::config::utils::parse_bool;
 use crate::core::stt::{
     BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback, STTStats,
 };
@@ -25,10 +26,26 @@ use super::messages::{PhonexiaCloseCode, PhonexiaErrorCode, ServerMessage};
 // Type Aliases
 // =============================================================================
 
+const WAAV_PHONEXIA_ALLOW_UNVERIFIED_ENV: &str = "WAAV_PHONEXIA_ALLOW_UNVERIFIED";
+
 type WebSocketSink = futures_util::stream::SplitSink<
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     Message,
 >;
+
+fn phonexia_allow_unverified_from_env() -> Result<bool, STTError> {
+    match std::env::var(WAAV_PHONEXIA_ALLOW_UNVERIFIED_ENV) {
+        Ok(value) => parse_bool(&value).ok_or_else(|| {
+            STTError::ConfigurationError(format!(
+                "{WAAV_PHONEXIA_ALLOW_UNVERIFIED_ENV} must be a boolean (true/false, 1/0, yes/no), got {value:?}"
+            ))
+        }),
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Err(std::env::VarError::NotUnicode(_)) => Err(STTError::ConfigurationError(format!(
+            "{WAAV_PHONEXIA_ALLOW_UNVERIFIED_ENV} must be valid UTF-8 boolean text"
+        ))),
+    }
+}
 
 // =============================================================================
 // Phonexia STT Client
@@ -78,6 +95,24 @@ impl PhonexiaSTT {
             error_callback: Arc::new(RwLock::new(None)),
             stats: Arc::new(RwLock::new(STTStats::default())),
         })
+    }
+
+    /// W1 keystone — construct directly from the standardized config so the advanced features
+    /// Phonexia can express (per-word timestamps, key terms / phrase hints) are honored
+    /// END-TO-END. Mirrors `DeepgramSTT::new_standard`: validate the credential, then build the
+    /// provider from the standardized->provider config mapping (`PhonexiaSTTConfig::from_standard`).
+    pub fn new_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        // Phonexia is on-premises: the server URL is carried in the api_key field.
+        if std.base.api_key.is_empty() {
+            return Err(STTError::ConfigurationError(
+                "Phonexia server URL is required (carried in the api_key field)".to_string(),
+            ));
+        }
+        Self::from_phonexia_config(
+            crate::core::stt::phonexia::config::PhonexiaSTTConfig::from_standard(std)?,
+        )
     }
 
     /// Get the stream ID
@@ -236,6 +271,22 @@ impl BaseSTT for PhonexiaSTT {
         if self.connected.load(Ordering::Acquire) {
             warn!("Phonexia: Already connected");
             return Ok(());
+        }
+
+        // FAIL CLOSED (BRUTAL_REVIEW.md "Phonexia" / PRODUCTION_PLAN.md W3): the real Phonexia
+        // Speech Platform 4 exposes gRPC + a REST async-job API, NOT the generic `/ws` +
+        // `X-SessionID` protocol implemented here. That protocol is unverified against any real
+        // Phonexia server, so we refuse by default rather than silently "succeed" against a
+        // fabricated wire format. Operators who have a server matching this protocol can opt in
+        // with WAAV_PHONEXIA_ALLOW_UNVERIFIED=1.
+        if !phonexia_allow_unverified_from_env()? {
+            return Err(STTError::ConfigurationError(
+                "Phonexia STT is not validated against the real Phonexia API (gRPC/REST). It is \
+                 disabled by default to avoid a fabricated-protocol connection. Set \
+                 WAAV_PHONEXIA_ALLOW_UNVERIFIED=1 only if your server matches the implemented \
+                 WebSocket protocol. Tracked by PRODUCTION_PLAN.md W3."
+                    .to_string(),
+            ));
         }
 
         info!(
@@ -475,8 +526,31 @@ impl BaseSTT for PhonexiaSTT {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::future::Future;
     use std::pin::Pin;
+
+    struct PhonexiaAllowUnverifiedEnvGuard(Option<String>);
+
+    impl Drop for PhonexiaAllowUnverifiedEnvGuard {
+        fn drop(&mut self) {
+            match self.0.as_deref() {
+                Some(value) => unsafe {
+                    std::env::set_var(WAAV_PHONEXIA_ALLOW_UNVERIFIED_ENV, value)
+                },
+                None => unsafe { std::env::remove_var(WAAV_PHONEXIA_ALLOW_UNVERIFIED_ENV) },
+            }
+        }
+    }
+
+    fn set_phonexia_allow_unverified_env(value: Option<&str>) -> PhonexiaAllowUnverifiedEnvGuard {
+        let previous = std::env::var(WAAV_PHONEXIA_ALLOW_UNVERIFIED_ENV).ok();
+        match value {
+            Some(value) => unsafe { std::env::set_var(WAAV_PHONEXIA_ALLOW_UNVERIFIED_ENV, value) },
+            None => unsafe { std::env::remove_var(WAAV_PHONEXIA_ALLOW_UNVERIFIED_ENV) },
+        }
+        PhonexiaAllowUnverifiedEnvGuard(previous)
+    }
 
     fn create_test_config() -> STTConfig {
         STTConfig {
@@ -496,6 +570,67 @@ mod tests {
         let config = create_test_config();
         let result = PhonexiaSTT::new(config);
         assert!(result.is_ok());
+    }
+
+    // Phonexia is fail-closed by default: its WS protocol is unverified against the real
+    // Phonexia gRPC/REST API, so connect() must refuse with a clear error unless explicitly
+    // opted in. (Prevents shipping a fabricated-protocol "success".)
+    #[tokio::test]
+    #[serial]
+    async fn test_phonexia_connect_fails_closed_by_default() {
+        let _guard = set_phonexia_allow_unverified_env(None);
+
+        let mut stt = PhonexiaSTT::new(create_test_config()).unwrap();
+        let err = stt
+            .connect()
+            .await
+            .expect_err("must fail closed by default");
+        assert!(
+            err.to_string()
+                .contains("not validated against the real Phonexia"),
+            "expected fail-closed message, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_phonexia_connect_explicit_false_fails_closed() {
+        let _guard = set_phonexia_allow_unverified_env(Some("0"));
+
+        let mut stt = PhonexiaSTT::new(create_test_config()).unwrap();
+        let err = stt
+            .connect()
+            .await
+            .expect_err("explicit false must keep Phonexia disabled");
+        assert!(
+            err.to_string()
+                .contains("not validated against the real Phonexia"),
+            "expected fail-closed message, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_phonexia_connect_malformed_allow_override_rejected() {
+        let _guard = set_phonexia_allow_unverified_env(Some("sure"));
+
+        let mut stt = PhonexiaSTT::new(create_test_config()).unwrap();
+        let err = stt
+            .connect()
+            .await
+            .expect_err("malformed explicit override must fail config");
+        assert!(
+            err.to_string().contains(WAAV_PHONEXIA_ALLOW_UNVERIFIED_ENV),
+            "error should name env var: {err}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_phonexia_allow_unverified_accepts_explicit_true() {
+        let _guard = set_phonexia_allow_unverified_env(Some("yes"));
+
+        assert!(phonexia_allow_unverified_from_env().unwrap());
     }
 
     #[test]
@@ -518,6 +653,42 @@ mod tests {
 
         let result = PhonexiaSTT::from_phonexia_config(config);
         assert!(result.is_ok());
+    }
+
+    // W1 keystone: advanced features Phonexia can express (word_timestamps -> enable_timestamps,
+    // keyterms -> preferred_phrases) survive through the provider-struct `new_standard` method to
+    // the provider-specific config — proving the standardized path is honored end-to-end.
+    #[test]
+    fn test_phonexia_new_standard_unlocks_advanced_features() {
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "phonexia".into(),
+                api_key: "https://test-phonexia.example.com".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                word_timestamps: Some(true),
+                keyterms: Some(vec!["WaaV".into(), "Phonexia".into()]),
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+            translation: None,
+        };
+        let stt = PhonexiaSTT::new_standard(&std).expect("new_standard must succeed");
+        assert!(stt.phonexia_config.enable_timestamps); // word_timestamps
+        assert_eq!(
+            stt.phonexia_config.preferred_phrases,
+            vec!["WaaV".to_string(), "Phonexia".to_string()]
+        ); // keyterms
+
+        // Missing server URL (carried in api_key) is rejected through the standardized path too.
+        let bad = StandardSTTConfig::from_base(STTConfig {
+            provider: "phonexia".into(),
+            api_key: String::new(),
+            ..Default::default()
+        });
+        assert!(PhonexiaSTT::new_standard(&bad).is_err());
     }
 
     #[test]

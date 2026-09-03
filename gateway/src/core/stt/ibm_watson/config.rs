@@ -7,6 +7,22 @@ use crate::core::stt::base::STTConfig;
 use serde::{Deserialize, Serialize};
 use url::form_urlencoded;
 
+fn validate_ibm_stt_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    let validation_url;
+    let endpoint = if endpoint.contains("://") {
+        endpoint
+    } else {
+        validation_url = format!("http://{endpoint}");
+        validation_url.as_str()
+    };
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -16,6 +32,14 @@ pub const DEFAULT_MODEL: &str = "en-US_Multimedia";
 
 /// IBM Watson IAM authentication endpoint.
 pub const IBM_IAM_URL: &str = "https://iam.cloud.ibm.com/identity/token";
+
+/// Strip any scheme prefix and trailing slash from an `endpoint_override`, returning the bare
+/// `host[:port]` authority. IBM's override drives BOTH an HTTP IAM POST and a `ws://` recognize dial
+/// against the same mock host, so each builder re-applies its own scheme to this authority.
+fn override_authority(ov: &str) -> &str {
+    let ov = ov.trim_end_matches('/');
+    ov.split_once("://").map(|(_, h)| h).unwrap_or(ov)
+}
 
 /// Default inactivity timeout in seconds (30 seconds).
 pub const DEFAULT_INACTIVITY_TIMEOUT: i32 = 30;
@@ -103,8 +127,10 @@ impl std::fmt::Display for IbmRegion {
 /// - Telephony: Optimized for telephone audio (8kHz)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[derive(Default)]
 pub enum IbmModel {
     // English models
+    #[default]
     EnUsMultimedia,
     EnUsTelephony,
     EnGbMultimedia,
@@ -230,12 +256,6 @@ impl IbmModel {
     }
 }
 
-impl Default for IbmModel {
-    fn default() -> Self {
-        Self::EnUsMultimedia
-    }
-}
-
 impl std::fmt::Display for IbmModel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.as_str())
@@ -303,6 +323,12 @@ pub struct IbmWatsonSTTConfig {
     /// Found in IBM Cloud service credentials.
     pub instance_id: String,
 
+    /// Carried from the standardized `endpoint_override` — rewrites BOTH the IAM token host and the
+    /// WS recognize host to an in-repo mock/proxy for credential-free e2e (paths preserved). `None`
+    /// uses the production IBM hosts.
+    #[serde(default)]
+    pub endpoint_override: Option<String>,
+
     /// Speech recognition model to use.
     #[serde(default)]
     pub model: IbmModel,
@@ -369,6 +395,57 @@ pub struct IbmWatsonSTTConfig {
 
     /// Character insertion bias (-1.0 to 1.0).
     pub character_insertion_bias: Option<f32>,
+
+    // ---- Keyword spotting / N-best / metrics / model knobs (W-feature wiring) ----
+    /// Keyword spotting: phrases to detect in the audio (IBM `keywords` array). Sourced from the
+    /// canonical typed `keyterms` feature.
+    #[serde(default)]
+    pub keywords: Vec<String>,
+
+    /// Keyword-spotting confidence threshold, 0.0–1.0 (IBM `keywords_threshold`). When set,
+    /// keyword spotting is enabled. Extras passthrough.
+    pub keywords_threshold: Option<f32>,
+
+    /// Maximum N-best alternative transcripts to return (IBM `max_alternatives`). Sourced from the
+    /// canonical typed `alternatives` feature.
+    pub max_alternatives: Option<u32>,
+
+    /// Word-alternatives ("confusion network") confidence threshold, 0.0–1.0
+    /// (IBM `word_alternatives_threshold`). Extras passthrough.
+    pub word_alternatives_threshold: Option<f32>,
+
+    /// Custom language-model interpolation weight, 0.0–1.0 (IBM `customization_weight`).
+    /// Extras passthrough.
+    pub customization_weight: Option<f32>,
+
+    /// Pin a specific base-model version for reproducible results (IBM `base_model_version`).
+    /// Emitted as a URL query parameter. Extras passthrough.
+    pub base_model_version: Option<String>,
+
+    /// Grammar name for FSM/constrained recognition, used with a custom language model
+    /// (IBM `grammar_name`). Extras passthrough.
+    pub grammar_name: Option<String>,
+
+    /// Return audio-quality metrics in the response (IBM `audio_metrics`). Extras passthrough.
+    #[serde(default)]
+    pub audio_metrics: bool,
+
+    /// Return real-time processing metrics during recognition (IBM `processing_metrics`).
+    /// Extras passthrough.
+    #[serde(default)]
+    pub processing_metrics: bool,
+
+    /// Interval (seconds) between processing-metrics events (IBM `processing_metrics_interval`).
+    /// Extras passthrough.
+    pub processing_metrics_interval: Option<f32>,
+
+    /// Smart-formatting version to apply (IBM `smart_formatting_version`). Extras passthrough.
+    pub smart_formatting_version: Option<u32>,
+
+    /// Emit a discrete begin-of-speech event when speech is first detected
+    /// (IBM `speech_begin_event`). Sourced from the typed `speech_begin_event` feature.
+    #[serde(default)]
+    pub speech_begin_event: bool,
 }
 
 fn default_interim_results() -> bool {
@@ -403,36 +480,142 @@ impl Default for IbmWatsonSTTConfig {
             split_transcript_at_phrase_end: false,
             low_latency: false,
             character_insertion_bias: None,
+            keywords: Vec::new(),
+            keywords_threshold: None,
+            max_alternatives: None,
+            word_alternatives_threshold: None,
+            customization_weight: None,
+            base_model_version: None,
+            grammar_name: None,
+            audio_metrics: false,
+            processing_metrics: false,
+            processing_metrics_interval: None,
+            smart_formatting_version: None,
+            speech_begin_event: false,
+            endpoint_override: None,
         }
     }
 }
 
 impl IbmWatsonSTTConfig {
+    /// Build from the standardized config (W1 keystone — 5th provider). IBM Watson has a rich
+    /// boolean surface, so this maps 6 features at once. Also demonstrates the `provider_extras`
+    /// passthrough: IBM's `instance_id` (not a standard field) is read from extras.
+    pub fn from_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, String> {
+        let f = &std.features;
+        let instance_id = std
+            .extras
+            .0
+            .get("instance_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        let mut cfg = Self::from_base(std.base.clone(), instance_id);
+        if let Some(i) = f.interim_results {
+            cfg.interim_results = i;
+        }
+        if let Some(w) = f.word_timestamps {
+            cfg.word_timestamps = w;
+        }
+        if let Some(d) = f.diarization {
+            cfg.speaker_labels = d;
+        }
+        if let Some(s) = f.smart_format {
+            cfg.smart_formatting = s;
+        }
+        if let Some(p) = f.profanity_filter {
+            cfg.profanity_filter = p;
+        }
+        if let Some(r) = &f.redaction {
+            cfg.redaction = !r.is_empty();
+        }
+        // Keyword spotting: canonical typed `keyterms` → IBM `keywords` array.
+        if let Some(k) = &f.keyterms {
+            cfg.keywords = k.clone();
+        }
+        // N-best: canonical typed `alternatives` → IBM `max_alternatives`.
+        if let Some(n) = f.alternatives {
+            cfg.max_alternatives = Some(n as u32);
+        }
+        // Begin-of-speech event: typed `speech_begin_event` → IBM `speech_begin_event`.
+        if let Some(b) = f.speech_begin_event {
+            cfg.speech_begin_event = b;
+        }
+
+        // Provider-specific knobs with no shared typed vocabulary — read from `extras` passthrough.
+        let e = &std.extras.0;
+        if let Some(v) = e.get("keywords_threshold").and_then(|v| v.as_f64()) {
+            cfg.keywords_threshold = Some(v as f32);
+        }
+        if let Some(v) = e
+            .get("word_alternatives_threshold")
+            .and_then(|v| v.as_f64())
+        {
+            cfg.word_alternatives_threshold = Some(v as f32);
+        }
+        if let Some(v) = e.get("customization_weight").and_then(|v| v.as_f64()) {
+            cfg.customization_weight = Some(v as f32);
+        }
+        if let Some(v) = e.get("base_model_version").and_then(|v| v.as_str()) {
+            cfg.base_model_version = Some(v.to_string());
+        }
+        if let Some(v) = e.get("grammar_name").and_then(|v| v.as_str()) {
+            cfg.grammar_name = Some(v.to_string());
+        }
+        if let Some(v) = e.get("audio_metrics").and_then(|v| v.as_bool()) {
+            cfg.audio_metrics = v;
+        }
+        if let Some(v) = e.get("processing_metrics").and_then(|v| v.as_bool()) {
+            cfg.processing_metrics = v;
+        }
+        if let Some(v) = e
+            .get("processing_metrics_interval")
+            .and_then(|v| v.as_f64())
+        {
+            cfg.processing_metrics_interval = Some(v as f32);
+        }
+        if let Some(v) = e.get("smart_formatting_version").and_then(|v| v.as_u64()) {
+            cfg.smart_formatting_version = Some(v as u32);
+        }
+        cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
+        cfg.validate_endpoint_override()?;
+        Ok(cfg)
+    }
+
     /// Create IBM Watson STT configuration from base STT config.
     ///
     /// # Arguments
     /// * `base` - Base STT configuration
     /// * `instance_id` - IBM Cloud service instance ID
     pub fn from_base(base: STTConfig, instance_id: String) -> Self {
-        // Determine model based on language in base config
-        let model = match base.language.as_str() {
-            "en-US" => IbmModel::EnUsMultimedia,
-            "en-GB" => IbmModel::EnGbMultimedia,
-            "en-AU" => IbmModel::EnAuMultimedia,
-            "es-ES" => IbmModel::EsEsMultimedia,
-            "es-LA" | "es-MX" => IbmModel::EsLaMultimedia,
-            "fr-FR" => IbmModel::FrFrMultimedia,
-            "fr-CA" => IbmModel::FrCaMultimedia,
-            "de-DE" => IbmModel::DeDeMultimedia,
-            "it-IT" => IbmModel::ItItMultimedia,
-            "pt-BR" => IbmModel::PtBrMultimedia,
-            "ja-JP" => IbmModel::JaJpMultimedia,
-            "ko-KR" => IbmModel::KoKrMultimedia,
-            "zh-CN" => IbmModel::ZhCnMultimedia,
-            "nl-NL" => IbmModel::NlNlMultimedia,
-            "ar-MS" | "ar" => IbmModel::ArMsMultimedia,
-            "hi-IN" | "hi" => IbmModel::HiInMultimedia,
-            _ => IbmModel::EnUsMultimedia,
+        // Honor an explicitly configured model verbatim (e.g. "en-US_Telephony",
+        // "en-US_NarrowbandModel", a custom LM) — `IbmModel::Custom` serializes as-is. Previously
+        // `base.model` was ignored and the model was derived from language alone, always selecting
+        // the *_Multimedia variant.
+        let model = if !base.model.is_empty() {
+            IbmModel::Custom(base.model.clone())
+        } else {
+            match base.language.as_str() {
+                "en-US" => IbmModel::EnUsMultimedia,
+                "en-GB" => IbmModel::EnGbMultimedia,
+                "en-AU" => IbmModel::EnAuMultimedia,
+                "es-ES" => IbmModel::EsEsMultimedia,
+                "es-LA" | "es-MX" => IbmModel::EsLaMultimedia,
+                "fr-FR" => IbmModel::FrFrMultimedia,
+                "fr-CA" => IbmModel::FrCaMultimedia,
+                "de-DE" => IbmModel::DeDeMultimedia,
+                "it-IT" => IbmModel::ItItMultimedia,
+                "pt-BR" => IbmModel::PtBrMultimedia,
+                "ja-JP" => IbmModel::JaJpMultimedia,
+                "ko-KR" => IbmModel::KoKrMultimedia,
+                "zh-CN" => IbmModel::ZhCnMultimedia,
+                "nl-NL" => IbmModel::NlNlMultimedia,
+                "ar-MS" | "ar" => IbmModel::ArMsMultimedia,
+                "hi-IN" | "hi" => IbmModel::HiInMultimedia,
+                _ => IbmModel::EnUsMultimedia,
+            }
         };
 
         // Determine encoding based on base config
@@ -469,16 +652,57 @@ impl IbmWatsonSTTConfig {
             split_transcript_at_phrase_end: false,
             low_latency: false,
             character_insertion_bias: None,
+            keywords: Vec::new(),
+            keywords_threshold: None,
+            max_alternatives: None,
+            word_alternatives_threshold: None,
+            customization_weight: None,
+            base_model_version: None,
+            grammar_name: None,
+            audio_metrics: false,
+            processing_metrics: false,
+            processing_metrics_interval: None,
+            smart_formatting_version: None,
+            speech_begin_event: false,
+            endpoint_override: None,
+        }
+    }
+
+    pub fn validate_endpoint_override(&self) -> Result<(), String> {
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_ibm_stt_endpoint("endpoint_override", endpoint)?;
+        }
+        Ok(())
+    }
+
+    /// Build the IAM token URL, honoring `endpoint_override` (mock host + `/identity/token`). The
+    /// override carries only an authority (any scheme prefix is stripped) and the IAM endpoint is an
+    /// HTTP POST, so `http://` is forced — distinct from the `ws://` the recognize dial needs against
+    /// the SAME mock host.
+    pub fn iam_url(&self) -> String {
+        match self.endpoint_override {
+            Some(ref ov) => format!("http://{}/identity/token", override_authority(ov)),
+            None => IBM_IAM_URL.to_string(),
         }
     }
 
     /// Build the WebSocket URL for connecting to IBM Watson STT.
     pub fn build_websocket_url(&self, access_token: &str) -> String {
-        let base_url = format!(
-            "wss://{}/instances/{}/v1/recognize",
-            self.region.stt_hostname(),
-            self.instance_id
-        );
+        // Honor an `endpoint_override` (in-repo mock/proxy): swap the dialed scheme://host while
+        // preserving the `/instances/{id}/v1/recognize` path + query. The override is an authority
+        // (scheme stripped) and `connect_async` needs a `ws://` URL.
+        let base_url = match self.endpoint_override {
+            Some(ref ov) => format!(
+                "ws://{}/instances/{}/v1/recognize",
+                override_authority(ov),
+                self.instance_id
+            ),
+            None => format!(
+                "wss://{}/instances/{}/v1/recognize",
+                self.region.stt_hostname(),
+                self.instance_id
+            ),
+        };
 
         // URL-encode helper using form_urlencoded
         fn encode(s: &str) -> String {
@@ -498,6 +722,13 @@ impl IbmWatsonSTTConfig {
 
         if let Some(ref am_id) = self.acoustic_model_id {
             params.push(format!("acoustic_customization_id={}", encode(am_id)));
+        }
+
+        // Base model version is selected per-connection via a URL query parameter (it pins which
+        // version of the base model the recognizer loads), unlike the per-utterance recognition
+        // knobs that ride the START message.
+        if let Some(ref bmv) = self.base_model_version {
+            params.push(format!("base_model_version={}", encode(bmv)));
         }
 
         format!("{}?{}", base_url, params.join("&"))
@@ -534,6 +765,49 @@ impl IbmWatsonSTTConfig {
             msg["character_insertion_bias"] = serde_json::json!(cib);
         }
 
+        // Keyword spotting: `keywords` only takes effect alongside `keywords_threshold`, so both
+        // are emitted together (per IBM's recognition-parameters contract).
+        if !self.keywords.is_empty() {
+            msg["keywords"] = serde_json::json!(self.keywords);
+        }
+        if let Some(kt) = self.keywords_threshold {
+            msg["keywords_threshold"] = serde_json::json!(kt);
+        }
+        // N-best alternatives.
+        if let Some(ma) = self.max_alternatives {
+            msg["max_alternatives"] = serde_json::json!(ma);
+        }
+        // Word alternatives (confusion network).
+        if let Some(wat) = self.word_alternatives_threshold {
+            msg["word_alternatives_threshold"] = serde_json::json!(wat);
+        }
+        // Custom language-model interpolation weight.
+        if let Some(cw) = self.customization_weight {
+            msg["customization_weight"] = serde_json::json!(cw);
+        }
+        // Grammar name (FSM/constrained recognition; used with a custom language model).
+        if let Some(ref gn) = self.grammar_name {
+            msg["grammar_name"] = serde_json::json!(gn);
+        }
+        // Audio / processing metrics.
+        if self.audio_metrics {
+            msg["audio_metrics"] = serde_json::json!(true);
+        }
+        if self.processing_metrics {
+            msg["processing_metrics"] = serde_json::json!(true);
+        }
+        if let Some(pmi) = self.processing_metrics_interval {
+            msg["processing_metrics_interval"] = serde_json::json!(pmi);
+        }
+        // Smart-formatting version.
+        if let Some(sfv) = self.smart_formatting_version {
+            msg["smart_formatting_version"] = serde_json::json!(sfv);
+        }
+        // Begin-of-speech event.
+        if self.speech_begin_event {
+            msg["speech_begin_event"] = serde_json::json!(true);
+        }
+
         msg
     }
 }
@@ -545,6 +819,176 @@ impl IbmWatsonSTTConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone (5th provider): maps 6 features + demonstrates provider_extras (instance_id).
+    #[test]
+    fn from_standard_maps_features_and_extras() {
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert("instance_id".into(), serde_json::json!("inst-123"));
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "ibm-watson".into(),
+                api_key: "k".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                diarization: Some(true),
+                word_timestamps: Some(true),
+                smart_format: Some(true),
+                redaction: Some(vec!["pii".into()]),
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+            translation: None,
+        };
+        let cfg = IbmWatsonSTTConfig::from_standard(&std).unwrap();
+        assert!(cfg.speaker_labels);
+        assert!(cfg.word_timestamps);
+        assert!(cfg.smart_formatting);
+        assert!(cfg.redaction);
+        assert_eq!(cfg.instance_id, "inst-123"); // from provider_extras passthrough
+    }
+
+    // WIRE-LEVEL: every keyword-spotting / N-best / metrics / model feature must reach the
+    // *serialized START message* (the JSON text frame the client sends on the WebSocket) or the
+    // *WebSocket URL query* — not merely a config struct field (the recurring "tested config, not
+    // wire" bug class). `build_start_message`/`build_websocket_url` are exactly the bytes the
+    // live client emits (verified above: client.rs uses both).
+    #[test]
+    fn keyword_nbest_metrics_features_reach_start_message_and_url() {
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
+
+        let mut extras = serde_json::Map::new();
+        extras.insert("instance_id".into(), serde_json::json!("inst-9"));
+        extras.insert("keywords_threshold".into(), serde_json::json!(0.5));
+        extras.insert("word_alternatives_threshold".into(), serde_json::json!(0.4));
+        extras.insert("customization_weight".into(), serde_json::json!(0.3));
+        extras.insert(
+            "base_model_version".into(),
+            serde_json::json!("en-US_NarrowbandModel.v2021"),
+        );
+        extras.insert("grammar_name".into(), serde_json::json!("digits"));
+        extras.insert("audio_metrics".into(), serde_json::json!(true));
+        extras.insert("processing_metrics".into(), serde_json::json!(true));
+        extras.insert(
+            "processing_metrics_interval".into(),
+            serde_json::json!(0.25),
+        );
+        extras.insert("smart_formatting_version".into(), serde_json::json!(2));
+
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "ibm-watson".into(),
+                api_key: "k".into(),
+                ..Default::default()
+            },
+            features: SttFeatures {
+                keyterms: Some(vec!["WaaV".into(), "Watson".into()]), // → keywords
+                alternatives: Some(3),                                // → max_alternatives
+                speech_begin_event: Some(true),                       // → speech_begin_event
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+            translation: None,
+        };
+
+        let cfg = IbmWatsonSTTConfig::from_standard(&std).unwrap();
+        let msg = cfg.build_start_message();
+        let url = cfg.build_websocket_url("tok");
+
+        // f32 round-trip precision: compare numeric knobs as f64 within tolerance.
+        let approx =
+            |v: &serde_json::Value, want: f64| (v.as_f64().expect("number") - want).abs() < 1e-4;
+
+        // --- START message body (per-utterance recognition knobs) ---
+        assert_eq!(msg["keywords"], serde_json::json!(["WaaV", "Watson"]));
+        assert!(approx(&msg["keywords_threshold"], 0.5));
+        assert_eq!(msg["max_alternatives"], serde_json::json!(3));
+        assert!(approx(&msg["word_alternatives_threshold"], 0.4));
+        assert!(approx(&msg["customization_weight"], 0.3));
+        assert_eq!(msg["grammar_name"], serde_json::json!("digits"));
+        assert_eq!(msg["audio_metrics"], serde_json::json!(true));
+        assert_eq!(msg["processing_metrics"], serde_json::json!(true));
+        assert!(approx(&msg["processing_metrics_interval"], 0.25));
+        assert_eq!(msg["smart_formatting_version"], serde_json::json!(2));
+        assert_eq!(msg["speech_begin_event"], serde_json::json!(true));
+
+        // --- WebSocket URL query (per-connection base-model version) ---
+        assert!(
+            url.contains("base_model_version=en-US_NarrowbandModel.v2021"),
+            "base_model_version must reach the WS URL query: {url}"
+        );
+    }
+
+    // Defaults must NOT emit any of the new knobs (no accidental always-on params on the wire).
+    #[test]
+    fn defaults_emit_no_keyword_or_metrics_params() {
+        let cfg = IbmWatsonSTTConfig::default();
+        let msg = cfg.build_start_message();
+        for k in [
+            "keywords",
+            "keywords_threshold",
+            "max_alternatives",
+            "word_alternatives_threshold",
+            "customization_weight",
+            "grammar_name",
+            "audio_metrics",
+            "processing_metrics",
+            "processing_metrics_interval",
+            "smart_formatting_version",
+            "speech_begin_event",
+        ] {
+            assert!(msg.get(k).is_none(), "{k} must be absent by default");
+        }
+        assert!(
+            !cfg.build_websocket_url("tok")
+                .contains("base_model_version")
+        );
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut config = IbmWatsonSTTConfig::from_base(
+            STTConfig {
+                api_key: "k".to_string(),
+                ..Default::default()
+            },
+            "inst".to_string(),
+        );
+        config.endpoint_override = Some("https://gateway.example.com".to_string());
+        assert!(config.validate_endpoint_override().is_ok());
+
+        config.endpoint_override = Some("gateway.example.com:8443".to_string());
+        assert!(config.validate_endpoint_override().is_ok());
+
+        config.endpoint_override = Some("http://127.0.0.1:8080".to_string());
+        let err = config
+            .validate_endpoint_override()
+            .expect_err("loopback endpoint_override must be rejected");
+        assert!(err.contains("SSRF protection"));
+
+        config.endpoint_override = Some("file:///tmp/socket".to_string());
+        let err = config
+            .validate_endpoint_override()
+            .expect_err("file endpoint_override must be rejected");
+        assert!(err.contains("URL scheme"));
+
+        config.endpoint_override = Some("ws://gateway.example.com".to_string());
+        let err = config
+            .validate_endpoint_override()
+            .expect_err("WebSocket endpoint_override must be rejected");
+        assert!(err.contains("URL scheme"));
+
+        let std = crate::core::stt::standard::StandardSTTConfig::from_base(STTConfig {
+            provider: "ibm-watson".to_string(),
+            api_key: "k".to_string(),
+            ..Default::default()
+        })
+        .with_endpoint_override("file:///tmp/socket");
+        assert!(IbmWatsonSTTConfig::from_standard(&std).is_err());
+    }
 
     #[test]
     fn test_region_hostnames() {
@@ -611,6 +1055,8 @@ mod tests {
             api_key: "test-api-key".to_string(),
             language: "de-DE".to_string(),
             sample_rate: 16000,
+            // No explicit model → selected by language (clear the Deepgram default "nova-3").
+            model: String::new(),
             ..Default::default()
         };
 
@@ -618,6 +1064,24 @@ mod tests {
 
         assert_eq!(config.model, IbmModel::DeDeMultimedia);
         assert_eq!(config.instance_id, "test-instance-id");
+    }
+
+    #[test]
+    fn test_from_base_honors_explicit_model() {
+        // An explicitly configured model (e.g. a Telephony variant) must be honored verbatim,
+        // not overridden by the language-based default.
+        let base = STTConfig {
+            api_key: "test-api-key".to_string(),
+            language: "en-US".to_string(),
+            model: "en-US_Telephony".to_string(),
+            ..Default::default()
+        };
+        let config = IbmWatsonSTTConfig::from_base(base, "iid".to_string());
+        assert_eq!(
+            config.model,
+            IbmModel::Custom("en-US_Telephony".to_string())
+        );
+        assert_eq!(config.model.as_str(), "en-US_Telephony");
     }
 
     #[test]

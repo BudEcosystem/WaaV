@@ -35,6 +35,7 @@ use tracing::{debug, error, info, warn};
 use super::super::base::{
     BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback,
 };
+use super::super::http_resilience::HttpBreaker;
 use super::config::{FlushStrategy, GroqResponseFormat, GroqSTTConfig};
 use super::messages::{
     GroqErrorResponse, TranscriptionResponse, TranscriptionResult, VerboseTranscriptionResponse,
@@ -75,6 +76,29 @@ const USER_AGENT: &str = concat!("WaaV-Gateway/", env!("CARGO_PKG_VERSION"));
 /// This is derived from the canonical f64 constant in messages.rs.
 /// Using 0.5 (neutral) instead of 0.9 to avoid overconfidence.
 pub const DEFAULT_UNKNOWN_CONFIDENCE: f32 = super::messages::DEFAULT_UNKNOWN_CONFIDENCE as f32;
+
+fn groq_stt_http_client() -> Result<Client, reqwest::Error> {
+    crate::core::net::ssrf_protected_client_builder(crate::core::net::HTTP_URL_SCHEMES)
+        .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
+        .connect_timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS))
+        .pool_max_idle_per_host(4)
+        .pool_idle_timeout(Duration::from_secs(90))
+        .user_agent(USER_AGENT)
+        .build()
+}
+
+fn default_groq_stt_http_client() -> Option<Client> {
+    match groq_stt_http_client() {
+        Ok(client) => Some(client),
+        Err(err) => {
+            warn!(
+                error = %err,
+                "failed to create default Groq STT HTTP client; default instance is inert until rebuilt with a valid config"
+            );
+            None
+        }
+    }
+}
 
 // =============================================================================
 // Type Aliases
@@ -234,7 +258,7 @@ pub struct GroqSTT {
     pub(crate) config: Option<GroqSTTConfig>,
 
     /// HTTP client for API requests (reused for connection pooling).
-    http_client: Client,
+    http_client: Option<Client>,
 
     /// Audio buffer for accumulating PCM data.
     /// Uses Vec for efficient appending with pre-allocated capacity.
@@ -272,6 +296,11 @@ pub struct GroqSTT {
 
     /// Whether the last audio chunk was detected as silent.
     last_was_silent: bool,
+
+    /// Shared per-provider circuit breaker for the REST transport (uniform with the WS fleet):
+    /// consulted before each upstream attempt, fed by the unified HTTP status classification.
+    /// Inert until `set_resilience` injects the process-global handles (W-D2).
+    resilience: HttpBreaker,
 }
 
 impl GroqSTT {
@@ -282,21 +311,30 @@ impl GroqSTT {
     ///
     /// # Returns
     /// * `Result<Self, STTError>` - New instance or error
+    /// W1 keystone — construct directly from the standardized config so Groq's one mappable
+    /// feature (word-level timestamps, which selects the verbose-JSON response format) is honored
+    /// END-TO-END. Groq is a batch REST Whisper provider, so the streaming-oriented standardized
+    /// features have no field here and stay at default. Mirrors `DeepgramSTT::new_standard`:
+    /// the api_key is checked first, then the provider is built from `GroqSTTConfig::from_standard`.
+    pub fn new_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        if std.base.api_key.is_empty() {
+            return Err(STTError::AuthenticationFailed(
+                "API key is required for Groq STT".to_string(),
+            ));
+        }
+        Self::with_config(GroqSTTConfig::from_standard(std))
+    }
+
     pub fn with_config(config: GroqSTTConfig) -> Result<Self, STTError> {
         // Validate configuration
         config.validate().map_err(STTError::ConfigurationError)?;
 
         // Create HTTP client with sensible defaults
-        let http_client = Client::builder()
-            .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
-            .connect_timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS))
-            .pool_max_idle_per_host(4) // Connection pooling
-            .pool_idle_timeout(Duration::from_secs(90)) // Close idle connections after 90s
-            .user_agent(USER_AGENT)
-            .build()
-            .map_err(|e| {
-                STTError::ConfigurationError(format!("Failed to create HTTP client: {e}"))
-            })?;
+        let http_client = groq_stt_http_client().map_err(|e| {
+            STTError::ConfigurationError(format!("Failed to create HTTP client: {e}"))
+        })?;
 
         // Pre-allocate audio buffer with expected capacity
         // Typical audio: 16kHz, 16-bit mono = 32KB/sec
@@ -305,7 +343,7 @@ impl GroqSTT {
 
         Ok(Self {
             config: Some(config),
-            http_client,
+            http_client: Some(http_client),
             audio_buffer: Vec::with_capacity(initial_capacity),
             connected: AtomicBool::new(false),
             result_callback: Arc::new(Mutex::new(None)),
@@ -316,7 +354,15 @@ impl GroqSTT {
             first_audio_time: None,
             silence_start_time: None,
             last_was_silent: false,
+            resilience: HttpBreaker::new("groq"),
         })
+    }
+
+    /// The shared circuit breaker this client feeds, if the process-global resilience handles
+    /// have been injected (W-D2). Two `GroqSTT` built from the same
+    /// [`crate::core::resilience::ResilienceRegistry`] return the *same* `Arc`.
+    pub fn resilience_breaker(&self) -> Option<&Arc<crate::core::resilience::CircuitBreaker>> {
+        self.resilience.breaker()
     }
 
     /// Publicly accessible flush method.
@@ -614,54 +660,47 @@ impl GroqSTT {
         wav_data: Vec<u8>,
         config: &GroqSTTConfig,
     ) -> Result<TranscriptionResult, STTError> {
-        // Build multipart form - wav_data ownership is transferred here (no copy)
-        let file_part = Part::bytes(wav_data)
-            .file_name(format!("audio.{}", config.audio_input_format.extension()))
-            .mime_str(config.audio_input_format.mime_type())
-            .map_err(|e| STTError::ConfigurationError(format!("Invalid MIME type: {e}")))?;
+        let http_client = self.http_client.as_ref().ok_or_else(|| {
+            STTError::ConfigurationError(
+                "Groq STT default HTTP client is unavailable; construct with GroqSTT::new, new_standard, or with_config".to_string(),
+            )
+        })?;
 
-        let mut form = Form::new()
-            .part("file", file_part)
-            .text("model", config.model.as_str().to_string())
-            .text(
-                "response_format",
-                config.response_format.as_str().to_string(),
-            );
-
-        // Add optional parameters
-        if !config.base.language.is_empty() {
-            form = form.text("language", config.base.language.clone());
+        // Build multipart form. The non-file text fields come from the single wire source of
+        // truth on the config (`build_form_text_fields`), so what a test asserts is exactly what
+        // is serialized here. The audio source is either an uploaded `file` part (default) or a
+        // remote `url` form field (when `config.audio_url` is set) — never both, per the
+        // Groq/OpenAI-Whisper REST contract.
+        let mut form = Form::new();
+        if config.audio_url.is_none() {
+            // wav_data ownership is transferred here (no copy).
+            let file_part = Part::bytes(wav_data)
+                .file_name(format!("audio.{}", config.audio_input_format.extension()))
+                .mime_str(config.audio_input_format.mime_type())
+                .map_err(|e| STTError::ConfigurationError(format!("Invalid MIME type: {e}")))?;
+            form = form.part("file", file_part);
+        }
+        for (name, value) in config.build_form_text_fields() {
+            form = form.text(name, value);
         }
 
-        if let Some(temp) = config.temperature {
-            form = form.text("temperature", temp.to_string());
-        }
-
-        if let Some(ref prompt) = config.prompt {
-            form = form.text("prompt", prompt.clone());
-        }
-
-        // Add timestamp granularities for verbose_json format
-        if config.response_format == GroqResponseFormat::VerboseJson
-            && !config.timestamp_granularities.is_empty()
-        {
-            for granularity in &config.timestamp_granularities {
-                form = form.text(
-                    "timestamp_granularities[]",
-                    granularity.as_str().to_string(),
-                );
-            }
-        }
+        // Consult the shared per-provider breaker before paying the upstream round-trip: an
+        // open breaker fails fast with a typed classified refusal (uniform with the WS fleet).
+        // Consulted per attempt, so a breaker that opens mid-retry stops the loop immediately
+        // (`is_retryable_error` does not retry `ConnectionFailed`).
+        self.resilience.check()?;
 
         // Send request to Groq API
-        let response = self
-            .http_client
+        let response = http_client
             .post(config.api_url())
             .header("Authorization", format!("Bearer {}", config.base.api_key))
             .multipart(form)
             .send()
             .await
-            .map_err(|e| STTError::NetworkError(format!("Request failed: {e}")))?;
+            .map_err(|e| {
+                self.resilience.record_send_error();
+                STTError::NetworkError(format!("Request failed: {e}"))
+            })?;
 
         // Extract rate limit headers before consuming response
         let rate_limit_info = RateLimitInfo::from_headers(response.headers());
@@ -685,6 +724,7 @@ impl GroqSTT {
 
         // Check response status
         let status = response.status();
+        self.resilience.record_status(status);
         let response_text = response
             .text()
             .await
@@ -932,18 +972,9 @@ impl GroqSTT {
 impl Default for GroqSTT {
     fn default() -> Self {
         // Create HTTP client with sensible defaults matching with_config()
-        let http_client = Client::builder()
-            .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
-            .connect_timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS))
-            .pool_max_idle_per_host(4)
-            .pool_idle_timeout(Duration::from_secs(90))
-            .user_agent(USER_AGENT)
-            .build()
-            .unwrap_or_else(|_| Client::new());
-
         Self {
             config: None,
-            http_client,
+            http_client: default_groq_stt_http_client(),
             audio_buffer: Vec::with_capacity(32 * 1024 * 30),
             connected: AtomicBool::new(false),
             result_callback: Arc::new(Mutex::new(None)),
@@ -954,6 +985,7 @@ impl Default for GroqSTT {
             first_audio_time: None,
             silence_start_time: None,
             last_was_silent: false,
+            resilience: HttpBreaker::new("groq"),
         }
     }
 }
@@ -1150,6 +1182,13 @@ impl BaseSTT for GroqSTT {
     fn get_provider_info(&self) -> &'static str {
         "Groq Whisper STT"
     }
+
+    /// W-D2: attach the shared per-provider circuit breaker so every Groq STT session trips
+    /// (and observes) the SAME breaker, uniform with the WS fleet. The REST transport consults
+    /// it before each upstream attempt and feeds it the unified HTTP status classification.
+    fn set_resilience(&mut self, resilience: crate::core::resilience::ResilienceHandles) {
+        self.resilience.set_handles(resilience);
+    }
 }
 
 #[cfg(test)]
@@ -1345,6 +1384,84 @@ mod tests {
             GroqResponseFormat::VerboseJson
         );
         assert_eq!(stored_config.temperature, Some(0.2));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn groq_stt_redirect_policy_rejects_private_hop() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local redirect test server");
+        let addr = listener.local_addr().expect("local addr");
+
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 1024];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+            let response = concat!(
+                "HTTP/1.1 302 Found\r\n",
+                "Location: http://127.0.0.1:9/metadata\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n"
+            );
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await;
+        });
+
+        let config = GroqSTTConfig {
+            base: STTConfig {
+                api_key: "test_key".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let stt = GroqSTT::with_config(config).expect("construct Groq STT");
+        let err = stt
+            .http_client
+            .as_ref()
+            .expect("strict constructor builds an HTTP client")
+            .get(format!("http://{addr}/start"))
+            .send()
+            .await
+            .expect_err("private redirect target must be rejected");
+        let mut error_chain = err.to_string();
+        let mut source = std::error::Error::source(&err);
+        while let Some(error) = source {
+            error_chain.push_str(": ");
+            error_chain.push_str(&error.to_string());
+            source = error.source();
+        }
+        assert!(
+            error_chain.contains("redirect URL rejected"),
+            "unexpected Groq STT redirect error: {error_chain}"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_without_http_client_returns_typed_error_without_panic() {
+        let mut stt = GroqSTT::default();
+        stt.http_client = None;
+        let config = GroqSTTConfig {
+            base: STTConfig {
+                api_key: "test_key".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let err = stt
+            .send_request(vec![0u8; 44], &config)
+            .await
+            .expect_err("inert default client must fail with a typed error");
+
+        match err {
+            STTError::ConfigurationError(msg) => {
+                assert!(msg.contains("default HTTP client"), "{msg}");
+            }
+            other => panic!("expected ConfigurationError, got {other:?}"),
+        }
     }
 
     #[test]

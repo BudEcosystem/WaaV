@@ -31,6 +31,7 @@ use super::mel_extractor::WHISPER_N_MELS;
 /// See: https://huggingface.co/pipecat-ai/smart-turn-v3
 const SMART_TURN_MODEL_URL: &str =
     "https://huggingface.co/pipecat-ai/smart-turn-v3/resolve/main/smart-turn-v3.2-cpu.onnx";
+const SMART_TURN_MODEL_URL_SCHEMES: &[&str] = &["http", "https"];
 
 /// Number of mel frames expected by the model (8 seconds at 10ms = 800 frames).
 pub const SMART_TURN_MAX_FRAMES: usize = 800;
@@ -218,6 +219,10 @@ impl SmartTurnDetectorConfig {
 
     /// Validates the configuration.
     pub fn validate(&self) -> Result<(), String> {
+        if self.model_path.is_none() {
+            smart_turn_model_download_url(self.model_url.as_deref())?;
+        }
+
         if self.threshold < 0.0 || self.threshold > 1.0 {
             return Err(format!(
                 "Threshold must be between 0.0 and 1.0, got {}",
@@ -242,6 +247,16 @@ impl SmartTurnDetectorConfig {
 
         Ok(())
     }
+}
+
+fn smart_turn_model_download_url(custom_url: Option<&str>) -> Result<&str, String> {
+    let url = custom_url.unwrap_or(SMART_TURN_MODEL_URL).trim();
+    if url.is_empty() {
+        return Err("Smart Turn model_url rejected (SSRF protection): empty URL".to_string());
+    }
+    crate::core::net::validate_url_for_ssrf(url, SMART_TURN_MODEL_URL_SCHEMES)
+        .map(|_| url)
+        .map_err(|msg| format!("Smart Turn model_url rejected (SSRF protection): {msg}"))
 }
 
 /// Result of Smart Turn detection.
@@ -367,10 +382,14 @@ impl SmartTurnDetector {
 
     /// Creates an ONNX session for the model.
     fn create_session(model_path: &Path, num_threads: usize) -> Result<Session> {
-        let session = SessionBuilder::new()?
+        let builder = SessionBuilder::new()?
             .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)?
             .with_intra_threads(num_threads)?
-            .with_inter_threads(1)?
+            .with_inter_threads(1)?;
+
+        // Hardware EP policy (MASTER_PLAN §7 H): single policy point, honors
+        // WAAV_ORT_EP, CPU is the guaranteed fallback.
+        let session = crate::core::onnx::apply_execution_providers(builder)?
             .commit_from_file(model_path)
             .context("Failed to load Smart Turn model")?;
 
@@ -421,7 +440,8 @@ impl SmartTurnDetector {
         }
 
         // Attempt to download
-        let model_url = config.model_url.as_deref().unwrap_or(SMART_TURN_MODEL_URL);
+        let model_url = smart_turn_model_download_url(config.model_url.as_deref())
+            .map_err(|e| anyhow::anyhow!(e))?;
 
         let cache_dir: PathBuf = dirs::cache_dir()
             .unwrap_or_else(|| PathBuf::from("."))
@@ -457,7 +477,8 @@ impl SmartTurnDetector {
             }
 
             let download_future = async {
-                let client = reqwest::Client::new();
+                let client = crate::core::net::ssrf_protected_client(SMART_TURN_MODEL_URL_SCHEMES)
+                    .context("Failed to create SSRF-protected download client")?;
                 let response = client
                     .get(model_url)
                     .timeout(std::time::Duration::from_secs(download_timeout_secs))
@@ -582,7 +603,7 @@ impl SmartTurnDetector {
         // 2. Check hysteresis - enough consecutive high-probability frames
         //
         // Each mel frame represents 10ms (hop_length=160 at 16kHz)
-        let min_frames_for_speech = (self.config.min_speech_ms as usize + 9) / 10;
+        let min_frames_for_speech = (self.config.min_speech_ms as usize).div_ceil(10);
         let has_enough_speech = frames_count >= min_frames_for_speech;
         let is_turn_complete =
             has_enough_speech && self.high_prob_frames >= self.config.hysteresis_frames;
@@ -678,6 +699,17 @@ impl SmartTurnDetector {
     /// so we need to transpose it to column-major order (mels × frames).
     ///
     /// Uses pre-allocated transpose buffer to avoid runtime allocations.
+    ///
+    /// # D-G4 (teardown) note
+    ///
+    /// `session.run` below is a **synchronous** ORT call with no await point, so
+    /// an in-flight inference cannot be force-cancelled by a `tokio::time::timeout`
+    /// (the critique's "FFI-timeout is inert" finding). It is bounded instead by
+    /// the session-teardown budget in the WS handler: if a wedged inference holds
+    /// this lock past the budget, teardown warns and proceeds, and the inference
+    /// thread runs to natural completion (detached) rather than hanging the
+    /// session. Inference stays inline (not `spawn_blocking`) on purpose — it is a
+    /// ~12 ms hot-path step and the offload overhead would cost more than it saves.
     async fn run_inference(&mut self, input_data: &[f32]) -> Result<f32> {
         let mut session = self.session.lock().await;
 
@@ -848,7 +880,7 @@ impl SmartTurnDetector {
         // Determine if turn is complete:
         // 1. Check min_speech_ms - enough audio must have been processed first
         // 2. Check hysteresis - enough consecutive high-probability frames
-        let min_frames_for_speech = (self.config.min_speech_ms as usize + 9) / 10;
+        let min_frames_for_speech = (self.config.min_speech_ms as usize).div_ceil(10);
         let has_enough_speech = num_frames >= min_frames_for_speech;
         let is_turn_complete =
             has_enough_speech && self.high_prob_frames >= self.config.hysteresis_frames;
@@ -1000,6 +1032,37 @@ impl SmartTurnDetectorBuilder {
 mod tests {
     use super::*;
 
+    // Live test: confirms the Smart-Turn v3 model LOADS and RUNS, and that the mel layout the
+    // code produces ([1, 80, 800]) matches the model's `input_features` ([batch, 80, 800]).
+    // (Independent inspection of the real model REFUTED the review's "transposed input"
+    // prediction — the layout is correct.) Run with: ORT_DYLIB_PATH=.../libonnxruntime.so
+    // cargo test --features smart-turn live_smart_turn_loads_and_runs -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "downloads smart-turn-v3 model + runs ONNX inference (needs ORT_DYLIB_PATH)"]
+    async fn live_smart_turn_loads_and_runs() {
+        let mut det = SmartTurnDetector::new(SmartTurnDetectorConfig::default())
+            .await
+            .expect("Smart-Turn model must load");
+        // 800 frames x 80 mel bins (the model input is [1, 80, 800]).
+        let frames: Vec<Vec<f32>> = (0..800)
+            .map(|f| {
+                (0..80)
+                    .map(|m| (((f + m) as f32) * 0.01).sin() * 0.1)
+                    .collect()
+            })
+            .collect();
+        let r = det.predict(&frames).await.expect("predict must run");
+        assert!(
+            (0.0..=1.0).contains(&r.probability),
+            "probability out of range: {}",
+            r.probability
+        );
+        eprintln!(
+            "SMARTTURN prob={:.4} complete={} ({}us)",
+            r.probability, r.is_turn_complete, r.inference_time_us
+        );
+    }
+
     // -------------------------------------------------------------------------
     // Configuration tests
     // -------------------------------------------------------------------------
@@ -1022,6 +1085,38 @@ mod tests {
     fn test_config_validation_valid() {
         let config = SmartTurnDetectorConfig::default();
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_validation_rejects_unsafe_model_url() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let config = SmartTurnDetectorConfig {
+            model_url: Some(" https://model.example.com/smart-turn.onnx ".to_string()),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+        assert_eq!(
+            smart_turn_model_download_url(config.model_url.as_deref()).unwrap(),
+            "https://model.example.com/smart-turn.onnx"
+        );
+
+        let config = SmartTurnDetectorConfig {
+            model_url: Some("http://127.0.0.1:9000/model.onnx".to_string()),
+            ..Default::default()
+        };
+        let err = config
+            .validate()
+            .expect_err("loopback model_url must be rejected");
+        assert!(err.contains("SSRF protection"), "{err}");
+
+        let config = SmartTurnDetectorConfig {
+            model_url: Some("file:///tmp/model.onnx".to_string()),
+            ..Default::default()
+        };
+        let err = config
+            .validate()
+            .expect_err("non-HTTP model_url must be rejected");
+        assert!(err.contains("not allowed"), "{err}");
     }
 
     #[test]

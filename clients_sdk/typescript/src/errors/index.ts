@@ -24,6 +24,12 @@ export {
   ConfigurationError,
 } from './api.js';
 
+// Rate-limit error (HTTP 429 + Retry-After)
+export {
+  RateLimitError,
+  parseRetryAfterMs,
+} from './ratelimit.js';
+
 // STT errors
 export {
   STTError,

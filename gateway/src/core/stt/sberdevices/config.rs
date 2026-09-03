@@ -6,6 +6,15 @@
 use crate::core::stt::base::{STTConfig, STTError};
 use std::str::FromStr;
 
+fn validate_sber_stt_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Ok(());
+    }
+    crate::core::net::validate_url_for_ssrf(endpoint, crate::core::net::HTTP_URL_SCHEMES)
+        .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))
+}
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -219,6 +228,26 @@ pub struct SberSTTConfig {
     pub connection_timeout_secs: u64,
     /// Request timeout in seconds
     pub request_timeout_secs: u64,
+    // -------------------------------------------------------------------------
+    // Standardized recognition options emitted as `speech:recognize` query params.
+    // -------------------------------------------------------------------------
+    /// Enable profanity filtering/masking. SaluteSpeech `speech:recognize` `enable_profanity_filter`
+    /// query param. Mapped from the typed `SttFeatures::profanity_filter`.
+    pub enable_profanity_filter: bool,
+    /// Number of audio channels to transcribe independently (per-channel transcription).
+    /// SaluteSpeech `speech:recognize` `channels_count` query param. `None` => omitted (provider
+    /// default, mono). Driven by the typed `SttFeatures::multichannel` flag (count from the base
+    /// `channels`).
+    pub channels_count: Option<u16>,
+    /// Acoustic recognition model / domain (e.g. "general", "callcenter", "media"). SaluteSpeech
+    /// `speech:recognize` `model` query param. `None` => omitted (provider default). Carried via the
+    /// standardized `extras` passthrough (`extras["model"]`) — distinct from the OAuth `scope`
+    /// (which the flat `STTConfig::model` field already reuses).
+    pub recognition_model: Option<String>,
+    /// Base endpoint override (scheme://host) from the standardized `endpoint_override` — rewrites
+    /// BOTH the OAuth token host and the `speech:recognize` host to an in-repo mock/proxy for
+    /// credential-free e2e (paths preserved). `None` uses the production Sber hosts.
+    pub endpoint_override: Option<String>,
 }
 
 impl SberSTTConfig {
@@ -281,12 +310,113 @@ impl SberSTTConfig {
             enable_punctuation: config.punctuation,
             connection_timeout_secs: 30,
             request_timeout_secs: 60,
+            // Standardized recognition options are absent on the flat path (no features/extras).
+            enable_profanity_filter: false,
+            channels_count: None,
+            recognition_model: None,
+            endpoint_override: None,
         })
+    }
+
+    /// Build from the standardized config (W1 keystone). SberDevices SaluteSpeech is a synchronous
+    /// REST recognizer (`speech:recognize`); the options it accepts are emitted as query params on
+    /// the recognize URL. This maps the standardized features it can express:
+    /// - `profanity_filter` (typed) -> `enable_profanity_filter` query param,
+    /// - `multichannel` (typed) -> `channels_count` query param (per-channel transcription; the
+    ///   count is taken from the base `channels`),
+    /// - `extras["model"]` -> `model` query param (acoustic recognition domain — distinct from the
+    ///   OAuth `scope`, which the flat `STTConfig::model` field reuses).
+    ///
+    /// Streaming-only knobs (interim_results, diarization, vad/endpointing, etc.) are capability
+    /// gaps for this synchronous endpoint and stay at provider defaults.
+    pub fn from_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, STTError> {
+        let f = &std.features;
+        let mut cfg = Self::from_base(&std.base)?;
+        if let Some(p) = f.profanity_filter {
+            cfg.enable_profanity_filter = p;
+        }
+        // Per-channel transcription: when `multichannel` is requested, emit the channel count from
+        // the base config (default to 1 if the base left it at 0). `None`/false -> mono default.
+        if f.multichannel == Some(true) {
+            let channels = if std.base.channels == 0 {
+                1
+            } else {
+                std.base.channels
+            };
+            cfg.channels_count = Some(channels);
+        }
+        // Acoustic recognition model/domain via the open passthrough (`extras["model"]`).
+        if let Some(m) = std.extras.0.get("model").and_then(|v| v.as_str()) {
+            let model = m.trim();
+            if !model.is_empty() {
+                cfg.recognition_model = Some(model.to_string());
+            }
+        }
+        // Standardized endpoint override → both Sber hosts (OAuth + recognize) for mock e2e.
+        cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Validate provider-specific URL surfaces.
+    pub fn validate(&self) -> Result<(), STTError> {
+        if let Some(endpoint) = self.endpoint_override.as_deref() {
+            validate_sber_stt_endpoint("endpoint_override", endpoint)
+                .map_err(STTError::ConfigurationError)?;
+        }
+        Ok(())
+    }
+
+    /// Build the `speech:recognize` request URL with the recognition options as query params.
+    ///
+    /// SaluteSpeech accepts recognition options as query parameters on the POST URL (the audio is
+    /// the request body). `language` and `sample_rate` are always emitted; the standardized
+    /// options (`enable_profanity_filter`, `channels_count`, `model`) are emitted only when set so
+    /// unset knobs fall back to the provider default. This is the URL that actually reaches Sber.
+    pub fn recognize_url(&self) -> Result<String, STTError> {
+        // When overridden, keep the production path (`/rest/v1/speech:recognize`) but swap the host.
+        let base = match self.endpoint_override {
+            Some(ref ov) => format!("{}/rest/v1/speech:recognize", ov.trim_end_matches('/')),
+            None => STT_RECOGNIZE_ENDPOINT.to_string(),
+        };
+        let mut url = url::Url::parse(&base).map_err(|e| {
+            STTError::ConfigurationError(format!("Invalid SberDevices recognize URL '{base}': {e}"))
+        })?;
+        {
+            let mut pairs = url.query_pairs_mut();
+            pairs.append_pair("language", self.language.as_code());
+            pairs.append_pair("sample_rate", &self.sample_rate.to_string());
+            if self.enable_profanity_filter {
+                pairs.append_pair("enable_profanity_filter", "true");
+            }
+            if let Some(channels) = self.channels_count {
+                pairs.append_pair("channels_count", &channels.to_string());
+            }
+            if let Some(ref model) = self.recognition_model {
+                let model = model.trim();
+                if !model.is_empty() {
+                    pairs.append_pair("model", model);
+                }
+            }
+        }
+        Ok(url.to_string())
     }
 
     /// Get the Authorization header for OAuth token request
     pub fn oauth_auth_header(&self) -> String {
         format!("Basic {}", self.client_credentials)
+    }
+
+    /// Build the OAuth token URL. When `endpoint_override` is set, the production OAuth path
+    /// (`/api/v2/oauth`) is preserved but the host is swapped to the override (mock e2e); otherwise
+    /// the production `OAUTH_ENDPOINT` is used.
+    pub fn oauth_url(&self) -> String {
+        match self.endpoint_override {
+            Some(ref ov) => format!("{}/api/v2/oauth", ov.trim_end_matches('/')),
+            None => OAUTH_ENDPOINT.to_string(),
+        }
     }
 
     /// Get the content-type for audio data
@@ -302,6 +432,162 @@ impl SberSTTConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // W1 keystone: SberDevices maps the standardized features its synchronous `speech:recognize`
+    // endpoint can express (profanity filter, per-channel transcription, acoustic model). Streaming
+    // knobs (diarization, interim_results) remain capability gaps. The base still carries through.
+    #[test]
+    fn from_standard_passthrough_carries_base() {
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "sberdevices".into(),
+                api_key: "test_client_id:test_client_secret".into(),
+                language: "ru-RU".into(),
+                ..Default::default()
+            },
+            // Streaming-only features are set but SberDevices cannot express them; they are ignored.
+            features: SttFeatures {
+                diarization: Some(true),
+                interim_results: Some(true),
+                ..Default::default()
+            },
+            extras: ProviderExtras::default(),
+            translation: None,
+        };
+        let cfg = SberSTTConfig::from_standard(&std).unwrap();
+        // Base carried through: credentials encoded and language parsed, exactly like from_base.
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        let expected = STANDARD.encode("test_client_id:test_client_secret".as_bytes());
+        assert_eq!(cfg.client_credentials, expected);
+        assert_eq!(cfg.language, SberSTTLanguage::Russian);
+        // Capability gaps: streaming knobs do not touch the recognize options.
+        assert!(!cfg.enable_profanity_filter);
+        assert_eq!(cfg.channels_count, None);
+        assert_eq!(cfg.recognition_model, None);
+    }
+
+    // WIRE-LEVEL: profanity filter (typed `profanity_filter`), per-channel transcription (typed
+    // `multichannel` -> `channels_count` from the base `channels`) and the acoustic recognition
+    // model (`extras["model"]`) must travel from the standardized config onto the actual
+    // `speech:recognize` request URL — the bytes that reach Sber — not merely the config struct.
+    // Guards the recurring "set on the struct but never emitted to the wire" gap class.
+    #[test]
+    fn standardized_options_reach_recognize_url() {
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
+        let mut extras = serde_json::Map::new();
+        extras.insert(
+            "model".into(),
+            serde_json::json!(" callcenter&sample_rate=8000 "),
+        );
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "sberdevices".into(),
+                api_key: "test_client_id:test_client_secret".into(),
+                language: "ru-RU".into(),
+                sample_rate: 16000,
+                channels: 2,
+                ..Default::default()
+            },
+            features: SttFeatures {
+                profanity_filter: Some(true),
+                multichannel: Some(true),
+                ..Default::default()
+            },
+            extras: ProviderExtras(extras),
+            translation: None,
+        };
+        let cfg = SberSTTConfig::from_standard(&std).unwrap();
+        // Config carried the mapping...
+        assert!(cfg.enable_profanity_filter);
+        assert_eq!(cfg.channels_count, Some(2));
+        assert_eq!(
+            cfg.recognition_model,
+            Some("callcenter&sample_rate=8000".to_string())
+        );
+        // ...and crucially the params reach the wire (recognize URL).
+        let url = cfg.recognize_url().expect("recognize URL is valid");
+        assert!(
+            url.starts_with("https://smartspeech.sber.ru/rest/v1/speech:recognize?"),
+            "url: {url}"
+        );
+        let parsed = url::Url::parse(&url).unwrap();
+        let pairs: Vec<_> = parsed.query_pairs().collect();
+        assert!(pairs.contains(&("enable_profanity_filter".into(), "true".into())));
+        assert!(pairs.contains(&("channels_count".into(), "2".into())));
+        assert!(pairs.contains(&("model".into(), "callcenter&sample_rate=8000".into())));
+        // Sanity: base language + sample_rate are always emitted, and the model value did not
+        // splice a second sample_rate query param into the provider URL.
+        assert!(pairs.contains(&("language".into(), "ru-RU".into())));
+        assert_eq!(
+            pairs
+                .iter()
+                .filter(|(key, value)| key == "sample_rate" && value == "16000")
+                .count(),
+            1,
+            "url: {url}"
+        );
+        assert!(
+            !url.contains("model=callcenter&sample_rate=8000"),
+            "model must be encoded as one query value: {url}"
+        );
+
+        // And when the features are NOT requested, the optional params are omitted (defaults).
+        let bare = SberSTTConfig::from_standard(&StandardSTTConfig::from_base(STTConfig {
+            api_key: "c:s".into(),
+            language: "ru-RU".into(),
+            sample_rate: 16000,
+            ..Default::default()
+        }))
+        .unwrap()
+        .recognize_url()
+        .expect("recognize URL is valid");
+        assert!(!bare.contains("enable_profanity_filter"), "url: {bare}");
+        assert!(!bare.contains("channels_count"), "url: {bare}");
+        assert!(!bare.contains("model="), "url: {bare}");
+    }
+
+    #[test]
+    fn recognize_url_rejects_malformed_override_without_panic() {
+        let mut cfg = SberSTTConfig::from_base(&STTConfig {
+            api_key: "client:secret".into(),
+            ..Default::default()
+        })
+        .expect("base config");
+        cfg.endpoint_override = Some("http://[::1".to_string());
+
+        let err = cfg.recognize_url().expect_err("malformed URL must fail");
+        assert!(matches!(
+            err,
+            STTError::ConfigurationError(message)
+                if message.contains("Invalid SberDevices recognize URL")
+        ));
+    }
+
+    #[test]
+    fn test_config_validation_rejects_ssrf_endpoint_override() {
+        let _env = crate::core::net::ssrf_env_lock();
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
+
+        let mk = |endpoint: &str| {
+            StandardSTTConfig {
+                base: STTConfig {
+                    provider: "sberdevices".into(),
+                    api_key: "test_client:test_secret".into(),
+                    ..Default::default()
+                },
+                features: SttFeatures::default(),
+                extras: ProviderExtras::default(),
+                translation: None,
+            }
+            .with_endpoint_override(endpoint)
+        };
+
+        assert!(SberSTTConfig::from_standard(&mk("https://sber-proxy.example.com")).is_ok());
+        assert!(SberSTTConfig::from_standard(&mk("http://127.0.0.1:9000")).is_err());
+        assert!(SberSTTConfig::from_standard(&mk("file:///tmp/socket")).is_err());
+        assert!(SberSTTConfig::from_standard(&mk("wss://sber-proxy.example.com")).is_err());
+    }
 
     #[test]
     fn test_audio_format_from_str() {

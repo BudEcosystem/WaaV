@@ -13,9 +13,22 @@ use crate::auth::Auth;
 use crate::state::AppState;
 
 const CONTENT_TYPE: &str = "audio/ogg";
+const MAX_STREAM_ID_SIZE: usize = 256;
 
 fn is_valid_stream_id(stream_id: &str) -> bool {
-    !stream_id.is_empty() && !stream_id.contains("..") && !stream_id.contains('/')
+    !stream_id.is_empty()
+        && stream_id.len() <= MAX_STREAM_ID_SIZE
+        && stream_id != "."
+        && !stream_id.contains("..")
+        && stream_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn recording_content_disposition(
+    stream_id: &str,
+) -> Result<HeaderValue, axum::http::header::InvalidHeaderValue> {
+    HeaderValue::from_str(&format!("attachment; filename=\"{}.ogg\"", stream_id))
 }
 
 /// Build recording object key with optional auth_id for tenant isolation.
@@ -84,23 +97,20 @@ pub async fn download_recording(
     // Extract auth_id for tenant-scoped recording access
     let auth_id = auth.id.as_deref();
 
-    info!(
-        "Recording download requested - stream_id={}, auth_id={:?}",
-        stream_id, auth_id
-    );
+    info!(stream_id = ?stream_id, auth_id = ?auth_id, "Recording download requested");
 
     // Log warning if downloading without authentication (potentially insecure)
     if auth_id.is_none() && state.config.auth_required {
         warn!(
-            "Recording download without auth_id - stream_id={}. Enable authentication for tenant isolation.",
-            stream_id
+            stream_id = ?stream_id,
+            "Recording download without auth_id. Enable authentication for tenant isolation."
         );
     }
 
     if !is_valid_stream_id(&stream_id) {
         error!(
-            "Invalid stream_id format for recording download: {}",
-            stream_id
+            stream_id = ?stream_id,
+            "Invalid stream_id format for recording download"
         );
         return (
             StatusCode::BAD_REQUEST,
@@ -143,7 +153,7 @@ pub async fn download_recording(
     let object_path = match ObjectPath::parse(object_key.clone()) {
         Ok(path) => path,
         Err(e) => {
-            error!("Invalid recording path for stream_id={}: {}", stream_id, e);
+            error!(stream_id = ?stream_id, error = %e, "Invalid recording path");
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({"error": "Invalid recording path"})),
@@ -153,16 +163,19 @@ pub async fn download_recording(
     };
 
     debug!(
-        "Fetching recording from bucket={} with key={}",
-        bucket, object_key
+        bucket = %bucket,
+        key = %object_key,
+        "Fetching recording from object storage"
     );
 
     let get_result = match store.get(&object_path).await {
         Ok(result) => result,
         Err(ObjectStoreError::NotFound { path, .. }) => {
             info!(
-                "Recording not found for stream_id={} key={} (path={})",
-                stream_id, object_key, path
+                stream_id = ?stream_id,
+                key = %object_key,
+                path = %path,
+                "Recording not found"
             );
             return (
                 StatusCode::NOT_FOUND,
@@ -172,8 +185,9 @@ pub async fn download_recording(
         }
         Err(e) => {
             error!(
-                "Failed to retrieve recording from storage for stream_id={}: {:?}",
-                stream_id, e
+                stream_id = ?stream_id,
+                error = ?e,
+                "Failed to retrieve recording from storage"
             );
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -189,8 +203,9 @@ pub async fn download_recording(
         Ok(bytes) => bytes,
         Err(e) => {
             error!(
-                "Failed to read recording from storage for stream_id={}: {:?}",
-                stream_id, e
+                stream_id = ?stream_id,
+                error = ?e,
+                "Failed to read recording from storage"
             );
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -200,21 +215,29 @@ pub async fn download_recording(
         }
     };
 
-    info!(
-        "Recording download successful - stream_id={}, size={} bytes",
-        stream_id, size
-    );
+    info!(stream_id = ?stream_id, size, "Recording download successful");
 
     let mut headers = HeaderMap::new();
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(CONTENT_TYPE));
     if let Ok(len) = HeaderValue::from_str(&size.to_string()) {
         headers.insert(header::CONTENT_LENGTH, len);
     }
-    if let Ok(disposition) =
-        HeaderValue::from_str(&format!("attachment; filename=\"{}.ogg\"", stream_id))
-    {
-        headers.insert(header::CONTENT_DISPOSITION, disposition);
-    }
+    let disposition = match recording_content_disposition(&stream_id) {
+        Ok(disposition) => disposition,
+        Err(e) => {
+            error!(
+                stream_id = ?stream_id,
+                error = %e,
+                "Failed to build recording Content-Disposition header"
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "Failed to build recording response"})),
+            )
+                .into_response();
+        }
+    };
+    headers.insert(header::CONTENT_DISPOSITION, disposition);
 
     (StatusCode::OK, headers, body).into_response()
 }
@@ -269,14 +292,36 @@ mod tests {
     }
 
     #[test]
+    fn test_invalid_stream_id_too_large() {
+        assert!(!is_valid_stream_id(&"a".repeat(MAX_STREAM_ID_SIZE + 1)));
+    }
+
+    #[test]
     fn test_invalid_stream_id_path_traversal() {
         assert!(!is_valid_stream_id("../etc/passwd"));
         assert!(!is_valid_stream_id(".."));
+        assert!(!is_valid_stream_id("."));
     }
 
     #[test]
     fn test_invalid_stream_id_contains_slash() {
         assert!(!is_valid_stream_id("abc/123"));
+    }
+
+    #[test]
+    fn test_invalid_stream_id_header_unsafe_characters() {
+        for stream_id in [
+            "abc\n123",
+            "abc\r123",
+            "abc\"123",
+            "abc\\123",
+            "abc 123",
+            "abc;filename=evil",
+            "recording,backup",
+            "\u{fc}mlaut",
+        ] {
+            assert!(!is_valid_stream_id(stream_id), "{stream_id:?}");
+        }
     }
 
     #[test]
@@ -287,5 +332,22 @@ mod tests {
     #[test]
     fn test_valid_stream_id_custom() {
         assert!(is_valid_stream_id("call-123"));
+        assert!(is_valid_stream_id("call_123.segment"));
+    }
+
+    #[test]
+    fn test_recording_content_disposition_for_valid_stream_id() {
+        let disposition = recording_content_disposition("call_123.segment")
+            .expect("valid stream id should produce a header value");
+
+        assert_eq!(
+            disposition.to_str().unwrap(),
+            "attachment; filename=\"call_123.segment.ogg\""
+        );
+    }
+
+    #[test]
+    fn test_recording_content_disposition_rejects_control_characters() {
+        assert!(recording_content_disposition("bad\nid").is_err());
     }
 }

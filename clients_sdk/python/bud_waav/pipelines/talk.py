@@ -5,31 +5,90 @@ BudTalk - Bidirectional voice pipeline
 from typing import Any, AsyncIterator, Callable, Optional, Union
 from dataclasses import dataclass
 
-from ..types import STTConfig, TTSConfig, STTResult, AudioEvent, FeatureFlags, AudioFeatures, DAGConfig
-from ..ws.session import WebSocketSession, SessionMetrics, ReconnectConfig
+from ..types import (
+    STTConfig, TTSConfig, STTResult, AudioEvent, FeatureFlags, AudioFeatures,
+    DAGConfig, ConversationConfig,
+)
+from ..ws.session import (
+    WebSocketSession,
+    SessionMetrics,
+    ReconnectConfig,
+    DEFAULT_CONNECT_TIMEOUT,
+)
+
+
+@dataclass
+class ConfigWarning:
+    """A typed gateway ``config_warning`` advisory (SDK_STANDARDIZATION_PLAN P1 #3).
+
+    The gateway emits this when a setting is sub-optimal or ignored but the
+    session still starts (it is non-fatal — it NEVER closes the session). The SDK
+    surfaces it as a first-class ``warning`` event so a beginner learns e.g.
+    "emotion=excited was ignored by deepgram" or "you placed a reasoning model on
+    the spoken path" instead of hitting a silent no-op.
+
+    Source of truth: ``OutgoingMessage::ConfigWarning`` (gateway messages.rs) +
+    the emitters in ``handlers/ws/config_lint.rs``.
+    """
+
+    code: str
+    """Stable machine code, e.g. ``unknown_config_keys``,
+    ``reasoning_model_on_voice_path``, ``reasoning_effort_clamped``,
+    ``emotion_ignored_for_provider``."""
+
+    message: str
+    """Human-readable explanation plus a one-line fix."""
+
+    detail: Optional[dict[str, Any]] = None
+    """Optional structured detail, e.g. ``{"ignored_keys": ["..."]}`` or
+    ``{"applied": ..., "floor": ...}``. ``None`` when the gateway omits it."""
+
+    @classmethod
+    def from_wire(cls, data: dict[str, Any]) -> "ConfigWarning":
+        """Parse a raw ``{type: config_warning, code, message, detail?}`` frame."""
+        return cls(
+            code=str(data.get("code", "")),
+            message=str(data.get("message", "")),
+            detail=data.get("detail"),
+        )
 
 
 @dataclass
 class TalkEvent:
-    """Event from a Talk session."""
+    """Event from a Talk session.
+
+    The unified ``__aiter__`` stream yields these. Beginners care about four
+    types: ``transcript`` (what the user said), ``bot_text`` (what the bot replied
+    in text, when the gateway exposes it), ``audio`` (the bot's spoken reply — the
+    primary bot output on ``/ws``), and ``warning`` (a typed config advisory).
+    """
 
     type: str
-    """Event type: transcript, audio, message, error, playback_complete, turn_completed, vad_event, audio_end"""
+    """Event type: transcript, bot_text, audio, warning, message, error,
+    playback_complete, turn_completed, vad_event, audio_end."""
 
     transcript: Optional[STTResult] = None
-    """Transcript result (if type is 'transcript')"""
+    """Transcript result (if type is 'transcript' or 'bot_text')."""
 
     audio: Optional[AudioEvent] = None
-    """Audio event (if type is 'audio')"""
+    """Audio event (if type is 'audio')."""
 
     message: Optional[dict[str, Any]] = None
-    """Message data (if type is 'message')"""
+    """Message data (if type is 'message')."""
 
     error: Optional[Exception] = None
-    """Error (if type is 'error')"""
+    """Error (if type is 'error')."""
+
+    warning: Optional[ConfigWarning] = None
+    """Typed gateway advisory (if type is 'warning')."""
 
     data: Optional[dict[str, Any]] = None
-    """Raw data payload (for turn_completed, vad_event, audio_end)"""
+    """Raw data payload (for turn_completed, vad_event, audio_end, warning)."""
+
+    @property
+    def text(self) -> Optional[str]:
+        """Convenience: the text of a ``transcript``/``bot_text`` event, if any."""
+        return self.transcript.text if self.transcript is not None else None
 
 
 class BudTalk:
@@ -59,7 +118,9 @@ class BudTalk:
         reconnect: Optional[ReconnectConfig] = None,
         audio_features: Optional[AudioFeatures] = None,
         dag_config: Optional[DAGConfig] = None,
+        conversation_config: Optional[ConversationConfig] = None,
         stream_id: Optional[str] = None,
+        alias: Optional[str] = None,
     ) -> "TalkSession":
         """
         Create a Talk session.
@@ -109,6 +170,10 @@ class BudTalk:
                     provider=tts.get("provider", "deepgram"),
                     voice=tts.get("voice"),
                     voice_id=tts.get("voice_id"),
+                    # P4: thread the abstract voice descriptor through the dict path
+                    # (pydantic coerces a nested dict to VoiceDescriptor). Without
+                    # this, an explicit field list here would silently DROP it.
+                    voice_descriptor=tts.get("voice_descriptor"),
                     model=tts.get("model"),
                     sample_rate=tts.get("sample_rate", 24000),
                 )
@@ -125,7 +190,9 @@ class BudTalk:
             reconnect=reconnect,
             audio_features=audio_features,
             dag_config=dag_config,
+            conversation_config=conversation_config,
             stream_id=stream_id,
+            alias=alias,
         )
 
     async def connect(
@@ -137,7 +204,9 @@ class BudTalk:
         reconnect: Optional[ReconnectConfig] = None,
         audio_features: Optional[AudioFeatures] = None,
         dag_config: Optional[DAGConfig] = None,
+        conversation_config: Optional[ConversationConfig] = None,
         stream_id: Optional[str] = None,
+        alias: Optional[str] = None,
     ) -> "TalkSession":
         """
         Create and connect a Talk session.
@@ -163,7 +232,9 @@ class BudTalk:
             reconnect=reconnect,
             audio_features=audio_features,
             dag_config=dag_config,
+            conversation_config=conversation_config,
             stream_id=stream_id,
+            alias=alias,
         )
         await session.connect()
         return session
@@ -183,7 +254,9 @@ class TalkSession:
         reconnect: Optional[ReconnectConfig] = None,
         audio_features: Optional[AudioFeatures] = None,
         dag_config: Optional[DAGConfig] = None,
+        conversation_config: Optional[ConversationConfig] = None,
         stream_id: Optional[str] = None,
+        alias: Optional[str] = None,
     ):
         """
         Initialize Talk session.
@@ -214,7 +287,9 @@ class TalkSession:
             reconnect=reconnect,
             audio_features=audio_features,
             dag_config=dag_config,
+            conversation_config=conversation_config,
             stream_id=stream_id,
+            alias=alias,
         )
 
         self._event_handlers: dict[str, list[Callable[..., Any]]] = {}
@@ -228,11 +303,24 @@ class TalkSession:
         self._session.on("turn_completed", self._on_turn_completed)
         self._session.on("vad_event", self._on_vad_event)
         self._session.on("audio_end", self._on_audio_end)
+        self._session.on("config_warning", self._on_config_warning)
 
     def _on_transcript(self, result: STTResult) -> None:
-        """Handle transcript events."""
+        """Handle transcript events (the user's speech)."""
         event = TalkEvent(type="transcript", transcript=result)
         self._emit("transcript", result)
+        self._emit("event", event)
+
+    def _on_config_warning(self, data: dict[str, Any]) -> None:
+        """Surface a gateway ``config_warning`` as a typed ``warning`` event.
+
+        P1 deliverable #3: a beginner learns that e.g. ``emotion`` was ignored by
+        the provider, or that an unknown/misnested config key was dropped, instead
+        of hitting a silent no-op. Never fatal — the session keeps running.
+        """
+        warning = ConfigWarning.from_wire(data)
+        event = TalkEvent(type="warning", warning=warning, data=data)
+        self._emit("warning", warning)
         self._emit("event", event)
 
     def _on_audio(self, audio: AudioEvent) -> None:
@@ -316,8 +404,13 @@ class TalkSession:
             elif handler in self._event_handlers[event]:
                 self._event_handlers[event].remove(handler)
 
-    async def connect(self, timeout: float = 10.0) -> None:
-        """Connect to the gateway."""
+    async def connect(self, timeout: float = DEFAULT_CONNECT_TIMEOUT) -> None:
+        """Connect to the gateway.
+
+        Defaults to the 35s connect timeout (D6) — the agent loop's audio=true
+        session waits on server-side PROVIDER_READY (STT+TTS upstream build, up
+        to ~30s) before `ready`.
+        """
         await self._session.connect(timeout=timeout)
 
     async def disconnect(self) -> None:
@@ -387,14 +480,31 @@ class TalkSession:
         self._session.reset_metrics()
 
     async def __aiter__(self) -> AsyncIterator[TalkEvent]:
-        """Iterate over all events."""
+        """Iterate over the unified event stream.
+
+        Beginner-facing types: ``transcript`` (user speech), ``bot_text`` (the
+        bot's reply text when the gateway exposes it via an assistant-role
+        transcript), ``audio`` (the bot's spoken reply — the primary bot output on
+        ``/ws``), and ``warning`` (a typed gateway ``config_warning`` advisory).
+        Lifecycle types (``turn_completed``/``vad_event``/``audio_end``/
+        ``playback_complete``/``message``/``error``) flow through too.
+        """
         async for message in self._session:
             msg_type = message.get("type")
 
             if msg_type == "transcript":
-                yield TalkEvent(type="transcript", transcript=message["result"])
+                # role="assistant" (DAG text echo) → bot_text; otherwise user.
+                ev_type = "bot_text" if message.get("role") == "assistant" else "transcript"
+                yield TalkEvent(type=ev_type, transcript=message["result"])
             elif msg_type == "audio":
                 yield TalkEvent(type="audio", audio=message["audio"])
+            elif msg_type == "config_warning":
+                # P1 #3: surface the gateway advisory instead of swallowing it.
+                yield TalkEvent(
+                    type="warning",
+                    warning=ConfigWarning.from_wire(message.get("data", {})),
+                    data=message.get("data"),
+                )
             elif msg_type == "message":
                 yield TalkEvent(type="message", message=message["data"])
             elif msg_type == "error":

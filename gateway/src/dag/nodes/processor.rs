@@ -4,7 +4,7 @@
 
 use async_trait::async_trait;
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use super::{DAGData, DAGNode, NodeCapability};
 use crate::dag::context::DAGContext;
@@ -128,21 +128,16 @@ impl DAGNode for ProcessorNode {
         // Text processors are not yet implemented through the plugin system
         // They would need a separate TextProcessor capability
         if self.is_text_processor {
-            warn!(
-                node_id = %self.id,
-                plugin_id = %self.plugin_id,
-                "Text processor plugins not yet implemented, passing through"
-            );
-            return Ok(input);
+            return Err(DAGError::processor_error(
+                &self.plugin_id,
+                "text processor plugins are not implemented",
+            ));
         }
 
-        // Fallback: pass through
-        warn!(
-            node_id = %self.id,
-            plugin_id = %self.plugin_id,
-            "Unknown processor type, passing through"
-        );
-        Ok(input)
+        Err(DAGError::processor_error(
+            &self.plugin_id,
+            "processor node has no supported processor type",
+        ))
     }
 
     fn clone_boxed(&self) -> Arc<dyn DAGNode> {
@@ -158,13 +153,7 @@ impl ProcessorNode {
             DAGData::Audio(bytes) => bytes.clone(),
             DAGData::TTSAudio(audio_data) => audio_data.data.clone(),
             other => {
-                warn!(
-                    node_id = %self.id,
-                    plugin_id = %self.plugin_id,
-                    input_type = %other.type_name(),
-                    "Expected audio input, passing through"
-                );
-                return Ok(input);
+                return Err(DAGError::data_type_error("audio", other.type_name()));
             }
         };
 
@@ -175,12 +164,10 @@ impl ProcessorNode {
         let registry = global_registry();
 
         if !registry.has_audio_processor(&self.plugin_id) {
-            warn!(
-                node_id = %self.id,
-                plugin_id = %self.plugin_id,
-                "Audio processor not found in registry, passing through"
-            );
-            return Ok(input);
+            return Err(DAGError::processor_error(
+                &self.plugin_id,
+                "audio processor plugin is not registered",
+            ));
         }
 
         // Create the processor with configuration
@@ -253,15 +240,51 @@ mod tests {
     use bytes::Bytes;
 
     #[tokio::test]
-    async fn test_processor_passthrough_when_plugin_missing() {
+    async fn test_processor_fails_when_audio_plugin_missing() {
         let node = ProcessorNode::new("proc", "nonexistent_plugin");
         let mut ctx = DAGContext::new("test");
 
-        // Without a real plugin, it should pass through
         let input = DAGData::Audio(Bytes::from("test audio"));
-        let output = node.execute(input, &mut ctx).await.unwrap();
+        let err = node
+            .execute(input, &mut ctx)
+            .await
+            .expect_err("missing processor plugin must fail closed, not pass audio through");
 
-        assert!(matches!(output, DAGData::Audio(_)));
+        assert!(matches!(err, DAGError::AudioProcessorError { .. }));
+        assert!(
+            err.to_string().contains("not registered"),
+            "error should name the missing plugin registry state: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_text_processor_fails_instead_of_passthrough() {
+        let node = ProcessorNode::text_processor("proc", "normalizer");
+        let mut ctx = DAGContext::new("test");
+
+        let err = node
+            .execute(DAGData::Text("hello".to_string()), &mut ctx)
+            .await
+            .expect_err("unsupported text processors must fail closed, not pass text through");
+
+        assert!(matches!(err, DAGError::AudioProcessorError { .. }));
+        assert!(
+            err.to_string().contains("not implemented"),
+            "error should make the unsupported processor type explicit: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_audio_processor_rejects_non_audio_input() {
+        let node = ProcessorNode::audio_processor("proc", "vad");
+        let mut ctx = DAGContext::new("test");
+
+        let err = node
+            .execute(DAGData::Text("not audio".to_string()), &mut ctx)
+            .await
+            .expect_err("audio processor fed text must fail typed, not pass data through");
+
+        assert!(matches!(err, DAGError::UnsupportedDataType { .. }));
     }
 
     #[test]

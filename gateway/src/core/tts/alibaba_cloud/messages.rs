@@ -187,7 +187,12 @@ pub struct CosyVoiceRunPayload {
     pub parameters: CosyVoiceParameters,
 }
 
-/// Parameters for CosyVoice.
+/// Parameters for CosyVoice (`run-task` `payload.parameters`).
+///
+/// The base prosody knobs (`voice`/`format`/`sample_rate`/`volume`/`rate`/`pitch`) are always
+/// present; the remaining fields are the advanced CosyVoice inference-protocol knobs and are
+/// omitted from the wire when unset (`skip_serializing_if`), so a request that uses none of them
+/// is byte-for-byte identical to the previous behavior.
 #[derive(Debug, Clone, Serialize)]
 pub struct CosyVoiceParameters {
     pub voice: String,
@@ -196,10 +201,38 @@ pub struct CosyVoiceParameters {
     pub volume: u8,
     pub rate: f32,
     pub pitch: f32,
+    /// Treat input text as SSML.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enable_ssml: Option<bool>,
+    /// Natural-language delivery instruction (emotion / dialect / style).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instruction: Option<String>,
+    /// Emit word-level timestamps.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub word_timestamp_enabled: Option<bool>,
+    /// Determinism seed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
+    /// Language hint(s).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language_hints: Option<Vec<String>>,
+    /// Opus output bitrate (bits/sec).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bit_rate: Option<u32>,
+    /// Text hotpatch / pronunciation override.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hot_fix: Option<serde_json::Value>,
+    /// Strip Markdown markup before synthesis.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enable_markdown_filter: Option<bool>,
+    /// Embed an AIGC watermark tag.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enable_aigc_tag: Option<bool>,
 }
 
 impl CosyVoiceRunTask {
-    /// Create a new run-task message.
+    /// Create a new run-task message from base prosody only (advanced knobs unset).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         model: &str,
         voice: &str,
@@ -209,6 +242,31 @@ impl CosyVoiceRunTask {
         rate: f32,
         pitch: f32,
     ) -> Self {
+        Self::with_parameters(
+            model,
+            CosyVoiceParameters {
+                voice: voice.to_string(),
+                format: format.to_string(),
+                sample_rate,
+                volume,
+                rate,
+                pitch,
+                enable_ssml: None,
+                instruction: None,
+                word_timestamp_enabled: None,
+                seed: None,
+                language_hints: None,
+                bit_rate: None,
+                hot_fix: None,
+                enable_markdown_filter: None,
+                enable_aigc_tag: None,
+            },
+        )
+    }
+
+    /// Create a new run-task message from a fully-populated parameter set (the path that carries
+    /// the advanced CosyVoice knobs onto the wire).
+    pub fn with_parameters(model: &str, parameters: CosyVoiceParameters) -> Self {
         let task_id = Uuid::new_v4().to_string();
         Self {
             header: CosyVoiceHeader {
@@ -225,14 +283,7 @@ impl CosyVoiceRunTask {
                 task_group: "audio".to_string(),
                 function: "SpeechSynthesizer".to_string(),
                 input: serde_json::json!({}),
-                parameters: CosyVoiceParameters {
-                    voice: voice.to_string(),
-                    format: format.to_string(),
-                    sample_rate,
-                    volume,
-                    rate,
-                    pitch,
-                },
+                parameters,
             },
         }
     }
