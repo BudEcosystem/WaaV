@@ -311,10 +311,28 @@ async fn transcription_inner(
             match field.bytes().await {
                 Ok(b) => file = Some(b.to_vec()),
                 Err(e) => {
+                    // The body limit is enforced LAZILY, as the body streams, so exceeding it
+                    // lands here rather than as a rejection of the `Multipart` extractor -- and
+                    // multer renders it as "Error parsing `multipart/form-data` request", which
+                    // mentions neither size nor a limit. Four identical attempts against this
+                    // gateway produced four log lines saying only "auth succeeded". Naming the
+                    // ceiling is the difference between a ten-second diagnosis and an
+                    // afternoon.
+                    let limit = crate::routes::api::max_audio_upload_bytes();
+                    tracing::warn!(
+                        "rejecting an upload on `file`: {e} (ceiling {limit} bytes, set \
+                         {} to change it)",
+                        crate::routes::api::MAX_AUDIO_UPLOAD_BYTES_ENV
+                    );
                     return openai_error(
                         StatusCode::BAD_REQUEST,
                         "invalid_request_error",
-                        format!("Could not read the uploaded file: {e}"),
+                        format!(
+                            "Could not read the uploaded file: {e}. This gateway accepts uploads \
+                             up to {limit} bytes ({:.0} MiB); a larger file is refused here with \
+                             exactly this message.",
+                            limit as f64 / (1024.0 * 1024.0)
+                        ),
                         Some("file"),
                     );
                 }
