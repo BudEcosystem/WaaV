@@ -95,12 +95,46 @@ pub fn validate_tls_config(tls: &Option<TlsConfig>) -> Result<(), Box<dyn std::e
 /// Validate that when auth is required, at least one auth method is configured
 ///
 /// Checks that either JWT auth (service URL + signing key) or API secret is present
+/// Test-facing shim preserving the pre-FRD-018 four-argument shape, with bud mode absent.
+///
+/// Existing tests assert what happens with no auth method configured at all; threading a
+/// `false` through each of them would add noise without adding coverage.
+#[cfg(test)]
+fn validate_auth_required_with_bud(
+    auth_required: bool,
+    auth_service_url: &Option<String>,
+    auth_signing_key_path: &Option<PathBuf>,
+    auth_api_secrets: &[AuthApiSecret],
+) -> Result<(), Box<dyn std::error::Error>> {
+    validate_auth_required(
+        auth_required,
+        auth_service_url,
+        auth_signing_key_path,
+        auth_api_secrets,
+        false,
+    )
+}
+
+/// True when the Bud control plane is configured.
+///
+/// The single place `WAAV_REDIS_URL` is consulted for this decision, so callers agree and the
+/// validator itself stays a pure function.
+pub fn bud_mode_configured() -> bool {
+    std::env::var("WAAV_REDIS_URL")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
+}
+
 /// when authentication is required.
 pub fn validate_auth_required(
     auth_required: bool,
     auth_service_url: &Option<String>,
     auth_signing_key_path: &Option<PathBuf>,
     auth_api_secrets: &[AuthApiSecret],
+    // FRD-018. Passed in rather than read from the environment here: a validator whose result
+    // depends on process-global state cannot be tested deterministically, and changes behaviour
+    // under a parallel test runner.
+    bud_mode_configured: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !auth_required {
         return Ok(());
@@ -113,10 +147,14 @@ pub fn validate_auth_required(
             .as_ref()
             .is_some_and(|p| !p.as_os_str().is_empty());
     let has_api_secret = !auth_api_secrets.is_empty();
-
-    if !has_jwt_auth && !has_api_secret {
+    // FRD-018: Bud mode resolves credentials from the control plane, so it is a complete auth
+    // configuration on its own. Without this arm the validator demands settings bud mode never
+    // uses, and the process refuses to start with auth correctly configured.
+    if !has_jwt_auth && !has_api_secret && !bud_mode_configured {
         return Err(
-            "When AUTH_REQUIRED=true, either (AUTH_SERVICE_URL + AUTH_SIGNING_KEY_PATH) or AUTH_API_SECRETS_JSON/AUTH_API_SECRET must be configured".into()
+            "When AUTH_REQUIRED=true, configure one of: WAAV_REDIS_URL (Bud control plane), \
+             (AUTH_SERVICE_URL + AUTH_SIGNING_KEY_PATH), or AUTH_API_SECRETS_JSON/AUTH_API_SECRET"
+                .into(),
         );
     }
 
@@ -460,7 +498,7 @@ mod tests {
         let auth_signing_key_path: Option<PathBuf> = None;
         let auth_api_secrets: Vec<AuthApiSecret> = Vec::new();
 
-        let result = validate_auth_required(
+        let result = validate_auth_required_with_bud(
             true,
             &auth_service_url,
             &auth_signing_key_path,
@@ -487,6 +525,9 @@ mod tests {
             &auth_service_url,
             &auth_signing_key_path,
             &auth_api_secrets,
+            // Not a Bud deployment: this case is about a blank JWT URL, and the control plane
+            // being absent is what makes the "no authenticator configured" verdict correct.
+            false,
         );
 
         assert!(result.is_err());

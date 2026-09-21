@@ -11,6 +11,114 @@ use xxhash_rust::xxh3::xxh3_128;
 /// Deepgram TTS endpoint
 pub const DEEPGRAM_TTS_URL: &str = "https://api.deepgram.com/v1/speak";
 
+/// Deepgram's Flux voices are served from a second speak endpoint.
+pub const DEEPGRAM_TTS_URL_V2: &str = "https://api.deepgram.com/v2/speak";
+
+/// Pick the speak endpoint for a Deepgram model.
+///
+/// Deepgram rejects a Flux model on `/v1/speak` outright:
+///
+/// > V2_MODEL_ON_V1_SPEAK_ENDPOINT — Flux models are not supported on the `/v1/speak`
+/// > endpoint. Please use the `/v2/speak` endpoint for Flux text-to-speech requests.
+///
+/// Every request to a published Flux deployment therefore failed with a 502 carrying that
+/// text. The model name is the only signal available: budapp publishes it verbatim and the
+/// voice table carries no endpoint hint.
+///
+/// Matched on a `flux-` PREFIX rather than a substring. A voice merely containing "flux"
+/// somewhere in its name is not a Flux model, and sending it to v2 would break a working
+/// deployment to fix a broken one.
+pub fn deepgram_speak_url(model: &str) -> &'static str {
+    if model.trim_start().to_ascii_lowercase().starts_with("flux-") {
+        DEEPGRAM_TTS_URL_V2
+    } else {
+        DEEPGRAM_TTS_URL
+    }
+}
+
+#[cfg(test)]
+mod speak_url_tests {
+    use super::*;
+
+    #[test]
+    fn flux_models_go_to_v2() {
+        // The live failure: flux-hannah-en, published and 502ing on every request.
+        assert_eq!(deepgram_speak_url("flux-hannah-en"), DEEPGRAM_TTS_URL_V2);
+        assert_eq!(deepgram_speak_url("FLUX-Hannah-EN"), DEEPGRAM_TTS_URL_V2);
+    }
+
+    #[test]
+    fn every_other_model_stays_on_v1() {
+        // aura-2-thalia-en works today and must keep working; moving it would trade one
+        // broken deployment for another.
+        for m in ["aura-2-thalia-en", "aura-asteria-en", "nova-3", ""] {
+            assert_eq!(deepgram_speak_url(m), DEEPGRAM_TTS_URL, "{m} must stay on v1");
+        }
+    }
+
+    #[test]
+    fn a_name_merely_containing_flux_is_not_a_flux_model() {
+        // Prefix, not substring. "aura-flux-like" is an Aura voice.
+        assert_eq!(deepgram_speak_url("aura-flux-like"), DEEPGRAM_TTS_URL);
+        assert_eq!(deepgram_speak_url("influx-en"), DEEPGRAM_TTS_URL);
+    }
+}
+
+/// Deepgram's `encoding` + `container` pair for a requested audio format.
+///
+/// WAV is a CONTAINER in Deepgram's model, not an encoding. Sending `encoding=wav` is rejected
+/// outright with `INVALID_QUERY_PARAMETER`, so every `response_format: "wav"` request 502'd —
+/// on a working endpoint, with a working voice. WAV is the OpenAI audio API's most ordinary
+/// format, so this failed for the most conventional caller.
+///
+/// Returns `(encoding, container)`. `None` means leave the container unset and let Deepgram
+/// default it, which is what every compressed format wants.
+pub fn deepgram_encoding_and_container(format: &str) -> (&str, Option<&'static str>) {
+    match format {
+        // A WAV file is linear16 samples inside a RIFF container.
+        "wav" => ("linear16", Some("wav")),
+        // Container-less: an explicit "none" keeps a WAV header off raw samples, matching the
+        // WebSocket path which delivers bare frames.
+        "linear16" | "pcm" | "mulaw" | "ulaw" | "alaw" => (format, Some("none")),
+        other => (other, None),
+    }
+}
+
+#[cfg(test)]
+mod encoding_container_tests {
+    use super::deepgram_encoding_and_container;
+
+    #[test]
+    fn wav_is_a_container_around_linear16() {
+        // The live failure: response_format "wav" returned 502 INVALID_QUERY_PARAMETER.
+        assert_eq!(deepgram_encoding_and_container("wav"), ("linear16", Some("wav")));
+    }
+
+    #[test]
+    fn raw_formats_keep_an_explicit_none_container() {
+        // Without this a WAV header is prepended to what the caller asked to be raw samples.
+        for f in ["linear16", "pcm", "mulaw", "ulaw", "alaw"] {
+            assert_eq!(deepgram_encoding_and_container(f), (f, Some("none")), "{f}");
+        }
+    }
+
+    #[test]
+    fn compressed_formats_are_passed_through_untouched() {
+        // mp3 and opus work today; setting a container on them is what would break them.
+        for f in ["mp3", "opus", "aac", "flac"] {
+            assert_eq!(deepgram_encoding_and_container(f), (f, None), "{f}");
+        }
+    }
+
+    #[test]
+    fn wav_still_takes_a_sample_rate() {
+        // It resolves to linear16, which is container-less at the codec level, so the rate is
+        // both allowed and needed — the caller cannot play samples at an unknown rate.
+        let (enc, _) = deepgram_encoding_and_container("wav");
+        assert!(matches!(enc, "linear16"));
+    }
+}
+
 fn validate_deepgram_tts_endpoint(source: &str, endpoint: &str) -> TTSResult<()> {
     let endpoint = endpoint.trim();
     if endpoint.is_empty() {
@@ -86,8 +194,15 @@ impl TTSRequestBuilder for DeepgramRequestBuilder {
     fn build_http_request(&self, client: &reqwest::Client, text: &str) -> reqwest::RequestBuilder {
         // Build the URL with query parameters (honoring the W-T0 endpoint override, which swaps
         // scheme+host while keeping the `/v1/speak` path the mock serves on).
+        // v1 or v2 depending on the model: Deepgram serves Flux voices only from /v2/speak
+        // and rejects them on /v1 with V2_MODEL_ON_V1_SPEAK_ENDPOINT.
+        let base = deepgram_speak_url(if self.config.model.is_empty() {
+            self.config.voice_id.as_deref().unwrap_or("")
+        } else {
+            &self.config.model
+        });
         let mut url = crate::core::tts::standard::override_rest_endpoint(
-            DEEPGRAM_TTS_URL,
+            base,
             self.speak.endpoint_override.as_deref(),
         );
         let mut params: Vec<(&str, String)> = Vec::new();
@@ -99,24 +214,31 @@ impl TTSRequestBuilder for DeepgramRequestBuilder {
             params.push(("model", voice_id.clone()));
         }
 
-        // Encoding (default to raw linear PCM)
-        let encoding = self.config.audio_format.as_deref().unwrap_or("linear16");
+        // Encoding + container (default to raw linear PCM). WAV is a CONTAINER here, not an
+        // encoding: `encoding=wav` is rejected with INVALID_QUERY_PARAMETER.
+        let requested = self.config.audio_format.as_deref().unwrap_or("linear16");
+        let (encoding, container) = deepgram_encoding_and_container(requested);
         params.push(("encoding", encoding.to_string()));
-
-        // Ensure no container when requesting raw PCM to avoid WAV headers
-        // Aligns with WS behavior which delivers raw binary frames without headers
-        match encoding {
-            "linear16" | "pcm" | "mulaw" | "ulaw" | "alaw" => {
-                params.push(("container", "none".to_string()));
-            }
-            _ => {}
+        if let Some(container) = container {
+            params.push(("container", container.to_string()));
         }
 
-        if let Some(sample_rate) = self.config.sample_rate {
-            params.push(("sample_rate", sample_rate.to_string()));
-        } else {
-            // Use 24000 to match defaults elsewhere (e.g., WS path)
-            params.push(("sample_rate", "24000".to_string()));
+        // `sample_rate` applies ONLY to container-less encodings. A compressed format carries
+        // its rate in its own header, and Deepgram rejects the combination outright:
+        //
+        //   400 UNSUPPORTED_AUDIO_FORMAT
+        //   `sample_rate` is not applicable when `encoding=mp3`
+        //
+        // Sending it unconditionally therefore made every compressed-format request fail, on
+        // this route and on /speak alike, regardless of what the caller configured.
+        let takes_sample_rate = matches!(encoding, "linear16" | "pcm" | "mulaw" | "ulaw" | "alaw");
+        if takes_sample_rate {
+            match self.config.sample_rate {
+                Some(sample_rate) => params.push(("sample_rate", sample_rate.to_string())),
+                // Match the default used elsewhere (the WS path) rather than letting the vendor
+                // pick, so raw samples arrive at a predictable rate.
+                None => params.push(("sample_rate", "24000".to_string())),
+            }
         }
 
         // Speaking speed/rate (`speed`, Deepgram range 0.7–1.5). Only emitted when explicitly set
@@ -517,7 +639,14 @@ mod tests {
 
         assert!(url.contains("model=aura-asteria-en"));
         assert!(url.contains("encoding=mp3"));
-        assert!(url.contains("sample_rate=24000"));
+        // NOT sample_rate. This assertion previously demanded `sample_rate=24000` here, which
+        // pinned a bug: Deepgram answers
+        //   400 UNSUPPORTED_AUDIO_FORMAT: `sample_rate` is not applicable when `encoding=mp3`
+        // so every compressed-format request failed. Verified against the live API.
+        assert!(
+            !url.contains("sample_rate"),
+            "a sample rate alongside a compressed encoding is a 400 from Deepgram: {url}"
+        );
         assert!(url.starts_with(DEEPGRAM_TTS_URL));
         // With default (empty) speak params, none of the advanced params appear.
         assert!(!url.contains("speed="));
@@ -732,5 +861,41 @@ mod tests {
             baseline, with_callback,
             "callback must NOT change the cache key (delivery-only)"
         );
+    }
+
+    /// The other half of the same rule: container-less encodings DO take a rate, and without
+    /// one the caller cannot interpret the samples they receive.
+    #[test]
+    fn raw_encodings_still_carry_a_sample_rate() {
+        for encoding in ["linear16", "pcm", "mulaw"] {
+            let config = TTSConfig {
+                provider: "deepgram".to_string(),
+                model: "aura-asteria-en".to_string(),
+                audio_format: Some(encoding.to_string()),
+                api_key: "test_key".to_string(),
+                ..Default::default()
+            };
+            let builder = DeepgramRequestBuilder {
+                config,
+                pronunciation_replacer: None,
+                speak: Default::default(),
+            };
+            let client = reqwest::Client::new();
+            let url = builder
+                .build_http_request(&client, "Test text")
+                .build()
+                .unwrap()
+                .url()
+                .to_string();
+
+            assert!(
+                url.contains("sample_rate="),
+                "{encoding} is container-less and needs a rate: {url}"
+            );
+            assert!(
+                url.contains("container=none"),
+                "{encoding} must not be wrapped in a container: {url}"
+            );
+        }
     }
 }

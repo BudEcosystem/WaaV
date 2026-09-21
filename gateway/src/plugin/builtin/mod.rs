@@ -632,6 +632,11 @@ fn nectec_stt_metadata() -> ProviderMetadata {
 // TTS Provider Metadata Functions
 // ============================================================================
 
+fn self_hosted_tts_metadata() -> ProviderMetadata {
+    ProviderMetadata::tts("self_hosted", "Self-hosted (OpenAI-compatible)")
+        .with_description("An audio server the operator runs, addressed by api_base")
+}
+
 fn deepgram_tts_metadata() -> ProviderMetadata {
     ProviderMetadata::tts("deepgram", "Deepgram Aura")
         .with_description("Real-time TTS with Aura voice models")
@@ -1518,6 +1523,12 @@ fn create_nectec_stt(config: STTConfig) -> Result<Box<dyn BaseSTT>, STTError> {
 // TTS Factory Functions
 // ============================================================================
 
+fn create_self_hosted_tts(config: TTSConfig) -> crate::core::tts::TTSResult<Box<dyn BaseTTS>> {
+    Ok(Box::new(crate::core::tts::self_hosted::SelfHostedTTS::new(
+        config,
+    )?))
+}
+
 fn create_deepgram_tts(config: TTSConfig) -> crate::core::tts::TTSResult<Box<dyn BaseTTS>> {
     Ok(Box::new(DeepgramTTS::new(config)?))
 }
@@ -1892,6 +1903,11 @@ inventory::submit! {
 // ============================================================================
 
 inventory::submit! {
+    PluginConstructor::tts("self_hosted", self_hosted_tts_metadata, create_self_hosted_tts)
+        .with_aliases(&["self-hosted", "waav_self_hosted", "openai_compatible"])
+}
+
+inventory::submit! {
     PluginConstructor::tts("deepgram", deepgram_tts_metadata, create_deepgram_tts)
 }
 
@@ -2143,12 +2159,16 @@ mod tests {
     fn gateway_does_not_register_unwired_infer_cascade_plugins() {
         let registry = global_registry();
 
+        // `self-hosted` is deliberately NOT in this list any more. It belonged here while it
+        // named nothing but an unwired cascade alias. It now names the FRD-018 self-hosted
+        // provider — registered, wired, and verified end to end against an OpenAI-compatible
+        // backend. Forbidding it would un-register the one voice provider a Bud deployment can
+        // run with no vendor credential at all. See the assertion below, which pins that.
         for alias in [
             "waav-infer",
             "infer",
             "waav_infer",
             "waavinfer",
-            "self-hosted",
             "WAAV-INFER",
             "Infer",
         ] {
@@ -2167,6 +2187,37 @@ mod tests {
             assert!(
                 registry.get_tts_metadata(alias).is_none(),
                 "unwired waav-infer TTS alias `{alias}` must not expose provider metadata"
+            );
+        }
+    }
+
+    /// The other half of the rule above: `self-hosted` must stay SELECTABLE.
+    ///
+    /// This exists because the two branches disagreed about what the name means. Upstream
+    /// reserved it for an unwired infer-cascade adapter and asserted it was absent; FRD-018
+    /// ships a wired provider under it. Without this test the merge is one careless re-add away
+    /// from silently un-registering that provider — and the symptom would not be a failing
+    /// test, it would be every self-hosted voice deployment resolving to no provider at all.
+    #[test]
+    fn the_self_hosted_provider_stays_registered_under_every_spelling_budapp_publishes() {
+        let registry = global_registry();
+
+        // The same spellings `core::tts::self_hosted::SELF_HOSTED_NAMES` accepts. budapp maps
+        // `waav_self_hosted` onto `self_hosted` when it writes `voice_table`, and callers use
+        // the hyphenated form, so all of them have to resolve.
+        for alias in [
+            "self_hosted",
+            "self-hosted",
+            "waav_self_hosted",
+            "openai_compatible",
+        ] {
+            assert!(
+                registry.has_tts_provider(alias),
+                "`{alias}` must resolve to the FRD-018 self-hosted TTS provider"
+            );
+            assert!(
+                registry.get_tts_metadata(alias).is_some(),
+                "`{alias}` must expose provider metadata so it appears as selectable"
             );
         }
     }

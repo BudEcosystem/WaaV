@@ -55,6 +55,7 @@ fn create_azure_tts_config() -> Option<TTSConfig> {
     let (subscription_key, _region) = get_azure_credentials()?;
 
     Some(TTSConfig {
+        api_base: None,
         provider: "azure".to_string(),
         api_key: subscription_key,
         voice_id: Some("en-US-JennyNeural".to_string()),

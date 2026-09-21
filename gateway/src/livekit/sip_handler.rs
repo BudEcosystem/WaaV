@@ -47,9 +47,7 @@
 //! }
 //! ```
 
-use livekit_api::services::sip::{
-    ListSIPDispatchRuleFilter, ListSIPInboundTrunkFilter, SIPClient,
-};
+use livekit_api::services::sip::{ListSIPDispatchRuleFilter, ListSIPInboundTrunkFilter, SIPClient};
 use livekit_protocol as proto;
 
 use crate::utils::sip_api_client::{SIPApiClient, SIPInboundTrunkOptions};

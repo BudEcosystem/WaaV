@@ -1,0 +1,34 @@
+{
+  "_comment": "SHARED CONTRACT FIXTURE \u2014 FRD-018 TC-CRED-02. Consumed by budapp's test_voice_publisher.py AND by WaaV's bud-auth/tests/contract.rs. A change here must satisfy both sides, which is the point: budgateway's equivalent config is deny_unknown_fields and drops mismatched entries with no error at all. Keep this file byte-identical in both repositories. The credential is a hex-shaped placeholder, not real ciphertext: the publisher refuses anything outside the hex/base64 alphabets so a plaintext vendor key can never reach a blob every WaaV replica loads.",
+  "vendor_backed": {
+    "vendor": "deepgram",
+    "api_base": "https://api.deepgram.com",
+    "credential": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+    "endpoints": [
+      "text_to_speech"
+    ],
+    "model": "aura-2",
+    "voice": "aura-asteria-en",
+    "language": "en-US",
+    "pricing": {
+      "unit": "character",
+      "cost_per_unit": 1.5e-05,
+      "currency": "USD",
+      "per_units": 1
+    }
+  },
+  "self_hosted": {
+    "vendor": "self_hosted",
+    "api_base": "http://whisper-abc.pde-ditto.svc:8000/v1",
+    "endpoints": [
+      "audio_transcription"
+    ],
+    "model": "openai/whisper-large-v3"
+  },
+  "minimal": {
+    "vendor": "elevenlabs",
+    "endpoints": [
+      "text_to_speech"
+    ]
+  }
+}

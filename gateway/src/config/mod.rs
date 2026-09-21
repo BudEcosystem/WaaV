@@ -496,6 +496,7 @@ impl ServerConfig {
             &config.auth_service_url,
             &config.auth_signing_key_path,
             &config.auth_api_secrets,
+            crate::config::validation::bud_mode_configured(),
         )?;
         validation::validate_sip_config(&config.sip)?;
 

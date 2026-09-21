@@ -1,0 +1,226 @@
+name: Release
+
+# Cut a release of the WaaV gateway: build and publish the image, then create (or update)
+# the GitHub Release for the tag.
+#
+# Two ways in, deliberately:
+#   * push a tag `v1.2.3`          -> builds and publishes, creates the release
+#   * run this workflow by hand    -> same, for a tag that already exists
+# The second is what makes a release UPDATABLE: re-running against an existing tag
+# re-publishes the image and rewrites the release body rather than failing on "already exists".
+#
+# Publishes to registry.bud.studio/runtime/waav, the registry every other Bud service is
+# pulled from (pde-ditto's imagePullSecret is `registry.bud.studio`).
+#
+# Secrets required: DOCKERHUB_USERNAME / DOCKERHUB_TOKEN. The names say dockerhub and the
+# registry is Harbor -- that mismatch is inherited from bud-runtime's release workflows,
+# where the same two secrets authenticate to registry.bud.studio. Kept identical so one
+# credential pair covers both repos.
+#
+# As of this commit THIS REPOSITORY HAS NO ACTIONS SECRETS AT ALL, so the first run will stop
+# at the credentials check until they are added under
+# Settings > Secrets and variables > Actions. That is deliberate: the alternative is a build
+# that cannot push and a green tick.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Tag to release, e.g. v1.2.3 (must already exist)"
+        required: true
+        type: string
+      platforms:
+        description: "Image platforms. arm64 goes through QEMU and is slow (Rust + ONNX)."
+        required: false
+        default: linux/amd64
+        type: choice
+        options:
+          - linux/amd64
+          - linux/amd64,linux/arm64
+      draft:
+        description: "Create the GitHub Release as a draft"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+env:
+  IMAGE: registry.bud.studio/runtime/waav
+
+concurrency:
+  group: release-${{ github.event.inputs.release_tag || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  image:
+    name: build + publish image
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      digest: ${{ steps.build.outputs.digest }}
+      tags: ${{ steps.meta.outputs.tags }}
+    steps:
+      - name: Resolve the tag
+        id: meta
+        env:
+          INPUT_TAG: ${{ inputs.release_tag }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          TAG="${INPUT_TAG:-$REF_NAME}"
+          case "$TAG" in
+            v*) VERSION="${TAG#v}" ;;
+            *)  VERSION="$TAG"; TAG="v${TAG}" ;;
+          esac
+          # A pre-release must not move :latest. Same rule as the sibling repo's release
+          # workflows, so an -rc image cannot become the default pull for a cluster.
+          if printf '%s' "$VERSION" | grep -qiE -- '-(rc|alpha|beta|pre|dev|hotfix|snapshot)'; then
+            PRERELEASE=true
+            TAGS="${IMAGE}:${VERSION}"
+            echo "::notice::Pre-release '${VERSION}' — :latest will not be moved."
+          else
+            PRERELEASE=false
+            TAGS="${IMAGE}:${VERSION}"$'\n'"${IMAGE}:latest"
+          fi
+          {
+            echo "tag=${TAG}"
+            echo "version=${VERSION}"
+            echo "prerelease=${PRERELEASE}"
+            echo 'tags<<TAGS_EOF'; printf '%s\n' "$TAGS"; echo 'TAGS_EOF'
+          } >> "$GITHUB_OUTPUT"
+          echo "publishing:"; printf '%s\n' "$TAGS" | sed 's/^/     /'
+
+      - name: Checkout the tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.meta.outputs.tag }}
+          fetch-depth: 0
+
+      - name: Compare the tag against the crate version
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          CRATE="$(sed -n '1,20{s/^version[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p;}' gateway/Cargo.toml | head -1)"
+          if [ "$CRATE" != "$VERSION" ]; then
+            # A warning, not a gate: the tag is the release's identity and the crate version
+            # is metadata inside it. Worth seeing on every release, not worth blocking one.
+            echo "::warning::tag ${VERSION} != gateway/Cargo.toml version ${CRATE}"
+          else
+            echo "tag matches gateway/Cargo.toml (${CRATE})"
+          fi
+
+      - name: Require the registry credentials
+        env:
+          USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [ -z "${USERNAME}" ] || [ -z "${TOKEN}" ]; then
+            echo "::error::DOCKERHUB_USERNAME / DOCKERHUB_TOKEN are not set on this repository." >&2
+            echo "::error::They authenticate to registry.bud.studio (the names are inherited" >&2
+            echo "::error::from bud-runtime, where the same pair is used). Add them under" >&2
+            echo "::error::Settings > Secrets and variables > Actions." >&2
+            exit 1
+          fi
+
+      - name: Set up QEMU
+        if: contains(inputs.platforms, 'arm64')
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to registry.bud.studio
+        uses: docker/login-action@v3
+        with:
+          registry: registry.bud.studio
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Context is the REPO ROOT, not gateway/: the Dockerfile copies the sibling crates
+      # (bud-auth, waav-openai-audio, plugin-api) that gateway/Cargo.toml depends on by path.
+      # Building from gateway/ fails at `COPY bud-auth /app/bud-auth`.
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: gateway/Dockerfile
+          platforms: ${{ inputs.platforms || 'linux/amd64' }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+
+      - name: Summarise
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          {
+            echo "### WaaV ${VERSION}"
+            echo
+            echo '| | |'
+            echo '|---|---|'
+            echo "| image | \`${IMAGE}:${VERSION}\` |"
+            echo "| digest | \`${DIGEST}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  release:
+    name: create or update the release
+    needs: image
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout the tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.image.outputs.tag }}
+          fetch-depth: 0
+
+      - name: Compose the release body
+        id: body
+        env:
+          VERSION: ${{ needs.image.outputs.version }}
+          DIGEST: ${{ needs.image.outputs.digest }}
+          PLATFORMS: ${{ inputs.platforms || 'linux/amd64' }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Image"
+            echo
+            echo '```'
+            echo "${IMAGE}:${VERSION}"
+            echo "${DIGEST}"
+            echo '```'
+            echo
+            echo "Platforms: \`${PLATFORMS}\`."
+            echo
+            echo "Pull by digest to pin exactly what was tested:"
+            echo '```bash'
+            echo "docker pull ${IMAGE}@${DIGEST}"
+            echo '```'
+          } > release-body.md
+          echo "path=release-body.md" >> "$GITHUB_OUTPUT"
+
+      # softprops/action-gh-release updates the release when one already exists for the tag,
+      # which is what makes a re-dispatch an UPDATE rather than a failure. The auto-generated
+      # notes are appended below the image block above.
+      - name: Create or update the GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.image.outputs.tag }}
+          name: ${{ needs.image.outputs.version }}
+          body_path: ${{ steps.body.outputs.path }}
+          append_body: true
+          generate_release_notes: true
+          draft: ${{ inputs.draft == true }}
+          prerelease: ${{ contains(needs.image.outputs.version, '-') }}
+          make_latest: ${{ !contains(needs.image.outputs.version, '-') }}

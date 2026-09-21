@@ -260,6 +260,7 @@ impl ServerConfig {
             &auth_service_url,
             &auth_signing_key_path,
             &auth_api_secrets,
+            crate::config::validation::bud_mode_configured(),
         )?;
 
         // SIP configuration
@@ -1110,9 +1111,10 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains(
-                    "either (AUTH_SERVICE_URL + AUTH_SIGNING_KEY_PATH) or AUTH_API_SECRETS_JSON/AUTH_API_SECRET"
-                )
+                // FRD-018 added WAAV_REDIS_URL as a third way to satisfy this, so the message
+                // now enumerates all three. The behaviour under test is unchanged: with none of
+                // them configured, startup still fails.
+                .contains("AUTH_API_SECRETS_JSON/AUTH_API_SECRET")
         );
 
         cleanup_env_vars();

@@ -12,6 +12,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::{
+    config::ServerConfig,
     core::{
         conversation::ConversationOrchestrator,
         stt::STTResult,
@@ -1214,6 +1215,81 @@ async fn validate_audio_configs(
     true
 }
 
+/// Resolve the vendor key for one provider, reporting any failure to the client.
+///
+/// `allow_client_keys` is what separates the two deployments. Standalone WaaV is BYOK by
+/// design, and preferring the caller's key is the feature. Under the Bud control plane the same
+/// field is a bypass — the vendor call would carry the caller's own credential, so the request
+/// is attributed to no project, counted against no quota and billed to nobody (FRD-018 §5.3.7).
+///
+/// The bypass is refused rather than ignored. A key that is silently dropped and then falls back
+/// to server config looks like it worked until the vendor answers 401 mid-session, naming
+/// neither WaaV nor the field that caused it.
+///
+/// # Arguments
+/// * `client_key` - Key supplied by the client in its config message, if any
+/// * `provider` - Provider name to resolve a configured key for
+/// * `role` - `"stt"` or `"tts"`, used to name the offending field back to the client
+/// * `allow_client_keys` - Whether client-supplied keys may be honoured
+/// * `config` - Server configuration holding the fallback keys
+/// * `message_tx` - Channel for sending error messages
+///
+/// # Returns
+/// * `Option<String>` - The key to use, or `None` after an error has been sent to the client
+async fn resolve_provider_api_key(
+    client_key: Option<&str>,
+    provider: &str,
+    role: &str,
+    allow_client_keys: bool,
+    config: &ServerConfig,
+    message_tx: &mpsc::Sender<MessageRoute>,
+) -> Option<String> {
+    // Normalisation is delegated so this gate and `/speak`'s agree on what counts as a supplied
+    // key: None, empty AND whitespace-only all mean "unset" and fall back, rather than a
+    // whitespace-only value being refused as a bypass attempt.
+    let client_key = client_api_key(client_key);
+
+    let error_msg = match client_key {
+        Some(key) if allow_client_keys => {
+            info!(
+                "Using client-provided API key for {} provider: {}",
+                role.to_uppercase(),
+                provider
+            );
+            return Some(key);
+        }
+        Some(_) => {
+            warn!(
+                provider = %provider,
+                role = %role,
+                "Refused client-supplied API key: vendor credentials are owned by the control plane"
+            );
+            // Accurate about THIS route. Addressing an endpoint by name is a
+            // /v1/audio/speech capability (`AppState::resolve_voice_endpoint`); the socket
+            // config path has no such field, so telling the caller to use one here sent them
+            // looking for something that does not exist.
+            format!(
+                "Client-supplied api_key in {role}_config is not accepted by this gateway. \
+                 Vendor credentials are owned by the control plane and resolved here; remove \
+                 the field. To address a specific deployment's credential, call POST \
+                 /v1/audio/speech with `model` set to your Bud endpoint name."
+            )
+        }
+        None => match config.get_api_key(provider) {
+            Ok(key) => return Some(key),
+            Err(error_msg) => error_msg,
+        },
+    };
+
+    error!("{}", error_msg);
+    let _ = message_tx
+        .send(MessageRoute::Outgoing(OutgoingMessage::Error {
+            message: error_msg,
+        }))
+        .await;
+    None
+}
+
 fn validate_audio_config_values(
     stt_config: &STTWebSocketConfig,
     tts_config: &TTSWebSocketConfig,
@@ -1244,40 +1320,28 @@ async fn initialize_voice_manager(
         stt_ws_config.provider, tts_ws_config.provider
     );
 
-    // Get API keys - prefer client-provided keys, fall back to server config
-    let stt_api_key = if let Some(client_key) = client_api_key(stt_ws_config.api_key.as_deref()) {
-        info!(
-            "Using client-provided API key for STT provider: {}",
-            stt_ws_config.provider
-        );
-        client_key
-    } else {
-        match app_state.config.get_api_key(&stt_ws_config.provider) {
-            Ok(key) => key,
-            Err(error_msg) => {
-                error!("{}", error_msg);
-                send_error(message_tx, error_msg).await;
-                return None;
-            }
-        }
-    };
+    // Get API keys - prefer client-provided keys where the deployment allows them, fall back to
+    // server config
+    let allow_client_keys = app_state.allows_client_supplied_keys();
+    let stt_api_key = resolve_provider_api_key(
+        stt_ws_config.api_key.as_deref(),
+        &stt_ws_config.provider,
+        "stt",
+        allow_client_keys,
+        &app_state.config,
+        message_tx,
+    )
+    .await?;
 
-    let tts_api_key = if let Some(client_key) = client_api_key(tts_ws_config.api_key.as_deref()) {
-        info!(
-            "Using client-provided API key for TTS provider: {}",
-            tts_ws_config.provider
-        );
-        client_key
-    } else {
-        match app_state.config.get_api_key(&tts_ws_config.provider) {
-            Ok(key) => key,
-            Err(error_msg) => {
-                error!("{}", error_msg);
-                send_error(message_tx, error_msg).await;
-                return None;
-            }
-        }
-    };
+    let tts_api_key = resolve_provider_api_key(
+        tts_ws_config.api_key.as_deref(),
+        &tts_ws_config.provider,
+        "tts",
+        allow_client_keys,
+        &app_state.config,
+        message_tx,
+    )
+    .await?;
 
     // P4 VOICE-DESCRIPTOR resolution: when the client supplied a canonical
     // `voice_descriptor` but NO raw `voice_id`, resolve it SERVER-SIDE to a concrete
@@ -3260,6 +3324,198 @@ mod tests {
         assert_ne!(id1, id2, "Generated UUIDs should be unique");
     }
 
+    /// A server config carrying exactly one provider key, so the fallback path has something
+    /// to resolve and a second provider stays deliberately unconfigured.
+    fn config_with_deepgram_key() -> ServerConfig {
+        ServerConfig {
+            host: "localhost".to_string(),
+            port: 3001,
+            tls: None,
+            livekit_url: "ws://localhost:7880".to_string(),
+            livekit_public_url: "http://localhost:7880".to_string(),
+            livekit_api_key: None,
+            livekit_api_secret: None,
+            deepgram_api_key: Some("dg-server-key".to_string()),
+            elevenlabs_api_key: None,
+            // Providers upstream added while this branch was out. All None on purpose: this
+            // helper exists to prove the fallback resolves the ONE configured key and refuses
+            // everything else, so any of these being Some would weaken the test it backs.
+            azure_openai_api_key: None,
+            azure_openai_endpoint: None,
+            gemini_api_key: None,
+            grok_api_key: None,
+            inworld_api_key: None,
+            speechmatics_api_key: None,
+            ultravox_api_key: None,
+            yandex_api_key: None,
+            yandex_folder_id: None,
+            realtime_endpoint_overrides: Default::default(),
+            aliases: Default::default(),
+            google_credentials: None,
+            azure_speech_subscription_key: None,
+            azure_speech_region: None,
+            cartesia_api_key: None,
+            openai_api_key: None,
+            assemblyai_api_key: None,
+            hume_api_key: None,
+            lmnt_api_key: None,
+            groq_api_key: None,
+            playht_api_key: None,
+            playht_user_id: None,
+            ibm_watson_api_key: None,
+            ibm_watson_instance_id: None,
+            ibm_watson_region: None,
+            aws_access_key_id: None,
+            aws_secret_access_key: None,
+            aws_region: None,
+            gnani_token: None,
+            gnani_access_key: None,
+            gnani_certificate_path: None,
+            recording_s3_bucket: None,
+            recording_s3_region: None,
+            recording_s3_endpoint: None,
+            recording_s3_access_key: None,
+            recording_s3_secret_key: None,
+            recording_s3_prefix: None,
+            cache_path: None,
+            cache_ttl_seconds: Some(3600),
+            auth_service_url: None,
+            auth_signing_key_path: None,
+            auth_api_secrets: Vec::new(),
+            auth_timeout_seconds: 5,
+            auth_required: false,
+            sip: None,
+            cors_allowed_origins: None,
+            rate_limit_requests_per_second: 60,
+            rate_limit_burst_size: 10,
+            max_websocket_connections: Some(10),
+            max_connections_per_ip: 3,
+            ws_processing_timeout_secs: 10,
+            realtime_processing_timeout_secs: 30,
+            sip_max_participants: 3,
+            plugins: crate::config::PluginConfig::default(),
+            dag_timeouts: crate::config::DAGTimeoutsConfig::default(),
+        }
+    }
+
+    /// The error text the client would receive, if any was sent.
+    fn next_error(rx: &mut mpsc::Receiver<MessageRoute>) -> Option<String> {
+        match rx.try_recv() {
+            Ok(MessageRoute::Outgoing(OutgoingMessage::Error { message })) => Some(message),
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_client_api_key_refused_when_bud_owns_credentials() {
+        for role in ["stt", "tts"] {
+            let (tx, mut rx) = mpsc::channel(4);
+            let client_key = "sk-caller-owned".to_string();
+
+            let key = resolve_provider_api_key(
+                Some(client_key.as_str()),
+                "deepgram",
+                role,
+                false,
+                &config_with_deepgram_key(),
+                &tx,
+            )
+            .await;
+
+            assert_eq!(key, None, "a client key must not resolve under Bud mode");
+
+            let message = next_error(&mut rx).expect("refusal must reach the client");
+            assert!(
+                message.contains(&format!("{role}_config")),
+                "error must name the field to remove: {message}"
+            );
+            assert!(
+                !message.contains("sk-caller-owned"),
+                "the key must not be echoed back to the client: {message}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_client_api_key_honoured_in_standalone_mode() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let client_key = "sk-caller-owned".to_string();
+
+        let key = resolve_provider_api_key(
+            Some(client_key.as_str()),
+            "deepgram",
+            "stt",
+            true,
+            &config_with_deepgram_key(),
+            &tx,
+        )
+        .await;
+
+        assert_eq!(key.as_deref(), Some("sk-caller-owned"));
+        assert!(next_error(&mut rx).is_none(), "BYOK is not an error");
+    }
+
+    #[tokio::test]
+    async fn test_empty_client_api_key_falls_back_under_bud_mode() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let empty = String::new();
+
+        let key = resolve_provider_api_key(
+            Some(empty.as_str()),
+            "deepgram",
+            "stt",
+            false,
+            &config_with_deepgram_key(),
+            &tx,
+        )
+        .await;
+
+        assert_eq!(key.as_deref(), Some("dg-server-key"));
+        assert!(
+            next_error(&mut rx).is_none(),
+            "an empty key bypasses nothing and must not fail the session"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_absent_client_api_key_falls_back_under_bud_mode() {
+        let (tx, mut rx) = mpsc::channel(4);
+
+        let key = resolve_provider_api_key(
+            None,
+            "deepgram",
+            "stt",
+            false,
+            &config_with_deepgram_key(),
+            &tx,
+        )
+        .await;
+
+        assert_eq!(key.as_deref(), Some("dg-server-key"));
+        assert!(next_error(&mut rx).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_unconfigured_provider_still_reports_its_own_error() {
+        let (tx, mut rx) = mpsc::channel(4);
+
+        let key = resolve_provider_api_key(
+            None,
+            "elevenlabs",
+            "tts",
+            false,
+            &config_with_deepgram_key(),
+            &tx,
+        )
+        .await;
+
+        assert_eq!(key, None);
+        let message = next_error(&mut rx).expect("a missing server key must still be reported");
+        assert!(
+            message.contains("not configured"),
+            "the refusal must not mask the configuration error: {message}"
+        );
+    }
     #[test]
     #[serial]
     fn heartbeat_period_env_rejects_malformed_value() {

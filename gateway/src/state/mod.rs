@@ -38,6 +38,10 @@ pub struct AppState {
     pub active_ws_connections: Arc<AtomicUsize>,
     /// Connection count per IP address (for per-IP limit enforcement)
     pub connections_per_ip: Arc<DashMap<IpAddr, AtomicUsize>>,
+    /// Bud control plane (FRD-018). `None` leaves WaaV in standalone mode, where credentials
+    /// come from configuration and voice endpoints are not registrable.
+    pub bud_mode: Option<Arc<crate::auth::bud_mode::BudMode>>,
+
     /// App-wide shutdown signal (RC6 SIGTERM session drain).
     ///
     /// Cancelled by `main()` when SIGTERM/SIGINT is received, BEFORE axum's
@@ -53,6 +57,73 @@ pub struct AppState {
     /// `GET /transcribe/batch/{job_id}` can return them. In-process (single-node); a multi-node
     /// deployment would back this with a shared store.
     pub batch_jobs: Arc<DashMap<String, crate::core::stt::batch::BatchJob>>,
+}
+
+impl AppState {
+    /// Whether a caller may bring its own vendor `api_key` in a request or WebSocket config.
+    ///
+    /// Standalone WaaV is BYOK by design: the caller holds the vendor relationship and pays the
+    /// vendor directly. Under the Bud control plane the same field bypasses the tenant's
+    /// credential entirely — no project attribution, no quota, no billing — so it is refused
+    /// (FRD-018 §5.3.7).
+    pub fn allows_client_supplied_keys(&self) -> bool {
+        self.bud_mode.is_none()
+    }
+
+    /// Resolve a Bud voice endpoint by the name the caller used, checking it serves what was
+    /// asked for.
+    ///
+    /// The capability check is not decoration: an endpoint registered for transcription would
+    /// otherwise accept a synthesis request and fail deep inside a vendor call, with an error
+    /// naming neither the endpoint nor the mistake.
+    /// Who the caller is, for attribution on the turn span.
+    ///
+    /// `resolve_voice_endpoint` deliberately does not return this: it resolves an ALIAS through
+    /// the caller's key and has no reason to care who they are. The identity was therefore
+    /// available all along and simply never asked for, which is why project_id, user_id and
+    /// api_key_id were NULL for every voice turn ever recorded.
+    ///
+    /// Cheap by construction — `authenticate` reads the in-memory ArcSwap snapshot and performs
+    /// no I/O, which is the whole point of the auth plane. The middleware has already
+    /// authenticated this request; this is a second lookup of the same map, not a second
+    /// round trip.
+    pub async fn resolve_principal(
+        &self,
+        bearer: Option<&str>,
+    ) -> Option<bud_auth::runtime::Principal> {
+        let plane = self.bud_mode.as_ref()?.plane();
+        plane.authenticate(bearer?).await.ok()
+    }
+
+    pub fn resolve_voice_endpoint(
+        &self,
+        name: &str,
+        capability: &str,
+        bearer: Option<&str>,
+    ) -> Option<bud_auth::credentials::VoiceEndpoint> {
+        let plane = self.bud_mode.as_ref()?.plane();
+
+        // A caller names an ALIAS ("tts-deepgram"); the voice table is keyed by ENDPOINT ID
+        // ("ep-e2e"). The mapping lives in the caller's own api_key blob, which is also the
+        // authorization boundary — resolving through it means a caller can only reach endpoints
+        // their key actually lists, rather than any endpoint whose id they can guess.
+        let endpoint_id = bearer
+            .and_then(|token| plane.alias_endpoint_id(token, name))
+            .unwrap_or_else(|| name.to_string());
+
+        let endpoint = plane.voice_endpoint(&endpoint_id)?;
+        if endpoint.serves(capability) {
+            Some(endpoint)
+        } else {
+            tracing::warn!(
+                endpoint = %name,
+                requested = %capability,
+                serves = ?endpoint.endpoints,
+                "voice endpoint does not serve the requested capability"
+            );
+            None
+        }
+    }
 }
 
 impl AppState {
@@ -309,6 +380,9 @@ impl AppState {
         };
 
         Ok(Arc::new(Self {
+            // Installed after construction by main(), once the control-plane connection is up:
+            // AppState::try_new runs before the Redis URL is known.
+            bud_mode: None,
             config,
             core_state,
             livekit_room_handler,

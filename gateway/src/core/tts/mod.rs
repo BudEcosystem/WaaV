@@ -31,6 +31,7 @@ pub mod provider;
 pub mod resemble;
 pub mod reverie;
 pub mod sberdevices;
+pub mod self_hosted;
 pub mod smallest;
 /// Magic-byte container sniffing — format truth at every audio boundary (P0.1).
 pub mod sniff;

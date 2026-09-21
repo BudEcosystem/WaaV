@@ -592,6 +592,7 @@ impl Default for AwsPollyTTSConfig {
                 pronunciations: Vec::new(),
                 request_pool_size: Some(4),
                 emotion_config: None,
+                api_base: None,
             },
             region: AwsRegion::default(),
             aws_access_key_id: None,

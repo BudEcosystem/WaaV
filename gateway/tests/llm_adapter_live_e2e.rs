@@ -52,7 +52,8 @@ fn openai_key() -> Option<String> {
 /// resource-contention flake, not a product bug. One at a time is deterministic. Poison-tolerant.
 fn ollama_serial_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[tokio::test]

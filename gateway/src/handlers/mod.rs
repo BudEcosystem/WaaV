@@ -17,6 +17,7 @@ pub mod capabilities;
 pub mod dag;
 pub mod debug_profile;
 pub mod livekit;
+pub mod openai_audio;
 pub mod realtime;
 pub mod recording;
 pub mod sip;

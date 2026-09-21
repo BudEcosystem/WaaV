@@ -99,7 +99,10 @@ async fn main() -> anyhow::Result<()> {
     let _ = dotenvy::dotenv();
 
     // Initialize tracing
-    tracing_subscriber::fmt::init();
+    // Exports to OTLP when the chart supplies an endpoint, stdout otherwise. The guard is
+    // held for the process lifetime so shutdown can flush: dropping it silently loses whatever
+    // is still batched, which is exactly the spans from the request that caused the shutdown.
+    let mut tracing_guard = waav_gateway::observability::tracing_init::init();
 
     // Initialize crypto provider for TLS connections
     // This must be done before any TLS connections are attempted
@@ -202,9 +205,38 @@ async fn main() -> anyhow::Result<()> {
     println!("Starting server on {address}");
 
     // Create application state
-    let app_state = AppState::try_new(config)
+    let mut app_state = AppState::try_new(config)
         .await
         .map_err(|e| anyhow!("invalid app state config: {e}"))?;
+
+    // FRD-018: bring up the Bud control plane, if configured.
+    //
+    // Boot failure is fatal on purpose. A WaaV that starts with an empty auth snapshot answers
+    // 401 to every valid credential — a total outage from a pod that looks perfectly healthy.
+    // Failing here stalls the rollout instead, which is the outcome an operator can act on.
+    if let Some(bud_cfg) = waav_gateway::auth::bud_mode::BudModeConfig::from_env() {
+        match waav_gateway::auth::bud_mode::BudMode::start(bud_cfg).await {
+            Ok(bud) => {
+                bud.spawn_keyspace_loop();
+                if let Some(state) = std::sync::Arc::get_mut(&mut app_state) {
+                    state.bud_mode = Some(bud);
+                } else {
+                    eprintln!(
+                        "FATAL: application state was already shared; cannot install the Bud control plane"
+                    );
+                    std::process::exit(1);
+                }
+                println!("Bud control plane active: identity and voice endpoints resolved locally");
+            }
+            Err(e) => {
+                eprintln!("FATAL: Bud control plane failed to start: {e}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        println!("Bud control plane not configured (WAAV_REDIS_URL unset); running standalone");
+    }
+    let app_state = app_state;
 
     // Create protected API routes with authentication middleware
     let protected_routes = routes::api::create_api_router().layer(middleware::from_fn_with_state(
@@ -267,10 +299,18 @@ async fn main() -> anyhow::Result<()> {
     // - `/readyz`: readiness (config + enabled-provider credentials + cached TCP reachability);
     //   returns 503 + a per-provider JSON breakdown when an enabled provider is unreachable.
     // - `/metrics`: Prometheus text exposition (waav_provider_* + waav_circuit_breaker_state).
+    // - `/ready`: FRD-018 readiness. Distinct from `/readyz`, which reports on vendor
+    //   reachability: this one reports whether the Bud control-plane snapshot has hydrated.
+    //   Before first hydration every valid credential resolves to 401, so a pod in that state
+    //   must stay out of the load balancer. It is also the path the Bud chart's probe uses.
     let public_routes = Router::new()
         .route(
             "/",
             axum::routing::get(waav_gateway::handlers::api::health_check),
+        )
+        .route(
+            "/ready",
+            axum::routing::get(waav_gateway::handlers::api::readiness_check),
         )
         .route(
             "/livez",
@@ -300,12 +340,25 @@ async fn main() -> anyhow::Result<()> {
         );
         None
     } else {
+        // `GovernorConfigBuilder::per_second(n)` does NOT mean "n requests per second". It
+        // sets the REPLENISH INTERVAL: `self.period = Duration::from_secs(n)`. So the old
+        // `.per_second(rate_limit_rps)` turned a configured 60 rps into one request every 60
+        // seconds -- roughly 3600x tighter than the number says. With the burst spent, the
+        // Kubernetes readiness probe got 429 and the pod never became ready.
+        //
+        // The interval for N requests per second is 1000/N milliseconds, floored at 1ms
+        // (anything faster than 1000 rps is effectively unlimited here, and a zero interval
+        // is rejected by the builder).
+        let period_ms = waav_gateway::rate_limit_period_ms(rate_limit_rps);
         let governor_config = GovernorConfigBuilder::default()
-            .per_second(rate_limit_rps as u64)
+            .per_millisecond(period_ms)
             .burst_size(rate_limit_burst)
             .key_extractor(PeerIpKeyExtractor)
             .finish()
             .ok_or_else(|| anyhow!("Failed to build rate limiter config"))?;
+        println!(
+            "Rate limiting: {rate_limit_rps} req/s per IP (one token per {period_ms}ms, burst {rate_limit_burst})"
+        );
         Some(GovernorLayer::new(governor_config))
     };
 
@@ -382,16 +435,27 @@ async fn main() -> anyhow::Result<()> {
     // can send a final protocol notice and tear down its providers within the drain window.
     let shutdown_token = app_state.shutdown.clone();
 
-    // Combine all routes: public + webhook + protected + websocket + realtime
-    let app = public_routes
-        .merge(webhook_routes)
+    // Combine all routes: webhook + protected + websocket + realtime + debug, rate-limited;
+    // then the public operability routes merged on top, deliberately OUTSIDE the governor.
+    //
+    // `/`, `/ready`, `/livez` and `/readyz` are what the kubelet polls, and `/metrics` is what
+    // Prometheus scrapes. Every one of those arrives from the node's own address — and because
+    // the limiter keys on the real TCP peer IP (see the S7 note above), behind Traefik that is
+    // the SAME bucket as all real traffic. Counting probes against it means a busy pod fails
+    // its own liveness check and is restarted for being popular, which is precisely backwards.
+    // These are also the endpoints that must answer when the pod is in trouble.
+    let limited_routes = webhook_routes
         .merge(protected_routes)
         .merge(ws_routes)
         .merge(realtime_routes)
         .merge(debug_profile_routes)
+        .with_state(app_state.clone())
+        .layer(tower::util::option_layer(governor_layer));
+
+    let app = public_routes
+        .merge(limited_routes)
         .with_state(app_state)
         .layer(cors_layer)
-        .layer(tower::util::option_layer(governor_layer))
         .layer(security_headers)
         // Request-id/trace-context correlation is the OUTERMOST layer so the id exists before
         // auth, rate-limiting, or any handler logs — every nested `tracing` event inherits it,
@@ -462,6 +526,11 @@ async fn main() -> anyhow::Result<()> {
         })
         .await?;
     }
+
+    // Flush batched spans BEFORE returning. Without this the exporter is dropped with its
+    // batch unsent, and the spans lost are the ones from the requests immediately before
+    // shutdown -- exactly the ones someone investigating a bad rollout is looking for.
+    tracing_guard.shutdown();
 
     info!("Server shutdown complete");
     Ok(())

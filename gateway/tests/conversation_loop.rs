@@ -2432,3 +2432,137 @@ async fn fatal_stage_error_fires_handler_once() {
         "fatal fires exactly once"
     );
 }
+
+// ---------------------------------------------------------------------------
+// FRD-018 M6 — the LLM leg of a voice turn
+// ---------------------------------------------------------------------------
+
+/// Captures span field names AND values from one turn.
+///
+/// Thread-local via `with_default` rather than a global subscriber: a global one would see
+/// spans from every other test in this binary and make the assertions depend on scheduling.
+mod span_capture {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id, Record};
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::Context;
+    use tracing_subscriber::registry::LookupSpan;
+
+    pub type Fields = Arc<Mutex<HashMap<String, String>>>;
+
+    struct V(Fields);
+    impl Visit for V {
+        fn record_debug(&mut self, f: &Field, v: &dyn std::fmt::Debug) {
+            // `Empty` fields report no value; only keep the ones actually recorded.
+            let rendered = format!("{v:?}");
+            if rendered != "Empty" {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .insert(f.name().to_string(), rendered);
+            }
+        }
+        fn record_u64(&mut self, f: &Field, v: u64) {
+            self.0
+                .lock()
+                .unwrap()
+                .insert(f.name().to_string(), v.to_string());
+        }
+        fn record_str(&mut self, f: &Field, v: &str) {
+            self.0
+                .lock()
+                .unwrap()
+                .insert(f.name().to_string(), v.to_string());
+        }
+    }
+
+    /// A Layer over the real `Registry`, NOT a bare `Subscriber`.
+    ///
+    /// This distinction is the test, not an implementation detail. A hand-rolled Subscriber
+    /// that no-ops `enter`/`exit` keeps no span stack, so `Span::current()` inside the
+    /// instrumented future resolves to `Span::none()` and every later `record` is silently
+    /// dropped — the harness would then report the production code broken when it is not.
+    /// `Registry` maintains the stack exactly as the deployed subscriber does.
+    pub struct CaptureLayer(pub Fields);
+
+    impl<S> Layer<S> for CaptureLayer
+    where
+        S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+    {
+        fn on_new_span(&self, attrs: &Attributes<'_>, _id: &Id, _ctx: Context<'_, S>) {
+            attrs.record(&mut V(self.0.clone()));
+        }
+        fn on_record(&self, _id: &Id, values: &Record<'_>, _ctx: Context<'_, S>) {
+            values.record(&mut V(self.0.clone()));
+        }
+    }
+}
+
+/// A real turn must emit the LLM leg, not merely declare it.
+///
+/// M6's exit criterion is per-leg spans for STT, LLM and TTS. The two HTTP audio routes had
+/// theirs; this path — the only one where all three legs happen in one turn — had no span at
+/// all, so the LLM leg was the milestone's outstanding gap. Driving `run_turn` against the
+/// mock LLM is what distinguishes "the field exists" from "the field arrives populated".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_conversation_turn_emits_the_llm_leg_on_its_voice_turn_span() {
+    unsafe {
+        std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1");
+    }
+    register_mock_tts();
+    reset_tts_stats();
+
+    let llm_state = LlmMockState::default();
+    *llm_state.reply.lock() = "Certainly.".to_string();
+    let (base_url, _server) = start_llm_mock(llm_state.clone()).await;
+
+    let vm = build_voice_manager();
+    vm.start().await.expect("vm start");
+    let _audio = wire_audio_egress(&vm).await;
+
+    let orchestrator =
+        ConversationOrchestrator::new("session-m6", conv_config(base_url, false), vm.clone())
+            .expect("orchestrator");
+
+    let fields: span_capture::Fields = Default::default();
+    use tracing_subscriber::layer::SubscriberExt;
+    let dispatch = tracing::Dispatch::new(
+        tracing_subscriber::registry().with(span_capture::CaptureLayer(fields.clone())),
+    );
+    // `with_subscriber`, not `dispatcher::with_default`: the latter is scoped to the current
+    // thread's synchronous execution, so it would fall away at the turn's first `.await` and
+    // capture nothing — the async-shaped version of the mistake this whole leg guards against.
+    use tracing::instrument::WithSubscriber;
+    orchestrator
+        .run_turn("what is the balance")
+        .with_subscriber(dispatch)
+        .await
+        .expect("turn should succeed against the mock LLM");
+
+    let f = fields.lock().unwrap();
+    let model = f
+        .get("gen_ai.request.model")
+        .unwrap_or_else(|| panic!("the turn span carries no LLM model; fields were {f:?}"));
+    assert!(
+        model.contains("mock-llm"),
+        "the model recorded should be the tier that actually answered, got {model}"
+    );
+    assert!(
+        f.contains_key("bud.voice.llm.duration_ms"),
+        "the turn span carries no LLM duration — the leg is declared but never populated, \
+         which reaches ClickHouse as a NULL column and reads as 'nobody uses this'; \
+         fields were {f:?}"
+    );
+    assert_eq!(
+        f.get("bud.voice.session_id").map(String::as_str),
+        Some("session-m6"),
+        "the turn must be attributable to its session"
+    );
+    assert!(
+        f.contains_key("bud.voice.turn_index"),
+        "turn index missing: two turns in one session would be indistinguishable"
+    );
+}

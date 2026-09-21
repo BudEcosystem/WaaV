@@ -1,0 +1,613 @@
+//! OpenAI-compatible audio handlers (FRD-018 T3.7).
+//!
+//! These are what make a WaaV voice endpoint reachable as an ordinary Bud model: budapp
+//! registers the endpoint, the ingress routes `/v1/audio/*` here, and callers use the request
+//! shapes they already use against OpenAI.
+//!
+//! The translation lives in the `waav-openai-audio` crate — pure functions, no I/O,
+//! exhaustively tested. What remains here is genuinely HTTP: reading the body, resolving the
+//! endpoint against the control plane, driving the provider, and writing correct headers.
+//!
+//! Synthesis goes through [`crate::handlers::speak::synthesize_once`], the same function
+//! `/speak` uses. Two synthesis paths would drift on timeouts, pronunciation handling and
+//! connection pooling, and the drift would show on only one of the two routes.
+
+use axum::{
+    body::Bytes,
+    extract::State,
+    http::{HeaderMap, StatusCode, header},
+    response::{IntoResponse, Json, Response},
+};
+use std::sync::Arc;
+use tracing::{info, warn};
+use waav_openai_audio::{
+    AudioError,
+    speech::{self, AudioFormat, SpeechRequest},
+    transcription,
+};
+
+use tracing::Instrument;
+
+use crate::observability::voice_attrs;
+use crate::state::AppState;
+
+/// Render a failure as OpenAI's error envelope.
+///
+/// The shape matters: SDKs branch on `error.type` and surface `error.message`, so an ad-hoc
+/// body reaches the user as "unknown error" however good the text is.
+fn openai_error(status: StatusCode, kind: &str, message: String, param: Option<&str>) -> Response {
+    (
+        status,
+        Json(serde_json::json!({
+            "error": {
+                "message": message,
+                "type": kind,
+                "param": param,
+                "code": serde_json::Value::Null,
+            }
+        })),
+    )
+        .into_response()
+}
+
+fn translation_error(err: &AudioError) -> Response {
+    let status = match err {
+        AudioError::TooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+        _ => StatusCode::BAD_REQUEST,
+    };
+    openai_error(status, "invalid_request_error", err.to_string(), None)
+}
+
+fn model_not_found(endpoint: &str, capability: &str) -> Response {
+    openai_error(
+        StatusCode::NOT_FOUND,
+        "invalid_request_error",
+        format!("Model '{endpoint}' not found or does not support {capability}"),
+        Some("model"),
+    )
+}
+
+/// `POST /v1/audio/speech`
+pub async fn speech_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    // The bearer resolves the caller's alias map, which is both the alias -> endpoint id
+    // mapping and the authorization boundary. Auth has already passed by the time we get here;
+    // this is resolution, not a second check.
+    let bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().strip_prefix("Bearer ").unwrap_or(v).to_string());
+
+    let req: SpeechRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return openai_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                format!("Invalid request body: {e}"),
+                None,
+            );
+        }
+    };
+
+    let settings = match speech::translate(req) {
+        Ok(s) => s,
+        Err(e) => return translation_error(&e),
+    };
+
+    let Some(endpoint) =
+        state.resolve_voice_endpoint(&settings.endpoint, "text_to_speech", bearer.as_deref())
+    else {
+        return model_not_found(&settings.endpoint, "text_to_speech");
+    };
+
+    // FRD-018 M7 exit criterion 3: a bad voice name must say which voices exist.
+    //
+    // Only checked where WaaV holds the vendor's catalog in process. Every other vendor
+    // publishes its voices from a live URL (`handlers::voices::list_voices` fetches them), and
+    // calling one here would put vendor I/O on the synthesis path — the thing the auth plane
+    // was built to avoid. Those keep forwarding verbatim, which is what `known_voices_for`
+    // returning an empty slice means. Giving another vendor an actionable error means
+    // hydrating its catalog into the snapshot the way credentials already are, which is a
+    // design change and not a line to bolt on here.
+    if let Err(e) = speech::validate_voice(&settings.voice, known_voices_for(&endpoint.vendor)) {
+        return translation_error(&e);
+    }
+
+    // A hosted vendor with no credential is a misconfiguration worth naming here, rather than a
+    // 401 from the vendor several seconds later that mentions neither Bud nor the endpoint.
+    let api_key = endpoint.credential.clone().unwrap_or_default();
+    if api_key.is_empty() && !crate::core::tts::self_hosted::is_self_hosted(&endpoint.vendor) {
+        return openai_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "api_error",
+            format!(
+                "Endpoint '{}' has no credential configured for vendor '{}'",
+                settings.endpoint, endpoint.vendor
+            ),
+            None,
+        );
+    }
+
+    // FRD-018 M6. The field names are the attribute names budmetrics' VoiceTurnFact reads —
+    // `tracing_opentelemetry` maps span fields straight onto OTel attributes, so a typo here is
+    // a permanently NULL column rather than an error. They come from `voice_attrs`, which the
+    // cross-repo contract test pins against budmetrics' own registry.
+    //
+    // `duration_ms` is declared Empty and recorded after synthesis: a field not declared at
+    // span creation cannot be recorded later, and silently does nothing if you try.
+    let chars = settings.text.chars().count();
+    let turn_span = tracing::info_span!(
+        "voice.turn",
+        { voice_attrs::turn::CAPABILITY } = "text_to_speech",
+        { voice_attrs::turn::TRANSPORT } = "http",
+        { voice_attrs::turn::ENDPOINT_ID } = %settings.endpoint,
+        { voice_attrs::turn::CHARACTERS } = chars,
+        { voice_attrs::turn::LANGUAGE } = endpoint.language.as_deref().unwrap_or(""),
+        { voice_attrs::leg::TTS_VENDOR } = %endpoint.vendor,
+        { voice_attrs::turn::PROJECT_ID } = tracing::field::Empty,
+        { voice_attrs::turn::USER_ID } = tracing::field::Empty,
+        { voice_attrs::turn::API_KEY_ID } = tracing::field::Empty,
+        { voice_attrs::leg::TTS_DURATION_MS } = tracing::field::Empty,
+    );
+    // NOT `turn_span.enter()`. A span guard held across an `.await` attaches the span to
+    // whatever task the executor resumes next, so the attributes land on someone else's work
+    // and this turn's span is missing them. `.instrument()` on the future is the async-correct
+    // form; the guard form is the single most common way to produce confidently wrong traces.
+    info!(
+        endpoint = %settings.endpoint,
+        vendor = %endpoint.vendor,
+        format = settings.format.as_str(),
+        chars,
+        "openai audio/speech"
+    );
+
+    let started = std::time::Instant::now();
+
+    // Attribution. The identity was always resolvable — `resolve_voice_endpoint` just never
+    // asked for it — so project_id, user_id and api_key_id were NULL for every voice turn ever
+    // recorded, and VoiceTurnFact could not attribute usage to a project at all.
+    //
+    // `recordable` filters `Some("")`: an empty string is not NULL, and recording one makes the
+    // column look populated to the live check that asks whether a value ever arrived.
+    if let Some(p) = state.resolve_principal(bearer.as_deref()).await {
+        use waav_openai_audio::recordable;
+        if let Some(v) = recordable(p.project_id.as_deref()) {
+            turn_span.record(voice_attrs::turn::PROJECT_ID, v);
+        }
+        if let Some(v) = recordable(p.user_id.as_deref()) {
+            turn_span.record(voice_attrs::turn::USER_ID, v);
+        }
+        if let Some(v) = recordable(p.api_key_id.as_deref()) {
+            turn_span.record(voice_attrs::turn::API_KEY_ID, v);
+        }
+    }
+
+    let tts_config = crate::core::tts::TTSConfig {
+        provider: endpoint.vendor.clone(),
+        api_key,
+        voice_id: Some(settings.voice.clone()),
+        model: endpoint.model.clone().unwrap_or_default(),
+        speaking_rate: settings.speaking_rate,
+        audio_format: Some(settings.format.as_waav_format().to_string()),
+        // Cleared for every compressed format. TTSConfig defaults to Some(24000), and a vendor
+        // rejects a sample rate alongside a container that carries its own — Deepgram answers
+        // `sample_rate is not applicable when encoding=mp3` and the whole request 400s.
+        sample_rate: settings.format.accepts_sample_rate().then_some(24000),
+        // Only the self-hosted provider reads this; every hosted vendor compiles its URL in.
+        // It has to be threaded through here because it is per-ENDPOINT data, published by
+        // budapp into voice_table, not a property of the vendor.
+        api_base: endpoint.api_base.clone(),
+        ..Default::default()
+    };
+
+    match crate::handlers::speak::synthesize_once(&state, tts_config, &settings.text)
+        .instrument(turn_span.clone())
+        .await
+    {
+        Ok((audio, format, sample_rate)) => {
+            turn_span.record(
+                voice_attrs::leg::TTS_DURATION_MS,
+                started.elapsed().as_millis() as u64,
+            );
+            let mut headers = HeaderMap::new();
+            if let Ok(ct) = settings.format.content_type().parse() {
+                headers.insert(header::CONTENT_TYPE, ct);
+            }
+            if let Ok(v) = format.parse() {
+                headers.insert("x-audio-format", v);
+            }
+            // Raw samples carry no container, so the rate has to travel out of band or the
+            // caller cannot play what they were sent.
+            if matches!(settings.format, AudioFormat::Pcm)
+                && let Ok(v) = sample_rate.to_string().parse()
+            {
+                headers.insert("x-sample-rate", v);
+            }
+            (StatusCode::OK, headers, audio).into_response()
+        }
+        Err(e) => {
+            warn!(endpoint = %settings.endpoint, error = %e, "synthesis failed");
+            // 502, not 500: the failure is upstream of WaaV, and the distinction is what tells
+            // an operator whether to look at the vendor or at us.
+            openai_error(StatusCode::BAD_GATEWAY, "api_error", e, None)
+        }
+    }
+}
+
+/// The voices WaaV can name for a vendor without leaving the process.
+///
+/// Empty means "no catalog here, forward whatever the caller asked for" — the behaviour every
+/// vendor had before, and the only safe default: validating against an empty list would reject
+/// every voice and turn a missing catalog into an outage for that endpoint.
+fn known_voices_for(vendor: &str) -> &'static [&'static str] {
+    match vendor {
+        "openai" => speech::OPENAI_VOICES,
+        _ => &[],
+    }
+}
+
+/// `POST /v1/audio/transcriptions` and `/v1/audio/translations`.
+///
+/// OpenAI's transcription API is a multipart upload, so this is the one audio route that does
+/// not take JSON. The file is decoded to PCM here and driven through a STREAMING provider by
+/// [`crate::handlers::transcribe::transcribe_once`] — WaaV has no batch STT provider to call,
+/// so the batch shape is synthesised from the streaming one.
+pub async fn transcription_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    multipart: axum::extract::Multipart,
+) -> Response {
+    transcription_inner(state, headers, multipart, false).await
+}
+
+/// `POST /v1/audio/translations` — same path, but the target language is always English.
+pub async fn translation_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    multipart: axum::extract::Multipart,
+) -> Response {
+    transcription_inner(state, headers, multipart, true).await
+}
+
+async fn transcription_inner(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    mut multipart: axum::extract::Multipart,
+    translate: bool,
+) -> Response {
+    let bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().strip_prefix("Bearer ").unwrap_or(v).to_string());
+
+    let mut file: Option<Vec<u8>> = None;
+    let mut filename = String::new();
+    let mut model = String::new();
+    let mut response_format: Option<String> = None;
+    let mut language: Option<String> = None;
+    let mut prompt: Option<String> = None;
+    let mut temperature: Option<f32> = None;
+
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(f)) => f,
+            Ok(None) => break,
+            Err(e) => {
+                return openai_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    format!("Malformed multipart body: {e}"),
+                    None,
+                );
+            }
+        };
+        let name = field.name().unwrap_or_default().to_string();
+        if name == "file" {
+            filename = field.file_name().unwrap_or_default().to_string();
+            match field.bytes().await {
+                Ok(b) => file = Some(b.to_vec()),
+                Err(e) => {
+                    // The body limit is enforced LAZILY, as the body streams, so exceeding it
+                    // lands here rather than as a rejection of the `Multipart` extractor -- and
+                    // multer renders it as "Error parsing `multipart/form-data` request", which
+                    // mentions neither size nor a limit. Four identical attempts against this
+                    // gateway produced four log lines saying only "auth succeeded". Naming the
+                    // ceiling is the difference between a ten-second diagnosis and an
+                    // afternoon.
+                    let limit = crate::routes::api::max_audio_upload_bytes();
+                    tracing::warn!(
+                        "rejecting an upload on `file`: {e} (ceiling {limit} bytes, set \
+                         {} to change it)",
+                        crate::routes::api::MAX_AUDIO_UPLOAD_BYTES_ENV
+                    );
+                    return openai_error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_request_error",
+                        format!(
+                            "Could not read the uploaded file: {e}. This gateway accepts uploads \
+                             up to {limit} bytes ({:.0} MiB); a larger file is refused here with \
+                             exactly this message.",
+                            limit as f64 / (1024.0 * 1024.0)
+                        ),
+                        Some("file"),
+                    );
+                }
+            }
+            continue;
+        }
+        let value = field.text().await.unwrap_or_default();
+        match name.as_str() {
+            "model" => model = value,
+            "response_format" => response_format = Some(value),
+            "language" => language = Some(value),
+            "prompt" => prompt = Some(value),
+            "temperature" => temperature = value.parse().ok(),
+            _ => {}
+        }
+    }
+
+    let Some(file_bytes) = file else {
+        return openai_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "`file` is required".to_string(),
+            Some("file"),
+        );
+    };
+
+    let req = transcription::TranscriptionRequest {
+        model: model.clone(),
+        filename: filename.clone(),
+        file_len: file_bytes.len(),
+        response_format,
+        language,
+        prompt,
+        temperature,
+        translate,
+    };
+    let settings = match transcription::translate(req) {
+        Ok(s) => s,
+        Err(e) => return translation_error(&e),
+    };
+
+    let capability = if translate {
+        "audio_translation"
+    } else {
+        "audio_transcription"
+    };
+    // The STT leg's span, mirroring the TTS one. `audio_seconds` is the billing dimension for
+    // transcription exactly as `characters` is for synthesis, and both are declared Empty
+    // because they are only known after the work: a field not declared at creation cannot be
+    // recorded later, and attempting it silently does nothing.
+    let turn_span = tracing::info_span!(
+        "voice.turn",
+        { voice_attrs::turn::CAPABILITY } = capability,
+        { voice_attrs::turn::TRANSPORT } = "http",
+        { voice_attrs::turn::ENDPOINT_ID } = %settings.endpoint,
+        { voice_attrs::turn::LANGUAGE } = settings.language.as_deref().unwrap_or(""),
+        { voice_attrs::turn::AUDIO_SECONDS } = tracing::field::Empty,
+        { voice_attrs::turn::PROJECT_ID } = tracing::field::Empty,
+        { voice_attrs::turn::USER_ID } = tracing::field::Empty,
+        { voice_attrs::turn::API_KEY_ID } = tracing::field::Empty,
+        { voice_attrs::leg::STT_VENDOR } = tracing::field::Empty,
+        { voice_attrs::leg::STT_DURATION_MS } = tracing::field::Empty,
+    );
+
+    let Some(endpoint) =
+        state.resolve_voice_endpoint(&settings.endpoint, capability, bearer.as_deref())
+    else {
+        return model_not_found(&settings.endpoint, capability);
+    };
+
+    turn_span.record(voice_attrs::leg::STT_VENDOR, endpoint.vendor.as_str());
+
+    // Attribution. The identity was always resolvable — `resolve_voice_endpoint` just never
+    // asked for it — so project_id, user_id and api_key_id were NULL for every voice turn ever
+    // recorded, and VoiceTurnFact could not attribute usage to a project at all.
+    //
+    // `recordable` filters `Some("")`: an empty string is not NULL, and recording one makes the
+    // column look populated to the live check that asks whether a value ever arrived.
+    if let Some(p) = state.resolve_principal(bearer.as_deref()).await {
+        use waav_openai_audio::recordable;
+        if let Some(v) = recordable(p.project_id.as_deref()) {
+            turn_span.record(voice_attrs::turn::PROJECT_ID, v);
+        }
+        if let Some(v) = recordable(p.user_id.as_deref()) {
+            turn_span.record(voice_attrs::turn::USER_ID, v);
+        }
+        if let Some(v) = recordable(p.api_key_id.as_deref()) {
+            turn_span.record(voice_attrs::turn::API_KEY_ID, v);
+        }
+    }
+    let stt_started = std::time::Instant::now();
+
+    let api_key = endpoint.credential.clone().unwrap_or_default();
+
+    // A self-hosted deployment already speaks this exact API, so the file is FORWARDED whole
+    // rather than decoded and replayed through a streaming provider. That is not a shortcut:
+    // decoding would impose WaaV's WAV-only limit on a backend that may well accept mp3, and
+    // the settle heuristic exists only because streaming providers never say "done" -- an
+    // HTTP backend answers once and is finished.
+    if crate::core::tts::self_hosted::is_self_hosted(&endpoint.vendor) {
+        let Some(api_base) = endpoint.api_base.clone() else {
+            return openai_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "api_error",
+                format!(
+                    "Endpoint '{}' is self-hosted but has no deployment URL configured",
+                    settings.endpoint
+                ),
+                None,
+            );
+        };
+        info!(
+            endpoint = %settings.endpoint,
+            capability,
+            bytes = file_bytes.len(),
+            "openai audio/transcriptions -> self-hosted passthrough"
+        );
+        // Measured before `file_bytes` is moved into the call below. Header read only: no
+        // samples are allocated, so a long upload costs nothing to measure.
+        let measured_secs = waav_openai_audio::pcm::wav_duration_secs(&file_bytes);
+        return match crate::handlers::transcribe::transcribe_self_hosted(
+            &api_base,
+            &api_key,
+            &endpoint.model.clone().unwrap_or_default(),
+            file_bytes,
+            &filename,
+            &settings,
+        )
+        .instrument(turn_span.clone())
+        .await
+        {
+            Ok(body) => {
+                turn_span.record(
+                    voice_attrs::leg::STT_DURATION_MS,
+                    stt_started.elapsed().as_millis() as u64,
+                );
+                // `audio_seconds` is the billing dimension for transcription. This branch
+                // forwards the upload verbatim and never decodes it, so the field the span
+                // reserves was never recorded and the column was permanently NULL for every
+                // self-hosted transcription. Read it from the WAV header instead — no samples
+                // are allocated. A container the header read cannot parse stays NULL, which is
+                // the honest answer: a guessed number in a billing column is worse than none.
+                if let Some(secs) = measured_secs {
+                    turn_span.record(voice_attrs::turn::AUDIO_SECONDS, secs);
+                }
+                passthrough_response(&settings.response_format, body)
+            }
+            Err(e) => {
+                warn!(endpoint = %settings.endpoint, error = %e, "self-hosted transcription failed");
+                openai_error(StatusCode::BAD_GATEWAY, "api_error", e, None)
+            }
+        };
+    }
+
+    // Decode BEFORE touching the provider: a container we cannot read is the caller's problem
+    // and must not cost a vendor connection to discover.
+    let audio = match waav_openai_audio::pcm::decode(&file_bytes, &filename) {
+        Ok(a) => a,
+        Err(e) => return translation_error(&e),
+    };
+
+    if api_key.is_empty() && !crate::core::tts::self_hosted::is_self_hosted(&endpoint.vendor) {
+        return openai_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "api_error",
+            format!(
+                "Endpoint '{}' has no credential configured for vendor '{}'",
+                settings.endpoint, endpoint.vendor
+            ),
+            None,
+        );
+    }
+
+    info!(
+        endpoint = %settings.endpoint,
+        vendor = %endpoint.vendor,
+        capability,
+        secs = audio.duration_secs(),
+        rate = audio.sample_rate,
+        "openai audio/transcriptions"
+    );
+
+    let stt_config = crate::core::stt::STTConfig {
+        provider: endpoint.vendor.clone(),
+        api_key,
+        language: settings
+            .language
+            .clone()
+            .unwrap_or_else(|| "en-US".to_string()),
+        sample_rate: audio.sample_rate,
+        channels: 1,
+        punctuation: true,
+        encoding: "linear16".to_string(),
+        model: endpoint.model.clone().unwrap_or_default(),
+    };
+
+    turn_span.record(voice_attrs::turn::AUDIO_SECONDS, audio.duration_secs());
+
+    match crate::handlers::transcribe::transcribe_once(&endpoint.vendor, stt_config, &audio)
+        .instrument(turn_span.clone())
+        .await
+    {
+        Ok(t) => {
+            turn_span.record(
+                voice_attrs::leg::STT_DURATION_MS,
+                stt_started.elapsed().as_millis() as u64,
+            );
+            if t.truncated {
+                warn!(endpoint = %settings.endpoint, "returning a partial transcript");
+            }
+            let result = transcription::TranscriptionResult {
+                text: t.text,
+                language: settings.language.clone(),
+                duration: Some(audio.duration_secs()),
+                segments: Vec::new(),
+            };
+            render_transcription(&settings.response_format, &result)
+        }
+        Err(e) => {
+            warn!(endpoint = %settings.endpoint, error = %e, "transcription failed");
+            openai_error(StatusCode::BAD_GATEWAY, "api_error", e, None)
+        }
+    }
+}
+
+/// Render a result in the format the caller asked for.
+///
+/// `text`, `srt` and `vtt` are PLAIN BODIES, not JSON — a client that asked for an SRT file
+/// and got `{"text": "1\n00:00:00,000 ..."}` cannot feed it to a player.
+fn render_transcription(
+    format: &transcription::TranscriptionResponseFormat,
+    result: &transcription::TranscriptionResult,
+) -> Response {
+    use transcription::TranscriptionResponseFormat as F;
+    let mut headers = HeaderMap::new();
+    if let Ok(ct) = format.content_type().parse() {
+        headers.insert(header::CONTENT_TYPE, ct);
+    }
+    match format {
+        F::Json => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "text": result.text })),
+        )
+            .into_response(),
+        F::VerboseJson => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "task": "transcribe",
+                "language": result.language,
+                "duration": result.duration,
+                "text": result.text,
+                "segments": [],
+            })),
+        )
+            .into_response(),
+        F::Text => (StatusCode::OK, headers, result.text.clone()).into_response(),
+        F::Srt => (StatusCode::OK, headers, result.to_srt()).into_response(),
+        F::Vtt => (StatusCode::OK, headers, result.to_vtt()).into_response(),
+    }
+}
+
+/// Return a self-hosted backend's response body unchanged, with the content type the caller
+/// asked for.
+///
+/// Re-parsing and re-rendering it would be worse than pointless: the backend was given the
+/// same `response_format`, so its body is already correct, and a round trip through our own
+/// structs would drop any field we do not model (word-level timestamps, per-segment
+/// confidence) from a response that had them.
+fn passthrough_response(
+    format: &transcription::TranscriptionResponseFormat,
+    body: String,
+) -> Response {
+    let mut headers = HeaderMap::new();
+    if let Ok(ct) = format.content_type().parse() {
+        headers.insert(header::CONTENT_TYPE, ct);
+    }
+    (StatusCode::OK, headers, body).into_response()
+}

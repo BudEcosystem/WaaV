@@ -1,5 +1,16 @@
 # syntax=docker/dockerfile:1
-ARG RUST_VERSION=1.88.0
+# 1.96.0, NOT upstream's 1.88.0 — and the reason is worth stating, because the obvious
+# reading of the lockfile is wrong. Committing `gateway/Cargo.lock` does stop version DRIFT,
+# but it does not lower the floor: the pinned `aws-types@1.3.16` itself declares
+# `rust-version = 1.91.1`, as do ~12 aws-smithy-* crates beside it. A 1.88 image therefore
+# fails in `cargo chef cook` with "requires rustc 1.91.1", before compiling a line of WaaV.
+# cargo-chef's own tree needs 1.91 too. Verified by building at 1.88 and reading the failure,
+# not by comparing version numbers — 1.3.16 looks older than the 1.5.0 this branch originally
+# blamed, and it is, but both are above the floor.
+#
+# Upstream's Dockerfile still says 1.88.0. Since CI pins `dtolnay/rust-toolchain@stable`
+# rather than that value, the mismatch does not show up in their clippy/test gates.
+ARG RUST_VERSION=1.96.0
 # Production feature set — must match CI's PROD_FEATURES (.github/workflows/ci.yml) so the shipped
 # binary is exactly what CI gates. Ships the DAG orchestration engine (dag-routing) and the full
 # neural turn-detection ensemble (turn-ensemble = smart-turn + turn-detect + silero-vad) — NOT just
@@ -10,14 +21,33 @@ ARG ONNX_VERSION=1.23.2
 
 # ==================== Chef Base ====================
 FROM rust:${RUST_VERSION}-slim-bookworm AS chef
-RUN cargo install cargo-chef
-WORKDIR /app
+# --locked: install cargo-chef from ITS lockfile rather than re-resolving, so a future
+# dependency bump in one of its transitive crates cannot raise the toolchain floor again
+# and break this image with no change on our side.
+RUN cargo install cargo-chef --locked
+# The gateway depends on sibling crates by path (`bud-auth`, `waav-openai-audio`,
+# `plugin-api`), so the build CONTEXT is the WaaV root, not gateway/. Laying the tree out
+# under /app with its original shape keeps `path = "../bud-auth"` resolving unchanged --
+# rewriting those paths for the image would make the Dockerfile and a local `cargo build`
+# disagree about the same manifest.
+#
+#   docker build -f gateway/Dockerfile .        <- from the WaaV root
+WORKDIR /app/gateway
 
 # ==================== Planner ====================
 FROM chef AS planner
-COPY Cargo.toml Cargo.lock ./
-# cargo-chef needs a target file for cargo metadata; stub keeps cache stable.
-RUN mkdir -p src && touch src/main.rs src/lib.rs
+# The sibling crates are real path dependencies: `cargo metadata` resolves them, so the
+# planner fails without them. They are copied whole (they are small) rather than stubbed,
+# because a stub would change the recipe and invalidate the cook cache on every edit.
+COPY bud-auth /app/bud-auth
+COPY waav-openai-audio /app/waav-openai-audio
+COPY plugin-api /app/plugin-api
+COPY gateway/Cargo.toml gateway/Cargo.lock ./
+# cargo-chef needs a target file for cargo metadata; stub keeps cache stable. The declared
+# [[bench]] targets need one too, or `cargo metadata` refuses to parse the manifest.
+RUN mkdir -p src benches \
+    && touch src/main.rs src/lib.rs \
+    && for b in gateway_benchmarks simd_benchmarks; do echo 'fn main() {}' > "benches/$b.rs"; done
 RUN cargo chef prepare --recipe-path recipe.json
 
 # ==================== Builder ====================
@@ -62,15 +92,26 @@ ENV RUSTFLAGS="-C opt-level=z -C link-arg=-s -C strip=symbols" \
     CXX=clang++
 
 # Cook dependencies (cached layer) - sharing=locked prevents cache corruption
-COPY --from=planner /app/recipe.json recipe.json
-COPY .cargo/config.toml .cargo/config.toml
+COPY --from=planner /app/gateway/recipe.json recipe.json
+COPY bud-auth /app/bud-auth
+COPY waav-openai-audio /app/waav-openai-audio
+COPY plugin-api /app/plugin-api
+COPY gateway/.cargo/config.toml .cargo/config.toml
+# cargo-chef rebuilds the crate skeleton from the recipe but creates no bench sources, and
+# Cargo refuses to parse a manifest whose declared [[bench]] targets are absent. Stubbing
+# them keeps the cook stage dependency-only (bench sources are never copied into the image)
+# without editing the manifest, which would then differ from the one that builds locally.
+RUN mkdir -p benches \
+    && for b in gateway_benchmarks simd_benchmarks; do \
+         [ -f "benches/$b.rs" ] || echo 'fn main() {}' > "benches/$b.rs"; \
+       done
 RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
     --mount=type=cache,target=/root/.cargo/git,sharing=locked \
     cargo chef cook --release ${CARGO_BUILD_FEATURES} --recipe-path recipe.json
 
 # Build application
-COPY Cargo.toml Cargo.lock ./
-COPY src ./src
+COPY gateway/Cargo.toml gateway/Cargo.lock ./
+COPY gateway/src ./src
 RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
     --mount=type=cache,target=/root/.cargo/git,sharing=locked \
     cargo build --release ${CARGO_BUILD_FEATURES} --locked
@@ -105,8 +146,8 @@ ENV LD_LIBRARY_PATH=/app
 FROM runtime-deps AS init
 ARG RUN_GATEWAY_INIT=true
 
-COPY --from=builder /app/target/release/waav-gateway /app/waav-gateway
-COPY --from=builder /app/onnxruntime/lib/*.so* /app/
+COPY --from=builder /app/gateway/target/release/waav-gateway /app/waav-gateway
+COPY --from=builder /app/gateway/onnxruntime/lib/*.so* /app/
 
 ENV CACHE_PATH=/app/cache
 
@@ -118,10 +159,10 @@ RUN mkdir -p "$CACHE_PATH" \
 FROM runtime-deps AS runtime
 
 # Binary
-COPY --from=builder /app/target/release/waav-gateway /app/waav-gateway
+COPY --from=builder /app/gateway/target/release/waav-gateway /app/waav-gateway
 
 # ONNX Runtime shared libraries
-COPY --from=builder /app/onnxruntime/lib/*.so* /app/
+COPY --from=builder /app/gateway/onnxruntime/lib/*.so* /app/
 
 # Cached models from init stage
 COPY --from=init /app/cache /app/cache

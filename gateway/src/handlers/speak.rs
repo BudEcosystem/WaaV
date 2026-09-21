@@ -32,6 +32,41 @@ pub struct SpeakRequest {
     pub tts_config: TTSWebSocketConfig,
 }
 
+/// Decide what a caller-supplied vendor key in a `/speak` body may do.
+///
+/// `Ok(Some(key))` uses the caller's key, `Ok(None)` falls back to server config, and `Err`
+/// carries the message to return to the caller.
+///
+/// `allow_client_keys` is what separates the two deployments. Standalone WaaV is BYOK by
+/// design, and honouring the caller's key is the feature. Under the Bud control plane the same
+/// field is a bypass — the vendor call would carry the caller's own credential, so the request
+/// is attributed to no project, counted against no quota and billed to nobody (FRD-018 §5.3.7).
+///
+/// The bypass is refused rather than ignored: a key that is silently dropped looks like it
+/// worked until the vendor answers 401, naming neither WaaV nor the field that caused it.
+fn vet_speak_api_key(
+    client_key: Option<&str>,
+    allow_client_keys: bool,
+) -> Result<Option<String>, String> {
+    // Normalisation is delegated so this gate and the WebSocket path agree on what counts as a
+    // supplied key. `client_api_key` treats None, empty AND whitespace-only as "unset" — the
+    // whitespace case matters here, because refusing "   " as a BYOK attempt would fail a
+    // request that was not trying to bypass anything.
+    match client_api_key(client_key) {
+        Some(key) if allow_client_keys => Ok(Some(key)),
+        // `/speak` takes no endpoint name -- `resolve_voice_endpoint` is reached only from
+        // /v1/audio/speech -- so the message must not tell the caller to use one here.
+        Some(_) => Err(
+            "Client-supplied api_key in tts_config is not accepted by this gateway. \
+             Vendor credentials are owned by the control plane and resolved here; remove the \
+             field. To address a specific deployment's credential, call POST /v1/audio/speech \
+             with `model` set to your Bud endpoint name."
+                .to_string(),
+        ),
+        None => Ok(None),
+    }
+}
+
 /// Collector for accumulating audio from TTS provider
 struct AudioCollector {
     audio_data: Arc<Mutex<Vec<u8>>>,
@@ -290,9 +325,27 @@ pub async fn speak_handler(
             .into_response();
     }
 
-    // Get API key: Client-provided key takes priority over server config (BYOK pattern)
-    // This allows multi-tenant setups where clients bring their own API keys
-    let api_key = if let Some(client_key) = client_api_key(request.tts_config.api_key.as_deref()) {
+    // Get API key: a client-provided key takes priority over server config (BYOK pattern),
+    // except under the Bud control plane, which owns the tenant's credentials
+    let client_key = match vet_speak_api_key(
+        request.tts_config.api_key.as_deref(),
+        state.allows_client_supplied_keys(),
+    ) {
+        Ok(key) => key,
+        Err(message) => {
+            warn!(
+                provider = %request.tts_config.provider,
+                "Refused client-supplied API key: vendor credentials are owned by the control plane"
+            );
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": message })),
+            )
+                .into_response();
+        }
+    };
+
+    let api_key = if let Some(client_key) = client_key {
         info!(
             "Using client-provided API key for provider: {}",
             request.tts_config.provider
@@ -477,9 +530,129 @@ pub async fn speak_handler(
         .into_response()
 }
 
+/// Synthesise once and return the whole buffer, with no HTTP shape attached.
+///
+/// Extracted from [`speak_handler`] so the OpenAI-compatible `/v1/audio/speech` route (FRD-018)
+/// drives exactly the same provider path rather than a parallel copy of it — two synthesis
+/// implementations would drift on timeouts, pronunciation handling and connection pooling, and
+/// the drift would only show on one of the two routes.
+///
+/// Returns `(audio, format, sample_rate)`.
+pub async fn synthesize_once(
+    state: &AppState,
+    tts_config: crate::core::tts::TTSConfig,
+    text: &str,
+) -> Result<(Vec<u8>, String, u32), String> {
+    // Pronunciation replacements apply to every synthesis path, not just the native one.
+    let mut processed = text.to_string();
+    for p in &tts_config.pronunciations {
+        processed = processed.replace(&p.word, &p.pronunciation);
+    }
+
+    let mut provider = create_tts_provider(&tts_config.provider, tts_config.clone())
+        .map_err(|e| format!("failed to create TTS provider: {e}"))?;
+
+    // Connection pooling and per-provider metrics come from the shared manager; without this
+    // the OpenAI route would open a fresh connection per request while `/speak` reuses them.
+    if let Some(req_manager) = state.get_tts_req_manager(&tts_config.provider).await {
+        if let Some(p) = provider.get_provider() {
+            p.set_req_manager(req_manager.clone()).await;
+        }
+        provider.set_req_manager(req_manager).await;
+    }
+
+    provider
+        .connect()
+        .await
+        .map_err(|e| format!("failed to connect to TTS provider: {e}"))?;
+
+    let collector = Arc::new(AudioCollector::new());
+    provider
+        .on_audio(collector.clone())
+        .map_err(|e| format!("failed to register audio callback: {e}"))?;
+
+    if let Err(e) = provider.speak(&processed, true).await {
+        let _ = provider.disconnect().await;
+        return Err(format!("synthesis failed: {e}"));
+    }
+
+    if let Err(e) = collector
+        .wait_for_completion(DEFAULT_SPEAK_TIMEOUT_SECS)
+        .await
+    {
+        // Always disconnect on the timeout path: leaking the connection is how a slow vendor
+        // turns into exhausted file descriptors.
+        let _ = provider.disconnect().await;
+        return Err(e.to_string());
+    }
+
+    let _ = provider.disconnect().await;
+
+    collector
+        .get_result()
+        .await
+        .map_err(|e| format!("synthesis error: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_client_api_key_refused_when_bud_owns_credentials() {
+        let message = vet_speak_api_key(Some("sk-caller-owned"), false)
+            .expect_err("a client key must not resolve under Bud mode");
+
+        assert!(
+            message.contains("tts_config"),
+            "error must name the field to remove: {message}"
+        );
+        assert!(
+            !message.contains("sk-caller-owned"),
+            "the key must not be echoed back to the caller: {message}"
+        );
+    }
+
+    #[test]
+    fn test_client_api_key_honoured_in_standalone_mode() {
+        let resolved = vet_speak_api_key(Some("sk-caller-owned"), true).unwrap();
+
+        assert_eq!(resolved.as_deref(), Some("sk-caller-owned"));
+    }
+
+    #[test]
+    fn test_client_api_key_is_trimmed_in_standalone_mode() {
+        // Normalisation is delegated to `client_api_key`; this pins that the delegation is
+        // actually in effect, so `/speak` and the WebSocket path cannot disagree about what a
+        // supplied key is.
+        let resolved = vet_speak_api_key(Some("  sk-caller-owned  "), true).unwrap();
+
+        assert_eq!(resolved.as_deref(), Some("sk-caller-owned"));
+    }
+
+    #[test]
+    fn test_empty_client_api_key_falls_back_under_bud_mode() {
+        let resolved = vet_speak_api_key(Some(""), false)
+            .expect("an empty key bypasses nothing and must not fail the request");
+
+        assert_eq!(resolved, None, "an empty key falls back to server config");
+    }
+
+    #[test]
+    fn test_whitespace_client_api_key_falls_back_rather_than_being_refused() {
+        // A whitespace-only value is "unset" spelled badly, not an attempt to bypass the
+        // control plane. Refusing it would fail a request that was not doing anything wrong —
+        // the case the pre-merge `!key.is_empty()` check got wrong.
+        let resolved = vet_speak_api_key(Some("   "), false)
+            .expect("a whitespace-only key bypasses nothing and must not fail the request");
+
+        assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn test_absent_client_api_key_falls_back_under_bud_mode() {
+        assert_eq!(vet_speak_api_key(None, false).unwrap(), None);
+    }
 
     fn chunk(data: &[u8], sample_rate: u32, format: &str) -> AudioData {
         AudioData {

@@ -47,7 +47,6 @@ fn allow_loopback_mocks() {
     ONCE.call_once(|| unsafe { std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1") });
 }
 
-
 struct MockServer {
     label: &'static str,
     handle: JoinHandle<()>,

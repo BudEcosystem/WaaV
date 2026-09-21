@@ -66,7 +66,8 @@ where
 /// (env vars are process-global; see the SAFETY note at the set_var site). Poison-tolerant.
 fn openai_base_url_env_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Test that OpenAI is included in supported providers

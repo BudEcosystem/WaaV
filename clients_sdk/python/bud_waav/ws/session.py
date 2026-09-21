@@ -713,6 +713,26 @@ class WebSocketSession:
                 self._connected = False
                 raise
 
+    def _vendor_api_key(self) -> Optional[str]:
+        """The key to put in `stt_config`/`tts_config`, or None to omit the field.
+
+        `self.api_key` is the SESSION's authentication -- it belongs in the `Authorization`
+        header, and nowhere else. Mirroring it into a provider config block treats the
+        caller's own credential as a vendor credential, which is wrong in both deployments:
+
+        * Against a Bud gateway it is REFUSED. Vendor credentials are owned by the control
+          plane, so a client-supplied `api_key` fails the session -- and because this SDK
+          always sent one, every Bud-mode session failed no matter what the caller intended.
+        * Against a standalone gateway it is worse than useless: WaaV would forward a `bud-`
+          key to Deepgram or ElevenLabs as if it were theirs.
+
+        A `bud-` prefixed key is therefore never a vendor key. Anything else is left alone,
+        so BYOK against a standalone gateway keeps working exactly as it did.
+        """
+        if not self.api_key or self.api_key.startswith("bud-"):
+            return None
+        return self.api_key
+
     async def _verify_connection(self) -> None:
         """Prove the freshly-opened socket actually carries data (D1).
 
@@ -925,9 +945,10 @@ class WebSocketSession:
             # the effective codec on `ready` and degrades to linear16 if its build lacks opus.
             if getattr(self.stt_config, "audio_in_codec", None):
                 stt_dict["audio_in_codec"] = self.stt_config.audio_in_codec
-            # Include API key if provided (gateway allows per-request override)
-            if self.api_key:
-                stt_dict["api_key"] = self.api_key
+            # A VENDOR key only -- never the session's own Bud credential.
+            vendor_key = self._vendor_api_key()
+            if vendor_key:
+                stt_dict["api_key"] = vendor_key
 
             # Advanced STT features → stt_config.features{} (canonical SttFeatures,
             # gateway/src/core/stt/standard.rs). Flat-on-top was silently dropped;
@@ -1023,9 +1044,10 @@ class WebSocketSession:
             # the effective codec on `ready` and degrades to linear16 if its build lacks opus.
             if getattr(self.tts_config, "audio_out_codec", None):
                 tts_dict["audio_out_codec"] = self.tts_config.audio_out_codec
-            # Include API key if provided (gateway allows per-request override)
-            if self.api_key:
-                tts_dict["api_key"] = self.api_key
+            # A VENDOR key only -- never the session's own Bud credential.
+            vendor_key = self._vendor_api_key()
+            if vendor_key:
+                tts_dict["api_key"] = vendor_key
             # Emotion fields (Unified Emotion System - gateway supports these)
             if self.tts_config.emotion is not None:
                 tts_dict["emotion"] = self.tts_config.emotion.value if hasattr(self.tts_config.emotion, 'value') else str(self.tts_config.emotion)

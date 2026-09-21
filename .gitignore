@@ -5,7 +5,11 @@
 # -----------------------------------------------------------------------------
 # Rust / Cargo
 # -----------------------------------------------------------------------------
-/gateway/target/
+# Anchored to the repo root, this covered `gateway/` and nothing else. The workspace now has
+# sibling crates (`bud-auth/`, `waav-openai-audio/`), and their build output was committed —
+# 2851 files, 1.74 GB — because no rule reached them. Unanchored, so it holds for any crate
+# added later without anyone having to remember this.
+**/target/
 **/*.rs.bk
 # Cargo.lock MUST be committed for the gateway binary (reproducible builds — see PRODUCTION_PLAN.md S9/W11).
 # Ignore lockfiles only for library crates that legitimately omit them.

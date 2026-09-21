@@ -128,6 +128,63 @@ pub async fn auth_middleware(
         }
     };
 
+    // FRD-018 Bud mode, checked FIRST because it is the deployed configuration when present:
+    // credentials resolve from the in-memory control-plane snapshot with no I/O and no call to
+    // budapp. Falling through to the modes below would ask an auth service that is not
+    // configured, and answer 500 to a perfectly valid Bud key.
+    if let Some(bud) = &state.bud_mode {
+        return match bud.authenticate(&token).await {
+            Ok(auth) => {
+                tracing::info!(
+                    method = %request_method,
+                    path = %request_path,
+                    auth_id = ?auth.id,
+                    "bud authentication successful"
+                );
+                request.extensions_mut().insert(auth);
+                Ok(next.run(request).await)
+            }
+            Err(bud_auth::AuthFailure::NotReady) => {
+                // 503, not 401: the credential may be perfectly good; this pod simply has not
+                // finished its first hydration. Answering 401 would teach a client to
+                // re-authenticate against a problem that is not theirs.
+                tracing::warn!(path = %request_path, "auth attempted before first hydration");
+                Err(AuthError::AuthServiceUnavailable(
+                    "control plane still hydrating".to_string(),
+                ))
+            }
+            Err(bud_auth::AuthFailure::Throttled) => {
+                tracing::warn!(path = %request_path, "auth escalation throttled");
+                Err(AuthError::Unauthorized("Too many auth misses".to_string()))
+            }
+            Err(bud_auth::AuthFailure::JwtRejected) => {
+                // Naming the credential that was judged. "Invalid API key" to someone holding
+                // a Keycloak token sends them to rotate a key they are not using, past the two
+                // things worth checking: whether the token is expired, and whether its client
+                // is in OIDC_ALLOWED_CLIENTS.
+                tracing::warn!(
+                    method = %request_method,
+                    path = %request_path,
+                    "bud authentication failed: JWT rejected"
+                );
+                Err(AuthError::Unauthorized(
+                    "Bearer token was rejected. It is a JWT, so this is not an API-key \
+                     problem: check that it has not expired and that its client is in this \
+                     gateway's allowed-clients list."
+                        .to_string(),
+                ))
+            }
+            Err(_) => {
+                tracing::warn!(
+                    method = %request_method,
+                    path = %request_path,
+                    "bud authentication failed"
+                );
+                Err(AuthError::Unauthorized("Invalid API key".to_string()))
+            }
+        };
+    }
+
     // Check authentication mode and validate accordingly
     // Priority: API secret mode first (simpler), then JWT mode
     if state.config.has_api_secret_auth() {

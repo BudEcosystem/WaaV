@@ -184,6 +184,7 @@ fn test_gnani_stt_factory_case_insensitive() {
 #[test]
 fn test_gnani_tts_factory_creation() {
     let config = TTSConfig {
+        api_base: None,
         provider: "gnani".to_string(),
         api_key: "mock-token".to_string(),
         model: "default".to_string(),
@@ -212,6 +213,7 @@ fn test_gnani_tts_factory_aliases() {
 
     for alias in aliases {
         let config = TTSConfig {
+            api_base: None,
             provider: alias.to_string(),
             api_key: "mock-token".to_string(),
             model: "default".to_string(),
@@ -348,6 +350,7 @@ async fn test_gnani_stt_disconnect_not_connected() {
 #[test]
 fn test_gnani_tts_not_connected_initially() {
     let config = TTSConfig {
+        api_base: None,
         provider: "gnani".to_string(),
         api_key: "mock-token".to_string(),
         model: "default".to_string(),
@@ -371,6 +374,7 @@ fn test_gnani_tts_not_connected_initially() {
 #[tokio::test]
 async fn test_gnani_tts_speak_fails_not_connected() {
     let config = TTSConfig {
+        api_base: None,
         provider: "gnani".to_string(),
         api_key: "mock-token".to_string(),
         model: "default".to_string(),
@@ -444,6 +448,7 @@ fn test_gnani_tts_all_languages() {
 
     for lang in languages {
         let config = TTSConfig {
+            api_base: None,
             provider: "gnani".to_string(),
             api_key: "mock-token".to_string(),
             model: "default".to_string(),
