@@ -3,11 +3,15 @@ name: Release
 # Cut a release of the WaaV gateway: build and publish the image, then create (or update)
 # the GitHub Release for the tag.
 #
-# Two ways in, deliberately:
-#   * push a tag `v1.2.3`          -> builds and publishes, creates the release
-#   * run this workflow by hand    -> same, for a tag that already exists
-# The second is what makes a release UPDATABLE: re-running against an existing tag
-# re-publishes the image and rewrites the release body rather than failing on "already exists".
+# Three ways in:
+#   * publish a Release in the UI  -> the `release` event; this is how releases are actually cut
+#   * push a tag `v1.2.3` or `1.2.3` -> the tag event
+#   * run this workflow by hand    -> same, against a tag that already exists
+# The last is what makes a release UPDATABLE: re-running against an existing tag re-publishes
+# the image and rewrites the release body rather than failing on "already exists".
+#
+# The tag is used VERBATIM (checkout, release) and the version is it without a leading `v`.
+# Both spellings are real here: release `v0.1.0` was cut against tag `0.1.0`.
 #
 # Publishes to registry.bud.studio/runtime/waav, the registry every other Bud service is
 # pulled from (pde-ditto's imagePullSecret is `registry.bud.studio`).
@@ -23,22 +27,18 @@ name: Release
 # that cannot push and a green tick.
 
 on:
+  release:
+    types: [published]
   push:
-    tags: ["v*"]
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+*"
+      - "[0-9]+.[0-9]+.[0-9]+*"
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Tag to release, e.g. v1.2.3 (must already exist)"
+        description: "Tag to release, with or without the v (e.g. 1.2.3). Must already exist."
         required: true
         type: string
-      platforms:
-        description: "Image platforms. arm64 goes through QEMU and is slow (Rust + ONNX)."
-        required: false
-        default: linux/amd64
-        type: choice
-        options:
-          - linux/amd64
-          - linux/amd64,linux/arm64
       draft:
         description: "Create the GitHub Release as a draft"
         required: false
@@ -58,7 +58,9 @@ concurrency:
 jobs:
   image:
     name: build + publish image
-    runs-on: ubuntu-latest
+    # Blacksmith, like every release workflow in bud-runtime. 8 vCPU because this is a Rust
+    # build with ONNX in it, not a script.
+    runs-on: blacksmith-8vcpu-ubuntu-2204
     timeout-minutes: 120
     outputs:
       version: ${{ steps.meta.outputs.version }}
@@ -70,14 +72,15 @@ jobs:
         id: meta
         env:
           INPUT_TAG: ${{ inputs.release_tag }}
+          EVENT_TAG: ${{ github.event.release.tag_name }}
           REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          TAG="${INPUT_TAG:-$REF_NAME}"
-          case "$TAG" in
-            v*) VERSION="${TAG#v}" ;;
-            *)  VERSION="$TAG"; TAG="v${TAG}" ;;
-          esac
+          # Precedence: an explicit dispatch input, then the release being published, then the
+          # pushed ref. The tag is used AS IT IS -- an earlier version rewrote `0.1.0` to
+          # `v0.1.0` and then checked out a ref that does not exist.
+          TAG="${INPUT_TAG:-${EVENT_TAG:-$REF_NAME}}"
+          VERSION="${TAG#v}"
           # A pre-release must not move :latest. Same rule as the sibling repo's release
           # workflows, so an -rc image cannot become the default pull for a cluster.
           if printf '%s' "$VERSION" | grep -qiE -- '-(rc|alpha|beta|pre|dev|hotfix|snapshot)'; then
@@ -129,12 +132,8 @@ jobs:
             exit 1
           fi
 
-      - name: Set up QEMU
-        if: contains(inputs.platforms, 'arm64')
-        uses: docker/setup-qemu-action@v3
-
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: useblacksmith/setup-docker-builder@v1
 
       - name: Log in to registry.bud.studio
         uses: docker/login-action@v3
@@ -146,17 +145,18 @@ jobs:
       # Context is the REPO ROOT, not gateway/: the Dockerfile copies the sibling crates
       # (bud-auth, waav-openai-audio, plugin-api) that gateway/Cargo.toml depends on by path.
       # Building from gateway/ fails at `COPY bud-auth /app/bud-auth`.
+      # amd64 only. bud-runtime builds arm64 on a native `blacksmith-*-arm` runner and joins
+      # the two with `docker buildx imagetools create`; QEMU for a Rust + ONNX build is not a
+      # substitute. Mirror that matrix here if an arm64 cluster ever needs this image.
       - name: Build and push
         id: build
-        uses: docker/build-push-action@v6
+        uses: useblacksmith/build-push-action@v2
         with:
           context: .
           file: gateway/Dockerfile
-          platforms: ${{ inputs.platforms || 'linux/amd64' }}
+          platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
           provenance: false
 
       - name: Summarise
@@ -176,7 +176,7 @@ jobs:
   release:
     name: create or update the release
     needs: image
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2204
     timeout-minutes: 15
     steps:
       - name: Checkout the tag
@@ -190,7 +190,7 @@ jobs:
         env:
           VERSION: ${{ needs.image.outputs.version }}
           DIGEST: ${{ needs.image.outputs.digest }}
-          PLATFORMS: ${{ inputs.platforms || 'linux/amd64' }}
+          PLATFORMS: linux/amd64
         run: |
           set -euo pipefail
           {
