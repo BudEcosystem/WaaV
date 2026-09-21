@@ -51,9 +51,13 @@ permissions:
 env:
   IMAGE: registry.bud.studio/runtime/waav
 
+# Publishing a Release in the UI creates the tag AND fires `release`, so one release matches
+# two triggers here and starts two runs. They build the same image from the same tag, so the
+# later one supersedes the earlier instead of queueing behind it -- `0.1.1` otherwise paid for
+# the same Rust build twice.
 concurrency:
-  group: release-${{ github.event.inputs.release_tag || github.ref }}
-  cancel-in-progress: false
+  group: release-${{ github.event.inputs.release_tag || github.event.release.tag_name || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   image:
@@ -185,15 +189,24 @@ jobs:
           ref: ${{ needs.image.outputs.tag }}
           fetch-depth: 0
 
-      - name: Compose the release body
-        id: body
+      - name: Create or update the release
         env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.image.outputs.tag }}
           VERSION: ${{ needs.image.outputs.version }}
           DIGEST: ${{ needs.image.outputs.digest }}
-          PLATFORMS: linux/amd64
+          DRAFT: ${{ inputs.draft }}
         run: |
           set -euo pipefail
+
+          # The image block is delimited so a re-run REPLACES it instead of adding another
+          # copy. softprops/action-gh-release with append_body did the latter: re-running
+          # 0.1.1 left the release carrying three "What's Changed" sections and two image
+          # blocks, which is the opposite of what an updatable release should do.
+          START='<!-- waav-release-image:start -->'
+          END='<!-- waav-release-image:end -->'
           {
+            echo "$START"
             echo "## Image"
             echo
             echo '```'
@@ -201,26 +214,33 @@ jobs:
             echo "${DIGEST}"
             echo '```'
             echo
-            echo "Platforms: \`${PLATFORMS}\`."
+            echo "Platform: \`linux/amd64\`."
             echo
             echo "Pull by digest to pin exactly what was tested:"
             echo '```bash'
             echo "docker pull ${IMAGE}@${DIGEST}"
             echo '```'
-          } > release-body.md
-          echo "path=release-body.md" >> "$GITHUB_OUTPUT"
+            echo "$END"
+          } > image-block.md
 
-      # softprops/action-gh-release updates the release when one already exists for the tag,
-      # which is what makes a re-dispatch an UPDATE rather than a failure. The auto-generated
-      # notes are appended below the image block above.
-      - name: Create or update the GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ needs.image.outputs.tag }}
-          name: ${{ needs.image.outputs.version }}
-          body_path: ${{ steps.body.outputs.path }}
-          append_body: true
-          generate_release_notes: true
-          draft: ${{ inputs.draft == true }}
-          prerelease: ${{ contains(needs.image.outputs.version, '-') }}
-          make_latest: ${{ !contains(needs.image.outputs.version, '-') }}
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG exists — updating it"
+          else
+            echo "release $TAG does not exist — creating it"
+            args=(--title "$VERSION" --generate-notes)
+            case "$VERSION" in *-*) args+=(--prerelease) ;; esac
+            [ "${DRAFT:-false}" = "true" ] && args+=(--draft)
+            gh release create "$TAG" "${args[@]}"
+          fi
+
+          # Take whatever the release says now -- generated notes, or notes a human wrote --
+          # drop any previous image block, and put the current one at the end.
+          gh release view "$TAG" --json body --jq .body > current-body.md
+          # Drop the previous block, then trim trailing blank lines so repeated runs do not
+          # grow the body by a newline each time.
+          sed "/${START}/,/${END}/d" current-body.md \
+            | awk 'NF{last=NR} {l[NR]=$0} END{for(i=1;i<=last;i++) print l[i]}' > kept-body.md
+          { cat kept-body.md; echo; cat image-block.md; } > new-body.md
+          gh release edit "$TAG" --notes-file new-body.md
+
+          echo "release $TAG now points at ${IMAGE}:${VERSION}"
