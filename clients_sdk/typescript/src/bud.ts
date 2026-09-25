@@ -268,9 +268,9 @@ export class BudClient {
    *
    * Returns an UNCONNECTED {@link GatewayRealtime} that speaks the gateway's
    * provider-agnostic `/realtime` WebSocket protocol, so the SAME surface works
-   * for ALL 12 realtime/S2S providers — `provider` is just a field: `openai`,
+   * for ALL 11 realtime/S2S providers — `provider` is just a field: `openai`,
    * `hume`, `azure`, `grok`, `inworld`, `deepgram`, `elevenlabs`, `gemini`,
-   * `ultravox`, `nova_sonic`, `speechmatics`, `yandex`.
+   * `ultravox`, `nova_sonic`, `yandex`.
    *
    * Unlike {@link BudRealtime} (the provider-NATIVE OpenAI/Hume escape hatch that
    * can bypass the gateway), this client never speaks a vendor wire: the gateway

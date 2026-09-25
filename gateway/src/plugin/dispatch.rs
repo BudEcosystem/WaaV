@@ -129,27 +129,25 @@ pub enum BuiltinTTSProvider {
     AwsPolly = 6,
     IbmWatson = 7,
     Hume = 8,
-    Lmnt = 9,
-    PlayHt = 10,
-    Gnani = 11,
-    Murf = 12,
-    WellSaid = 13,
-    Resemble = 14,
-    Speechify = 15,
-    Smallest = 16,
-    UnrealSpeech = 17,
-    Acapela = 18,
-    Cereproc = 19,
-    Speechmatics = 20,
-    AlibabaCloud = 21,
-    Baidu = 22,
-    Bhashini = 23,
-    IFlytek = 24,
-    Reverie = 25,
-    SberDevices = 26,
-    Tinkoff = 27,
-    Yandex = 28,
-    Tencent = 29,
+    Gnani = 9,
+    Murf = 10,
+    WellSaid = 11,
+    Resemble = 12,
+    Speechify = 13,
+    Smallest = 14,
+    UnrealSpeech = 15,
+    Acapela = 16,
+    Cereproc = 17,
+    Speechmatics = 18,
+    AlibabaCloud = 19,
+    Baidu = 20,
+    Bhashini = 21,
+    IFlytek = 22,
+    Reverie = 23,
+    SberDevices = 24,
+    Tinkoff = 25,
+    Yandex = 26,
+    Tencent = 27,
 }
 
 impl BuiltinTTSProvider {
@@ -166,8 +164,6 @@ impl BuiltinTTSProvider {
             Self::AwsPolly => "aws-polly",
             Self::IbmWatson => "ibm-watson",
             Self::Hume => "hume",
-            Self::Lmnt => "lmnt",
-            Self::PlayHt => "playht",
             Self::Gnani => "gnani",
             Self::Murf => "murf",
             Self::WellSaid => "wellsaid",
@@ -221,14 +217,10 @@ pub enum BuiltinRealtimeProvider {
     /// `InvokeModelWithBidirectionalStream` HTTP/2 event stream, NOT a WebSocket;
     /// auth is AWS SigV4 via the `aws-config` default chain, NO api-key).
     NovaSonic = 9,
-    /// Speechmatics Flow (Voice AI) — conversational speech-to-speech on
-    /// Speechmatics' streaming STT (raw-PCM binary frames + JSON control, its own
-    /// protocol; template-driven agents; auth `Authorization: Bearer <token>`).
-    Speechmatics = 10,
     /// Yandex Cloud AI Studio Realtime — OpenAI-protocol clone (GA wire reused by
     /// delegation; the `wss://ai.api.cloud.yandex.net/v1/realtime?model=gpt://…`
     /// host + Bearer auth — a Yandex IAM token / static API key).
-    Yandex = 11,
+    Yandex = 10,
 }
 
 impl BuiltinRealtimeProvider {
@@ -246,7 +238,6 @@ impl BuiltinRealtimeProvider {
             Self::Gemini => "gemini",
             Self::Ultravox => "ultravox",
             Self::NovaSonic => "nova_sonic",
-            Self::Speechmatics => "speechmatics",
             Self::Yandex => "yandex",
         }
     }
@@ -361,8 +352,6 @@ pub static TTS_PROVIDER_MAP: phf::Map<&'static str, BuiltinTTSProvider> = phf_ma
     "aws-polly" => BuiltinTTSProvider::AwsPolly,
     "ibm-watson" => BuiltinTTSProvider::IbmWatson,
     "hume" => BuiltinTTSProvider::Hume,
-    "lmnt" => BuiltinTTSProvider::Lmnt,
-    "playht" => BuiltinTTSProvider::PlayHt,
     "gnani" => BuiltinTTSProvider::Gnani,
     "murf" => BuiltinTTSProvider::Murf,
     "wellsaid" => BuiltinTTSProvider::WellSaid,
@@ -392,11 +381,6 @@ pub static TTS_PROVIDER_MAP: phf::Map<&'static str, BuiltinTTSProvider> = phf_ma
     "ibm" => BuiltinTTSProvider::IbmWatson,
     "hume-ai" => BuiltinTTSProvider::Hume,
     "hume_ai" => BuiltinTTSProvider::Hume,
-    "lmnt-ai" => BuiltinTTSProvider::Lmnt,
-    "lmnt_ai" => BuiltinTTSProvider::Lmnt,
-    "play-ht" => BuiltinTTSProvider::PlayHt,
-    "play_ht" => BuiltinTTSProvider::PlayHt,
-    "play.ht" => BuiltinTTSProvider::PlayHt,
     "gnani-ai" => BuiltinTTSProvider::Gnani,
     "gnani.ai" => BuiltinTTSProvider::Gnani,
     "murf-ai" => BuiltinTTSProvider::Murf,
@@ -499,9 +483,6 @@ pub static REALTIME_PROVIDER_MAP: phf::Map<&'static str, BuiltinRealtimeProvider
     "nova_sonic" => BuiltinRealtimeProvider::NovaSonic,
     "nova-sonic" => BuiltinRealtimeProvider::NovaSonic,
     "aws" => BuiltinRealtimeProvider::NovaSonic,
-    // Speechmatics Flow (Voice AI; raw-PCM binary + JSON control).
-    "speechmatics" => BuiltinRealtimeProvider::Speechmatics,
-    "flow" => BuiltinRealtimeProvider::Speechmatics,
     // Yandex Cloud AI Studio Realtime (OpenAI-protocol clone; GA wire, Bearer auth).
     "yandex" => BuiltinRealtimeProvider::Yandex,
     "yandexgpt" => BuiltinRealtimeProvider::Yandex,
@@ -620,10 +601,10 @@ impl SmallString {
 pub const BUILTIN_STT_COUNT: usize = 25;
 
 /// Number of built-in TTS providers
-pub const BUILTIN_TTS_COUNT: usize = 29;
+pub const BUILTIN_TTS_COUNT: usize = 27;
 
 /// Number of built-in Realtime providers
-pub const BUILTIN_REALTIME_COUNT: usize = 12;
+pub const BUILTIN_REALTIME_COUNT: usize = 11;
 
 /// Total number of built-in providers
 pub const TOTAL_BUILTIN_PROVIDERS: usize =
@@ -673,8 +654,6 @@ pub const BUILTIN_TTS_NAMES: [&str; BUILTIN_TTS_COUNT] = [
     "aws-polly",
     "ibm-watson",
     "hume",
-    "lmnt",
-    "playht",
     "gnani",
     "murf",
     "wellsaid",
@@ -707,7 +686,6 @@ pub const BUILTIN_REALTIME_NAMES: [&str; BUILTIN_REALTIME_COUNT] = [
     "gemini",
     "ultravox",
     "nova_sonic",
-    "speechmatics",
     "yandex",
 ];
 
@@ -775,10 +753,6 @@ mod tests {
         assert_eq!(
             resolve_tts_provider("polly"),
             Some(BuiltinTTSProvider::AwsPolly)
-        );
-        assert_eq!(
-            resolve_tts_provider("play.ht"),
-            Some(BuiltinTTSProvider::PlayHt)
         );
 
         // Test unknown
@@ -880,19 +854,9 @@ mod tests {
             resolve_realtime_provider("aws"),
             Some(BuiltinRealtimeProvider::NovaSonic)
         );
-        // Speechmatics Flow (Voice AI) + alias (case-insensitive).
-        assert_eq!(
-            resolve_realtime_provider("speechmatics"),
-            Some(BuiltinRealtimeProvider::Speechmatics)
-        );
-        assert_eq!(
-            resolve_realtime_provider("SPEECHMATICS"),
-            Some(BuiltinRealtimeProvider::Speechmatics)
-        );
-        assert_eq!(
-            resolve_realtime_provider("flow"),
-            Some(BuiltinRealtimeProvider::Speechmatics)
-        );
+        // Speechmatics Flow shut down: its id must no longer resolve.
+        assert_eq!(resolve_realtime_provider("speechmatics"), None);
+        assert_eq!(resolve_realtime_provider("flow"), None);
         // Yandex Cloud AI Studio Realtime (OpenAI-protocol clone) + aliases
         // (case-insensitive).
         assert_eq!(

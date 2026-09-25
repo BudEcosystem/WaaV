@@ -281,6 +281,52 @@ pub struct BatchSubmission {
     pub config_warnings: Vec<String>,
 }
 
+/// Audio a builder has been handed, already decoded.
+///
+/// The `/transcribe/batch` route carries audio as base64 inside a JSON envelope; the
+/// `/v1/audio/transcriptions` route has the bytes in hand already. Passing the latter through the
+/// former would cost two extra copies of every upload AND impose
+/// [`MAX_BATCH_INLINE_AUDIO_BYTES`] (25 MB) on a route whose own ceiling is 50 MB — refusing
+/// uploads that work today. So each builder takes this instead, and the base64 decode happens
+/// exactly once, in the one caller that has base64.
+pub enum ResolvedAudio {
+    /// A remote URL the vendor fetches itself.
+    Url(String),
+    /// Decoded bytes plus their media type.
+    Bytes {
+        /// The audio.
+        bytes: Vec<u8>,
+        /// Its media type, e.g. `audio/wav`.
+        content_type: String,
+    },
+}
+
+impl ResolvedAudio {
+    /// Decode a request's audio source once, applying the inline-size ceiling to base64 only.
+    pub fn from_source(provider: &str, audio: &BatchAudioSource) -> Result<Self, String> {
+        match audio {
+            BatchAudioSource::Url { url } => {
+                Ok(Self::Url(validate_batch_audio_source_url(provider, url)?))
+            }
+            BatchAudioSource::Bytes {
+                audio_base64,
+                content_type,
+            } => Ok(Self::Bytes {
+                bytes: b64_decode(audio_base64)?,
+                content_type: content_type.clone().unwrap_or_else(|| "audio/wav".into()),
+            }),
+        }
+    }
+
+    /// A WAV the gateway decoded and re-encoded itself.
+    pub fn wav(bytes: Vec<u8>) -> Self {
+        Self::Bytes {
+            bytes,
+            content_type: "audio/wav".to_string(),
+        }
+    }
+}
+
 /// Build the Deepgram prerecorded submission (`POST /v1/listen`). Enables the streaming-gap
 /// features (`alternatives`, `detect_language`) plus the batch-exclusive ones on the query string —
 /// the wire-level proof that batch unlocks what streaming drops.
@@ -289,6 +335,17 @@ pub struct BatchSubmission {
 /// credential. Returns the submission; `is_async` is `true` iff `callback_url` is set.
 pub fn build_deepgram_prerecorded(
     req: &BatchTranscribeRequest,
+    api_key: &str,
+    base_url: &str,
+) -> Result<BatchSubmission, String> {
+    let audio = ResolvedAudio::from_source("deepgram", &req.audio)?;
+    build_deepgram_prerecorded_with(req, audio, api_key, base_url)
+}
+
+/// As [`build_deepgram_prerecorded`], for a caller that already holds the decoded audio.
+pub fn build_deepgram_prerecorded_with(
+    req: &BatchTranscribeRequest,
+    audio: ResolvedAudio,
     api_key: &str,
     base_url: &str,
 ) -> Result<BatchSubmission, String> {
@@ -394,28 +451,21 @@ pub fn build_deepgram_prerecorded(
     }
     let url = parsed.to_string();
 
-    let (body, content_type) = match &req.audio {
-        BatchAudioSource::Url { url } => {
-            let audio_url = validate_batch_audio_source_url("deepgram", url)?;
-            (
-                BatchHttpBody::Json(serde_json::json!({ "url": audio_url })),
-                "application/json".to_string(),
-            )
-        }
-        BatchAudioSource::Bytes {
-            audio_base64,
+    let (body, content_type) = match audio {
+        ResolvedAudio::Url(audio_url) => (
+            BatchHttpBody::Json(serde_json::json!({ "url": audio_url })),
+            "application/json".to_string(),
+        ),
+        ResolvedAudio::Bytes {
+            bytes,
             content_type,
-        } => {
-            let bytes = b64_decode(audio_base64)?;
-            let ct = content_type.clone().unwrap_or_else(|| "audio/wav".into());
-            (
-                BatchHttpBody::Raw {
-                    bytes,
-                    content_type: ct.clone(),
-                },
-                ct,
-            )
-        }
+        } => (
+            BatchHttpBody::Raw {
+                bytes,
+                content_type: content_type.clone(),
+            },
+            content_type,
+        ),
     };
 
     let request = BatchHttpRequest {
@@ -652,11 +702,102 @@ pub fn build_openai_transcription(
     })
 }
 
+/// Build the ElevenLabs submission (`POST /v1/speech-to-text`, multipart).
+///
+/// The only provider here that accepts BOTH a file and a remote URL natively, so neither the
+/// AssemblyAI upload dance nor OpenAI's bytes-only restriction applies.
+///
+/// The wire surface comes from [`crate::core::stt::elevenlabs::ElevenLabsBatchConfig`], the same
+/// builder the `/v1/audio/transcriptions` path uses. One wire surface, two routes: a field added
+/// for one is present on the other, and the field-level tests cover both.
+pub fn build_elevenlabs_transcription(
+    req: &BatchTranscribeRequest,
+    api_key: &str,
+    base_url: &str,
+) -> Result<BatchSubmission, String> {
+    let audio = ResolvedAudio::from_source("elevenlabs", &req.audio)?;
+    build_elevenlabs_transcription_with(req, audio, api_key, base_url)
+}
+
+/// As [`build_elevenlabs_transcription`], for a caller that already holds the decoded audio.
+pub fn build_elevenlabs_transcription_with(
+    req: &BatchTranscribeRequest,
+    audio: ResolvedAudio,
+    api_key: &str,
+    base_url: &str,
+) -> Result<BatchSubmission, String> {
+    validate_batch_base_url("elevenlabs", base_url)?;
+
+    let b = &req.batch;
+    let mut warnings = Vec::new();
+
+    let mut cfg = crate::core::stt::elevenlabs::ElevenLabsBatchConfig::from_standard(&req.config);
+    cfg.endpoint_override = Some(base_url.trim_end_matches('/').to_string());
+    cfg.validate()?;
+
+    // `detect_language` is a batch-only knob here as well as a canonical feature; either asking
+    // route means "omit `language_code`".
+    let detect_language =
+        b.detect_language == Some(true) || req.config.features.language_detection == Some(true);
+
+    let mut fields = cfg.multipart_fields(detect_language);
+
+    // Batch knobs ElevenLabs has no equivalent for. A degrade, never a 400 — the transcript is
+    // still the thing the caller asked for.
+    for (on, name) in [
+        (b.summarize == Some(true), "summarize"),
+        (b.topics == Some(true), "topics"),
+        (b.intents == Some(true), "intents"),
+        (b.alternatives.is_some(), "alternatives"),
+        (b.paragraphs == Some(true), "paragraphs"),
+        (b.utterances == Some(true), "utterances"),
+    ] {
+        if on {
+            warnings.push(format!("{name} not supported by elevenlabs batch; omitted"));
+        }
+    }
+    if let Some(t) = &req.config.translation {
+        warnings.extend(t.warnings_for("elevenlabs", false));
+    }
+
+    // A remote URL rides as a form field; inline bytes ride as the file part.
+    let file = match audio {
+        ResolvedAudio::Url(url) => {
+            fields.push(("source_url".into(), url));
+            None
+        }
+        ResolvedAudio::Bytes {
+            bytes,
+            content_type,
+        } => Some((
+            "file".to_string(),
+            "audio.wav".to_string(),
+            content_type,
+            bytes,
+        )),
+    };
+
+    let request = BatchHttpRequest {
+        method: "POST".into(),
+        url: cfg.api_url(),
+        // ElevenLabs authenticates with its own header, not `Authorization: Bearer`.
+        headers: vec![("xi-api-key".into(), api_key.to_string())],
+        body: BatchHttpBody::Multipart { fields, file },
+    };
+    Ok(BatchSubmission {
+        request,
+        // ElevenLabs' async mode needs a workspace webhook configured on THEIR side, which WaaV
+        // cannot provision, so the synchronous answer is the only one it can actually collect.
+        is_async: false,
+        config_warnings: warnings,
+    })
+}
+
 /// Whether a provider name is supported by the batch dispatcher.
 pub fn batch_provider_supported(provider: &str) -> bool {
     matches!(
         provider.to_lowercase().as_str(),
-        "deepgram" | "assemblyai" | "openai"
+        "deepgram" | "assemblyai" | "openai" | "elevenlabs"
     )
 }
 
@@ -1245,5 +1386,163 @@ mod tests {
         assert!(batch_provider_supported("assemblyai"));
         assert!(batch_provider_supported("openai"));
         assert!(!batch_provider_supported("gladia"));
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // ElevenLabs
+    // ---------------------------------------------------------------------------------------
+
+    fn eleven_fields(sub: &BatchSubmission) -> Vec<(String, String)> {
+        match &sub.request.body {
+            BatchHttpBody::Multipart { fields, .. } => fields.clone(),
+            other => panic!("expected multipart, got {other:?}"),
+        }
+    }
+
+    fn eleven_req(audio: BatchAudioSource, features: SttFeatures) -> BatchTranscribeRequest {
+        let mut r = req_with("elevenlabs", audio, features, BatchFeatures::default());
+        r.config.base.api_key = "xi-test".into();
+        r.config.base.model = "scribe_v2".into();
+        r
+    }
+
+    #[test]
+    fn elevenlabs_is_a_supported_batch_provider() {
+        assert!(batch_provider_supported("elevenlabs"));
+        assert!(batch_provider_supported("ElevenLabs"));
+    }
+
+    #[test]
+    fn elevenlabs_bytes_ride_as_the_file_part() {
+        let sub = build_elevenlabs_transcription(
+            &eleven_req(
+                BatchAudioSource::Bytes {
+                    audio_base64: "AAAA".into(),
+                    content_type: Some("audio/wav".into()),
+                },
+                SttFeatures {
+                    diarization: Some(true),
+                    ..Default::default()
+                },
+            ),
+            "xi-key",
+            "https://api.elevenlabs.io",
+        )
+        .unwrap();
+
+        assert_eq!(
+            sub.request.url,
+            "https://api.elevenlabs.io/v1/speech-to-text"
+        );
+        // Their own header, not `Authorization: Bearer` — a bearer token here is a 401 that
+        // reads like a bad credential rather than a bad header name.
+        assert_eq!(
+            sub.request.headers,
+            vec![("xi-api-key".to_string(), "xi-key".to_string())]
+        );
+        assert!(!sub.is_async);
+        let fields = eleven_fields(&sub);
+        assert!(
+            fields
+                .iter()
+                .any(|(k, v)| k == "model_id" && v == "scribe_v2")
+        );
+        assert!(fields.iter().any(|(k, v)| k == "diarize" && v == "true"));
+        assert!(fields.iter().all(|(k, _)| k != "source_url"));
+        match &sub.request.body {
+            BatchHttpBody::Multipart { file, .. } => assert!(file.is_some()),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn elevenlabs_takes_a_remote_url_natively() {
+        // The only provider here that needs neither AssemblyAI's upload dance nor OpenAI's
+        // bytes-only restriction.
+        let sub = build_elevenlabs_transcription(
+            &eleven_req(
+                BatchAudioSource::Url {
+                    url: "https://example.com/a.wav".into(),
+                },
+                SttFeatures::default(),
+            ),
+            "xi-key",
+            "https://api.elevenlabs.io",
+        )
+        .unwrap();
+
+        let fields = eleven_fields(&sub);
+        assert!(
+            fields
+                .iter()
+                .any(|(k, v)| k == "source_url" && v == "https://example.com/a.wav")
+        );
+        match &sub.request.body {
+            BatchHttpBody::Multipart { file, .. } => assert!(file.is_none()),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn elevenlabs_degrades_on_knobs_it_has_no_equivalent_for() {
+        // A degrade, never a 400: the transcript is still the thing the caller asked for.
+        let mut r = eleven_req(
+            BatchAudioSource::Url {
+                url: "https://example.com/a.wav".into(),
+            },
+            SttFeatures::default(),
+        );
+        r.batch.summarize = Some(true);
+        r.batch.topics = Some(true);
+        let sub =
+            build_elevenlabs_transcription(&r, "xi-key", "https://api.elevenlabs.io").unwrap();
+
+        assert!(sub.config_warnings.iter().any(|w| w.contains("summarize")));
+        assert!(sub.config_warnings.iter().any(|w| w.contains("topics")));
+    }
+
+    #[test]
+    fn elevenlabs_detect_language_omits_the_language_code() {
+        let mut r = eleven_req(
+            BatchAudioSource::Url {
+                url: "https://example.com/a.wav".into(),
+            },
+            SttFeatures::default(),
+        );
+        r.config.base.language = "en-US".into();
+        r.batch.detect_language = Some(true);
+        let sub =
+            build_elevenlabs_transcription(&r, "xi-key", "https://api.elevenlabs.io").unwrap();
+
+        assert!(
+            eleven_fields(&sub)
+                .iter()
+                .all(|(k, _)| k != "language_code")
+        );
+    }
+
+    #[test]
+    fn elevenlabs_refuses_a_realtime_model_on_the_batch_route() {
+        let mut r = eleven_req(
+            BatchAudioSource::Url {
+                url: "https://example.com/a.wav".into(),
+            },
+            SttFeatures::default(),
+        );
+        r.config.base.model = "scribe_v2_realtime".into();
+        let err =
+            build_elevenlabs_transcription(&r, "xi-key", "https://api.elevenlabs.io").unwrap_err();
+        assert!(err.contains("scribe_v2_realtime"), "{err}");
+    }
+
+    #[test]
+    fn elevenlabs_needs_an_audio_source() {
+        // Covered by construction elsewhere, but this is the message an operator sees.
+        let mut r = eleven_req(
+            BatchAudioSource::Url { url: "  ".into() },
+            SttFeatures::default(),
+        );
+        r.config.base.model = "scribe_v2".into();
+        assert!(build_elevenlabs_transcription(&r, "k", "https://api.elevenlabs.io").is_err());
     }
 }

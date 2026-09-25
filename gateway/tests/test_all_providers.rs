@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 // Provider Definitions
 // ============================================================================
 
-/// All 32 STT providers
+/// All 31 STT providers
 const STT_PROVIDERS: &[(&str, &str)] = &[
     ("deepgram", "DEEPGRAM_API_KEY"),
     ("google", "GOOGLE_APPLICATION_CREDENTIALS"),
@@ -46,11 +46,10 @@ const STT_PROVIDERS: &[(&str, &str)] = &[
     ("amivoice", "AMIVOICE_APP_KEY"),
     ("fpt-ai", "FPT_AI_API_KEY"),
     ("viettel-ai", "VIETTEL_AI_TOKEN"),
-    ("prosa-ai", "PROSA_API_KEY"),
     ("nectec", "NECTEC_API_KEY"),
 ];
 
-/// All 37 TTS providers
+/// All 34 TTS providers
 const TTS_PROVIDERS: &[(&str, &str)] = &[
     ("deepgram", "DEEPGRAM_API_KEY"),
     ("elevenlabs", "ELEVENLABS_API_KEY"),
@@ -61,8 +60,6 @@ const TTS_PROVIDERS: &[(&str, &str)] = &[
     ("aws-polly", "AWS_ACCESS_KEY_ID"),
     ("ibm-watson", "IBM_WATSON_API_KEY"),
     ("hume", "HUME_API_KEY"),
-    ("lmnt", "LMNT_API_KEY"),
-    ("playht", "PLAYHT_API_KEY"),
     ("gnani", "GNANI_API_KEY"),
     ("murf", "MURF_API_KEY"),
     ("wellsaid", "WELLSAID_API_KEY"),
@@ -87,7 +84,6 @@ const TTS_PROVIDERS: &[(&str, &str)] = &[
     ("zalo-ai", "ZALO_API_KEY"),
     ("fpt-ai", "FPT_AI_API_KEY"),
     ("viettel-ai", "VIETTEL_AI_TOKEN"),
-    ("prosa-ai", "PROSA_API_KEY"),
     ("nectec", "NECTEC_API_KEY"),
 ];
 

@@ -175,14 +175,6 @@ const PROVIDER_DATA: Record<string, Omit<ProviderEntry, 'id' | 'type' | 'configu
     website: 'https://aws.amazon.com/polly/',
     pricing: 'Pay-per-use',
   },
-  play_ht: {
-    name: 'PlayHT',
-    description: 'AI voice generator with ultra-realistic voices and cloning.',
-    tags: ['voice-cloning', 'realistic', 'streaming'],
-    features: ['Voice cloning', 'Real-time streaming', 'Emotion control', '142 languages'],
-    website: 'https://play.ht',
-    pricing: 'Free tier, paid plans',
-  },
   coqui: {
     name: 'Coqui TTS',
     description: 'Open-source TTS with XTTS for voice cloning.',

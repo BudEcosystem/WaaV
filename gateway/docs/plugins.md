@@ -82,7 +82,7 @@ src/plugin/
 ├── dispatch.rs         # PHF static maps for O(1) provider lookup
 ├── macros.rs           # Helper macros for plugin registration
 └── builtin/
-    └── mod.rs          # Built-in provider registrations (25 providers)
+    └── mod.rs          # Built-in provider registrations (23 providers)
 ```
 
 ### Plugin Lifecycle State Machine
@@ -256,7 +256,7 @@ pub trait AuthStrategy: Send + Sync {
 
 ## Built-in Providers
 
-WaaV Gateway ships with **25 built-in providers** registered via the plugin system:
+WaaV Gateway ships with **23 built-in providers** registered via the plugin system:
 
 ### STT Providers (11)
 
@@ -274,7 +274,7 @@ WaaV Gateway ships with **25 built-in providers** registered via the plugin syst
 | Groq | `groq` | - | fast-inference (216x real-time), translation |
 | Gnani | `gnani` | `gnani-ai`, `gnani.ai`, `vachana` | indic-languages (14), interim-results |
 
-### TTS Providers (12)
+### TTS Providers (10)
 
 | Provider | ID | Aliases | Features |
 |----------|-----|---------|----------|
@@ -287,8 +287,6 @@ WaaV Gateway ships with **25 built-in providers** registered via the plugin syst
 | AWS Polly | `aws-polly` | `polly`, `amazon-polly` | ssml, neural-voices |
 | IBM Watson | `ibm-watson` | `watson`, `ibm` | streaming, ssml |
 | Hume AI Octave | `hume` | `hume-ai` | streaming, emotion-control |
-| LMNT | `lmnt` | `lmnt-ai` | streaming, low-latency (~150ms) |
-| Play.ht | `playht` | `play.ht`, `play-ht` | streaming, voice-cloning |
 | Gnani | `gnani` | `gnani-ai`, `gnani.ai` | multi-speaker, ssml-gender, indic-languages (12) |
 
 ### Realtime Providers (2)
@@ -691,9 +689,6 @@ GNANI_CERTIFICATE_PATH=/path/to/cert.pem
 # TTS Providers (additional)
 ELEVENLABS_API_KEY=your-key
 HUME_API_KEY=your-key
-LMNT_API_KEY=your-key
-PLAYHT_API_KEY=your-key
-PLAYHT_USER_ID=your-user-id
 ```
 
 ---

@@ -1,6 +1,6 @@
 """Tests for provider types and capabilities (SDK_STANDARDIZATION_PLAN P1 #4).
 
-The SDK provider enums are the FULL gateway dispatch set: 32 STT / 37 TTS / 12
+The SDK provider enums are the FULL gateway dispatch set: 31 STT / 34 TTS / 11
 realtime, sourced 1:1 from the gateway dispatch/registry tables. These tests pin
 the exact sets (so a stale or partial enum fails) and assert forward-compat: a
 bare ``str`` is accepted everywhere a provider is taken, and an uncatalogued
@@ -84,20 +84,20 @@ EXPECTED_STT = {
     "alibaba-cloud", "amivoice", "assemblyai", "aws-transcribe", "baidu", "bhashini",
     "cartesia", "deepgram", "elevenlabs", "fpt-ai", "gladia", "gnani", "google",
     "groq", "huawei-cloud", "ibm-watson", "iflytek", "microsoft-azure", "naver-clova",
-    "nectec", "openai", "phonexia", "prosa-ai", "revai", "reverie", "sarvam",
+    "nectec", "openai", "phonexia", "revai", "reverie", "sarvam",
     "sberdevices", "speechmatics", "tencent", "tinkoff", "viettel-ai", "yandex",
 }
 EXPECTED_TTS = {
     "acapela", "alibaba-cloud", "aws-polly", "baidu", "bhashini", "cartesia",
     "cereproc", "deepgram", "elevenlabs", "fpt-ai", "gnani", "google", "huawei-cloud",
-    "hume", "ibm-watson", "iflytek", "lmnt", "microsoft-azure", "murf", "naver-clova",
-    "nectec", "openai", "playht", "prosa-ai", "resemble", "reverie", "sberdevices",
+    "hume", "ibm-watson", "iflytek", "microsoft-azure", "murf", "naver-clova",
+    "nectec", "openai", "resemble", "reverie", "sberdevices",
     "smallest", "speechify", "speechmatics", "tencent", "tinkoff", "unrealspeech",
     "viettel-ai", "wellsaid", "yandex", "zalo-ai",
 }
 EXPECTED_REALTIME = {
     "openai", "hume", "azure", "grok", "inworld", "deepgram", "elevenlabs", "gemini",
-    "ultravox", "nova_sonic", "speechmatics", "yandex",
+    "ultravox", "nova_sonic", "yandex",
 }
 
 
@@ -107,11 +107,11 @@ def _values(enum_cls) -> set[str]:
 
 
 class TestSTTProviders:
-    """STT provider enum = the full 32-provider gateway dispatch set."""
+    """STT provider enum = the full 31-provider gateway dispatch set."""
 
     def test_full_stt_set_present(self):
         assert _values(STTProvider) == EXPECTED_STT
-        assert len(list(STTProvider)) == 32
+        assert len(list(STTProvider)) == 31
 
     def test_representative_enum_values(self):
         assert STTProvider.DEEPGRAM.value == "deepgram"
@@ -146,11 +146,11 @@ class TestSTTProviders:
 
 
 class TestTTSProviders:
-    """TTS provider enum = the full 37-provider gateway dispatch set."""
+    """TTS provider enum = the full 34-provider gateway dispatch set."""
 
     def test_full_tts_set_present(self):
         assert _values(TTSProvider) == EXPECTED_TTS
-        assert len(list(TTSProvider)) == 37
+        assert len(list(TTSProvider)) == 34
 
     def test_representative_enum_values(self):
         assert TTSProvider.DEEPGRAM.value == "deepgram"
@@ -175,11 +175,11 @@ class TestTTSProviders:
 
 
 class TestRealtimeProviders:
-    """Realtime provider enum = the full 12-provider gateway realtime registry."""
+    """Realtime provider enum = the full 11-provider gateway realtime registry."""
 
     def test_full_realtime_set_present(self):
         assert _values(RealtimeProvider) == EXPECTED_REALTIME
-        assert len(list(RealtimeProvider)) == 12
+        assert len(list(RealtimeProvider)) == 11
 
     def test_gateway_native_tokens(self):
         # The realtime names are the bare vendor tokens /realtime accepts.
@@ -244,9 +244,9 @@ class TestProviderEnumDriftGuard:
     """
 
     def test_counts_match_gateway_dispatch(self):
-        assert len(EXPECTED_STT) == 32
-        assert len(EXPECTED_TTS) == 37
-        assert len(EXPECTED_REALTIME) == 12
+        assert len(EXPECTED_STT) == 31
+        assert len(EXPECTED_TTS) == 34
+        assert len(EXPECTED_REALTIME) == 11
 
     def test_enums_have_no_duplicate_values(self):
         # Iteration must yield exactly the expected count with no accidental dupes.

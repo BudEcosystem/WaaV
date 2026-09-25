@@ -27,7 +27,7 @@ pub mod naver_clova;
 pub mod nectec;
 pub mod openai;
 pub mod phonexia;
-pub mod prosa_ai;
+pub mod prerecorded;
 pub mod revai;
 pub mod reverie;
 pub mod sarvam;
@@ -37,6 +37,7 @@ pub mod speechmatics;
 pub mod standard;
 pub mod tencent;
 pub mod tinkoff;
+pub mod translation_matrix;
 pub mod viettel_ai;
 pub(crate) mod wav;
 pub mod yandex;
@@ -44,7 +45,7 @@ pub mod yandex;
 // Re-export public types and traits
 pub use base::{
     BaseSTT, STTConfig, STTConnectionState, STTError, STTErrorCallback, STTFactory, STTHelper,
-    STTResult, STTResultCallback, STTStats,
+    STTResult, STTResultCallback, STTStats, SpeakerInfo, WordTiming,
 };
 
 // Re-export Alibaba Cloud DashScope implementation
@@ -69,8 +70,14 @@ pub use infer::{INFER_STT_ALIASES, INFER_STT_PROVIDER_ID, InferSTT};
 
 // Re-export ElevenLabs implementation
 pub use elevenlabs::{
-    CommitStrategy, ElevenLabsAudioFormat, ElevenLabsMessage, ElevenLabsRegion, ElevenLabsSTT,
-    ElevenLabsSTTConfig,
+    CommitStrategy, ElevenLabsAudioFormat, ElevenLabsBatchConfig, ElevenLabsMessage,
+    ElevenLabsRegion, ElevenLabsSTT, ElevenLabsSTTConfig, REALTIME_MODELS, model_is_realtime,
+};
+
+// Re-export the shared prerecorded (batch HTTP) driver
+pub use prerecorded::{PrerecordedSTT, PrerecordedVendor};
+pub use translation_matrix::{
+    TranslationSupport, TranslationSupportRow, translation_support_for, translation_support_matrix,
 };
 
 // Re-export Google implementation
@@ -268,18 +275,6 @@ pub use viettel_ai::{
     VIETTEL_STT_ENDPOINT, ViettelStt, ViettelSttConfig, ViettelSttResponse,
 };
 
-// Re-export Prosa.ai implementation
-pub use prosa_ai::{
-    DEFAULT_CHANNELS as PROSA_DEFAULT_CHANNELS, DEFAULT_CHUNK_SIZE as PROSA_DEFAULT_CHUNK_SIZE,
-    DEFAULT_REQUEST_TIMEOUT as PROSA_DEFAULT_REQUEST_TIMEOUT,
-    DEFAULT_SAMPLE_RATE as PROSA_DEFAULT_SAMPLE_RATE,
-    MAX_ASYNC_DURATION_SECS as PROSA_MAX_ASYNC_DURATION,
-    MAX_SYNC_DURATION_SECS as PROSA_MAX_SYNC_DURATION, MAX_SYNC_SIZE_BYTES as PROSA_MAX_SYNC_SIZE,
-    MIN_AUDIO_BUFFER_SIZE as PROSA_MIN_AUDIO_BUFFER_SIZE, PROSA_STT_BASE_URL,
-    PROSA_STT_WS_ENDPOINT, ProsaAudioFormat, ProsaStt, ProsaSttConfig, ProsaSttModel,
-    ProsaSttResponse, ProsaSttResult, ProsaSttSegment, ProsaSttWsMessage,
-};
-
 // Re-export NECTEC AI for Thai implementation
 pub use nectec::{
     API_KEY_HEADER as NECTEC_API_KEY_HEADER, DEFAULT_CHANNELS as NECTEC_DEFAULT_CHANNELS,
@@ -350,8 +345,6 @@ pub enum STTProvider {
     FptAi,
     /// Viettel AI STT REST API (Vietnamese language, 96% accuracy)
     ViettelAi,
-    /// Prosa.ai STT WebSocket/REST API (Indonesian, Javanese, Sundanese, English)
-    ProsaAi,
     /// NECTEC AI for Thai STT REST API (Partii4/Partii5, Thai language)
     Nectec,
 }
@@ -387,7 +380,6 @@ impl std::fmt::Display for STTProvider {
             STTProvider::IFlytek => write!(f, "iflytek"),
             STTProvider::FptAi => write!(f, "fpt-ai"),
             STTProvider::ViettelAi => write!(f, "viettel-ai"),
-            STTProvider::ProsaAi => write!(f, "prosa-ai"),
             STTProvider::Nectec => write!(f, "nectec"),
         }
     }
@@ -445,12 +437,11 @@ impl std::str::FromStr for STTProvider {
             "viettel-ai" | "viettel_ai" | "viettelai" | "viettel" | "vtai" => {
                 Ok(STTProvider::ViettelAi)
             }
-            "prosa-ai" | "prosa_ai" | "prosai" | "prosa" | "prosa.ai" => Ok(STTProvider::ProsaAi),
             "nectec" | "aiforthai" | "ai4thai" | "partii" | "partii5" | "partii4" => {
                 Ok(STTProvider::Nectec)
             }
             _ => Err(STTError::ConfigurationError(format!(
-                "Unsupported STT provider: {s}. Supported providers: alibaba-cloud, baidu, deepgram, google, elevenlabs, microsoft-azure, cartesia, openai, assemblyai, aws-transcribe, ibm-watson, groq, sarvam, speechmatics, gladia, revai, phonexia, reverie, yandex, tinkoff, sberdevices, tencent, huawei-cloud, naver-clova, bhashini, iflytek, fpt-ai, viettel-ai, prosa-ai, nectec"
+                "Unsupported STT provider: {s}. Supported providers: alibaba-cloud, baidu, deepgram, google, elevenlabs, microsoft-azure, cartesia, openai, assemblyai, aws-transcribe, ibm-watson, groq, sarvam, speechmatics, gladia, revai, phonexia, reverie, yandex, tinkoff, sberdevices, tencent, huawei-cloud, naver-clova, bhashini, iflytek, fpt-ai, viettel-ai, nectec"
             ))),
         }
     }
@@ -585,7 +576,6 @@ pub fn get_supported_stt_providers() -> Vec<&'static str> {
         "iflytek",
         "fpt-ai",
         "viettel-ai",
-        "prosa-ai",
         "nectec",
     ]
 }
@@ -706,7 +696,6 @@ mod factory_tests {
                 "iflytek",
                 "fpt-ai",
                 "viettel-ai",
-                "prosa-ai",
                 "nectec",
             ]
         );
@@ -731,7 +720,6 @@ mod factory_tests {
         assert!(providers.contains(&"sberdevices"));
         assert!(providers.contains(&"fpt-ai"));
         assert!(providers.contains(&"viettel-ai"));
-        assert!(providers.contains(&"prosa-ai"));
     }
 
     #[tokio::test]

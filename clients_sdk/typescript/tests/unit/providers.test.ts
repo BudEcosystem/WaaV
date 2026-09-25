@@ -104,7 +104,7 @@ describe('provider-enum drift guard (SDK ⊇ gateway dispatch.rs)', () => {
 
   it('SDK REALTIME_PROVIDERS covers every gateway BuiltinRealtimeProvider variant', () => {
     const variants = extractEnumVariants(source, 'BuiltinRealtimeProvider');
-    expect(variants.length).toBe(12); // 12 realtime/S2S providers
+    expect(variants.length).toBe(11); // 11 realtime/S2S providers
     const sdk = new Set(REALTIME_PROVIDERS.map(norm));
     const missing = variants.filter((v) => !sdk.has(canon(v)));
     expect(missing, `gateway realtime providers missing from SDK REALTIME_PROVIDERS: ${missing.join(', ')}`).toEqual([]);
@@ -112,8 +112,8 @@ describe('provider-enum drift guard (SDK ⊇ gateway dispatch.rs)', () => {
 });
 
 describe('STT Provider Types (full fleet)', () => {
-  it('has the full canonical STT fleet (32 providers)', () => {
-    expect(STT_PROVIDERS).toHaveLength(32);
+  it('has the full canonical STT fleet (31 providers)', () => {
+    expect(STT_PROVIDERS).toHaveLength(31);
   });
 
   it('includes the common providers under their canonical names', () => {
@@ -138,12 +138,12 @@ describe('STT Provider Types (full fleet)', () => {
 });
 
 describe('TTS Provider Types (full fleet)', () => {
-  it('has the full canonical TTS fleet (37 providers)', () => {
-    expect(TTS_PROVIDERS).toHaveLength(37);
+  it('has the full canonical TTS fleet (34 providers)', () => {
+    expect(TTS_PROVIDERS).toHaveLength(34);
   });
 
   it('includes the common providers', () => {
-    for (const p of ['deepgram', 'elevenlabs', 'google', 'microsoft-azure', 'cartesia', 'openai', 'hume', 'lmnt', 'playht']) {
+    for (const p of ['deepgram', 'elevenlabs', 'google', 'microsoft-azure', 'cartesia', 'openai', 'hume']) {
       expect(TTS_PROVIDERS).toContain(p);
     }
   });
@@ -162,8 +162,8 @@ describe('TTS Provider Types (full fleet)', () => {
 });
 
 describe('Realtime Provider Types (gateway /realtime fleet)', () => {
-  it('has the full realtime/S2S fleet (12 providers)', () => {
-    expect(REALTIME_PROVIDERS).toHaveLength(12);
+  it('has the full realtime/S2S fleet (11 providers)', () => {
+    expect(REALTIME_PROVIDERS).toHaveLength(11);
   });
 
   it('uses gateway canonical names, not OpenAI-native names', () => {

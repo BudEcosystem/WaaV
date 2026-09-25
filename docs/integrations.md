@@ -4,7 +4,7 @@ This document provides detailed integration guides for WaaV Gateway's provider e
 
 ## Provider Integrations
 
-WaaV Gateway supports 10+ STT providers, 11+ TTS providers, and 2 realtime audio-to-audio providers through a unified API.
+WaaV Gateway supports 10+ STT providers, 9+ TTS providers, and 2 realtime audio-to-audio providers through a unified API.
 
 ### Speech-to-Text (STT) Providers
 
@@ -34,8 +34,6 @@ WaaV Gateway supports 10+ STT providers, 11+ TTS providers, and 2 realtime audio
 | AWS Polly | Neural, Standard | ~200ms | SSML, speech marks |
 | IBM Watson | Neural | ~250ms | Expressive voices |
 | Hume AI | Octave | ~200ms | Emotion-aware synthesis |
-| LMNT | Various | ~150ms | Voice cloning |
-| Play.ht | PlayDialog | ~190ms | Multi-turn, cloning |
 
 ### Realtime Audio-to-Audio Providers
 

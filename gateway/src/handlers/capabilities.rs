@@ -30,6 +30,13 @@ pub struct LanguageCapabilitiesResponse {
     pub canonical_languages: Vec<CanonicalLanguageInfo>,
     /// The per-provider native-notation matrix (how each provider renders `en-US` / `cmn-CN`).
     pub providers: Vec<LanguageSupportRow>,
+    /// Models whose language support is NARROWER than their vendor's.
+    ///
+    /// Deepgram's specialised models — medical, pharma, phonecall and the rest — are English-only
+    /// while `nova-3` itself speaks fifty languages, so a per-vendor answer is not enough to tell
+    /// a caller what a given deployment will accept. A model absent from this list carries no
+    /// model-level restriction; the provider row above applies.
+    pub model_restrictions: &'static [crate::core::lang::ModelLanguageRow],
     /// Count of canonical languages (convenience for clients).
     pub canonical_count: usize,
 }
@@ -49,8 +56,21 @@ pub async fn list_language_capabilities(State(_state): State<Arc<AppState>>) -> 
     Json(LanguageCapabilitiesResponse {
         canonical_languages,
         providers: language_support_matrix(),
+        model_restrictions: crate::core::lang::MODEL_LANGUAGE_SUPPORT,
         canonical_count,
     })
+}
+
+/// `GET /capabilities/features` — which providers honour which canonical features.
+///
+/// The discovery surface for FRD-018 M1. `/capabilities/languages` is the precedent and the
+/// shape this copies: a canonical value space plus a per-provider matrix, so an SDK, budadmin or
+/// an operator can see what a knob will actually do on a given vendor without trial and error.
+///
+/// The matrix is derived from the mappings themselves rather than declared beside them — see
+/// `core::capabilities` for why, and for the guard that keeps the two from drifting.
+pub async fn list_feature_capabilities(State(_state): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(crate::core::capabilities::feature_capabilities())
 }
 
 #[cfg(test)]

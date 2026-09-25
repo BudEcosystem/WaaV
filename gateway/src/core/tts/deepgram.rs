@@ -52,7 +52,11 @@ mod speak_url_tests {
         // aura-2-thalia-en works today and must keep working; moving it would trade one
         // broken deployment for another.
         for m in ["aura-2-thalia-en", "aura-asteria-en", "nova-3", ""] {
-            assert_eq!(deepgram_speak_url(m), DEEPGRAM_TTS_URL, "{m} must stay on v1");
+            assert_eq!(
+                deepgram_speak_url(m),
+                DEEPGRAM_TTS_URL,
+                "{m} must stay on v1"
+            );
         }
     }
 
@@ -91,7 +95,10 @@ mod encoding_container_tests {
     #[test]
     fn wav_is_a_container_around_linear16() {
         // The live failure: response_format "wav" returned 502 INVALID_QUERY_PARAMETER.
-        assert_eq!(deepgram_encoding_and_container("wav"), ("linear16", Some("wav")));
+        assert_eq!(
+            deepgram_encoding_and_container("wav"),
+            ("linear16", Some("wav"))
+        );
     }
 
     #[test]

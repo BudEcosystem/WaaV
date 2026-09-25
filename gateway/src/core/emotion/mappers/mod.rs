@@ -100,7 +100,6 @@ pub fn get_mapper_for_provider(provider: &str) -> Box<dyn EmotionMapper> {
         "aws-polly" | "aws_polly" | "amazon-polly" | "polly" => {
             Box::new(FallbackEmotionMapper::aws_polly())
         }
-        "lmnt" | "lmnt-ai" | "lmnt_ai" => Box::new(FallbackEmotionMapper::lmnt()),
         _ => Box::new(FallbackEmotionMapper::new("unknown")),
     }
 }
@@ -156,12 +155,11 @@ pub fn providers_with_emotion_support() -> &'static [&'static str] {
 /// Returns the list of providers without emotion support.
 ///
 /// These providers only support voice selection, not emotional expression.
-/// Note: LMNT supports `top_p`/`temperature` for expressiveness but not emotions.
 /// `google` here is the plain/Chirp3-HD path (gemini-tts DOES support emotion);
 /// `aws-polly` honors two delivery domains but no affective emotion (partial).
 #[inline]
 pub fn providers_without_emotion_support() -> &'static [&'static str] {
-    &["deepgram", "google", "ibm-watson", "lmnt"]
+    &["deepgram", "google", "ibm-watson"]
 }
 
 // =============================================================================
@@ -295,24 +293,6 @@ mod tests {
     }
 
     #[test]
-    fn test_get_mapper_lmnt_fallback() {
-        let mapper = get_mapper_for_provider("lmnt");
-        let support = mapper.get_support();
-
-        assert_eq!(support.provider_id, "lmnt");
-        assert!(!support.supports_emotions);
-        assert_eq!(support.method, EmotionMethod::None);
-    }
-
-    #[test]
-    fn test_get_mapper_lmnt_variants() {
-        for provider in ["lmnt", "lmnt-ai", "lmnt_ai", "LMNT"] {
-            let mapper = get_mapper_for_provider(provider);
-            assert_eq!(mapper.get_support().provider_id, "lmnt");
-        }
-    }
-
-    #[test]
     fn test_get_mapper_unknown() {
         let mapper = get_mapper_for_provider("unknown-provider");
         let support = mapper.get_support();
@@ -350,17 +330,9 @@ mod tests {
         let providers = providers_without_emotion_support();
         assert!(providers.contains(&"deepgram"));
         assert!(providers.contains(&"google"));
-        assert!(providers.contains(&"lmnt"));
         assert!(!providers.contains(&"hume"));
         // P4: cartesia/openai are no longer in the no-support list.
         assert!(!providers.contains(&"cartesia"));
         assert!(!providers.contains(&"openai"));
-    }
-
-    #[test]
-    fn test_lmnt_provider_no_emotion_support() {
-        assert!(!provider_supports_emotions("lmnt"));
-        assert!(!provider_supports_emotions("lmnt-ai"));
-        assert!(!provider_supports_emotions("lmnt_ai"));
     }
 }

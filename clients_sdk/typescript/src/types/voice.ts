@@ -12,9 +12,7 @@
 export const VOICE_CLONE_PROVIDERS = [
   'hume',
   'elevenlabs',
-  'lmnt',
   'cartesia',
-  'playht',
   'speechify',
   'resemble',
 ] as const;
@@ -24,8 +22,8 @@ export type VoiceCloneProvider = (typeof VOICE_CLONE_PROVIDERS)[number] | (strin
 /**
  * Voice-clone mode (gateway `CloneMode`).
  * - `instant` (default): IVC / clip clone; returns `ready` immediately or near-instantly.
- * - `professional`: async high-fidelity (ElevenLabs PVC / Resemble / PlayHT PVC);
- *   the returned `voiceId` is polled until `ready`.
+ * - `professional`: async high-fidelity (ElevenLabs PVC / Resemble); the returned
+ *   `voiceId` is polled until `ready`.
  */
 export type CloneMode = 'instant' | 'professional';
 
@@ -72,7 +70,7 @@ export interface VoiceCloneRequest {
   mode?: CloneMode;
   /** Design-from-existing: the base voice to clone/derive from (provider-specific). */
   baseVoiceId?: string;
-  /** Remove background noise from samples (ElevenLabs IVC / LMNT enhance). */
+  /** Remove background noise from samples (ElevenLabs IVC). */
   removeBackgroundNoise?: boolean;
   /** Sample text for voice generation (Hume only). */
   sampleText?: string;

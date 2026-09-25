@@ -187,15 +187,8 @@ impl ServerConfig {
         // Hume AI API key (used for TTS and EVI)
         let hume_api_key = cred_env!("HUME_API_KEY");
 
-        // LMNT API key (used for TTS and voice cloning)
-        let lmnt_api_key = cred_env!("LMNT_API_KEY");
-
         // Groq API key (used for ultra-fast Whisper STT)
         let groq_api_key = cred_env!("GROQ_API_KEY");
-
-        // Play.ht credentials (used for TTS with voice cloning)
-        let playht_api_key = cred_env!("PLAYHT_API_KEY");
-        let playht_user_id = cred_env!("PLAYHT_USER_ID");
 
         // IBM Watson credentials (used for STT/TTS)
         let ibm_watson_api_key = cred_env!("IBM_WATSON_API_KEY");
@@ -340,10 +333,7 @@ impl ServerConfig {
             yandex_folder_id,
             assemblyai_api_key,
             hume_api_key,
-            lmnt_api_key,
             groq_api_key,
-            playht_api_key,
-            playht_user_id,
             ibm_watson_api_key,
             ibm_watson_instance_id,
             ibm_watson_region,

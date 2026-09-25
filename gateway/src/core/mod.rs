@@ -6,6 +6,7 @@
 pub mod alias;
 pub mod audio;
 pub mod cache;
+pub mod capabilities;
 pub mod conversation;
 pub mod credentials;
 pub mod emotion;
@@ -43,6 +44,8 @@ pub mod tts;
 pub mod turn;
 pub mod turn_decision;
 pub mod turn_detect;
+/// The message inside a vendor's error body, shared by the batch STT and HTTP TTS paths.
+pub mod vendor_error;
 /// Unified VOICE-DESCRIPTOR system (P4): a canonical `{gender, locale/accent, style,
 /// age, name_hint}` resolved server-side to a provider `voice_id` over the `/voices`
 /// catalog. Mirrors the [`emotion`] / [`lang`] mapper chassis; raw `voice_id` is the

@@ -3,7 +3,7 @@
     "title": "Global Audio AI Cloud Providers Database",
     "description": "Comprehensive database of Speech-to-Text (STT), Text-to-Speech (TTS), and Audio-to-Audio cloud providers worldwide",
     "last_updated": "2026-01-04",
-    "total_providers": 120,
+    "total_providers": 117,
     "categories": {
       "global_leaders": 15,
       "regional_specialists": 45,
@@ -154,17 +154,6 @@
       "supported_technologies": ["TTS (Octave)", "Audio-to-Audio (EVI 3)", "Expression Measurement"],
       "opensource_available": "NO",
       "opensource_link": null
-    },
-    {
-      "name": "LMNT",
-      "website": "https://www.lmnt.com",
-      "regions": ["Global", "US"],
-      "languages": "24 languages with code-switching support",
-      "api_documentation": "https://docs.lmnt.com",
-      "pricing_page": "https://www.lmnt.com/pricing",
-      "supported_technologies": ["TTS", "Voice Cloning"],
-      "opensource_available": "YES",
-      "opensource_link": "https://github.com/lmnt-com/diffwave"
     },
     {
       "name": "Resemble AI",
@@ -409,17 +398,6 @@
         "compliance": ["SOC2", "GDPR", "EU AI Act-ready"],
         "render_speed": "10x faster than real-time"
       }
-    },
-    {
-      "name": "Play.ht",
-      "website": "https://play.ht",
-      "regions": ["Global", "US"],
-      "languages": "142 languages, 900+ voices",
-      "api_documentation": "https://docs.play.ht",
-      "pricing_page": "https://play.ht/pricing/",
-      "supported_technologies": ["TTS", "Voice Cloning"],
-      "opensource_available": "NO",
-      "opensource_link": null
     },
     {
       "name": "Murf.ai",
@@ -1078,17 +1056,6 @@
       "supported_technologies": ["STT"],
       "opensource_available": "YES",
       "opensource_link": "https://github.com/VinAIResearch/PhoWhisper"
-    },
-    {
-      "name": "Prosa.ai",
-      "website": "https://prosa.ai",
-      "regions": ["Indonesia"],
-      "languages": "Indonesian (Bahasa Indonesia), Javanese, Sundanese, English",
-      "api_documentation": "https://docs.prosa.ai",
-      "pricing_page": "https://prosa.ai/pricing",
-      "supported_technologies": ["STT", "TTS"],
-      "opensource_available": "NO",
-      "opensource_link": null
     },
     {
       "name": "Kata.ai",

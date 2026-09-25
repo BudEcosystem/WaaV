@@ -204,10 +204,9 @@ class BudClient:
 
         Returns an UNCONNECTED :class:`GatewayRealtime` that speaks the gateway's
         provider-agnostic ``/realtime`` WebSocket protocol, so the SAME surface
-        works for ALL 12 realtime/S2S providers — ``provider`` is just a field:
+        works for ALL 11 realtime/S2S providers — ``provider`` is just a field:
         ``openai``, ``hume``, ``azure``, ``grok``, ``inworld``, ``deepgram``,
-        ``elevenlabs``, ``gemini``, ``ultravox``, ``nova_sonic``,
-        ``speechmatics``, ``yandex``.
+        ``elevenlabs``, ``gemini``, ``ultravox``, ``nova_sonic``, ``yandex``.
 
         Unlike :meth:`create_realtime` (the provider-NATIVE escape hatch that only
         knows OpenAI/Hume and can bypass the gateway), this client never speaks a
@@ -216,7 +215,7 @@ class BudClient:
         unified async stream (``async for ev in session``).
 
         Args:
-            provider: Realtime provider (default ``"openai"``). One of the 12 above.
+            provider: Realtime provider (default ``"openai"``). One of the 11 above.
             voice: Output TTS voice (provider-specific).
             instructions: System instructions for the assistant.
             model: Model id (provider-specific; gateway defaults apply if unset).

@@ -48,7 +48,7 @@ await talk.startListening();
 - **Talk**: Bidirectional voice conversations with VAD and interruption handling
 - **Realtime**: Full-duplex audio-to-audio with OpenAI Realtime and Hume EVI
 - **Emotion Control**: Unified 22-emotion system with delivery styles
-- **Voice Cloning**: Clone voices with ElevenLabs, PlayHT, and Hume
+- **Voice Cloning**: Clone voices with ElevenLabs, Cartesia, and Hume
 - **DAG Pipelines**: Configure custom audio processing workflows
 - **Audio Features**: Turn detection, noise filtering, VAD
 - **Performance Metrics**: Built-in TTFT, TTFB, and E2E latency tracking
@@ -73,7 +73,7 @@ await talk.startListening();
 | Groq | `groq` | Ultra-fast (216x real-time) |
 | Gateway | `gateway` | Local Whisper inference |
 
-### TTS Providers (12)
+### TTS Providers (10)
 
 | Provider | ID | Features |
 |----------|-----|----------|
@@ -86,8 +86,6 @@ await talk.startListening();
 | AWS Polly | `aws-polly` | SSML, neural/generative engines |
 | IBM Watson | `ibm-watson` | SSML, rate/pitch control |
 | Hume | `hume` | Emotion control, voice cloning |
-| LMNT | `lmnt` | Low-latency (~150ms), voice cloning |
-| PlayHT | `playht` | Voice cloning, emotion |
 | Kokoro | `kokoro` | Local inference |
 
 ### Realtime Providers (2)

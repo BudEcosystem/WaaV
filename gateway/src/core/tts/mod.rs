@@ -20,13 +20,10 @@ pub mod ibm_watson;
 pub mod iflytek;
 /// WaaV-Infer self-hosted cascade TTS adapter (`provider = "waav-infer"`).
 pub mod infer;
-pub mod lmnt;
 pub mod murf;
 pub mod naver_clova;
 pub mod nectec;
 pub mod openai;
-pub mod playht;
-pub mod prosa_ai;
 pub mod provider;
 pub mod resemble;
 pub mod reverie;
@@ -77,15 +74,11 @@ pub use ibm_watson::{
     IBM_WATSON_TTS_URL, IbmOutputFormat, IbmVoice, IbmWatsonTTS, IbmWatsonTTSConfig,
 };
 pub use infer::{INFER_TTS_ALIASES, INFER_TTS_PROVIDER_ID, InferTTS};
-pub use lmnt::{LMNT_TTS_URL, LmntAudioFormat, LmntTts, LmntTtsConfig, LmntVoice};
 pub use murf::{
     MURF_TTS_STREAM_URL, MurfAudioFormat, MurfModel, MurfRegion, MurfRequestBuilder, MurfTts,
     MurfTtsConfig,
 };
 pub use openai::{AudioOutputFormat, OPENAI_TTS_URL, OpenAITTS, OpenAITTSModel, OpenAIVoice};
-pub use playht::{
-    PLAYHT_TTS_URL, PlayHtAudioFormat, PlayHtModel, PlayHtTts, PlayHtTtsConfig, PlayHtVoice,
-};
 pub use provider::{TTSProvider, TTSRequestBuilder};
 pub use resemble::{
     RESEMBLE_TTS_STREAM_URL, RESEMBLE_VOICES_URL, ResembleModel, ResembleOutputFormat,
@@ -225,17 +218,6 @@ pub use viettel_ai::{
     ViettelTtsConfig, ViettelTtsResponse, ViettelVoice,
 };
 
-// Re-export Prosa.ai TTS implementation
-pub use prosa_ai::{
-    DEFAULT_PITCH as PROSA_TTS_DEFAULT_PITCH, DEFAULT_SAMPLE_RATE as PROSA_TTS_SAMPLE_RATE,
-    DEFAULT_TEMPO as PROSA_TTS_DEFAULT_TEMPO,
-    MAX_ASYNC_TEXT_LENGTH as PROSA_TTS_MAX_ASYNC_TEXT_LENGTH, MAX_PITCH as PROSA_TTS_MAX_PITCH,
-    MAX_SYNC_TEXT_LENGTH as PROSA_TTS_MAX_SYNC_TEXT_LENGTH, MAX_TEMPO as PROSA_TTS_MAX_TEMPO,
-    MIN_PITCH as PROSA_TTS_MIN_PITCH, MIN_TEMPO as PROSA_TTS_MIN_TEMPO, PROSA_TTS_BASE_URL,
-    ProsaTts, ProsaTtsAudioFormat, ProsaTtsConfig, ProsaTtsError, ProsaTtsRequest,
-    ProsaTtsRequestConfig, ProsaTtsRequestData, ProsaTtsResponse, ProsaTtsResult, ProsaTtsVoice,
-};
-
 // Re-export NECTEC AI for Thai TTS implementation
 pub use nectec::{
     API_KEY_HEADER as NECTEC_TTS_API_KEY_HEADER,
@@ -261,8 +243,6 @@ use std::collections::HashMap;
 /// - `"aws-polly"` or `"amazon-polly"` or `"polly"` - Amazon Polly TTS API
 /// - `"ibm-watson"` or `"ibm_watson"` or `"watson"` or `"ibm"` - IBM Watson TTS API
 /// - `"hume"` or `"hume-ai"` - Hume AI Octave TTS API (natural language emotions)
-/// - `"lmnt"` or `"lmnt-ai"` - LMNT TTS API (ultra-low latency ~150ms)
-/// - `"playht"` or `"play-ht"` or `"play.ht"` - Play.ht TTS API (voice cloning, ~190ms)
 /// - `"murf"` or `"murf-ai"` - Murf.ai TTS API (ultra-low latency ~130ms)
 /// - `"wellsaid"` or `"wellsaid-labs"` - WellSaid Labs TTS API (200+ voices, 20+ languages)
 /// - `"resemble"` or `"resemble-ai"` - Resemble AI TTS API (149+ languages, voice cloning)
@@ -316,9 +296,7 @@ pub fn get_tts_provider_urls() -> HashMap<String, String> {
     );
     urls.insert("ibm-watson".to_string(), IBM_WATSON_TTS_URL.to_string());
     urls.insert("hume".to_string(), HUME_TTS_STREAM_URL.to_string());
-    urls.insert("lmnt".to_string(), LMNT_TTS_URL.to_string());
     urls.insert("murf".to_string(), MURF_TTS_STREAM_URL.to_string());
-    urls.insert("playht".to_string(), PLAYHT_TTS_URL.to_string());
     urls.insert("wellsaid".to_string(), WELLSAID_TTS_STREAM_URL.to_string());
     urls.insert("resemble".to_string(), RESEMBLE_TTS_STREAM_URL.to_string());
     urls.insert("reverie".to_string(), REVERIE_TTS_URL.to_string());
@@ -353,7 +331,6 @@ pub fn get_tts_provider_urls() -> HashMap<String, String> {
     urls.insert("zalo-ai".to_string(), ZALO_TTS_ENDPOINT.to_string());
     urls.insert("fpt-ai".to_string(), FPT_TTS_ENDPOINT.to_string());
     urls.insert("viettel-ai".to_string(), VIETTEL_TTS_ENDPOINT.to_string());
-    urls.insert("prosa-ai".to_string(), PROSA_TTS_BASE_URL.to_string());
     urls.insert("nectec".to_string(), NECTEC_TTS_ENDPOINT.to_string());
     urls
 }
@@ -644,169 +621,6 @@ mod tests {
                 assert!(
                     msg.contains("ibm-watson"),
                     "Error message should mention ibm-watson as a supported provider"
-                );
-            }
-            Err(other) => panic!("Expected InvalidConfiguration error, got: {:?}", other),
-            Ok(_) => panic!("Expected error for invalid provider"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_create_lmnt_tts_provider() {
-        let config = TTSConfig {
-            provider: "lmnt".to_string(),
-            api_key: "test_key".to_string(),
-            voice_id: Some("lily".to_string()),
-            audio_format: Some("pcm".to_string()),
-            sample_rate: Some(24000),
-            ..Default::default()
-        };
-        let result = create_tts_provider("lmnt", config);
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_create_lmnt_tts_provider_aliases() {
-        let config = TTSConfig {
-            provider: "lmnt".to_string(),
-            api_key: "test_key".to_string(),
-            voice_id: Some("lily".to_string()),
-            ..Default::default()
-        };
-
-        // All aliases should work
-        let result = create_tts_provider("lmnt-ai", config.clone());
-        assert!(result.is_ok());
-
-        let result = create_tts_provider("lmnt_ai", config);
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_create_lmnt_tts_provider_case_insensitive() {
-        let config = TTSConfig {
-            provider: "lmnt".to_string(),
-            api_key: "test_key".to_string(),
-            voice_id: Some("lily".to_string()),
-            ..Default::default()
-        };
-        // Case should not matter
-        let result = create_tts_provider("LMNT", config.clone());
-        assert!(result.is_ok());
-
-        let result = create_tts_provider("Lmnt", config);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_get_tts_provider_urls_includes_lmnt() {
-        let urls = get_tts_provider_urls();
-        assert!(urls.contains_key("lmnt"));
-        assert_eq!(urls.get("lmnt").unwrap(), LMNT_TTS_URL);
-    }
-
-    #[test]
-    fn test_invalid_provider_error_message_includes_lmnt() {
-        let config = TTSConfig::default();
-        let result = create_tts_provider("invalid_provider", config);
-
-        match result {
-            Err(TTSError::InvalidConfiguration(msg)) => {
-                assert!(
-                    msg.contains("lmnt"),
-                    "Error message should mention lmnt as a supported provider"
-                );
-            }
-            Err(other) => panic!("Expected InvalidConfiguration error, got: {:?}", other),
-            Ok(_) => panic!("Expected error for invalid provider"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_create_playht_tts_provider() {
-        // Set required environment variable for Play.ht auth
-        // SAFETY: Test-only environment setup, no concurrent access in tests
-        unsafe {
-            std::env::set_var("PLAYHT_USER_ID", "test-user-id");
-        }
-
-        let config = TTSConfig {
-            provider: "playht".to_string(),
-            api_key: "test_key".to_string(),
-            voice_id: Some("s3://voice-cloning-zero-shot/test/manifest.json".to_string()),
-            audio_format: Some("mp3".to_string()),
-            sample_rate: Some(48000),
-            ..Default::default()
-        };
-        let result = create_tts_provider("playht", config);
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_create_playht_tts_provider_aliases() {
-        // Set required environment variable for Play.ht auth
-        // SAFETY: Test-only environment setup, no concurrent access in tests
-        unsafe {
-            std::env::set_var("PLAYHT_USER_ID", "test-user-id");
-        }
-
-        let config = TTSConfig {
-            provider: "playht".to_string(),
-            api_key: "test_key".to_string(),
-            voice_id: Some("s3://voice-cloning-zero-shot/test/manifest.json".to_string()),
-            ..Default::default()
-        };
-
-        // All aliases should work
-        let result = create_tts_provider("play-ht", config.clone());
-        assert!(result.is_ok());
-
-        let result = create_tts_provider("play_ht", config.clone());
-        assert!(result.is_ok());
-
-        let result = create_tts_provider("play.ht", config);
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_create_playht_tts_provider_case_insensitive() {
-        // Set required environment variable for Play.ht auth
-        // SAFETY: Test-only environment setup, no concurrent access in tests
-        unsafe {
-            std::env::set_var("PLAYHT_USER_ID", "test-user-id");
-        }
-
-        let config = TTSConfig {
-            provider: "playht".to_string(),
-            api_key: "test_key".to_string(),
-            voice_id: Some("s3://voice-cloning-zero-shot/test/manifest.json".to_string()),
-            ..Default::default()
-        };
-        // Case should not matter
-        let result = create_tts_provider("PLAYHT", config.clone());
-        assert!(result.is_ok());
-
-        let result = create_tts_provider("PlayHt", config);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_get_tts_provider_urls_includes_playht() {
-        let urls = get_tts_provider_urls();
-        assert!(urls.contains_key("playht"));
-        assert_eq!(urls.get("playht").unwrap(), PLAYHT_TTS_URL);
-    }
-
-    #[test]
-    fn test_invalid_provider_error_message_includes_playht() {
-        let config = TTSConfig::default();
-        let result = create_tts_provider("invalid_provider", config);
-
-        match result {
-            Err(TTSError::InvalidConfiguration(msg)) => {
-                assert!(
-                    msg.contains("playht"),
-                    "Error message should mention playht as a supported provider"
                 );
             }
             Err(other) => panic!("Expected InvalidConfiguration error, got: {:?}", other),

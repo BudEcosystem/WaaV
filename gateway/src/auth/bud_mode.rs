@@ -156,6 +156,11 @@ impl BudMode {
         }))
     }
 
+    /// The Redis store the plane reads — and the voice-catalog publisher writes to.
+    pub fn store(&self) -> &Arc<RedisStore> {
+        &self.store
+    }
+
     pub fn plane(&self) -> &Arc<BudPlane> {
         &self.plane
     }

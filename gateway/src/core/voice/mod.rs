@@ -49,6 +49,7 @@ mod tests {
             accent: "American".into(),
             gender: "Female".into(),
             language: "English".into(),
+            ..Default::default()
         }];
         let r: ResolvedVoice = resolve_voice(&d, &catalog, "default");
         assert_eq!(r.voice_id, "v1");

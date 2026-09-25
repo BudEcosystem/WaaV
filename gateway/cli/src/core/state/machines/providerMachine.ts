@@ -393,16 +393,6 @@ export const TTS_PROVIDERS: ProviderInfo[] = [
     configured: false,
   },
   {
-    id: 'play_ht',
-    name: 'PlayHT',
-    type: 'tts',
-    description: 'AI voice generation',
-    features: ['Voice cloning', 'Multiple languages', 'Emotions'],
-    requiresApiKey: true,
-    envVar: 'PLAYHT_API_KEY',
-    configured: false,
-  },
-  {
     id: 'google_tts',
     name: 'Google Cloud TTS',
     type: 'tts',

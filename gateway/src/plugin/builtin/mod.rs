@@ -5,22 +5,23 @@
 //!
 //! # Providers
 //!
-//! ## STT Providers (32)
+//! ## STT Providers (31)
 //! - Alibaba Cloud, AmiVoice, Baidu, Deepgram, Google, ElevenLabs, Azure, Cartesia, OpenAI, AssemblyAI,
 //!   AWS Transcribe, IBM Watson, Groq, Gnani, Sarvam, Speechmatics, Gladia, Rev AI,
 //!   Phonexia, Reverie, Yandex, Tinkoff, SberDevices, Tencent, Huawei Cloud, NAVER CLOVA,
-//!   Bhashini, iFlytek, FPT.AI, Viettel AI, Prosa.ai, NECTEC
+//!   Bhashini, iFlytek, FPT.AI, Viettel AI, NECTEC
 //!
-//! ## TTS Providers (37)
+//! ## TTS Providers (34)
 //! - Deepgram, ElevenLabs, Google, Azure, Cartesia, OpenAI, AWS Polly,
-//!   IBM Watson, Hume, LMNT, PlayHT, Gnani, Murf, WellSaid, Resemble, Speechify,
+//!   IBM Watson, Hume, Gnani, Murf, WellSaid, Resemble, Speechify,
 //!   Unreal Speech, Speechmatics, Acapela, CereProc, Reverie, Yandex, Smallest.ai,
 //!   Tinkoff, SberDevices, Bhashini, iFlytek, Alibaba Cloud, Baidu, Tencent,
-//!   Huawei Cloud, NAVER CLOVA, Zalo AI, FPT.AI, Viettel AI, Prosa.ai, NECTEC
+//!   Huawei Cloud, NAVER CLOVA, Zalo AI, FPT.AI, Viettel AI, NECTEC
 //!
-//! ## Realtime Providers (12)
+//! ## Realtime Providers (11)
 //! - OpenAI, Hume EVI, Azure OpenAI, Grok/xAI, Inworld, Deepgram Voice Agent,
-//!   ElevenLabs Conversational AI, Google Gemini Live, Ultravox, AWS Nova Sonic
+//!   ElevenLabs Conversational AI, Google Gemini Live, Ultravox, AWS Nova Sonic,
+//!   Yandex AI Studio Realtime
 //!   (Azure/Grok/Inworld are OpenAI-protocol clones reusing the GA wire;
 //!   Deepgram Voice Agent is speech-to-speech with raw linear16 binary frames;
 //!   ElevenLabs Conversational AI is speech-to-speech with base64+JSON frames;
@@ -35,22 +36,21 @@
 use crate::core::realtime::{
     AzureRealtime, BaseRealtime, DeepgramRealtime, ElevenLabsRealtime, GeminiRealtime,
     GrokRealtime, HumeEVI, InworldRealtime, NovaSonicRealtime, OpenAIRealtime, RealtimeConfig,
-    RealtimeError, SpeechmaticsRealtime, UltravoxRealtime, YandexRealtime,
+    RealtimeError, UltravoxRealtime, YandexRealtime,
 };
 use crate::core::stt::{
     AmiVoiceSTT, AssemblyAISTT, AwsTranscribeSTT, AzureSTT, BaiduStt, BaseSTT, BhashiniStt,
     CartesiaSTT, DashScopeStt, DeepgramSTT, ElevenLabsSTT, FptStt, GladiaSTT, GnaniSTT, GoogleSTT,
     GroqSTT, HuaweiCloudStt, IFlytekStt, IbmWatsonSTT, NaverClovaStt, NectecStt, OpenAISTT,
-    PhonexiaSTT, ProsaStt, RevAISTT, ReverieSTT, STTConfig, STTError, SarvamSTT, SberDevicesSTT,
+    PhonexiaSTT, RevAISTT, ReverieSTT, STTConfig, STTError, SarvamSTT, SberDevicesSTT,
     SpeechmaticsSTT, TencentStt, TinkoffStt, ViettelStt, YandexSTT,
 };
 use crate::core::tts::{
     AcapelaTts, AwsPollyTTS, AzureTTS, BaiduTts, BaseTTS, BhashiniTts, CartesiaTTS, CereprocTts,
     DashScopeTts, DeepgramTTS, ElevenLabsTTS, FptTts, GnaniTTS, GoogleTTS, HuaweiCloudTts, HumeTTS,
-    IFlytekTts, IbmWatsonTTS, LmntTts, MurfTts, NaverClovaTts, NectecTts, OpenAITTS, PlayHtTts,
-    ProsaTts, ResembleTts, ReverieTts, SberDevicesTts, SmallestTts, SpeechifyTts, SpeechmaticsTts,
-    TTSConfig, TencentTts, TinkoffTts, UnrealSpeechTts, ViettelTts, WellSaidTts, YandexTts,
-    ZaloTts,
+    IFlytekTts, IbmWatsonTTS, MurfTts, NaverClovaTts, NectecTts, OpenAITTS, ResembleTts,
+    ReverieTts, SberDevicesTts, SmallestTts, SpeechifyTts, SpeechmaticsTts, TTSConfig, TencentTts,
+    TinkoffTts, UnrealSpeechTts, ViettelTts, WellSaidTts, YandexTts, ZaloTts,
 };
 use crate::plugin::metadata::ProviderMetadata;
 use crate::plugin::registry::PluginConstructor;
@@ -578,31 +578,6 @@ fn viettel_ai_stt_metadata() -> ProviderMetadata {
         .with_languages(["vi"])
 }
 
-fn prosa_ai_stt_metadata() -> ProviderMetadata {
-    ProviderMetadata::stt("prosa-ai", "Prosa.ai STT (Indonesian NLP)")
-        .with_description(
-            "Indonesian AI speech-to-text with streaming WebSocket API, optimized for Bahasa Indonesia",
-        )
-        .with_alias("prosa_ai-stt")
-        .with_alias("prosa-stt")
-        .with_alias("prosa")
-        .with_alias("prosaid")
-        .with_features([
-            "websocket-streaming",
-            "rest-api",
-            "indonesian-optimized",
-            "partial-results",
-            "word-timestamps",
-            "speaker-diarization",
-            "model-stt-general",
-            "model-stt-general-online",
-            "opus-format",
-            "mp3-format",
-            "wav-format",
-        ])
-        .with_languages(["id", "en"])
-}
-
 fn nectec_stt_metadata() -> ProviderMetadata {
     ProviderMetadata::stt("nectec", "NECTEC AI for Thai STT (Partii)")
         .with_description(
@@ -694,20 +669,6 @@ fn hume_tts_metadata() -> ProviderMetadata {
         .with_description("Empathic TTS with natural language emotion control")
         .with_alias("hume-ai")
         .with_features(["streaming", "emotion-control"])
-}
-
-fn lmnt_tts_metadata() -> ProviderMetadata {
-    ProviderMetadata::tts("lmnt", "LMNT TTS")
-        .with_description("Ultra-low latency TTS (~150ms)")
-        .with_alias("lmnt-ai")
-        .with_features(["streaming", "low-latency", "voice-cloning"])
-}
-
-fn playht_tts_metadata() -> ProviderMetadata {
-    ProviderMetadata::tts("playht", "Play.ht TTS")
-        .with_description("Voice cloning TTS with ultra-realistic voices (~190ms)")
-        .with_alias("play.ht")
-        .with_features(["streaming", "voice-cloning"])
 }
 
 fn gnani_tts_metadata() -> ProviderMetadata {
@@ -1210,36 +1171,6 @@ fn viettel_ai_tts_metadata() -> ProviderMetadata {
         .with_languages(["vi"])
 }
 
-fn prosa_ai_tts_metadata() -> ProviderMetadata {
-    ProviderMetadata::tts("prosa-ai", "Prosa.ai TTS (Indonesian NLP)")
-        .with_description(
-            "Indonesian AI text-to-speech with 40+ voices, optimized for Bahasa Indonesia and English",
-        )
-        .with_alias("prosa_ai-tts")
-        .with_alias("prosa-tts")
-        .with_features([
-            "rest-api",
-            "indonesian-optimized",
-            "english-support",
-            "pitch-control",
-            "tempo-control",
-            "opus-format",
-            "mp3-format",
-            "wav-format",
-            "async-synthesis",
-            "voice-dimas-formal:male-id",
-            "voice-dimas-expressive:male-id",
-            "voice-ocha-friendly:female-id",
-            "voice-dini:female-id-audiobook",
-            "voice-kinanti:female-id-news",
-            "voice-darah:female-id-kids",
-            "voice-abimana:male-id-news",
-            "voice-roger:male-en-news",
-            "voice-jennifer:female-en-news",
-        ])
-        .with_languages(["id", "en"])
-}
-
 fn nectec_tts_metadata() -> ProviderMetadata {
     ProviderMetadata::tts("nectec", "NECTEC AI for Thai TTS (VAJA9)")
         .with_description(
@@ -1364,16 +1295,6 @@ fn nova_sonic_realtime_metadata() -> ProviderMetadata {
         )
         .with_models(["amazon.nova-sonic-v1:0"])
         .with_aliases(["nova-sonic", "aws"])
-        .with_features(["full-duplex", "function-calling", "turn-detection", "barge-in"])
-}
-
-fn speechmatics_realtime_metadata() -> ProviderMetadata {
-    ProviderMetadata::realtime("speechmatics", "Speechmatics Flow")
-        .with_description(
-            "Speechmatics Flow (Voice AI) — conversational speech-to-speech on Speechmatics' streaming STT (RAW PCM binary audio both ways + JSON control, 16k; template-driven agents; auth Authorization: Bearer <JWT/temp-token>; server VAD)",
-        )
-        .with_models(["default", "flow-service-assistant-amelia"])
-        .with_aliases(["flow"])
         .with_features(["full-duplex", "function-calling", "turn-detection", "barge-in"])
 }
 
@@ -1511,10 +1432,6 @@ fn create_viettel_ai_stt(config: STTConfig) -> Result<Box<dyn BaseSTT>, STTError
     Ok(Box::new(ViettelStt::new(config)?))
 }
 
-fn create_prosa_ai_stt(config: STTConfig) -> Result<Box<dyn BaseSTT>, STTError> {
-    Ok(Box::new(ProsaStt::new(config)?))
-}
-
 fn create_nectec_stt(config: STTConfig) -> Result<Box<dyn BaseSTT>, STTError> {
     Ok(Box::new(NectecStt::new(config)?))
 }
@@ -1563,14 +1480,6 @@ fn create_ibm_watson_tts(config: TTSConfig) -> crate::core::tts::TTSResult<Box<d
 
 fn create_hume_tts(config: TTSConfig) -> crate::core::tts::TTSResult<Box<dyn BaseTTS>> {
     Ok(Box::new(HumeTTS::new(config)?))
-}
-
-fn create_lmnt_tts(config: TTSConfig) -> crate::core::tts::TTSResult<Box<dyn BaseTTS>> {
-    Ok(Box::new(LmntTts::new(config)?))
-}
-
-fn create_playht_tts(config: TTSConfig) -> crate::core::tts::TTSResult<Box<dyn BaseTTS>> {
-    Ok(Box::new(PlayHtTts::new(config)?))
 }
 
 fn create_gnani_tts(config: TTSConfig) -> crate::core::tts::TTSResult<Box<dyn BaseTTS>> {
@@ -1669,10 +1578,6 @@ fn create_viettel_ai_tts(config: TTSConfig) -> crate::core::tts::TTSResult<Box<d
     Ok(Box::new(ViettelTts::new(config)?))
 }
 
-fn create_prosa_ai_tts(config: TTSConfig) -> crate::core::tts::TTSResult<Box<dyn BaseTTS>> {
-    Ok(Box::new(ProsaTts::new(config)?))
-}
-
 fn create_nectec_tts(config: TTSConfig) -> crate::core::tts::TTSResult<Box<dyn BaseTTS>> {
     Ok(Box::new(NectecTts::new(config)?))
 }
@@ -1729,12 +1634,6 @@ fn create_nova_sonic_realtime(
     config: RealtimeConfig,
 ) -> Result<Box<dyn BaseRealtime>, RealtimeError> {
     Ok(Box::new(NovaSonicRealtime::new(config)?))
-}
-
-fn create_speechmatics_realtime(
-    config: RealtimeConfig,
-) -> Result<Box<dyn BaseRealtime>, RealtimeError> {
-    Ok(Box::new(SpeechmaticsRealtime::new(config)?))
 }
 
 fn create_yandex_realtime(config: RealtimeConfig) -> Result<Box<dyn BaseRealtime>, RealtimeError> {
@@ -1889,11 +1788,6 @@ inventory::submit! {
 }
 
 inventory::submit! {
-    PluginConstructor::stt("prosa-ai", prosa_ai_stt_metadata, create_prosa_ai_stt)
-        .with_aliases(&["prosa_ai-stt", "prosa-stt", "prosa", "prosaid", "prosaai"])
-}
-
-inventory::submit! {
     PluginConstructor::stt("nectec", nectec_stt_metadata, create_nectec_stt)
         .with_aliases(&["aiforthai", "ai4thai", "partii", "partii5", "partii4", "nectec-stt"])
 }
@@ -1945,16 +1839,6 @@ inventory::submit! {
 inventory::submit! {
     PluginConstructor::tts("hume", hume_tts_metadata, create_hume_tts)
         .with_aliases(&["hume-ai", "hume_ai"])
-}
-
-inventory::submit! {
-    PluginConstructor::tts("lmnt", lmnt_tts_metadata, create_lmnt_tts)
-        .with_aliases(&["lmnt-ai", "lmnt_ai"])
-}
-
-inventory::submit! {
-    PluginConstructor::tts("playht", playht_tts_metadata, create_playht_tts)
-        .with_aliases(&["play-ht", "play_ht", "play.ht"])
 }
 
 inventory::submit! {
@@ -2076,11 +1960,6 @@ inventory::submit! {
 }
 
 inventory::submit! {
-    PluginConstructor::tts("prosa-ai", prosa_ai_tts_metadata, create_prosa_ai_tts)
-        .with_aliases(&["prosa_ai-tts", "prosa-tts", "prosaid-tts", "prosaai-tts"])
-}
-
-inventory::submit! {
     PluginConstructor::tts("nectec", nectec_tts_metadata, create_nectec_tts)
         .with_aliases(&["aiforthai-tts", "ai4thai-tts", "vaja9", "vaja", "nectec-tts"])
 }
@@ -2138,11 +2017,6 @@ inventory::submit! {
 }
 
 inventory::submit! {
-    PluginConstructor::realtime("speechmatics", speechmatics_realtime_metadata, create_speechmatics_realtime)
-        .with_aliases(&["flow"])
-}
-
-inventory::submit! {
     PluginConstructor::realtime("yandex", yandex_realtime_metadata, create_yandex_realtime)
         .with_aliases(&["yandexgpt", "yandex-cloud"])
 }
@@ -2150,6 +2024,44 @@ inventory::submit! {
 #[cfg(test)]
 mod tests {
     use crate::plugin::registry::global_registry;
+
+    /// Vendors whose service no longer exists (checked 2026-09-24): PlayHT's API domain does not
+    /// resolve, LMNT has shut down, Prosa.ai's site, console, docs and streaming host are gone, and
+    /// Speechmatics Flow's host does not resolve. A deployment naming one must fail at
+    /// construction with "unknown provider", not connect to nothing at the first request.
+    #[test]
+    fn vendors_that_shut_down_are_not_registered() {
+        let registry = global_registry();
+        for id in [
+            "lmnt",
+            "lmnt-ai",
+            "playht",
+            "play.ht",
+            "prosa-ai",
+            "prosa-tts",
+        ] {
+            assert!(
+                !registry.has_tts_provider(id),
+                "{id} is still a TTS provider"
+            );
+        }
+        for id in ["prosa-ai", "prosa"] {
+            assert!(
+                !registry.has_stt_provider(id),
+                "{id} is still an STT provider"
+            );
+        }
+        for id in ["flow", "speechmatics_flow"] {
+            assert!(
+                !registry.has_realtime_provider(id),
+                "{id} is still a realtime provider"
+            );
+        }
+        // Speechmatics itself stays: only its Flow realtime product went away.
+        assert!(!registry.has_realtime_provider("speechmatics"));
+        assert!(registry.has_stt_provider("speechmatics"));
+        assert!(registry.has_tts_provider("speechmatics"));
+    }
 
     /// The cascade `waav-infer` STT/TTS adapters are still transport stubs, so the built-in registry must
     /// not advertise them as selectable providers. The native S2S realtime Infer provider is the wired
@@ -2284,10 +2196,6 @@ mod tests {
         assert!(registry.has_stt_provider("viettel-stt")); // alias
         assert!(registry.has_stt_provider("viettel")); // alias
         assert!(registry.has_stt_provider("vtai")); // alias
-        assert!(registry.has_stt_provider("prosa-ai")); // Prosa.ai STT
-        assert!(registry.has_stt_provider("prosa-stt")); // alias
-        assert!(registry.has_stt_provider("prosa")); // alias
-        assert!(registry.has_stt_provider("prosaid")); // alias
     }
 
     #[test]
@@ -2304,8 +2212,6 @@ mod tests {
         assert!(registry.has_tts_provider("aws-polly"));
         assert!(registry.has_tts_provider("ibm-watson"));
         assert!(registry.has_tts_provider("hume"));
-        assert!(registry.has_tts_provider("lmnt"));
-        assert!(registry.has_tts_provider("playht"));
         assert!(registry.has_tts_provider("gnani"));
         assert!(registry.has_tts_provider("murf"));
         assert!(registry.has_tts_provider("wellsaid"));
@@ -2365,10 +2271,6 @@ mod tests {
         assert!(registry.has_tts_provider("viettel-tts")); // alias
         assert!(registry.has_tts_provider("vtai-tts")); // alias
         assert!(registry.has_tts_provider("viettelai-tts")); // alias
-        assert!(registry.has_tts_provider("prosa-ai")); // Prosa.ai TTS
-        assert!(registry.has_tts_provider("prosa-tts")); // alias
-        assert!(registry.has_tts_provider("prosaid-tts")); // alias
-        assert!(registry.has_tts_provider("prosaai-tts")); // alias
         assert!(registry.has_tts_provider("nectec")); // NECTEC AI for Thai TTS
         assert!(registry.has_tts_provider("nectec-tts")); // alias
         assert!(registry.has_tts_provider("aiforthai-tts")); // alias
@@ -2410,9 +2312,6 @@ mod tests {
         assert!(registry.has_realtime_provider("nova_sonic"));
         assert!(registry.has_realtime_provider("nova-sonic")); // alias
         assert!(registry.has_realtime_provider("aws")); // alias
-        // Speechmatics Flow (S2S, raw-PCM binary + JSON control; template-driven).
-        assert!(registry.has_realtime_provider("speechmatics"));
-        assert!(registry.has_realtime_provider("flow")); // alias
         // Yandex Cloud AI Studio Realtime (OpenAI-protocol clone; GA wire, Bearer).
         assert!(registry.has_realtime_provider("yandex"));
         assert!(registry.has_realtime_provider("yandexgpt")); // alias
@@ -2485,7 +2384,6 @@ mod tests {
 
         // Test TTS aliases
         assert!(registry.has_tts_provider("polly")); // alias for aws-polly
-        assert!(registry.has_tts_provider("play.ht")); // alias for playht
         assert!(registry.has_tts_provider("gnani-ai")); // alias for gnani
         assert!(registry.has_tts_provider("murf-ai")); // alias for murf
         assert!(registry.has_tts_provider("murf.ai")); // alias for murf

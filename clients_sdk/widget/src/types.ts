@@ -6,7 +6,7 @@
 // Provider Types
 // =============================================================================
 //
-// The canonical provider value-space (32 STT / 37 TTS / 12 realtime) lives in
+// The canonical provider value-space (31 STT / 34 TTS / 11 realtime) lives in
 // ./providers.ts as runtime const arrays sourced from the gateway dispatch
 // tables. Import the union TYPES for local use, and re-export them so existing
 // imports (`import { STTProvider } from './types'`) keep working while the

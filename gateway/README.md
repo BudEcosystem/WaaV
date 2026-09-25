@@ -12,9 +12,9 @@ A high-performance real-time voice processing server built in Rust that provides
 - **Advanced Noise Filtering**: Optional DeepFilterNet integration (`noise-filter` feature)
 - **Plugin Architecture**: Extensible capability-based plugin system with O(1) provider lookup
 - **70+ Cloud Providers**: Comprehensive coverage of global and regional STT/TTS services
-  - **STT (27 providers)**: Deepgram, Google Cloud, Azure, ElevenLabs, OpenAI, AssemblyAI, Cartesia, AWS Transcribe, IBM Watson, Groq, Gnani, Sarvam AI, Speechmatics, Gladia, Rev AI, Phonexia, Yandex, Tinkoff, SberDevices, Bhashini, iFlytek, Alibaba Cloud, Baidu, Tencent, Huawei, NAVER CLOVA, and more
-  - **TTS (32 providers)**: Deepgram, ElevenLabs, Google Cloud, Azure, OpenAI, Cartesia, AWS Polly, IBM Watson, Hume AI, LMNT, Play.ht, Murf.ai, WellSaid Labs, Resemble AI, Speechify, Unreal Speech, Smallest.ai, and regional providers
-  - **Realtime / Speech-to-Speech (12 providers)**: OpenAI `gpt-realtime` (GA), Hume EVI, Azure OpenAI Realtime, xAI Grok, Inworld, Deepgram Voice Agent, ElevenLabs Conversational AI, Gemini Live, Ultravox, AWS Nova Sonic, Speechmatics Flow, Yandex — on a shared `RealtimeSession<P>` scaffold (reconnect/replay resilience + barge-in), usable via `/realtime` or as a persistent DAG node
+  - **STT (31 providers)**: Deepgram, Google Cloud, Azure, ElevenLabs, OpenAI, AssemblyAI, Cartesia, AWS Transcribe, IBM Watson, Groq, Gnani, Sarvam AI, Speechmatics, Gladia, Rev AI, Phonexia, Yandex, Tinkoff, SberDevices, Bhashini, iFlytek, Alibaba Cloud, Baidu, Tencent, Huawei, NAVER CLOVA, and more
+  - **TTS (35 providers)**: Deepgram, ElevenLabs, Google Cloud, Azure, OpenAI, Cartesia, AWS Polly, IBM Watson, Hume AI, Murf.ai, WellSaid Labs, Resemble AI, Speechify, Unreal Speech, Smallest.ai, and regional providers
+  - **Realtime / Speech-to-Speech (11 providers)**: OpenAI `gpt-realtime` (GA), Hume EVI, Azure OpenAI Realtime, xAI Grok, Inworld, Deepgram Voice Agent, ElevenLabs Conversational AI, Gemini Live, Ultravox, AWS Nova Sonic, Yandex — on a shared `RealtimeSession<P>` scaffold (reconnect/replay resilience + barge-in), usable via `/realtime` or as a persistent DAG node
 - **Regional Language Support**: India (22 languages), China (25+ with dialects), Southeast Asia (Thai, Vietnamese, Indonesian)
 - **Audio-Disabled Mode**: Development mode without API keys
 
@@ -276,9 +276,9 @@ flowchart TB
 
     subgraph Capabilities["Capability Types"]
         direction LR
-        STT_CAP["STTCapability<br/>27 providers"]
-        TTS_CAP["TTSCapability<br/>32 providers"]
-        RT_CAP["RealtimeCapability<br/>12 providers"]
+        STT_CAP["STTCapability<br/>31 providers"]
+        TTS_CAP["TTSCapability<br/>35 providers"]
+        RT_CAP["RealtimeCapability<br/>11 providers"]
         PROC_CAP["AudioProcessor<br/>VAD, Noise Filter"]
         MW_CAP["Middleware<br/>Auth, Rate Limit"]
         WS_CAP["WSHandler<br/>Custom Messages"]
@@ -318,12 +318,12 @@ graph TB
     end
 
     subgraph Providers["Provider System (70+ providers)"]
-        STT["STT Providers<br/>(27)"]
-        TTS["TTS Providers<br/>(32)"]
-        RT["Realtime Providers<br/>(12)"]
+        STT["STT Providers<br/>(31)"]
+        TTS["TTS Providers<br/>(35)"]
+        RT["Realtime Providers<br/>(11)"]
     end
 
-    subgraph STTList["STT Providers (27)"]
+    subgraph STTList["STT Providers (31)"]
         DG_S["Deepgram"]
         GC_S["Google Cloud"]
         AZ_S["Azure"]
@@ -336,10 +336,10 @@ graph TB
         GQ_S["Groq"]
         SM_S["Speechmatics"]
         GL_S["Gladia"]
-        MORE_S["+ 15 Regional"]
+        MORE_S["+ 19 Regional"]
     end
 
-    subgraph TTSList["TTS Providers (32)"]
+    subgraph TTSList["TTS Providers (35)"]
         DG_T["Deepgram"]
         GC_T["Google Cloud"]
         AZ_T["Azure"]
@@ -349,9 +349,7 @@ graph TB
         AWS_T["AWS Polly"]
         IBM_T["IBM Watson"]
         HU_T["Hume AI"]
-        LM_T["LMNT"]
-        PH_T["Play.ht"]
-        MORE_T["+ 21 More"]
+        MORE_T["+ 26 More"]
     end
 
     Client((Client)) --> WS
@@ -583,10 +581,7 @@ docker run -p 3001:3001 --env-file .env waav-gateway
 | `IBM_WATSON_API_KEY` | IBM Watson API key (for STT/TTS) | - | No* |
 | `IBM_WATSON_INSTANCE_ID` | IBM Watson service instance ID | - | No* |
 | `GROQ_API_KEY` | Groq API key (for ultra-fast Whisper STT) | - | No* |
-| `PLAYHT_API_KEY` | Play.ht API key (for TTS) | - | No* |
-| `PLAYHT_USER_ID` | Play.ht user ID (for TTS authentication) | - | No* |
 | `HUME_API_KEY` | Hume AI API key (for EVI realtime and TTS) | - | No* |
-| `LMNT_API_KEY` | LMNT API key (for ultra-low latency TTS) | - | No* |
 | `GNANI_TOKEN` | Gnani.ai authentication token (for Indic STT/TTS) | - | No* |
 | `GNANI_ACCESS_KEY` | Gnani.ai access key (for Indic STT/TTS) | - | No* |
 | `GNANI_CERTIFICATE_PATH` | Path to Gnani SSL certificate (for mTLS auth) | - | No* |

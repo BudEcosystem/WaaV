@@ -3430,6 +3430,18 @@ components:
           type: string
           description: Accent or dialect
           example: American
+        age:
+          type: string
+          description: |-
+            Age band, when the vendor labels one: `young`, `middle_aged`, `old`.
+
+            The descriptor resolver used to look for "young"/"old" inside the voice's NAME, which on
+            ElevenLabs ("Sarah", "George") never matched — so the Age control did nothing there.
+        description:
+          type: string
+          description: |-
+            The vendor's own descriptive words for the voice — ElevenLabs' `descriptive` label and
+            free-text description. What a timbre hint ("warm", "calm") is matched against.
         gender:
           type: string
           description: Gender of the voice
@@ -3450,15 +3462,16 @@ components:
           type: string
           description: URL to sample audio
           example: https://example.com/sample.mp3
+        use_case:
+          type: string
+          description: What the vendor says the voice is for (`narrative_story`, `conversational`, …).
     VoiceCloneProvider:
       type: string
       description: Voice cloning provider selection.
       enum:
       - hume
       - elevenlabs
-      - lmnt
       - cartesia
-      - playht
       - speechify
       - resemble
     VoiceCloneRequest:
@@ -3521,7 +3534,7 @@ components:
           description: Provider to use for voice cloning.
         remove_background_noise:
           type: boolean
-          description: Remove background noise from samples (ElevenLabs IVC / LMNT `enhance`).
+          description: Remove background noise from samples (ElevenLabs IVC).
         sample_text:
           type:
           - string

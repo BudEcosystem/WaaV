@@ -948,21 +948,6 @@ async fn resemble_tts_full_integration_via_mock_endpoint() {
 }
 
 #[tokio::test]
-async fn lmnt_tts_full_integration_via_mock_endpoint() {
-    assert_rest_tts_surfaces_audio(
-        "lmnt",
-        "/v1/ai/speech/bytes",
-        TTSConfig {
-            provider: "lmnt".into(),
-            api_key: "test-key".into(),
-            voice_id: Some("lily".to_string()),
-            ..Default::default()
-        },
-    )
-    .await;
-}
-
-#[tokio::test]
 async fn tinkoff_tts_full_integration_via_mock_endpoint() {
     // Tinkoff is genuine tonic gRPC (unary Synthesize). endpoint_override points the channel at a
     // plaintext localhost tonic mock that returns a SynthesizeSpeechResponse (audio in field 1).
@@ -1249,29 +1234,6 @@ async fn bhashini_tts_full_integration_via_mock_endpoint() {
 }
 
 #[tokio::test]
-async fn prosa_ai_tts_full_integration_via_mock_endpoint() {
-    // Prosa with wait=true (default) returns base64 audio directly in the POST response under
-    // {status:"complete", result:{data: ...}} — no poll, no download.
-    ensure_crypto();
-    let body = serde_json::json!({
-        "job_id": "job-1",
-        "status": "complete",
-        "result": { "data": b64(&fake_audio()), "url": "", "duration": 1.0 }
-    });
-    let (port, _server) = spawn_fixed_json_mock(body).await;
-    let std = StandardTTSConfig::from_base(TTSConfig {
-        provider: "prosa_ai".into(),
-        api_key: "test-key".into(),
-        ..Default::default()
-    })
-    .with_endpoint_override(format!("http://127.0.0.1:{port}"));
-    let mut tts = create_tts_standard("prosa_ai", std).expect("build prosa_ai tts via keystone");
-    let bytes = drive_tts(tts.as_mut()).await;
-    println!("prosa_ai TTS mock e2e surfaced {bytes} audio bytes");
-    assert!(bytes > 0, "prosa_ai TTS surfaced no audio end-to-end");
-}
-
-#[tokio::test]
 async fn ibm_watson_tts_full_integration_via_mock_endpoint() {
     // IBM Watson: IAM token POST /identity/token → {access_token}, then synth POST
     // /instances/{id}/v1/synthesize → raw audio bytes. instance_id is a provider extra.
@@ -1382,27 +1344,4 @@ async fn tencent_tts_full_integration_via_mock_endpoint() {
     let bytes = drive_tts(tts.as_mut()).await;
     println!("tencent TTS mock e2e surfaced {bytes} audio bytes");
     assert!(bytes > 0, "tencent TTS surfaced no audio end-to-end");
-}
-
-#[tokio::test]
-async fn playht_tts_full_integration_via_mock_endpoint() {
-    // PlayHT authenticates with both an api_key (Authorization) and a user_id (X-USER-ID); the
-    // user_id is a provider-specific extra, not part of the flat config.
-    ensure_crypto();
-    let (port, _server) = spawn_audio_mock("/api/v2/tts/stream", fake_audio()).await;
-    let mut std = StandardTTSConfig::from_base(TTSConfig {
-        provider: "playht".into(),
-        api_key: "test-key".into(),
-        voice_id: Some("s3://voice/manifest.json".to_string()),
-        ..Default::default()
-    })
-    .with_endpoint_override(format!("http://127.0.0.1:{port}"));
-    std.extras.0.insert(
-        "user_id".to_string(),
-        serde_json::Value::String("test-user".into()),
-    );
-    let mut tts = create_tts_standard("playht", std).expect("build playht tts via keystone");
-    let bytes = drive_tts(tts.as_mut()).await;
-    println!("playht TTS mock e2e surfaced {bytes} audio bytes");
-    assert!(bytes > 0, "playht TTS surfaced no audio end-to-end");
 }

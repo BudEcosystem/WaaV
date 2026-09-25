@@ -35,7 +35,7 @@ fn voice_clone_http_client() -> Result<reqwest::Client, VoiceCloneError> {
     })
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct Voice {
     /// Voice ID or canonical name
@@ -59,6 +59,19 @@ pub struct Voice {
     /// Language supported by the voice
     #[cfg_attr(feature = "openapi", schema(example = "English"))]
     pub language: String,
+    /// Age band, when the vendor labels one: `young`, `middle_aged`, `old`.
+    ///
+    /// The descriptor resolver used to look for "young"/"old" inside the voice's NAME, which on
+    /// ElevenLabs ("Sarah", "George") never matched — so the Age control did nothing there.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub age: String,
+    /// The vendor's own descriptive words for the voice — ElevenLabs' `descriptive` label and
+    /// free-text description. What a timbre hint ("warm", "calm") is matched against.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    /// What the vendor says the voice is for (`narrative_story`, `conversational`, …).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub use_case: String,
 }
 
 pub type VoicesResponse = HashMap<String, Vec<Voice>>;
@@ -75,13 +88,15 @@ struct ElevenLabsVoice {
     name: String,
     preview_url: Option<String>,
     description: Option<String>,
-    labels: Option<HashMap<String, String>>,
+    /// Values are read as JSON, not `String`: a single `null` label on one voice would otherwise
+    /// fail the parse of the WHOLE list, and the catalog would silently come back empty.
+    labels: Option<HashMap<String, serde_json::Value>>,
     verified_languages: Option<Vec<ElevenLabsLanguage>>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ElevenLabsLanguage {
-    language: String,
+    language: Option<String>,
     accent: Option<String>,
 }
 
@@ -118,21 +133,6 @@ struct GoogleVoice {
     language_codes: Vec<String>,
     name: String,
     ssml_gender: Option<String>,
-}
-
-// LMNT API response structures
-#[derive(Debug, Deserialize)]
-struct LmntVoice {
-    id: String,
-    name: String,
-    owner: String,
-    state: String,
-    #[serde(default)]
-    description: Option<String>,
-    #[serde(default)]
-    gender: Option<String>,
-    #[serde(default)]
-    preview_url: Option<String>,
 }
 
 // Azure TTS Voices API response structures
@@ -297,83 +297,123 @@ async fn fetch_elevenlabs_voices(
         .send()
         .await?;
 
+    // An error body parsed as a voice list fails as "missing field `voices`", which names
+    // neither the status nor the reason (a key scoped without `voices_read` is the usual one).
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        let reason = crate::core::vendor_error::vendor_message(&body).unwrap_or(body);
+        return Err(format!("elevenlabs /v2/voices answered {status}: {reason}").into());
+    }
     let elevenlabs_response: ElevenLabsVoicesResponse = response.json().await?;
 
     let voices = elevenlabs_response
         .voices
         .into_iter()
-        .map(|voice| {
-            // Extract language and accent information from verified_languages
-            let (language, accent) = if let Some(verified_languages) = &voice.verified_languages {
-                if let Some(first_lang) = verified_languages.first() {
-                    (
-                        first_lang.language.clone(),
-                        first_lang
-                            .accent
-                            .clone()
-                            .unwrap_or_else(|| "Unknown".to_string()),
-                    )
-                } else {
-                    ("Unknown".to_string(), "Unknown".to_string())
-                }
-            } else {
-                ("Unknown".to_string(), "Unknown".to_string())
-            };
-
-            // Extract gender from labels or description
-            let gender = voice
-                .labels
-                .as_ref()
-                .and_then(|labels| {
-                    // Check common gender keys in labels
-                    for key in ["gender", "sex", "voice_type"] {
-                        if let Some(value) = labels.get(key) {
-                            let value_lower = value.to_lowercase();
-                            if value_lower.contains("male") && !value_lower.contains("female") {
-                                return Some("Male".to_string());
-                            }
-                            if value_lower.contains("female") && !value_lower.contains("male") {
-                                return Some("Female".to_string());
-                            }
-                        }
-                    }
-                    None
-                })
-                .or_else(|| {
-                    // Check description for gender keywords
-                    voice.description.as_ref().and_then(|desc| {
-                        let desc_lower = desc.to_lowercase();
-                        if (desc_lower.contains("male") && !desc_lower.contains("female"))
-                            || desc_lower.contains("masculine")
-                            || desc_lower.contains(" man ")
-                            || desc_lower.contains("gentleman")
-                        {
-                            Some("Male".to_string())
-                        } else if (desc_lower.contains("female") && !desc_lower.contains("male"))
-                            || desc_lower.contains("feminine")
-                            || desc_lower.contains(" woman ")
-                            || desc_lower.contains("lady")
-                        {
-                            Some("Female".to_string())
-                        } else {
-                            None
-                        }
-                    })
-                })
-                .unwrap_or_else(|| "Unknown".to_string());
-
-            Voice {
-                id: voice.voice_id,
-                sample: voice.preview_url.unwrap_or_default(),
-                name: voice.name,
-                accent,
-                gender,
-                language,
-            }
-        })
+        .map(voice_from_elevenlabs)
         .collect();
 
     Ok(voices)
+}
+
+/// One ElevenLabs `/v2/voices` entry as WaaV's `Voice`, labels included.
+fn voice_from_elevenlabs(voice: ElevenLabsVoice) -> Voice {
+    // Extract language and accent information from verified_languages
+    let (language, accent) = if let Some(verified_languages) = &voice.verified_languages {
+        if let Some(first_lang) = verified_languages.first() {
+            (
+                first_lang
+                    .language
+                    .clone()
+                    .unwrap_or_else(|| "Unknown".to_string()),
+                first_lang
+                    .accent
+                    .clone()
+                    .unwrap_or_else(|| "Unknown".to_string()),
+            )
+        } else {
+            ("Unknown".to_string(), "Unknown".to_string())
+        }
+    } else {
+        ("Unknown".to_string(), "Unknown".to_string())
+    };
+
+    // Extract gender from labels or description
+    let gender = voice
+        .labels
+        .as_ref()
+        .and_then(|labels| {
+            // Check common gender keys in labels
+            for key in ["gender", "sex", "voice_type"] {
+                if let Some(value) = labels.get(key).and_then(|v| v.as_str()) {
+                    let value_lower = value.to_lowercase();
+                    if value_lower.contains("male") && !value_lower.contains("female") {
+                        return Some("Male".to_string());
+                    }
+                    if value_lower.contains("female") && !value_lower.contains("male") {
+                        return Some("Female".to_string());
+                    }
+                }
+            }
+            None
+        })
+        .or_else(|| {
+            // Check description for gender keywords
+            voice.description.as_ref().and_then(|desc| {
+                let desc_lower = desc.to_lowercase();
+                if (desc_lower.contains("male") && !desc_lower.contains("female"))
+                    || desc_lower.contains("masculine")
+                    || desc_lower.contains(" man ")
+                    || desc_lower.contains("gentleman")
+                {
+                    Some("Male".to_string())
+                } else if (desc_lower.contains("female") && !desc_lower.contains("male"))
+                    || desc_lower.contains("feminine")
+                    || desc_lower.contains(" woman ")
+                    || desc_lower.contains("lady")
+                {
+                    Some("Female".to_string())
+                } else {
+                    None
+                }
+            })
+        })
+        .unwrap_or_else(|| "Unknown".to_string());
+
+    let label = |key: &str| {
+        voice
+            .labels
+            .as_ref()
+            .and_then(|l| l.get(key))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .unwrap_or_default()
+    };
+    // `verified_languages` is absent on many voices; the `accent` label is not.
+    let accent = if accent == "Unknown" && !label("accent").is_empty() {
+        label("accent")
+    } else {
+        accent
+    };
+    let description = [
+        label("descriptive"),
+        voice.description.clone().unwrap_or_default(),
+    ]
+    .into_iter()
+    .filter(|s| !s.trim().is_empty())
+    .collect::<Vec<_>>()
+    .join(" — ");
+    Voice {
+        age: label("age"),
+        description,
+        use_case: label("use_case"),
+        id: voice.voice_id,
+        sample: voice.preview_url.unwrap_or_default(),
+        name: voice.name,
+        accent,
+        gender,
+        language,
+    }
 }
 
 // Helper function to fetch voices from Deepgram API
@@ -388,6 +428,12 @@ async fn fetch_deepgram_voices(
         .send()
         .await?;
 
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        let reason = crate::core::vendor_error::vendor_message(&body).unwrap_or(body);
+        return Err(format!("deepgram /v1/models answered {status}: {reason}").into());
+    }
     let deepgram_response: DeepgramModelsResponse = response.json().await?;
 
     let voices = deepgram_response
@@ -443,6 +489,7 @@ async fn fetch_deepgram_voices(
                 accent,
                 gender,
                 language,
+                ..Default::default()
             }
         })
         .collect();
@@ -518,6 +565,7 @@ async fn fetch_google_voices(
                 accent,
                 gender,
                 language,
+                ..Default::default()
             }
         })
         .collect();
@@ -565,6 +613,7 @@ async fn fetch_azure_voices(
                 accent,
                 gender: voice.gender,
                 language,
+                ..Default::default()
             }
         })
         .collect();
@@ -577,83 +626,6 @@ fn azure_voices_list_url(region: &str) -> Result<String, String> {
         .parse::<AzureRegion>()
         .map_err(|msg| format!("Azure TTS region rejected (SSRF protection): {msg}"))?;
     Ok(region.voices_list_url())
-}
-
-// Helper function to fetch voices from LMNT API
-async fn fetch_lmnt_voices(
-    api_key: &str,
-) -> Result<Vec<Voice>, Box<dyn std::error::Error + Send + Sync>> {
-    let client = voice_catalog_http_client()?;
-
-    // LMNT voice list endpoint
-    let response = client
-        .get("https://api.lmnt.com/v1/ai/voice/list")
-        .header("X-API-Key", api_key)
-        .send()
-        .await?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let error_body = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "Unknown error".to_string());
-        return Err(format!("LMNT API error ({}): {}", status, error_body).into());
-    }
-
-    let lmnt_voices: Vec<LmntVoice> = response.json().await?;
-
-    let voices = lmnt_voices
-        .into_iter()
-        .filter(|v| v.state == "ready") // Only include ready voices
-        .map(|voice| {
-            // Extract gender from the gender field or description
-            let gender = voice
-                .gender
-                .clone()
-                .map(|g| {
-                    let g_lower = g.to_lowercase();
-                    if g_lower.contains("male") && !g_lower.contains("female") {
-                        "Male".to_string()
-                    } else if g_lower.contains("female") {
-                        "Female".to_string()
-                    } else {
-                        g
-                    }
-                })
-                .or_else(|| {
-                    voice.description.as_ref().and_then(|desc| {
-                        let desc_lower = desc.to_lowercase();
-                        if desc_lower.contains("male") && !desc_lower.contains("female") {
-                            Some("Male".to_string())
-                        } else if desc_lower.contains("female") {
-                            Some("Female".to_string())
-                        } else {
-                            None
-                        }
-                    })
-                })
-                .unwrap_or_else(|| "Unknown".to_string());
-
-            // Determine accent based on owner type
-            let accent = match voice.owner.as_str() {
-                "system" => "Standard".to_string(),
-                "me" => "Custom".to_string(),
-                _ => "Shared".to_string(),
-            };
-
-            Voice {
-                id: voice.id,
-                sample: voice.preview_url.unwrap_or_default(),
-                name: voice.name,
-                accent,
-                gender,
-                language: "English".to_string(), // LMNT supports 22+ languages, default to English
-            }
-        })
-        .collect();
-
-    Ok(voices)
 }
 
 /// Handler for GET /voices - returns available voices per provider
@@ -735,20 +707,6 @@ pub async fn list_voices(
         tracing::debug!("Azure Speech credentials not configured, skipping");
     }
 
-    // Fetch LMNT voices - skip if not configured
-    if let Ok(api_key) = state.config.get_api_key("lmnt") {
-        match fetch_lmnt_voices(&api_key).await {
-            Ok(voices) => {
-                voices_response.insert("lmnt".to_string(), voices);
-            }
-            Err(e) => {
-                tracing::warn!("Failed to fetch LMNT voices: {}", e);
-            }
-        }
-    } else {
-        tracing::debug!("LMNT API key not configured, skipping");
-    }
-
     Ok(Json(voices_response))
 }
 
@@ -767,10 +725,9 @@ const VOICE_CATALOG_CACHE_TTL_SECS: u64 = 600;
 pub(crate) fn provider_default_voice(provider: &str) -> &'static str {
     match provider.to_lowercase().as_str() {
         "deepgram" => "aura-2-thalia-en",
-        "elevenlabs" | "eleven_labs" => "21m00Tcm4TlvDq8ikWAM", // Rachel
+        "elevenlabs" | "eleven_labs" => crate::core::tts::elevenlabs::DEFAULT_VOICE_ID, // George
         "azure" | "microsoft-azure" | "microsoft_azure" => "en-US-JennyNeural",
         "google" | "google-tts" => "en-US-Standard-C",
-        "lmnt" => "lily",
         "cartesia" => "a0e99841-438c-4a64-b679-ae501e7d6091",
         "openai" | "openai-tts" => "alloy",
         "hume" => "",
@@ -782,8 +739,69 @@ pub(crate) fn provider_default_voice(provider: &str) -> &'static str {
 /// when the provider is not configured / unreachable / has no catalog endpoint —
 /// the resolver maps empty → provider default + warning, so this never errors.
 pub(crate) async fn fetch_provider_catalog(state: &Arc<AppState>, provider: &str) -> Vec<Voice> {
+    fetch_provider_catalog_with_key(state, provider, None).await
+}
+
+/// As [`fetch_provider_catalog`], but preferring a caller-supplied credential.
+///
+/// The server's own `get_api_key` is the right source for a session the SERVER configured. It is
+/// the wrong one for a Bud deployment, whose credential arrives in the `voice_table` blob and may
+/// be the only key for that vendor in the process — so a descriptor on such a deployment would
+/// resolve against an empty catalog and silently take the vendor default. `None` keeps the old
+/// behaviour exactly.
+/// A vendor's voice list fetched with ONE credential, or why it could not be.
+///
+/// `None` when WaaV has no way to list this vendor's voices with a deployment's own key — the
+/// vendor publishes no list, or (Google, Azure) WaaV only lists it with a server-configured key.
+/// The descriptor resolver and the published catalog (`voice_catalog`) both come through here,
+/// so "can this deployment's voices be listed" has one answer.
+pub(crate) async fn fetch_catalog_with_key(
+    provider: &str,
+    api_key: &str,
+) -> Option<Result<Vec<Voice>, String>> {
+    let fetched = match provider.to_lowercase().as_str() {
+        "elevenlabs" | "eleven_labs" => fetch_elevenlabs_voices(api_key).await,
+        "deepgram" => fetch_deepgram_voices(api_key).await,
+        _ => return None,
+    };
+    Some(fetched.map_err(|e| e.to_string()))
+}
+
+/// A fetched catalog, or empty — logging why when it is empty because the fetch FAILED.
+///
+/// Empty is the documented degrade (the resolver falls back to a default), but a silent one hid
+/// every cause: an unparseable response, a key without permission to list voices, a network
+/// error. Callers that pick a voice from this list then pick the fixed default instead, and the
+/// vendor's refusal of THAT voice is the only symptom anyone sees. The key is never logged.
+fn catalog_or_empty(
+    provider: &str,
+    fetched: Result<Vec<Voice>, Box<dyn std::error::Error + Send + Sync>>,
+) -> Vec<Voice> {
+    fetched.unwrap_or_else(|e| {
+        tracing::warn!(provider, error = %e, "voice catalog fetch failed; treating it as empty");
+        Vec::new()
+    })
+}
+
+pub(crate) async fn fetch_provider_catalog_with_key(
+    state: &Arc<AppState>,
+    provider: &str,
+    api_key: Option<&str>,
+) -> Vec<Voice> {
     let provider_key = provider.to_lowercase();
-    let cache_key = format!("voice_catalog:{provider_key}");
+    let supplied = api_key.map(str::trim).filter(|k| !k.is_empty());
+    // Keyed by CREDENTIAL as well as vendor: two deployments on the same vendor with different
+    // keys see different voice libraries, and a shared entry would hand one of them the other's.
+    // The key is hashed, never stored.
+    let cache_key = match supplied {
+        Some(key) => {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            key.hash(&mut h);
+            format!("voice_catalog:{provider_key}:{:x}", h.finish())
+        }
+        None => format!("voice_catalog:{provider_key}"),
+    };
 
     // Cache hit?
     if let Ok(Some(bytes)) = state.core_state.cache.get(&cache_key).await
@@ -794,14 +812,24 @@ pub(crate) async fn fetch_provider_catalog(state: &Arc<AppState>, provider: &str
 
     // Cache miss → fetch live for the one provider.
     let voices: Vec<Voice> = match provider_key.as_str() {
-        "elevenlabs" | "eleven_labs" => match state.config.get_api_key("elevenlabs") {
-            Ok(key) => fetch_elevenlabs_voices(&key).await.unwrap_or_default(),
-            Err(_) => Vec::new(),
-        },
-        "deepgram" => match state.config.get_api_key("deepgram") {
-            Ok(key) => fetch_deepgram_voices(&key).await.unwrap_or_default(),
-            Err(_) => Vec::new(),
-        },
+        "elevenlabs" | "eleven_labs" => {
+            match supplied
+                .map(str::to_string)
+                .or_else(|| state.config.get_api_key("elevenlabs").ok())
+            {
+                Some(key) => catalog_or_empty("elevenlabs", fetch_elevenlabs_voices(&key).await),
+                None => Vec::new(),
+            }
+        }
+        "deepgram" => {
+            match supplied
+                .map(str::to_string)
+                .or_else(|| state.config.get_api_key("deepgram").ok())
+            {
+                Some(key) => catalog_or_empty("deepgram", fetch_deepgram_voices(&key).await),
+                None => Vec::new(),
+            }
+        }
         "google" | "google-tts" => match state.config.get_api_key("google") {
             Ok(creds) => fetch_google_voices(&creds).await.unwrap_or_default(),
             Err(_) => Vec::new(),
@@ -815,10 +843,6 @@ pub(crate) async fn fetch_provider_catalog(state: &Arc<AppState>, provider: &str
                 Err(_) => Vec::new(),
             }
         }
-        "lmnt" => match state.config.get_api_key("lmnt") {
-            Ok(key) => fetch_lmnt_voices(&key).await.unwrap_or_default(),
-            Err(_) => Vec::new(),
-        },
         _ => Vec::new(),
     };
 
@@ -851,13 +875,8 @@ pub enum VoiceCloneProvider {
     Hume,
     /// ElevenLabs — instant IVC, or professional PVC (async) when `mode=professional`.
     ElevenLabs,
-    /// LMNT instant voice cloning (5+ seconds of audio).
-    Lmnt,
     /// Cartesia instant clip-mode clone.
     Cartesia,
-    /// PlayHT — instant or professional (async) cloning.
-    #[serde(rename = "playht")]
-    PlayHt,
     /// Speechify instant clone (consent REQUIRED).
     Speechify,
     /// Resemble AI professional clone (async; consent/voice-talent proof required).
@@ -869,9 +888,7 @@ impl std::fmt::Display for VoiceCloneProvider {
         match self {
             Self::Hume => write!(f, "hume"),
             Self::ElevenLabs => write!(f, "elevenlabs"),
-            Self::Lmnt => write!(f, "lmnt"),
             Self::Cartesia => write!(f, "cartesia"),
-            Self::PlayHt => write!(f, "playht"),
             Self::Speechify => write!(f, "speechify"),
             Self::Resemble => write!(f, "resemble"),
         }
@@ -884,9 +901,7 @@ impl VoiceCloneProvider {
         match self {
             Self::Hume => "hume",
             Self::ElevenLabs => "elevenlabs",
-            Self::Lmnt => "lmnt",
             Self::Cartesia => "cartesia",
-            Self::PlayHt => "playht",
             Self::Speechify => "speechify",
             Self::Resemble => "resemble",
         }
@@ -895,7 +910,7 @@ impl VoiceCloneProvider {
     /// Whether this provider's [`CloneMode::Professional`] path is an ASYNC job
     /// (returns a non-`ready` status that must be polled).
     fn supports_professional(&self) -> bool {
-        matches!(self, Self::ElevenLabs | Self::PlayHt | Self::Resemble)
+        matches!(self, Self::ElevenLabs | Self::Resemble)
     }
 }
 
@@ -905,11 +920,10 @@ impl VoiceCloneProvider {
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum CloneMode {
-    /// Instant cloning (ElevenLabs IVC / Cartesia clip / PlayHT instant / LMNT /
-    /// Speechify). Returns `ready` immediately or near-instantly.
+    /// Instant cloning (ElevenLabs IVC / Cartesia clip / Speechify). Returns `ready` immediately or near-instantly.
     #[default]
     Instant,
-    /// Professional cloning (ElevenLabs PVC / Resemble / PlayHT PVC). ASYNC — the
+    /// Professional cloning (ElevenLabs PVC / Resemble). ASYNC — the
     /// returned `voice_id` is polled until `ready`.
     Professional,
 }
@@ -1009,7 +1023,7 @@ impl CloneLabels {
             || self.age.is_some()
     }
 
-    /// Render to the flat `{key: value}` map ElevenLabs / LMNT expect.
+    /// Render to the flat `{key: value}` map ElevenLabs expects.
     fn to_map(&self) -> HashMap<String, String> {
         let mut m = HashMap::new();
         if let Some(v) = &self.language {
@@ -1085,7 +1099,7 @@ pub struct VoiceCloneRequest {
     )]
     pub sample_text: Option<String>,
 
-    /// Remove background noise from samples (ElevenLabs IVC / LMNT `enhance`).
+    /// Remove background noise from samples (ElevenLabs IVC).
     #[serde(default)]
     pub remove_background_noise: bool,
 
@@ -1212,14 +1226,8 @@ impl VoiceCloneRequest {
                 VoiceCloneProvider::ElevenLabs => {
                     Some("ElevenLabs voice cloning requires at least one audio sample")
                 }
-                VoiceCloneProvider::Lmnt => {
-                    Some("LMNT voice cloning requires at least one audio sample (5+ seconds)")
-                }
                 VoiceCloneProvider::Cartesia => {
                     Some("Cartesia voice cloning requires one audio clip (~5-20s)")
-                }
-                VoiceCloneProvider::PlayHt => {
-                    Some("PlayHT voice cloning requires at least one audio sample")
                 }
                 VoiceCloneProvider::Speechify => {
                     Some("Speechify voice cloning requires one audio sample (10-30s)")
@@ -1237,17 +1245,6 @@ impl VoiceCloneRequest {
                     })),
                 });
             }
-        }
-
-        if self.provider == VoiceCloneProvider::Lmnt && self.audio_samples.len() > 20 {
-            return Err(VoiceCloneError {
-                code: "TOO_MANY_FILES".to_string(),
-                message: format!(
-                    "LMNT supports max 20 audio files, got {}",
-                    self.audio_samples.len()
-                ),
-                details: None,
-            });
         }
 
         validate_voice_clone_audio_size_limits(&self.audio_samples)?;
@@ -1625,134 +1622,6 @@ async fn clone_voice_hume(
 }
 
 // =============================================================================
-// LMNT Voice Cloning
-// =============================================================================
-
-/// LMNT voice creation response.
-#[derive(Debug, Deserialize)]
-struct LmntVoiceCreateResponse {
-    id: String,
-    name: String,
-    state: String,
-}
-
-/// Clone a voice using LMNT API.
-///
-/// LMNT voice cloning requires:
-/// - Audio samples: 5+ seconds, max 20 files, 250MB total
-/// - Supported formats: wav, mp3, mp4, m4a, webm
-async fn clone_voice_lmnt(
-    api_key: &str,
-    request: &VoiceCloneRequest,
-) -> Result<VoiceCloneResponse, VoiceCloneError> {
-    use reqwest::multipart::{Form, Part};
-
-    // Validate audio samples (LMNT requires at least 5 seconds of audio)
-    if request.audio_samples.is_empty() {
-        return Err(VoiceCloneError {
-            code: "MISSING_AUDIO".to_string(),
-            message: "LMNT voice cloning requires at least one audio sample (5+ seconds)"
-                .to_string(),
-            details: Some(serde_json::json!({
-                "hint": "Provide 5+ seconds of clear audio for best results",
-                "max_files": 20,
-                "max_total_size": "250MB",
-                "supported_formats": ["wav", "mp3", "mp4", "m4a", "webm"]
-            })),
-        });
-    }
-
-    // LMNT limits: max 20 files, 250MB total
-    if request.audio_samples.len() > 20 {
-        return Err(VoiceCloneError {
-            code: "TOO_MANY_FILES".to_string(),
-            message: format!(
-                "LMNT supports max 20 audio files, got {}",
-                request.audio_samples.len()
-            ),
-            details: None,
-        });
-    }
-
-    let client = voice_clone_http_client()?;
-
-    // Build multipart form
-    let mut form = Form::new().text("name", request.name.clone());
-
-    // Add enhancement option if specified (process noisy audio)
-    // LMNT uses "enhance" parameter to clean up audio
-    if request.remove_background_noise {
-        form = form.text("enhance", "true");
-    }
-
-    // Decode and add audio samples
-    for (i, sample_b64) in request.audio_samples.iter().enumerate() {
-        let decoded = decode_audio_sample(sample_b64, i)?;
-
-        // Detect format from magic bytes
-        let (mime_type, extension) = detect_audio_format(&decoded);
-
-        let part = Part::bytes(decoded)
-            .file_name(format!("sample_{}.{}", i, extension))
-            .mime_str(mime_type)
-            .map_err(|e| VoiceCloneError {
-                code: "INTERNAL_ERROR".to_string(),
-                message: format!("Failed to set MIME type: {}", e),
-                details: None,
-            })?;
-
-        form = form.part("files", part);
-    }
-
-    // Make API request to LMNT voice clone endpoint
-    let response = client
-        .post("https://api.lmnt.com/v1/ai/voice")
-        .header("X-API-Key", api_key)
-        .multipart(form)
-        .send()
-        .await
-        .map_err(|e| VoiceCloneError {
-            code: "REQUEST_FAILED".to_string(),
-            message: format!("Failed to send request to LMNT: {}", e),
-            details: None,
-        })?;
-
-    let status = response.status();
-    if !status.is_success() {
-        let error_body = response.text().await.unwrap_or_default();
-        return Err(VoiceCloneError {
-            code: format!("LMNT_{}", status.as_u16()),
-            message: format!("LMNT API error: {}", error_body),
-            details: Some(serde_json::json!({ "status": status.as_u16() })),
-        });
-    }
-
-    let lmnt_response: LmntVoiceCreateResponse =
-        response.json().await.map_err(|e| VoiceCloneError {
-            code: "PARSE_ERROR".to_string(),
-            message: format!("Failed to parse LMNT response: {}", e),
-            details: None,
-        })?;
-
-    // LMNT voice states: "ready" or "training"
-    let status_str = if lmnt_response.state == "ready" {
-        "ready"
-    } else {
-        "processing"
-    };
-
-    Ok(VoiceCloneResponse {
-        voice_id: lmnt_response.id,
-        name: lmnt_response.name,
-        provider: VoiceCloneProvider::Lmnt,
-        status: status_str.to_string(),
-        requires_verification: None,
-        created_at: now_rfc3339(),
-        metadata: None,
-    })
-}
-
-// =============================================================================
 // Cartesia Voice Cloning (instant clip-mode)
 // =============================================================================
 
@@ -1848,111 +1717,6 @@ async fn clone_voice_cartesia(
         name: parsed.name.unwrap_or_else(|| request.name.clone()),
         provider: VoiceCloneProvider::Cartesia,
         status: CloneStatus::Ready.to_string(),
-        requires_verification: None,
-        created_at: now_rfc3339(),
-        metadata: None,
-    })
-}
-
-// =============================================================================
-// PlayHT Voice Cloning (instant + professional)
-// =============================================================================
-
-#[derive(Debug, Deserialize)]
-struct PlayHtVoiceCreateResponse {
-    id: String,
-    #[serde(default)]
-    name: Option<String>,
-}
-
-/// Clone a voice using PlayHT. `instant` → `/v2/cloned-voices/instant` (multipart
-/// `voice_name` + `sample_file`); `professional` → `/v2/cloned-voices` (async).
-async fn clone_voice_playht(
-    api_key: &str,
-    user_id: &str,
-    request: &VoiceCloneRequest,
-) -> Result<VoiceCloneResponse, VoiceCloneError> {
-    use reqwest::multipart::{Form, Part};
-
-    let sample = request
-        .audio_samples
-        .first()
-        .ok_or_else(|| VoiceCloneError {
-            code: "MISSING_AUDIO".to_string(),
-            message: "PlayHT voice cloning requires at least one audio sample".to_string(),
-            details: None,
-        })?;
-    let decoded = decode_audio_sample(sample, 0)?;
-    let (mime, ext) = detect_audio_format(&decoded);
-
-    let sample_part = Part::bytes(decoded)
-        .file_name(format!("sample.{ext}"))
-        .mime_str(mime)
-        .map_err(|e| VoiceCloneError {
-            code: "INTERNAL_ERROR".to_string(),
-            message: format!("Failed to set MIME type: {e}"),
-            details: None,
-        })?;
-
-    let mut form = Form::new()
-        .text("voice_name", request.name.clone())
-        .part("sample_file", sample_part);
-    if let Some(g) = request
-        .structured_labels
-        .as_ref()
-        .and_then(|l| l.gender.clone())
-    {
-        form = form.text("gender", g);
-    }
-
-    let professional = request.mode == CloneMode::Professional;
-    let url = if professional {
-        "https://api.play.ht/api/v2/cloned-voices"
-    } else {
-        "https://api.play.ht/api/v2/cloned-voices/instant"
-    };
-
-    let client = voice_clone_http_client()?;
-    let response = client
-        .post(url)
-        .header("Authorization", format!("Bearer {api_key}"))
-        .header("X-User-ID", user_id)
-        .header("accept", "application/json")
-        .multipart(form)
-        .send()
-        .await
-        .map_err(|e| VoiceCloneError {
-            code: "REQUEST_FAILED".to_string(),
-            message: format!("Failed to send request to PlayHT: {e}"),
-            details: None,
-        })?;
-
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        return Err(VoiceCloneError {
-            code: format!("PLAYHT_{}", status.as_u16()),
-            message: format!("PlayHT API error: {body}"),
-            details: Some(serde_json::json!({ "status": status.as_u16() })),
-        });
-    }
-
-    let parsed: PlayHtVoiceCreateResponse = response.json().await.map_err(|e| VoiceCloneError {
-        code: "PARSE_ERROR".to_string(),
-        message: format!("Failed to parse PlayHT response: {e}"),
-        details: None,
-    })?;
-
-    Ok(VoiceCloneResponse {
-        voice_id: parsed.id,
-        name: parsed.name.unwrap_or_else(|| request.name.clone()),
-        provider: VoiceCloneProvider::PlayHt,
-        // Instant → ready; professional → async (poll the cloned-voices list).
-        status: if professional {
-            CloneStatus::Training.to_string()
-        } else {
-            CloneStatus::Ready.to_string()
-        },
         requires_verification: None,
         created_at: now_rfc3339(),
         metadata: None,
@@ -2577,26 +2341,12 @@ pub async fn clone_voice(
                 .map_err(|_| missing_key(request.provider))?;
             clone_voice_hume(&api_key, &request).await
         }
-        VoiceCloneProvider::Lmnt => {
-            let api_key = state
-                .config
-                .get_api_key(key)
-                .map_err(|_| missing_key(request.provider))?;
-            clone_voice_lmnt(&api_key, &request).await
-        }
         VoiceCloneProvider::Cartesia => {
             let api_key = state
                 .config
                 .get_api_key(key)
                 .map_err(|_| missing_key(request.provider))?;
             clone_voice_cartesia(&api_key, &request).await
-        }
-        VoiceCloneProvider::PlayHt => {
-            let (api_key, user_id) = state
-                .config
-                .get_playht_credentials()
-                .map_err(|_| missing_key(request.provider))?;
-            clone_voice_playht(&api_key, &user_id, &request).await
         }
         VoiceCloneProvider::Speechify => {
             let api_key = state
@@ -2626,13 +2376,50 @@ pub async fn clone_voice(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn elevenlabs_labels_become_age_description_and_use_case() {
+        // Shape of a real `/v2/voices` premade entry (George).
+        let body = r#"{"voices":[{"voice_id":"JBFqnCBsd6RMkjVDRZzb","name":"George - Warm, Captivating Storyteller",
+            "preview_url":"https://x/george.mp3","description":null,
+            "labels":{"accent":"british","descriptive":"mature","age":"middle_aged","gender":"male","language":"en","use_case":"narrative_story"}}]}"#;
+        let parsed: ElevenLabsVoicesResponse = serde_json::from_str(body).unwrap();
+        let v = voice_from_elevenlabs(parsed.voices.into_iter().next().unwrap());
+        assert_eq!(v.age, "middle_aged");
+        assert_eq!(v.use_case, "narrative_story");
+        assert_eq!(v.description, "mature");
+        assert_eq!(v.gender, "Male");
+        // No `verified_languages`: the accent label is the fallback, not "Unknown".
+        assert_eq!(v.accent, "british");
+    }
+
+    #[test]
+    fn an_elevenlabs_voice_list_with_a_null_label_still_parses() {
+        // One null label, one language entry with no `language`, and the v2 envelope's paging
+        // fields. With `HashMap<String, String>` the null alone failed the whole list, and the
+        // catalog came back empty with nothing logged.
+        let body = r#"{"voices":[
+            {"voice_id":"EXAVITQu4vr4xnSDxMaL","name":"Sarah","preview_url":null,
+             "labels":{"gender":"female","accent":null},"verified_languages":[{"accent":"american"}]},
+            {"voice_id":"v2","name":"Two"}
+          ],"has_more":false,"total_count":2,"next_page_token":null}"#;
+        let parsed: ElevenLabsVoicesResponse = serde_json::from_str(body).unwrap();
+        assert_eq!(parsed.voices.len(), 2);
+        assert_eq!(parsed.voices[0].voice_id, "EXAVITQu4vr4xnSDxMaL");
+    }
+
+    #[test]
+    fn a_failed_catalog_fetch_is_empty_rather_than_an_error() {
+        let failed: Result<Vec<Voice>, Box<dyn std::error::Error + Send + Sync>> =
+            Err("elevenlabs /v2/voices answered 401 Unauthorized: missing voices_read".into());
+        assert!(catalog_or_empty("elevenlabs", failed).is_empty());
+    }
     use std::io::ErrorKind;
 
     #[test]
     fn test_voice_clone_provider_display() {
         assert_eq!(VoiceCloneProvider::Hume.to_string(), "hume");
         assert_eq!(VoiceCloneProvider::ElevenLabs.to_string(), "elevenlabs");
-        assert_eq!(VoiceCloneProvider::Lmnt.to_string(), "lmnt");
     }
 
     #[test]
@@ -2643,14 +2430,8 @@ mod tests {
         let el: VoiceCloneProvider = serde_json::from_str("\"elevenlabs\"").unwrap();
         assert_eq!(el, VoiceCloneProvider::ElevenLabs);
 
-        let lmnt: VoiceCloneProvider = serde_json::from_str("\"lmnt\"").unwrap();
-        assert_eq!(lmnt, VoiceCloneProvider::Lmnt);
-
         let hume_json = serde_json::to_string(&VoiceCloneProvider::Hume).unwrap();
         assert_eq!(hume_json, "\"hume\"");
-
-        let lmnt_json = serde_json::to_string(&VoiceCloneProvider::Lmnt).unwrap();
-        assert_eq!(lmnt_json, "\"lmnt\"");
     }
 
     #[test]
@@ -2796,40 +2577,6 @@ mod tests {
     }
 
     #[test]
-    fn test_voice_clone_request_lmnt() {
-        let json = r#"{
-            "provider": "lmnt",
-            "name": "My LMNT Voice",
-            "audio_samples": ["base64data"],
-            "remove_background_noise": true
-        }"#;
-
-        let request: VoiceCloneRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(request.provider, VoiceCloneProvider::Lmnt);
-        assert_eq!(request.name, "My LMNT Voice");
-        assert_eq!(request.audio_samples.len(), 1);
-        assert!(request.remove_background_noise);
-    }
-
-    #[test]
-    fn test_voice_clone_response_lmnt() {
-        let response = VoiceCloneResponse {
-            voice_id: "voice_lmnt_123".to_string(),
-            name: "LMNT Voice".to_string(),
-            provider: VoiceCloneProvider::Lmnt,
-            status: "ready".to_string(),
-            requires_verification: None,
-            created_at: "2026-01-07T12:00:00Z".to_string(),
-            metadata: None,
-        };
-
-        let json = serde_json::to_string(&response).unwrap();
-        assert!(json.contains("\"voice_id\":\"voice_lmnt_123\""));
-        assert!(json.contains("\"provider\":\"lmnt\""));
-        assert!(json.contains("\"status\":\"ready\""));
-    }
-
-    #[test]
     fn azure_voices_region_is_ssrf_checked() {
         let _env = crate::core::net::ssrf_env_lock();
         assert_eq!(
@@ -2899,10 +2646,21 @@ mod tests {
     // ---- P4 canonical VoiceClone widening ----------------------------------
 
     #[test]
+    fn retired_clone_providers_are_refused() {
+        // LMNT shut down and PlayHT's API is gone; a request naming either is a bad request,
+        // not a call to a vendor that no longer answers.
+        for s in ["lmnt", "playht"] {
+            assert!(
+                serde_json::from_str::<VoiceCloneProvider>(&format!("\"{s}\"")).is_err(),
+                "{s}"
+            );
+        }
+    }
+
+    #[test]
     fn p4_new_providers_serde() {
         for (s, p) in [
             ("cartesia", VoiceCloneProvider::Cartesia),
-            ("playht", VoiceCloneProvider::PlayHt),
             ("speechify", VoiceCloneProvider::Speechify),
             ("resemble", VoiceCloneProvider::Resemble),
         ] {
@@ -3044,9 +2802,7 @@ mod tests {
     fn p4_audio_clone_providers_require_audio_before_credentials() {
         let cases = [
             (r#"{ "provider": "elevenlabs", "name": "V" }"#, "elevenlabs"),
-            (r#"{ "provider": "lmnt", "name": "V" }"#, "lmnt"),
             (r#"{ "provider": "cartesia", "name": "V" }"#, "cartesia"),
-            (r#"{ "provider": "playht", "name": "V" }"#, "playht"),
             (
                 r#"{ "provider": "speechify", "name": "V",
                      "consent": { "full_name": "Jane", "email": "j@x.com" } }"#,
@@ -3065,16 +2821,6 @@ mod tests {
             assert_eq!(err.code, "MISSING_AUDIO", "provider {provider}");
             assert!(err.message.to_lowercase().contains(provider));
         }
-    }
-
-    #[test]
-    fn p4_lmnt_rejects_too_many_audio_samples_before_credentials() {
-        let samples = (0..21).map(|_| "\"YWJj\"").collect::<Vec<_>>().join(",");
-        let json =
-            format!(r#"{{ "provider": "lmnt", "name": "V", "audio_samples": [{samples}] }}"#);
-        let req: VoiceCloneRequest = serde_json::from_str(&json).unwrap();
-        let err = req.validate().unwrap_err();
-        assert_eq!(err.code, "TOO_MANY_FILES");
     }
 
     #[test]

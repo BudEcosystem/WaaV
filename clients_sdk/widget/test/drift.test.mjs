@@ -15,8 +15,8 @@
  * renames a config field and the widget isn't updated, the new openapi property
  * has no emitted key here and this test FAILS — drift can no longer ship.
  *
- * It also pins the canonical provider value-space counts (32 STT / 37 TTS /
- * 12 realtime) so a provider added to the gateway dispatch tables without
+ * It also pins the canonical provider value-space counts (31 STT / 34 TTS /
+ * 11 realtime) so a provider added to the gateway dispatch tables without
  * updating providers.ts is caught.
  */
 import { test } from 'node:test';
@@ -176,12 +176,12 @@ test('drift: tts_config emits the gateway TTSWebSocketConfig beginner fields', (
 });
 
 // --- provider value-space counts (mirror of the gateway dispatch tables) ------
-test('drift: provider counts mirror the gateway dispatch tables (32/37/12)', () => {
-  assert.equal(STT_PROVIDERS.length, 32, 'STT provider count drifted from gateway dispatch tables');
-  assert.equal(TTS_PROVIDERS.length, 37, 'TTS provider count drifted from gateway dispatch tables');
+test('drift: provider counts mirror the gateway dispatch tables (31/34/11)', () => {
+  assert.equal(STT_PROVIDERS.length, 31, 'STT provider count drifted from gateway dispatch tables');
+  assert.equal(TTS_PROVIDERS.length, 34, 'TTS provider count drifted from gateway dispatch tables');
   assert.equal(
     REALTIME_PROVIDERS.length,
-    12,
+    11,
     'realtime provider count drifted from gateway dispatch tables'
   );
   // No duplicates, all lowercase canonical names.

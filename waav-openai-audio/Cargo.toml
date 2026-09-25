@@ -10,5 +10,12 @@ publish = false
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 thiserror = "2.0.12"
+# Compressed uploads for /v1/audio/transcriptions. Pure Rust, so no system codec library enters
+# the image. The formats OpenAI's API takes that have a Symphonia decoder: mp3/mpeg/mpga, m4a/mp4
+# (AAC), flac, ogg (Vorbis), webm (Vorbis). Opus has none and is refused by name.
+symphonia = { version = "0.5", default-features = false, features = ["mp3", "aac", "isomp4", "flac", "ogg", "vorbis", "mkv"] }
+# Same version the gateway already builds, so it resolves to one crate: compressed uploads are
+# resampled to 16 kHz so a 25 MB file cannot decode into hundreds of MB of samples.
+rubato = "0.16"
 
 [dev-dependencies]

@@ -17,6 +17,8 @@ use rsa::pkcs8::DecodePrivateKey;
 use rsa::{Oaep, RsaPrivateKey};
 use serde::Deserialize;
 use sha2::Sha256;
+
+use crate::endpoint_config::{VoiceEndpointSettings, parse_endpoint_settings};
 use std::collections::HashMap;
 
 #[derive(Debug, thiserror::Error)]
@@ -145,10 +147,21 @@ pub struct VoiceEndpointBlob {
     pub voice: Option<String>,
     #[serde(default)]
     pub language: Option<String>,
+    /// The operator's feature configuration (FRD-018 Part III C2).
+    ///
+    /// Kept as a raw `Value` here and parsed by [`parse_endpoint_settings`] so that a malformed
+    /// block degrades to vendor defaults rather than failing the whole entry: `serde_json::from_value`
+    /// on the typed struct is all-or-nothing, and an entry that fails to deserialize is an
+    /// endpoint that stops resolving.
+    #[serde(default)]
+    pub config: Option<serde_json::Value>,
 }
 
 /// A voice endpoint after hydration: the credential is already plaintext.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `PartialEq` but not `Eq`: the config block carries vendor float knobs (pitch, stability,
+/// similarity boost), and a total-equality bound on a struct containing `f32` does not hold.
+#[derive(Debug, Clone, PartialEq)]
 pub struct VoiceEndpoint {
     pub vendor: String,
     pub api_base: Option<String>,
@@ -158,6 +171,8 @@ pub struct VoiceEndpoint {
     pub model: Option<String>,
     pub voice: Option<String>,
     pub language: Option<String>,
+    /// Parsed at hydration, like the credential: the request path does no JSON work.
+    pub config: VoiceEndpointSettings,
 }
 
 impl VoiceEndpoint {
@@ -196,6 +211,9 @@ pub fn parse_voice_blob(
                 "voice",
                 "language",
                 "pricing",
+                // FRD-018 Part III C2. Listed so a widened blob stops being reported as drift;
+                // the fields INSIDE it get the same treatment in `parse_endpoint_settings`.
+                "config",
             ];
             for k in fields.keys() {
                 if !KNOWN.contains(&k.as_str()) {
@@ -235,6 +253,14 @@ pub fn parse_voice_blob(
             },
         };
 
+        // Parsed BEFORE the insert, which moves `endpoint_id`. Hydration-time, like the
+        // credential decryption above: the request path does no JSON work.
+        let config = blob
+            .config
+            .as_ref()
+            .map(|raw| parse_endpoint_settings(&endpoint_id, raw))
+            .unwrap_or_default();
+
         out.insert(
             endpoint_id,
             VoiceEndpoint {
@@ -245,6 +271,7 @@ pub fn parse_voice_blob(
                 model: blob.model,
                 voice: blob.voice,
                 language: blob.language,
+                config,
             },
         );
     }
@@ -398,6 +425,7 @@ mod tests {
             model: None,
             voice: None,
             language: None,
+            config: Default::default(),
         };
         let rendered = format!("{ep:?}");
         assert!(

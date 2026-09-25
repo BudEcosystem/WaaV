@@ -84,8 +84,29 @@ fn parse_auth_request_body(body_bytes: &[u8]) -> Result<serde_json::Value, AuthE
 /// * `next` - The next middleware or handler in the chain
 ///
 /// # Returns
-/// * `Result<Response, AuthError>` - The response from the next handler or an auth error
+/// * `Response` - The response from the next handler, or the auth refusal. Refusals on the
+///   OpenAI-compatible `/v1/…` routes use OpenAI's error envelope (see
+///   [`AuthError::into_openai_response`]); every other route keeps the native shape.
 pub async fn auth_middleware(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let openai_shape = is_openai_compatible_path(request.uri().path());
+    match authenticate_request(State(state), request, next).await {
+        Ok(response) => response,
+        Err(e) if openai_shape => e.into_openai_response(),
+        Err(e) => axum::response::IntoResponse::into_response(e),
+    }
+}
+
+/// The routes that speak OpenAI's wire format: `/v1/audio/*` and `/v1/realtime`. A client there
+/// is an OpenAI SDK, which reads `error.message` and cannot read the native `{"error": "<code>"}`.
+pub(crate) fn is_openai_compatible_path(path: &str) -> bool {
+    path.starts_with("/v1/")
+}
+
+async fn authenticate_request(
     State(state): State<Arc<AppState>>,
     mut request: Request,
     next: Next,

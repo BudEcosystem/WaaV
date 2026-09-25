@@ -816,10 +816,10 @@ mod tests {
         assert!(registry.has_tts_provider("aws-polly"));
         assert!(registry.has_tts_provider("amazon-polly"));
 
-        // TTS: "play.ht" should resolve to "playht"
-        assert!(registry.has_tts_provider("play.ht"));
-        assert!(registry.has_tts_provider("playht"));
-        assert!(registry.has_tts_provider("play-ht"));
+        // TTS: "murf.ai" should resolve to "murf"
+        assert!(registry.has_tts_provider("murf.ai"));
+        assert!(registry.has_tts_provider("murf"));
+        assert!(registry.has_tts_provider("murf-ai"));
 
         // Realtime: "evi" should resolve to "hume"
         assert!(registry.has_realtime_provider("evi"));

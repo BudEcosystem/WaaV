@@ -72,10 +72,9 @@ REALTIME_PROVIDERS: tuple[str, ...] = (
     "gemini",
     "ultravox",
     "nova_sonic",
-    "speechmatics",
     "yandex",
 )
-"""The 12 realtime/S2S providers reachable through the gateway ``/realtime``
+"""The 11 realtime/S2S providers reachable through the gateway ``/realtime``
 endpoint. Pass any of these as ``provider`` to :meth:`BudClient.realtime`."""
 
 
@@ -277,7 +276,7 @@ class GatewayRealtime:
     """A gateway-native, provider-agnostic realtime session.
 
     Speaks ONLY the gateway ``/realtime`` wire, so the same object works for all
-    12 realtime providers. Construct via :meth:`BudClient.realtime` (recommended)
+    11 realtime providers. Construct via :meth:`BudClient.realtime` (recommended)
     or directly.
 
     Two consumption styles (use either or both):

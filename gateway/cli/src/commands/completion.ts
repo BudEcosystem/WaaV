@@ -64,9 +64,9 @@ const PROVIDERS = [
   // East Asia
   'naver', 'amivoice',
   // Southeast Asia
-  'zalo', 'fpt', 'viettel', 'prosa', 'nectec',
+  'zalo', 'fpt', 'viettel', 'nectec',
   // Voice Cloning
-  'hume', 'lmnt', 'playht', 'murf', 'wellsaid', 'resemble', 'speechify', 'unrealspeech', 'smallest',
+  'hume', 'murf', 'wellsaid', 'resemble', 'speechify', 'unrealspeech', 'smallest',
 ];
 
 /**

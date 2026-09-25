@@ -15,7 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field
 class STTProvider(str, Enum):
     """Speech-to-Text providers dispatchable by the gateway.
 
-    The FULL set (32) sourced 1:1 from the gateway's STT dispatch table
+    The FULL set (31) sourced 1:1 from the gateway's STT dispatch table
     (``gateway/src/core/stt/standard.rs`` ``create_stt_standard`` +
     ``plugin/dispatch.rs`` builtin registry). Accept a bare ``str`` anywhere a
     provider is taken so a newly-added gateway provider is reachable before the
@@ -45,7 +45,6 @@ class STTProvider(str, Enum):
     NECTEC = "nectec"
     OPENAI = "openai"
     PHONEXIA = "phonexia"
-    PROSA_AI = "prosa-ai"
     REVAI = "revai"
     REVERIE = "reverie"
     SARVAM = "sarvam"
@@ -60,7 +59,7 @@ class STTProvider(str, Enum):
 class TTSProvider(str, Enum):
     """Text-to-Speech providers dispatchable by the gateway.
 
-    The FULL set (37) sourced 1:1 from the gateway's TTS dispatch table
+    The FULL set (34) sourced 1:1 from the gateway's TTS dispatch table
     (``gateway/src/core/tts/standard.rs`` ``create_tts_standard`` +
     ``plugin/dispatch.rs`` builtin registry). Accept a bare ``str`` for
     forward-compat. Drift-guarded against ``PROVIDER_DRIFT.md``.
@@ -82,14 +81,11 @@ class TTSProvider(str, Enum):
     HUME = "hume"
     IBM_WATSON = "ibm-watson"
     IFLYTEK = "iflytek"
-    LMNT = "lmnt"
     MICROSOFT_AZURE = "microsoft-azure"
     MURF = "murf"
     NAVER_CLOVA = "naver-clova"
     NECTEC = "nectec"
     OPENAI = "openai"
-    PLAYHT = "playht"
-    PROSA_AI = "prosa-ai"
     RESEMBLE = "resemble"
     REVERIE = "reverie"
     SBERDEVICES = "sberdevices"
@@ -108,7 +104,7 @@ class TTSProvider(str, Enum):
 class RealtimeProvider(str, Enum):
     """Realtime (speech-to-speech) providers dispatchable by the gateway.
 
-    The FULL set (12) sourced 1:1 from the gateway realtime registry
+    The FULL set (11) sourced 1:1 from the gateway realtime registry
     (``gateway/src/core/realtime/mod.rs`` ``get_supported_realtime_providers``
     / ``plugin/dispatch.rs`` ``BUILTIN_REALTIME_NAMES``). Accept a bare ``str``
     for forward-compat. Drift-guarded against ``PROVIDER_DRIFT.md``.
@@ -128,7 +124,6 @@ class RealtimeProvider(str, Enum):
     GEMINI = "gemini"
     ULTRAVOX = "ultravox"
     NOVA_SONIC = "nova_sonic"
-    SPEECHMATICS = "speechmatics"
     YANDEX = "yandex"
 
     # Backward-compatible aliases for the pre-P1 SDK names. The realtime
@@ -254,7 +249,7 @@ def language_capabilities(provider: str) -> dict[str, Any]:
 # Provider capability hints (best-effort REFERENCE only — NOT authoritative).
 #
 # This is a small curated subset for the most-used providers; it is intentionally
-# NOT exhaustive across all 32/37/12 dispatchable providers. The authoritative,
+# NOT exhaustive across all 31/34/11 dispatchable providers. The authoritative,
 # always-current capability matrix lives gateway-side (SDK_STANDARDIZATION_PLAN
 # P3 `/capabilities`); ``get_provider_capabilities`` returns ``None`` for any
 # valid-but-uncatalogued provider rather than blocking it. Never gate a provider
@@ -395,22 +390,6 @@ TTS_PROVIDER_CAPABILITIES: dict[TTSProvider, dict[str, Any]] = {
         "voice_cloning": True,
         "languages": ["en"],
         "models": ["octave"],
-    },
-    TTSProvider.LMNT: {
-        "streaming": True,
-        "ssml": False,
-        "emotion": False,
-        "voice_cloning": True,
-        "languages": ["en"],
-        "models": ["default"],
-    },
-    TTSProvider.PLAYHT: {
-        "streaming": True,
-        "ssml": False,
-        "emotion": True,
-        "voice_cloning": True,
-        "languages": ["en"],
-        "models": ["PlayHT2.0", "PlayHT2.0-turbo"],
     },
 }
 
@@ -1613,9 +1592,7 @@ class VoiceCloneProvider(str, Enum):
 
     HUME = "hume"
     ELEVENLABS = "elevenlabs"
-    LMNT = "lmnt"
     CARTESIA = "cartesia"
-    PLAYHT = "playht"
     SPEECHIFY = "speechify"
     RESEMBLE = "resemble"
 
@@ -1625,8 +1602,8 @@ class CloneMode(str, Enum):
 
     - ``instant`` (default): IVC / clip clone; returns ``ready`` immediately or
       near-instantly.
-    - ``professional``: async high-fidelity (ElevenLabs PVC / Resemble / PlayHT
-      PVC); the returned ``voice_id`` is polled until ``ready``.
+    - ``professional``: async high-fidelity (ElevenLabs PVC / Resemble); the
+      returned ``voice_id`` is polled until ``ready``.
     """
 
     INSTANT = "instant"
@@ -1658,7 +1635,7 @@ class VoiceCloneRequest(BaseModel):
     """Sample text for voice generation (Hume only)"""
 
     remove_background_noise: bool = False
-    """Remove background noise from samples (ElevenLabs IVC / LMNT enhance)"""
+    """Remove background noise from samples (ElevenLabs IVC)"""
 
     labels: Optional[dict[str, str]] = None
     """Flat labels for the voice (ElevenLabs)"""

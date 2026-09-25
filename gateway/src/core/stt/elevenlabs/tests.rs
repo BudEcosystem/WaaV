@@ -572,6 +572,9 @@ mod client_tests {
             base: STTConfig {
                 provider: "elevenlabs".into(),
                 api_key: "test-key".into(),
+                // `STTConfig::default()` carries `model: "nova-3"` — a Deepgram id — so an
+                // ElevenLabs fixture that inherits it describes a configuration that cannot exist.
+                model: String::new(),
                 ..Default::default()
             },
             features: SttFeatures {
@@ -579,7 +582,13 @@ mod client_tests {
                 keyterms: Some(vec!["WaaV".into(), "ElevenLabs".into()]),
                 ..Default::default()
             },
-            ..StandardSTTConfig::from_base(STTConfig::default())
+            ..StandardSTTConfig::from_base(STTConfig {
+                // Explicit: `STTConfig::default()` carries `model: "nova-3"`, a Deepgram id, so a
+                // fixture that inherits it is describing a configuration ElevenLabs could never
+                // be given.
+                model: String::new(),
+                ..Default::default()
+            })
         };
         let stt = ElevenLabsSTT::new_standard(&std).expect("new_standard should succeed");
         // `ElevenLabsSTT` implements `Drop`, so borrow the config rather than move it out.
@@ -618,6 +627,8 @@ mod client_tests {
                     language: "en".into(),
                     sample_rate: 16000,
                     encoding: "pcm_s16le".into(),
+                    // See above: the shared default model is a Deepgram id.
+                    model: String::new(),
                     ..Default::default()
                 },
                 features: SttFeatures::default(),
@@ -1714,6 +1725,7 @@ mod resilience_wiring_tests {
         let std = StandardSTTConfig::from_base(STTConfig {
             provider: "elevenlabs".to_string(),
             api_key: "test-key".to_string(),
+            model: String::new(),
             ..Default::default()
         });
         let mut stt = ElevenLabsSTT::new_standard(&std).expect("build elevenlabs session");
@@ -1746,4 +1758,72 @@ mod resilience_wiring_tests {
             "a trip in session A must be visible to session B (shared provider breaker)"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Realtime model vocabulary (FRD-018 Part III, found in pde-ditto)
+// ---------------------------------------------------------------------------
+
+/// 🔒 A batch model id is refused with a message naming it and the alternatives.
+///
+/// This is the regression that took a working deployment down. `voice_table` carried
+/// `model: "scribe_v2"` — a BATCH id — and the realtime WebSocket answered `Policy:
+/// invalid_request`, which the supervisor retried, the circuit breaker read as a credentials
+/// failure, and the caller received as "Connection failed: Connection channel closed before
+/// session started". Nothing in that chain named the model.
+#[test]
+fn a_batch_model_id_is_refused_before_a_socket_is_opened() {
+    for batch in ["scribe_v1", "scribe_v2"] {
+        let cfg = ElevenLabsSTTConfig {
+            base: STTConfig {
+                api_key: "k".into(),
+                model: batch.into(),
+                ..Default::default()
+            },
+            model_id: batch.into(),
+            ..Default::default()
+        };
+
+        let err = cfg
+            .validate()
+            .expect_err("a batch model must not reach the realtime endpoint");
+        assert!(
+            err.contains(batch),
+            "the refusal must name what was configured: {err}"
+        );
+        assert!(
+            err.contains("scribe_v2_realtime"),
+            "and what to use instead: {err}"
+        );
+    }
+}
+
+#[test]
+fn the_realtime_model_is_accepted() {
+    // The control case. Over-correcting into refusing everything would be its own outage.
+    let cfg = ElevenLabsSTTConfig {
+        base: STTConfig {
+            api_key: "k".into(),
+            model: "scribe_v2_realtime".into(),
+            ..Default::default()
+        },
+        model_id: "scribe_v2_realtime".into(),
+        ..Default::default()
+    };
+
+    assert!(cfg.validate().is_ok());
+}
+
+#[test]
+fn an_empty_model_still_takes_the_default() {
+    // An unconfigured deployment must keep working: `from_base` leaves the realtime default in
+    // place, and validation must not then reject the thing it just defaulted to.
+    let cfg = ElevenLabsSTTConfig::from_base(STTConfig {
+        api_key: "k".into(),
+        model: String::new(),
+        ..Default::default()
+    });
+
+    assert_eq!(cfg.model_id, "scribe_v2_realtime");
+    assert!(cfg.validate().is_ok());
 }

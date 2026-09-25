@@ -1,7 +1,18 @@
-//! ElevenLabs Speech-to-Text Real-Time WebSocket API integration.
+//! ElevenLabs Speech-to-Text integration — BOTH of its transports.
 //!
-//! This module provides a streaming STT client for the ElevenLabs Real-Time
-//! WebSocket API with support for:
+//! ElevenLabs serves speech-to-text two ways, over disjoint model vocabularies, and each rejects
+//! the other's model ids:
+//!
+//! | model id | transport | wire |
+//! |---|---|---|
+//! | `scribe_v2`, `scribe_v2_medical` | batch | `POST /v1/speech-to-text` ([`batch`]) |
+//! | `scribe_v2_realtime` | realtime | WebSocket ([`client`]) |
+//!
+//! Which one runs is decided by the CALLER, not by the config: a prerecorded upload goes through
+//! `create_stt_standard_prerecorded`, a live session through `create_stt_standard`. See
+//! [`batch::model_is_realtime`].
+//!
+//! The realtime client below supports:
 //!
 //! - Real-time streaming transcription
 //! - Multiple regional endpoints (US, EU, India)
@@ -16,6 +27,7 @@
 //! - [`config`]: Configuration types (`ElevenLabsSTTConfig`, `ElevenLabsAudioFormat`, etc.)
 //! - [`messages`]: WebSocket message types for API communication
 //! - [`client`]: The main `ElevenLabsSTT` client implementation
+//! - [`batch`]: The prerecorded `POST /v1/speech-to-text` client and its config
 //!
 //! # Example
 //!
@@ -50,6 +62,7 @@
 //! }
 //! ```
 
+pub mod batch;
 mod client;
 mod config;
 mod messages;
@@ -58,8 +71,14 @@ mod messages;
 mod tests;
 
 // Re-export public types
+pub use batch::{
+    DEFAULT_BATCH_MODEL, ElevenLabsBatchConfig, EntityRedactionMode, MAX_BATCH_KEYTERMS,
+    TimestampsGranularity, model_is_realtime,
+};
 pub use client::ElevenLabsSTT;
-pub use config::{CommitStrategy, ElevenLabsAudioFormat, ElevenLabsRegion, ElevenLabsSTTConfig};
+pub use config::{
+    CommitStrategy, ElevenLabsAudioFormat, ElevenLabsRegion, ElevenLabsSTTConfig, REALTIME_MODELS,
+};
 pub use messages::{
     CommittedTranscript, CommittedTranscriptWithTimestamps, ElevenLabsMessage, ElevenLabsSTTError,
     EndOfStream, InputAudioChunk, PartialTranscript, SessionStarted, WordTiming,

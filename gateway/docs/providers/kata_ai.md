@@ -92,7 +92,6 @@ Since Kata.ai is not publicly accessible, consider these alternatives for Indone
 
 | Provider | Status | Languages |
 |----------|--------|-----------|
-| Prosa.ai | [DONE] | Indonesian, English |
 | Google Cloud | [DONE] | Indonesian + 125 languages |
 | Azure Speech | [DONE] | Indonesian + 100 languages |
 | Deepgram | [DONE] | Indonesian + 36 languages |

@@ -155,13 +155,11 @@ describe('cloneVoice — canonical JSON body (gateway VoiceCloneRequest)', () =>
 });
 
 describe('voice-clone value space (mirror of gateway enums)', () => {
-  it('widened to the gateway 7 providers', () => {
+  it('widened to the gateway 5 providers', () => {
     expect([...VOICE_CLONE_PROVIDERS]).toEqual([
       'hume',
       'elevenlabs',
-      'lmnt',
       'cartesia',
-      'playht',
       'speechify',
       'resemble',
     ]);

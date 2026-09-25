@@ -150,14 +150,8 @@ pub struct ProvidersYaml {
     pub assemblyai_api_key: Option<String>,
     /// Hume AI API key for TTS (Octave) and EVI
     pub hume_api_key: Option<String>,
-    /// LMNT API key for ultra-low latency TTS and voice cloning
-    pub lmnt_api_key: Option<String>,
     /// Groq API key for ultra-fast Whisper STT
     pub groq_api_key: Option<String>,
-    /// Play.ht API key for low-latency TTS with voice cloning
-    pub playht_api_key: Option<String>,
-    /// Play.ht user ID (required alongside playht_api_key)
-    pub playht_user_id: Option<String>,
     /// IBM Watson API key for STT/TTS
     pub ibm_watson_api_key: Option<String>,
     /// IBM Watson service instance ID

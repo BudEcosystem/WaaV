@@ -71,8 +71,8 @@ WaaV Gateway uses a compile-time plugin registration system based on the `invent
 **STT Providers (11):**
 - Deepgram, Google, ElevenLabs, Azure, Cartesia, OpenAI, AssemblyAI, AWS Transcribe, IBM Watson, Groq, Gnani
 
-**TTS Providers (12):**
-- Deepgram, ElevenLabs, Google, Azure, Cartesia, OpenAI, AWS Polly, IBM Watson, Hume, LMNT, PlayHT, Gnani
+**TTS Providers (10):**
+- Deepgram, ElevenLabs, Google, Azure, Cartesia, OpenAI, AWS Polly, IBM Watson, Hume, Gnani
 
 **Realtime Providers (2):**
 - OpenAI Realtime, Hume EVI
@@ -1175,8 +1175,8 @@ See `tests/mock_providers/` for comprehensive mock server implementations:
 
 ```rust
 // tests/mock_providers/mod.rs provides:
-// - HTTP mock servers (ElevenLabs, OpenAI, PlayHT)
-// - WebSocket mock servers (Deepgram, Cartesia, LMNT)
+// - HTTP mock servers (ElevenLabs, OpenAI)
+// - WebSocket mock servers (Deepgram, Cartesia)
 // - gRPC mock servers (Google)
 // - Chaos testing (failures, timeouts, rate limits)
 ```

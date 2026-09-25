@@ -238,6 +238,13 @@ async fn main() -> anyhow::Result<()> {
     }
     let app_state = app_state;
 
+    // Each TTS deployment's voice list, for budapp's settings page (see `voice_catalog`). Needs
+    // the final shared state — the publisher fetches with the plaintext credentials only this
+    // process holds — so it starts here, after the control plane is installed.
+    if waav_gateway::handlers::voice_catalog::spawn(app_state.clone()).is_some() {
+        println!("Voice catalog publisher active: voice lists written to voice_catalog:*");
+    }
+
     // Create protected API routes with authentication middleware
     let protected_routes = routes::api::create_api_router().layer(middleware::from_fn_with_state(
         app_state.clone(),

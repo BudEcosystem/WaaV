@@ -180,6 +180,16 @@ pub enum TTSError {
 
     #[error("Authentication failed: {0}")]
     AuthenticationFailed(String),
+
+    /// The vendor refused the request as built: a voice, model or setting it does not have.
+    ///
+    /// Distinct from [`TTSError::ProviderError`] because the two call for opposite responses. A
+    /// refusal is fixed by changing the request or the deployment, so the caller is told 400; a
+    /// provider error is the vendor failing to serve a well-formed request, which is 502. Folding
+    /// the first into the second sent callers to read a status page about a value they typed.
+    /// The message is the vendor's own sentence, prefixed with who refused and the status.
+    #[error("{0}")]
+    RequestRejected(String),
 }
 
 /// Result type for TTS operations
@@ -435,7 +445,7 @@ pub trait BaseTTS: Send + Sync {
     ///
     /// # Provider-Specific Behavior
     ///
-    /// - **HTTP providers** (Deepgram, OpenAI, Play.ht): This is a no-op because
+    /// - **HTTP providers** (Deepgram, OpenAI): This is a no-op because
     ///   each `speak()` call immediately sends an HTTP request. There is no
     ///   internal queue to flush.
     ///

@@ -75,21 +75,6 @@ providers:
   # Get from Hume dashboard: https://beta.hume.ai/
   hume_api_key: ""                               # ENV: HUME_API_KEY
 
-  # LMNT API key (used for TTS and voice cloning)
-  # TTS: Ultra-low latency (~150ms) text-to-speech with 22+ languages
-  # Voice Cloning: Create custom voices from 5+ second audio samples
-  # Supports HTTP streaming and WebSocket for real-time synthesis
-  # Get from LMNT dashboard: https://app.lmnt.com/
-  lmnt_api_key: ""                               # ENV: LMNT_API_KEY
-
-  # Play.ht API credentials (used for TTS and voice cloning)
-  # TTS: HTTP streaming with ~190ms latency, 36+ languages, PlayDialog multi-turn
-  # Voice Cloning: Create custom voices from 30+ second audio samples
-  # Voice engines: Play3.0-mini (fastest), PlayDialog (expressive), PlayHT2.0-turbo (legacy)
-  # Get from Play.ht dashboard: https://play.ht/studio/api-access
-  playht_api_key: ""                             # ENV: PLAYHT_API_KEY
-  playht_user_id: ""                             # ENV: PLAYHT_USER_ID (required for dual-header auth)
-
   # Murf.ai API key (used for TTS)
   # TTS: HTTP streaming with ultra-low latency (~130ms TTFA for Falcon model)
   # Models: Falcon (real-time, low latency), Gen2 (studio quality with pitch/rate/style)
@@ -184,7 +169,7 @@ providers:
 
 # TTS Provider Configuration (optional - can also be set via WebSocket config)
 # tts:
-#   provider: elevenlabs  # Options: "deepgram", "elevenlabs", "google", "azure", "cartesia", "openai", "aws-polly", "hume", "lmnt", "playht", "murf", "wellsaid", "resemble", "speechify", "unrealspeech", "speechmatics"
+#   provider: elevenlabs  # Options: "deepgram", "elevenlabs", "google", "azure", "cartesia", "openai", "aws-polly", "hume", "murf", "wellsaid", "resemble", "speechify", "unrealspeech", "speechmatics"
 #   # Cartesia-specific settings (only used when provider is "cartesia")
 #   cartesia:
 #     model: sonic-3           # Options: sonic-3, sonic-3-2025-10-27
@@ -198,35 +183,6 @@ providers:
 #     output_format: pcm       # Options: pcm, mp3, ogg_vorbis
 #     sample_rate: 16000       # PCM: 8000, 16000 | MP3/OGG: 8000, 16000, 22050, 24000
 #     text_type: text          # Options: text, ssml
-#   # LMNT-specific settings (only used when provider is "lmnt")
-#   lmnt:
-#     voice: lily              # Options: lily, daniel, or custom voice IDs
-#     model: blizzard          # Options: blizzard (current default model)
-#     language: auto           # Options: auto, en, es, fr, de, it, pt, ja, ko, zh, etc. (22+ languages)
-#     audio_format: linear16   # Options: linear16/pcm, mp3, ulaw, webm
-#     sample_rate: 24000       # Options: 8000, 16000, 24000
-#     top_p: 0.8               # Speech stability (0.0-1.0, lower = more stable)
-#     temperature: 1.0         # Expressiveness (≥0, higher = more varied)
-#     speed: 1.0               # Speech speed (0.25-2.0)
-#
-#   # Play.ht-specific settings (only used when provider is "playht")
-#   # Requires PLAYHT_API_KEY and PLAYHT_USER_ID environment variables
-#   playht:
-#     voice: s3://voice-cloning-zero-shot/.../manifest.json  # Voice manifest URL
-#     voice_engine: Play3.0-mini   # Options: Play3.0-mini (~190ms), PlayDialog (~350ms), PlayDialogMultilingual, PlayDialogArabic, PlayHT2.0-turbo
-#     audio_format: mp3            # Options: mp3, wav, mulaw, flac, ogg, raw (PCM)
-#     sample_rate: 48000           # Options: 8000, 16000, 24000, 44100, 48000
-#     speed: 1.0                   # Speech speed (0.5-2.0)
-#     temperature: 0.5             # Randomness (0.0-1.0)
-#     language: en                 # ISO 639-1 language code (for Play3.0-mini only)
-#     # Advanced guidance parameters (Play3.0, PlayHT2.0 only):
-#     # text_guidance: 1.0         # Text adherence strength
-#     # voice_guidance: 1.0        # Voice adherence strength
-#     # style_guidance: 1.0        # Style adherence (Play3.0 only)
-#     # PlayDialog multi-turn parameters (optional):
-#     # voice_2: s3://...          # Second speaker voice URL
-#     # turn_prefix: "S1:"         # First speaker identifier
-#     # turn_prefix_2: "S2:"       # Second speaker identifier
 #
 #   # Murf.ai-specific settings (only used when provider is "murf")
 #   # Requires MURF_API_KEY environment variable

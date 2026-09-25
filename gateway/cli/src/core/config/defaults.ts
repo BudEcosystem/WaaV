@@ -72,12 +72,6 @@ export const DEFAULT_PROVIDER_CONFIGS: Record<string, Partial<ProviderConfig>> =
       speed: 1.0,
     },
   },
-  play_ht: {
-    voice_id: 's3://voice-cloning-zero-shot/775ae416-49bb-4fb6-bd45-740f205d20a1/sadfemalesad/manifest.json',
-    options: {
-      quality: 'premium',
-    },
-  },
 
   // Realtime Providers
   openai_realtime: {
@@ -326,13 +320,8 @@ export const PROVIDER_ENV_VARS: Record<string, { api_key?: string; additional?: 
   openai_tts: { api_key: 'OPENAI_API_KEY' },
   assemblyai: { api_key: 'ASSEMBLYAI_API_KEY' },
   cartesia: { api_key: 'CARTESIA_API_KEY' },
-  play_ht: {
-    api_key: 'PLAYHT_API_KEY',
-    additional: { user_id: 'PLAYHT_USER_ID' },
-  },
   hume: { api_key: 'HUME_API_KEY' },
   groq: { api_key: 'GROQ_API_KEY' },
-  lmnt: { api_key: 'LMNT_API_KEY' },
   resemble: { api_key: 'RESEMBLE_API_KEY' },
   aws_transcribe: {
     additional: {

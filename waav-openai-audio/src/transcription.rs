@@ -62,11 +62,12 @@ impl TranscriptionResponseFormat {
         }
     }
 
-    /// Whether producing this format needs per-segment timings from the vendor.
+    /// Whether producing this format needs word timings from the vendor.
     ///
-    /// Load-bearing: a vendor that returns only a flat transcript cannot produce SRT or VTT,
-    /// and emitting a single subtitle spanning the whole recording would be worse than an
-    /// honest refusal.
+    /// The handler turns word timestamps on for these formats wherever the vendor has a switch
+    /// for them: subtitle cues and `verbose_json` segments are built from word timings
+    /// ([`caption_segments`]), so a vendor left at its default would hand back a transcript
+    /// nothing can be cut from.
     pub fn requires_timestamps(self) -> bool {
         matches!(self, Self::Srt | Self::Vtt | Self::VerboseJson)
     }
@@ -88,8 +89,27 @@ pub struct TranscriptionRequest {
     pub language: Option<String>,
     pub prompt: Option<String>,
     pub temperature: Option<f32>,
+    /// `timestamp_granularities[]`, one entry per form field, unvalidated.
+    pub timestamp_granularities: Vec<String>,
     /// True for `/v1/audio/translations`.
     pub translate: bool,
+}
+
+/// Timestamp detail requested with OpenAI's `timestamp_granularities[]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimestampGranularity {
+    Word,
+    Segment,
+}
+
+impl TimestampGranularity {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim() {
+            "word" => Some(Self::Word),
+            "segment" => Some(Self::Segment),
+            _ => None,
+        }
+    }
 }
 
 /// A translated request, ready for WaaV's STT layer.
@@ -100,7 +120,21 @@ pub struct TranscriptionSettings {
     pub language: Option<String>,
     pub prompt: Option<String>,
     pub temperature: Option<f32>,
+    /// `None` when the caller did not send `timestamp_granularities[]`. Kept distinct from an
+    /// explicit list because OpenAI's default (segments only) and "whatever the vendor has"
+    /// answer differently: an explicit list without `word` leaves `words` out of `verbose_json`.
+    pub timestamp_granularities: Option<Vec<TimestampGranularity>>,
     pub translate: bool,
+}
+
+impl TranscriptionSettings {
+    /// Whether `words` belongs in `verbose_json`: always, unless the caller listed granularities
+    /// and `word` was not among them.
+    pub fn wants_words(&self) -> bool {
+        self.timestamp_granularities
+            .as_ref()
+            .is_none_or(|g| g.contains(&TimestampGranularity::Word))
+    }
 }
 
 fn extension_of(filename: &str) -> Option<String> {
@@ -169,6 +203,23 @@ pub fn translate(req: TranscriptionRequest) -> Result<TranscriptionSettings, Aud
         }
     };
 
+    let timestamp_granularities = if req.timestamp_granularities.is_empty() {
+        None
+    } else {
+        let mut parsed = Vec::new();
+        for raw in &req.timestamp_granularities {
+            let g = TimestampGranularity::parse(raw).ok_or_else(|| AudioError::Unsupported {
+                field: "timestamp_granularities",
+                value: raw.clone(),
+                expected: "word, segment".to_string(),
+            })?;
+            if !parsed.contains(&g) {
+                parsed.push(g);
+            }
+        }
+        Some(parsed)
+    };
+
     Ok(TranscriptionSettings {
         endpoint: req.model,
         response_format,
@@ -177,6 +228,7 @@ pub fn translate(req: TranscriptionRequest) -> Result<TranscriptionSettings, Aud
         language: if req.translate { None } else { req.language },
         prompt: req.prompt,
         temperature,
+        timestamp_granularities,
         translate: req.translate,
     })
 }
@@ -194,6 +246,7 @@ mod tests {
             language: None,
             prompt: None,
             temperature: None,
+            timestamp_granularities: Vec::new(),
             translate: false,
         }
     }
@@ -429,9 +482,91 @@ pub struct TranscriptionResult {
     pub text: String,
     pub language: Option<String>,
     pub duration: Option<f64>,
-    /// Empty when the vendor returns only a flat transcript. Subtitle formats then cannot be
-    /// produced, and the caller is told so rather than handed one caption spanning the file.
+    /// Caption-sized spans, cut from the vendor's word timings by [`caption_segments`]. The
+    /// vendors return words, not segments, and before these were cut `srt` answered 200 with an
+    /// empty body and `vtt` with a bare header.
     pub segments: Vec<Segment>,
+}
+
+/// One word with its timing — the input to [`caption_segments`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TimedWord<'a> {
+    pub text: &'a str,
+    pub start: f64,
+    pub end: f64,
+    /// Diarization label, when the deployment has it on. A new speaker starts a new cue.
+    pub speaker: Option<&'a str>,
+}
+
+/// Longest cue, in characters: two 42-character lines, the usual broadcast subtitle limit.
+pub const MAX_CUE_CHARS: usize = 84;
+/// Longest cue, in seconds.
+pub const MAX_CUE_SECS: f64 = 7.0;
+/// A silence at least this long between two words ends a cue.
+pub const CUE_PAUSE_SECS: f64 = 1.0;
+
+/// Cut word timings into subtitle cues.
+///
+/// A cue ends after a word that ends a sentence, and before a word that would push it past
+/// [`MAX_CUE_CHARS`] or [`MAX_CUE_SECS`], that follows a pause of [`CUE_PAUSE_SECS`], or that a
+/// different speaker says. The same cues are `verbose_json`'s `segments`, so the two never
+/// disagree about where a span starts or ends.
+pub fn caption_segments(words: &[TimedWord<'_>]) -> Vec<Segment> {
+    struct Cue<'a> {
+        start: f64,
+        end: f64,
+        text: String,
+        speaker: Option<&'a str>,
+    }
+
+    fn close(cue: Cue<'_>, out: &mut Vec<Segment>) {
+        out.push(Segment {
+            id: out.len() as u32,
+            start: cue.start,
+            end: cue.end.max(cue.start),
+            text: cue.text,
+        });
+    }
+
+    let mut out = Vec::new();
+    let mut current: Option<Cue<'_>> = None;
+    for w in words {
+        let text = w.text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        if let Some(cue) = current.take() {
+            let speaker_changed = matches!((cue.speaker, w.speaker), (Some(a), Some(b)) if a != b);
+            let paused = w.start - cue.end >= CUE_PAUSE_SECS;
+            let too_long = cue.text.chars().count() + 1 + text.chars().count() > MAX_CUE_CHARS;
+            let too_slow = w.end - cue.start > MAX_CUE_SECS;
+            if speaker_changed || paused || too_long || too_slow {
+                close(cue, &mut out);
+            } else {
+                current = Some(cue);
+            }
+        }
+        let cue = current.get_or_insert_with(|| Cue {
+            start: w.start,
+            end: w.end,
+            text: String::new(),
+            speaker: w.speaker,
+        });
+        if !cue.text.is_empty() {
+            cue.text.push(' ');
+        }
+        cue.text.push_str(text);
+        cue.end = cue.end.max(w.end);
+        if text.ends_with(['.', '!', '?', '。', '！', '？']) {
+            if let Some(cue) = current.take() {
+                close(cue, &mut out);
+            }
+        }
+    }
+    if let Some(cue) = current.take() {
+        close(cue, &mut out);
+    }
+    out
 }
 
 /// `HH:MM:SS,mmm` (SRT) or `HH:MM:SS.mmm` (WebVTT).
@@ -608,6 +743,165 @@ mod subtitle_tests {
         assert!(
             srt.contains("Hello there.\n\n2\n"),
             "cues must be separated by a blank line"
+        );
+    }
+}
+
+#[cfg(test)]
+mod caption_tests {
+    use super::*;
+
+    fn w(text: &str, start: f64, end: f64) -> TimedWord<'_> {
+        TimedWord {
+            text,
+            start,
+            end,
+            speaker: None,
+        }
+    }
+
+    #[test]
+    fn a_sentence_end_closes_the_cue() {
+        let words = [
+            w("Hello", 0.0, 0.4),
+            w("there.", 0.4, 0.9),
+            w("General", 1.0, 1.5),
+            w("Kenobi.", 1.5, 2.2),
+        ];
+        let cues = caption_segments(&words);
+        assert_eq!(cues.len(), 2, "{cues:?}");
+        assert_eq!(cues[0].text, "Hello there.");
+        assert_eq!((cues[0].start, cues[0].end), (0.0, 0.9));
+        assert_eq!(cues[1].text, "General Kenobi.");
+        assert_eq!((cues[1].id, cues[1].start, cues[1].end), (1, 1.0, 2.2));
+    }
+
+    #[test]
+    fn a_pause_closes_the_cue_even_mid_sentence() {
+        let words = [
+            w("so", 0.0, 0.3),
+            w("anyway", 0.3, 0.8),
+            w("later", 2.0, 2.4),
+        ];
+        let cues = caption_segments(&words);
+        assert_eq!(
+            cues.iter().map(|c| c.text.as_str()).collect::<Vec<_>>(),
+            vec!["so anyway", "later"]
+        );
+    }
+
+    #[test]
+    fn no_cue_outgrows_the_length_or_duration_limits() {
+        // Forty unpunctuated words, 0.3 s apart: without the limits this is one 12-second cue.
+        let texts: Vec<String> = (0..40).map(|i| format!("word{i:02}")).collect();
+        let words: Vec<TimedWord<'_>> = texts
+            .iter()
+            .enumerate()
+            .map(|(i, t)| w(t, i as f64 * 0.3, i as f64 * 0.3 + 0.25))
+            .collect();
+        let cues = caption_segments(&words);
+        assert!(cues.len() > 1, "{cues:?}");
+        for c in &cues {
+            assert!(c.text.chars().count() <= MAX_CUE_CHARS, "{c:?}");
+            assert!(c.end - c.start <= MAX_CUE_SECS, "{c:?}");
+        }
+        // Every word lands in exactly one cue, in order.
+        let rejoined = cues
+            .iter()
+            .map(|c| c.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(rejoined, texts.join(" "));
+    }
+
+    #[test]
+    fn a_new_speaker_starts_a_new_cue() {
+        let words = [
+            TimedWord {
+                speaker: Some("0"),
+                ..w("Hi", 0.0, 0.3)
+            },
+            TimedWord {
+                speaker: Some("1"),
+                ..w("hello", 0.35, 0.7)
+            },
+        ];
+        assert_eq!(caption_segments(&words).len(), 2);
+    }
+
+    #[test]
+    fn blank_words_are_skipped_and_nothing_in_is_nothing_out() {
+        assert!(caption_segments(&[]).is_empty());
+        assert!(caption_segments(&[w("  ", 0.0, 0.1)]).is_empty());
+    }
+
+    #[test]
+    fn the_cues_render_as_real_subtitles() {
+        let words = [w("Hello", 0.0, 0.4), w("there.", 0.4, 0.9)];
+        let result = TranscriptionResult {
+            text: "Hello there.".into(),
+            segments: caption_segments(&words),
+            ..Default::default()
+        };
+        assert_eq!(
+            result.to_srt(),
+            "1\n00:00:00,000 --> 00:00:00,900\nHello there.\n\n"
+        );
+        assert_eq!(
+            result.to_vtt(),
+            "WEBVTT\n\n00:00:00.000 --> 00:00:00.900\nHello there.\n\n"
+        );
+    }
+
+    fn with_granularities(values: &[&str]) -> Result<TranscriptionSettings, AudioError> {
+        translate(TranscriptionRequest {
+            model: "stt".into(),
+            filename: "a.wav".into(),
+            file_len: 10,
+            response_format: Some("verbose_json".into()),
+            language: None,
+            prompt: None,
+            temperature: None,
+            timestamp_granularities: values.iter().map(|s| s.to_string()).collect(),
+            translate: false,
+        })
+    }
+
+    #[test]
+    fn timestamp_granularities_are_parsed_and_decide_whether_words_are_returned() {
+        let absent = with_granularities(&[]).unwrap();
+        assert_eq!(absent.timestamp_granularities, None);
+        assert!(
+            absent.wants_words(),
+            "no list keeps the default: words when the vendor has them"
+        );
+
+        let segment_only = with_granularities(&["segment"]).unwrap();
+        assert!(!segment_only.wants_words());
+
+        let both = with_granularities(&["word", "segment", "word"]).unwrap();
+        assert_eq!(
+            both.timestamp_granularities,
+            Some(vec![
+                TimestampGranularity::Word,
+                TimestampGranularity::Segment
+            ])
+        );
+        assert!(both.wants_words());
+    }
+
+    #[test]
+    fn an_unknown_granularity_is_refused_by_name() {
+        let err = with_granularities(&["character"]).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AudioError::Unsupported {
+                    field: "timestamp_granularities",
+                    ..
+                }
+            ),
+            "{err:?}"
         );
     }
 }

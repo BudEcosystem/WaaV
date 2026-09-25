@@ -17,7 +17,14 @@ pub struct SpeechRequest {
     /// The Bud endpoint name. Resolved against `voice_table` to pick the vendor.
     pub model: String,
     pub input: String,
-    pub voice: String,
+    /// OPTIONAL since FRD-018 Part III C1, where OpenAI requires it.
+    ///
+    /// A Bud voice deployment carries a default voice chosen by the operator, published on the
+    /// `voice_table` entry. Requiring `voice` on every request would make that default
+    /// unreachable — it could only ever be overridden, never used. Omitting it here means "use
+    /// the deployment's voice"; the handler still refuses when neither exists, naming the field.
+    #[serde(default)]
+    pub voice: Option<String>,
     #[serde(default)]
     pub response_format: Option<String>,
     #[serde(default)]
@@ -25,6 +32,11 @@ pub struct SpeechRequest {
     /// Present in newer OpenAI models; forwarded to vendors that support a free-text style.
     #[serde(default)]
     pub instructions: Option<String>,
+    /// OpenAI's `audio` (one response body) or `sse` (a stream of events). Only `audio` is
+    /// served. Declared rather than left to serde's unknown-field tolerance: an ignored `sse`
+    /// answered a caller waiting for events with a binary body and a 200.
+    #[serde(default)]
+    pub stream_format: Option<String>,
 }
 
 /// Output encodings WaaV can return.
@@ -110,9 +122,10 @@ impl AudioFormat {
 pub struct SpeechSettings {
     pub endpoint: String,
     pub text: String,
-    /// The vendor's voice identifier. OpenAI names are mapped where an equivalent exists;
-    /// everything else passes through unchanged.
-    pub voice: String,
+    /// The vendor's voice identifier as the CALLER gave it, or `None` to take the
+    /// deployment's default. Resolution happens in the handler, which is the only place that
+    /// can see the endpoint; this crate stays free of control-plane types.
+    pub voice: Option<String>,
     pub format: AudioFormat,
     /// 0.25–4.0, OpenAI's range. `None` means the vendor default.
     pub speaking_rate: Option<f32>,
@@ -159,12 +172,38 @@ pub fn translate(req: SpeechRequest) -> Result<SpeechSettings, AudioError> {
     if req.model.trim().is_empty() {
         return Err(AudioError::Missing { field: "model" });
     }
-    if req.input.is_empty() {
+    // Whitespace counts as missing. It reached the provider, which skips blank text without
+    // queueing a request — so nothing ever completed, and the caller waited out the full 30 s
+    // synthesis timeout for a 502 that blamed the vendor.
+    if req.input.trim().is_empty() {
         return Err(AudioError::Missing { field: "input" });
     }
-    if req.voice.trim().is_empty() {
-        return Err(AudioError::Missing { field: "voice" });
+    // Nothing a voice can say: punctuation, symbols or emoji alone. Vendors answer these
+    // inconsistently — ElevenLabs returns an EMPTY clip for "..." (which surfaced as a 502 that
+    // blamed the vendor) and a 400 for "👍" — so the one answer is given here, before a vendor
+    // call. Letters and digits in any script count; `is_alphanumeric` is Unicode-aware, so
+    // Japanese, Hindi and numbers pass.
+    if !req.input.chars().any(char::is_alphanumeric) {
+        return Err(AudioError::InvalidField {
+            field: "input",
+            reason: "it contains no letters or digits, so there is nothing to speak".to_string(),
+        });
     }
+    match req.stream_format.as_deref() {
+        None | Some("audio") => {}
+        Some(other) => {
+            return Err(AudioError::Unsupported {
+                field: "stream_format",
+                value: other.to_string(),
+                expected: "audio".to_string(),
+            });
+        }
+    }
+    // An EMPTY voice is treated as absent rather than refused: a form that submits `""` for an
+    // untouched field is indistinguishable from one that omitted it, and refusing the first
+    // while honouring the second is a distinction no caller can see. The handler refuses when
+    // neither the request nor the deployment supplies one.
+    let voice = req.voice.filter(|v| !v.trim().is_empty());
 
     // Characters, not bytes. A byte limit would give a caller writing Japanese roughly a third
     // of the budget for the same text, which is not a limit anybody can reason about.
@@ -202,7 +241,7 @@ pub fn translate(req: SpeechRequest) -> Result<SpeechSettings, AudioError> {
     Ok(SpeechSettings {
         endpoint: req.model,
         text: req.input,
-        voice: req.voice,
+        voice,
         format,
         speaking_rate,
         instructions: req.instructions,
@@ -217,11 +256,81 @@ mod tests {
         SpeechRequest {
             model: "deepgram-tts".into(),
             input: "Hello from Bud.".into(),
-            voice: "aura-asteria-en".into(),
+            voice: Some("aura-asteria-en".into()),
             response_format: None,
             speed: None,
             instructions: None,
+            stream_format: None,
         }
+    }
+
+    #[test]
+    fn whitespace_only_input_is_missing_input() {
+        for input in ["   ", "\n\t "] {
+            let err = translate(SpeechRequest {
+                input: input.into(),
+                ..req()
+            })
+            .unwrap_err();
+            assert!(
+                matches!(err, AudioError::Missing { field: "input" }),
+                "{input:?}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn input_with_nothing_to_speak_is_refused_but_any_script_passes() {
+        for input in ["...", "👍", "?!", "—"] {
+            let err = translate(SpeechRequest {
+                input: input.into(),
+                ..req()
+            })
+            .unwrap_err();
+            assert!(
+                matches!(err, AudioError::InvalidField { field: "input", .. }),
+                "{input:?}: {err:?}"
+            );
+        }
+        for input in ["こんにちは。", "नमस्ते।", "42", "Hi 👍", "[laughs] ok"]
+        {
+            assert!(
+                translate(SpeechRequest {
+                    input: input.into(),
+                    ..req()
+                })
+                .is_ok(),
+                "{input:?} must pass"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_whole_body_stream_format_is_served() {
+        for ok in [None, Some("audio")] {
+            assert!(
+                translate(SpeechRequest {
+                    stream_format: ok.map(str::to_string),
+                    ..req()
+                })
+                .is_ok()
+            );
+        }
+        let err = translate(SpeechRequest {
+            stream_format: Some("sse".into()),
+            ..req()
+        })
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AudioError::Unsupported {
+                    field: "stream_format",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -229,7 +338,7 @@ mod tests {
         let s = translate(req()).unwrap();
         assert_eq!(s.endpoint, "deepgram-tts");
         assert_eq!(s.text, "Hello from Bud.");
-        assert_eq!(s.voice, "aura-asteria-en");
+        assert_eq!(s.voice.as_deref(), Some("aura-asteria-en"));
         assert_eq!(s.format, AudioFormat::Mp3, "OpenAI defaults to mp3");
         assert_eq!(s.speaking_rate, None);
     }
@@ -239,11 +348,11 @@ mod tests {
         // Rejecting these would make every vendor's own catalog unreachable.
         for voice in ["aura-asteria-en", "Rachel", "sonic-english", "元気な女性"] {
             let s = translate(SpeechRequest {
-                voice: voice.into(),
+                voice: Some(voice.into()),
                 ..req()
             })
             .unwrap();
-            assert_eq!(s.voice, voice);
+            assert_eq!(s.voice.as_deref(), Some(voice));
         }
     }
 
@@ -389,10 +498,6 @@ mod tests {
                 Box::new(|r: &mut SpeechRequest| r.input = String::new()),
                 "input",
             ),
-            (
-                Box::new(|r: &mut SpeechRequest| r.voice = "".into()),
-                "voice",
-            ),
         ] {
             let mut r = req();
             mutate(&mut r);
@@ -403,6 +508,34 @@ mod tests {
                 "a caller can only fix a field the error names"
             );
         }
+    }
+
+    /// FRD-018 Part III C1. `voice` moved from required to optional, so the two spellings of
+    /// "I did not choose one" have to mean the same thing — otherwise a form that submits an
+    /// empty string behaves differently from one that omits the key, and no caller can see why.
+    #[test]
+    fn an_absent_and_a_blank_voice_are_both_none() {
+        for blank in [None, Some(String::new()), Some("   ".to_string())] {
+            let s = translate(SpeechRequest {
+                voice: blank.clone(),
+                ..req()
+            })
+            .unwrap();
+            assert_eq!(
+                s.voice, None,
+                "{blank:?} should mean 'use the endpoint default'"
+            );
+        }
+    }
+
+    #[test]
+    fn a_request_without_a_voice_key_still_deserialises() {
+        // The wire-level half of the same change: OpenAI's schema requires `voice`, so a
+        // `#[serde(default)]` that went missing would turn every default-voice request into a
+        // 400 at parse time, before any of the logic above runs.
+        let req: SpeechRequest =
+            serde_json::from_str(r#"{"model":"deepgram-tts","input":"hi"}"#).unwrap();
+        assert_eq!(req.voice, None);
     }
 
     /// A vendor rejects the combination outright, so this cannot be left to a default.
@@ -476,15 +609,24 @@ mod voice_validation_tests {
     fn an_unknown_voice_is_rejected_and_names_the_alternatives() {
         let err = validate_voice("aloy", OPENAI_VOICES).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("aloy"), "must quote what the caller actually sent: {msg}");
+        assert!(
+            msg.contains("aloy"),
+            "must quote what the caller actually sent: {msg}"
+        );
         assert!(msg.contains("alloy"), "must list the real voices: {msg}");
-        assert!(msg.contains("shimmer"), "must list ALL of them, not a sample: {msg}");
+        assert!(
+            msg.contains("shimmer"),
+            "must list ALL of them, not a sample: {msg}"
+        );
     }
 
     #[test]
     fn a_known_voice_passes() {
         for v in OPENAI_VOICES {
-            assert!(validate_voice(v, OPENAI_VOICES).is_ok(), "{v} should be accepted");
+            assert!(
+                validate_voice(v, OPENAI_VOICES).is_ok(),
+                "{v} should be accepted"
+            );
         }
     }
 
@@ -501,7 +643,10 @@ mod voice_validation_tests {
         // Unsupported is what `response_format` already uses, and the handler maps it to 400.
         // The whole point is that this stops being a 502: the caller can fix it themselves.
         let err = validate_voice("nope", OPENAI_VOICES).unwrap_err();
-        assert!(matches!(err, AudioError::Unsupported { field: "voice", .. }));
+        assert!(matches!(
+            err,
+            AudioError::Unsupported { field: "voice", .. }
+        ));
     }
 
     #[test]
