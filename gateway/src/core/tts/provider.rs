@@ -504,29 +504,12 @@ impl TTSProvider {
                         .await
                         .unwrap_or_else(|_| "Unknown error".to_string());
 
-                    // Handle specific HTTP status codes with appropriate error types
-                    let tts_error = match status.as_u16() {
-                        429 => {
-                            warn!(
-                                "TTS rate limited. Retry-After: {:?} seconds. Body: {}",
-                                retry_after_secs, error_body
-                            );
-                            TTSError::RateLimited {
-                                retry_after_secs,
-                                message: error_body,
-                            }
-                        }
-                        401 | 403 => {
-                            error!("TTS authentication failed ({}): {}", status, error_body);
-                            TTSError::AuthenticationFailed(format!(
-                                "API error ({status}): {error_body}"
-                            ))
-                        }
-                        _ => {
-                            error!("TTS API error ({}): {}", status, error_body);
-                            TTSError::ProviderError(format!("API error ({status}): {error_body}"))
-                        }
-                    };
+                    let tts_error = classify_tts_status(
+                        &request_builder.get_config().provider,
+                        status,
+                        error_body,
+                        retry_after_secs,
+                    );
 
                     let _ = sender.send(Err(tts_error)).await;
                     return;
@@ -906,7 +889,14 @@ impl TTSProvider {
                                     }
                                 }
                                 Err(err) => {
-                                    error!("TTS dispatcher received error: {:?}", err);
+                                    // A vendor refusal is the request's fault — a voice the
+                                    // account lacks, an unknown model — and already surfaces as a
+                                    // 400. Logging it at ERROR made every caller typo page someone.
+                                    if matches!(err, TTSError::RequestRejected(_)) {
+                                        warn!("TTS dispatcher received a vendor refusal: {:?}", err);
+                                    } else {
+                                        error!("TTS dispatcher received error: {:?}", err);
+                                    }
                                     if let Some(cb) = cb_opt.as_ref() {
                                         cb.on_error(err).await;
                                     }
@@ -1330,7 +1320,7 @@ impl TTSProvider {
     ///
     /// # Behavior
     ///
-    /// For HTTP-based providers (Deepgram, OpenAI, Play.ht, etc.), flush is a no-op
+    /// For HTTP-based providers (Deepgram, OpenAI, etc.), flush is a no-op
     /// because each speak() request is immediately sent as an HTTP request. There is
     /// no internal queue to flush.
     ///
@@ -1416,6 +1406,76 @@ impl Drop for TTSProvider {
     }
 }
 
+/// Vendor error codes that mean "your plan does not include this", on a 403.
+const PLAN_LIMIT_CODES: &[&str] = &["subscription_required", "paid_plan_required"];
+
+/// Map a vendor's non-success TTS response onto the error the caller is shown.
+///
+/// Mirrors the batch STT driver's `classify_vendor_status`, so a vendor refusal reads the same on
+/// both audio routes. A 4xx means the vendor rejected the request WaaV built — a voice the account
+/// does not have, a model id that does not exist — and is [`TTSError::RequestRejected`]. Three
+/// exceptions:
+///
+/// * **401 / 403** — the credential is the deployment's, not the caller's. Telling the caller
+///   "bad request" sends them to inspect a request with nothing wrong in it.
+/// * **408 / 429** — "too slow" and "too many" are the upstream unable to serve this one right
+///   now, not a malformed request.
+pub(crate) fn classify_tts_status(
+    provider: &str,
+    status: reqwest::StatusCode,
+    error_body: String,
+    retry_after_secs: Option<u64>,
+) -> TTSError {
+    match status.as_u16() {
+        429 => {
+            warn!(
+                "TTS rate limited. Retry-After: {:?} seconds. Body: {}",
+                retry_after_secs, error_body
+            );
+            TTSError::RateLimited {
+                retry_after_secs,
+                message: error_body,
+            }
+        }
+        // A 403 that is about the account's PLAN, not its key: an output format or voice the
+        // tier does not include. ElevenLabs answers `pcm_44100` on a free key with 403
+        // `subscription_required`; reporting that as "Authentication failed" sent the reader to
+        // rotate a key that was fine. It is a request the account cannot make — a refusal.
+        403 if crate::core::vendor_error::vendor_code(&error_body)
+            .is_some_and(|c| PLAN_LIMIT_CODES.contains(&c.as_str())) =>
+        {
+            warn!("TTS request refused by plan ({}): {}", status, error_body);
+            let message =
+                crate::core::vendor_error::vendor_message(&error_body).unwrap_or(error_body);
+            TTSError::RequestRejected(format!(
+                "{provider} rejected the request ({status}): {message}"
+            ))
+        }
+        401 | 403 => {
+            error!("TTS authentication failed ({}): {}", status, error_body);
+            let message =
+                crate::core::vendor_error::vendor_message(&error_body).unwrap_or(error_body);
+            TTSError::AuthenticationFailed(format!("{provider} API error ({status}): {message}"))
+        }
+        408 => {
+            error!("TTS API error ({}): {}", status, error_body);
+            TTSError::ProviderError(format!("API error ({status}): {error_body}"))
+        }
+        code if (400..500).contains(&code) => {
+            warn!("TTS request rejected ({}): {}", status, error_body);
+            let message =
+                crate::core::vendor_error::vendor_message(&error_body).unwrap_or(error_body);
+            TTSError::RequestRejected(format!(
+                "{provider} rejected the request ({status}): {message}"
+            ))
+        }
+        _ => {
+            error!("TTS API error ({}): {}", status, error_body);
+            TTSError::ProviderError(format!("API error ({status}): {error_body}"))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1465,5 +1525,90 @@ mod tests {
                 .await
                 .expect_err("non-HTTP provider audio URL must be rejected");
         assert!(err.to_string().contains("not allowed"), "{err}");
+    }
+
+    // --- classify_tts_status: who can fix a vendor's non-success answer -------------------
+
+    const VOICE_NOT_FOUND: &str = r#"{"detail":{"type":"not_found","code":"voice_not_found","message":"A voice with voice_id 'alloy' was not found.","status":"voice_not_found"}}"#;
+
+    #[test]
+    fn a_vendor_4xx_is_a_rejection_carrying_the_vendors_sentence() {
+        let err = classify_tts_status(
+            "elevenlabs",
+            reqwest::StatusCode::NOT_FOUND,
+            VOICE_NOT_FOUND.to_string(),
+            None,
+        );
+        let TTSError::RequestRejected(message) = err else {
+            panic!("a 404 must be a rejection, got {err:?}");
+        };
+        assert_eq!(
+            message,
+            "elevenlabs rejected the request (404 Not Found): A voice with voice_id 'alloy' was not found."
+        );
+    }
+
+    #[test]
+    fn an_unparseable_4xx_body_is_kept_whole() {
+        let err = classify_tts_status("x", reqwest::StatusCode::BAD_REQUEST, "nope".into(), None);
+        assert!(
+            matches!(&err, TTSError::RequestRejected(m) if m.ends_with(": nope")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_plan_limit_403_is_a_refusal_and_a_key_403_is_not() {
+        // Live: `pcm_44100` on a free ElevenLabs key.
+        let plan = r#"{"detail":{"type":"authorization_error","code":"subscription_required","message":"Output format 'pcm_44100' is only available on the Pro tier and above."}}"#;
+        let err = classify_tts_status(
+            "elevenlabs",
+            reqwest::StatusCode::FORBIDDEN,
+            plan.into(),
+            None,
+        );
+        assert!(
+            matches!(&err, TTSError::RequestRejected(m) if m.ends_with("only available on the Pro tier and above.")),
+            "{err:?}"
+        );
+        let key = r#"{"detail":{"status":"missing_permissions","message":"The API key you used is missing the permission text_to_speech"}}"#;
+        let err = classify_tts_status(
+            "elevenlabs",
+            reqwest::StatusCode::FORBIDDEN,
+            key.into(),
+            None,
+        );
+        assert!(
+            matches!(&err, TTSError::AuthenticationFailed(m) if m.ends_with("missing the permission text_to_speech")),
+            "the vendor's sentence, not its JSON envelope: {err:?}"
+        );
+    }
+
+    #[test]
+    fn credential_throttling_and_timeouts_are_not_the_callers_to_fix() {
+        let s = |code: u16| reqwest::StatusCode::from_u16(code).unwrap();
+        assert!(matches!(
+            classify_tts_status("x", s(401), "k".into(), None),
+            TTSError::AuthenticationFailed(_)
+        ));
+        assert!(matches!(
+            classify_tts_status("x", s(403), "k".into(), None),
+            TTSError::AuthenticationFailed(_)
+        ));
+        assert!(matches!(
+            classify_tts_status("x", s(429), "slow down".into(), Some(3)),
+            TTSError::RateLimited {
+                retry_after_secs: Some(3),
+                ..
+            }
+        ));
+        assert!(matches!(
+            classify_tts_status("x", s(408), "t".into(), None),
+            TTSError::ProviderError(_)
+        ));
+        assert!(matches!(
+            classify_tts_status("x", s(503), "down".into(), None),
+            TTSError::ProviderError(_)
+        ));
     }
 }

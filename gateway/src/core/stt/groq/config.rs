@@ -565,6 +565,20 @@ impl GroqSTTConfig {
         if let Some(url) = std.extras.0.get("url").and_then(|v| v.as_str()) {
             cfg.audio_url = Some(url.trim().to_string());
         }
+        // A request's own `prompt` and `temperature` (`/v1/audio/transcriptions`).
+        if let Some(p) = std
+            .extras
+            .0
+            .get("prompt")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            && !p.is_empty()
+        {
+            cfg.prompt = Some(p.to_string());
+        }
+        if let Some(t) = std.extras.0.get("temperature").and_then(|v| v.as_f64()) {
+            cfg.temperature = Some(t as f32);
+        }
         cfg
     }
 

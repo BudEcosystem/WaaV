@@ -175,6 +175,19 @@ impl ElevenLabsRegion {
 
 /// Configuration specific to ElevenLabs STT Real-Time API.
 ///
+/// The model ids ElevenLabs accepts on the REALTIME WebSocket endpoint.
+///
+/// Deliberately not "every model ElevenLabs publishes". `scribe_v2` and `scribe_v2_medical` are
+/// the BATCH transcription API, served by [`super::batch`] over `POST /v1/speech-to-text`; the
+/// two vocabularies are disjoint and each transport rejects the other's ids. A deployment that
+/// reaches THIS client with a batch model is on the wrong transport, and `validate` says so
+/// rather than letting ElevenLabs close the socket with a policy error that names nothing.
+///
+/// The list is closed because ElevenLabs publishes realtime models rarely and batch models often
+/// — so [`super::batch::model_is_realtime`] treats membership here as the only question, and
+/// everything else as batch.
+pub const REALTIME_MODELS: &[&str] = &["scribe_v2_realtime"];
+
 /// This configuration extends the base `STTConfig` with ElevenLabs-specific
 /// parameters for the WebSocket streaming API.
 #[derive(Debug, Clone)]
@@ -362,6 +375,28 @@ impl ElevenLabsSTTConfig {
         // Validate API key
         if self.base.api_key.is_empty() {
             return Err("API key is required".to_string());
+        }
+
+        // Validate the model against the REALTIME vocabulary.
+        //
+        // This client speaks the realtime WebSocket API, and ElevenLabs' batch model ids are not
+        // valid there. Sent one, ElevenLabs accepts the TLS connection and then closes it with
+        // `Policy: invalid_request` — which the supervisor retries three times, the circuit
+        // breaker reads as a credentials failure, and the caller finally receives as
+        // "Connection failed: Connection channel closed before session started". Nothing in that
+        // chain names the model, so the one fact needed to fix it is the one fact missing.
+        //
+        // Caught here instead, where the value is still in hand and can be named alongside the
+        // alternatives.
+        if !self.model_id.is_empty() && !REALTIME_MODELS.contains(&self.model_id.as_str()) {
+            return Err(format!(
+                "model '{}' is not a realtime model for ElevenLabs speech-to-text. This is the \
+                 realtime WebSocket transport, which rejects the batch model ids (scribe_v2, \
+                 scribe_v2_medical) — those are served over `POST /v1/speech-to-text`, which \
+                 this gateway reaches for a prerecorded upload. Use one of: {}",
+                self.model_id,
+                REALTIME_MODELS.join(", ")
+            ));
         }
 
         // Validate keyterms count

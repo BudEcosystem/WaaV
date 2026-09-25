@@ -127,6 +127,12 @@ pub fn create_api_router() -> Router<Arc<AppState>> {
             "/capabilities/languages",
             get(capabilities::list_language_capabilities),
         )
+        // Capability discovery: which providers honour which canonical STT/TTS features
+        // (FRD-018 Part III M1). Same shape as the language matrix above, for the same reason.
+        .route(
+            "/capabilities/features",
+            get(capabilities::list_feature_capabilities),
+        )
         // DAG routing endpoints
         .route("/dag/templates", get(dag::list_templates))
         .route("/dag/templates/{template_name}", get(dag::get_template))

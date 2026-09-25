@@ -363,7 +363,7 @@ impl From<STTConfig> for StandardSTTConfig {
     }
 }
 
-fn validate_standard_endpoint_override(
+pub(crate) fn validate_standard_endpoint_override(
     override_base: Option<&str>,
 ) -> Result<(), super::base::STTError> {
     let Some(base) = override_base else {
@@ -448,9 +448,6 @@ pub fn create_stt_standard(
         "phonexia" | "phonexia-stt" | "phonexia_stt" => Ok(Box::new(
             super::phonexia::PhonexiaSTT::new_standard(&config)?,
         )),
-        "prosa-ai" | "prosa_ai" | "prosai" | "prosa" | "prosa.ai" => {
-            Ok(Box::new(super::prosa_ai::ProsaStt::new_standard(&config)?))
-        }
         "revai" | "rev-ai" | "rev_ai" | "rev.ai" => {
             Ok(Box::new(super::revai::RevAISTT::new_standard(&config)?))
         }
@@ -477,6 +474,51 @@ pub fn create_stt_standard(
         // Not-yet-migrated providers use the flat path; advanced features stay at provider
         // defaults until they gain `from_standard` (tracked by W2).
         _ => super::create_stt_provider(provider, config.base),
+    }
+}
+
+/// Build a provider for a PRERECORDED upload, preferring a vendor's batch API where WaaV has one.
+///
+/// The transport is a property of the ROUTE, not of the configuration. A file arriving at
+/// `/v1/audio/transcriptions` is prerecorded; a live voice session is not. Deciding it inside
+/// [`create_stt_standard`] — by looking at the model id, say — would mean a live session
+/// configured with a batch model silently buffered the whole call and answered at the end, which
+/// is not a degraded experience but a broken one.
+///
+/// So the choice is made here, by the caller that knows. Every provider without a batch
+/// implementation falls through to [`create_stt_standard`] unchanged: this adds a path, it does
+/// not reroute any existing one.
+///
+/// Today exactly one vendor has a second implementation. ElevenLabs serves prerecorded audio over
+/// `POST /v1/speech-to-text` with `scribe_v2` / `scribe_v2_medical`, and the realtime socket over
+/// `scribe_v2_realtime` — two disjoint model vocabularies on two disjoint transports. Before this,
+/// WaaV had only the socket, so a `scribe_v2` deployment could not serve a file upload at all.
+///
+/// Deepgram, AssemblyAI and OpenAI also publish prerecorded APIs, and WaaV already builds requests
+/// for the first three in [`super::batch`] — but only for the separate `/transcribe/batch` route.
+/// Routing the OpenAI-compatible endpoint through those is a larger change with its own questions
+/// (job polling vs. a synchronous answer, timestamp fidelity, `response_format` coverage) and is
+/// deliberately not folded in here.
+pub fn create_stt_standard_prerecorded(
+    provider: &str,
+    config: StandardSTTConfig,
+) -> Result<Box<dyn super::base::BaseSTT>, super::base::STTError> {
+    // ElevenLabs is the one vendor whose two transports have DISJOINT model vocabularies, so an
+    // operator who named the realtime model gets the realtime client even here — and finds out
+    // from that client if the combination cannot work, rather than being silently rerouted.
+    if provider.eq_ignore_ascii_case("elevenlabs")
+        && super::elevenlabs::model_is_realtime(&config.base.model)
+    {
+        return create_stt_standard(provider, config);
+    }
+    match super::prerecorded::PrerecordedVendor::from_provider(provider) {
+        Some(vendor) => Ok(Box::new(super::prerecorded::PrerecordedSTT::new_standard(
+            vendor, &config,
+        )?)),
+        // Every vendor without a prerecorded implementation keeps the streaming replay, which
+        // still works. OpenAI and Groq are deliberately absent: their STT clients already ARE
+        // `POST /v1/audio/transcriptions`, and needed only the request/response marker.
+        None => create_stt_standard(provider, config),
     }
 }
 
@@ -859,5 +901,140 @@ mod tests {
         assert_eq!(v["text"], "Hola");
         // `is_partial:false` is omitted (skip_serializing_if Not::not) — keeps the wire lean.
         assert!(v.get("is_partial").is_none());
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // The prerecorded factory
+    // ---------------------------------------------------------------------------------------
+
+    fn eleven(model: &str) -> StandardSTTConfig {
+        StandardSTTConfig::from_base(STTConfig {
+            provider: "elevenlabs".into(),
+            api_key: "xi-test".into(),
+            language: "en-US".into(),
+            sample_rate: 16_000,
+            channels: 1,
+            punctuation: true,
+            encoding: "linear16".into(),
+            model: model.into(),
+        })
+    }
+
+    #[test]
+    fn a_batch_model_on_an_upload_gets_the_batch_client() {
+        // The defect this exists for: `scribe_v2` is the model ElevenLabs' own docs put on the
+        // file-upload endpoint, and WaaV used to send it to the realtime WebSocket, where it is
+        // rejected with a policy close that names nothing.
+        let p = create_stt_standard_prerecorded("elevenlabs", eleven("scribe_v2")).unwrap();
+        assert!(p.get_provider_info().contains("batch"));
+        assert!(p.is_request_response());
+    }
+
+    #[test]
+    fn an_unset_model_on_an_upload_also_gets_the_batch_client() {
+        let p = create_stt_standard_prerecorded("elevenlabs", eleven("")).unwrap();
+        assert!(p.get_provider_info().contains("batch"));
+    }
+
+    #[test]
+    fn a_realtime_model_on_an_upload_still_gets_the_realtime_client() {
+        // Not silently rerouted: an operator who configured the realtime model gets the realtime
+        // transport, and finds out from that client if the combination cannot work.
+        let p =
+            create_stt_standard_prerecorded("elevenlabs", eleven("scribe_v2_realtime")).unwrap();
+        assert!(!p.get_provider_info().contains("batch"));
+        assert!(!p.is_request_response());
+    }
+
+    #[test]
+    fn a_live_session_never_gets_the_batch_client() {
+        // `create_stt_standard` is what the voice manager calls. A batch client there would
+        // buffer an entire call and answer at the end — not a degraded experience, a broken one.
+        let Err(err) = create_stt_standard("elevenlabs", eleven("scribe_v2")) else {
+            panic!("the realtime client accepted a batch model");
+        };
+        assert!(
+            format!("{err}").contains("realtime"),
+            "the realtime client should refuse a batch model by name: {err}"
+        );
+    }
+
+    #[test]
+    fn the_wired_vendors_get_their_prerecorded_client() {
+        // The point of the whole exercise: an upload reaches the vendor's own prerecorded API
+        // instead of being replayed frame by frame at a streaming socket.
+        for provider in ["deepgram", "assemblyai"] {
+            let cfg = StandardSTTConfig::from_base(STTConfig {
+                provider: provider.into(),
+                api_key: "k".into(),
+                ..Default::default()
+            });
+            let p = create_stt_standard_prerecorded(provider, cfg).unwrap();
+            assert!(
+                p.get_provider_info().to_lowercase().contains("prerecorded"),
+                "{provider} resolved to {}",
+                p.get_provider_info()
+            );
+            assert!(p.is_request_response(), "{provider}");
+        }
+    }
+
+    #[test]
+    fn a_live_session_still_gets_the_streaming_client() {
+        // The prerecorded factory adds a path; `create_stt_standard` — what the voice manager
+        // calls — must be untouched, or a live call would buffer to its end and answer once.
+        for provider in ["deepgram", "assemblyai"] {
+            let cfg = StandardSTTConfig::from_base(STTConfig {
+                provider: provider.into(),
+                api_key: "k".into(),
+                ..Default::default()
+            });
+            let p = create_stt_standard(provider, cfg).unwrap();
+            assert!(
+                !p.get_provider_info().to_lowercase().contains("prerecorded"),
+                "{provider} live session resolved to {}",
+                p.get_provider_info()
+            );
+            assert!(!p.is_request_response(), "{provider}");
+        }
+    }
+
+    #[test]
+    fn a_vendor_with_no_prerecorded_path_resolves_exactly_as_before() {
+        // This adds a path; it must not reroute one. 27 of the 31 vendors keep the streaming
+        // replay, which still works.
+        for provider in ["azure", "speechmatics", "google"] {
+            let cfg = StandardSTTConfig::from_base(STTConfig {
+                provider: provider.into(),
+                api_key: "k".into(),
+                ..Default::default()
+            });
+            let via_prerecorded = create_stt_standard_prerecorded(provider, cfg.clone())
+                .map(|p| p.get_provider_info());
+            let via_standard = create_stt_standard(provider, cfg).map(|p| p.get_provider_info());
+            assert_eq!(
+                via_prerecorded.is_ok(),
+                via_standard.is_ok(),
+                "{provider} construction differs between the two factories"
+            );
+            if let (Ok(a), Ok(b)) = (via_prerecorded, via_standard) {
+                assert_eq!(a, b, "{provider}");
+            }
+        }
+    }
+
+    #[test]
+    fn openai_answers_on_close_without_a_second_client() {
+        // Its STT client already posts to `/v1/audio/transcriptions`, so it needs the marker and
+        // nothing else. Before the marker, every OpenAI transcription sat out a 45-second wait.
+        let cfg = StandardSTTConfig::from_base(STTConfig {
+            provider: "openai".into(),
+            api_key: "sk-test".into(),
+            model: "whisper-1".into(),
+            ..Default::default()
+        });
+        let p = create_stt_standard_prerecorded("openai", cfg).unwrap();
+        assert!(p.is_request_response());
+        assert!(p.get_provider_info().contains("OpenAI"));
     }
 }

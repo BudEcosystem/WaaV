@@ -5,7 +5,7 @@
 /**
  * STT (Speech-to-Text) providers supported by the WaaV gateway (the canonical
  * primary names from the gateway dispatch table, gateway/src/plugin/dispatch.rs
- * STT_PROVIDER_MAP / get_supported_stt_providers). 32 providers.
+ * STT_PROVIDER_MAP / get_supported_stt_providers). 31 providers.
  *
  * Kept in sync by the provider-enum drift guard (tests/unit/providers.test.ts).
  */
@@ -32,7 +32,6 @@ export const STT_PROVIDERS = [
   'nectec',
   'openai',
   'phonexia',
-  'prosa-ai',
   'revai',
   'reverie',
   'sarvam',
@@ -48,7 +47,7 @@ export type STTProvider = (typeof STT_PROVIDERS)[number];
 
 /**
  * TTS (Text-to-Speech) providers supported by the WaaV gateway (canonical
- * primary names from the gateway dispatch table TTS_PROVIDER_MAP). 37 providers.
+ * primary names from the gateway dispatch table TTS_PROVIDER_MAP). 34 providers.
  */
 export const TTS_PROVIDERS = [
   'acapela',
@@ -67,14 +66,11 @@ export const TTS_PROVIDERS = [
   'hume',
   'ibm-watson',
   'iflytek',
-  'lmnt',
   'microsoft-azure',
   'murf',
   'naver-clova',
   'nectec',
   'openai',
-  'playht',
-  'prosa-ai',
   'resemble',
   'reverie',
   'sberdevices',
@@ -95,7 +91,7 @@ export type TTSProvider = (typeof TTS_PROVIDERS)[number];
 /**
  * Realtime (speech-to-speech / S2S) providers for bidirectional conversation
  * (canonical primary names from the gateway dispatch table REALTIME_PROVIDER_MAP
- * / BuiltinRealtimeProvider enum). 12 providers — these are the gateway's
+ * / BuiltinRealtimeProvider enum). 11 providers — these are the gateway's
  * `/realtime` providers, NOT the OpenAI-native names the old list used.
  */
 export const REALTIME_PROVIDERS = [
@@ -109,7 +105,6 @@ export const REALTIME_PROVIDERS = [
   'gemini',
   'ultravox',
   'nova_sonic',
-  'speechmatics',
   'yandex',
 ] as const;
 
@@ -398,28 +393,6 @@ const TTS_CAPABILITIES: Partial<Record<TTSProvider, TTSCapabilities>> = {
     supportsPronunciations: false,
     maxCharacters: 10000,
     outputFormats: ['pcm'],
-  },
-  lmnt: {
-    streaming: true,
-    voices: ['lily', 'daniel', 'mira', 'emily'],
-    languages: ['en'],
-    supportsEmotion: false,
-    supportsSSML: false,
-    supportsVoiceCloning: true,
-    supportsPronunciations: false,
-    maxCharacters: 5000,
-    outputFormats: ['mp3', 'wav'],
-  },
-  playht: {
-    streaming: true,
-    voices: ['matthew', 'jennifer', 'richard', 'sarah'],
-    languages: ['en', 'es', 'fr', 'de', 'pt', 'it'],
-    supportsEmotion: false,
-    supportsSSML: true,
-    supportsVoiceCloning: true,
-    supportsPronunciations: false,
-    maxCharacters: 10000,
-    outputFormats: ['mp3', 'wav'],
   },
 };
 

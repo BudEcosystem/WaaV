@@ -158,12 +158,64 @@ impl IntoResponse for AuthError {
     }
 }
 
+impl AuthError {
+    /// The same refusal in OpenAI's error envelope, for the OpenAI-compatible `/v1/…` routes.
+    ///
+    /// Every other status on those routes already answers
+    /// `{"error": {"message", "type", "param", "code"}}`; auth failures alone answered WaaV's
+    /// native `{"error": "<code>", "message": …}`, so an OpenAI SDK found a string where it reads
+    /// an object and lost the message. The status and the machine code are unchanged — `code`
+    /// carries the same value the native shape puts in `error`.
+    pub fn into_openai_response(self) -> Response {
+        self.log();
+        let status = self.status_code();
+        let kind = if status.is_server_error() {
+            "api_error"
+        } else {
+            "invalid_request_error"
+        };
+        let body = Json(json!({
+            "error": {
+                "message": self.to_string(),
+                "type": kind,
+                "param": serde_json::Value::Null,
+                "code": self.error_code(),
+            }
+        }));
+        (status, body).into_response()
+    }
+}
+
 // Result type alias for convenience
 pub type AuthResult<T> = Result<T, AuthError>;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn openai_body(e: AuthError) -> (StatusCode, serde_json::Value) {
+        let r = e.into_openai_response();
+        let status = r.status();
+        let b = axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&b).unwrap())
+    }
+
+    #[tokio::test]
+    async fn the_openai_envelope_keeps_the_status_and_the_code() {
+        let (status, v) = openai_body(AuthError::Unauthorized("Invalid API key".into())).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(v["error"]["message"], "Unauthorized: Invalid API key");
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        assert_eq!(v["error"]["code"], "unauthorized");
+        assert!(v["error"]["param"].is_null());
+
+        let (status, v) = openai_body(AuthError::AuthServiceUnavailable("hydrating".into())).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(v["error"]["type"], "api_error");
+        assert_eq!(v["error"]["code"], "auth_service_unavailable");
+    }
 
     #[test]
     fn test_error_codes() {

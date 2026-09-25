@@ -16,7 +16,7 @@
  * gateway recognizes and will route; offering a value the gateway does not
  * recognize would silently no-op, so this list must stay a faithful mirror.
  *
- * The matching gateway-side counts are 32 STT / 37 TTS / 12 realtime. The
+ * The matching gateway-side counts are 31 STT / 34 TTS / 11 realtime. The
  * widget drift guard (`test/drift.test.mjs`) asserts these counts so a gateway
  * provider added without updating the widget is caught in CI.
  *
@@ -49,7 +49,6 @@ export const STT_PROVIDERS = [
   'nectec',
   'openai',
   'phonexia',
-  'prosa-ai',
   'revai',
   'reverie',
   'sarvam',
@@ -79,14 +78,11 @@ export const TTS_PROVIDERS = [
   'hume',
   'ibm-watson',
   'iflytek',
-  'lmnt',
   'microsoft-azure',
   'murf',
   'naver-clova',
   'nectec',
   'openai',
-  'playht',
-  'prosa-ai',
   'resemble',
   'reverie',
   'sberdevices',
@@ -118,7 +114,6 @@ export const REALTIME_PROVIDERS = [
   'gemini',
   'ultravox',
   'nova_sonic',
-  'speechmatics',
   'yandex',
 ] as const;
 

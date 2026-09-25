@@ -101,16 +101,6 @@ impl FallbackEmotionMapper {
     pub const fn openai() -> Self {
         Self::openai_legacy()
     }
-
-    /// Creates a fallback mapper for LMNT.
-    ///
-    /// Note: LMNT doesn't support emotion tags directly, but users can
-    /// control expressiveness through `top_p` (0-1, speech stability) and
-    /// `temperature` (≥0, expressiveness range) parameters instead.
-    #[inline]
-    pub const fn lmnt() -> Self {
-        Self::new("lmnt")
-    }
 }
 
 impl Default for FallbackEmotionMapper {
@@ -375,9 +365,6 @@ mod tests {
 
         let openai = FallbackEmotionMapper::openai();
         assert_eq!(openai.provider_id, "openai");
-
-        let lmnt = FallbackEmotionMapper::lmnt();
-        assert_eq!(lmnt.provider_id, "lmnt");
     }
 
     #[test]

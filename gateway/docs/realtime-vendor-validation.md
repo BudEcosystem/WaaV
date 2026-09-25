@@ -13,10 +13,10 @@ vendor in **one command**.
 | validation tier | providers |
 |---|---|
 | **Real-vendor validated** | `openai`, `deepgram`, `elevenlabs` |
-| **Awaiting a key** (mock-validated only) | `azure`, `grok`, `inworld`, `gemini`, `ultravox`, `nova_sonic`, `speechmatics`, `hume`, `yandex` |
-| **All 12** | pass credential-free mock round-trips (CI) |
+| **Awaiting a key** (mock-validated only) | `azure`, `grok`, `inworld`, `gemini`, `ultravox`, `nova_sonic`, `hume`, `yandex` |
+| **All 11** | pass credential-free mock round-trips (CI) |
 
-This document is how to **real-vendor-validate the 9 awaiting a key** and
+This document is how to **real-vendor-validate the 8 awaiting a key** and
 **re-validate the 3** that already are. Every endpoint / auth / rate / required
 field below is sourced from the provider's `src/core/realtime/<p>/protocol.rs`
 (`connect_spec`, `caps()`, `from_config`) and the gateway request schema
@@ -80,7 +80,6 @@ rate where in/out differ). **Auth** is the scheme `connect_spec` sets.
 | **gemini** | `GEMINI_API_KEY` | `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=<key>` | `?key=<key>` (query, no header) | 16000 in / 24000 out | `gemini-2.0-flash-live-001` / `Puck` | — |
 | **ultravox** | `ULTRAVOX_API_KEY` | `POST https://api.ultravox.ai/api/calls` → `wss` joinUrl | `X-API-Key: <key>` (on the REST create-call; the joinUrl is pre-authed) | 16000 in / 24000 out | `fixie-ai/ultravox` / `Mark` | none beyond the key — the **gateway does the REST create-call** (`RestThenWebSocket`) |
 | **nova_sonic** | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION` | Amazon Bedrock `InvokeModelWithBidirectionalStream` (HTTP/2 event stream, **not** a WebSocket) | **AWS SigV4** (aws-config default chain) — no api-key | 16000 in / 24000 out | `amazon.nova-sonic-v1:0` / `matthew` | AWS creds with **Bedrock model access** to `amazon.nova-sonic-v1:0` in the region (request access in the Bedrock console first); `AWS_SESSION_TOKEN` honored |
-| **speechmatics** | `SPEECHMATICS_API_KEY` | `wss://flow.api.speechmatics.com/v1/flow` | `Authorization: Bearer <key>` (a JWT / temp token) | 16000 | `flow-service-assistant-amelia` (template) / `amelia` | a Flow **portal template_id** (set `SPEECHMATICS_TEMPLATE_ID`); key is passed **as** the Bearer token — supply a JWT/temp token |
 | **hume** | `HUME_API_KEY` | `wss://api.hume.ai/v0/evi/chat` | `?api_key=<key>` (query, no header) | 44100 | (no model id) / `kora` | — |
 | **yandex** | `YANDEX_API_KEY`, `YANDEX_FOLDER_ID` | `wss://ai.api.cloud.yandex.net/v1/realtime?model=gpt://<folder>/<model>` | `Authorization: Bearer <key>` (IAM `t1.…`) **or** `Api-Key <key>` (static) | 24000 | `speech-realtime-250923` / `alloy` | the Yandex Cloud **folder id** (set `YANDEX_FOLDER_ID`); key may be an IAM token or a static API key |
 
@@ -132,10 +131,6 @@ ULTRAVOX_API_KEY=... \
 # nova_sonic — AWS SigV4 (keyless); needs Bedrock model access
 AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... AWS_REGION=us-east-1 \
   python3 scripts/realtime_vendor_validation.py nova_sonic
-
-# speechmatics — Bearer (JWT/temp token); model = a portal template_id
-SPEECHMATICS_API_KEY=<jwt-or-temp-token> SPEECHMATICS_TEMPLATE_ID=flow-service-assistant-amelia \
-  python3 scripts/realtime_vendor_validation.py speechmatics
 
 # hume — ?api_key= query
 HUME_API_KEY=... \
@@ -239,12 +234,6 @@ byte-verified (no key was held when written). Watch them on the **first** real r
   has **model access** to `amazon.nova-sonic-v1:0` in `AWS_REGION` (grant it in the
   Bedrock console). The bidi event-stream wire is unit-validated against the AWS
   docs, not a live capture.
-- **speechmatics** — **token exchange + path + output rate.** WaaV passes the key
-  **as** the `Authorization: Bearer` token and does **not** perform the
-  management-platform token **exchange** — a static api-key may **401**; supply a
-  JWT / pre-minted temp token. The connect path `/v1/flow`, the assumed 16 kHz
-  output rate, and the transcript field names (`metadata.transcript`,
-  `content`) are documented, not byte-verified. `model` = a portal `template_id`.
 - **yandex** — **Bearer vs Api-Key.** The auth scheme is chosen by key shape: a
   `t1.`-prefixed value ⇒ `Authorization: Bearer` (the OpenAI-SDK / IAM-token path);
   anything else ⇒ `Authorization: Api-Key` (the static-key path). If the server
@@ -268,9 +257,7 @@ the operator isn't surprised:
 
 Two more need a **server-side resource id** the gateway injects (still just the key
 plus one value): **azure** (`AZURE_OPENAI_ENDPOINT` resource + a realtime
-deployment in `model`) and **yandex** (`YANDEX_FOLDER_ID`). **speechmatics** needs
-a portal **template_id** (`SPEECHMATICS_TEMPLATE_ID`) and a JWT/temp token rather
-than a static key.
+deployment in `model`) and **yandex** (`YANDEX_FOLDER_ID`).
 
 ---
 

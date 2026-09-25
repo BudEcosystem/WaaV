@@ -201,7 +201,6 @@ const SetupWizard: React.FC<{ options: GlobalOptions }> = ({ options }) => {
     { value: 'elevenlabs', label: 'ElevenLabs', description: 'Voice cloning, most natural' },
     { value: 'cartesia', label: 'Cartesia', description: 'Sonic, ultra-low latency' },
     { value: 'openai', label: 'OpenAI TTS', description: 'HD voices, streaming' },
-    { value: 'play_ht', label: 'PlayHT', description: 'Voice emotions, custom' },
     { value: 'deepgram', label: 'Deepgram Aura', description: 'Fast, conversational' },
     { value: 'azure', label: 'Azure Speech', description: 'Neural voices, enterprise' },
   ];

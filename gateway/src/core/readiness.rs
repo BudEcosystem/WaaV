@@ -126,28 +126,12 @@ fn enabled_provider_targets(config: &ServerConfig) -> BTreeMap<String, Option<(S
         "api.hume.ai",
     );
     add(
-        "lmnt",
-        config
-            .lmnt_api_key
-            .as_deref()
-            .is_some_and(|k| !k.is_empty()),
-        "api.lmnt.com",
-    );
-    add(
         "groq",
         config
             .groq_api_key
             .as_deref()
             .is_some_and(|k| !k.is_empty()),
         "api.groq.com",
-    );
-    add(
-        "playht",
-        config
-            .playht_api_key
-            .as_deref()
-            .is_some_and(|k| !k.is_empty()),
-        "api.play.ht",
     );
     add(
         "microsoft-azure",
@@ -275,10 +259,7 @@ mod tests {
             yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
-            lmnt_api_key: None,
             groq_api_key: None,
-            playht_api_key: None,
-            playht_user_id: None,
             ibm_watson_api_key: None,
             ibm_watson_instance_id: None,
             ibm_watson_region: None,

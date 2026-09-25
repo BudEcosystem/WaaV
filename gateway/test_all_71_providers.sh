@@ -1,7 +1,7 @@
 #!/bin/bash
 #
-# WaaV Gateway - Complete 71 Provider Test Suite
-# Tests all 32 STT + 37 TTS + 2 Realtime providers
+# WaaV Gateway - Complete 67 Provider Test Suite
+# Tests all 31 STT + 34 TTS + 2 Realtime providers
 #
 # Usage: ./test_all_71_providers.sh [gateway_url]
 #
@@ -32,7 +32,7 @@ NO_KEY=0
 declare -a RESULTS
 
 echo "========================================================================"
-echo "        WaaV Gateway - Complete 71 Provider Test Suite"
+echo "        WaaV Gateway - Complete 67 Provider Test Suite"
 echo "========================================================================"
 echo ""
 echo "Gateway URL: $GATEWAY_URL"
@@ -69,8 +69,6 @@ TTS_TESTS=(
 
     # Specialist Providers
     "hume:default:HUME_API_KEY"
-    "lmnt:lily:LMNT_API_KEY"
-    "playht:Play3.0-mini:PLAYHT_API_KEY"
     "gnani:en-IN:GNANI_API_KEY"
     "murf:falcon:MURF_API_KEY"
     "wellsaid:legacy:WELLSAID_API_KEY"
@@ -99,7 +97,6 @@ TTS_TESTS=(
     "zalo-ai:1:ZALO_API_KEY"
     "fpt-ai:banmai:FPT_AI_API_KEY"
     "viettel-ai:hcm-diemmy:VIETTEL_AI_TOKEN"
-    "prosa-ai:dimas-formal:PROSA_API_KEY"
     "nectec:vaja9:NECTEC_API_KEY"
 )
 
@@ -139,7 +136,6 @@ STT_PROVIDERS=(
     "amivoice:AMIVOICE_APP_KEY"
     "fpt-ai:FPT_AI_API_KEY"
     "viettel-ai:VIETTEL_AI_TOKEN"
-    "prosa-ai:PROSA_API_KEY"
     "nectec:NECTEC_API_KEY"
 )
 

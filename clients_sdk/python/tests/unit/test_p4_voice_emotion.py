@@ -173,8 +173,8 @@ async def test_voices_clone_professional_queued_raises_on_wait() -> None:
 def test_clone_mode_and_provider_enum_values() -> None:
     assert CloneMode.INSTANT.value == "instant"
     assert CloneMode.PROFESSIONAL.value == "professional"
-    # Widened from the old 2-provider SDK enum to the gateway's 7.
-    expected = {"hume", "elevenlabs", "lmnt", "cartesia", "playht", "speechify", "resemble"}
+    # Widened from the old 2-provider SDK enum to the gateway's 5.
+    expected = {"hume", "elevenlabs", "cartesia", "speechify", "resemble"}
     assert {p.value for p in VoiceCloneProvider} == expected
 
 

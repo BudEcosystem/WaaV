@@ -600,53 +600,6 @@ async fn iflytek_full_integration_via_mock_endpoint() {
     assert_eq!(got, "hello world", "iFlytek full integration broken");
 }
 
-/// Prosa mock: streams audio as `Message::Binary`; replies with the `{"type":"result",...}` shape.
-async fn spawn_prosa_mock(transcript_value: &'static str) -> MockEndpoint {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let server = spawn_mock_server("prosa_mock", async move {
-        if let Ok((stream, _)) = listener.accept().await
-            && let Ok(ws) = tokio_tungstenite::accept_async(stream).await
-        {
-            let (mut write, mut read) = ws.split();
-            let msg = format!(
-                r#"{{"type":"result","transcript":"{transcript_value}","time_start":0.0,"time_end":1.0}}"#
-            );
-            let mut sent = false;
-            while let Some(Ok(frame)) = read.next().await {
-                if !sent && matches!(frame, Message::Binary(_)) {
-                    let _ = write.send(Message::Text(msg.clone().into())).await;
-                    sent = true;
-                }
-            }
-        }
-    });
-    MockEndpoint::new(port, server)
-}
-
-#[tokio::test]
-async fn prosa_full_integration_via_mock_endpoint() {
-    ensure_crypto();
-    let port = spawn_prosa_mock("hello world").await;
-    let endpoint = format!("ws://127.0.0.1:{port}");
-    // Prosa only dials the WS when the streaming model is selected (model field).
-    let std = StandardSTTConfig::from_base(STTConfig {
-        provider: "prosa_ai".into(),
-        api_key: "test-key".into(),
-        language: "id".into(),
-        sample_rate: 16000,
-        channels: 1,
-        punctuation: true,
-        encoding: "linear16".into(),
-        model: "stt-general-online".into(),
-    })
-    .with_endpoint_override(&endpoint);
-    let mut stt = create_stt_standard("prosa_ai", std).expect("build prosa via keystone");
-    let got = drive_and_capture(stt.as_mut()).await;
-    println!("Prosa mock e2e surfaced transcript: {got:?}");
-    assert_eq!(got, "hello world", "Prosa full integration broken");
-}
-
 /// Speechmatics mock: the client requests the `json` WS subprotocol, so we MUST echo it via
 /// `accept_hdr_async` (a plain accept fails the handshake). Replies with an `AddTranscript` message.
 async fn spawn_speechmatics_mock(transcript_value: &'static str) -> MockEndpoint {

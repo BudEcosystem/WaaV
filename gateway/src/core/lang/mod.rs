@@ -33,6 +33,7 @@
 
 pub mod mapper;
 pub mod mappers;
+pub mod models;
 pub mod notation;
 pub mod types;
 
@@ -42,6 +43,7 @@ pub use mapper::{
     LanguageMapper, MappedLanguage, NotationKind, ProviderLanguageSupport, to_provider_language,
 };
 pub use mappers::get_language_mapper;
+pub use models::{MODEL_LANGUAGE_SUPPORT, ModelLanguageRow, model_language_support};
 pub use notation::{NotationMap, resolve, resolve_alias};
 pub use types::{CanonicalLanguage, LANG_ALIASES};
 
@@ -87,6 +89,17 @@ pub struct LanguageSupportRow {
     pub example_cmn_cn: Option<String>,
     /// Example: canonical `en-US` rendered natively.
     pub example_en_us: Option<String>,
+    /// The canonical languages this provider accepts, as BCP-47 tokens.
+    ///
+    /// **Empty means "no gating"** — the provider takes any canonical language at its default
+    /// notation — NOT "supports nothing". The distinction matters to every consumer: a UI that
+    /// read empty as unsupported would offer no languages at all for the majority of providers,
+    /// which are exactly the broad BCP-47 ones.
+    ///
+    /// Added for FRD-018 Part III: the gate existed on `ProviderLanguageSupport` and was not on
+    /// the HTTP surface, so nothing outside this crate could answer "which languages does this
+    /// vendor take" — and budadmin rendered a free-text box.
+    pub supported: Vec<&'static str>,
 }
 
 /// The providers whose language handling the matrix enumerates (the ones with a registered mapper;
@@ -139,6 +152,7 @@ pub fn language_support_matrix() -> Vec<LanguageSupportRow> {
                 supports_auto: support.supports_auto,
                 example_cmn_cn: render(CanonicalLanguage::CmnCn),
                 example_en_us: render(CanonicalLanguage::EnUs),
+                supported: support.supported.iter().map(|l| l.as_bcp47()).collect(),
             }
         })
         .collect()
@@ -147,6 +161,88 @@ pub fn language_support_matrix() -> Vec<LanguageSupportRow> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 🔒 The checked-in snapshot still describes the mappers.
+    ///
+    /// `language_matrix.json` is what budapp reads to build its own copy of this data — the
+    /// settings form offers a language list instead of a free-text box, and needs to know which
+    /// vendors gate. Snapshotting rather than re-parsing is deliberate: a parser would be a
+    /// second implementation of the thing it describes, and could be wrong in the same direction
+    /// as the code it checks.
+    ///
+    /// Regenerate deliberately, by running this test with the file deleted and reading the
+    /// failure — never by editing the JSON to match.
+    #[test]
+    fn the_language_snapshot_still_matches_the_mappers() {
+        let canonical: Vec<&str> = CanonicalLanguage::all()
+            .iter()
+            .map(|c| c.as_bcp47())
+            .collect();
+        let computed = serde_json::json!({
+            "canonical": canonical,
+            "providers": language_support_matrix(),
+            "model_restrictions": models::MODEL_LANGUAGE_SUPPORT,
+        });
+
+        let snapshot: serde_json::Value =
+            serde_json::from_str(include_str!("language_matrix.json")).expect("snapshot is json");
+
+        assert_eq!(
+            snapshot["canonical"], computed["canonical"],
+            "the canonical language value space changed; regenerate language_matrix.json"
+        );
+        // The per-MODEL gate. budapp mirrors this so the settings form can stop offering 44
+        // languages for an English-only model; a drift here is a picker that lies.
+        assert_eq!(
+            snapshot["model_restrictions"], computed["model_restrictions"],
+            "the per-model language restrictions changed; regenerate language_matrix.json"
+        );
+
+        // Compared per provider so a failure names the one that moved rather than printing two
+        // 23-element arrays and leaving the reader to diff them.
+        let a = snapshot["providers"]
+            .as_array()
+            .expect("snapshot providers");
+        let b = computed["providers"]
+            .as_array()
+            .expect("computed providers");
+        assert_eq!(
+            a.len(),
+            b.len(),
+            "provider count changed: {} -> {}",
+            a.len(),
+            b.len()
+        );
+        for (want, got) in a.iter().zip(b.iter()) {
+            assert_eq!(
+                want, got,
+                "language support drifted for {}",
+                got["provider"]
+            );
+        }
+    }
+
+    #[test]
+    fn an_ungated_provider_means_unrestricted_not_unsupported() {
+        // The distinction every consumer has to get right: `supported: []` is "takes any
+        // canonical language", and 15 of 23 providers are in that state. Reading it as
+        // "supports nothing" would offer no languages at all for most vendors.
+        let matrix = language_support_matrix();
+        let ungated = matrix.iter().filter(|r| r.supported.is_empty()).count();
+        assert!(
+            ungated > 0,
+            "if every provider gates, the empty-means-any rule is dead code"
+        );
+
+        let deepgram = matrix.iter().find(|r| r.provider == "deepgram").unwrap();
+        assert!(deepgram.supported.is_empty());
+        assert!(
+            get_language_mapper("deepgram")
+                .support()
+                .supports(CanonicalLanguage::DeDe),
+            "an ungated provider must answer `supports` affirmatively for any language"
+        );
+    }
 
     #[test]
     fn map_language_resolves_then_maps() {

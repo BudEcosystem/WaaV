@@ -22,7 +22,7 @@ vi.stubGlobal('fetch', mockFetch);
 
 describe('Voice Cloning Types', () => {
   it('should have all voice clone providers defined', () => {
-    const expectedProviders: VoiceCloneProvider[] = ['elevenlabs', 'playht', 'resemble'];
+    const expectedProviders: VoiceCloneProvider[] = ['elevenlabs', 'resemble'];
     for (const provider of expectedProviders) {
       expect(VOICE_CLONE_PROVIDERS).toContain(provider);
     }
@@ -107,27 +107,6 @@ describe('Voice Cloning API', () => {
       expect(result.status).toBe('processing');
     });
 
-    it('should send correct request for PlayHT', async () => {
-      mockFetch.mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve({
-          voice_id: 'playht_voice_456',
-          name: 'PlayHT Voice',
-          provider: 'playht',
-          status: 'ready',
-          created_at: '2024-01-01T00:00:00Z',
-        }),
-      });
-
-      const result = await cloneVoice('http://localhost:3001', {
-        name: 'PlayHT Voice',
-        audioFiles: [new ArrayBuffer(2048)],
-        provider: 'playht',
-      });
-
-      expect(result.provider).toBe('playht');
-    });
-
     it('should send correct request for Resemble', async () => {
       mockFetch.mockResolvedValueOnce({
         ok: true,
@@ -171,7 +150,7 @@ describe('Voice Cloning API', () => {
         json: () => Promise.resolve({
           voices: [
             { voice_id: 'v1', name: 'Voice 1', provider: 'elevenlabs', status: 'ready', created_at: '2024-01-01T00:00:00Z' },
-            { voice_id: 'v2', name: 'Voice 2', provider: 'playht', status: 'ready', created_at: '2024-01-02T00:00:00Z' },
+            { voice_id: 'v2', name: 'Voice 2', provider: 'cartesia', status: 'ready', created_at: '2024-01-02T00:00:00Z' },
           ],
         }),
       });

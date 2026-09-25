@@ -90,16 +90,44 @@ const FIRST_RESULT_TIMEOUT: Duration = Duration::from_secs(45);
 /// What a batch run produced.
 pub struct Transcript {
     pub text: String,
+    /// What the provider could not honour about the configuration, for the caller's advisories.
+    pub config_warnings: Vec<String>,
+    /// Runner-up transcripts, when `alternatives` was requested and honoured.
+    pub alternatives: Vec<String>,
     /// True when a bound fired before the provider went quiet on its own, so the text may be
     /// short of the audio. Surfaced so the handler can say so rather than implying completeness.
     pub truncated: bool,
+    /// Per-word timings, when the provider returned them.
+    ///
+    /// Everything below this line used to be thrown away. The collector kept `r.transcript` and
+    /// dropped the rest of every `STTResult`, so `diarization`, `word_timestamps` and
+    /// `language_detection` reached the vendor, were honoured, came back — and could not be seen
+    /// by a caller. A setting whose result is invisible is indistinguishable from one that does
+    /// nothing, which is the defect this whole configuration surface exists to remove.
+    pub words: Vec<crate::core::stt::WordTiming>,
+    /// The distinct speakers the provider identified, when diarization was on.
+    pub speakers: Vec<crate::core::stt::SpeakerInfo>,
+    /// The language the provider says it heard. Distinct from the one the request asked for:
+    /// this is the answer `language_detection` exists to produce.
+    pub detected_language: Option<String>,
+    /// The provider's own measurement of the audio, when it reports one. The decoder's reading is
+    /// the fallback and is what `duration` carried before.
+    pub audio_duration: Option<f64>,
 }
 
 #[derive(Default)]
 struct Collector {
     segments: Vec<String>,
+    alternatives: Vec<String>,
+    words: Vec<crate::core::stt::WordTiming>,
+    speakers: Vec<crate::core::stt::SpeakerInfo>,
+    detected_language: Option<String>,
+    audio_duration: Option<f64>,
     last_result_at: Option<Instant>,
-    error: Option<String>,
+    /// The first error, already classified. Carrying the CLASSIFICATION rather than just the text
+    /// is what lets a vendor's "no such model/language combination" reach the caller as a 400
+    /// naming the value they chose, instead of a 502 that reads as "the vendor is down".
+    error: Option<TranscribeFailure>,
 }
 
 /// Run one file through a streaming provider and return the joined transcript.
@@ -111,8 +139,61 @@ pub async fn transcribe_once(
     stt_config: STTConfig,
     pcm: &PcmAudio,
 ) -> Result<Transcript, String> {
-    let mut provider = crate::core::stt::create_stt_provider(provider_name, stt_config)
-        .map_err(|e| format!("{e}"))?;
+    // The flat config with no canonical features — the pre-C3 shape, kept so existing callers
+    // are unaffected by the standard-config switch.
+    transcribe_once_standard(
+        provider_name,
+        crate::core::stt::standard::StandardSTTConfig::from_base(stt_config),
+        pcm,
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Why a transcription failed, split by WHOSE problem it is.
+///
+/// Everything used to collapse into one string and become a 502, which is right for a vendor
+/// outage and wrong for a misconfigured deployment: an operator who named a model the vendor's
+/// realtime API does not accept was told "Connection failed: Connection channel closed before
+/// session started" — a message about sockets, for a problem about a model, with no way to tell
+/// the two apart.
+#[derive(Debug, Clone)]
+pub enum TranscribeFailure {
+    /// The deployment cannot be served as configured. Fixable by whoever configured it, so it is
+    /// a 400 naming the field — not a 502 that reads as "the vendor is down".
+    Configuration(String),
+    /// The vendor failed, or the connection did. Genuinely upstream: 502.
+    Upstream(String),
+}
+
+impl std::fmt::Display for TranscribeFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Configuration(m) | Self::Upstream(m) => write!(f, "{m}"),
+        }
+    }
+}
+
+/// Transcribe once from the STANDARD config, so a deployment's canonical features reach the
+/// provider (FRD-018 Part III C3).
+///
+/// `create_stt_provider` cannot carry `features` — the flat struct has no room for them — so
+/// every diarization, redaction and keyterm setting was dropped before it reached a vendor.
+/// Providers without a `from_standard` arm fall back to the flat path inside `create_stt_standard`.
+pub async fn transcribe_once_standard(
+    provider_name: &str,
+    std_config: crate::core::stt::standard::StandardSTTConfig,
+    pcm: &PcmAudio,
+) -> Result<Transcript, TranscribeFailure> {
+    // The PRERECORDED factory: this is a file, not a live session, so a vendor with a batch API
+    // gets to use it. Every vendor without one resolves to exactly the same provider as before.
+    //
+    // Provider CONSTRUCTION is also where a bad configuration is caught — before a socket is
+    // opened, while the offending value is still in hand. Keeping its error kind separate from
+    // everything after it is what lets the handler answer 400 instead of 502.
+    let mut provider =
+        crate::core::stt::standard::create_stt_standard_prerecorded(provider_name, std_config)
+            .map_err(classify)?;
 
     let collector = Arc::new(Mutex::new(Collector::default()));
 
@@ -124,8 +205,8 @@ pub async fn transcribe_once(
         Box::pin(async move {
             let mut c = sink.lock().await;
             c.last_result_at = Some(Instant::now());
-            if r.is_final && !r.transcript.trim().is_empty() {
-                c.segments.push(r.transcript);
+            if r.is_final {
+                accumulate(&mut c, r);
             }
         })
     });
@@ -133,13 +214,13 @@ pub async fn transcribe_once(
     let sink = Arc::clone(&collector);
     let on_error: STTErrorCallback = Arc::new(move |e| {
         let sink = Arc::clone(&sink);
-        let msg = e.to_string();
+        let failure = classify(e);
         Box::pin(async move {
             let mut c = sink.lock().await;
             // First error wins: later ones are usually consequences of the first (a closed
             // socket reporting every subsequent write), and the first names the real cause.
             if c.error.is_none() {
-                c.error = Some(msg);
+                c.error = Some(failure);
             }
         })
     });
@@ -147,12 +228,15 @@ pub async fn transcribe_once(
     provider
         .on_result(on_result)
         .await
-        .map_err(|e| format!("{e}"))?;
+        .map_err(|e| TranscribeFailure::Upstream(format!("{e}")))?;
     provider
         .on_error(on_error)
         .await
-        .map_err(|e| format!("{e}"))?;
-    provider.connect().await.map_err(|e| format!("{e}"))?;
+        .map_err(|e| TranscribeFailure::Upstream(format!("{e}")))?;
+    provider
+        .connect()
+        .await
+        .map_err(|e| TranscribeFailure::Upstream(format!("{e}")))?;
 
     let started = Instant::now();
     let frame_samples = (pcm.sample_rate as usize * FRAME_MS / 1000).max(1);
@@ -169,7 +253,7 @@ pub async fn transcribe_once(
         }
         if let Err(e) = provider.send_audio(bytes.into()).await {
             let _ = provider.disconnect().await;
-            return Err(format!("{e}"));
+            return Err(TranscribeFailure::Upstream(format!("{e}")));
         }
     }
     debug!(
@@ -178,7 +262,15 @@ pub async fn transcribe_once(
         "batch audio sent; waiting for the provider to settle"
     );
 
-    let truncated = wait_for_settle(&collector, started).await;
+    // A request/response provider answers exactly once, on close. Waiting for it to go quiet
+    // waits for a stream that does not exist: the loop below runs out the full 45-second
+    // first-result timeout and then reports a complete transcript as truncated. Close instead.
+    let truncated = if provider.is_request_response() {
+        debug!("provider answers on close; skipping the settle wait");
+        false
+    } else {
+        wait_for_settle(&collector, started).await
+    };
 
     // Disconnect BEFORE reading the transcript: several providers flush a trailing final
     // segment on close, and reading first would drop the last few words of every file.
@@ -193,6 +285,7 @@ pub async fn transcribe_once(
     }
 
     Ok(Transcript {
+        config_warnings: provider.config_warnings(),
         text: c
             .segments
             .join(" ")
@@ -200,7 +293,75 @@ pub async fn transcribe_once(
             .collect::<Vec<_>>()
             .join(" "),
         truncated,
+        alternatives: c.alternatives.clone(),
+        words: c.words.clone(),
+        speakers: c.speakers.clone(),
+        detected_language: c.detected_language.clone(),
+        audio_duration: c.audio_duration,
     })
+}
+
+/// Fold one FINAL result into the collector.
+///
+/// Everything but `segments` used to be discarded here: the collector kept `r.transcript` and
+/// dropped each result's words, speakers, detected language and duration, so `diarization`,
+/// `word_timestamps` and `language_detection` reached the vendor, were honoured, came back — and
+/// could not be seen by a caller. A setting whose result is invisible is indistinguishable from
+/// one that does nothing.
+///
+/// Three details easy to get wrong in the other direction:
+///
+/// * **An empty transcript still carries metadata.** A diarized result can name speakers for
+///   audio the provider scored as silence, and a detected language is an answer whether or not
+///   anything was said. Only the TEXT is skipped when blank.
+/// * **Speakers are deduplicated by id.** A multi-result provider names the same speaker in every
+///   chunk, and a raw extend would report `speaker_0` fifteen times.
+/// * **The FIRST language and duration win.** Later results restate them, and a provider that
+///   changes its mind mid-file is describing a chunk, not the file.
+fn accumulate(c: &mut Collector, r: STTResult) {
+    if let Some(alternatives) = r.alternatives {
+        c.alternatives.extend(alternatives);
+    }
+    if let Some(words) = r.words {
+        c.words.extend(words);
+    }
+    if let Some(speakers) = r.speakers {
+        for speaker in speakers {
+            if !c
+                .speakers
+                .iter()
+                .any(|s| s.speaker_id == speaker.speaker_id)
+            {
+                c.speakers.push(speaker);
+            }
+        }
+    }
+    if c.detected_language.is_none() {
+        c.detected_language = r.detected_language;
+    }
+    if c.audio_duration.is_none() {
+        c.audio_duration = r.audio_duration;
+    }
+    if !r.transcript.trim().is_empty() {
+        c.segments.push(r.transcript);
+    }
+}
+
+/// Whose problem is this error?
+///
+/// One rule for both the construction path and the runtime one, because the answer does not
+/// depend on when the failure happened. A configuration error is fixable by whoever configured
+/// the deployment — a model id that is not a realtime model, a language the chosen model does not
+/// serve — and reaches them as a 400 naming the value. Everything else is upstream: 502.
+///
+/// `InvalidAudioFormat` is grouped with configuration because it describes the request's own
+/// audio, which the caller controls.
+fn classify(e: crate::core::stt::STTError) -> TranscribeFailure {
+    match e {
+        crate::core::stt::STTError::ConfigurationError(m)
+        | crate::core::stt::STTError::InvalidAudioFormat(m) => TranscribeFailure::Configuration(m),
+        other => TranscribeFailure::Upstream(other.to_string()),
+    }
 }
 
 /// Wait until the provider stops producing, or a bound fires. Returns whether a bound fired.
@@ -250,7 +411,7 @@ pub async fn submit_batch(
             StatusCode::BAD_REQUEST,
             &format!(
                 "batch transcription is not supported for provider '{provider}' \
-                 (supported: deepgram, assemblyai, openai)"
+                 (supported: deepgram, assemblyai, openai, elevenlabs)"
             ),
         );
     }
@@ -397,6 +558,11 @@ async fn build_submission(
         "openai" => {
             build_openai_transcription(req, api_key, base_url.unwrap_or("https://api.openai.com"))
         }
+        "elevenlabs" => crate::core::stt::batch::build_elevenlabs_transcription(
+            req,
+            api_key,
+            base_url.unwrap_or("https://api.elevenlabs.io"),
+        ),
         "assemblyai" => {
             let host = base_url.unwrap_or("https://api.assemblyai.com");
             // URL source → pass through; bytes source → upload first to obtain an audio_url.
@@ -574,6 +740,14 @@ pub async fn transcribe_self_hosted(
     if let Some(t) = settings.temperature {
         form = form.text("temperature", t.to_string());
     }
+    // The backend speaks this API, so the caller's own choice goes through as it was sent.
+    for g in settings.timestamp_granularities.iter().flatten() {
+        let name = match g {
+            waav_openai_audio::transcription::TimestampGranularity::Word => "word",
+            waav_openai_audio::transcription::TimestampGranularity::Segment => "segment",
+        };
+        form = form.text("timestamp_granularities[]", name);
+    }
 
     let client = reqwest::Client::builder()
         .timeout(OVERALL_DEADLINE)
@@ -706,10 +880,7 @@ mod tests {
             yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
-            lmnt_api_key: None,
             groq_api_key: None,
-            playht_api_key: None,
-            playht_user_id: None,
             ibm_watson_api_key: None,
             ibm_watson_instance_id: None,
             ibm_watson_region: None,
@@ -865,5 +1036,106 @@ mod tests {
             error_chain.contains("redirect URL rejected"),
             "unexpected redirect error: {error_chain}"
         );
+    }
+}
+
+#[cfg(test)]
+mod collector_tests {
+    use super::{Collector, accumulate};
+    use crate::core::stt::{STTResult, SpeakerInfo, WordTiming};
+
+    fn word(w: &str, start: f64, speaker: Option<&str>) -> WordTiming {
+        WordTiming {
+            word: w.into(),
+            start,
+            end: start + 0.3,
+            confidence: None,
+            speaker_id: speaker.map(str::to_string),
+            logprob: None,
+        }
+    }
+
+    #[test]
+    fn what_the_vendor_returned_survives_to_the_caller() {
+        // The defect: this metadata was parsed out of every vendor response and thrown away, so
+        // diarization and word timestamps reached the vendor, worked, and were invisible.
+        let mut c = Collector::default();
+        let mut r = STTResult::new("hello world".into(), true, true, 0.9);
+        r.words = Some(vec![word("hello", 0.0, Some("speaker_0"))]);
+        r.speakers = Some(vec![SpeakerInfo::new("speaker_0".into())]);
+        r.detected_language = Some("en".into());
+        r.audio_duration = Some(17.5);
+        accumulate(&mut c, r);
+
+        assert_eq!(c.segments, vec!["hello world"]);
+        assert_eq!(c.words.len(), 1);
+        assert_eq!(c.speakers.len(), 1);
+        assert_eq!(c.detected_language.as_deref(), Some("en"));
+        assert_eq!(c.audio_duration, Some(17.5));
+    }
+
+    #[test]
+    fn a_silent_result_still_carries_its_metadata() {
+        // Only the TEXT is skipped when blank. A diarized result can name speakers for audio the
+        // provider scored as silence, and a detected language is an answer either way.
+        let mut c = Collector::default();
+        let mut r = STTResult::new("   ".into(), true, true, 0.0);
+        r.speakers = Some(vec![SpeakerInfo::new("speaker_1".into())]);
+        r.detected_language = Some("th".into());
+        accumulate(&mut c, r);
+
+        assert!(
+            c.segments.is_empty(),
+            "blank text must not become a segment"
+        );
+        assert_eq!(c.speakers.len(), 1);
+        assert_eq!(c.detected_language.as_deref(), Some("th"));
+    }
+
+    #[test]
+    fn speakers_are_deduplicated_across_results() {
+        // A multi-result provider names the same speaker in every chunk; a raw extend would
+        // report speaker_0 once per chunk.
+        let mut c = Collector::default();
+        for text in ["one", "two", "three"] {
+            let mut r = STTResult::new(text.into(), true, true, 0.9);
+            r.speakers = Some(vec![
+                SpeakerInfo::new("speaker_0".into()),
+                SpeakerInfo::new("speaker_1".into()),
+            ]);
+            accumulate(&mut c, r);
+        }
+        assert_eq!(c.speakers.len(), 2);
+        assert_eq!(c.segments.len(), 3);
+    }
+
+    #[test]
+    fn words_accumulate_in_order_rather_than_deduplicating() {
+        // Unlike speakers, a repeated word is a real second utterance of it.
+        let mut c = Collector::default();
+        for (text, w) in [("life moves", "life"), ("pretty fast", "pretty")] {
+            let mut r = STTResult::new(text.into(), true, true, 0.9);
+            r.words = Some(vec![word(w, 0.0, None), word(w, 1.0, None)]);
+            accumulate(&mut c, r);
+        }
+        assert_eq!(c.words.len(), 4);
+    }
+
+    #[test]
+    fn the_first_language_and_duration_win() {
+        // Later results restate them; one that changes its mind is describing a chunk.
+        let mut c = Collector::default();
+        let mut first = STTResult::new("a".into(), true, true, 0.9);
+        first.detected_language = Some("en".into());
+        first.audio_duration = Some(10.0);
+        accumulate(&mut c, first);
+
+        let mut second = STTResult::new("b".into(), true, true, 0.9);
+        second.detected_language = Some("fr".into());
+        second.audio_duration = Some(99.0);
+        accumulate(&mut c, second);
+
+        assert_eq!(c.detected_language.as_deref(), Some("en"));
+        assert_eq!(c.audio_duration, Some(10.0));
     }
 }

@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # WaaV Gateway Provider Test Script
-# Tests all 71 providers (32 STT + 37 TTS + 2 Realtime)
+# Tests all 67 providers (31 STT + 34 TTS + 2 Realtime)
 #
 # Usage: ./test_providers.sh [gateway_url]
 # Default: http://localhost:3001
@@ -71,7 +71,7 @@ echo "Done"
 echo ""
 
 # =====================================================
-# STT Providers (32)
+# STT Providers (31)
 # =====================================================
 STT_PROVIDERS=(
     "deepgram:DEEPGRAM_API_KEY"
@@ -104,12 +104,11 @@ STT_PROVIDERS=(
     "amivoice:AMIVOICE_APP_KEY"
     "fpt-ai:FPT_AI_API_KEY"
     "viettel-ai:VIETTEL_AI_TOKEN"
-    "prosa-ai:PROSA_API_KEY"
     "nectec:NECTEC_API_KEY"
 )
 
 # =====================================================
-# TTS Providers (37)
+# TTS Providers (34)
 # =====================================================
 TTS_PROVIDERS=(
     "deepgram:DEEPGRAM_API_KEY"
@@ -121,8 +120,6 @@ TTS_PROVIDERS=(
     "aws-polly:AWS_ACCESS_KEY_ID"
     "ibm-watson:IBM_WATSON_API_KEY"
     "hume:HUME_API_KEY"
-    "lmnt:LMNT_API_KEY"
-    "playht:PLAYHT_API_KEY"
     "gnani:GNANI_API_KEY"
     "murf:MURF_API_KEY"
     "wellsaid:WELLSAID_API_KEY"
@@ -147,7 +144,6 @@ TTS_PROVIDERS=(
     "zalo-ai:ZALO_API_KEY"
     "fpt-ai:FPT_AI_API_KEY"
     "viettel-ai:VIETTEL_AI_TOKEN"
-    "prosa-ai:PROSA_API_KEY"
     "nectec:NECTEC_API_KEY"
 )
 

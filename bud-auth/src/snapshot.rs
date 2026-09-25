@@ -130,6 +130,19 @@ impl BudAuth {
         self.snapshot.load().voice.get(endpoint_id).map(Arc::clone)
     }
 
+    /// Every voice endpoint in the current generation.
+    ///
+    /// A copy of the `Arc`s, so a long walk (the voice-catalog publisher calls a vendor per
+    /// entry) never holds the snapshot and never sees a half-applied mutation.
+    pub fn voice_endpoints(&self) -> Vec<(Arc<str>, Arc<VoiceEndpoint>)> {
+        self.snapshot
+            .load()
+            .voice
+            .iter()
+            .map(|(id, e)| (Arc::clone(id), Arc::clone(e)))
+            .collect()
+    }
+
     pub fn voice_count(&self) -> usize {
         self.snapshot.load().voice.len()
     }

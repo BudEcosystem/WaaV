@@ -5,7 +5,7 @@ WaaV realtime / S2S REAL-VENDOR live-validation tool.
   python3 scripts/realtime_vendor_validation.py <provider> [--gateway-port N]
 
 This is the TURNKEY bridge across the credential boundary: an operator who has a
-vendor key validates ANY of WaaV's 12 realtime providers against the REAL vendor
+vendor key validates ANY of WaaV's 11 realtime providers against the REAL vendor
 endpoint in one command. It drives the SAME WaaV `/realtime` WebSocket a real
 client uses, so a PASS means the gateway's wire mapping round-trips end-to-end
 against the live vendor.
@@ -78,7 +78,7 @@ PCM_16K = "/tmp/question_16k.raw"
 #   config        : EXTRA fields merged into the `{type:config, provider:…}` message
 #                   beyond provider/model/voice/instructions (e.g. transcribe_input).
 #   model/voice   : a known-good example (model is REQUIRED for some providers —
-#                   azure deployment, elevenlabs agent_id, speechmatics template).
+#                   azure deployment, elevenlabs agent_id).
 #   model_env     : if set, the operator may supply `model` via this env var
 #                   (used for resources that are account-specific, e.g.
 #                   ELEVENLABS_AGENT_ID, INWORLD_SESSION_ID, ULTRAVOX_MODEL).
@@ -266,28 +266,6 @@ PROVIDERS = {
             "live capture.",
         ],
     },
-    "speechmatics": {
-        "key_env": "SPEECHMATICS_API_KEY",
-        "extra_env": {},
-        "sample_rate": 16000,
-        "pattern": "audio",
-        # model == a Flow PORTAL template_id (the agent's persona/LLM/voice binding).
-        "model": "flow-service-assistant-amelia",
-        "model_env": "SPEECHMATICS_TEMPLATE_ID",
-        "voice": "amelia",
-        "config": {"modalities": ["audio", "text"]},
-        "endpoint": "wss://flow.api.speechmatics.com/v1/flow",
-        "auth": "Authorization: Bearer <SPEECHMATICS_API_KEY>  (a JWT / temp token)",
-        "needs": "a Flow PORTAL template_id (set SPEECHMATICS_TEMPLATE_ID). The key "
-                 "is passed AS the Bearer token — supply a JWT / pre-minted temp "
-                 "token; a static api-key may be rejected (no in-gateway exchange).",
-        "flags": [
-            "WaaV does NOT perform the management-platform token EXCHANGE — a "
-            "static api-key passed as Bearer may 401; a JWT/temp token works.",
-            "Connect PATH /v1/flow + the OUTPUT sample rate (assumed 16 kHz) + the "
-            "transcript field names are documented, not byte-verified.",
-        ],
-    },
     "hume": {
         "key_env": "HUME_API_KEY",
         "extra_env": {},
@@ -331,7 +309,7 @@ PROVIDERS = {
 # Pretty-print order for the table (matches the prompt's provider order).
 PROVIDER_ORDER = [
     "openai", "azure", "grok", "inworld", "deepgram", "elevenlabs",
-    "gemini", "ultravox", "nova_sonic", "speechmatics", "hume", "yandex",
+    "gemini", "ultravox", "nova_sonic", "hume", "yandex",
 ]
 
 
@@ -414,7 +392,7 @@ def client_side_env_for(provider: str) -> dict:
     (account-specific resources the gateway reads from the client config, not from
     server config). REQUIRED in BOTH spawn and attach mode. Only those with NO
     usable default count: elevenlabs agent_id (no default). Azure deployment /
-    speechmatics template / ultravox model have working defaults ⇒ optional.
+    ultravox model have working defaults ⇒ optional.
     """
     p = PROVIDERS[provider]
     req = {}
@@ -503,8 +481,7 @@ def gateway_env(provider: str, port: int) -> dict:
         ("grok", "GROK_REALTIME_URL"), ("inworld", "INWORLD_REALTIME_URL"),
         ("deepgram", "DEEPGRAM_REALTIME_URL"), ("elevenlabs", "ELEVENLABS_REALTIME_URL"),
         ("gemini", "GEMINI_REALTIME_URL"), ("ultravox", "ULTRAVOX_REALTIME_URL"),
-        ("hume", "HUME_REALTIME_URL"), ("speechmatics", "SPEECHMATICS_REALTIME_URL"),
-        ("yandex", "YANDEX_REALTIME_URL"),
+        ("hume", "HUME_REALTIME_URL"), ("yandex", "YANDEX_REALTIME_URL"),
     ]:
         keep = (canon == provider) and PROVIDERS[provider].get("requires_override")
         if not keep and var in env:

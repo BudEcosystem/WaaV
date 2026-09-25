@@ -179,20 +179,34 @@ fn score_voice(d: &VoiceDescriptor, v: &Voice) -> i32 {
         }
     }
 
-    // age: matched against labels embedded in name/description-bearing fields. The
-    // unified Voice struct doesn't carry age directly, so we match the age token in
-    // the name/id (best-effort; ElevenLabs voices often encode it).
+    // age: the vendor's own age label when it has one (ElevenLabs labels every voice), else
+    // an age word in the name/id. The name-only rule was all there was, and ElevenLabs names
+    // ("Sarah", "George") never carry one — so on the one vendor that labels age, the Age
+    // control matched nothing.
     if let Some(age) = d.age {
-        let hay = format!("{} {}", v.name.to_lowercase(), v.id.to_lowercase());
-        if age_token_matches(&hay, age) {
+        let matched = match Age::from_str(&v.age) {
+            Some(labelled) => labelled == age,
+            None => {
+                let hay = format!("{} {}", v.name.to_lowercase(), v.id.to_lowercase());
+                age_token_matches(&hay, age)
+            }
+        };
+        if matched {
             score += W_AGE;
         }
     }
 
-    // style/timbre: substring match against name + id (the catalog's descriptive
-    // surface). Deepgram ids/names and ElevenLabs names carry timbre words.
+    // style/timbre: substring match against the voice's descriptive surface — name, id, and
+    // the vendor's own description and use case. Name + id alone missed ElevenLabs entirely:
+    // "warm", "calm", "deep" live in its `descriptive` label, never in "Sarah".
     if let Some(style) = d.style.as_ref().filter(|s| !s.trim().is_empty()) {
-        let hay = format!("{} {}", v.name.to_lowercase(), v.id.to_lowercase());
+        let hay = format!(
+            "{} {} {} {}",
+            v.name.to_lowercase(),
+            v.id.to_lowercase(),
+            v.description.to_lowercase(),
+            v.use_case.to_lowercase()
+        );
         if hay.contains(&style.trim().to_lowercase()) {
             score += W_STYLE;
         }
@@ -295,7 +309,50 @@ mod tests {
             accent: accent.to_string(),
             gender: gender.to_string(),
             language: language.to_string(),
+            ..Default::default()
         }
+    }
+
+    /// ElevenLabs-shaped: plain names, with age and timbre only in the labels.
+    fn labelled(id: &str, name: &str, gender: &str, age: &str, description: &str) -> Voice {
+        Voice {
+            age: age.into(),
+            description: description.into(),
+            ..v(id, name, "american", gender, "en")
+        }
+    }
+
+    #[test]
+    fn age_and_timbre_match_the_vendors_labels_not_just_the_name() {
+        let catalog = vec![
+            labelled(
+                "a",
+                "George",
+                "male",
+                "middle_aged",
+                "warm, captivating storyteller",
+            ),
+            labelled(
+                "b",
+                "Liam",
+                "male",
+                "young",
+                "energetic, social media creator",
+            ),
+        ];
+        let young = VoiceDescriptor {
+            gender: Some(Gender::Male),
+            age: Some(Age::Young),
+            ..Default::default()
+        };
+        assert_eq!(resolve_voice(&young, &catalog, "default").voice_id, "b");
+
+        let warm = VoiceDescriptor {
+            gender: Some(Gender::Male),
+            style: Some("warm".into()),
+            ..Default::default()
+        };
+        assert_eq!(resolve_voice(&warm, &catalog, "default").voice_id, "a");
     }
 
     /// A Deepgram-shaped stub catalog (Aura naming, region accent, gender tag).

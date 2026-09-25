@@ -1,6 +1,6 @@
 # Bud WaaV Provider Integration Status & Playbook
 
-> **Last Updated:** 2026-01-14
+> **Last Updated:** 2026-09-25
 > **Scope:** Cloud API providers only (no self-hosted/local inference engines)
 
 ---
@@ -10,8 +10,9 @@
 | Metric | Count |
 |--------|-------|
 | **Total Cloud Providers** | 70 |
-| **Implemented** | 46 |
+| **Implemented** | 43 |
 | **Blocked** | 10 |
+| **Removed** | 3 |
 | **In Progress** | 0 |
 | **Yet to Start** | 14 |
 | **Estimated Days Remaining** | 7-11 |
@@ -26,6 +27,7 @@
 | In Progress | `[IN_PROGRESS]` | Currently being implemented |
 | Yet to Start | `[TODO]` | Not started |
 | Blocked | `[BLOCKED]` | Waiting on external dependency |
+| Removed | `[REMOVED]` | Was implemented; deleted because the vendor no longer operates |
 | Research | `[RESEARCH]` | Researching API/documentation |
 
 ---
@@ -364,8 +366,8 @@ RUSTFLAGS="-Zsanitizer=address" cargo +nightly test [provider]
 
 | # | Provider | Type | Status | Start Date | Notes |
 |---|----------|------|--------|------------|-------|
-| 9 | LMNT | TTS+Clone | [COMPLETE] | 2026-01-07 | Ultra-low latency (~150ms), 22+ languages, voice cloning |
-| 10 | Play.ht | TTS+Clone | [COMPLETE] | 2026-01-07 | HTTP streaming (~190ms), 36+ languages, voice cloning, PlayDialog multi-turn |
+| 9 | LMNT | TTS+Clone | [REMOVED] | 2026-01-07 | Removed 2026-09-25: the vendor no longer operates, so the integration was deleted from the gateway |
+| 10 | Play.ht | TTS+Clone | [REMOVED] | 2026-01-07 | Removed 2026-09-25: the vendor no longer operates, so the integration was deleted from the gateway |
 | 11 | Murf.ai | TTS+Clone | [DONE] | 2026-01-13 | HTTP streaming, Falcon/Gen2 models, 12 regional endpoints |
 | 12 | WellSaid Labs | TTS+Clone | [DONE] | 2026-01-13 | HTTP streaming, 200+ avatars, 20+ languages, Legacy/Caruso models |
 | 13 | Resemble AI | TTS+A2A+Clone | [DONE] | 2026-01-13 | HTTP streaming, 3 models, 149+ languages, voice cloning |
@@ -440,7 +442,7 @@ RUSTFLAGS="-Zsanitizer=address" cargo +nightly test [provider]
 | 47 | Zalo AI | TTS | [DONE] | 2026-01-14 | VNG Corporation Vietnamese TTS. 4 voices (Northern/Southern accents), 35 tests. REST API with two-step synthesis. WAV 16kHz output. See docs/providers/zalo_ai.md |
 | 48 | FPT.AI | STT+TTS | [DONE] | 2026-01-14 | FPT Corporation Vietnamese STT+TTS. 7 voices (BanMai, LanNhi, LeMinh, MyAn, ThuMinh, GiaHuy, LinhSan). STT: REST file upload (non-streaming), 8/16kHz mono. TTS: REST two-step synthesis, MP3/WAV. 80 tests total (46 TTS + 34 STT). See docs/providers/fpt_ai.md |
 | 49 | Viettel AI | STT+TTS | [DONE] | 2026-01-14 | Viettel Group Vietnamese STT+TTS. 12 voices (Northern/Central/Southern accents), 96% STT accuracy. TTS: REST API, WAV 16kHz output, 0.5-2.0x speed control. STT: REST multipart file upload. 170+ tests total (56 TTS + STT). See docs/providers/viettel_ai.md |
-| 50 | Prosa.ai | STT+TTS | [DONE] | 2026-01-14 | Indonesian AI (Prosa.ai) STT+TTS. STT: WebSocket streaming + REST async API, stt-general and stt-general-online models. TTS: 9 voices (Dimas, Ocha, Dini, Kinanti, Darah, Abimana, Roger, Jennifer), pitch/tempo control, opus/mp3/wav formats. 203 tests total. See docs/providers/prosa_ai.md |
+| 50 | Prosa.ai | STT+TTS | [REMOVED] | 2026-01-14 | Removed 2026-09-25: the vendor no longer operates, so the integration was deleted from the gateway |
 | 51 | Kata.ai | STT+TTS | [BLOCKED] | 2026-01-14 | Enterprise-only conversational AI platform (Indonesia). No public API documentation available. Kata Voice requires sales contact for access. Voice APIs integrated into their chatbot platform, not standalone STT/TTS. Contact business@kata.ai for enterprise pricing. See docs/providers/kata_ai.md |
 | 52 | NECTEC | STT+TTS | [DONE] | 2026-01-17 | Thai government AI for Thai platform (NECTEC). STT: Partii4/Partii5 engines, REST file upload, WAV 16kHz mono, max 30 seconds. TTS: VAJA9 engine, REST two-step synthesis (POST for URL, GET for audio), WAV 22kHz PCM16, male/female voices, 300-char limit with auto-chunking. Free government-backed service. 83 tests total (39 STT + 44 TTS). See docs/providers/nectec.md |
 | 53 | Botnoi Voice | TTS | [TODO] | - | Thailand |
@@ -523,6 +525,8 @@ These require the Python inference engine to be completed first:
 ---
 
 ## Session Log
+
+> The LMNT, Play.ht and Prosa.ai entries below are historical: those integrations were removed on 2026-09-25.
 
 ### Session: 2026-01-13 (Update 27)
 **Status:** iFlytek (科大讯飞) STT+TTS implementation complete
@@ -1549,8 +1553,6 @@ These require the Python inference engine to be completed first:
 | IBM Watson TTS | https://cloud.ibm.com/apidocs/text-to-speech |
 | Groq | https://console.groq.com/docs |
 | Hume AI | https://dev.hume.ai |
-| LMNT | https://docs.lmnt.com |
-| Play.ht | https://docs.play.ht |
 | Speechmatics | https://docs.speechmatics.com |
 | Gladia | https://docs.gladia.io |
 | Rev AI | https://docs.rev.ai |

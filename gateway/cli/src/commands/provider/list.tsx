@@ -61,14 +61,12 @@ const PROVIDER_METADATA: Record<string, { description: string; tags: string[] }>
   krutrim: { description: 'Krutrim AI (Indian)', tags: ['indian', 'ola'] },
   vakyansh: { description: 'Vakyansh (Indian open-source)', tags: ['indian', 'open-source'] },
   gladia: { description: 'Gladia transcription', tags: ['fast', 'accurate'] },
-  lmnt: { description: 'LMNT speech recognition', tags: ['low-latency'] },
   eleven_labs: { description: 'ElevenLabs STT', tags: ['premium'] },
   hume: { description: 'Hume AI (emotional)', tags: ['emotion', 'empathic'] },
 
   // TTS Providers
   elevenlabs: { description: 'ElevenLabs voice synthesis', tags: ['premium', 'voice-cloning', 'realistic'] },
   aws_polly: { description: 'Amazon Polly', tags: ['aws', 'enterprise', 'neural'] },
-  play_ht: { description: 'PlayHT voice generation', tags: ['voice-cloning', 'realistic'] },
   murf: { description: 'Murf AI voices', tags: ['professional', 'studio'] },
   lovo: { description: 'LOVO AI voice generator', tags: ['video', 'marketing'] },
   resemble: { description: 'Resemble AI voice cloning', tags: ['voice-cloning', 'custom'] },

@@ -28,12 +28,12 @@
 
 **WaaV Gateway** is a high-performance, real-time voice processing server built in Rust. It provides a unified interface for Speech-to-Text (STT) and Text-to-Speech (TTS) services across multiple cloud providers, with advanced audio processing capabilities including noise suppression and intelligent turn detection. WaaV features a powerful DAG-based pipeline engine for building custom voice processing workflows with conditional routing and multi-provider orchestration.
 
-WaaV eliminates the complexity of integrating with multiple voice AI providers by providing a single WebSocket and REST API that abstracts away provider-specific implementations. Switch between Deepgram, ElevenLabs, Google Cloud, Azure, Cartesia, OpenAI, Amazon Transcribe, Amazon Polly, IBM Watson, Groq, or LMNT with a simple configuration change—no code modifications required.
+WaaV eliminates the complexity of integrating with multiple voice AI providers by providing a single WebSocket and REST API that abstracts away provider-specific implementations. Switch between Deepgram, ElevenLabs, Google Cloud, Azure, Cartesia, OpenAI, Amazon Transcribe, Amazon Polly, IBM Watson, or Groq with a simple configuration change—no code modifications required.
 
 **Key Highlights:**
 - **[70+ Cloud Providers](gateway/docs/SUPPORTED_PROVIDERS.md)** - Global STT/TTS coverage including Deepgram, ElevenLabs, Google Cloud, Azure, OpenAI, plus regional providers for India (Sarvam, Gnani, Bhashini), China (Alibaba, Baidu, Tencent, iFlytek), Southeast Asia (Zalo, FPT, NECTEC), and more
 - **DAG Pipeline Engine** - Build custom voice workflows with conditional routing, multi-provider orchestration, and data transformations
-- **Realtime / Speech-to-Speech (12 providers)** - Full-duplex audio streaming on a shared S2S scaffold: OpenAI `gpt-realtime` (GA), Hume EVI, Azure, Grok, Inworld, Deepgram Voice Agent, ElevenLabs Conversational AI, Gemini Live, Ultravox, AWS Nova Sonic, Speechmatics Flow, Yandex — with reconnect/replay resilience and persistent reuse as a DAG node
+- **Realtime / Speech-to-Speech (11 providers)** - Full-duplex audio streaming on a shared S2S scaffold: OpenAI `gpt-realtime` (GA), Hume EVI, Azure, Grok, Inworld, Deepgram Voice Agent, ElevenLabs Conversational AI, Gemini Live, Ultravox, AWS Nova Sonic, Yandex — with reconnect/replay resilience and persistent reuse as a DAG node
 - **WebSocket Streaming** - Real-time bidirectional audio with sub-second latency
 - **LiveKit Integration** - WebRTC rooms and SIP telephony support
 - **Advanced Audio Processing** - DeepFilterNet noise suppression, ONNX-based turn detection
@@ -78,13 +78,13 @@ WaaV eliminates the complexity of integrating with multiple voice AI providers b
 - **Canonical mappers (gateway-side, one source of truth).** `language` — one `en-US` works on every provider (`core/lang/`, 49 region-qualified BCP-47 locales + an alias resolver, mapping the 8-way Chinese fork / Sarvam `od-IN` / ElevenLabs ISO-639-1 downgrade / Baidu numeric / … per provider). `emotion`/`style` — a 44-variant canonical set where `emotion="excited"` becomes a Cartesia emotion array, an OpenAI `instructions` string, an ElevenLabs `[excited]` inline tag, or an Azure SSML style. `voice` — a `VoiceDescriptor{gender,locale,age,style}` resolved to a real provider `voice_id` over the unified `/voices` catalog. Unsupported → a typed `config_warning`, never a 400.
 - **`bud.agent(...)` — a full voice agent in ~5 lines.** The flagship helper drives the gateway's built-in STT→LLM→TTS loop with reasoning, barge-in, and latency-filler, yielding one unified `transcript | audio | warning` event stream. Beginner-first DX that beats Pipecat's per-service wiring.
 - **Proxy / alias model names.** A server-config alias maps a logical name to a full `{stt,tts,llm,dag}` bundle — `bud.agent(alias="support-bot")`. Re-point what "support-bot" means (swap providers, A/B, cost-tier) by editing server config; the client never changes (proven live: identical payload, provider swapped).
-- **All call types, one SDK surface.** `bud.realtime(provider=…)` speaks the gateway's provider-agnostic `/realtime` protocol for **all 12 S2S providers**; `bud.transcribe_batch(...)` for async/prerecorded; `bud.voices.clone(...)` for instant + professional voice cloning; canonical in-stream **translation** (`translation={target_languages:[…]}`). 
+- **All call types, one SDK surface.** `bud.realtime(provider=…)` speaks the gateway's provider-agnostic `/realtime` protocol for **all 11 S2S providers**; `bud.transcribe_batch(...)` for async/prerecorded; `bud.voices.clone(...)` for instant + professional voice cloning; canonical in-stream **translation** (`translation={target_languages:[…]}`). 
 - **Drift-guarded mirror.** A CI guard reads the gateway OpenAPI spec and fails the build if any config field is unreachable from the SDK — structurally killing the entire "feature exists server-side but the SDK silently drops it" bug class that had left TS transcripts empty and the whole reasoning loop unreachable.
 
-**June 2026 — Realtime / Speech-to-Speech (S2S) fleet + full WaaV integration (live-validated).** WaaV's full-duplex realtime path grew from **2 providers to 12** on a shared, heavily-reviewed S2S scaffold, then was proven integrated with every relevant gateway subsystem — DAG, noise reduction, VAD, smart-turn, turn detection, the cascade audio sink, and circuit-breaker resilience — end-to-end through the **running gateway**. Shipped with extreme-TDD + multi-agent brutal-review (RCA / integration / impact / adversarial-verify workflows) + credential-free live validation; lib suite **6,400+ tests, 0 failing**.
+**June 2026 — Realtime / Speech-to-Speech (S2S) fleet + full WaaV integration (live-validated).** WaaV's full-duplex realtime path grew from **2 providers to 11** on a shared, heavily-reviewed S2S scaffold, then was proven integrated with every relevant gateway subsystem — DAG, noise reduction, VAD, smart-turn, turn detection, the cascade audio sink, and circuit-breaker resilience — end-to-end through the **running gateway**. Shipped with extreme-TDD + multi-agent brutal-review (RCA / integration / impact / adversarial-verify workflows) + credential-free live validation; lib suite **6,400+ tests, 0 failing**.
 
 - **Shared S2S scaffold.** A generic `RealtimeSession<P: RealtimeProtocol>` driver implements the reconnect supervisor, conversation replay, barge-in/truncate, and resilience **once**; each provider is a small pure protocol mapper + a thin newtype. A `RealtimeTransport` seam absorbs all transports — WS-JSON, WS-binary, REST-handshake→WS (Ultravox), and AWS Bedrock bidirectional HTTP/2 (Nova Sonic). The existing OpenAI client was migrated onto it under a byte-identical golden-wire oracle (every pre-existing test unchanged).
-- **12 realtime/S2S providers.** OpenAI `gpt-realtime` (GA), Hume EVI, Azure OpenAI Realtime, xAI Grok, Inworld, Deepgram Voice Agent, ElevenLabs Conversational AI, Google Gemini Live, Ultravox, AWS Nova Sonic, Speechmatics Flow, and Yandex. **3 live-validated against real vendors** (OpenAI / Deepgram / ElevenLabs — full audio round-trips through `/realtime`); the other 9 are validated to the byte at the wire level (probe-grounded unit tests + credential-free mock round-trips through the *real* transport code), with the final real-vendor handshake pending a key (one command: `scripts/realtime_vendor_validation.py <provider>`).
+- **11 realtime/S2S providers.** OpenAI `gpt-realtime` (GA), Hume EVI, Azure OpenAI Realtime, xAI Grok, Inworld, Deepgram Voice Agent, ElevenLabs Conversational AI, Google Gemini Live, Ultravox, AWS Nova Sonic, and Yandex. **3 live-validated against real vendors** (OpenAI / Deepgram / ElevenLabs — full audio round-trips through `/realtime`); the other 8 are validated to the byte at the wire level (probe-grounded unit tests + credential-free mock round-trips through the *real* transport code), with the final real-vendor handshake pending a key (one command: `scripts/realtime_vendor_validation.py <provider>`).
 - **Resilience, live-validated end-to-end.** The reconnect supervisor + conversation replay + quick-failure cutoff were validated through the real driver against a mock that drops mid-session — reconnect + session-config re-send + **verbatim conversation-log replay** + bounded no-storm cutoff. The shared per-provider **circuit breaker** now fast-trips on a bad-credential handshake-then-drop signature (cross-session storm control), and a terminally-dead session is surfaced to the client instead of held open silently.
 - **Realtime as a DAG node (persistent S2S).** A `RealtimeProviderNode` now reuses **one** upstream socket across turns (retaining server-side conversation state) with a bounded teardown owner, wired into production and **live-validated credential-free** through the full gateway — a 3-turn DAG with the session reused (not reconnected per turn), audio riding the cascade `DagOutput::Audio` sink, and clean teardown, with anti-fabrication negative controls.
 - **Front-end ↔ realtime, proven together.** A live test drives **real audio** through WaaV's audio front-end — DeepFilterNet noise reduction → silero-VAD → smart-turn → text turn-detector — into a realtime DAG node, asserting (via scraped `/metrics` counters + sink egress) that every optimization actually ran on the bytes. Adversarially verified with three negative controls (disabling the front-end drives smart-turn inference to zero and **fails** the test).
@@ -365,7 +365,7 @@ cargo build --release --features dag-routing,turn-detect,noise-filter,openapi
 
 > **[View All 70+ Supported Providers](gateway/docs/SUPPORTED_PROVIDERS.md)** - Complete documentation for STT, TTS, and Realtime providers across all regions.
 
-WaaV Gateway supports **27 STT providers**, **32 TTS providers**, and **12 Realtime / Speech-to-Speech providers** with global coverage including specialized regional providers.
+WaaV Gateway supports **31 STT providers**, **35 TTS providers**, and **11 Realtime / Speech-to-Speech providers** with global coverage including specialized regional providers.
 
 ### Speech-to-Text (STT) - 31 Providers
 
@@ -377,17 +377,17 @@ WaaV Gateway supports **27 STT providers**, **32 TTS providers**, and **12 Realt
 | **India** | Sarvam AI, Gnani.ai, Reverie, Bhashini |
 | **China** | iFlytek, Alibaba Cloud, Baidu AI, Tencent Cloud, Huawei Cloud |
 | **East Asia** | NAVER CLOVA (Korea), AmiVoice (Japan) |
-| **Southeast Asia** | Zalo AI, FPT.AI, Viettel AI (Vietnam), Prosa.ai (Indonesia), NECTEC (Thailand) |
+| **Southeast Asia** | Zalo AI, FPT.AI, Viettel AI (Vietnam), NECTEC (Thailand) |
 
-### Text-to-Speech (TTS) - 36 Providers
+### Text-to-Speech (TTS) - 35 Providers
 
 | Category | Providers |
 |----------|-----------|
 | **Global Leaders** | Deepgram, Google Cloud, Azure, OpenAI, ElevenLabs, Cartesia, AWS Polly, IBM Watson |
-| **Voice Cloning** | Hume AI, LMNT, Play.ht, Murf.ai, WellSaid Labs, Resemble AI, Speechify, Unreal Speech, Smallest.ai |
-| **Regional** | Yandex, Tinkoff, SberDevices, Sarvam AI, Gnani.ai, Reverie, Bhashini, iFlytek, Alibaba, Baidu, Tencent, Huawei, NAVER CLOVA, Zalo, FPT, Viettel, Prosa, NECTEC |
+| **Voice Cloning** | Hume AI, Murf.ai, WellSaid Labs, Resemble AI, Speechify, Unreal Speech, Smallest.ai |
+| **Regional** | Yandex, Tinkoff, SberDevices, Sarvam AI, Gnani.ai, Reverie, Bhashini, iFlytek, Alibaba, Baidu, Tencent, Huawei, NAVER CLOVA, Zalo, FPT, Viettel, NECTEC |
 
-### Audio-to-Audio (Realtime / Speech-to-Speech) - 12 Providers
+### Audio-to-Audio (Realtime / Speech-to-Speech) - 11 Providers
 
 All on a shared `RealtimeSession<P>` scaffold (reconnect + conversation replay + barge-in/truncate + circuit-breaker resilience implemented once); usable via the `/realtime` WebSocket **or** as a persistent `RealtimeProviderNode` inside a DAG. ✅ = live-validated against the real vendor; ◷ = validated to the byte at the wire level (probe-grounded tests + credential-free mock round-trips through the real transport code), real-vendor handshake pending a key.
 
@@ -403,7 +403,6 @@ All on a shared `RealtimeSession<P>` scaffold (reconnect + conversation replay +
 | **Google Gemini Live** ◷ | WebSocket (JSON) | Multi-frame responses, session resumption |
 | **Ultravox** ◷ | REST → WebSocket | `create-call` handshake then WS, binary audio |
 | **AWS Nova Sonic** ◷ | Bedrock bidirectional HTTP/2 | SigV4 + smithy event-stream framing |
-| **Speechmatics Flow** ◷ | WebSocket (binary) | Flow conversational API |
 | **Yandex Realtime** ◷ | WebSocket (JSON) | OpenAI-GA-compatible, dual IAM-token / Api-Key auth |
 
 ---
@@ -502,7 +501,6 @@ graph TB
             IBM[IBM Watson<br/>STT/TTS]
             GRQ[Groq<br/>REST]
             HUM[Hume AI<br/>TTS/EVI]
-            LMNT[LMNT<br/>HTTP]
         end
     end
 
@@ -613,7 +611,7 @@ await agent.connect();
 // Proxy / alias model name — re-point providers server-side, client never changes
 const bot = bud.agent({ alias: 'support-bot' });       // a complete agent from one name
 
-// Provider-agnostic realtime (S2S) — same surface for ALL 12 providers
+// Provider-agnostic realtime (S2S) — same surface for ALL 11 providers
 const rt = bud.realtime({ provider: 'openai', voice: 'alloy', instructions: 'Be concise.' });
 
 // Bidirectional Voice (low-level STT+TTS, no LLM loop)
@@ -683,7 +681,7 @@ async with bud.agent(
 # Proxy / alias model name — re-point providers server-side, client never changes
 call = bud.agent(alias="support-bot")          # a complete agent from one name
 
-# Provider-agnostic realtime (S2S) — same surface for ALL 12 providers
+# Provider-agnostic realtime (S2S) — same surface for ALL 11 providers
 rt = bud.realtime(provider="openai", voice="alloy", instructions="Be concise.")
 
 # Voice cloning + batched/async transcription + standardized translation
@@ -872,7 +870,6 @@ providers:
   ibm_watson_region: "us-south"         # ENV: IBM_WATSON_REGION
   groq_api_key: ""                      # ENV: GROQ_API_KEY
   hume_api_key: ""                      # ENV: HUME_API_KEY
-  lmnt_api_key: ""                      # ENV: LMNT_API_KEY
 
 # LiveKit configuration (optional)
 livekit:

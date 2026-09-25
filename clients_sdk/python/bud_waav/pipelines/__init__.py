@@ -54,7 +54,7 @@ __all__ = [
     "RealtimeAudioEvent",
     "EmotionEvent",
     "StateChangeEvent",
-    # Gateway-native realtime (provider-agnostic /realtime — all 12 providers)
+    # Gateway-native realtime (provider-agnostic /realtime — all 11 providers)
     "GatewayRealtime",
     "GatewayRealtimeConfig",
     "GatewayTurnDetection",

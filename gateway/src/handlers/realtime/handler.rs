@@ -653,10 +653,6 @@ async fn handle_config(
         // transport resolves SigV4 credentials at connect (exactly like the AWS
         // Transcribe STT provider).
         "nova_sonic" | "nova-sonic" | "aws" => Some(String::new()),
-        // Speechmatics Flow (Voice AI) uses the dedicated Speechmatics API key,
-        // passed as the `Authorization: Bearer <token>` value (a JWT / temporary
-        // token). The same credential the Speechmatics STT/TTS providers use.
-        "speechmatics" | "flow" => app_state.config.speechmatics_api_key.clone(),
         // Yandex Cloud AI Studio Realtime (OpenAI-protocol clone) uses the dedicated
         // Yandex API key (a Yandex IAM token / static API key), passed as the
         // `Authorization: Bearer <token>` value. The folder id is injected below.
@@ -995,7 +991,6 @@ fn canonical_realtime_provider(provider_name: &str) -> Option<&'static str> {
         "gemini" | "gemini-live" | "google" => Some("gemini"),
         "ultravox" | "fixie" => Some("ultravox"),
         "hume" => Some("hume"),
-        "speechmatics" | "flow" => Some("speechmatics"),
         "yandex" | "yandexgpt" | "yandex-cloud" => Some("yandex"),
         _ => None,
     }
@@ -1162,7 +1157,9 @@ mod tests {
         assert_eq!(canonical_realtime_provider("11labs"), Some("elevenlabs"));
         assert_eq!(canonical_realtime_provider("gemini-live"), Some("gemini"));
         assert_eq!(canonical_realtime_provider("fixie"), Some("ultravox"));
-        assert_eq!(canonical_realtime_provider("flow"), Some("speechmatics"));
+        // Speechmatics Flow shut down; neither its id nor its alias is a realtime provider.
+        assert_eq!(canonical_realtime_provider("flow"), None);
+        assert_eq!(canonical_realtime_provider("speechmatics"), None);
         assert_eq!(canonical_realtime_provider("hume"), Some("hume"));
         // nova_sonic is a Bedrock HTTP/2 stream — NO ws endpoint override.
         assert_eq!(canonical_realtime_provider("nova_sonic"), None);

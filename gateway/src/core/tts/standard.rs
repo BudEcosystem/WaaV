@@ -258,9 +258,6 @@ pub fn create_tts_standard(
         "iflytek" => Ok(Box::new(super::iflytek::IFlytekTts::from_standard(
             &config,
         )?)),
-        "lmnt" | "lmnt-ai" | "lmnt_ai" => {
-            Ok(Box::new(super::lmnt::LmntTts::from_standard(&config)?))
-        }
         "murf" | "murf-ai" | "murf_ai" | "murf.ai" => {
             Ok(Box::new(super::murf::MurfTts::from_standard(&config)?))
         }
@@ -271,12 +268,6 @@ pub fn create_tts_standard(
             Ok(Box::new(super::nectec::NectecTts::from_standard(&config)?))
         }
         "openai" => Ok(Box::new(super::openai::OpenAITTS::from_standard(&config)?)),
-        "playht" | "play_ht" | "play-ht" | "play.ht" => {
-            Ok(Box::new(super::playht::PlayHtTts::from_standard(&config)?))
-        }
-        "prosa_ai" | "prosa-ai" | "prosa" => {
-            Ok(Box::new(super::prosa_ai::ProsaTts::from_standard(&config)?))
-        }
         "resemble" | "resemble_ai" | "resemble-ai" => Ok(Box::new(
             super::resemble::ResembleTts::from_standard(&config)?,
         )),
@@ -846,25 +837,6 @@ mod tests {
         };
         assert!(create_tts_standard("iflytek", iflytek).is_ok());
 
-        let lmnt = StandardTTSConfig {
-            base: TTSConfig {
-                provider: "lmnt".into(),
-                api_key: "k".into(),
-                voice_id: Some("lily".into()),
-                ..Default::default()
-            },
-            features: TtsFeatures {
-                speed: Some(1.5),
-                stability: Some(0.9),
-                language: Some("en".into()),
-                seed: Some(12345),
-                sample_rate: Some(16000),
-                ..Default::default()
-            },
-            extras: ProviderExtras::default(),
-        };
-        assert!(create_tts_standard("lmnt", lmnt).is_ok());
-
         let murf = StandardTTSConfig {
             base: TTSConfig {
                 provider: "murf".into(),
@@ -929,44 +901,6 @@ mod tests {
             extras: ProviderExtras::default(),
         };
         assert!(create_tts_standard("openai", openai).is_ok());
-
-        let mut playht_extras = serde_json::Map::new();
-        playht_extras.insert("user_id".into(), serde_json::json!("user-123"));
-        let playht = StandardTTSConfig {
-            base: TTSConfig {
-                provider: "playht".into(),
-                api_key: "k".into(),
-                voice_id: Some("s3://voice-cloning-zero-shot/manifest.json".into()),
-                ..Default::default()
-            },
-            features: TtsFeatures {
-                speed: Some(1.4),
-                style: Some(0.6),
-                language: Some("en".into()),
-                seed: Some(42),
-                sample_rate: Some(24000),
-                ..Default::default()
-            },
-            extras: ProviderExtras(playht_extras),
-        };
-        assert!(create_tts_standard("playht", playht).is_ok());
-
-        let mut prosa_extras = serde_json::Map::new();
-        prosa_extras.insert("label".into(), serde_json::json!("greeting"));
-        let prosa = StandardTTSConfig {
-            base: TTSConfig {
-                provider: "prosa_ai".into(),
-                api_key: "k".into(),
-                ..Default::default()
-            },
-            features: TtsFeatures {
-                speed: Some(1.5),
-                pitch: Some(3.0),
-                ..Default::default()
-            },
-            extras: ProviderExtras(prosa_extras),
-        };
-        assert!(create_tts_standard("prosa_ai", prosa).is_ok());
 
         let mut resemble_extras = serde_json::Map::new();
         resemble_extras.insert("project_uuid".into(), serde_json::json!("proj-123"));

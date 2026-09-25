@@ -374,11 +374,9 @@ pub async fn speak_handler(
     // Convert WebSocket config to full TTSConfig with API key
     let tts_config = request.tts_config.to_tts_config(api_key);
 
-    // Apply pronunciation replacements
-    let mut processed_text = request.text.clone();
-    for pronunciation in &tts_config.pronunciations {
-        processed_text = processed_text.replace(&pronunciation.word, &pronunciation.pronunciation);
-    }
+    // Apply pronunciation replacements — whole words only, via the same matcher the streaming
+    // providers use. A plain substring replace turned "Bud -> Buddy" into "Buddyget".
+    let processed_text = apply_pronunciations(&request.text, &tts_config.pronunciations);
 
     // Create TTS provider
     let mut tts_provider = match create_tts_provider(&tts_config.provider, tts_config.clone()) {
@@ -543,14 +541,94 @@ pub async fn synthesize_once(
     tts_config: crate::core::tts::TTSConfig,
     text: &str,
 ) -> Result<(Vec<u8>, String, u32), String> {
+    // The flat config with no canonical features — the shape every caller had before FRD-018
+    // Part III C3, preserved so `/speak` and the WS path are untouched by that change.
+    synthesize_once_standard(
+        state,
+        crate::core::tts::standard::StandardTTSConfig::from_base(tts_config),
+        text,
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Apply a deployment's pronunciation replacements to text, whole words only.
+///
+/// The one function both one-shot synthesis paths call, so the rule cannot differ between them.
+/// It used to be a plain substring `replace` at each site, which rewrote the inside of longer
+/// words — "Bud -> Buddy" spoke "Budget" as "Buddyget". `PronunciationReplacer` is the
+/// word-boundary matcher the streaming providers already used.
+pub(crate) fn apply_pronunciations(
+    text: &str,
+    pronunciations: &[crate::core::tts::Pronunciation],
+) -> String {
+    if pronunciations.is_empty() {
+        return text.to_string();
+    }
+    crate::core::tts::provider::PronunciationReplacer::new(pronunciations).apply(text)
+}
+
+/// Why a one-shot synthesis failed, split by who can fix it.
+///
+/// The OpenAI route answers these two differently — 400 and 502 — and a single string could not
+/// tell them apart, so a vendor's "that voice does not exist" reached the caller as a gateway
+/// fault.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SynthesisError {
+    /// The vendor refused the request as built ([`TTSError::RequestRejected`]). Fixed by changing
+    /// the request or the deployment.
+    Rejected(String),
+    /// Anything else: provider construction, the connection, a timeout, or the vendor failing a
+    /// well-formed request.
+    Failed(String),
+}
+
+impl std::fmt::Display for SynthesisError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rejected(m) | Self::Failed(m) => f.write_str(m),
+        }
+    }
+}
+
+impl From<TTSError> for SynthesisError {
+    fn from(e: TTSError) -> Self {
+        match e {
+            TTSError::RequestRejected(m) => Self::Rejected(m),
+            other => Self::Failed(format!("synthesis error: {other}")),
+        }
+    }
+}
+
+/// Synthesise once from the STANDARD config, so a caller's canonical features reach the provider.
+///
+/// FRD-018 Part III C3. `create_tts_standard` is the dispatch that calls each provider's
+/// `from_standard`; `create_tts_provider` drops `features` on the floor by construction, because
+/// the flat config has nowhere to put them. Providers without a `from_standard` arm fall back to
+/// the flat path inside that dispatch, so this is safe for every vendor including self-hosted.
+pub async fn synthesize_once_standard(
+    state: &AppState,
+    std_config: crate::core::tts::standard::StandardTTSConfig,
+    text: &str,
+) -> Result<(Vec<u8>, String, u32), SynthesisError> {
+    let tts_config = std_config.base.clone();
+
     // Pronunciation replacements apply to every synthesis path, not just the native one.
-    let mut processed = text.to_string();
-    for p in &tts_config.pronunciations {
-        processed = processed.replace(&p.word, &p.pronunciation);
+    // Whole words only (see `PronunciationReplacer`): a substring replace rewrote the inside of
+    // longer words — "Bud -> Buddy" spoke "Budget" as "Buddyget".
+    let processed = apply_pronunciations(text, &tts_config.pronunciations);
+    // The provider skips blank text without queueing a request, so nothing would ever complete
+    // and this would wait out the full timeout before failing as if the vendor were down.
+    if processed.trim().is_empty() {
+        return Err(SynthesisError::Rejected(
+            "the text to synthesise is empty or whitespace; nothing was sent to the vendor"
+                .to_string(),
+        ));
     }
 
-    let mut provider = create_tts_provider(&tts_config.provider, tts_config.clone())
-        .map_err(|e| format!("failed to create TTS provider: {e}"))?;
+    let mut provider =
+        crate::core::tts::standard::create_tts_standard(&tts_config.provider, std_config)
+            .map_err(|e| SynthesisError::Failed(format!("failed to create TTS provider: {e}")))?;
 
     // Connection pooling and per-provider metrics come from the shared manager; without this
     // the OpenAI route would open a fresh connection per request while `/speak` reuses them.
@@ -564,16 +642,16 @@ pub async fn synthesize_once(
     provider
         .connect()
         .await
-        .map_err(|e| format!("failed to connect to TTS provider: {e}"))?;
+        .map_err(|e| SynthesisError::Failed(format!("failed to connect to TTS provider: {e}")))?;
 
     let collector = Arc::new(AudioCollector::new());
     provider
         .on_audio(collector.clone())
-        .map_err(|e| format!("failed to register audio callback: {e}"))?;
+        .map_err(|e| SynthesisError::Failed(format!("failed to register audio callback: {e}")))?;
 
     if let Err(e) = provider.speak(&processed, true).await {
         let _ = provider.disconnect().await;
-        return Err(format!("synthesis failed: {e}"));
+        return Err(SynthesisError::Failed(format!("synthesis failed: {e}")));
     }
 
     if let Err(e) = collector
@@ -583,20 +661,54 @@ pub async fn synthesize_once(
         // Always disconnect on the timeout path: leaking the connection is how a slow vendor
         // turns into exhausted file descriptors.
         let _ = provider.disconnect().await;
-        return Err(e.to_string());
+        return Err(SynthesisError::Failed(e.to_string()));
     }
 
     let _ = provider.disconnect().await;
 
-    collector
-        .get_result()
-        .await
-        .map_err(|e| format!("synthesis error: {e}"))
+    collector.get_result().await.map_err(SynthesisError::from)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pronunciations_replace_whole_words_only() {
+        use crate::core::tts::Pronunciation;
+        let list = [Pronunciation {
+            word: "Bud".into(),
+            pronunciation: "Buddy".into(),
+        }];
+        // Live: "Check the Budget." was spoken as "Check the Buddyget".
+        assert_eq!(
+            apply_pronunciations("Hello Bud, check the Budget.", &list),
+            "Hello Buddy, check the Budget."
+        );
+        assert_eq!(apply_pronunciations("Bud.", &list), "Buddy.");
+        assert_eq!(apply_pronunciations("no change", &[]), "no change");
+    }
+
+    #[test]
+    fn only_a_vendor_refusal_is_a_rejection() {
+        assert_eq!(
+            SynthesisError::from(TTSError::RequestRejected("elevenlabs rejected".into())),
+            SynthesisError::Rejected("elevenlabs rejected".into())
+        );
+        for other in [
+            TTSError::ProviderError("down".into()),
+            TTSError::AuthenticationFailed("key".into()),
+            TTSError::InvalidConfiguration("cfg".into()),
+        ] {
+            assert!(
+                matches!(
+                    SynthesisError::from(other.clone()),
+                    SynthesisError::Failed(_)
+                ),
+                "{other:?} must stay a failure"
+            );
+        }
+    }
 
     #[test]
     fn test_client_api_key_refused_when_bud_owns_credentials() {

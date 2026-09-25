@@ -711,6 +711,20 @@ impl OpenAISTTConfig {
         }
         // Provider extras → diarization-side knobs (string keys not modeled by the typed vocab).
         let e = &std.extras.0;
+        // A request's own `prompt` and `temperature` (`/v1/audio/transcriptions`). Whisper has
+        // one prompt, so the caller's text comes first and the deployment's key terms follow it
+        // rather than one silently replacing the other.
+        if let Some(p) = e.get("prompt").and_then(|v| v.as_str()).map(str::trim)
+            && !p.is_empty()
+        {
+            cfg.prompt = Some(match cfg.prompt.take() {
+                Some(terms) => format!("{p} {terms}"),
+                None => p.to_string(),
+            });
+        }
+        if let Some(t) = e.get("temperature").and_then(|v| v.as_f64()) {
+            cfg.temperature = Some(t as f32);
+        }
         if let Some(b) = e.get("logprobs").and_then(|v| v.as_bool()) {
             cfg.diarization.include_logprobs = b;
         }

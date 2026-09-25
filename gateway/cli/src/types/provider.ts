@@ -215,7 +215,6 @@ export const STT_PROVIDERS: readonly string[] = [
   'krutrim',
   'vakyansh',
   'gladia',
-  'lmnt',
   'eleven_labs',
   'hume',
   // Indian & Regional
@@ -237,7 +236,6 @@ export const TTS_PROVIDERS: readonly string[] = [
   'openai',
   'cartesia',
   'deepgram',
-  'play_ht',
   'murf',
   'lovo',
   'resemble',
@@ -247,7 +245,6 @@ export const TTS_PROVIDERS: readonly string[] = [
   'tortoise',
   'piper',
   'xtts',
-  'lmnt',
   'unrealspeech',
   'fish',
   'neets',

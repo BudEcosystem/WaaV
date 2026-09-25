@@ -67,14 +67,14 @@ const STT_BATCHES = [
   ['cartesia', 'elevenlabs', 'aws_transcribe', 'ibm_watson', 'groq'],
   ['speechmatics', 'gladia', 'revai', 'phonexia', 'sarvam', 'gnani', 'reverie', 'bhashini'],
   ['iflytek', 'alibaba_cloud', 'baidu', 'tencent', 'huawei_cloud', 'naver_clova', 'amivoice'],
-  ['fpt_ai', 'viettel_ai', 'prosa_ai', 'nectec', 'yandex', 'tinkoff', 'sberdevices'],
+  ['fpt_ai', 'viettel_ai', 'nectec', 'yandex', 'tinkoff', 'sberdevices'],
 ]
 const TTS_BATCHES = [
   ['deepgram', 'elevenlabs', 'google', 'azure', 'openai', 'cartesia'],
-  ['aws_polly', 'ibm_watson', 'hume', 'lmnt', 'playht', 'murf', 'resemble'],
+  ['aws_polly', 'ibm_watson', 'hume', 'murf', 'resemble'],
   ['speechify', 'smallest', 'unrealspeech', 'wellsaid', 'acapela', 'cereproc'],
   ['yandex', 'tinkoff', 'sberdevices', 'bhashini', 'gnani', 'reverie', 'iflytek'],
-  ['alibaba_cloud', 'baidu', 'tencent', 'huawei_cloud', 'naver_clova', 'zalo_ai', 'fpt_ai', 'viettel_ai', 'prosa_ai', 'nectec', 'speechmatics'],
+  ['alibaba_cloud', 'baidu', 'tencent', 'huawei_cloud', 'naver_clova', 'zalo_ai', 'fpt_ai', 'viettel_ai', 'nectec', 'speechmatics'],
 ]
 
 phase('Design-freeze')

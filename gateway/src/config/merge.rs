@@ -403,30 +403,10 @@ pub fn merge_config(
         yaml.providers.as_ref().and_then(|p| p.hume_api_key.clone())
     );
 
-    // LMNT API key (TTS and voice cloning)
-    let lmnt_api_key = get_credential!(
-        "LMNT_API_KEY",
-        yaml.providers.as_ref().and_then(|p| p.lmnt_api_key.clone())
-    );
-
     // Groq API key (ultra-fast Whisper STT)
     let groq_api_key = get_credential!(
         "GROQ_API_KEY",
         yaml.providers.as_ref().and_then(|p| p.groq_api_key.clone())
-    );
-
-    // Play.ht credentials (TTS with voice cloning)
-    let playht_api_key = get_credential!(
-        "PLAYHT_API_KEY",
-        yaml.providers
-            .as_ref()
-            .and_then(|p| p.playht_api_key.clone())
-    );
-    let playht_user_id = get_credential!(
-        "PLAYHT_USER_ID",
-        yaml.providers
-            .as_ref()
-            .and_then(|p| p.playht_user_id.clone())
     );
 
     // IBM Watson credentials (STT/TTS)
@@ -759,10 +739,7 @@ pub fn merge_config(
         yandex_folder_id,
         assemblyai_api_key,
         hume_api_key,
-        lmnt_api_key,
         groq_api_key,
-        playht_api_key,
-        playht_user_id,
         ibm_watson_api_key,
         ibm_watson_instance_id,
         ibm_watson_region,

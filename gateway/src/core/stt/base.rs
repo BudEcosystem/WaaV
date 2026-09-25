@@ -262,6 +262,15 @@ pub struct STTResult {
     /// Each word includes start/end times and optionally speaker assignment.
     pub words: Option<Vec<WordTiming>>,
 
+    /// Runner-up transcripts, when `alternatives` was requested and the provider returned more
+    /// than one hypothesis.
+    ///
+    /// The BEST hypothesis is [`transcript`](Self::transcript); this carries the rest, in the
+    /// provider's own order. Without it, `alternatives=3` asked Deepgram for three hypotheses,
+    /// Deepgram returned three, and the parser kept the first and dropped the other two — a
+    /// setting that reached the vendor, was honoured, and could not be seen.
+    pub alternatives: Option<Vec<String>>,
+
     /// Speaker information from diarization.
     ///
     /// Contains metadata about each identified speaker when diarization is enabled.
@@ -338,6 +347,7 @@ impl STTResult {
             segment_transcript: None,
             // Initialize all optional metadata fields to None for backward compatibility
             words: None,
+            alternatives: None,
             speakers: None,
             entities: None,
             sensitive_data: None,
@@ -400,6 +410,8 @@ impl STTResult {
             confidence: confidence.clamp(0.0, 1.0),
             segment_transcript: None,
             words,
+            // `with_metadata` predates N-best; callers that want it set the field directly.
+            alternatives: None,
             speakers,
             entities,
             sensitive_data,
@@ -732,6 +744,36 @@ pub trait BaseSTT: Send + Sync {
     /// override this to store the handles and use them in their connect path instead of
     /// creating per-session ones. Non-streaming / one-shot providers use the default no-op.
     fn set_resilience(&mut self, _resilience: crate::core::resilience::ResilienceHandles) {}
+
+    /// Whether this provider answers in ONE request/response exchange rather than streaming.
+    ///
+    /// A streaming provider emits results while audio is still arriving, so the prerecorded
+    /// driver sends the file and then waits for the provider to go quiet before closing. A
+    /// request/response provider holds everything until the connection closes and answers once —
+    /// waiting for it to settle waits for something that cannot happen, so the driver must skip
+    /// straight to the close.
+    ///
+    /// This is not a nicety. Before it existed, every OpenAI Whisper transcription sat out the
+    /// full 45-second first-result timeout, was then reported as a partial transcript, and logged
+    /// "provider produced no transcript within the first-result timeout" on the way to returning
+    /// a complete and correct one.
+    ///
+    /// Defaults to `false`: a provider that streams need not think about this.
+    fn is_request_response(&self) -> bool {
+        false
+    }
+
+    /// What this provider could not honour about the configuration it was given.
+    ///
+    /// Providers already produce these — a translation target list handed to a vendor that cannot
+    /// translate, a batch knob with no equivalent — and until now they were logged and nothing
+    /// else. The caller saw a response byte-identical to one where the setting had worked.
+    ///
+    /// A degrade that reaches nobody is the same silence as no degrade at all, so the driver
+    /// collects these and the handler puts them on `x-bud-config-warning`.
+    fn config_warnings(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// Factory trait for creating STT providers

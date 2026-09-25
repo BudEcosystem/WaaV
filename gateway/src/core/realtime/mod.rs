@@ -5,9 +5,9 @@
 //!
 //! # Supported Providers
 //!
-//! Twelve realtime/S2S providers ride the scaffold — the authoritative list is
+//! Eleven realtime/S2S providers ride the scaffold — the authoritative list is
 //! [`get_supported_realtime_providers`] (openai, hume, azure, grok, inworld, deepgram,
-//! elevenlabs, gemini, ultravox, nova_sonic, speechmatics, yandex); the [`RealtimeProvider`]
+//! elevenlabs, gemini, ultravox, nova_sonic, yandex); the [`RealtimeProvider`]
 //! enum mirrors it 1:1 (a `parse`/`Display` pair kept in lockstep by a unit test).
 //!
 //! # Architecture
@@ -61,7 +61,6 @@ pub mod inworld;
 pub mod nova_sonic;
 pub mod openai;
 pub mod scaffold;
-pub mod speechmatics;
 pub mod ultravox;
 pub mod yandex;
 
@@ -90,7 +89,6 @@ pub use openai::{
     Modality, OPENAI_REALTIME_SAMPLE_RATE, OPENAI_REALTIME_URL, OpenAIRealtime,
     OpenAIRealtimeAudioFormat, OpenAIRealtimeModel, OpenAIRealtimeVoice,
 };
-pub use speechmatics::{SpeechmaticsProtocol, SpeechmaticsRealtime};
 pub use ultravox::{UltravoxProtocol, UltravoxRealtime};
 pub use yandex::{YandexProtocol, YandexRealtime};
 
@@ -122,8 +120,6 @@ pub enum RealtimeProvider {
     Ultravox,
     /// AWS Nova Sonic (Bedrock bidirectional event stream)
     NovaSonic,
-    /// Speechmatics Flow (raw-PCM binary S2S)
-    Speechmatics,
     /// Yandex AI Studio Realtime (OpenAI-protocol clone)
     Yandex,
 }
@@ -143,7 +139,6 @@ impl RealtimeProvider {
             "gemini" | "gemini_live" | "google" => Some(RealtimeProvider::Gemini),
             "ultravox" => Some(RealtimeProvider::Ultravox),
             "nova_sonic" | "nova-sonic" | "bedrock" => Some(RealtimeProvider::NovaSonic),
-            "speechmatics" | "speechmatics_flow" => Some(RealtimeProvider::Speechmatics),
             "yandex" => Some(RealtimeProvider::Yandex),
             _ => None,
         }
@@ -163,7 +158,6 @@ impl std::fmt::Display for RealtimeProvider {
             RealtimeProvider::Gemini => write!(f, "gemini"),
             RealtimeProvider::Ultravox => write!(f, "ultravox"),
             RealtimeProvider::NovaSonic => write!(f, "nova_sonic"),
-            RealtimeProvider::Speechmatics => write!(f, "speechmatics"),
             RealtimeProvider::Yandex => write!(f, "yandex"),
         }
     }
@@ -225,10 +219,6 @@ pub fn create_realtime_provider_from_enum(
 /// events on its own [`NovaSonicProtocol`]; the FIRST `BedrockBidi` provider (an
 /// Amazon Bedrock `InvokeModelWithBidirectionalStream` HTTP/2 event stream, NOT a
 /// WebSocket; auth is AWS SigV4 via the `aws-config` default chain — NO api-key).
-/// `speechmatics` is Speechmatics Flow (Voice AI) — raw-PCM binary on its own
-/// [`SpeechmaticsProtocol`] (Deepgram-shaped wire: binary audio in/out + JSON
-/// control); template-driven agents, auth via `Authorization: Bearer <token>`
-/// (a Speechmatics JWT / temporary token).
 /// `yandex` is Yandex Cloud AI Studio's Realtime API — an OpenAI-PROTOCOL CLONE
 /// (GA wire reused via the embedded [`OpenAiProtocol`](openai::OpenAiProtocol) by
 /// delegation, like azure/grok/inworld); it differs only in the host
@@ -246,7 +236,6 @@ pub fn get_supported_realtime_providers() -> Vec<&'static str> {
         "gemini",
         "ultravox",
         "nova_sonic",
-        "speechmatics",
         "yandex",
     ]
 }
@@ -314,11 +303,9 @@ mod tests {
         assert!(providers.contains(&"ultravox"));
         // AWS Nova Sonic (S2S, base64-PCM+JSON; the first BedrockBidi provider).
         assert!(providers.contains(&"nova_sonic"));
-        // Speechmatics Flow (S2S, raw-PCM binary + JSON control; template-driven).
-        assert!(providers.contains(&"speechmatics"));
         // Yandex Cloud AI Studio Realtime (OpenAI-protocol clone; GA wire, Bearer).
         assert!(providers.contains(&"yandex"));
-        assert_eq!(providers.len(), 12);
+        assert_eq!(providers.len(), 11);
     }
 
     #[test]

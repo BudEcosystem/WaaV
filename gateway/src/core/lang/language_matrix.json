@@ -1,0 +1,487 @@
+{
+  "canonical": [
+    "en-US",
+    "en-GB",
+    "en-IN",
+    "en-AU",
+    "en-ZA",
+    "en-NZ",
+    "es-ES",
+    "es-MX",
+    "es-US",
+    "fr-FR",
+    "fr-CA",
+    "pt-BR",
+    "pt-PT",
+    "de-DE",
+    "it-IT",
+    "nl-NL",
+    "ru-RU",
+    "tr-TR",
+    "pl-PL",
+    "sv-SE",
+    "nb-NO",
+    "da-DK",
+    "fi-FI",
+    "uk-UA",
+    "cs-CZ",
+    "el-GR",
+    "ro-RO",
+    "hu-HU",
+    "ja-JP",
+    "ko-KR",
+    "cmn-CN",
+    "cmn-TW",
+    "yue-HK",
+    "hi-IN",
+    "bn-IN",
+    "ta-IN",
+    "te-IN",
+    "gu-IN",
+    "kn-IN",
+    "ml-IN",
+    "mr-IN",
+    "pa-IN",
+    "or-IN",
+    "ar-SA",
+    "vi-VN",
+    "th-TH",
+    "id-ID",
+    "ms-MY",
+    "he-IL"
+  ],
+  "providers": [
+    {
+      "example_cmn_cn": "zh-CN",
+      "example_en_us": "en-US",
+      "notation": "bcp47",
+      "provider": "deepgram",
+      "supported": [],
+      "supports_auto": true
+    },
+    {
+      "example_cmn_cn": "zh-CN",
+      "example_en_us": "en-US",
+      "notation": "bcp47",
+      "provider": "azure",
+      "supported": [],
+      "supports_auto": true
+    },
+    {
+      "example_cmn_cn": "zh-CN",
+      "example_en_us": "en-US",
+      "notation": "bcp47",
+      "provider": "aws-transcribe",
+      "supported": [],
+      "supports_auto": true
+    },
+    {
+      "example_cmn_cn": "cmn-CN",
+      "example_en_us": "en-US",
+      "notation": "bcp47",
+      "provider": "aws-polly",
+      "supported": [],
+      "supports_auto": false
+    },
+    {
+      "example_cmn_cn": "cmn-CN",
+      "example_en_us": "en-US",
+      "notation": "bcp47",
+      "provider": "nova-sonic",
+      "supported": [],
+      "supports_auto": true
+    },
+    {
+      "example_cmn_cn": "cmn-CN",
+      "example_en_us": "en-US",
+      "notation": "bcp47",
+      "provider": "gemini",
+      "supported": [],
+      "supports_auto": true
+    },
+    {
+      "example_cmn_cn": "cmn-CN",
+      "example_en_us": "en-US",
+      "notation": "bcp47",
+      "provider": "yandex",
+      "supported": [],
+      "supports_auto": true
+    },
+    {
+      "example_cmn_cn": "hi-IN",
+      "example_en_us": "hi-IN",
+      "notation": "bcp47",
+      "provider": "sarvam",
+      "supported": [
+        "hi-IN",
+        "bn-IN",
+        "ta-IN",
+        "te-IN",
+        "gu-IN",
+        "kn-IN",
+        "ml-IN",
+        "mr-IN",
+        "pa-IN",
+        "or-IN",
+        "en-IN"
+      ],
+      "supports_auto": true
+    },
+    {
+      "example_cmn_cn": "hi",
+      "example_en_us": "hi",
+      "notation": "iso6391",
+      "provider": "reverie",
+      "supported": [
+        "hi-IN",
+        "bn-IN",
+        "ta-IN",
+        "te-IN",
+        "gu-IN",
+        "kn-IN",
+        "ml-IN",
+        "mr-IN",
+        "pa-IN",
+        "or-IN",
+        "en-IN"
+      ],
+      "supports_auto": false
+    },
+    {
+      "example_cmn_cn": "hi",
+      "example_en_us": "hi",
+      "notation": "iso6391",
+      "provider": "reverie-tts",
+      "supported": [
+        "hi-IN",
+        "bn-IN",
+        "ta-IN",
+        "te-IN",
+        "gu-IN",
+        "kn-IN",
+        "ml-IN",
+        "mr-IN",
+        "pa-IN",
+        "or-IN",
+        "en-IN"
+      ],
+      "supports_auto": false
+    },
+    {
+      "example_cmn_cn": "zh",
+      "example_en_us": "en",
+      "notation": "iso6391",
+      "provider": "elevenlabs",
+      "supported": [],
+      "supports_auto": true
+    },
+    {
+      "example_cmn_cn": "zh",
+      "example_en_us": "en",
+      "notation": "iso6391",
+      "provider": "openai",
+      "supported": [],
+      "supports_auto": true
+    },
+    {
+      "example_cmn_cn": null,
+      "example_en_us": null,
+      "notation": "none",
+      "provider": "openai-tts",
+      "supported": [],
+      "supports_auto": false
+    },
+    {
+      "example_cmn_cn": "zh",
+      "example_en_us": "en",
+      "notation": "iso6391",
+      "provider": "cartesia",
+      "supported": [],
+      "supports_auto": false
+    },
+    {
+      "example_cmn_cn": "en",
+      "example_en_us": "en",
+      "notation": "iso6391",
+      "provider": "assemblyai",
+      "supported": [
+        "en-US",
+        "en-GB",
+        "en-IN",
+        "en-AU",
+        "es-ES",
+        "es-MX",
+        "fr-FR",
+        "de-DE",
+        "it-IT",
+        "pt-BR",
+        "pt-PT"
+      ],
+      "supports_auto": true
+    },
+    {
+      "example_cmn_cn": "cmn",
+      "example_en_us": "en",
+      "notation": "iso6391",
+      "provider": "speechmatics",
+      "supported": [],
+      "supports_auto": true
+    },
+    {
+      "example_cmn_cn": "cmn-Hans-CN",
+      "example_en_us": "en-US",
+      "notation": "bcp47",
+      "provider": "google-stt",
+      "supported": [],
+      "supports_auto": true
+    },
+    {
+      "example_cmn_cn": "cmn-CN",
+      "example_en_us": "en-US",
+      "notation": "bcp47",
+      "provider": "google-tts",
+      "supported": [],
+      "supports_auto": false
+    },
+    {
+      "example_cmn_cn": "zh_cn",
+      "example_en_us": "en_us",
+      "notation": "underscore",
+      "provider": "iflytek",
+      "supported": [
+        "cmn-CN",
+        "en-US",
+        "ms-MY",
+        "id-ID",
+        "bn-IN",
+        "hi-IN",
+        "ja-JP",
+        "ko-KR",
+        "th-TH",
+        "vi-VN",
+        "ru-RU",
+        "de-DE",
+        "fr-FR",
+        "ar-SA"
+      ],
+      "supports_auto": false
+    },
+    {
+      "example_cmn_cn": "1537",
+      "example_en_us": "1737",
+      "notation": "none",
+      "provider": "baidu",
+      "supported": [
+        "cmn-CN",
+        "en-US",
+        "yue-HK"
+      ],
+      "supports_auto": false
+    },
+    {
+      "example_cmn_cn": "zh",
+      "example_en_us": "en",
+      "notation": "iso6391",
+      "provider": "baidu-tts",
+      "supported": [
+        "cmn-CN",
+        "en-US",
+        "yue-HK"
+      ],
+      "supports_auto": false
+    },
+    {
+      "example_cmn_cn": "zh",
+      "example_en_us": "en",
+      "notation": "iso6391",
+      "provider": "tencent",
+      "supported": [
+        "cmn-CN",
+        "en-US",
+        "yue-HK",
+        "ja-JP",
+        "ko-KR"
+      ],
+      "supports_auto": false
+    },
+    {
+      "example_cmn_cn": null,
+      "example_en_us": null,
+      "notation": "none",
+      "provider": "hume",
+      "supported": [],
+      "supports_auto": false
+    }
+  ],
+  "model_restrictions": [
+    {
+      "provider": "deepgram",
+      "model": "nova-3-medical",
+      "supported": [
+        "en-US",
+        "en-GB",
+        "en-IN",
+        "en-AU",
+        "en-NZ"
+      ]
+    },
+    {
+      "provider": "deepgram",
+      "model": "nova-3-pharma",
+      "supported": [
+        "en-US",
+        "en-GB",
+        "en-IN",
+        "en-AU",
+        "en-NZ"
+      ]
+    },
+    {
+      "provider": "deepgram",
+      "model": "nova-2-medical",
+      "supported": [
+        "en-US"
+      ]
+    },
+    {
+      "provider": "deepgram",
+      "model": "nova-2-meeting",
+      "supported": [
+        "en-US"
+      ]
+    },
+    {
+      "provider": "deepgram",
+      "model": "nova-2-phonecall",
+      "supported": [
+        "en-US"
+      ]
+    },
+    {
+      "provider": "deepgram",
+      "model": "nova-2-finance",
+      "supported": [
+        "en-US"
+      ]
+    },
+    {
+      "provider": "deepgram",
+      "model": "nova-2-conversationalai",
+      "supported": [
+        "en-US"
+      ]
+    },
+    {
+      "provider": "deepgram",
+      "model": "nova-2-voicemail",
+      "supported": [
+        "en-US"
+      ]
+    },
+    {
+      "provider": "deepgram",
+      "model": "nova-2-video",
+      "supported": [
+        "en-US"
+      ]
+    },
+    {
+      "provider": "deepgram",
+      "model": "nova-2-drivethru",
+      "supported": [
+        "en-US"
+      ]
+    },
+    {
+      "provider": "deepgram",
+      "model": "nova-2-automotive",
+      "supported": [
+        "en-US"
+      ]
+    },
+    {
+      "provider": "deepgram",
+      "model": "nova-2-atc",
+      "supported": [
+        "en-US"
+      ]
+    },
+    {
+      "provider": "deepgram",
+      "model": "base-meeting",
+      "supported": [
+        "en-US"
+      ]
+    },
+    {
+      "provider": "deepgram",
+      "model": "base-phonecall",
+      "supported": [
+        "en-US"
+      ]
+    },
+    {
+      "provider": "deepgram",
+      "model": "base-finance",
+      "supported": [
+        "en-US"
+      ]
+    },
+    {
+      "provider": "deepgram",
+      "model": "base-conversationalai",
+      "supported": [
+        "en-US"
+      ]
+    },
+    {
+      "provider": "deepgram",
+      "model": "base-voicemail",
+      "supported": [
+        "en-US"
+      ]
+    },
+    {
+      "provider": "deepgram",
+      "model": "base-video",
+      "supported": [
+        "en-US"
+      ]
+    },
+    {
+      "provider": "deepgram",
+      "model": "enhanced-meeting",
+      "supported": [
+        "en-US"
+      ]
+    },
+    {
+      "provider": "deepgram",
+      "model": "enhanced-phonecall",
+      "supported": [
+        "en-US"
+      ]
+    },
+    {
+      "provider": "deepgram",
+      "model": "enhanced-finance",
+      "supported": [
+        "en-US"
+      ]
+    },
+    {
+      "provider": "deepgram",
+      "model": "nova-medical",
+      "supported": [
+        "en-US"
+      ]
+    },
+    {
+      "provider": "deepgram",
+      "model": "nova-phonecall",
+      "supported": [
+        "en-US"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,123 @@
+[
+  {
+    "provider": "alibaba-cloud",
+    "support": "none"
+  },
+  {
+    "provider": "amivoice",
+    "support": "none"
+  },
+  {
+    "provider": "assemblyai",
+    "support": "batch_only"
+  },
+  {
+    "provider": "aws-transcribe",
+    "support": "none"
+  },
+  {
+    "provider": "azure",
+    "support": "none"
+  },
+  {
+    "provider": "baidu",
+    "support": "none"
+  },
+  {
+    "provider": "bhashini",
+    "support": "none"
+  },
+  {
+    "provider": "cartesia",
+    "support": "none"
+  },
+  {
+    "provider": "deepgram",
+    "support": "none"
+  },
+  {
+    "provider": "elevenlabs",
+    "support": "none"
+  },
+  {
+    "provider": "fpt-ai",
+    "support": "none"
+  },
+  {
+    "provider": "gladia",
+    "support": "arbitrary"
+  },
+  {
+    "provider": "gnani",
+    "support": "none"
+  },
+  {
+    "provider": "google",
+    "support": "none"
+  },
+  {
+    "provider": "groq",
+    "support": "english_only"
+  },
+  {
+    "provider": "ibm-watson",
+    "support": "none"
+  },
+  {
+    "provider": "iflytek",
+    "support": "none"
+  },
+  {
+    "provider": "naver-clova",
+    "support": "none"
+  },
+  {
+    "provider": "nectec",
+    "support": "none"
+  },
+  {
+    "provider": "openai",
+    "support": "english_only"
+  },
+  {
+    "provider": "phonexia",
+    "support": "none"
+  },
+  {
+    "provider": "revai",
+    "support": "none"
+  },
+  {
+    "provider": "reverie",
+    "support": "none"
+  },
+  {
+    "provider": "sarvam",
+    "support": "none"
+  },
+  {
+    "provider": "sberdevices",
+    "support": "none"
+  },
+  {
+    "provider": "speechmatics",
+    "support": "arbitrary",
+    "max_targets": 5
+  },
+  {
+    "provider": "tencent",
+    "support": "none"
+  },
+  {
+    "provider": "tinkoff",
+    "support": "none"
+  },
+  {
+    "provider": "viettel-ai",
+    "support": "none"
+  },
+  {
+    "provider": "yandex",
+    "support": "none"
+  }
+]

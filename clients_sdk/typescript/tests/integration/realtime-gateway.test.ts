@@ -89,7 +89,7 @@ describeLive('LIVE bud.realtime reaches the gateway /realtime handler (credentia
     }
   });
 
-  it('exposes all 12 providers', () => {
-    expect(REALTIME_PROVIDERS).toHaveLength(12);
+  it('exposes all 11 providers', () => {
+    expect(REALTIME_PROVIDERS).toHaveLength(11);
   });
 });

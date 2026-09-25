@@ -1,5 +1,7 @@
 //! `POST /v1/audio/speech` — synthesis.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::AudioError;
@@ -17,7 +19,14 @@ pub struct SpeechRequest {
     /// The Bud endpoint name. Resolved against `voice_table` to pick the vendor.
     pub model: String,
     pub input: String,
-    pub voice: String,
+    /// OPTIONAL since FRD-018 Part III C1, where OpenAI requires it.
+    ///
+    /// A Bud voice deployment carries a default voice chosen by the operator, published on the
+    /// `voice_table` entry. Requiring `voice` on every request would make that default
+    /// unreachable — it could only ever be overridden, never used. Omitting it here means "use
+    /// the deployment's voice"; the handler still refuses when neither exists, naming the field.
+    #[serde(default)]
+    pub voice: Option<String>,
     #[serde(default)]
     pub response_format: Option<String>,
     #[serde(default)]
@@ -25,6 +34,152 @@ pub struct SpeechRequest {
     /// Present in newer OpenAI models; forwarded to vendors that support a free-text style.
     #[serde(default)]
     pub instructions: Option<String>,
+    /// OpenAI's `audio` (one response body) or `sse` (a stream of events). Only `audio` is
+    /// served. Declared rather than left to serde's unknown-field tolerance: an ignored `sse`
+    /// answered a caller waiting for events with a binary body and a 200.
+    #[serde(default)]
+    pub stream_format: Option<String>,
+    /// Bud's per-request overrides of the deployment's speech settings. None of them is in
+    /// OpenAI's schema; all are optional, so an OpenAI client that never sends them is unaffected.
+    #[serde(flatten)]
+    pub overrides: SpeechOverrides,
+    /// Every other key. Kept so the handler can say it was ignored: serde's default drops unknown
+    /// keys silently, and a caller who typed `stabilty` got a 200 and the deployment's value.
+    #[serde(flatten)]
+    pub unrecognised: BTreeMap<String, serde_json::Value>,
+}
+
+/// One pronunciation replacement: `word` is replaced as a whole word by `pronunciation`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct PronunciationOverride {
+    pub word: String,
+    pub pronunciation: String,
+}
+
+/// Per-request values for a deployment's speech settings (the deployment's audio settings page).
+///
+/// Each one, when present, replaces the deployment's value for this request only; the handler
+/// then applies it exactly as it applies a saved setting, including the warning when the vendor
+/// cannot honour it. `pronunciations` add to the deployment's list, and win on the same word.
+/// Operational settings (latency tier, streaming endpoint, timeouts) stay deployment-only.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct SpeechOverrides {
+    pub language: Option<String>,
+    pub emotion: Option<String>,
+    /// A number 0.0–1.0 or one of [`INTENSITY_LEVELS`].
+    pub emotion_intensity: Option<serde_json::Value>,
+    pub delivery_style: Option<String>,
+    pub pitch: Option<f32>,
+    pub volume: Option<f32>,
+    pub rate_percentage: Option<i32>,
+    pub pitch_percentage: Option<i32>,
+    pub stability: Option<f32>,
+    pub similarity_boost: Option<f32>,
+    pub style: Option<f32>,
+    pub use_speaker_boost: Option<bool>,
+    /// For `pcm` output; one of [`SAMPLE_RATES`].
+    pub sample_rate: Option<u32>,
+    pub pronunciations: Option<Vec<PronunciationOverride>>,
+}
+
+/// PCM sample rates a request may ask for. The same list the deployment settings accept.
+pub const SAMPLE_RATES: &[u32] = &[8000, 16000, 22050, 24000, 44100, 48000];
+/// Named emotion intensities, besides a number from 0.0 to 1.0.
+pub const INTENSITY_LEVELS: &[&str] = &["low", "medium", "high"];
+
+impl SpeechOverrides {
+    /// Range and shape checks that need no vendor knowledge. Whether the vendor honours a value
+    /// is the handler's question, answered with a warning rather than a refusal.
+    fn validate(&self) -> Result<(), AudioError> {
+        let unit = |field: &'static str, v: Option<f32>| match v {
+            Some(x) if !(0.0..=1.0).contains(&x) => Err(AudioError::OutOfRange {
+                field,
+                value: x.to_string(),
+                min: "0.0".into(),
+                max: "1.0".into(),
+            }),
+            _ => Ok(()),
+        };
+        unit("stability", self.stability)?;
+        unit("similarity_boost", self.similarity_boost)?;
+        unit("style", self.style)?;
+        for (field, v) in [
+            ("rate_percentage", self.rate_percentage),
+            ("pitch_percentage", self.pitch_percentage),
+        ] {
+            if let Some(x) = v
+                && !(-50..=50).contains(&x)
+            {
+                return Err(AudioError::OutOfRange {
+                    field,
+                    value: x.to_string(),
+                    min: "-50".into(),
+                    max: "50".into(),
+                });
+            }
+        }
+        if let Some(rate) = self.sample_rate
+            && !SAMPLE_RATES.contains(&rate)
+        {
+            return Err(AudioError::Unsupported {
+                field: "sample_rate",
+                value: rate.to_string(),
+                expected: SAMPLE_RATES
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            });
+        }
+        match &self.emotion_intensity {
+            None => {}
+            Some(serde_json::Value::String(s)) if INTENSITY_LEVELS.contains(&s.as_str()) => {}
+            Some(serde_json::Value::Number(n))
+                if n.as_f64().is_some_and(|v| (0.0..=1.0).contains(&v)) => {}
+            Some(serde_json::Value::Number(n)) => {
+                return Err(AudioError::OutOfRange {
+                    field: "emotion_intensity",
+                    value: n.to_string(),
+                    min: "0.0".into(),
+                    max: "1.0".into(),
+                });
+            }
+            Some(other) => {
+                return Err(AudioError::InvalidField {
+                    field: "emotion_intensity",
+                    reason: format!(
+                        "expected a number from 0.0 to 1.0 or one of {}; got {other}",
+                        INTENSITY_LEVELS.join(", ")
+                    ),
+                });
+            }
+        }
+        for (field, v) in [
+            ("language", &self.language),
+            ("emotion", &self.emotion),
+            ("delivery_style", &self.delivery_style),
+        ] {
+            if v.as_deref().is_some_and(|s| s.trim().is_empty()) {
+                return Err(AudioError::InvalidField {
+                    field,
+                    reason: "it is empty; leave it out to use the deployment's value".to_string(),
+                });
+            }
+        }
+        if self
+            .pronunciations
+            .iter()
+            .flatten()
+            .any(|p| p.word.trim().is_empty() || p.pronunciation.trim().is_empty())
+        {
+            return Err(AudioError::InvalidField {
+                field: "pronunciations",
+                reason: "every entry needs a non-empty `word` and `pronunciation`".to_string(),
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Output encodings WaaV can return.
@@ -110,13 +265,18 @@ impl AudioFormat {
 pub struct SpeechSettings {
     pub endpoint: String,
     pub text: String,
-    /// The vendor's voice identifier. OpenAI names are mapped where an equivalent exists;
-    /// everything else passes through unchanged.
-    pub voice: String,
+    /// The vendor's voice identifier as the CALLER gave it, or `None` to take the
+    /// deployment's default. Resolution happens in the handler, which is the only place that
+    /// can see the endpoint; this crate stays free of control-plane types.
+    pub voice: Option<String>,
     pub format: AudioFormat,
     /// 0.25–4.0, OpenAI's range. `None` means the vendor default.
     pub speaking_rate: Option<f32>,
     pub instructions: Option<String>,
+    /// Validated per-request overrides of the deployment's speech settings.
+    pub overrides: SpeechOverrides,
+    /// Keys the request carried that nothing reads, sorted. The handler warns about each.
+    pub unrecognised: Vec<String>,
 }
 
 /// OpenAI's eleven canonical voice names.
@@ -159,12 +319,38 @@ pub fn translate(req: SpeechRequest) -> Result<SpeechSettings, AudioError> {
     if req.model.trim().is_empty() {
         return Err(AudioError::Missing { field: "model" });
     }
-    if req.input.is_empty() {
+    // Whitespace counts as missing. It reached the provider, which skips blank text without
+    // queueing a request — so nothing ever completed, and the caller waited out the full 30 s
+    // synthesis timeout for a 502 that blamed the vendor.
+    if req.input.trim().is_empty() {
         return Err(AudioError::Missing { field: "input" });
     }
-    if req.voice.trim().is_empty() {
-        return Err(AudioError::Missing { field: "voice" });
+    // Nothing a voice can say: punctuation, symbols or emoji alone. Vendors answer these
+    // inconsistently — ElevenLabs returns an EMPTY clip for "..." (which surfaced as a 502 that
+    // blamed the vendor) and a 400 for "👍" — so the one answer is given here, before a vendor
+    // call. Letters and digits in any script count; `is_alphanumeric` is Unicode-aware, so
+    // Japanese, Hindi and numbers pass.
+    if !req.input.chars().any(char::is_alphanumeric) {
+        return Err(AudioError::InvalidField {
+            field: "input",
+            reason: "it contains no letters or digits, so there is nothing to speak".to_string(),
+        });
     }
+    match req.stream_format.as_deref() {
+        None | Some("audio") => {}
+        Some(other) => {
+            return Err(AudioError::Unsupported {
+                field: "stream_format",
+                value: other.to_string(),
+                expected: "audio".to_string(),
+            });
+        }
+    }
+    // An EMPTY voice is treated as absent rather than refused: a form that submits `""` for an
+    // untouched field is indistinguishable from one that omitted it, and refusing the first
+    // while honouring the second is a distinction no caller can see. The handler refuses when
+    // neither the request nor the deployment supplies one.
+    let voice = req.voice.filter(|v| !v.trim().is_empty());
 
     // Characters, not bytes. A byte limit would give a caller writing Japanese roughly a third
     // of the budget for the same text, which is not a limit anybody can reason about.
@@ -199,13 +385,17 @@ pub fn translate(req: SpeechRequest) -> Result<SpeechSettings, AudioError> {
         }
     };
 
+    req.overrides.validate()?;
+
     Ok(SpeechSettings {
         endpoint: req.model,
         text: req.input,
-        voice: req.voice,
+        voice,
         format,
         speaking_rate,
         instructions: req.instructions,
+        overrides: req.overrides,
+        unrecognised: req.unrecognised.into_keys().collect(),
     })
 }
 
@@ -217,11 +407,83 @@ mod tests {
         SpeechRequest {
             model: "deepgram-tts".into(),
             input: "Hello from Bud.".into(),
-            voice: "aura-asteria-en".into(),
+            voice: Some("aura-asteria-en".into()),
             response_format: None,
             speed: None,
             instructions: None,
+            stream_format: None,
+            overrides: SpeechOverrides::default(),
+            unrecognised: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn whitespace_only_input_is_missing_input() {
+        for input in ["   ", "\n\t "] {
+            let err = translate(SpeechRequest {
+                input: input.into(),
+                ..req()
+            })
+            .unwrap_err();
+            assert!(
+                matches!(err, AudioError::Missing { field: "input" }),
+                "{input:?}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn input_with_nothing_to_speak_is_refused_but_any_script_passes() {
+        for input in ["...", "👍", "?!", "—"] {
+            let err = translate(SpeechRequest {
+                input: input.into(),
+                ..req()
+            })
+            .unwrap_err();
+            assert!(
+                matches!(err, AudioError::InvalidField { field: "input", .. }),
+                "{input:?}: {err:?}"
+            );
+        }
+        for input in ["こんにちは。", "नमस्ते।", "42", "Hi 👍", "[laughs] ok"]
+        {
+            assert!(
+                translate(SpeechRequest {
+                    input: input.into(),
+                    ..req()
+                })
+                .is_ok(),
+                "{input:?} must pass"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_whole_body_stream_format_is_served() {
+        for ok in [None, Some("audio")] {
+            assert!(
+                translate(SpeechRequest {
+                    stream_format: ok.map(str::to_string),
+                    ..req()
+                })
+                .is_ok()
+            );
+        }
+        let err = translate(SpeechRequest {
+            stream_format: Some("sse".into()),
+            ..req()
+        })
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AudioError::Unsupported {
+                    field: "stream_format",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -229,7 +491,7 @@ mod tests {
         let s = translate(req()).unwrap();
         assert_eq!(s.endpoint, "deepgram-tts");
         assert_eq!(s.text, "Hello from Bud.");
-        assert_eq!(s.voice, "aura-asteria-en");
+        assert_eq!(s.voice.as_deref(), Some("aura-asteria-en"));
         assert_eq!(s.format, AudioFormat::Mp3, "OpenAI defaults to mp3");
         assert_eq!(s.speaking_rate, None);
     }
@@ -239,11 +501,11 @@ mod tests {
         // Rejecting these would make every vendor's own catalog unreachable.
         for voice in ["aura-asteria-en", "Rachel", "sonic-english", "元気な女性"] {
             let s = translate(SpeechRequest {
-                voice: voice.into(),
+                voice: Some(voice.into()),
                 ..req()
             })
             .unwrap();
-            assert_eq!(s.voice, voice);
+            assert_eq!(s.voice.as_deref(), Some(voice));
         }
     }
 
@@ -389,10 +651,6 @@ mod tests {
                 Box::new(|r: &mut SpeechRequest| r.input = String::new()),
                 "input",
             ),
-            (
-                Box::new(|r: &mut SpeechRequest| r.voice = "".into()),
-                "voice",
-            ),
         ] {
             let mut r = req();
             mutate(&mut r);
@@ -403,6 +661,34 @@ mod tests {
                 "a caller can only fix a field the error names"
             );
         }
+    }
+
+    /// FRD-018 Part III C1. `voice` moved from required to optional, so the two spellings of
+    /// "I did not choose one" have to mean the same thing — otherwise a form that submits an
+    /// empty string behaves differently from one that omits the key, and no caller can see why.
+    #[test]
+    fn an_absent_and_a_blank_voice_are_both_none() {
+        for blank in [None, Some(String::new()), Some("   ".to_string())] {
+            let s = translate(SpeechRequest {
+                voice: blank.clone(),
+                ..req()
+            })
+            .unwrap();
+            assert_eq!(
+                s.voice, None,
+                "{blank:?} should mean 'use the endpoint default'"
+            );
+        }
+    }
+
+    #[test]
+    fn a_request_without_a_voice_key_still_deserialises() {
+        // The wire-level half of the same change: OpenAI's schema requires `voice`, so a
+        // `#[serde(default)]` that went missing would turn every default-voice request into a
+        // 400 at parse time, before any of the logic above runs.
+        let req: SpeechRequest =
+            serde_json::from_str(r#"{"model":"deepgram-tts","input":"hi"}"#).unwrap();
+        assert_eq!(req.voice, None);
     }
 
     /// A vendor rejects the combination outright, so this cannot be left to a default.
@@ -476,15 +762,24 @@ mod voice_validation_tests {
     fn an_unknown_voice_is_rejected_and_names_the_alternatives() {
         let err = validate_voice("aloy", OPENAI_VOICES).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("aloy"), "must quote what the caller actually sent: {msg}");
+        assert!(
+            msg.contains("aloy"),
+            "must quote what the caller actually sent: {msg}"
+        );
         assert!(msg.contains("alloy"), "must list the real voices: {msg}");
-        assert!(msg.contains("shimmer"), "must list ALL of them, not a sample: {msg}");
+        assert!(
+            msg.contains("shimmer"),
+            "must list ALL of them, not a sample: {msg}"
+        );
     }
 
     #[test]
     fn a_known_voice_passes() {
         for v in OPENAI_VOICES {
-            assert!(validate_voice(v, OPENAI_VOICES).is_ok(), "{v} should be accepted");
+            assert!(
+                validate_voice(v, OPENAI_VOICES).is_ok(),
+                "{v} should be accepted"
+            );
         }
     }
 
@@ -501,7 +796,10 @@ mod voice_validation_tests {
         // Unsupported is what `response_format` already uses, and the handler maps it to 400.
         // The whole point is that this stops being a 502: the caller can fix it themselves.
         let err = validate_voice("nope", OPENAI_VOICES).unwrap_err();
-        assert!(matches!(err, AudioError::Unsupported { field: "voice", .. }));
+        assert!(matches!(
+            err,
+            AudioError::Unsupported { field: "voice", .. }
+        ));
     }
 
     #[test]
@@ -510,5 +808,62 @@ mod voice_validation_tests {
         // caller who gets a quiet pass here would be surprised by a vendor rejection later.
         assert!(validate_voice("Alloy", OPENAI_VOICES).is_err());
         assert!(validate_voice(" alloy", OPENAI_VOICES).is_err());
+    }
+}
+
+#[cfg(test)]
+mod override_tests {
+    use super::*;
+
+    fn parse(body: &str) -> SpeechRequest {
+        serde_json::from_str(body).expect("parses")
+    }
+
+    #[test]
+    fn a_plain_openai_body_carries_no_overrides_and_nothing_unrecognised() {
+        let s = translate(parse(
+            r#"{"model":"tts","input":"Hello.","voice":"alloy","response_format":"mp3","speed":1.2}"#,
+        ))
+        .unwrap();
+        assert_eq!(s.overrides, SpeechOverrides::default());
+        assert!(s.unrecognised.is_empty(), "{:?}", s.unrecognised);
+    }
+
+    #[test]
+    fn override_fields_are_read_and_are_not_reported_as_unrecognised() {
+        let s = translate(parse(
+            r#"{"model":"tts","input":"Hello.","stability":0.3,"emotion":"happy",
+                "emotion_intensity":"high","sample_rate":16000,"language":"fr-FR",
+                "pronunciations":[{"word":"Bud","pronunciation":"bud"}],"stabilty":0.9}"#,
+        ))
+        .unwrap();
+        assert_eq!(s.overrides.stability, Some(0.3));
+        assert_eq!(s.overrides.emotion.as_deref(), Some("happy"));
+        assert_eq!(s.overrides.sample_rate, Some(16000));
+        assert_eq!(s.overrides.language.as_deref(), Some("fr-FR"));
+        assert_eq!(s.overrides.pronunciations.as_ref().map(Vec::len), Some(1));
+        // The typo, and only the typo.
+        assert_eq!(s.unrecognised, vec!["stabilty".to_string()]);
+    }
+
+    #[test]
+    fn out_of_range_and_malformed_overrides_are_refused_by_name() {
+        let cases = [
+            (r#""stability":1.5"#, "stability"),
+            (r#""rate_percentage":80"#, "rate_percentage"),
+            (r#""sample_rate":12345"#, "sample_rate"),
+            (r#""emotion_intensity":"extreme""#, "emotion_intensity"),
+            (r#""emotion_intensity":7"#, "emotion_intensity"),
+            (r#""emotion":"  ""#, "emotion"),
+            (
+                r#""pronunciations":[{"word":"Bud","pronunciation":""}]"#,
+                "pronunciations",
+            ),
+        ];
+        for (field_json, field) in cases {
+            let body = format!(r#"{{"model":"tts","input":"Hello.",{field_json}}}"#);
+            let err = translate(parse(&body)).unwrap_err();
+            assert!(err.to_string().contains(field), "{field}: {err}");
+        }
     }
 }

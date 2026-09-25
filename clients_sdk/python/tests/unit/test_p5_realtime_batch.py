@@ -231,10 +231,10 @@ class TestBatchEnvelope:
 
 
 class TestGatewayRealtimeConfig:
-    def test_all_twelve_providers_supported(self):
+    def test_all_eleven_providers_supported(self):
         expected = {
             "openai", "hume", "azure", "grok", "inworld", "deepgram",
-            "elevenlabs", "gemini", "ultravox", "nova_sonic", "speechmatics", "yandex",
+            "elevenlabs", "gemini", "ultravox", "nova_sonic", "yandex",
         }
         assert set(REALTIME_PROVIDERS) == expected
         assert set(get_supported_realtime_providers()) == expected

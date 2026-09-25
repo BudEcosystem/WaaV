@@ -52,6 +52,23 @@ impl RedisStore {
         Ok(c)
     }
 
+    /// Write one key with an expiry.
+    ///
+    /// The control plane is otherwise read-only from WaaV's side. The one thing WaaV writes back
+    /// is derived data budapp cannot produce without the plaintext credential — a deployment's
+    /// voice list (`voice_catalog:`). The TTL means an entry for a deleted deployment ages out
+    /// rather than lingering.
+    pub async fn set_ex(&self, key: &str, value: &str, ttl_secs: u64) -> Result<(), StoreError> {
+        let mut c = self.conn().await?;
+        match c.set_ex::<_, _, ()>(key, value, ttl_secs).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.invalidate().await;
+                Err(StoreError::Unavailable(e.to_string()))
+            }
+        }
+    }
+
     /// Drop the cached connection so the next caller re-establishes it.
     async fn invalidate(&self) {
         *self.conn.lock().await = None;

@@ -1,8 +1,8 @@
 # WaaV Gateway - Supported Providers
 
-> **Last Updated:** 2026-01-17
+> **Last Updated:** 2026-09-25
 > **Total Providers:** 70+ Cloud API Providers
-> **Implemented:** 46 | **Blocked:** 10 | **Planned:** 14
+> **Implemented:** 43 | **Blocked:** 10 | **Planned:** 14
 
 WaaV Gateway provides unified access to 70+ cloud-based Speech-to-Text (STT), Text-to-Speech (TTS), and Audio-to-Audio providers worldwide.
 
@@ -10,8 +10,8 @@ WaaV Gateway provides unified access to 70+ cloud-based Speech-to-Text (STT), Te
 
 ## Quick Navigation
 
-- [STT Providers](#speech-to-text-stt-providers) (27 implemented)
-- [TTS Providers](#text-to-speech-tts-providers) (32 implemented)
+- [STT Providers](#speech-to-text-stt-providers) (31 implemented)
+- [TTS Providers](#text-to-speech-tts-providers) (34 implemented)
 - [Realtime/Audio-to-Audio Providers](#realtime-audio-to-audio-providers) (2 implemented)
 - [Provider by Region](#providers-by-region)
 - [Feature Comparison](#feature-comparison)
@@ -85,7 +85,6 @@ WaaV Gateway provides unified access to 70+ cloud-based Speech-to-Text (STT), Te
 | **Zalo AI** | REST | 1 | Vietnamese, Northern/Southern accents | `ZALO_API_KEY` |
 | **FPT.AI** | REST | 1 | Vietnamese, 7 voices | `FPT_API_KEY` |
 | **Viettel AI** | REST | 1 | Vietnamese, 96% accuracy | `VIETTEL_TOKEN` |
-| **Prosa.ai** | WebSocket/REST | 1 | Indonesian, stt-general models | `PROSA_API_KEY` |
 | **NECTEC** | REST | 1 | Thai government AI, Partii engines | `NECTEC_API_KEY` |
 
 ---
@@ -110,8 +109,6 @@ WaaV Gateway provides unified access to 70+ cloud-based Speech-to-Text (STT), Te
 | Provider | Protocol | Languages | Latency | Key Features | Env Variable |
 |----------|----------|-----------|---------|--------------|--------------|
 | **Hume AI** | HTTP/WS | 11+ | ~200ms | Octave, emotion control, 48 emotions | `HUME_API_KEY` |
-| **LMNT** | HTTP | 22+ | ~150ms | Voice cloning, top_p/temperature | `LMNT_API_KEY` |
-| **Play.ht** | HTTP | 36+ | ~190ms | PlayDialog multi-turn, cloning | `PLAYHT_API_KEY` |
 | **Murf.ai** | HTTP | 35+ | ~130ms | Falcon/Gen2, 12 regional endpoints | `MURF_API_KEY` |
 | **WellSaid Labs** | HTTP | 20+ | ~500ms | Caruso AI Director, 200+ avatars | `WELLSAID_API_KEY` |
 | **Resemble AI** | HTTP | 149+ | ~350ms | Chatterbox, paralinguistic tags | `RESEMBLE_API_KEY` |
@@ -162,7 +159,6 @@ WaaV Gateway provides unified access to 70+ cloud-based Speech-to-Text (STT), Te
 | **Zalo AI** | REST | 4 | 1 | Vietnamese, Northern/Southern | `ZALO_API_KEY` |
 | **FPT.AI** | REST | 7 | 1 | Vietnamese, MP3/WAV | `FPT_API_KEY` |
 | **Viettel AI** | REST | 12 | 1 | Vietnamese, speed control | `VIETTEL_TOKEN` |
-| **Prosa.ai** | REST | 9 | 1 | Indonesian, pitch/tempo | `PROSA_API_KEY` |
 | **NECTEC** | REST | 2 | 1 | Thai, VAJA9 engine, free | `NECTEC_API_KEY` |
 
 ---
@@ -194,7 +190,7 @@ WaaV Gateway provides unified access to 70+ cloud-based Speech-to-Text (STT), Te
 ## Providers by Region
 
 ### North America
-- Deepgram, OpenAI, AssemblyAI, Amazon (Transcribe/Polly), IBM Watson, Groq, ElevenLabs, LMNT, Play.ht, Hume AI, WellSaid Labs, Resemble AI, Speechify, Unreal Speech
+- Deepgram, OpenAI, AssemblyAI, Amazon (Transcribe/Polly), IBM Watson, Groq, ElevenLabs, Hume AI, WellSaid Labs, Resemble AI, Speechify, Unreal Speech
 
 ### Europe
 - Google Cloud, Microsoft Azure, Speechmatics (UK), Gladia (France), Rev AI, Phonexia, Acapela Group, Cereproc (Scotland)
@@ -212,7 +208,7 @@ WaaV Gateway provides unified access to 70+ cloud-based Speech-to-Text (STT), Te
 - NAVER CLOVA (Korea), AmiVoice (Japan)
 
 ### Southeast Asia
-- Zalo AI (Vietnam), FPT.AI (Vietnam), Viettel AI (Vietnam), Prosa.ai (Indonesia), NECTEC (Thailand)
+- Zalo AI (Vietnam), FPT.AI (Vietnam), Viettel AI (Vietnam), NECTEC (Thailand)
 
 ---
 
@@ -230,8 +226,8 @@ WaaV Gateway provides unified access to 70+ cloud-based Speech-to-Text (STT), Te
 
 | Tier | Providers | Time-to-First-Audio |
 |------|-----------|---------------------|
-| **Ultra-Low** | Smallest.ai (~100ms), Cartesia (<100ms), LMNT (~150ms) | <200ms |
-| **Low** | Play.ht (~190ms), Murf.ai (~130ms), Hume AI (~200ms) | 150-250ms |
+| **Ultra-Low** | Smallest.ai (~100ms), Cartesia (<100ms) | <200ms |
+| **Low** | Murf.ai (~130ms), Hume AI (~200ms) | 150-250ms |
 | **Standard** | ElevenLabs, Azure, Resemble AI (~350ms) | 250-500ms |
 
 ### Voice Cloning Support
@@ -239,8 +235,6 @@ WaaV Gateway provides unified access to 70+ cloud-based Speech-to-Text (STT), Te
 | Provider | Clone Time | Min Audio | Max Files | Features |
 |----------|------------|-----------|-----------|----------|
 | **ElevenLabs** | ~1 min | 30s | N/A | Instant + Professional |
-| **Play.ht** | ~1 min | 30s | N/A | Instant |
-| **LMNT** | ~1 min | 5s | 20 (250MB) | Enhancement option |
 | **Resemble AI** | ~1 min | 10s | N/A | Rapid + Professional |
 | **Hume AI** | ~1 min | 15s | N/A | Voice design |
 | **Cartesia** | ~1 min | 10s | N/A | Instant |
@@ -279,9 +273,6 @@ export GROQ_API_KEY="gsk_your-key"
 
 # Voice Cloning Specialists
 export HUME_API_KEY="your-key"
-export LMNT_API_KEY="your-key"
-export PLAYHT_API_KEY="your-key"
-export PLAYHT_USER_ID="your-user-id"
 export MURF_API_KEY="your-key"
 export WELLSAID_API_KEY="your-key"
 export RESEMBLE_API_KEY="your-key"
@@ -326,7 +317,6 @@ export NAVER_CLIENT_SECRET="your-secret"
 export ZALO_API_KEY="your-key"
 export FPT_API_KEY="your-key"
 export VIETTEL_TOKEN="your-token"
-export PROSA_API_KEY="your-key"
 export NECTEC_API_KEY="your-key"
 ```
 
@@ -394,7 +384,7 @@ The following providers cannot be integrated due to API limitations:
 | **Kakao** | Original API terminated (2022) | NAVER CLOVA |
 | **NTT COTOHA** | Service terminated (2024) | Google Cloud, Azure |
 | **Vbee** | API docs inaccessible | Zalo AI, FPT.AI |
-| **Kata.ai** | Enterprise platform only | Prosa.ai |
+| **Kata.ai** | Enterprise platform only | Google Cloud, Azure |
 | **CoRover** | Chatbot platform, no standalone API | Bhashini |
 
 ---
@@ -436,9 +426,9 @@ The following providers are planned for future releases:
 | Use Case | Recommended STT | Recommended TTS |
 |----------|-----------------|-----------------|
 | **Ultra-fast transcription** | Groq, Deepgram | Cartesia, Smallest.ai |
-| **Low latency streaming** | Deepgram, Gladia | LMNT, Play.ht, Cartesia |
+| **Low latency streaming** | Deepgram, Gladia | Cartesia |
 | **High accuracy** | AssemblyAI, Google | Azure Neural, Google WaveNet |
-| **Voice cloning** | - | ElevenLabs, Play.ht, Resemble AI |
+| **Voice cloning** | - | ElevenLabs, Cartesia, Resemble AI |
 | **Emotion control** | - | Hume AI, Azure SSML |
 | **Multi-language (global)** | Google (125+), AssemblyAI (99) | Azure (140+), Google (75+) |
 | **Indian languages** | Sarvam AI, Gnani, Bhashini | Sarvam AI, Reverie, Bhashini |
@@ -453,6 +443,7 @@ The following providers are planned for future releases:
 
 ## Version History
 
+- **2026-09-25**: Removed LMNT, Play.ht, and Prosa.ai (the vendors no longer operate)
 - **2026-01-17**: Added NECTEC (Thailand), updated provider counts
 - **2026-01-14**: Added Tencent Cloud, Huawei Cloud, NAVER CLOVA, AmiVoice
 - **2026-01-13**: Added 20+ providers including Southeast Asia region

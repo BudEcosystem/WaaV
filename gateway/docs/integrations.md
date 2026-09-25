@@ -36,8 +36,6 @@ This document lists commonly used speech-to-text (STT), text-to-speech (TTS), an
 | **Amazon Polly** | AWS SDK | 60+ voices, neural/standard/generative engines, SSML, 30+ languages | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` |
 | **IBM Watson** | HTTP | 30+ V3 neural voices, 15+ languages, SSML, rate/pitch control | `IBM_WATSON_API_KEY`, `IBM_WATSON_INSTANCE_ID` |
 | **Hume AI** | HTTP/WebSocket | Octave TTS, natural language emotion control, voice cloning, acting instructions | `HUME_API_KEY` |
-| **LMNT** | HTTP | Low-latency (~150ms), voice cloning, 22+ languages, top_p/temperature control | `LMNT_API_KEY` |
-| **Play.ht** | HTTP | Low-latency (~190ms), PlayDialog multi-turn, 36+ languages, voice cloning | `PLAYHT_API_KEY`, `PLAYHT_USER_ID` |
 
 ### Audio-to-Audio (Realtime)
 
@@ -131,91 +129,6 @@ This document lists commonly used speech-to-text (STT), text-to-speech (TTS), an
   - EVI 3: Starting ~$0.02/min (volume), $0.072/min standard
   - Octave TTS: Free tier (10K chars), Starter $3/mo (30K chars), Creator $10/mo (100K chars)
 - **Authentication:** API key header (`X-HUME-API-KEY`)
-
-### LMNT
-
-- **Website:** https://lmnt.com
-- **Documentation:** https://docs.lmnt.com
-- **Capabilities:** TTS, Voice Cloning
-- **Protocol:** HTTP streaming
-- **Typical Latency:** ~150ms
-- **Max Text Length:** 5000 characters per request
-- **Languages:** 22+ languages (auto-detect, Arabic, German, English, Spanish, French, Hindi, Indonesian, Italian, Japanese, Korean, Dutch, Polish, Portuguese, Russian, Swedish, Thai, Turkish, Ukrainian, Urdu, Vietnamese, Chinese)
-- **Audio Formats:**
-  - **MP3** - 96kbps, streamable (default)
-  - **PCM S16LE** - 16-bit signed PCM, streamable
-  - **PCM F32LE** - 32-bit float PCM, streamable
-  - **µ-law** - 8-bit G711, streamable
-  - **WebM** - Opus codec, streamable
-  - **WAV** - Not streamable
-  - **AAC** - Not streamable
-- **Sample Rates:** 8000 Hz, 16000 Hz, 24000 Hz (default)
-- **Voice Parameters:**
-  - `top_p` (0-1): Speech stability control (default: 0.8)
-  - `temperature` (≥0): Expressiveness range (default: 1.0)
-  - `speed` (0.25-2.0): Speech rate control (default: 1.0)
-  - `seed`: Deterministic output (optional)
-- **Voice Cloning:**
-  - Minimum audio: 5 seconds
-  - Maximum files: 20 attachments
-  - Maximum total size: 250 MB
-  - Supported formats: WAV, MP3, MP4, M4A, WebM
-  - Enhancement option: Process noisy audio automatically
-- **Endpoints:**
-  - HTTP Streaming: `POST https://api.lmnt.com/v1/ai/speech/bytes`
-  - Voice List: `GET https://api.lmnt.com/v1/ai/voice/list`
-  - Voice Clone: `POST https://api.lmnt.com/v1/ai/voice`
-- **Authentication:** `X-API-Key` header
-
-### Play.ht
-
-- **Website:** https://play.ht
-- **Documentation:** https://docs.play.ht
-- **Capabilities:** TTS, Voice Cloning
-- **Protocol:** HTTP streaming
-- **Typical Latency:** ~190ms (Play3.0-mini), ~350ms (PlayDialog)
-- **Max Text Length:** 20,000 characters per request
-- **Languages:** 36+ languages (Afrikaans, Albanian, Amharic, Arabic, Bengali, Bulgarian, Catalan, Croatian, Czech, Danish, Dutch, English, French, Galician, German, Greek, Hebrew, Hindi, Hungarian, Indonesian, Italian, Japanese, Korean, Malay, Mandarin, Polish, Portuguese, Russian, Serbian, Spanish, Swedish, Tagalog, Thai, Turkish, Ukrainian, Urdu, Xhosa)
-- **Voice Engines/Models:**
-  - **Play3.0-mini** - Fast, multilingual, 36+ languages (~190ms TTFA)
-  - **PlayDialog** - Expressive, two-speaker dialogue support (~350ms TTFA)
-  - **PlayDialogMultilingual** - Multilingual dialogue support
-  - **PlayDialogArabic** - Arabic dialogue support
-  - **PlayHT2.0-turbo** - Legacy English only (~230ms TTFA)
-- **Audio Formats:**
-  - **MP3** - Streamable (default)
-  - **WAV** - Streamable
-  - **PCM Mulaw** - Streamable
-  - **FLAC** - Streamable
-  - **OGG** - Streamable
-  - **Raw** - PCM, Streamable
-- **Sample Rates:** 8000 Hz, 16000 Hz, 24000 Hz, 44100 Hz, 48000 Hz (default)
-- **Voice Parameters:**
-  - `speed` (0.5-2.0): Playback speed control (default: 1.0)
-  - `temperature` (0.0-1.0): Randomness control
-  - `seed`: Deterministic output
-  - `quality`: Audio quality tier (draft/standard/premium)
-  - `text_guidance`: Text adherence (Play3.0, PlayHT2.0)
-  - `voice_guidance`: Voice adherence (Play3.0, PlayHT2.0)
-  - `style_guidance`: Style adherence (Play3.0 only)
-  - `repetition_penalty`: Repetition control
-- **PlayDialog Parameters:**
-  - `voice_2`: Second speaker voice URL
-  - `turn_prefix`: First speaker identifier (e.g., "S1:")
-  - `turn_prefix_2`: Second speaker identifier (e.g., "S2:")
-  - `voice_conditioning_seconds`: Reference audio duration
-  - `num_candidates`: Number of candidates for ranking
-- **Voice Cloning:**
-  - Instant voice clones from 30+ second audio samples
-  - Uses multipart/form-data upload
-- **Endpoints:**
-  - HTTP Streaming: `POST https://api.play.ht/api/v2/tts/stream`
-  - Voice List: `GET https://api.play.ht/api/v2/voices`
-  - Voice Clone: `POST https://api.play.ht/api/v2/cloned-voices/instant`
-  - WebSocket Auth: `POST https://api.play.ht/api/v4/websocket-auth`
-- **Authentication:** Dual-header authentication
-  - `X-USER-ID`: Your Play.ht user ID
-  - `AUTHORIZATION`: Your Play.ht API key
 
 ### AssemblyAI
 
@@ -392,13 +305,6 @@ export GROQ_API_KEY="gsk_your-groq-api-key"
 
 # Hume AI
 export HUME_API_KEY="your-hume-api-key"
-
-# LMNT
-export LMNT_API_KEY="your-lmnt-api-key"
-
-# Play.ht
-export PLAYHT_API_KEY="your-playht-api-key"
-export PLAYHT_USER_ID="your-playht-user-id"
 ```
 
 ### YAML Configuration
@@ -425,10 +331,6 @@ providers:
     region: ${IBM_WATSON_REGION}
   groq_api_key: ${GROQ_API_KEY}
   hume_api_key: ${HUME_API_KEY}
-  lmnt_api_key: ${LMNT_API_KEY}
-  playht:
-    api_key: ${PLAYHT_API_KEY}
-    user_id: ${PLAYHT_USER_ID}
 ```
 
 ### WebSocket Configuration Message
@@ -451,16 +353,15 @@ providers:
 
 | Use Case | Recommended STT | Recommended TTS |
 |----------|-----------------|-----------------|
-| **Ultra-fast** | Groq (216x real-time) | Cartesia, ElevenLabs, LMNT, Play.ht |
-| **Low latency** | Deepgram, Cartesia | Cartesia, ElevenLabs, LMNT, Play.ht |
+| **Ultra-fast** | Groq (216x real-time) | Cartesia, ElevenLabs |
+| **Low latency** | Deepgram, Cartesia | Cartesia, ElevenLabs |
 | **High accuracy** | AssemblyAI, Google | Google Neural2, Azure |
-| **Voice cloning** | - | ElevenLabs, Cartesia, Hume AI, LMNT, Play.ht |
+| **Voice cloning** | - | ElevenLabs, Cartesia, Hume AI |
 | **Emotion control** | - | Hume AI, ElevenLabs, Azure |
-| **Multi-language** | AssemblyAI (99), Amazon Transcribe (100+), Google (125+), IBM Watson (30+) | Azure (140+), Amazon Polly (30+), Google (40+), Play.ht (36+), LMNT (22+), IBM Watson (15+) |
+| **Multi-language** | AssemblyAI (99), Amazon Transcribe (100+), Google (125+), IBM Watson (30+) | Azure (140+), Amazon Polly (30+), Google (40+), IBM Watson (15+) |
 | **Cost-effective** | Deepgram, Groq ($0.04/hr), OpenAI | OpenAI, Deepgram |
 | **Enterprise/HIPAA** | Azure, Google, Amazon Transcribe, IBM Watson | Azure, Google, Amazon Polly, IBM Watson |
 | **Conversational AI** | - | OpenAI Realtime, Hume AI EVI |
-| **Multi-turn dialogue** | - | Play.ht PlayDialog |
 
 ---
 
@@ -507,7 +408,7 @@ Since this document was created, 30+ additional providers have been integrated:
 - iFlytek (STT+TTS), Alibaba Cloud DashScope (STT+TTS), Baidu AI (STT+TTS), Tencent Cloud (STT+TTS), Huawei Cloud (STT+TTS), NAVER CLOVA (STT+TTS), AmiVoice (STT)
 
 ### Southeast Asia
-- Zalo AI (TTS), FPT.AI (STT+TTS), Viettel AI (STT+TTS), Prosa.ai (STT+TTS), NECTEC (STT+TTS)
+- Zalo AI (TTS), FPT.AI (STT+TTS), Viettel AI (STT+TTS), NECTEC (STT+TTS)
 
 For the complete documentation including all 70+ providers, see **[SUPPORTED_PROVIDERS.md](./SUPPORTED_PROVIDERS.md)**.
 

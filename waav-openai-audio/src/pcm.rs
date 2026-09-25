@@ -4,11 +4,11 @@
 //! samples. Something has to bridge the two, and this is it — kept dependency-free and pure
 //! so the format edge cases can be tested in milliseconds rather than against a live vendor.
 //!
-//! **Scope is deliberately narrow.** WAV and headerless PCM are decoded here; mp3, m4a, ogg,
-//! flac and webm are REFUSED with a message naming what does work. Guessing at a compressed
-//! container without a real decoder would not produce a bad transcript, it would produce a
-//! confident one from noise, which is far worse than a 400. Widening this means adding a
-//! decoder crate (symphonia), not loosening the check.
+//! WAV and headerless PCM are parsed here directly. The compressed formats OpenAI's API accepts
+//! — mp3/mpeg/mpga, m4a/mp4 (AAC), flac, ogg and webm (Vorbis) — are decoded by Symphonia, a
+//! pure-Rust decoder, then downmixed and resampled to 16 kHz. Opus, which Symphonia cannot
+//! decode, is refused by name. Guessing at a container without a real decoder would not produce
+//! a bad transcript, it would produce a confident one from noise, which is far worse than a 400.
 
 use crate::AudioError;
 
@@ -44,7 +44,28 @@ impl PcmAudio {
 }
 
 /// Containers this module can actually turn into samples.
-pub const DECODABLE_EXTENSIONS: &[&str] = &["wav", "wave", "pcm", "raw"];
+pub const DECODABLE_EXTENSIONS: &[&str] = &[
+    "wav", "wave", "pcm", "raw", "mp3", "mpeg", "mpga", "m4a", "mp4", "flac", "ogg", "oga", "webm",
+];
+
+/// The subset that goes through Symphonia.
+const COMPRESSED_EXTENSIONS: &[&str] = &[
+    "mp3", "mpeg", "mpga", "m4a", "mp4", "flac", "ogg", "oga", "webm",
+];
+
+/// Rate compressed uploads are resampled DOWN to (never up).
+///
+/// A compressed upload has no rate the caller chose for transcription — it is whatever the
+/// encoder used, usually 44.1 or 48 kHz — and decoding at that rate costs 3x the memory of the
+/// 16 kHz every STT vendor here is built around. WAV uploads keep their own rate.
+pub const COMPRESSED_TARGET_RATE: u32 = 16_000;
+
+/// The longest compressed upload decoded, in seconds.
+///
+/// The 25 MB upload cap bounds a WAV's samples but not an MP3's: at 16 kbps, 25 MB is over three
+/// hours, which decodes to hundreds of MB. Thirty minutes covers a 25 MB MP3 at 128 kbps
+/// (about 27 minutes) and bounds the decode at ~58 MB of 16 kHz samples.
+pub const MAX_DECODED_SECS: u32 = 30 * 60;
 
 /// Rate assumed for a headerless PCM upload, matching the rate WaaV's own pipeline uses.
 pub const DEFAULT_PCM_SAMPLE_RATE: u32 = 16_000;
@@ -68,22 +89,240 @@ pub fn decode(bytes: &[u8], filename: &str) -> Result<PcmAudio, AudioError> {
     }
 
     match ext.as_str() {
-        "wav" | "wave" => decode_wav(bytes),
+        // Headerless samples carry no magic, and a small negative first sample (0xFFFF) looks
+        // exactly like an MPEG frame sync — so for these the name is the only evidence.
         "pcm" | "raw" => decode_raw_pcm(bytes, DEFAULT_PCM_SAMPLE_RATE),
-        // A RIFF header is trusted over an absent or wrong extension: a caller that uploads a
-        // real WAV named `audio.bin` is unambiguous, and refusing it would be pedantry.
+        // Otherwise the bytes are trusted over the name, in both directions: a real WAV named
+        // `audio.bin` is a WAV, and an MP3 named `speech.wav` — a browser recorder's default —
+        // is an MP3. Refusing either would be pedantry about a label.
         _ if bytes.starts_with(b"RIFF") => decode_wav(bytes),
+        _ if looks_compressed(bytes) => decode_compressed(
+            bytes,
+            Some(ext.as_str()).filter(|e| COMPRESSED_EXTENSIONS.contains(e)),
+        ),
+        "wav" | "wave" => decode_wav(bytes),
+        e if COMPRESSED_EXTENSIONS.contains(&e) => decode_compressed(bytes, Some(e)),
         other => Err(AudioError::InvalidField {
             field: "file",
             reason: format!(
-                "cannot decode {} audio; this gateway transcribes {} only. \
+                "cannot decode {} audio; this gateway transcribes {}. \
                  Convert the file first (e.g. `ffmpeg -i in.{} -ar 16000 -ac 1 out.wav`).",
-                if other.is_empty() { "unrecognised" } else { other },
+                if other.is_empty() {
+                    "unrecognised"
+                } else {
+                    other
+                },
                 DECODABLE_EXTENSIONS.join(", "),
-                if other.is_empty() { "mp3" } else { other },
+                if other.is_empty() { "audio" } else { other },
             ),
         }),
     }
+}
+
+/// Whether the bytes open with a compressed container's magic.
+fn looks_compressed(b: &[u8]) -> bool {
+    b.starts_with(b"ID3")                                          // mp3 with ID3v2 tag
+        || (b.len() > 1 && b[0] == 0xFF && (b[1] & 0xE0) == 0xE0)  // mpeg audio frame sync
+        || b.starts_with(b"fLaC")
+        || b.starts_with(b"OggS")
+        || b.get(4..8) == Some(b"ftyp")                             // mp4 / m4a
+        || b.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) // matroska / webm
+}
+
+/// Decode a compressed container to mono 16-bit PCM at no more than 16 kHz.
+///
+/// Streams packet by packet: each is downmixed and fed to the resampler as it is decoded, so the
+/// only full-length buffer is the 16 kHz output — never the source-rate float samples, which for
+/// a 30-minute 48 kHz file would be 345 MB. The duration cap is checked as samples arrive, so an
+/// over-long file is refused before it has been decoded to the end.
+fn decode_compressed(bytes: &[u8], ext: Option<&str>) -> Result<PcmAudio, AudioError> {
+    use symphonia::core::audio::SampleBuffer;
+    use symphonia::core::codecs::{CODEC_TYPE_NULL, CODEC_TYPE_OPUS, DecoderOptions};
+    use symphonia::core::errors::Error as SymphoniaError;
+    use symphonia::core::formats::FormatOptions;
+    use symphonia::core::io::MediaSourceStream;
+    use symphonia::core::meta::MetadataOptions;
+    use symphonia::core::probe::Hint;
+
+    let label = ext.unwrap_or("compressed");
+    let mss = MediaSourceStream::new(
+        Box::new(std::io::Cursor::new(bytes.to_vec())),
+        Default::default(),
+    );
+    let mut hint = Hint::new();
+    if let Some(e) = ext {
+        hint.with_extension(e);
+    }
+    let probed = symphonia::default::get_probe()
+        .format(
+            &hint,
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
+        .map_err(|e| invalid(format!("could not read the {label} file: {e}")))?;
+    let mut format = probed.format;
+
+    let track = format
+        .tracks()
+        .iter()
+        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
+        .ok_or_else(|| invalid(format!("the {label} file has no audio track")))?;
+    if track.codec_params.codec == CODEC_TYPE_OPUS {
+        return Err(invalid(
+            "Opus audio cannot be decoded here; send wav, mp3, m4a, flac or ogg (Vorbis), \
+             or convert it first (e.g. `ffmpeg -i in.ogg -ar 16000 -ac 1 out.wav`)",
+        ));
+    }
+    let track_id = track.id;
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&track.codec_params, &DecoderOptions::default())
+        .map_err(|e| {
+            invalid(format!(
+                "the {label} file's codec cannot be decoded here: {e}"
+            ))
+        })?;
+
+    let mut out = Downsampler::default();
+    loop {
+        let packet = match format.next_packet() {
+            Ok(p) => p,
+            // The normal end of a stream in Symphonia is an unexpected-EOF I/O error.
+            Err(SymphoniaError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                break;
+            }
+            Err(SymphoniaError::ResetRequired) => break,
+            Err(e) => return Err(invalid(format!("the {label} file is unreadable: {e}"))),
+        };
+        if packet.track_id() != track_id {
+            continue;
+        }
+        let decoded = match decoder.decode(&packet) {
+            Ok(d) => d,
+            // A single corrupt frame is skipped, as players do; it is not the whole file.
+            Err(SymphoniaError::DecodeError(_)) => continue,
+            Err(e) => {
+                return Err(invalid(format!(
+                    "the {label} file could not be decoded: {e}"
+                )));
+            }
+        };
+        let spec = *decoded.spec();
+        let channels = spec.channels.count().max(1);
+        let mut buf = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
+        buf.copy_interleaved_ref(decoded);
+        let mono: Vec<f32> = buf
+            .samples()
+            .chunks(channels)
+            .map(|frame| frame.iter().sum::<f32>() / channels as f32)
+            .collect();
+        out.push(&mono, spec.rate)?;
+    }
+    out.finish(label)
+}
+
+/// Streaming mono resampler to at most [`COMPRESSED_TARGET_RATE`], with the duration cap.
+#[derive(Default)]
+struct Downsampler {
+    source_rate: u32,
+    resampler: Option<rubato::FftFixedIn<f32>>,
+    pending: Vec<f32>,
+    source_frames: usize,
+    output: Vec<i16>,
+}
+
+impl Downsampler {
+    fn push(&mut self, mono: &[f32], rate: u32) -> Result<(), AudioError> {
+        use rubato::Resampler;
+        if rate == 0 {
+            return Err(invalid("the file declares a sample rate of 0"));
+        }
+        if self.source_rate == 0 {
+            self.source_rate = rate;
+            if rate > COMPRESSED_TARGET_RATE {
+                self.resampler = Some(
+                    rubato::FftFixedIn::<f32>::new(
+                        rate as usize,
+                        COMPRESSED_TARGET_RATE as usize,
+                        1024,
+                        2,
+                        1,
+                    )
+                    .map_err(|e| invalid(format!("cannot resample {rate} Hz audio: {e}")))?,
+                );
+            }
+        } else if rate != self.source_rate {
+            return Err(invalid(
+                "the file changes sample rate mid-stream, which cannot be transcribed as one clip",
+            ));
+        }
+        self.source_frames += mono.len();
+        if self.source_frames as u64 > MAX_DECODED_SECS as u64 * rate as u64 {
+            return Err(AudioError::TooLarge {
+                field: "file",
+                limit: format!("{} minutes of audio", MAX_DECODED_SECS / 60),
+                actual: "a longer recording; split it and send the parts".to_string(),
+            });
+        }
+        match self.resampler.as_mut() {
+            None => self.output.extend(mono.iter().map(|s| to_i16(*s))),
+            Some(r) => {
+                self.pending.extend_from_slice(mono);
+                let chunk = r.input_frames_next();
+                while self.pending.len() >= chunk {
+                    let take: Vec<f32> = self.pending.drain(..chunk).collect();
+                    let resampled = r
+                        .process(&[take], None)
+                        .map_err(|e| invalid(format!("resampling failed: {e}")))?;
+                    if let Some(ch) = resampled.first() {
+                        self.output.extend(ch.iter().map(|s| to_i16(*s)));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Flush the resampler's tail and trim its filter delay, so the output is exactly the
+    /// source's duration at the target rate — no clipped final syllable, no leading silence.
+    fn finish(mut self, label: &str) -> Result<PcmAudio, AudioError> {
+        use rubato::Resampler;
+        if self.source_rate == 0 {
+            return Err(invalid(format!("the {label} file contains no audio")));
+        }
+        let Some(mut r) = self.resampler.take() else {
+            return Ok(PcmAudio {
+                samples: self.output,
+                sample_rate: self.source_rate,
+            });
+        };
+        let delay = r.output_delay();
+        let tail = std::mem::take(&mut self.pending);
+        let mut flush = |input: Option<&[Vec<f32>]>| -> Result<(), AudioError> {
+            let out = r
+                .process_partial(input, None)
+                .map_err(|e| invalid(format!("resampling failed: {e}")))?;
+            if let Some(ch) = out.first() {
+                self.output.extend(ch.iter().map(|s| to_i16(*s)));
+            }
+            Ok(())
+        };
+        if !tail.is_empty() {
+            flush(Some(&[tail]))?;
+        }
+        flush(None)?;
+        let expected = (self.source_frames as u64 * COMPRESSED_TARGET_RATE as u64
+            / self.source_rate as u64) as usize;
+        let samples: Vec<i16> = self.output.into_iter().skip(delay).take(expected).collect();
+        Ok(PcmAudio {
+            samples,
+            sample_rate: COMPRESSED_TARGET_RATE,
+        })
+    }
+}
+
+fn to_i16(s: f32) -> i16 {
+    (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16
 }
 
 fn invalid(reason: impl Into<String>) -> AudioError {
@@ -138,9 +377,12 @@ pub fn wav_duration_secs(bytes: &[u8]) -> Option<f64> {
 
     while pos + 8 <= bytes.len() {
         let id = &bytes[pos..pos + 4];
-        let size =
-            u32::from_le_bytes([bytes[pos + 4], bytes[pos + 5], bytes[pos + 6], bytes[pos + 7]])
-                as usize;
+        let size = u32::from_le_bytes([
+            bytes[pos + 4],
+            bytes[pos + 5],
+            bytes[pos + 6],
+            bytes[pos + 7],
+        ]) as usize;
         let body = pos + 8;
         match id {
             // channels at +2, rate at +4, bits at +14 — enough to derive the frame size
@@ -188,7 +430,12 @@ fn decode_wav(bytes: &[u8]) -> Result<PcmAudio, AudioError> {
 
     while pos + 8 <= bytes.len() {
         let id = &bytes[pos..pos + 4];
-        let size = u32::from_le_bytes([bytes[pos + 4], bytes[pos + 5], bytes[pos + 6], bytes[pos + 7]]) as usize;
+        let size = u32::from_le_bytes([
+            bytes[pos + 4],
+            bytes[pos + 5],
+            bytes[pos + 6],
+            bytes[pos + 7],
+        ]) as usize;
         let body_start = pos + 8;
         // A declared size past the end means a truncated file; clamp so a partially-uploaded
         // recording still transcribes what arrived rather than failing outright.
@@ -288,7 +535,13 @@ mod tests {
     use super::*;
 
     /// Build a WAV in memory, optionally with a junk chunk before `data`.
-    fn wav(channels: u16, sample_rate: u32, bits: u16, samples: &[i16], extra_chunk: bool) -> Vec<u8> {
+    fn wav(
+        channels: u16,
+        sample_rate: u32,
+        bits: u16,
+        samples: &[i16],
+        extra_chunk: bool,
+    ) -> Vec<u8> {
         let data: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
         let mut out = Vec::new();
         out.extend_from_slice(b"RIFF");
@@ -368,16 +621,90 @@ mod tests {
         let bytes = wav(1, 16_000, 24, &[1, 2], false);
         let err = decode(&bytes, "a.wav").unwrap_err().to_string();
         assert!(err.contains("24-bit"), "got: {err}");
-        assert!(err.contains("ffmpeg"), "the message must say how to fix it: {err}");
+        assert!(
+            err.contains("ffmpeg"),
+            "the message must say how to fix it: {err}"
+        );
+    }
+
+    /// "Hello from Bud." — 44.1 kHz mono MP3, synthesised by the `eleven-v3` deployment.
+    const HELLO_MP3: &[u8] = include_bytes!("../tests/fixtures/hello.mp3");
+    /// The same sentence as Ogg Opus (ElevenLabs `opus_48000_64`).
+    const HELLO_OPUS: &[u8] = include_bytes!("../tests/fixtures/hello.opus");
+
+    #[test]
+    fn an_mp3_decodes_to_16khz_mono_of_the_right_length() {
+        let audio = decode(HELLO_MP3, "speech.mp3").expect("a real MP3 must decode");
+        assert_eq!(audio.sample_rate, COMPRESSED_TARGET_RATE);
+        // ~1-2 s of speech; the exact length is the encoder's, the bounds are sanity.
+        let secs = audio.duration_secs();
+        assert!((0.5..5.0).contains(&secs), "decoded {secs}s");
+        // Not silence: a decoder that ran but produced zeros would pass the length check.
+        let peak = audio
+            .samples
+            .iter()
+            .map(|s| s.unsigned_abs())
+            .max()
+            .unwrap_or(0);
+        assert!(peak > 1000, "peak amplitude {peak} — decoded to silence?");
     }
 
     #[test]
-    fn an_mp3_is_refused_and_the_message_names_what_does_work() {
-        let err = decode(b"\xff\xfbfake mp3 body", "speech.mp3")
+    fn a_compressed_file_is_recognised_by_its_bytes_whatever_its_name() {
+        let named = decode(HELLO_MP3, "speech.mp3").unwrap();
+        for name in ["upload.bin", "noextension", "speech.MP3", "speech.wav"] {
+            let other = decode(HELLO_MP3, name).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(other, named, "{name}");
+        }
+    }
+
+    #[test]
+    fn opus_is_refused_by_name_with_a_way_out() {
+        let err = decode(HELLO_OPUS, "speech.ogg").unwrap_err().to_string();
+        assert!(err.contains("Opus"), "got: {err}");
+        assert!(err.contains("mp3") && err.contains("ffmpeg"), "got: {err}");
+    }
+
+    #[test]
+    fn a_truncated_or_fake_mp3_is_a_clean_error_not_a_panic() {
+        assert!(decode(b"\xff\xfbfake mp3 body", "speech.mp3").is_err());
+        // A file cut off mid-frame: whatever it yields, it must not panic the worker.
+        let _ = decode(&HELLO_MP3[..HELLO_MP3.len() / 2], "speech.mp3");
+    }
+
+    #[test]
+    fn the_duration_cap_is_enforced_while_decoding() {
+        // 8 kHz, so no resampler runs and the test stays fast; the cap is on source duration.
+        let mut d = Downsampler::default();
+        let minute = vec![0.0f32; 8_000 * 60];
+        let mut refused = None;
+        for i in 0..=(MAX_DECODED_SECS / 60 + 1) {
+            if let Err(e) = d.push(&minute, 8_000) {
+                refused = Some((i, e));
+                break;
+            }
+        }
+        let (at, err) = refused.expect("a recording past the cap must be refused");
+        assert_eq!(
+            at,
+            MAX_DECODED_SECS / 60,
+            "refused on the first minute past the cap"
+        );
+        assert!(
+            matches!(err, AudioError::TooLarge { field: "file", .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_container_is_refused_and_names_what_works() {
+        let err = decode(b"not audio at all", "speech.xyz")
             .unwrap_err()
             .to_string();
-        assert!(err.contains("mp3"), "got: {err}");
-        assert!(err.contains("wav"), "the message must name a working format: {err}");
+        assert!(
+            err.contains("xyz") && err.contains("mp3") && err.contains("wav"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -409,7 +736,10 @@ mod tests {
 
     #[test]
     fn headerless_pcm_is_accepted_at_the_default_rate() {
-        let raw: Vec<u8> = [1i16, -1, 300].iter().flat_map(|s| s.to_le_bytes()).collect();
+        let raw: Vec<u8> = [1i16, -1, 300]
+            .iter()
+            .flat_map(|s| s.to_le_bytes())
+            .collect();
         let pcm = decode(&raw, "a.pcm").unwrap();
         assert_eq!(pcm.samples, vec![1, -1, 300]);
         assert_eq!(pcm.sample_rate, DEFAULT_PCM_SAMPLE_RATE);

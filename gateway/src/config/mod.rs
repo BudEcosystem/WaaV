@@ -212,14 +212,8 @@ pub struct ServerConfig {
     pub assemblyai_api_key: Option<String>,
     /// Hume AI API key for TTS (Octave) and EVI (Empathic Voice Interface)
     pub hume_api_key: Option<String>,
-    /// LMNT API key for ultra-low latency TTS and voice cloning
-    pub lmnt_api_key: Option<String>,
     /// Groq API key for ultra-fast Whisper STT (216x real-time)
     pub groq_api_key: Option<String>,
-    /// Play.ht API key for low-latency TTS with voice cloning
-    pub playht_api_key: Option<String>,
-    /// Play.ht user ID (required alongside playht_api_key)
-    pub playht_user_id: Option<String>,
     /// IBM Watson API key for STT/TTS
     pub ibm_watson_api_key: Option<String>,
     /// IBM Watson service instance ID
@@ -397,9 +391,6 @@ impl Drop for ServerConfig {
             secret.zeroize();
         }
         if let Some(ref mut key) = self.groq_api_key {
-            key.zeroize();
-        }
-        if let Some(ref mut key) = self.playht_api_key {
             key.zeroize();
         }
         if let Some(ref mut key) = self.ibm_watson_api_key {
@@ -649,25 +640,12 @@ impl ServerConfig {
                     .cloned()
                     .ok_or_else(|| "Hume API key not configured in server environment".to_string())
             }
-            "lmnt" | "lmnt-ai" | "lmnt_ai" => {
-                // LMNT uses API key authentication for TTS and voice cloning
-                self.lmnt_api_key
-                    .as_ref()
-                    .cloned()
-                    .ok_or_else(|| "LMNT API key not configured in server environment".to_string())
-            }
             "groq" => {
                 // Groq uses API key authentication for ultra-fast Whisper STT
                 self.groq_api_key
                     .as_ref()
                     .cloned()
                     .ok_or_else(|| "Groq API key not configured in server environment".to_string())
-            }
-            "playht" | "play.ht" | "play-ht" => {
-                // Play.ht uses API key authentication for TTS
-                self.playht_api_key.as_ref().cloned().ok_or_else(|| {
-                    "Play.ht API key not configured in server environment".to_string()
-                })
             }
             "ibm-watson" | "ibm_watson" | "ibm" | "watson" => {
                 // IBM Watson uses API key authentication for STT/TTS
@@ -713,26 +691,6 @@ impl ServerConfig {
         self.azure_speech_region
             .clone()
             .unwrap_or_else(|| "eastus".to_string())
-    }
-
-    /// Get Play.ht credentials (API key and user ID)
-    ///
-    /// Play.ht uses dual-header authentication requiring both API key and user ID.
-    ///
-    /// # Returns
-    /// * `Result<(String, String), String>` - Tuple of (api_key, user_id) on success
-    pub fn get_playht_credentials(&self) -> Result<(String, String), String> {
-        let api_key = self
-            .playht_api_key
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| "Play.ht API key not configured".to_string())?;
-        let user_id = self
-            .playht_user_id
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| "Play.ht user ID not configured".to_string())?;
-        Ok((api_key, user_id))
     }
 
     /// Get AWS credentials (access key ID, secret access key, region)
@@ -841,10 +799,7 @@ mod tests {
             yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
-            lmnt_api_key: None,
             groq_api_key: None,
-            playht_api_key: None,
-            playht_user_id: None,
             ibm_watson_api_key: None,
             ibm_watson_instance_id: None,
             ibm_watson_region: None,
@@ -926,10 +881,7 @@ mod tests {
             yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
-            lmnt_api_key: None,
             groq_api_key: None,
-            playht_api_key: None,
-            playht_user_id: None,
             ibm_watson_api_key: None,
             ibm_watson_instance_id: None,
             ibm_watson_region: None,
@@ -1000,10 +952,7 @@ mod tests {
             yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
-            lmnt_api_key: None,
             groq_api_key: None,
-            playht_api_key: None,
-            playht_user_id: None,
             ibm_watson_api_key: None,
             ibm_watson_instance_id: None,
             ibm_watson_region: None,
@@ -1077,10 +1026,7 @@ mod tests {
             yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
-            lmnt_api_key: None,
             groq_api_key: None,
-            playht_api_key: None,
-            playht_user_id: None,
             ibm_watson_api_key: None,
             ibm_watson_instance_id: None,
             ibm_watson_region: None,
@@ -1154,10 +1100,7 @@ mod tests {
             yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
-            lmnt_api_key: None,
             groq_api_key: None,
-            playht_api_key: None,
-            playht_user_id: None,
             ibm_watson_api_key: None,
             ibm_watson_instance_id: None,
             ibm_watson_region: None,
@@ -1237,10 +1180,7 @@ mod tests {
             yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
-            lmnt_api_key: None,
             groq_api_key: None,
-            playht_api_key: None,
-            playht_user_id: None,
             ibm_watson_api_key: None,
             ibm_watson_instance_id: None,
             ibm_watson_region: None,
@@ -1307,10 +1247,7 @@ mod tests {
             yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
-            lmnt_api_key: None,
             groq_api_key: None,
-            playht_api_key: None,
-            playht_user_id: None,
             ibm_watson_api_key: None,
             ibm_watson_instance_id: None,
             ibm_watson_region: None,
@@ -1385,10 +1322,7 @@ mod tests {
             yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
-            lmnt_api_key: None,
             groq_api_key: None,
-            playht_api_key: None,
-            playht_user_id: None,
             ibm_watson_api_key: None,
             ibm_watson_instance_id: None,
             ibm_watson_region: None,
@@ -1458,10 +1392,7 @@ mod tests {
             yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
-            lmnt_api_key: None,
             groq_api_key: None,
-            playht_api_key: None,
-            playht_user_id: None,
             ibm_watson_api_key: None,
             ibm_watson_instance_id: None,
             ibm_watson_region: None,
@@ -1530,10 +1461,7 @@ mod tests {
             yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
-            lmnt_api_key: None,
             groq_api_key: None,
-            playht_api_key: None,
-            playht_user_id: None,
             ibm_watson_api_key: None,
             ibm_watson_instance_id: None,
             ibm_watson_region: None,
@@ -1612,10 +1540,7 @@ mod tests {
             yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
-            lmnt_api_key: None,
             groq_api_key: None,
-            playht_api_key: None,
-            playht_user_id: None,
             ibm_watson_api_key: None,
             ibm_watson_instance_id: None,
             ibm_watson_region: None,
@@ -1688,10 +1613,7 @@ mod tests {
             yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
-            lmnt_api_key: None,
             groq_api_key: None,
-            playht_api_key: None,
-            playht_user_id: None,
             ibm_watson_api_key: None,
             ibm_watson_instance_id: None,
             ibm_watson_region: None,
@@ -1763,10 +1685,7 @@ mod tests {
             yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
-            lmnt_api_key: None,
             groq_api_key: None,
-            playht_api_key: None,
-            playht_user_id: None,
             ibm_watson_api_key: None,
             ibm_watson_instance_id: None,
             ibm_watson_region: None,
@@ -1838,10 +1757,7 @@ mod tests {
             yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
-            lmnt_api_key: None,
             groq_api_key: None,
-            playht_api_key: None,
-            playht_user_id: None,
             ibm_watson_api_key: None,
             ibm_watson_instance_id: None,
             ibm_watson_region: None,
@@ -1918,10 +1834,7 @@ mod tests {
             yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
-            lmnt_api_key: None,
             groq_api_key: None,
-            playht_api_key: None,
-            playht_user_id: None,
             ibm_watson_api_key: None,
             ibm_watson_instance_id: None,
             ibm_watson_region: None,
@@ -1992,10 +1905,7 @@ mod tests {
             yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
-            lmnt_api_key: None,
             groq_api_key: None,
-            playht_api_key: None,
-            playht_user_id: None,
             ibm_watson_api_key: None,
             ibm_watson_instance_id: None,
             ibm_watson_region: None,
@@ -2069,10 +1979,7 @@ mod tests {
             yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
-            lmnt_api_key: None,
             groq_api_key: None,
-            playht_api_key: None,
-            playht_user_id: None,
             ibm_watson_api_key: None,
             ibm_watson_instance_id: None,
             ibm_watson_region: None,
@@ -2141,10 +2048,7 @@ mod tests {
             yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
-            lmnt_api_key: None,
             groq_api_key: None,
-            playht_api_key: None,
-            playht_user_id: None,
             ibm_watson_api_key: None,
             ibm_watson_instance_id: None,
             ibm_watson_region: None,

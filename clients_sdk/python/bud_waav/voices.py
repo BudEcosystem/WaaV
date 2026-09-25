@@ -132,7 +132,7 @@ class VoicesAPI:
         """Clone a voice (``POST /voices/clone``) and return a :class:`CloneResult`.
 
         Args:
-            provider: hume | elevenlabs | lmnt | cartesia | playht | speechify | resemble.
+            provider: hume | elevenlabs | cartesia | speechify | resemble.
             name: Name for the cloned voice (required).
             samples: Audio samples — each a ``bytes`` blob (base64-encoded here) or a
                 ``str`` (already-base64 or a URL).
@@ -140,7 +140,7 @@ class VoicesAPI:
             description: Optional description (Hume design / ElevenLabs label).
             labels: Optional flat labels (ElevenLabs).
             base_voice_id: Base voice to design/derive from (provider-specific).
-            remove_background_noise: Strip background noise (ElevenLabs IVC / LMNT).
+            remove_background_noise: Strip background noise (ElevenLabs IVC).
             sample_text: Sample text for voice generation (Hume only).
 
         Returns:

@@ -15,6 +15,7 @@
 
 pub mod authz;
 pub mod credentials;
+pub mod endpoint_config;
 pub mod guards;
 pub mod hash;
 pub mod hydrate;
@@ -27,6 +28,10 @@ pub mod types;
 
 pub use authz::{AuthzTier, Resolution};
 pub use credentials::{CredentialDecryptor, CredentialError, VoiceEndpoint};
+pub use endpoint_config::{
+    Pronunciation, SttSettings, TranslationSettings, TtsSettings, VoiceDescriptor,
+    VoiceEndpointSettings,
+};
 pub use guards::{Denied, EscalationPermit, KeyShape, MissGuardConfig, MissGuards};
 pub use hash::hash_api_key;
 pub use hydrate::{KeyEvent, hydrate_all};

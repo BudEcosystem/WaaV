@@ -589,8 +589,8 @@ class RestClient:
 
         Args:
             name: Name for the cloned voice (required).
-            provider: Voice-clone provider (hume, elevenlabs, lmnt, cartesia,
-                playht, speechify, resemble).
+            provider: Voice-clone provider (hume, elevenlabs, cartesia,
+                speechify, resemble).
             audio_samples: Samples as base64 strings or URLs (canonical wire field).
             audio_files: Raw audio bytes (convenience; base64-encoded into
                 ``audio_samples``). Merged with ``audio_samples`` if both given.
@@ -598,7 +598,7 @@ class RestClient:
             labels: Optional flat labels (ElevenLabs).
             mode: ``instant`` (default) or ``professional`` (async).
             base_voice_id: Base voice to design/derive from (provider-specific).
-            remove_background_noise: Strip background noise (ElevenLabs IVC / LMNT).
+            remove_background_noise: Strip background noise (ElevenLabs IVC).
             sample_text: Sample text for voice generation (Hume only).
 
         Returns:

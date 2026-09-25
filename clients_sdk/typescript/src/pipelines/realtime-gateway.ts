@@ -5,7 +5,7 @@
 // Unlike BudRealtime (pipelines/realtime.ts — the OpenAI/Hume provider-NATIVE
 // escape hatch), this client speaks ONLY the WaaV gateway's provider-agnostic
 // `/realtime` WebSocket protocol. Because the gateway abstracts every provider
-// behind one wire, the SAME surface works for ALL 12 realtime/S2S providers —
+// behind one wire, the SAME surface works for ALL 11 realtime/S2S providers —
 // `provider` is just a field.
 //
 // The exact wire is mirrored from the gateway handler
@@ -39,7 +39,7 @@
 import { EventEmitter } from 'events';
 
 /**
- * The 12 realtime/S2S providers reachable through the gateway `/realtime`
+ * The 11 realtime/S2S providers reachable through the gateway `/realtime`
  * endpoint (provider-agnostic — the gateway routes each behind the SAME wire).
  * Mirror of the gateway `get_supported_realtime_providers()`
  * (gateway/src/core/realtime/mod.rs:187).
@@ -55,7 +55,6 @@ export const REALTIME_PROVIDERS = [
   'gemini',
   'ultravox',
   'nova_sonic',
-  'speechmatics',
   'yandex',
 ] as const;
 
@@ -261,7 +260,7 @@ export function gatewayRealtimeConfigToWire(config: GatewayRealtimeConfig): Reco
 
 /**
  * A gateway-native, provider-agnostic realtime session. Speaks ONLY the gateway
- * `/realtime` wire, so the same object works for all 12 realtime providers.
+ * `/realtime` wire, so the same object works for all 11 realtime providers.
  *
  * Construct via {@link BudClient.realtime} (recommended) or directly.
  *

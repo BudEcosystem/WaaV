@@ -125,6 +125,7 @@
 
 pub mod mapper;
 pub mod mappers;
+pub mod matrix;
 pub mod types;
 
 // =============================================================================

@@ -73,6 +73,70 @@ impl VoiceSettings {
 
 pub const ELEVENLABS_TTS_URL: &str = "https://api.elevenlabs.io/v1/text-to-speech";
 
+/// The voice used when nothing names one: George, the voice ElevenLabs' own quickstart uses.
+///
+/// Must be a voice EVERY account may use, which rules out the long-standing choice, Rachel
+/// (`21m00Tcm4TlvDq8ikWAM`). ElevenLabs has since moved Rachel into the shared library, and a
+/// free-tier key is refused her outright — `402 Free users cannot use library voices via the
+/// API` — so a default meant to always work failed on exactly the accounts least likely to have
+/// configured anything. George (and Sarah) synthesise on a free-tier key; verified live against
+/// eleven_v3 on 2026-09-24.
+pub const DEFAULT_VOICE_ID: &str = "JBFqnCBsd6RMkjVDRZzb";
+
+/// The `output_format` ElevenLabs is sent for a requested WaaV format.
+///
+/// One function for the request builder and for anyone asking "can ElevenLabs produce this?" —
+/// the OpenAI route refuses a format this maps to PCM for (other than `wav`/`pcm` themselves)
+/// before spending a vendor call, instead of serving raw samples labelled as a codec.
+///
+/// ElevenLabs outputs mp3, pcm, ulaw, alaw and opus. `opus` maps to its native `opus_48000_64`;
+/// before this it fell through to the PCM default, and `/v1/audio/speech` answered
+/// `response_format: opus` with raw samples labelled `audio/opus`. `wav` is PCM here and is given
+/// its RIFF header by the OpenAI route, which holds the whole clip. `aac` and `flac` have no
+/// ElevenLabs equivalent and still map to PCM — that is the signal the route reads.
+pub fn output_format_for(audio_format: Option<&str>, sample_rate: Option<u32>) -> String {
+    let Some(format) = audio_format else {
+        // Default to PCM 24kHz for consistency with the rest of the system
+        return "pcm_24000".to_string();
+    };
+    match format {
+        // ElevenLabs supports PCM at specific sample rates
+        // Every PCM rate ElevenLabs offers. 8000 and 48000 were missing, so they fell to the
+        // 24 kHz default while the audio was still LABELLED 8000/48000 — played at the label,
+        // 3 s of speech became 8.9 s of noise. `new` now reports the rate actually requested.
+        "linear16" | "pcm" => match sample_rate.unwrap_or(24000) {
+            8000 => "pcm_8000".to_string(),
+            16000 => "pcm_16000".to_string(),
+            22050 => "pcm_22050".to_string(),
+            24000 => "pcm_24000".to_string(),
+            44100 => "pcm_44100".to_string(),
+            48000 => "pcm_48000".to_string(),
+            _ => "pcm_24000".to_string(), // Default to 24kHz
+        },
+        "mp3" => match sample_rate.unwrap_or(44100) {
+            22050 => "mp3_22050_32".to_string(),
+            44100 => "mp3_44100_128".to_string(),
+            _ => "mp3_44100_128".to_string(),
+        },
+        "opus" => "opus_48000_64".to_string(),
+        "ulaw" => "ulaw_8000".to_string(),
+        other => {
+            // If the caller already passed a canonical ElevenLabs format string
+            // (e.g. "mp3_44100_128", "pcm_16000", "ulaw_8000", "opus_48000_64"),
+            // honor it verbatim instead of silently forcing PCM — otherwise a valid
+            // explicit selection (e.g. MP3, the only output allowed on lower tiers) was
+            // being overridden to the Pro-tier-only `pcm_*` and rejected with HTTP 403.
+            const KNOWN_PREFIXES: [&str; 5] = ["mp3_", "pcm_", "ulaw_", "alaw_", "opus_"];
+            if KNOWN_PREFIXES.iter().any(|p| other.starts_with(p)) {
+                other.to_string()
+            } else {
+                // Unknown short alias → default to PCM for downstream-pipeline compatibility.
+                format!("pcm_{}", sample_rate.unwrap_or(24000))
+            }
+        }
+    }
+}
+
 /// ElevenLabs-specific request builder
 #[derive(Clone)]
 struct ElevenLabsRequestBuilder {
@@ -129,7 +193,7 @@ impl TTSRequestBuilder for ElevenLabsRequestBuilder {
         previous_text: Option<&str>,
     ) -> reqwest::RequestBuilder {
         // Get voice_id from config, required for ElevenLabs
-        let default_voice = "21m00Tcm4TlvDq8ikWAM".to_string();
+        let default_voice = DEFAULT_VOICE_ID.to_string();
         let voice_id = self.config.voice_id.as_ref().unwrap_or(&default_voice);
 
         // Build the URL with voice_id
@@ -141,49 +205,8 @@ impl TTSRequestBuilder for ElevenLabsRequestBuilder {
         // Add output format based on config
         // ElevenLabs expects format like "pcm_24000", "pcm_16000", "pcm_22050", etc.
         // For linear16/pcm format, we need to specify PCM with the correct sample rate
-        let output_format = if let Some(format) = &self.config.audio_format {
-            match format.as_str() {
-                "linear16" | "pcm" => {
-                    // ElevenLabs supports PCM at specific sample rates
-                    let sample_rate = self.config.sample_rate.unwrap_or(24000);
-                    // Map to supported ElevenLabs PCM formats
-                    match sample_rate {
-                        16000 => "pcm_16000".to_string(),
-                        22050 => "pcm_22050".to_string(),
-                        24000 => "pcm_24000".to_string(),
-                        44100 => "pcm_44100".to_string(),
-                        _ => "pcm_24000".to_string(), // Default to 24kHz
-                    }
-                }
-                "mp3" => {
-                    let sample_rate = self.config.sample_rate.unwrap_or(44100);
-                    match sample_rate {
-                        22050 => "mp3_22050_32".to_string(),
-                        44100 => "mp3_44100_128".to_string(),
-                        _ => "mp3_44100_128".to_string(),
-                    }
-                }
-                "ulaw" => "ulaw_8000".to_string(),
-                other => {
-                    // If the caller already passed a canonical ElevenLabs format string
-                    // (e.g. "mp3_44100_128", "pcm_16000", "ulaw_8000", "opus_48000_64"),
-                    // honor it verbatim instead of silently forcing PCM — otherwise a valid
-                    // explicit selection (e.g. MP3, the only output allowed on lower tiers) was
-                    // being overridden to the Pro-tier-only `pcm_*` and rejected with HTTP 403.
-                    const KNOWN_PREFIXES: [&str; 5] = ["mp3_", "pcm_", "ulaw_", "alaw_", "opus_"];
-                    if KNOWN_PREFIXES.iter().any(|p| other.starts_with(p)) {
-                        other.to_string()
-                    } else {
-                        // Unknown short alias → default to PCM for downstream-pipeline compatibility.
-                        let sample_rate = self.config.sample_rate.unwrap_or(24000);
-                        format!("pcm_{sample_rate}")
-                    }
-                }
-            }
-        } else {
-            // Default to PCM 24kHz for consistency with the rest of the system
-            "pcm_24000".to_string()
-        };
+        let output_format =
+            output_format_for(self.config.audio_format.as_deref(), self.config.sample_rate);
 
         query_params.push(format!("output_format={output_format}"));
 
@@ -285,6 +308,8 @@ impl TTSRequestBuilder for ElevenLabsRequestBuilder {
             "audio/mpeg"
         } else if output_format.starts_with("ulaw") {
             "audio/basic"
+        } else if output_format.starts_with("opus") {
+            "audio/opus"
         } else {
             "audio/pcm"
         };
@@ -319,6 +344,18 @@ impl ElevenLabsTTS {
             return Err(super::base::TTSError::InvalidConfiguration(
                 "API key is required for ElevenLabs".to_string(),
             ));
+        }
+
+        // The rate the audio is LABELLED with must be the rate ElevenLabs is asked for. The
+        // shared provider labels chunks with `config.sample_rate`, and `output_format_for` maps
+        // any rate it does not know to 24 kHz; left alone, the two disagree and the caller plays
+        // the audio at the wrong speed.
+        let mut config = config;
+        if let Some(rate) = output_format_for(config.audio_format.as_deref(), config.sample_rate)
+            .strip_prefix("pcm_")
+            .and_then(|r| r.parse::<u32>().ok())
+        {
+            config.sample_rate = Some(rate);
         }
 
         // Create voice settings from config
@@ -1290,5 +1327,60 @@ mod tests {
         assert!(body.get("apply_text_normalization").is_none());
         assert!(body.get("use_pvc_as_ivc").is_none());
         assert!(!built.url().to_string().contains("enable_logging"));
+    }
+
+    #[test]
+    fn output_format_for_maps_each_openai_format() {
+        assert_eq!(output_format_for(Some("mp3"), None), "mp3_44100_128");
+        assert_eq!(output_format_for(Some("opus"), None), "opus_48000_64");
+        assert_eq!(output_format_for(Some("pcm"), None), "pcm_24000");
+        assert_eq!(
+            output_format_for(Some("linear16"), Some(16000)),
+            "pcm_16000"
+        );
+        // No ElevenLabs equivalent: these fall to PCM, which is what the OpenAI route reads as
+        // "cannot produce this" — and `wav`, which the route wraps itself.
+        assert_eq!(output_format_for(Some("wav"), None), "pcm_24000");
+        assert_eq!(output_format_for(Some("aac"), None), "pcm_24000");
+        assert_eq!(output_format_for(Some("flac"), None), "pcm_24000");
+        assert_eq!(
+            output_format_for(Some("opus_48000_128"), None),
+            "opus_48000_128"
+        );
+        assert_eq!(output_format_for(None, None), "pcm_24000");
+        assert_eq!(output_format_for(Some("pcm"), Some(8000)), "pcm_8000");
+        assert_eq!(output_format_for(Some("pcm"), Some(48000)), "pcm_48000");
+    }
+
+    #[test]
+    fn the_reported_rate_is_the_rate_requested_from_elevenlabs() {
+        let mk = |format: &str, rate: Option<u32>| {
+            ElevenLabsTTS::new(TTSConfig {
+                provider: "elevenlabs".into(),
+                api_key: "k".into(),
+                audio_format: Some(format.into()),
+                sample_rate: rate,
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        // A rate ElevenLabs has no PCM for is served at 24 kHz, and must be LABELLED 24 kHz.
+        assert_eq!(
+            mk("pcm", Some(12345)).request_builder.config.sample_rate,
+            Some(24000)
+        );
+        assert_eq!(
+            mk("pcm", Some(8000)).request_builder.config.sample_rate,
+            Some(8000)
+        );
+        assert_eq!(
+            mk("wav", None).request_builder.config.sample_rate,
+            Some(24000)
+        );
+        // A codec keeps whatever it was given; only PCM output is relabelled.
+        assert_eq!(
+            mk("mp3", Some(22050)).request_builder.config.sample_rate,
+            Some(22050)
+        );
     }
 }

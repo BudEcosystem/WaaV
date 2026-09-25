@@ -41,10 +41,7 @@ async fn create_test_state_auth_disabled() -> Arc<AppState> {
         yandex_folder_id: None,
         assemblyai_api_key: None,
         hume_api_key: None,
-        lmnt_api_key: None,
         groq_api_key: None,
-        playht_api_key: None,
-        playht_user_id: None,
         ibm_watson_api_key: None,
         ibm_watson_instance_id: None,
         ibm_watson_region: None,
@@ -215,10 +212,7 @@ V/reoL3Jcy/mQ9MrmJx+K1VC
             yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
-            lmnt_api_key: None,
             groq_api_key: None,
-            playht_api_key: None,
-            playht_user_id: None,
             ibm_watson_api_key: None,
             ibm_watson_instance_id: None,
             ibm_watson_region: None,
@@ -528,10 +522,7 @@ mod with_api_secret {
             yandex_folder_id: None,
             assemblyai_api_key: None,
             hume_api_key: None,
-            lmnt_api_key: None,
             groq_api_key: None,
-            playht_api_key: None,
-            playht_user_id: None,
             ibm_watson_api_key: None,
             ibm_watson_instance_id: None,
             ibm_watson_region: None,
@@ -583,6 +574,68 @@ mod with_api_secret {
 
     async fn auth_id_handler(Extension(auth): Extension<Auth>) -> String {
         auth.id.clone().unwrap_or_else(|| "missing".to_string())
+    }
+
+    /// The OpenAI-compatible routes answer an auth refusal in OpenAI's envelope, so an OpenAI
+    /// SDK can read `error.message`; the native routes keep `{"error": "<code>", "message"}`.
+    #[tokio::test]
+    async fn test_openai_routes_refuse_auth_in_the_openai_envelope() {
+        let state = create_test_state_with_api_secret("my-secret-token").await;
+        let app = Router::new()
+            .route("/v1/audio/speech", axum::routing::post(test_handler))
+            .route("/test", get(test_handler))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                auth_middleware,
+            ))
+            .with_state(state);
+
+        for (auth, code) in [
+            (None, "missing_auth_header"),
+            (Some("Bearer wrong-secret"), "unauthorized"),
+        ] {
+            let mut builder = Request::builder()
+                .method(Method::POST)
+                .uri("/v1/audio/speech");
+            if let Some(a) = auth {
+                builder = builder.header("Authorization", a);
+            }
+            let response = app
+                .clone()
+                .oneshot(builder.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["error"]["code"], code, "{json}");
+            assert_eq!(json["error"]["type"], "invalid_request_error", "{json}");
+            assert!(
+                json["error"]["message"]
+                    .as_str()
+                    .is_some_and(|m| !m.is_empty())
+            );
+            assert!(json["error"]["param"].is_null());
+        }
+
+        // A native route is unchanged.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "missing_auth_header");
     }
 
     #[tokio::test]

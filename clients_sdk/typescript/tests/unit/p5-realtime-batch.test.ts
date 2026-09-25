@@ -8,7 +8,7 @@
  *      (audio source, flattened StandardSTTConfig, batch-only knobs, translation)
  *      and polls `GET /transcribe/batch/{job_id}` until terminal.
  *   3. REALTIME: `bud.realtime(...)` builds the gateway PROVIDER-AGNOSTIC
- *      `/realtime` config message (NOT OpenAI's `session.update`) for all 12
+ *      `/realtime` config message (NOT OpenAI's `session.update`) for all 11
  *      providers; the unified event stream + callbacks decode the gateway IN msgs.
  */
 import { describe, it, expect, vi } from 'vitest';
@@ -184,10 +184,10 @@ describe('P5 bud.transcribeBatch', () => {
 // =============================================================================
 
 describe('P5 gateway-native bud.realtime', () => {
-  it('exposes all 12 realtime providers', () => {
+  it('exposes all 11 realtime providers', () => {
     const expected = [
       'openai', 'hume', 'azure', 'grok', 'inworld', 'deepgram',
-      'elevenlabs', 'gemini', 'ultravox', 'nova_sonic', 'speechmatics', 'yandex',
+      'elevenlabs', 'gemini', 'ultravox', 'nova_sonic', 'yandex',
     ];
     expect([...REALTIME_PROVIDERS].sort()).toEqual([...expected].sort());
     expect([...getSupportedRealtimeProviders()].sort()).toEqual([...expected].sort());
