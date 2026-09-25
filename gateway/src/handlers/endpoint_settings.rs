@@ -54,8 +54,12 @@ pub fn resolve_voice(requested: Option<&str>, endpoint_default: Option<&str>) ->
         .map(|v| v.to_string())
 }
 
-/// Resolve a language token: request, then endpoint default, then the deployment's section
-/// override, then nothing (which means "the provider decides").
+/// Resolve a language token: request, then the deployment's section override (`tts.language` /
+/// `stt.language`), then the endpoint default, then nothing (which means "the provider decides").
+///
+/// The section outranks the endpoint default because it is the more specific of the two: a
+/// deployment that speaks English and transcribes German sets both, and the German override lost
+/// to the default on every request.
 pub fn resolve_language(
     requested: Option<&str>,
     endpoint_default: Option<&str>,
@@ -63,8 +67,8 @@ pub fn resolve_language(
 ) -> Option<String> {
     requested
         .filter(|v| !v.trim().is_empty())
-        .or(endpoint_default.filter(|v| !v.trim().is_empty()))
         .or(section_default.filter(|v| !v.trim().is_empty()))
+        .or(endpoint_default.filter(|v| !v.trim().is_empty()))
         .map(|v| v.to_string())
 }
 
@@ -87,6 +91,68 @@ pub fn map_language_for(
     } else {
         Some(mapped.native)
     }
+}
+
+/// The language an upload sends the vendor, in the vendor's notation (C1/C3 step 3).
+///
+/// `language`, `channels`, `punctuation` and `encoding` were hardcoded in the handler; they keep
+/// the same values as defaults, so a deployment with no `stt` block behaves as it did — `en-US`
+/// when nothing names a language. The language is routed through the P2 mapper, which is what
+/// makes an endpoint default work across vendors, and mapped against the model the vendor will be
+/// called with: `stt.model` replaces the endpoint's in [`apply_stt_flat`].
+///
+/// Detection and a pinned language answer the same question in opposite ways, and a vendor handed
+/// both lets the pin win or refuses the pair. So:
+///
+/// * a request asking for both is refused (`Err` carries the message for a 400);
+/// * a request naming its language beats the deployment's detection, which is switched off;
+/// * with detection on, no language is pinned — an empty string, which every prerecorded builder
+///   omits;
+/// * a language the vendor cannot take is omitted too, never replaced by `en-US`, which
+///   transcribed Thai speech as English.
+pub fn upload_language(
+    stt: &mut SttSettings,
+    canonical: Option<&str>,
+    request_named_language: bool,
+    request_asked_detection: bool,
+    vendor: &str,
+    endpoint_model: Option<&str>,
+    advisories: &mut Advisories,
+) -> Result<String, String> {
+    let mut detect = stt.language_detection == Some(true);
+    if detect && request_named_language {
+        if request_asked_detection {
+            return Err(
+                "`language_detection` cannot be combined with `language`: send one or the other"
+                    .to_string(),
+            );
+        }
+        stt.language_detection = None;
+        detect = false;
+        advisories.warn(
+            "`language` was given, so this deployment's language detection was not used for this \
+             request"
+                .to_string(),
+        );
+    }
+    if detect {
+        if let Some(pinned) = canonical {
+            advisories.warn(format!(
+                "the default language {pinned} was not sent, because language detection is on"
+            ));
+        }
+        return Ok(String::new());
+    }
+    let Some(canonical) = canonical else {
+        return Ok("en-US".to_string());
+    };
+    let model = stt
+        .model
+        .as_deref()
+        .filter(|m| !m.trim().is_empty())
+        .or(endpoint_model)
+        .unwrap_or_default();
+    Ok(map_language_for(canonical, vendor, model, advisories).unwrap_or_default())
 }
 
 /// Build the emotion configuration a deployment asked for, if any (C2).
@@ -458,6 +524,7 @@ pub fn stt_features_for(
 pub fn translation_for(
     settings: Option<&bud_auth::endpoint_config::TranslationSettings>,
     translate_to_english: bool,
+    advisories: &mut Advisories,
 ) -> Option<TranslationConfig> {
     if translate_to_english {
         return Some(TranslationConfig {
@@ -467,9 +534,19 @@ pub fn translation_for(
     }
     let settings = settings?;
     let targets = settings.target_languages.as_ref()?;
+    // A target outside WaaV's canonical set cannot be sent, and dropping it without a word made
+    // a configured translation look like one the vendor had simply not done.
     let parsed: Vec<_> = targets
         .iter()
-        .filter_map(|t| crate::core::lang::resolve(t))
+        .filter_map(|t| {
+            let resolved = crate::core::lang::resolve(t);
+            if resolved.is_none() {
+                advisories.warn(format!(
+                    "translation target '{t}' is not a language this gateway can send; it was dropped"
+                ));
+            }
+            resolved
+        })
         .collect();
     if parsed.is_empty() {
         return None;
@@ -512,6 +589,124 @@ pub fn standard_stt(
     }
 }
 
+/// Lay a request's speech overrides over the deployment's saved settings.
+///
+/// The merged settings then take the same path a saved setting does, so an override the vendor
+/// cannot honour gets the same `x-bud-config-warning` and nothing new is special-cased. `Err` names
+/// a value outside the canonical vocabulary: a request's own typo is the caller's to fix, where a
+/// saved one only degrades (a deployment-time choice must not become a serve-time outage).
+pub fn apply_speech_overrides(
+    tts: &mut TtsSettings,
+    o: &waav_openai_audio::speech::SpeechOverrides,
+) -> Result<(), (&'static str, String)> {
+    if let Some(e) = &o.emotion {
+        if Emotion::from_str(e).is_none() {
+            let known: Vec<&str> = Emotion::all().iter().map(|e| e.as_str()).collect();
+            return Err((
+                "emotion",
+                format!("{e:?} is not one of: {}", known.join(", ")),
+            ));
+        }
+        tts.emotion = Some(e.clone());
+    }
+    if let Some(d) = &o.delivery_style {
+        if DeliveryStyle::from_str(d).is_none() {
+            let known: Vec<&str> = DeliveryStyle::all().iter().map(|d| d.as_str()).collect();
+            return Err((
+                "delivery_style",
+                format!("{d:?} is not one of: {}", known.join(", ")),
+            ));
+        }
+        tts.delivery_style = Some(d.clone());
+    }
+    macro_rules! replace {
+        ($($field:ident),*) => {$(
+            if o.$field.is_some() {
+                tts.$field = o.$field.clone();
+            }
+        )*};
+    }
+    replace!(
+        emotion_intensity,
+        pitch,
+        volume,
+        rate_percentage,
+        pitch_percentage,
+        stability,
+        similarity_boost,
+        style,
+        use_speaker_boost,
+        sample_rate,
+        language
+    );
+    // Added to the deployment's list; the request wins on the same word.
+    if let Some(extra) = &o.pronunciations {
+        let mut merged: Vec<bud_auth::endpoint_config::Pronunciation> = tts
+            .pronunciations
+            .take()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|p| !extra.iter().any(|e| e.word.eq_ignore_ascii_case(&p.word)))
+            .collect();
+        merged.extend(
+            extra
+                .iter()
+                .map(|e| bud_auth::endpoint_config::Pronunciation {
+                    word: e.word.clone(),
+                    pronunciation: e.pronunciation.clone(),
+                }),
+        );
+        tts.pronunciations = Some(merged);
+    }
+    Ok(())
+}
+
+/// Lay a request's transcription overrides over the deployment's saved settings.
+///
+/// Plain switches replace the saved value. The two compliance settings only tighten: a request can
+/// switch `profanity_filter` on but not off, and adds `redaction` categories without removing any.
+/// Boosted terms are added to the deployment's.
+pub fn apply_transcription_overrides(
+    stt: &mut SttSettings,
+    o: &waav_openai_audio::transcription::TranscriptionOverrides,
+    advisories: &mut Advisories,
+) {
+    macro_rules! replace {
+        ($($field:ident),*) => {$(
+            if o.$field.is_some() {
+                stt.$field = o.$field;
+            }
+        )*};
+    }
+    replace!(
+        punctuation,
+        diarization,
+        smart_format,
+        numerals,
+        filler_words,
+        language_detection
+    );
+    match (o.profanity_filter, stt.profanity_filter) {
+        (Some(true), _) => stt.profanity_filter = Some(true),
+        (Some(false), Some(true)) => advisories
+            .warn("`profanity_filter` is required by this deployment and stays on".to_string()),
+        _ => {}
+    }
+    let union = |saved: &mut Option<Vec<String>>, extra: &[String]| {
+        if extra.is_empty() {
+            return;
+        }
+        let list = saved.get_or_insert_with(Vec::new);
+        for term in extra {
+            if !list.iter().any(|t| t == term) {
+                list.push(term.clone());
+            }
+        }
+    };
+    union(&mut stt.keyterms, &o.keyterms);
+    union(&mut stt.redaction, &o.redaction);
+}
+
 /// Borrowed-or-default access, so a handler does not need a `match` per section.
 pub fn tts_of(settings: &bud_auth::VoiceEndpointSettings) -> Cow<'_, TtsSettings> {
     settings.tts()
@@ -524,6 +719,124 @@ pub fn stt_of(settings: &bud_auth::VoiceEndpointSettings) -> Cow<'_, SttSettings
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_speech_override_replaces_the_saved_value_and_adds_pronunciations() {
+        use waav_openai_audio::speech::{PronunciationOverride, SpeechOverrides};
+        let mut tts = TtsSettings {
+            stability: Some(0.8),
+            emotion: Some("calm".into()),
+            pronunciations: Some(vec![
+                bud_auth::endpoint_config::Pronunciation {
+                    word: "Bud".into(),
+                    pronunciation: "budd".into(),
+                },
+                bud_auth::endpoint_config::Pronunciation {
+                    word: "WaaV".into(),
+                    pronunciation: "wave".into(),
+                },
+            ]),
+            ..Default::default()
+        };
+        let o = SpeechOverrides {
+            stability: Some(0.2),
+            emotion: Some("happy".into()),
+            pronunciations: Some(vec![PronunciationOverride {
+                word: "bud".into(),
+                pronunciation: "bud".into(),
+            }]),
+            ..Default::default()
+        };
+        apply_speech_overrides(&mut tts, &o).unwrap();
+        assert_eq!(tts.stability, Some(0.2));
+        assert_eq!(tts.emotion.as_deref(), Some("happy"));
+        let p = tts.pronunciations.unwrap();
+        // WaaV kept; Bud replaced by the request's entry (case-insensitive match).
+        assert_eq!(p.len(), 2, "{p:?}");
+        assert!(p.iter().any(|x| x.word == "WaaV"));
+        assert!(
+            p.iter()
+                .any(|x| x.word == "bud" && x.pronunciation == "bud")
+        );
+    }
+
+    #[test]
+    fn a_speech_override_outside_the_vocabulary_is_refused_by_name() {
+        use waav_openai_audio::speech::SpeechOverrides;
+        let mut tts = TtsSettings::default();
+        let err = apply_speech_overrides(
+            &mut tts,
+            &SpeechOverrides {
+                emotion: Some("ecstatic-ish".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.0, "emotion");
+        let err = apply_speech_overrides(
+            &mut tts,
+            &SpeechOverrides {
+                delivery_style: Some("yodel".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.0, "delivery_style");
+    }
+
+    #[test]
+    fn transcription_overrides_replace_switches_and_only_tighten_compliance() {
+        use waav_openai_audio::transcription::TranscriptionOverrides;
+        let mut stt = SttSettings {
+            diarization: Some(false),
+            profanity_filter: Some(true),
+            redaction: Some(vec!["pii".into()]),
+            keyterms: Some(vec!["Dapr".into()]),
+            ..Default::default()
+        };
+        let o = TranscriptionOverrides {
+            diarization: Some(true),
+            profanity_filter: Some(false),
+            redaction: vec!["pci".into(), "pii".into()],
+            keyterms: vec!["Kubernetes".into()],
+            ..Default::default()
+        };
+        let mut adv = Advisories::new();
+        apply_transcription_overrides(&mut stt, &o, &mut adv);
+        assert_eq!(stt.diarization, Some(true));
+        assert_eq!(
+            stt.profanity_filter,
+            Some(true),
+            "a request cannot switch it off"
+        );
+        assert!(
+            adv.as_slice()
+                .iter()
+                .any(|w| w.contains("`profanity_filter` is required")),
+            "{:?}",
+            adv.as_slice()
+        );
+        assert_eq!(
+            stt.redaction.unwrap(),
+            vec!["pii", "pci"],
+            "added, never removed"
+        );
+        assert_eq!(stt.keyterms.unwrap(), vec!["Dapr", "Kubernetes"]);
+
+        // Switching the filter ON from a request is allowed.
+        let mut stt = SttSettings::default();
+        let mut adv = Advisories::new();
+        apply_transcription_overrides(
+            &mut stt,
+            &TranscriptionOverrides {
+                profanity_filter: Some(true),
+                ..Default::default()
+            },
+            &mut adv,
+        );
+        assert_eq!(stt.profanity_filter, Some(true));
+        assert!(adv.is_empty());
+    }
 
     #[test]
     fn an_emotion_the_vendor_does_not_map_is_named_and_dropped() {
@@ -595,13 +908,18 @@ mod tests {
     }
 
     #[test]
-    fn language_precedence_runs_request_then_endpoint_then_section() {
+    fn language_precedence_runs_request_then_section_then_endpoint() {
         assert_eq!(
             resolve_language(Some("fr-FR"), Some("de-DE"), Some("es-ES")).as_deref(),
             Some("fr-FR")
         );
         assert_eq!(
             resolve_language(None, Some("de-DE"), Some("es-ES")).as_deref(),
+            Some("es-ES"),
+            "the section's own language is more specific than the endpoint default"
+        );
+        assert_eq!(
+            resolve_language(None, Some("de-DE"), None).as_deref(),
             Some("de-DE")
         );
         assert_eq!(
@@ -971,7 +1289,7 @@ mod tests {
             target_languages: Some(vec!["es-ES".into()]),
             ..Default::default()
         };
-        let config = translation_for(Some(&settings), true).unwrap();
+        let config = translation_for(Some(&settings), true, &mut Advisories::new()).unwrap();
 
         assert_eq!(config.translate_to_english, Some(true));
         assert!(config.target_languages.is_empty());
@@ -984,20 +1302,164 @@ mod tests {
             target_languages: Some(vec!["es-ES".into(), "de-DE".into()]),
             ..Default::default()
         };
-        let config = translation_for(Some(&settings), false).unwrap();
+        let config = translation_for(Some(&settings), false, &mut Advisories::new()).unwrap();
 
         assert_eq!(config.target_languages.len(), 2);
     }
 
     #[test]
     fn no_translation_configured_means_none() {
-        assert!(translation_for(None, false).is_none());
+        assert!(translation_for(None, false, &mut Advisories::new()).is_none());
         assert!(
             translation_for(
                 Some(&bud_auth::endpoint_config::TranslationSettings::default()),
-                false
+                false,
+                &mut Advisories::new()
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn with_detection_on_no_language_is_pinned() {
+        let mut stt = SttSettings {
+            language_detection: Some(true),
+            ..Default::default()
+        };
+        let mut adv = Advisories::new();
+        let lang =
+            upload_language(&mut stt, None, false, false, "deepgram", None, &mut adv).unwrap();
+        assert_eq!(lang, "", "not `en-US`, which would override the detection");
+
+        // A deployment default beside detection is not sent either, and the caller is told.
+        let mut adv = Advisories::new();
+        let lang = upload_language(
+            &mut stt,
+            Some("de-DE"),
+            false,
+            false,
+            "deepgram",
+            None,
+            &mut adv,
+        )
+        .unwrap();
+        assert_eq!(lang, "");
+        assert!(adv.as_slice().iter().any(|w| w.contains("de-DE")));
+    }
+
+    #[test]
+    fn a_request_asking_for_both_is_refused_and_a_named_language_beats_saved_detection() {
+        let mut stt = SttSettings {
+            language_detection: Some(true),
+            ..Default::default()
+        };
+        let mut adv = Advisories::new();
+        assert!(
+            upload_language(&mut stt, Some("de"), true, true, "deepgram", None, &mut adv).is_err()
+        );
+
+        let mut adv = Advisories::new();
+        let lang = upload_language(
+            &mut stt,
+            Some("de-DE"),
+            true,
+            false,
+            "deepgram",
+            None,
+            &mut adv,
+        )
+        .unwrap();
+        assert_eq!(lang, "de-DE");
+        assert_eq!(
+            stt.language_detection, None,
+            "switched off for this request"
+        );
+        assert!(!adv.is_empty());
+    }
+
+    #[test]
+    fn nothing_named_still_defaults_to_en_us() {
+        let mut stt = SttSettings::default();
+        let mut adv = Advisories::new();
+        assert_eq!(
+            upload_language(&mut stt, None, false, false, "deepgram", None, &mut adv).unwrap(),
+            "en-US"
+        );
+    }
+
+    #[test]
+    fn a_language_the_mapper_omits_is_not_replaced_by_english() {
+        // `auto` maps to "omit the field" on ElevenLabs, meaning "let the vendor detect it". The
+        // omission used to become `en-US`, which pinned the very language detection was for.
+        let mut stt = SttSettings::default();
+        let mut adv = Advisories::new();
+        let lang = upload_language(
+            &mut stt,
+            Some("auto"),
+            true,
+            false,
+            "elevenlabs",
+            Some("scribe_v2"),
+            &mut adv,
+        )
+        .unwrap();
+        assert_eq!(lang, "");
+    }
+
+    #[test]
+    fn the_language_is_mapped_for_the_model_the_vendor_is_called_with() {
+        // `stt.model` replaces the endpoint's model on the wire, so it is the one the mapper must
+        // judge. ElevenLabs enforces `language_code` on v2.5 models only.
+        let mut adv = Advisories::new();
+        upload_language(
+            &mut SttSettings::default(),
+            Some("de-DE"),
+            true,
+            false,
+            "elevenlabs",
+            Some("eleven_flash_v2_5"),
+            &mut adv,
+        )
+        .unwrap();
+        assert!(adv.is_empty(), "{:?}", adv.as_slice());
+
+        let mut stt = SttSettings {
+            model: Some("eleven_multilingual_v2".into()),
+            ..Default::default()
+        };
+        let mut adv = Advisories::new();
+        upload_language(
+            &mut stt,
+            Some("de-DE"),
+            true,
+            false,
+            "elevenlabs",
+            Some("eleven_flash_v2_5"),
+            &mut adv,
+        )
+        .unwrap();
+        assert!(
+            adv.as_slice()
+                .iter()
+                .any(|w| w.contains("eleven_multilingual_v2")),
+            "{:?}",
+            adv.as_slice()
+        );
+    }
+
+    #[test]
+    fn a_translation_target_that_cannot_be_sent_is_named() {
+        let settings = bud_auth::endpoint_config::TranslationSettings {
+            target_languages: Some(vec!["xx-YY".into(), "es-ES".into()]),
+            ..Default::default()
+        };
+        let mut adv = Advisories::new();
+        let config = translation_for(Some(&settings), false, &mut adv).unwrap();
+        assert_eq!(config.target_languages.len(), 1);
+        assert!(
+            adv.as_slice().iter().any(|w| w.contains("'xx-YY'")),
+            "{:?}",
+            adv.as_slice()
         );
     }
 }

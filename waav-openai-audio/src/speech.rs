@@ -1,5 +1,7 @@
 //! `POST /v1/audio/speech` — synthesis.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::AudioError;
@@ -37,6 +39,147 @@ pub struct SpeechRequest {
     /// answered a caller waiting for events with a binary body and a 200.
     #[serde(default)]
     pub stream_format: Option<String>,
+    /// Bud's per-request overrides of the deployment's speech settings. None of them is in
+    /// OpenAI's schema; all are optional, so an OpenAI client that never sends them is unaffected.
+    #[serde(flatten)]
+    pub overrides: SpeechOverrides,
+    /// Every other key. Kept so the handler can say it was ignored: serde's default drops unknown
+    /// keys silently, and a caller who typed `stabilty` got a 200 and the deployment's value.
+    #[serde(flatten)]
+    pub unrecognised: BTreeMap<String, serde_json::Value>,
+}
+
+/// One pronunciation replacement: `word` is replaced as a whole word by `pronunciation`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct PronunciationOverride {
+    pub word: String,
+    pub pronunciation: String,
+}
+
+/// Per-request values for a deployment's speech settings (the deployment's audio settings page).
+///
+/// Each one, when present, replaces the deployment's value for this request only; the handler
+/// then applies it exactly as it applies a saved setting, including the warning when the vendor
+/// cannot honour it. `pronunciations` add to the deployment's list, and win on the same word.
+/// Operational settings (latency tier, streaming endpoint, timeouts) stay deployment-only.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct SpeechOverrides {
+    pub language: Option<String>,
+    pub emotion: Option<String>,
+    /// A number 0.0–1.0 or one of [`INTENSITY_LEVELS`].
+    pub emotion_intensity: Option<serde_json::Value>,
+    pub delivery_style: Option<String>,
+    pub pitch: Option<f32>,
+    pub volume: Option<f32>,
+    pub rate_percentage: Option<i32>,
+    pub pitch_percentage: Option<i32>,
+    pub stability: Option<f32>,
+    pub similarity_boost: Option<f32>,
+    pub style: Option<f32>,
+    pub use_speaker_boost: Option<bool>,
+    /// For `pcm` output; one of [`SAMPLE_RATES`].
+    pub sample_rate: Option<u32>,
+    pub pronunciations: Option<Vec<PronunciationOverride>>,
+}
+
+/// PCM sample rates a request may ask for. The same list the deployment settings accept.
+pub const SAMPLE_RATES: &[u32] = &[8000, 16000, 22050, 24000, 44100, 48000];
+/// Named emotion intensities, besides a number from 0.0 to 1.0.
+pub const INTENSITY_LEVELS: &[&str] = &["low", "medium", "high"];
+
+impl SpeechOverrides {
+    /// Range and shape checks that need no vendor knowledge. Whether the vendor honours a value
+    /// is the handler's question, answered with a warning rather than a refusal.
+    fn validate(&self) -> Result<(), AudioError> {
+        let unit = |field: &'static str, v: Option<f32>| match v {
+            Some(x) if !(0.0..=1.0).contains(&x) => Err(AudioError::OutOfRange {
+                field,
+                value: x.to_string(),
+                min: "0.0".into(),
+                max: "1.0".into(),
+            }),
+            _ => Ok(()),
+        };
+        unit("stability", self.stability)?;
+        unit("similarity_boost", self.similarity_boost)?;
+        unit("style", self.style)?;
+        for (field, v) in [
+            ("rate_percentage", self.rate_percentage),
+            ("pitch_percentage", self.pitch_percentage),
+        ] {
+            if let Some(x) = v
+                && !(-50..=50).contains(&x)
+            {
+                return Err(AudioError::OutOfRange {
+                    field,
+                    value: x.to_string(),
+                    min: "-50".into(),
+                    max: "50".into(),
+                });
+            }
+        }
+        if let Some(rate) = self.sample_rate
+            && !SAMPLE_RATES.contains(&rate)
+        {
+            return Err(AudioError::Unsupported {
+                field: "sample_rate",
+                value: rate.to_string(),
+                expected: SAMPLE_RATES
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            });
+        }
+        match &self.emotion_intensity {
+            None => {}
+            Some(serde_json::Value::String(s)) if INTENSITY_LEVELS.contains(&s.as_str()) => {}
+            Some(serde_json::Value::Number(n))
+                if n.as_f64().is_some_and(|v| (0.0..=1.0).contains(&v)) => {}
+            Some(serde_json::Value::Number(n)) => {
+                return Err(AudioError::OutOfRange {
+                    field: "emotion_intensity",
+                    value: n.to_string(),
+                    min: "0.0".into(),
+                    max: "1.0".into(),
+                });
+            }
+            Some(other) => {
+                return Err(AudioError::InvalidField {
+                    field: "emotion_intensity",
+                    reason: format!(
+                        "expected a number from 0.0 to 1.0 or one of {}; got {other}",
+                        INTENSITY_LEVELS.join(", ")
+                    ),
+                });
+            }
+        }
+        for (field, v) in [
+            ("language", &self.language),
+            ("emotion", &self.emotion),
+            ("delivery_style", &self.delivery_style),
+        ] {
+            if v.as_deref().is_some_and(|s| s.trim().is_empty()) {
+                return Err(AudioError::InvalidField {
+                    field,
+                    reason: "it is empty; leave it out to use the deployment's value".to_string(),
+                });
+            }
+        }
+        if self
+            .pronunciations
+            .iter()
+            .flatten()
+            .any(|p| p.word.trim().is_empty() || p.pronunciation.trim().is_empty())
+        {
+            return Err(AudioError::InvalidField {
+                field: "pronunciations",
+                reason: "every entry needs a non-empty `word` and `pronunciation`".to_string(),
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Output encodings WaaV can return.
@@ -130,6 +273,10 @@ pub struct SpeechSettings {
     /// 0.25–4.0, OpenAI's range. `None` means the vendor default.
     pub speaking_rate: Option<f32>,
     pub instructions: Option<String>,
+    /// Validated per-request overrides of the deployment's speech settings.
+    pub overrides: SpeechOverrides,
+    /// Keys the request carried that nothing reads, sorted. The handler warns about each.
+    pub unrecognised: Vec<String>,
 }
 
 /// OpenAI's eleven canonical voice names.
@@ -238,6 +385,8 @@ pub fn translate(req: SpeechRequest) -> Result<SpeechSettings, AudioError> {
         }
     };
 
+    req.overrides.validate()?;
+
     Ok(SpeechSettings {
         endpoint: req.model,
         text: req.input,
@@ -245,6 +394,8 @@ pub fn translate(req: SpeechRequest) -> Result<SpeechSettings, AudioError> {
         format,
         speaking_rate,
         instructions: req.instructions,
+        overrides: req.overrides,
+        unrecognised: req.unrecognised.into_keys().collect(),
     })
 }
 
@@ -261,6 +412,8 @@ mod tests {
             speed: None,
             instructions: None,
             stream_format: None,
+            overrides: SpeechOverrides::default(),
+            unrecognised: BTreeMap::new(),
         }
     }
 
@@ -655,5 +808,62 @@ mod voice_validation_tests {
         // caller who gets a quiet pass here would be surprised by a vendor rejection later.
         assert!(validate_voice("Alloy", OPENAI_VOICES).is_err());
         assert!(validate_voice(" alloy", OPENAI_VOICES).is_err());
+    }
+}
+
+#[cfg(test)]
+mod override_tests {
+    use super::*;
+
+    fn parse(body: &str) -> SpeechRequest {
+        serde_json::from_str(body).expect("parses")
+    }
+
+    #[test]
+    fn a_plain_openai_body_carries_no_overrides_and_nothing_unrecognised() {
+        let s = translate(parse(
+            r#"{"model":"tts","input":"Hello.","voice":"alloy","response_format":"mp3","speed":1.2}"#,
+        ))
+        .unwrap();
+        assert_eq!(s.overrides, SpeechOverrides::default());
+        assert!(s.unrecognised.is_empty(), "{:?}", s.unrecognised);
+    }
+
+    #[test]
+    fn override_fields_are_read_and_are_not_reported_as_unrecognised() {
+        let s = translate(parse(
+            r#"{"model":"tts","input":"Hello.","stability":0.3,"emotion":"happy",
+                "emotion_intensity":"high","sample_rate":16000,"language":"fr-FR",
+                "pronunciations":[{"word":"Bud","pronunciation":"bud"}],"stabilty":0.9}"#,
+        ))
+        .unwrap();
+        assert_eq!(s.overrides.stability, Some(0.3));
+        assert_eq!(s.overrides.emotion.as_deref(), Some("happy"));
+        assert_eq!(s.overrides.sample_rate, Some(16000));
+        assert_eq!(s.overrides.language.as_deref(), Some("fr-FR"));
+        assert_eq!(s.overrides.pronunciations.as_ref().map(Vec::len), Some(1));
+        // The typo, and only the typo.
+        assert_eq!(s.unrecognised, vec!["stabilty".to_string()]);
+    }
+
+    #[test]
+    fn out_of_range_and_malformed_overrides_are_refused_by_name() {
+        let cases = [
+            (r#""stability":1.5"#, "stability"),
+            (r#""rate_percentage":80"#, "rate_percentage"),
+            (r#""sample_rate":12345"#, "sample_rate"),
+            (r#""emotion_intensity":"extreme""#, "emotion_intensity"),
+            (r#""emotion_intensity":7"#, "emotion_intensity"),
+            (r#""emotion":"  ""#, "emotion"),
+            (
+                r#""pronunciations":[{"word":"Bud","pronunciation":""}]"#,
+                "pronunciations",
+            ),
+        ];
+        for (field_json, field) in cases {
+            let body = format!(r#"{{"model":"tts","input":"Hello.",{field_json}}}"#);
+            let err = translate(parse(&body)).unwrap_err();
+            assert!(err.to_string().contains(field), "{field}: {err}");
+        }
     }
 }

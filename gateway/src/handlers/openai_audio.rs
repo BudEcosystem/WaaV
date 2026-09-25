@@ -108,6 +108,28 @@ pub async fn speech_handler(
     };
 
     let mut advisories = Advisories::new();
+    warn_unrecognised(&settings.unrecognised, &mut advisories);
+
+    // The request's own speech settings, laid over the deployment's. Merged here, before any
+    // vendor work, so a value outside the canonical vocabulary is a 400 and not a wasted call;
+    // everything downstream reads the merged copy exactly as it read the saved one.
+    let mut tts_overridden = endpoint.config.tts().into_owned();
+    if let Err((field, reason)) =
+        settings_map::apply_speech_overrides(&mut tts_overridden, &settings.overrides)
+    {
+        return openai_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            format!("`{field}`: {reason}"),
+            Some(field),
+        );
+    }
+    if settings.overrides.sample_rate.is_some() && !settings.format.accepts_sample_rate() {
+        advisories.warn(format!(
+            "`sample_rate` applies only to response_format=pcm and was ignored for {}",
+            settings.format.as_str()
+        ));
+    }
 
     // FRD-018 Part III C1. The deployment's voice is the default; the request still wins.
     //
@@ -224,10 +246,10 @@ pub async fn speech_handler(
     // `duration_ms` is declared Empty and recorded after synthesis: a field not declared at
     // span creation cannot be recorded later, and silently does nothing if you try.
     let chars = settings.text.chars().count();
-    // Endpoint default, then the tts block's override. There is no request-level language on
-    // `/v1/audio/speech`, so precedence has only two levels here.
+    // The request's own `language` (a Bud per-request override), then the tts block's, then the
+    // endpoint default.
     let language = settings_map::resolve_language(
-        None,
+        settings.overrides.language.as_deref(),
         endpoint.language.as_deref(),
         endpoint.config.tts().language.as_deref(),
     );
@@ -284,7 +306,7 @@ pub async fn speech_handler(
         }
     }
 
-    let mut tts_settings = endpoint.config.tts().into_owned();
+    let mut tts_settings = tts_overridden;
 
     // Deployment settings a model refuses outright. `optimize_streaming_latency` on `eleven_v3`
     // is a 400 from ElevenLabs ("not supported with the 'eleven_v3' model") — saved once in the
@@ -340,8 +362,8 @@ pub async fn speech_handler(
         &mut advisories,
     );
 
-    // C1/C3: the synthesis language, mapped into the vendor's own notation. `/v1/audio/speech`
-    // has no language field of its own, so this is entirely the deployment's choice.
+    // C1/C3: the synthesis language, mapped into the vendor's own notation. OpenAI's schema has
+    // no language field; this one is Bud's per-request override, else the deployment's choice.
     let mapped_language = language.as_deref().and_then(|canonical| {
         settings_map::map_language_for(
             canonical,
@@ -790,7 +812,8 @@ async fn apply_noise_suppression(
     {
         turn_span.record(NOISE_SUPPRESSION_ATTR, false);
         advisories.warn(
-            "noise_suppression is configured on this deployment but this gateway build does not              include the noise-filter feature; the recording was transcribed unprocessed"
+            "noise_suppression is configured on this deployment but this gateway build does not \
+             include the noise-filter feature; the recording was transcribed unprocessed"
                 .to_string(),
         );
         audio
@@ -966,6 +989,10 @@ async fn transcription_inner(
     let mut temperature: Option<f32> = None;
     // OpenAI's SDKs send the array as repeated `timestamp_granularities[]` fields.
     let mut timestamp_granularities: Vec<String> = Vec::new();
+    // Bud's per-request overrides of the deployment's transcription settings, and every other
+    // field, so an ignored one is named instead of dropped.
+    let mut overrides = transcription::TranscriptionOverrides::default();
+    let mut unrecognised: Vec<String> = Vec::new();
 
     loop {
         let field = match multipart.next_field().await {
@@ -1036,7 +1063,15 @@ async fn transcription_inner(
             "timestamp_granularities[]" | "timestamp_granularities" => {
                 timestamp_granularities.push(value)
             }
-            _ => {}
+            other => match overrides.set(other, &value) {
+                Ok(true) => {}
+                Ok(false) => {
+                    if !other.is_empty() && !unrecognised.iter().any(|n| n == other) {
+                        unrecognised.push(other.to_string());
+                    }
+                }
+                Err(e) => return translation_error(&e),
+            },
         }
     }
 
@@ -1058,6 +1093,8 @@ async fn transcription_inner(
         prompt,
         temperature,
         timestamp_granularities,
+        overrides,
+        unrecognised,
         translate,
     };
     let settings = match transcription::translate(req) {
@@ -1072,6 +1109,7 @@ async fn transcription_inner(
     };
 
     let mut advisories = Advisories::new();
+    warn_unrecognised(&settings.unrecognised, &mut advisories);
     // Resolved BEFORE the span so the recorded language is the one that will be used. The
     // endpoint is looked up first for the same reason; it was already being resolved a few
     // lines further down, so nothing new is on the request path.
@@ -1158,6 +1196,13 @@ async fn transcription_inner(
             bytes = file_bytes.len(),
             "openai audio/transcriptions -> self-hosted passthrough"
         );
+        // The backend receives OpenAI's own fields; Bud's per-request settings have nothing on
+        // that wire to ride, so say so rather than drop them.
+        if settings.overrides != transcription::TranscriptionOverrides::default() {
+            advisories.warn(
+                "per-request audio settings are not applied by self-hosted deployments".to_string(),
+            );
+        }
         // Measured before `file_bytes` is moved into the call below. Header read only: no
         // samples are allocated, so a long upload costs nothing to measure.
         let measured_secs = waav_openai_audio::pcm::wav_duration_secs(&file_bytes);
@@ -1246,26 +1291,37 @@ async fn transcription_inner(
         "openai audio/transcriptions"
     );
 
-    let stt_settings = endpoint.config.stt();
+    let mut stt_settings = endpoint.config.stt().into_owned();
+    settings_map::apply_transcription_overrides(
+        &mut stt_settings,
+        &settings.overrides,
+        &mut advisories,
+    );
 
-    // FRD-018 Part III C1/C3 step 3. `language`, `channels`, `punctuation` and `encoding` were
-    // hardcoded here; they keep the same values as defaults, so a deployment with no `stt`
-    // block behaves exactly as it did.
-    //
-    // The language is routed through the P2 mapper rather than handed to the vendor raw, which
-    // is what makes an endpoint default work across vendors instead of only on the ones that
-    // happen to speak BCP-47.
-    let mapped_language = canonical_language
-        .as_deref()
-        .and_then(|canonical| {
-            settings_map::map_language_for(
-                canonical,
-                &endpoint.vendor,
-                endpoint.model.as_deref().unwrap_or_default(),
-                &mut advisories,
-            )
-        })
-        .unwrap_or_else(|| "en-US".to_string());
+    // FRD-018 Part III C1/C3 step 3, and language detection reconciled with it: see
+    // `settings_map::upload_language` for the rules.
+    let mapped_language = match settings_map::upload_language(
+        &mut stt_settings,
+        canonical_language.as_deref(),
+        settings
+            .language
+            .as_deref()
+            .is_some_and(|l| !l.trim().is_empty()),
+        settings.overrides.language_detection == Some(true),
+        &endpoint.vendor,
+        endpoint.model.as_deref(),
+        &mut advisories,
+    ) {
+        Ok(language) => language,
+        Err(message) => {
+            return openai_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                message,
+                Some("language_detection"),
+            );
+        }
+    };
 
     let mut stt_config = crate::core::stt::STTConfig {
         provider: endpoint.vendor.clone(),
@@ -1297,7 +1353,11 @@ async fn transcription_inner(
     let mut std_config = settings_map::standard_stt(
         stt_config,
         &stt_settings,
-        settings_map::translation_for(endpoint.config.translation.as_ref(), translate),
+        settings_map::translation_for(
+            endpoint.config.translation.as_ref(),
+            translate,
+            &mut advisories,
+        ),
         &mut advisories,
     );
     apply_request_stt_fields(
@@ -1394,15 +1454,42 @@ async fn transcription_inner(
     }
 }
 
-/// Render a result in the format the caller asked for.
+/// Name each request field nothing reads. serde and the multipart loop both dropped unknown fields
+/// silently, so a misspelled setting answered 200 with the deployment's value.
 ///
-/// `text`, `srt` and `vtt` are PLAIN BODIES, not JSON — a client that asked for an SRT file
-/// and got `{"text": "1\n00:00:00,000 ..."}` cannot feed it to a player.
-///
-/// Advisories (W1) ride the HEADERS on every format, because three of the five have no JSON body
-/// to put an array in. `verbose_json` additionally carries them in the body, where an SDK finds
-/// them without reaching for response headers — which is the natural home, but only covers two
-/// of the five cases, so it cannot be the only carrier.
+/// The names are the caller's, so they are bounded before they become headers and log lines: at
+/// most [`MAX_UNRECOGNISED_WARNINGS`] are named, each cut to [`MAX_UNRECOGNISED_NAME_CHARS`] and
+/// escaped (a newline in a JSON key would otherwise forge a log line), and the rest are counted.
+fn warn_unrecognised(names: &[String], advisories: &mut Advisories) {
+    for name in names.iter().take(MAX_UNRECOGNISED_WARNINGS) {
+        let shown: String = name
+            .chars()
+            .take(MAX_UNRECOGNISED_NAME_CHARS)
+            .collect::<String>()
+            .escape_debug()
+            .to_string();
+        let cut = if name.chars().count() > MAX_UNRECOGNISED_NAME_CHARS {
+            "…"
+        } else {
+            ""
+        };
+        advisories.warn(format!(
+            "`{shown}{cut}` is not a recognised field and was ignored"
+        ));
+    }
+    if names.len() > MAX_UNRECOGNISED_WARNINGS {
+        advisories.warn(format!(
+            "{} more unrecognised fields were ignored",
+            names.len() - MAX_UNRECOGNISED_WARNINGS
+        ));
+    }
+}
+
+/// How many unrecognised fields are named one by one before the rest are only counted.
+const MAX_UNRECOGNISED_WARNINGS: usize = 10;
+/// How much of an unrecognised field's name is repeated back.
+const MAX_UNRECOGNISED_NAME_CHARS: usize = 64;
+
 /// Vendors whose upload path sends a request's `prompt` / `temperature` on to the vendor.
 ///
 /// Each entry is a provider config that reads the key from `extras`: OpenAI and Groq
@@ -1523,6 +1610,15 @@ fn transcript_segments(
     }]
 }
 
+/// Render a result in the format the caller asked for.
+///
+/// `text`, `srt` and `vtt` are PLAIN BODIES, not JSON — a client that asked for an SRT file
+/// and got `{"text": "1\n00:00:00,000 ..."}` cannot feed it to a player.
+///
+/// Advisories (W1) ride the HEADERS on every format, because three of the five have no JSON body
+/// to put an array in. `verbose_json` additionally carries them in the body, where an SDK finds
+/// them without reaching for response headers — which is the natural home, but only covers two
+/// of the five cases, so it cannot be the only carrier.
 fn render_transcription(
     format: &transcription::TranscriptionResponseFormat,
     // `/v1/audio/translations`. OpenAI's `verbose_json` names the task, and this route said
@@ -2051,6 +2147,8 @@ mod request_field_tests {
             prompt: None,
             temperature: None,
             timestamp_granularities: None,
+            overrides: Default::default(),
+            unrecognised: Vec::new(),
             translate: false,
         }
     }
@@ -2330,6 +2428,18 @@ mod request_field_tests {
             .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&b).unwrap();
         assert_eq!(v["task"], "translate");
+    }
+
+    #[test]
+    fn unrecognised_field_names_are_capped_and_escaped() {
+        let mut names: Vec<String> = (0..25).map(|i| format!("junk{i}")).collect();
+        names[0] = format!("bad\nx-injected: yes{}", "x".repeat(500));
+        let mut adv = Advisories::new();
+        super::warn_unrecognised(&names, &mut adv);
+        assert_eq!(adv.as_slice().len(), super::MAX_UNRECOGNISED_WARNINGS + 1);
+        assert!(!adv.as_slice()[0].contains('\n'), "{}", adv.as_slice()[0]);
+        assert!(adv.as_slice()[0].chars().count() < 120);
+        assert!(adv.as_slice().last().unwrap().starts_with("15 more"));
     }
 
     #[test]

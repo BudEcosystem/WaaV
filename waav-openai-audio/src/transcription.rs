@@ -91,8 +91,75 @@ pub struct TranscriptionRequest {
     pub temperature: Option<f32>,
     /// `timestamp_granularities[]`, one entry per form field, unvalidated.
     pub timestamp_granularities: Vec<String>,
+    /// Bud's per-request overrides of the deployment's transcription settings.
+    pub overrides: TranscriptionOverrides,
+    /// Form fields nothing reads, so the handler can say they were ignored.
+    pub unrecognised: Vec<String>,
     /// True for `/v1/audio/translations`.
     pub translate: bool,
+}
+
+/// Per-request values for a deployment's transcription settings (its audio settings page).
+///
+/// None of these is in OpenAI's schema, and all are optional form fields. Each present value
+/// replaces the deployment's for this request, and is then applied — or warned about — exactly
+/// as the saved setting is. Two only tighten: `profanity_filter` can be switched on but not off,
+/// and `redaction` categories are added to the deployment's, never removed, because those are the
+/// operator's compliance choices. Settings that cost more per request (alternatives, sentiment,
+/// entity detection, translation targets) stay deployment-only.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TranscriptionOverrides {
+    pub punctuation: Option<bool>,
+    pub diarization: Option<bool>,
+    pub smart_format: Option<bool>,
+    pub numerals: Option<bool>,
+    pub filler_words: Option<bool>,
+    pub language_detection: Option<bool>,
+    pub profanity_filter: Option<bool>,
+    /// Added to the deployment's boosted terms.
+    pub keyterms: Vec<String>,
+    /// Added to the deployment's redaction categories.
+    pub redaction: Vec<String>,
+}
+
+impl TranscriptionOverrides {
+    /// Record one override form field. `Ok(false)` when `name` is not an override field.
+    pub fn set(&mut self, name: &str, value: &str) -> Result<bool, AudioError> {
+        let flag = |field: &'static str| parse_form_bool(field, value).map(Some);
+        match name {
+            "punctuation" => self.punctuation = flag("punctuation")?,
+            "diarization" => self.diarization = flag("diarization")?,
+            "smart_format" => self.smart_format = flag("smart_format")?,
+            "numerals" => self.numerals = flag("numerals")?,
+            "filler_words" => self.filler_words = flag("filler_words")?,
+            "language_detection" => self.language_detection = flag("language_detection")?,
+            "profanity_filter" => self.profanity_filter = flag("profanity_filter")?,
+            "keyterms" | "keyterms[]" => push_term(&mut self.keyterms, value),
+            "redaction" | "redaction[]" => push_term(&mut self.redaction, value),
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+}
+
+fn push_term(list: &mut Vec<String>, value: &str) {
+    let v = value.trim();
+    if !v.is_empty() && !list.iter().any(|t| t == v) {
+        list.push(v.to_string());
+    }
+}
+
+/// A multipart boolean: `true`/`false`, also `1`/`0`. Anything else is refused by name rather than
+/// read as false, which would quietly do the opposite of what a caller who wrote `yes` meant.
+pub fn parse_form_bool(field: &'static str, value: &str) -> Result<bool, AudioError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" => Ok(true),
+        "false" | "0" => Ok(false),
+        _ => Err(AudioError::InvalidField {
+            field,
+            reason: format!("expected true or false, got {value:?}"),
+        }),
+    }
 }
 
 /// Timestamp detail requested with OpenAI's `timestamp_granularities[]`.
@@ -124,6 +191,8 @@ pub struct TranscriptionSettings {
     /// explicit list because OpenAI's default (segments only) and "whatever the vendor has"
     /// answer differently: an explicit list without `word` leaves `words` out of `verbose_json`.
     pub timestamp_granularities: Option<Vec<TimestampGranularity>>,
+    pub overrides: TranscriptionOverrides,
+    pub unrecognised: Vec<String>,
     pub translate: bool,
 }
 
@@ -229,6 +298,8 @@ pub fn translate(req: TranscriptionRequest) -> Result<TranscriptionSettings, Aud
         prompt: req.prompt,
         temperature,
         timestamp_granularities,
+        overrides: req.overrides,
+        unrecognised: req.unrecognised,
         translate: req.translate,
     })
 }
@@ -247,6 +318,8 @@ mod tests {
             prompt: None,
             temperature: None,
             timestamp_granularities: Vec::new(),
+            overrides: TranscriptionOverrides::default(),
+            unrecognised: Vec::new(),
             translate: false,
         }
     }
@@ -863,6 +936,8 @@ mod caption_tests {
             prompt: None,
             temperature: None,
             timestamp_granularities: values.iter().map(|s| s.to_string()).collect(),
+            overrides: TranscriptionOverrides::default(),
+            unrecognised: Vec::new(),
             translate: false,
         })
     }
@@ -898,6 +973,51 @@ mod caption_tests {
                 err,
                 AudioError::Unsupported {
                     field: "timestamp_granularities",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod override_tests {
+    use super::*;
+
+    #[test]
+    fn override_form_fields_are_recorded_and_others_are_not_claimed() {
+        let mut o = TranscriptionOverrides::default();
+        assert!(o.set("diarization", "true").unwrap());
+        assert!(o.set("smart_format", "0").unwrap());
+        assert!(o.set("keyterms[]", "Kubernetes").unwrap());
+        assert!(o.set("keyterms", "Dapr").unwrap());
+        assert!(o.set("keyterms", "Dapr").unwrap());
+        assert!(o.set("redaction[]", "pii").unwrap());
+        assert!(
+            !o.set("chunking_strategy", "auto").unwrap(),
+            "not an override field"
+        );
+        assert_eq!(o.diarization, Some(true));
+        assert_eq!(o.smart_format, Some(false));
+        assert_eq!(
+            o.keyterms,
+            vec!["Kubernetes", "Dapr"],
+            "deduplicated, in order"
+        );
+        assert_eq!(o.redaction, vec!["pii"]);
+    }
+
+    #[test]
+    fn a_boolean_that_is_not_one_is_refused_rather_than_read_as_false() {
+        let err = TranscriptionOverrides::default()
+            .set("punctuation", "yes")
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AudioError::InvalidField {
+                    field: "punctuation",
                     ..
                 }
             ),

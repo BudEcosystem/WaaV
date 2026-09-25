@@ -301,16 +301,66 @@ pub fn parse_endpoint_settings(
     match serde_json::from_value::<VoiceEndpointSettings>(raw.clone()) {
         Ok(settings) => settings,
         Err(e) => {
+            // Degrade by FIELD, not by block. Falling back to the whole default dropped every
+            // setting with the one bad knob -- `stt.redaction` included, so one mistyped `pitch`
+            // meant unredacted transcripts. Each section is re-read with only the fields that
+            // parse on their own, and each dropped field is named.
             tracing::warn!(
                 endpoint_id = %endpoint_id,
                 error = %e,
-                "voice_table config block could not be parsed; serving this endpoint with vendor \
-                 defaults. The endpoint stays usable deliberately -- a typo in one knob must not \
+                "voice_table config block did not parse as a whole; dropping only the fields that \
+                 do not. The endpoint stays usable deliberately -- a typo in one knob must not \
                  take a whole deployment out of service"
             );
-            VoiceEndpointSettings::default()
+            let section = |name: &str| raw.get(name).filter(|v| !v.is_null());
+            VoiceEndpointSettings {
+                tts: section("tts").and_then(|v| parse_section(endpoint_id, "tts", v)),
+                stt: section("stt").and_then(|v| parse_section(endpoint_id, "stt", v)),
+                translation: section("translation")
+                    .and_then(|v| parse_section(endpoint_id, "translation", v)),
+            }
         }
     }
+}
+
+/// Parse one section, keeping every field that parses on its own and naming each one that does
+/// not. `None` when nothing in it survives, so a section that was all typos reads as unset.
+fn parse_section<T: serde::de::DeserializeOwned>(
+    endpoint_id: &str,
+    section: &str,
+    raw: &serde_json::Value,
+) -> Option<T> {
+    if let Ok(parsed) = serde_json::from_value::<T>(raw.clone()) {
+        return Some(parsed);
+    }
+    let serde_json::Value::Object(fields) = raw else {
+        tracing::warn!(
+            endpoint_id = %endpoint_id,
+            field = %format!("config.{section}"),
+            "voice_table config section is not an object; ignoring it"
+        );
+        return None;
+    };
+    let mut kept = serde_json::Map::new();
+    for (key, value) in fields {
+        let alone =
+            serde_json::Value::Object(serde_json::Map::from_iter([(key.clone(), value.clone())]));
+        match serde_json::from_value::<T>(alone) {
+            Ok(_) => {
+                kept.insert(key.clone(), value.clone());
+            }
+            Err(e) => tracing::warn!(
+                endpoint_id = %endpoint_id,
+                field = %format!("config.{section}.{key}"),
+                error = %e,
+                "voice_table config field has the wrong type; dropping this field only"
+            ),
+        }
+    }
+    if kept.is_empty() {
+        return None;
+    }
+    serde_json::from_value::<T>(serde_json::Value::Object(kept)).ok()
 }
 
 fn warn_unmodelled<'a>(
@@ -384,6 +434,23 @@ mod tests {
         let settings = parse(r#"{"tts": {"sample_rate": "twenty four thousand"}}"#);
 
         assert!(settings.is_empty());
+    }
+
+    #[test]
+    fn a_wrongly_typed_field_drops_only_itself_and_keeps_the_compliance_settings() {
+        // One bad knob used to discard the whole block, `stt.redaction` with it.
+        let settings = parse(
+            r#"{"tts": {"pitch": "high", "emotion": "calm"},
+                "stt": {"alternatives": 300, "redaction": ["pii"], "profanity_filter": true}}"#,
+        );
+
+        let tts = settings.tts.expect("the rest of tts survives");
+        assert_eq!(tts.pitch, None);
+        assert_eq!(tts.emotion.as_deref(), Some("calm"));
+        let stt = settings.stt.expect("the rest of stt survives");
+        assert_eq!(stt.alternatives, None);
+        assert_eq!(stt.redaction, Some(vec!["pii".to_string()]));
+        assert_eq!(stt.profanity_filter, Some(true));
     }
 
     #[test]

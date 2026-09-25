@@ -507,9 +507,15 @@ impl PrerecordedSTT {
         self.resilience.record_status(status);
         let text = response.text().await.unwrap_or_default();
         if !status.is_success() {
-            return Err(STTError::ProviderError(format!(
-                "assemblyai upload rejected ({status}): {text}"
-            )));
+            // The same classification as every other vendor status: a revoked key here is an
+            // authentication failure, not the vendor having a bad day.
+            return Err(classify_vendor_status(
+                status,
+                format!(
+                    "assemblyai upload rejected: {}",
+                    describe_error(self.vendor, status, &text)
+                ),
+            ));
         }
         serde_json::from_str::<serde_json::Value>(&text)
             .ok()

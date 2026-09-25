@@ -742,13 +742,6 @@ pub(crate) async fn fetch_provider_catalog(state: &Arc<AppState>, provider: &str
     fetch_provider_catalog_with_key(state, provider, None).await
 }
 
-/// As [`fetch_provider_catalog`], but preferring a caller-supplied credential.
-///
-/// The server's own `get_api_key` is the right source for a session the SERVER configured. It is
-/// the wrong one for a Bud deployment, whose credential arrives in the `voice_table` blob and may
-/// be the only key for that vendor in the process — so a descriptor on such a deployment would
-/// resolve against an empty catalog and silently take the vendor default. `None` keeps the old
-/// behaviour exactly.
 /// A vendor's voice list fetched with ONE credential, or why it could not be.
 ///
 /// `None` when WaaV has no way to list this vendor's voices with a deployment's own key — the
@@ -783,6 +776,13 @@ fn catalog_or_empty(
     })
 }
 
+/// As [`fetch_provider_catalog`], but preferring a caller-supplied credential.
+///
+/// The server's own `get_api_key` is the right source for a session the SERVER configured. It is
+/// the wrong one for a Bud deployment, whose credential arrives in the `voice_table` blob and may
+/// be the only key for that vendor in the process — so a descriptor on such a deployment would
+/// resolve against an empty catalog and silently take the vendor default. `None` keeps the old
+/// behaviour exactly.
 pub(crate) async fn fetch_provider_catalog_with_key(
     state: &Arc<AppState>,
     provider: &str,
