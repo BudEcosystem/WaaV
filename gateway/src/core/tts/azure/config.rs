@@ -8,7 +8,8 @@
 //! Note: The `AzureRegion` type is defined in `crate::core::providers::azure`
 //! and should be used from there.
 
-use crate::core::providers::azure::AzureRegion;
+use crate::core::emotion::{AzureEmotionMapper, EmotionMapper};
+use crate::core::providers::azure::{AzureRegion, AzureSpeechEndpoint};
 use crate::core::tts::base::{TTSConfig, TTSError};
 use serde::{Deserialize, Serialize};
 
@@ -429,6 +430,17 @@ fn escape_attr(value: &str) -> String {
     escape_xml(value)
 }
 
+/// Renders a mapped emotion intensity as the `<mstts:express-as styledegree>` value.
+///
+/// Vendor contract: Azure accepts `styledegree` in 0.01–2 (Azure SSML reference). The value is
+/// clamped into that range and printed with two decimals, so an f32 artefact such as
+/// `0.95000005` never reaches the wire; a non-finite value yields no attribute at all.
+fn format_style_degree(degree: f32) -> Option<String> {
+    degree
+        .is_finite()
+        .then(|| format!("{:.2}", degree.clamp(0.01, 2.0)))
+}
+
 /// All the additional Azure SSML knobs that are documented on the `cognitiveservices/v1` REST
 /// synthesis endpoint (which consumes SSML) but were previously unreachable through config.
 ///
@@ -816,6 +828,15 @@ pub struct AzureTTSConfig {
     /// Choose the region closest to your users for optimal latency.
     pub region: AzureRegion,
 
+    /// The endpoint resolved from the deployment's `api_base` (`TTSConfig.api_base`), when one
+    /// was supplied. When set it decides the synthesis host and wins over `region`; `None` keeps
+    /// the region-derived URL. A regional `api_base` also writes its region into `region`, so
+    /// the two agree wherever `region` is still read (cache key, provider info).
+    ///
+    /// Vendor contract: a Speech key is valid only on its own resource's region / custom
+    /// domain, so a key from any region other than the gateway default needs this to avoid 401.
+    pub speech_endpoint: Option<AzureSpeechEndpoint>,
+
     /// Output audio format for synthesis results.
     ///
     /// Maps to the `X-Microsoft-OutputFormat` header value.
@@ -871,6 +892,7 @@ impl Default for AzureTTSConfig {
         Self {
             base: TTSConfig::default(),
             region: AzureRegion::default(),
+            speech_endpoint: None,
             output_format: AzureAudioEncoding::default(),
             use_ssml: true,
             emotion: None,
@@ -942,6 +964,7 @@ impl AzureTTSConfig {
         Self {
             base,
             region: AzureRegion::default(),
+            speech_endpoint: None,
             output_format,
             use_ssml: true,
             emotion: None,
@@ -964,6 +987,12 @@ impl AzureTTSConfig {
     /// - `pitch` → `<prosody pitch>` (typed numeric → relative percentage, e.g. `+4%`)
     /// - `volume` → `<prosody volume>` (typed numeric → absolute level, e.g. `75`)
     /// - `language` → the `<speak xml:lang>` override (otherwise derived from the voice name)
+    ///
+    /// Flat [`TTSConfig`] fields:
+    /// - `api_base` → [`speech_endpoint`](Self::speech_endpoint) (regional or resource host;
+    ///   wins over the `region` extra; a non-Azure value is an `InvalidConfiguration` error)
+    /// - `emotion_config` → `<mstts:express-as style styledegree>` via [`AzureEmotionMapper`],
+    ///   only when `emotion` above is unset; a `style_degree` extra overrides the mapped degree
     ///
     /// `provider_extras` passthrough (string values emitted verbatim into the SSML/URL/header):
     /// `region`, `style_degree`, `role`, `contour`, `range`, `emphasis`, `say_as_interpret_as`,
@@ -996,6 +1025,30 @@ impl AzureTTSConfig {
                 ))
             })?;
         }
+        // ---- api_base → synthesis endpoint (wins over provider_extras.region) ---------------
+        // Vendor contract: a Speech key is accepted only on its own resource's region or custom
+        // domain; anywhere else it is a 401. Bud publishes the credential's "API Base URL" as
+        // the deployment's `api_base`, which is the one value that names where the key lives, so
+        // it outranks a region extra. A value that is not an Azure Speech endpoint is refused
+        // here — falling back to the default region is exactly the silent 401 this replaces. The
+        // handler refuses it earlier with a 400; this is the provider's own line of defence.
+        if let Some(api_base) = std
+            .base
+            .api_base
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let (endpoint, note) = AzureSpeechEndpoint::from_api_base_with_note(api_base)
+                .map_err(|err| TTSError::InvalidConfiguration(format!("Azure TTS {err}")))?;
+            if let Some(note) = note {
+                tracing::warn!(provider = "azure", "Azure TTS: {note}");
+            }
+            if let Some(region) = endpoint.region() {
+                cfg.region = region.clone();
+            }
+            cfg.speech_endpoint = Some(endpoint);
+        }
         if let Some(s) = f.ssml {
             cfg.use_ssml = s;
         }
@@ -1007,6 +1060,24 @@ impl AzureTTSConfig {
         // (Azure SSML reference, doc ms.date 2026-01-30), so passing it through is safe.
         if let Some(emotion) = f.emotion.as_ref().filter(|s| !s.is_empty()) {
             cfg.emotion = Some(emotion.clone());
+        }
+        // The deployment's emotion arrives on the flat `base.emotion_config`, not on
+        // `features.emotion`: for a vendor with a real emotion mapper the handler routes emotion
+        // through the mapper rather than as a raw token (see `apply_tts_flat`). Reading only
+        // `features.emotion` therefore never emitted `<mstts:express-as>` for a deployment's
+        // emotion. Map it through Azure's mapper into the same express-as style; an explicit
+        // `features.emotion` still wins. The mapped intensity rides `ssml_options.style_degree`,
+        // where an explicit `style_degree` extra overrides it below. When the mapper yields no
+        // style (e.g. Neutral), nothing is set and the SSML stays neutral.
+        if cfg.emotion.is_none()
+            && let Some(emotion_config) = std.base.emotion_config.as_ref()
+        {
+            let mapped = AzureEmotionMapper::new().map_emotion(emotion_config);
+            if let Some(style) = mapped.ssml_style.filter(|s| !s.is_empty()) {
+                cfg.emotion = Some(style);
+                cfg.ssml_options.style_degree =
+                    mapped.ssml_style_degree.and_then(format_style_degree);
+            }
         }
         // Fold the standardized speaking speed into the base rate so the SSML <prosody rate> path
         // actually applies it. (Review S4.)
@@ -1043,7 +1114,8 @@ impl AzureTTSConfig {
         }
         opt.contour = s("contour").or(opt.contour.take());
         opt.range = s("range").or(opt.range.take());
-        opt.style_degree = s("style_degree");
+        // An explicit `style_degree` extra wins over the degree mapped from `emotion_config`.
+        opt.style_degree = s("style_degree").or(opt.style_degree.take());
         opt.role = s("role");
         opt.emphasis = s("emphasis");
         opt.say_as_interpret_as = s("say_as_interpret_as");
@@ -1108,7 +1180,13 @@ impl AzureTTSConfig {
 
     /// Builds the TTS synthesis endpoint URL for this configuration.
     ///
-    /// Format: `https://{region}.tts.speech.microsoft.com/cognitiveservices/v1`
+    /// Format: `https://{region}.tts.speech.microsoft.com/cognitiveservices/v1`, or — when
+    /// `api_base` resolved to a resource ([`AzureSpeechEndpoint::Resource`]) —
+    /// `https://{name}.cognitiveservices.azure.com/tts/cognitiveservices/v1` (Microsoft's
+    /// custom-domain rule; see [`AzureSpeechEndpoint::tts_rest_url`], pending a live probe).
+    ///
+    /// An `endpoint_override` is applied on top of this by the request builder: it swaps only
+    /// scheme://host, keeping this URL's path, so it still wins over both.
     ///
     /// # Example
     ///
@@ -1127,7 +1205,10 @@ impl AzureTTSConfig {
     /// );
     /// ```
     pub fn build_tts_url(&self) -> String {
-        self.region.tts_rest_url()
+        match &self.speech_endpoint {
+            Some(endpoint) => endpoint.tts_rest_url(),
+            None => self.region.tts_rest_url(),
+        }
     }
 
     /// Extracts the language code from the voice name.
@@ -1330,6 +1411,243 @@ mod tests {
                 .contains("Azure TTS provider_extras.region rejected"),
             "{err}"
         );
+    }
+
+    // =========================================================================
+    // api_base → synthesis endpoint
+    // =========================================================================
+
+    fn api_base_std(
+        api_base: Option<&str>,
+        extras: serde_json::Map<String, serde_json::Value>,
+    ) -> crate::core::tts::standard::StandardTTSConfig {
+        crate::core::tts::standard::StandardTTSConfig {
+            base: TTSConfig {
+                provider: "azure".into(),
+                api_key: "k".into(),
+                voice_id: Some("en-US-JennyNeural".into()),
+                api_base: api_base.map(str::to_string),
+                ..Default::default()
+            },
+            features: crate::core::tts::standard::TtsFeatures::default(),
+            extras: crate::core::stt::standard::ProviderExtras(extras),
+        }
+    }
+
+    #[test]
+    fn from_standard_regional_api_base_sets_region_and_url() {
+        let std = api_base_std(
+            Some("https://japaneast.api.cognitive.microsoft.com/"),
+            serde_json::Map::new(),
+        );
+        let cfg = AzureTTSConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.region, AzureRegion::JapanEast);
+        assert_eq!(
+            cfg.speech_endpoint,
+            Some(AzureSpeechEndpoint::Region(AzureRegion::JapanEast))
+        );
+        assert_eq!(
+            cfg.build_tts_url(),
+            "https://japaneast.tts.speech.microsoft.com/cognitiveservices/v1"
+        );
+    }
+
+    #[test]
+    fn from_standard_api_base_wins_over_region_extra() {
+        let mut extras = serde_json::Map::new();
+        extras.insert("region".into(), serde_json::json!("westeurope"));
+        let std = api_base_std(
+            Some("https://australiaeast.tts.speech.microsoft.com"),
+            extras,
+        );
+        let cfg = AzureTTSConfig::from_standard(&std).unwrap();
+        assert_eq!(cfg.region, AzureRegion::AustraliaEast);
+        assert_eq!(
+            cfg.build_tts_url(),
+            "https://australiaeast.tts.speech.microsoft.com/cognitiveservices/v1"
+        );
+    }
+
+    #[test]
+    fn from_standard_resource_api_base_targets_the_custom_domain() {
+        let std = api_base_std(
+            Some("https://My-Speech.cognitiveservices.azure.com/"),
+            serde_json::Map::new(),
+        );
+        let cfg = AzureTTSConfig::from_standard(&std).unwrap();
+        assert_eq!(
+            cfg.build_tts_url(),
+            "https://my-speech.cognitiveservices.azure.com/tts/cognitiveservices/v1"
+        );
+    }
+
+    #[test]
+    fn from_standard_ai_services_alias_api_base_uses_the_cognitiveservices_host() {
+        let std = api_base_std(
+            Some("https://my-foundry.openai.azure.com/"),
+            serde_json::Map::new(),
+        );
+        let cfg = AzureTTSConfig::from_standard(&std).unwrap();
+        assert_eq!(
+            cfg.build_tts_url(),
+            "https://my-foundry.cognitiveservices.azure.com/tts/cognitiveservices/v1"
+        );
+    }
+
+    #[test]
+    fn from_standard_refuses_an_api_base_that_is_not_azure_speech() {
+        for bad in [
+            "https://evil.example.com",
+            "http://westeurope.api.cognitive.microsoft.com/",
+            "https://10.0.0.5/",
+        ] {
+            let std = api_base_std(Some(bad), serde_json::Map::new());
+            let err = AzureTTSConfig::from_standard(&std)
+                .expect_err("a non-Azure api_base must not fall back to eastus");
+            let msg = err.to_string();
+            assert!(matches!(err, TTSError::InvalidConfiguration(_)), "{msg}");
+            assert!(msg.contains("api_base"), "{msg}");
+            assert!(!msg.contains(bad), "the value must not be echoed: {msg}");
+        }
+    }
+
+    #[test]
+    fn from_standard_without_api_base_keeps_region_behaviour() {
+        // No api_base, or a blank one: default region, exactly as before.
+        for api_base in [None, Some(""), Some("   ")] {
+            let cfg =
+                AzureTTSConfig::from_standard(&api_base_std(api_base, serde_json::Map::new()))
+                    .unwrap();
+            assert_eq!(cfg.speech_endpoint, None, "{api_base:?}");
+            assert_eq!(
+                cfg.build_tts_url(),
+                "https://eastus.tts.speech.microsoft.com/cognitiveservices/v1",
+                "{api_base:?}"
+            );
+        }
+        // …and the region extra still applies.
+        let mut extras = serde_json::Map::new();
+        extras.insert("region".into(), serde_json::json!("westeurope"));
+        let cfg = AzureTTSConfig::from_standard(&api_base_std(None, extras)).unwrap();
+        assert_eq!(
+            cfg.build_tts_url(),
+            "https://westeurope.tts.speech.microsoft.com/cognitiveservices/v1"
+        );
+    }
+
+    // =========================================================================
+    // base.emotion_config → <mstts:express-as>
+    // =========================================================================
+
+    fn emotion_std(
+        emotion_config: crate::core::emotion::EmotionConfig,
+        features_emotion: Option<&str>,
+        extras: serde_json::Map<String, serde_json::Value>,
+    ) -> AzureTTSConfig {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        let std = StandardTTSConfig {
+            base: TTSConfig {
+                provider: "azure".into(),
+                api_key: "k".into(),
+                voice_id: Some("en-US-JennyNeural".into()),
+                emotion_config: Some(emotion_config),
+                ..Default::default()
+            },
+            features: TtsFeatures {
+                emotion: features_emotion.map(str::to_string),
+                ..Default::default()
+            },
+            extras: crate::core::stt::standard::ProviderExtras(extras),
+        };
+        AzureTTSConfig::from_standard(&std).unwrap()
+    }
+
+    #[test]
+    fn from_standard_emotion_config_reaches_express_as_in_ssml() {
+        use crate::core::emotion::{Emotion, EmotionConfig};
+        let emotion_config = EmotionConfig::with_emotion(Emotion::Happy);
+        // Assert on what Azure's mapper yields, not on a guess of its table.
+        let mapped = AzureEmotionMapper::new().map_emotion(&emotion_config);
+        let style = mapped.ssml_style.clone().expect("Happy maps to a style");
+        let degree = format_style_degree(mapped.ssml_style_degree.expect("and a degree"))
+            .expect("finite degree");
+
+        let cfg = emotion_std(emotion_config, None, serde_json::Map::new());
+        assert_eq!(cfg.emotion.as_deref(), Some(style.as_str()));
+        let ssml = cfg.build_ssml_for_text("Hello");
+        assert!(
+            ssml.contains(&format!("<mstts:express-as style=\"{style}\"")),
+            "deployment emotion not wired into SSML body: {ssml}"
+        );
+        assert!(
+            ssml.contains(&format!("styledegree=\"{degree}\"")),
+            "mapped intensity not carried as styledegree: {ssml}"
+        );
+        assert!(ssml.contains("xmlns:mstts="), "{ssml}");
+    }
+
+    #[test]
+    fn from_standard_features_emotion_wins_over_emotion_config() {
+        use crate::core::emotion::{Emotion, EmotionConfig};
+        let cfg = emotion_std(
+            EmotionConfig::with_emotion(Emotion::Happy),
+            Some("sad"),
+            serde_json::Map::new(),
+        );
+        assert_eq!(cfg.emotion.as_deref(), Some("sad"));
+        // The mapped degree belongs to the mapped style; it is not grafted onto an explicit one.
+        assert_eq!(cfg.ssml_options.style_degree, None);
+        let ssml = cfg.build_ssml_for_text("Hello");
+        assert!(ssml.contains("<mstts:express-as style=\"sad\">"), "{ssml}");
+    }
+
+    #[test]
+    fn from_standard_style_degree_extra_wins_over_mapped_degree() {
+        use crate::core::emotion::{Emotion, EmotionConfig};
+        let mut extras = serde_json::Map::new();
+        extras.insert("style_degree".into(), serde_json::json!("0.3"));
+        let emotion_config = EmotionConfig::with_emotion(Emotion::Happy);
+        let style = AzureEmotionMapper::new()
+            .map_emotion(&emotion_config)
+            .ssml_style
+            .expect("Happy maps to a style");
+
+        let cfg = emotion_std(emotion_config, None, extras);
+        assert_eq!(cfg.ssml_options.style_degree.as_deref(), Some("0.3"));
+        let ssml = cfg.build_ssml_for_text("Hello");
+        assert!(
+            ssml.contains(&format!(
+                "<mstts:express-as style=\"{style}\" styledegree=\"0.3\">"
+            )),
+            "{ssml}"
+        );
+    }
+
+    #[test]
+    fn from_standard_emotion_config_without_a_style_sets_nothing() {
+        use crate::core::emotion::{Emotion, EmotionConfig};
+        let emotion_config = EmotionConfig::with_emotion(Emotion::Neutral);
+        assert!(
+            AzureEmotionMapper::new()
+                .map_emotion(&emotion_config)
+                .ssml_style
+                .is_none(),
+            "precondition: the mapper yields no style for Neutral"
+        );
+
+        let cfg = emotion_std(emotion_config, None, serde_json::Map::new());
+        assert_eq!(cfg.emotion, None);
+        assert_eq!(cfg.ssml_options.style_degree, None);
+        let ssml = cfg.build_ssml_for_text("Hello");
+        assert!(!ssml.contains("mstts:express-as"), "{ssml}");
+    }
+
+    #[test]
+    fn format_style_degree_clamps_and_rounds() {
+        assert_eq!(format_style_degree(0.95000005).as_deref(), Some("0.95"));
+        assert_eq!(format_style_degree(5.0).as_deref(), Some("2.00"));
+        assert_eq!(format_style_degree(0.0).as_deref(), Some("0.01"));
+        assert_eq!(format_style_degree(f32::NAN), None);
     }
 
     #[test]

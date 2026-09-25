@@ -361,27 +361,46 @@ impl AwsTranscribeSTT {
     /// stabilization) are honored END-TO-END. The flat `BaseSTT::new` path hardcodes diarization
     /// and redaction off; this is the reachable standardized path.
     ///
-    /// Amazon Transcribe authenticates with AWS credentials (env / credentials file / IAM role),
-    /// NOT an `api_key`, so this does not require `base.api_key` — credentials and region are
-    /// resolved from the environment exactly as the flat `BaseSTT::new` path does.
+    /// Amazon Transcribe authenticates with AWS credentials, NOT an `api_key`, so this does not
+    /// require `base.api_key`. Credentials the request carries (the `aws_access_key_id` /
+    /// `aws_secret_access_key` / `aws_session_token` extras) are used as given; with none, the
+    /// connection uses the SDK default chain (environment, credentials file, IAM role) — the
+    /// gateway's own identity.
     pub fn new_standard(
         std: &crate::core::stt::standard::StandardSTTConfig,
     ) -> Result<Self, STTError> {
-        let mut aws_config = AwsTranscribeSTTConfig::from_standard(std);
-        // Resolve credentials/region from the environment, but ONLY when the env var is actually set
-        // — otherwise keep what `from_standard` already pulled from the standardized config/extras
-        // (env was clobbering explicit extras credentials with `None`).
-        if let Ok(region) = std::env::var("AWS_REGION") {
-            aws_config.region = AwsRegion::from_str_or_default(&region);
-        }
-        if let Ok(k) = std::env::var("AWS_ACCESS_KEY_ID") {
-            aws_config.aws_access_key_id = Some(k);
-        }
-        if let Ok(k) = std::env::var("AWS_SECRET_ACCESS_KEY") {
-            aws_config.aws_secret_access_key = Some(k);
-        }
-        if let Ok(k) = std::env::var("AWS_SESSION_TOKEN") {
-            aws_config.aws_session_token = Some(k);
+        Self::new_standard_with_env(std, |name| std::env::var(name).ok())
+    }
+
+    /// [`Self::new_standard`] with the process environment injected, so the precedence between a
+    /// request's own settings and the gateway's environment is testable without mutating
+    /// process-global state.
+    ///
+    /// Precedence — the request's explicit choice always wins over the gateway's environment:
+    ///
+    /// * **Credentials** are never read from the environment here. This used to copy
+    ///   `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` OVER the credentials
+    ///   the request carried, so a request with its own AWS identity was authenticated — and billed,
+    ///   and authorised — as the gateway's. With no explicit credentials the fields stay `None`
+    ///   and `start_connection` hands the SDK its default chain, which reads the same environment
+    ///   variables itself (and then the profile and instance role), so nothing is lost.
+    /// * **Region**: the request's `region` extra, else the gateway's `AWS_REGION`, else
+    ///   us-east-1. `AWS_REGION` used to override the request's region too — a data-residency
+    ///   choice silently replaced. A malformed `AWS_REGION` is a configuration error.
+    fn new_standard_with_env(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Result<Self, STTError> {
+        let mut aws_config = AwsTranscribeSTTConfig::from_standard(std)
+            .map_err(|e| STTError::ConfigurationError(format!("Invalid configuration: {e}")))?;
+        let region_chosen = matches!(
+            AwsRegion::from_extra(std.extras.0.get("region")),
+            Ok(Some(_))
+        );
+        if !region_chosen && let Some(region) = env("AWS_REGION").filter(|r| !r.trim().is_empty()) {
+            aws_config.region = AwsRegion::parse(&region).map_err(|e| {
+                STTError::ConfigurationError(format!("Invalid configuration: AWS_REGION: {e}"))
+            })?;
         }
         aws_config.media_encoding = MediaEncoding::from_str_or_default(&std.base.encoding);
         Self::new_with_config(aws_config)
@@ -548,6 +567,45 @@ impl AwsTranscribeSTT {
         input
     }
 
+    /// Load the AWS SDK config the streaming client is built from — the single place region and
+    /// credentials reach the SDK, factored out of `start_connection` so both can be asserted in a
+    /// unit test without dialing AWS.
+    ///
+    /// * **Region**: the configured name, passed through verbatim (`Region::new`) — any AWS-shaped
+    ///   region, not a fixed list (see [`AwsRegion`]).
+    /// * **Credentials**: explicit ones (key id + secret, optional session token) are set as THE
+    ///   credentials provider, which replaces the SDK default chain outright. Only with none
+    ///   given does the default chain (environment, profile, IAM role) apply — the gateway's own
+    ///   identity. A partial set never gets here: `from_standard` refuses it.
+    /// * **Endpoint override** (e.g. a localhost mock) and an injected HTTP client are honored on
+    ///   both credential branches alike.
+    async fn load_sdk_config(
+        config: &AwsTranscribeSTTConfig,
+        http_client: Option<aws_smithy_runtime_api::client::http::SharedHttpClient>,
+    ) -> aws_config::SdkConfig {
+        let mut loader =
+            aws_config::defaults(BehaviorVersion::latest()).region(config.region.to_sdk());
+        if let (Some(key), Some(secret)) = (
+            config.aws_access_key_id.as_deref(),
+            config.aws_secret_access_key.as_deref(),
+        ) {
+            loader = loader.credentials_provider(aws_credential_types::Credentials::new(
+                key,
+                secret,
+                config.aws_session_token.clone(),
+                None, // Expiration
+                "waav-gateway",
+            ));
+        }
+        if let Some(ep) = config.endpoint_override.as_deref() {
+            loader = loader.endpoint_url(ep);
+        }
+        if let Some(c) = http_client {
+            loader = loader.http_client(c);
+        }
+        loader.load().await
+    }
+
     /// Start the transcription stream connection.
     async fn start_connection(&mut self, config: AwsTranscribeSTTConfig) -> Result<(), STTError> {
         // Bounded channels for backpressure - 256 should handle bursts while preventing memory exhaustion
@@ -568,20 +626,12 @@ impl AwsTranscribeSTT {
         self.intentional_disconnect.store(false, Ordering::SeqCst);
 
         // Clone data needed for the connection task
-        let region_str = config.region.as_str().to_string();
-
         let is_connected = self.is_connected.clone();
         let session_id_storage = self.session_id.clone();
         let audio_tx_slot = Arc::clone(&self.audio_tx_slot);
 
-        let aws_access_key_id = config.aws_access_key_id.clone();
-        let aws_secret_access_key = config.aws_secret_access_key.clone();
-        let aws_session_token = config.aws_session_token.clone();
-        // Raw endpoint base (e.g. https://127.0.0.1:PORT for a mock e2e harness). The SDK appends
-        // the operation path; honored on BOTH the explicit-creds and default-chain loader branches.
-        let endpoint_override = config.endpoint_override.clone();
         // Optional injected HttpClient (proxy / custom TLS / in-process test connector). When set,
-        // applied to the loader below so it overrides the SDK default hyper client.
+        // applied to the SDK config loader so it overrides the SDK default hyper client.
         let http_client = self.http_client.clone();
         // The full provider config drives request-parameter wiring via `apply_request_params`
         // (the single source of truth shared with the wire-level tests).
@@ -599,34 +649,7 @@ impl AwsTranscribeSTT {
         // audio receiver (channel-swap — see `audio_tx_slot` doc).
         let connection_handle = tokio::spawn(async move {
             // Build AWS config + client ONCE (async cred load); reused across reconnect attempts.
-            // Compute the explicit credentials (if any) first, then a SINGLE loader so the endpoint
-            // override is honored uniformly whether credentials are explicit or come from the
-            // default chain (env vars, IAM roles, etc.).
-            let explicit_credentials =
-                if aws_access_key_id.is_some() && aws_secret_access_key.is_some() {
-                    Some(aws_credential_types::Credentials::new(
-                        aws_access_key_id.as_deref().unwrap_or_default(),
-                        aws_secret_access_key.as_deref().unwrap_or_default(),
-                        aws_session_token,
-                        None, // Expiration
-                        "waav-gateway",
-                    ))
-                } else {
-                    None
-                };
-
-            let mut loader = aws_config::defaults(BehaviorVersion::latest())
-                .region(aws_config::Region::new(region_str));
-            if let Some(creds) = explicit_credentials {
-                loader = loader.credentials_provider(creds);
-            }
-            if let Some(ep) = endpoint_override.as_deref() {
-                loader = loader.endpoint_url(ep);
-            }
-            if let Some(c) = http_client.clone() {
-                loader = loader.http_client(c);
-            }
-            let aws_config = loader.load().await;
+            let aws_config = AwsTranscribeSTT::load_sdk_config(&request_config, http_client).await;
 
             let client = TranscribeClient::new(&aws_config);
 
@@ -827,14 +850,19 @@ impl BaseSTT for AwsTranscribeSTT {
             )));
         }
 
+        // The flat path has no per-request settings, so the gateway's AWS_REGION is the region;
+        // unset → us-east-1. A malformed value is refused rather than replaced with us-east-1.
+        let region = match std::env::var("AWS_REGION") {
+            Ok(r) if !r.trim().is_empty() => AwsRegion::parse(&r).map_err(|e| {
+                STTError::ConfigurationError(format!("Invalid configuration: AWS_REGION: {e}"))
+            })?,
+            _ => AwsRegion::default(),
+        };
+
         // Create AWS-specific configuration from base config
         let aws_config = AwsTranscribeSTTConfig {
             base: config.clone(),
-            region: AwsRegion::from_str_or_default(
-                std::env::var("AWS_REGION")
-                    .unwrap_or_else(|_| "us-east-1".to_string())
-                    .as_str(),
-            ),
+            region,
             aws_access_key_id: std::env::var("AWS_ACCESS_KEY_ID").ok(),
             aws_secret_access_key: std::env::var("AWS_SECRET_ACCESS_KEY").ok(),
             aws_session_token: std::env::var("AWS_SESSION_TOKEN").ok(),
@@ -1009,7 +1037,11 @@ impl BaseSTT for AwsTranscribeSTT {
         // Create new AWS config from base config
         let aws_config = AwsTranscribeSTTConfig {
             base: config.clone(),
-            region: self.config.as_ref().map(|c| c.region).unwrap_or_default(),
+            region: self
+                .config
+                .as_ref()
+                .map(|c| c.region.clone())
+                .unwrap_or_default(),
             aws_access_key_id: self
                 .config
                 .as_ref()
@@ -1155,6 +1187,183 @@ mod tests {
         }
     }
 
+    // =========================================================================
+    // Credential / region precedence: the request's explicit choice beats the
+    // gateway's environment. `new_standard` used to copy AWS_ACCESS_KEY_ID /
+    // AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN / AWS_REGION OVER what the request
+    // carried, so a request with its own AWS identity ran as the gateway's.
+    // =========================================================================
+
+    /// A standardized Transcribe config carrying the given string extras.
+    fn std_with_extras(pairs: &[(&str, &str)]) -> crate::core::stt::standard::StandardSTTConfig {
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig};
+        let mut extras = serde_json::Map::new();
+        for (k, v) in pairs {
+            extras.insert((*k).to_string(), serde_json::json!(v));
+        }
+        StandardSTTConfig {
+            extras: ProviderExtras(extras),
+            ..StandardSTTConfig::from_base(STTConfig {
+                provider: "aws-transcribe".into(),
+                api_key: String::new(),
+                language: "en-US".into(),
+                sample_rate: 16000,
+                channels: 1,
+                punctuation: true,
+                encoding: "pcm".into(),
+                model: String::new(),
+            })
+        }
+    }
+
+    const REQUEST_CREDENTIALS: [(&str, &str); 3] = [
+        ("aws_access_key_id", "AKIAREQUEST"),
+        ("aws_secret_access_key", "request-secret"),
+        ("aws_session_token", "request-token"),
+    ];
+
+    /// The gateway's own AWS identity and region, as its environment carries them.
+    fn gateway_env(name: &str) -> Option<String> {
+        match name {
+            "AWS_ACCESS_KEY_ID" => Some("AKIAGATEWAY".into()),
+            "AWS_SECRET_ACCESS_KEY" => Some("gateway-secret".into()),
+            "AWS_SESSION_TOKEN" => Some("gateway-token".into()),
+            "AWS_REGION" => Some("us-west-2".into()),
+            _ => None,
+        }
+    }
+
+    fn assert_request_identity(cfg: &AwsTranscribeSTTConfig) {
+        assert_eq!(cfg.aws_access_key_id.as_deref(), Some("AKIAREQUEST"));
+        assert_eq!(cfg.aws_secret_access_key.as_deref(), Some("request-secret"));
+        assert_eq!(cfg.aws_session_token.as_deref(), Some("request-token"));
+    }
+
+    #[test]
+    fn request_credentials_and_region_win_over_the_gateway_environment() {
+        let mut pairs = REQUEST_CREDENTIALS.to_vec();
+        pairs.push(("region", "eu-north-1"));
+        let stt =
+            AwsTranscribeSTT::new_standard_with_env(&std_with_extras(&pairs), gateway_env).unwrap();
+        let cfg = stt.config.as_ref().unwrap();
+        assert_request_identity(cfg);
+        assert_eq!(cfg.region.as_str(), "eu-north-1");
+    }
+
+    /// With no request credentials nothing is copied from the environment: the fields stay empty
+    /// and `load_sdk_config` hands the SDK its default chain, which reads the environment itself.
+    /// The region falls back to AWS_REGION, then us-east-1.
+    #[test]
+    fn without_request_credentials_the_sdk_default_chain_applies() {
+        let std = std_with_extras(&[]);
+        let stt = AwsTranscribeSTT::new_standard_with_env(&std, gateway_env).unwrap();
+        let cfg = stt.config.as_ref().unwrap();
+        assert_eq!(cfg.aws_access_key_id, None);
+        assert_eq!(cfg.aws_secret_access_key, None);
+        assert_eq!(cfg.aws_session_token, None);
+        assert!(!cfg.has_explicit_credentials());
+        assert_eq!(cfg.region.as_str(), "us-west-2");
+
+        let stt = AwsTranscribeSTT::new_standard_with_env(&std, |_| None).unwrap();
+        assert_eq!(stt.config.as_ref().unwrap().region, AwsRegion::US_EAST_1);
+    }
+
+    #[test]
+    fn malformed_region_in_request_or_environment_is_a_configuration_error() {
+        match AwsTranscribeSTT::new_standard_with_env(
+            &std_with_extras(&[("region", "narnia")]),
+            gateway_env,
+        ) {
+            Err(STTError::ConfigurationError(m)) => assert!(m.contains("narnia"), "{m}"),
+            Err(other) => panic!("expected a configuration error, got {other:?}"),
+            Ok(_) => panic!("a malformed request region must not become us-east-1"),
+        }
+        let moon_env = |name: &str| (name == "AWS_REGION").then(|| "moon-base".to_string());
+        match AwsTranscribeSTT::new_standard_with_env(&std_with_extras(&[]), moon_env) {
+            Err(STTError::ConfigurationError(m)) => assert!(m.contains("AWS_REGION"), "{m}"),
+            Err(other) => panic!("expected a configuration error, got {other:?}"),
+            Ok(_) => panic!("a malformed AWS_REGION must not become us-east-1"),
+        }
+    }
+
+    /// A key id without its secret must not quietly run as the gateway's identity.
+    #[test]
+    fn partial_request_credentials_are_refused() {
+        let std = std_with_extras(&[("aws_access_key_id", "AKIAREQUEST")]);
+        assert!(matches!(
+            AwsTranscribeSTT::new_standard_with_env(&std, gateway_env),
+            Err(STTError::ConfigurationError(_))
+        ));
+    }
+
+    /// SDK level: the request's credentials and region are what the loaded `SdkConfig` carries —
+    /// the explicit provider replaces the default chain, so the gateway identity is unreachable.
+    #[tokio::test]
+    async fn request_credentials_and_region_reach_the_sdk_config() {
+        use aws_credential_types::provider::ProvideCredentials;
+        // The SDK loader may build its default TLS client; make the rustls provider unambiguous.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let mut pairs = REQUEST_CREDENTIALS.to_vec();
+        pairs.push(("region", "eu-north-1"));
+        let stt =
+            AwsTranscribeSTT::new_standard_with_env(&std_with_extras(&pairs), gateway_env).unwrap();
+        let sdk = AwsTranscribeSTT::load_sdk_config(stt.config.as_ref().unwrap(), None).await;
+        assert_eq!(sdk.region().map(|r| r.as_ref()), Some("eu-north-1"));
+        let creds = sdk
+            .credentials_provider()
+            .expect("explicit credentials provider")
+            .provide_credentials()
+            .await
+            .unwrap();
+        assert_eq!(creds.access_key_id(), "AKIAREQUEST");
+        assert_eq!(creds.secret_access_key(), "request-secret");
+        assert_eq!(creds.session_token(), Some("request-token"));
+    }
+
+    /// The same precedence through the REAL process environment (serialized: env is
+    /// process-global). Before the fix this authenticated as AKIAGATEWAY in us-west-2.
+    #[test]
+    #[serial_test::serial]
+    fn process_environment_does_not_override_request_credentials() {
+        struct RestoreEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                for (name, previous) in self.0.drain(..) {
+                    // SAFETY: test-only env mutation, serialized by #[serial].
+                    unsafe {
+                        match previous {
+                            Some(v) => std::env::set_var(name, v),
+                            None => std::env::remove_var(name),
+                        }
+                    }
+                }
+            }
+        }
+        const GATEWAY: [(&str, &str); 4] = [
+            ("AWS_ACCESS_KEY_ID", "AKIAGATEWAY"),
+            ("AWS_SECRET_ACCESS_KEY", "gateway-secret"),
+            ("AWS_SESSION_TOKEN", "gateway-token"),
+            ("AWS_REGION", "us-west-2"),
+        ];
+        let _restore = RestoreEnv(
+            GATEWAY
+                .iter()
+                .map(|(name, _)| (*name, std::env::var_os(name)))
+                .collect(),
+        );
+        for (name, value) in GATEWAY {
+            // SAFETY: test-only env mutation, serialized by #[serial]; restored on drop.
+            unsafe { std::env::set_var(name, value) };
+        }
+
+        let mut pairs = REQUEST_CREDENTIALS.to_vec();
+        pairs.push(("region", "eu-north-1"));
+        let stt = AwsTranscribeSTT::new_standard(&std_with_extras(&pairs)).unwrap();
+        let cfg = stt.config.as_ref().unwrap();
+        assert_request_identity(cfg);
+        assert_eq!(cfg.region.as_str(), "eu-north-1");
+    }
+
     #[tokio::test]
     async fn test_aws_transcribe_invalid_sample_rate() {
         let config = STTConfig {
@@ -1298,7 +1507,7 @@ mod tests {
             extras: ProviderExtras(extras),
             translation: None,
         };
-        let cfg = AwsTranscribeSTTConfig::from_standard(&std);
+        let cfg = AwsTranscribeSTTConfig::from_standard(&std).unwrap();
         AwsTranscribeSTT::apply_request_params(&cfg, StartStreamTranscriptionInput::builder())
     }
 
@@ -1314,7 +1523,7 @@ mod tests {
                 model: String::new(),
                 ..Default::default()
             });
-            let cfg = AwsTranscribeSTTConfig::from_standard(&std);
+            let cfg = AwsTranscribeSTTConfig::from_standard(&std).unwrap();
             AwsTranscribeSTT::apply_request_params(&cfg, StartStreamTranscriptionInput::builder())
                 .get_language_code()
                 .clone()

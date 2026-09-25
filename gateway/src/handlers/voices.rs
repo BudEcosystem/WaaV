@@ -750,7 +750,7 @@ pub(crate) fn provider_default_voice(provider: &str) -> &'static str {
         "azure" | "microsoft-azure" | "microsoft_azure" => "en-US-JennyNeural",
         "google" | "google-tts" => "en-US-Standard-C",
         "cartesia" => "a0e99841-438c-4a64-b679-ae501e7d6091",
-        "openai" | "openai-tts" => "alloy",
+        "openai" | "openai-tts" | "azure_openai" | "azure-openai" => "alloy",
         "hume" => "",
         _ => "",
     }

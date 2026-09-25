@@ -13,6 +13,16 @@ use url::form_urlencoded;
 
 // Re-export AzureRegion from the shared providers module for backwards compatibility
 pub use crate::core::providers::azure::AzureRegion;
+use crate::core::providers::azure::AzureSpeechEndpoint;
+
+/// `provider_extras` key under which the handler passes the deployment's `api_base` (STT has no
+/// flat `api_base` field, unlike `TTSConfig`).
+pub const AZURE_STT_API_BASE_EXTRA: &str = "api_base";
+
+/// The WebSocket recognition path appended to the endpoint's base URL. Identical on regional
+/// and resource endpoints — only the base differs (`wss://<region>.stt.speech.microsoft.com` vs
+/// `wss://<name>.cognitiveservices.azure.com/stt`).
+const AZURE_STT_RECOGNITION_PATH: &str = "/speech/recognition/conversation/cognitiveservices/v1";
 
 fn encode_query_value(value: &str) -> String {
     form_urlencoded::byte_serialize(value.as_bytes()).collect()
@@ -132,6 +142,15 @@ pub struct AzureSTTConfig {
     /// Choose the region closest to your users for optimal latency.
     pub region: AzureRegion,
 
+    /// The endpoint resolved from the deployment's `api_base` (`provider_extras.api_base`), when
+    /// one was supplied and valid. When set it decides the dialed host and wins over `region`;
+    /// `None` keeps the region-derived URL. A regional `api_base` also writes its region into
+    /// `region`, so the two agree.
+    ///
+    /// Vendor contract: a Speech key is valid only on its own resource's region / custom
+    /// domain, so a key from any region other than the gateway default needs this to avoid 401.
+    pub speech_endpoint: Option<AzureSpeechEndpoint>,
+
     /// Output format for recognition results.
     ///
     /// - `Simple`: Basic results with just the display text
@@ -221,6 +240,7 @@ impl Default for AzureSTTConfig {
         Self {
             base: STTConfig::default(),
             region: AzureRegion::default(),
+            speech_endpoint: None,
             output_format: AzureOutputFormat::Detailed,
             profanity: AzureProfanityOption::Masked,
             interim_results: true,
@@ -259,11 +279,32 @@ impl AzureSTTConfig {
         }
     }
 
+    /// The production host the WebSocket addresses: the resource's custom domain when `api_base`
+    /// named one, else `<region>.stt.speech.microsoft.com`. The client pins this as the upgrade
+    /// request's `Host` header (also when an `endpoint_override` redirects the dial).
+    pub fn websocket_host(&self) -> String {
+        match &self.speech_endpoint {
+            Some(endpoint) => endpoint.stt_hostname(),
+            None => self.region.stt_hostname(),
+        }
+    }
+
+    /// The production WebSocket base URL, before the recognition path: regional
+    /// `wss://<region>.stt.speech.microsoft.com`, or resource
+    /// `wss://<name>.cognitiveservices.azure.com/stt` (Microsoft's custom-domain rule — the
+    /// `/stt` prefix in front of the regional path; pending a live probe).
+    fn websocket_base_url(&self) -> String {
+        match &self.speech_endpoint {
+            Some(endpoint) => endpoint.stt_websocket_base_url(),
+            None => self.region.stt_websocket_base_url(),
+        }
+    }
+
     /// Build the complete WebSocket URL with all query parameters.
     ///
     /// Constructs the full WebSocket URL for connecting to Azure Speech Service,
     /// including:
-    /// - Regional endpoint base URL
+    /// - Endpoint base URL (regional, or the resource custom domain from `api_base`)
     /// - Speech recognition API path
     /// - All configuration query parameters
     ///
@@ -278,27 +319,38 @@ impl AzureSTTConfig {
     ///     ?language=en-US
     ///     &format=detailed
     ///     &profanity=masked
+    ///
+    /// wss://my-speech.cognitiveservices.azure.com/stt/speech/recognition/conversation/cognitiveservices/v1
+    ///     ?language=en-US   (same query parameters)
     /// ```
     pub fn build_websocket_url(&self) -> String {
+        let endpoint_base = self.websocket_base_url();
         // Honor an `endpoint_override` (in-repo mock/proxy → local `ws://` server) for credential-free
-        // e2e: swap only the dialed scheme://host; the `/speech/recognition/.../v1?...` path+query
-        // (and USP auth) are kept verbatim.
+        // e2e: swap only the dialed scheme://host; the endpoint's path (the resource `/stt` prefix,
+        // empty for a regional endpoint), the `/speech/recognition/.../v1?...` path+query and USP
+        // auth are kept verbatim — the same rule the Azure TTS override follows.
         let base_url = match self
             .endpoint_override
             .as_deref()
             .map(str::trim)
             .filter(|o| !o.is_empty())
         {
-            Some(o) => o.trim_end_matches('/').to_string(),
-            None => self.region.stt_websocket_base_url().to_string(),
+            Some(o) => {
+                let endpoint_path = url::Url::parse(&endpoint_base)
+                    .map(|u| u.path().trim_end_matches('/').to_string())
+                    .unwrap_or_default();
+                format!("{}{endpoint_path}", o.trim_end_matches('/'))
+            }
+            None => endpoint_base,
         };
 
         let language = encode_query_value(self.effective_language());
 
         // Start with the base path and required parameters
         let mut url = format!(
-            "{}/speech/recognition/conversation/cognitiveservices/v1?language={}&format={}&profanity={}",
+            "{}{}?language={}&format={}&profanity={}",
             base_url,
+            AZURE_STT_RECOGNITION_PATH,
             language,
             self.output_format.as_str(),
             self.profanity.as_str()
@@ -492,6 +544,11 @@ impl AzureSTTConfig {
     /// segmentation endpointing, continuous language-ID, N-best detailed output, phrase-list
     /// biasing, dictation/disfluency mode, and sentiment — in addition to the URL query-param
     /// features (interim results, word-level timing, profanity).
+    ///
+    /// The dialed endpoint comes from `provider_extras.region` and
+    /// `provider_extras.api_base` ([`AZURE_STT_API_BASE_EXTRA`]); `api_base` wins. Invalid values
+    /// are logged and ignored (this constructor is infallible) — validate `api_base` with
+    /// [`AzureSpeechEndpoint::from_api_base`] before building a session to refuse it instead.
     pub fn from_standard(std: &crate::core::stt::standard::StandardSTTConfig) -> Self {
         let f = &std.features;
         let ex = &std.extras.0;
@@ -558,6 +615,49 @@ impl AzureSTTConfig {
             _ => Vec::new(),
         };
 
+        // --- Endpoint: provider_extras.region, then api_base (which wins) ---------------------
+        // Vendor contract: a Speech key is accepted only on its own resource's region or custom
+        // domain; anywhere else the handshake is a 401. `region` was never read here before, so
+        // every STT session dialed eastus. `api_base` (the deployment's credential "API Base
+        // URL", passed by the handler under `provider_extras.api_base`) names where the key lives
+        // and outranks a region extra. This constructor is infallible: a value that does not
+        // parse keeps the previous endpoint and logs a warning — the handler refuses a bad
+        // `api_base` with a 400 before this point, so reaching the fallback means a caller that
+        // skipped that check. Neither warning repeats the value.
+        if let Some(region) = ex.get("region").and_then(|v| v.as_str()) {
+            match region.parse::<AzureRegion>() {
+                Ok(region) => cfg.region = region,
+                Err(_) => tracing::warn!(
+                    provider = "azure",
+                    "Azure STT provider_extras.region is not a valid Azure region; keeping {}",
+                    cfg.region.as_str()
+                ),
+            }
+        }
+        if let Some(api_base) = ex
+            .get(AZURE_STT_API_BASE_EXTRA)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            match AzureSpeechEndpoint::from_api_base_with_note(api_base) {
+                Ok((endpoint, note)) => {
+                    if let Some(note) = note {
+                        tracing::warn!(provider = "azure", "Azure STT: {note}");
+                    }
+                    if let Some(region) = endpoint.region() {
+                        cfg.region = region.clone();
+                    }
+                    cfg.speech_endpoint = Some(endpoint);
+                }
+                Err(err) => tracing::warn!(
+                    provider = "azure",
+                    "Azure STT {err}; keeping the {} regional endpoint",
+                    cfg.region.as_str()
+                ),
+            }
+        }
+
         // Credential-free e2e / proxy: point the dial at the override host (mock ignores auth).
         cfg.endpoint_override = std.endpoint_override().map(|s| s.to_string());
 
@@ -612,6 +712,159 @@ mod tests {
         let cfg = AzureSTTConfig::from_standard(&std);
         assert!(!cfg.interim_results); // interim_results
         assert!(cfg.word_level_timing); // word_timestamps
+    }
+
+    // =========================================================================
+    // provider_extras.region / provider_extras.api_base → dialed endpoint
+    // =========================================================================
+
+    fn endpoint_std(extras: &[(&str, &str)]) -> crate::core::stt::standard::StandardSTTConfig {
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
+        let mut map = serde_json::Map::new();
+        for (k, v) in extras {
+            map.insert((*k).to_string(), serde_json::json!(v));
+        }
+        StandardSTTConfig {
+            base: STTConfig {
+                provider: "azure".into(),
+                api_key: "test-key".into(),
+                language: "en-US".into(),
+                ..Default::default()
+            },
+            features: SttFeatures::default(),
+            extras: ProviderExtras(map),
+            translation: None,
+        }
+    }
+
+    const RECOGNITION_QUERY: &str = "/speech/recognition/conversation/cognitiveservices/v1?language=en-US&format=detailed&profanity=masked";
+
+    #[test]
+    fn from_standard_reads_the_region_extra() {
+        let cfg = AzureSTTConfig::from_standard(&endpoint_std(&[("region", "westeurope")]));
+        assert_eq!(cfg.region, AzureRegion::WestEurope);
+        assert_eq!(
+            cfg.build_websocket_url(),
+            format!("wss://westeurope.stt.speech.microsoft.com{RECOGNITION_QUERY}")
+        );
+        assert_eq!(cfg.websocket_host(), "westeurope.stt.speech.microsoft.com");
+    }
+
+    #[test]
+    fn from_standard_invalid_region_extra_keeps_the_default() {
+        let cfg = AzureSTTConfig::from_standard(&endpoint_std(&[("region", "west/europe")]));
+        assert_eq!(cfg.region, AzureRegion::EastUS);
+    }
+
+    #[test]
+    fn from_standard_regional_api_base_wins_over_region_extra() {
+        let cfg = AzureSTTConfig::from_standard(&endpoint_std(&[
+            ("region", "westeurope"),
+            (
+                AZURE_STT_API_BASE_EXTRA,
+                "https://japaneast.api.cognitive.microsoft.com/",
+            ),
+        ]));
+        assert_eq!(cfg.region, AzureRegion::JapanEast);
+        assert_eq!(
+            cfg.build_websocket_url(),
+            format!("wss://japaneast.stt.speech.microsoft.com{RECOGNITION_QUERY}")
+        );
+        assert_eq!(cfg.websocket_host(), "japaneast.stt.speech.microsoft.com");
+    }
+
+    #[test]
+    fn from_standard_resource_api_base_dials_the_custom_domain_with_identical_query() {
+        let resource = AzureSTTConfig::from_standard(&endpoint_std(&[(
+            AZURE_STT_API_BASE_EXTRA,
+            "https://My-Speech.cognitiveservices.azure.com/",
+        )]));
+        assert_eq!(
+            resource.build_websocket_url(),
+            format!("wss://my-speech.cognitiveservices.azure.com/stt{RECOGNITION_QUERY}")
+        );
+        assert_eq!(
+            resource.websocket_host(),
+            "my-speech.cognitiveservices.azure.com"
+        );
+
+        // Every query parameter the regional URL carries is carried identically.
+        let mut regional = AzureSTTConfig::from_standard(&endpoint_std(&[]));
+        let mut resource = resource;
+        for cfg in [&mut regional, &mut resource] {
+            cfg.endpoint_id = Some("custom-model".into());
+            cfg.auto_detect_languages = Some(vec!["en-US".into(), "de-DE".into()]);
+            cfg.profanity = AzureProfanityOption::Raw;
+        }
+        let tail = |url: String| {
+            url.split_once("/speech/recognition/")
+                .unwrap()
+                .1
+                .to_string()
+        };
+        assert_eq!(
+            tail(regional.build_websocket_url()),
+            tail(resource.build_websocket_url())
+        );
+    }
+
+    #[test]
+    fn from_standard_ai_services_alias_api_base_dials_the_cognitiveservices_host() {
+        let cfg = AzureSTTConfig::from_standard(&endpoint_std(&[(
+            AZURE_STT_API_BASE_EXTRA,
+            "https://my-foundry.services.ai.azure.com/",
+        )]));
+        assert_eq!(
+            cfg.build_websocket_url(),
+            format!("wss://my-foundry.cognitiveservices.azure.com/stt{RECOGNITION_QUERY}")
+        );
+    }
+
+    #[test]
+    fn from_standard_invalid_api_base_does_not_panic_and_keeps_the_region() {
+        for bad in [
+            "https://evil.example.com",
+            "http://westeurope.api.cognitive.microsoft.com/",
+            "not a url",
+        ] {
+            let cfg = AzureSTTConfig::from_standard(&endpoint_std(&[
+                ("region", "westeurope"),
+                (AZURE_STT_API_BASE_EXTRA, bad),
+            ]));
+            assert_eq!(cfg.speech_endpoint, None, "{bad}");
+            assert_eq!(cfg.region, AzureRegion::WestEurope, "{bad}");
+            assert!(
+                cfg.build_websocket_url()
+                    .starts_with("wss://westeurope.stt.speech.microsoft.com/"),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn endpoint_override_keeps_the_resource_path_prefix() {
+        let mut cfg = AzureSTTConfig::from_standard(&endpoint_std(&[(
+            AZURE_STT_API_BASE_EXTRA,
+            "https://my-speech.cognitiveservices.azure.com/",
+        )]));
+        cfg.endpoint_override = Some("ws://127.0.0.1:9000/".into());
+        assert_eq!(
+            cfg.build_websocket_url(),
+            format!("ws://127.0.0.1:9000/stt{RECOGNITION_QUERY}")
+        );
+        // The Host header stays the production host, as it does for a regional override.
+        assert_eq!(
+            cfg.websocket_host(),
+            "my-speech.cognitiveservices.azure.com"
+        );
+
+        // A regional endpoint's override is unchanged: no prefix.
+        let mut regional = AzureSTTConfig::from_standard(&endpoint_std(&[]));
+        regional.endpoint_override = Some("ws://127.0.0.1:9000".into());
+        assert_eq!(
+            regional.build_websocket_url(),
+            format!("ws://127.0.0.1:9000{RECOGNITION_QUERY}")
+        );
     }
 
     // Note: Core AzureRegion tests are now in crate::core::providers::azure::region.

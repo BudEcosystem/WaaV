@@ -37,8 +37,8 @@ fn every_contract_case_parses() {
         match name.as_str() {
             // A case carrying a credential needs a decryptor; without one the endpoint is
             // correctly dropped rather than used with an unopened secret.
-            "vendor_backed" => {
-                let map = parsed.expect("vendor_backed must parse");
+            "vendor_backed" | "aws_polly" => {
+                let map = parsed.unwrap_or_else(|e| panic!("case {name} must parse: {e}"));
                 assert!(
                     map.is_empty(),
                     "an endpoint with an unopenable credential was kept; its ciphertext would be \
@@ -54,6 +54,23 @@ fn every_contract_case_parses() {
             }
         }
     }
+}
+
+/// `provider_params` is plaintext and per-vendor: a Google deployment's project and location reach
+/// the endpoint as budapp published them.
+#[test]
+fn the_google_case_carries_its_provider_params() {
+    let entry = cases()
+        .get("google_params")
+        .cloned()
+        .expect("fixture has a google_params case");
+    let blob = serde_json::json!({ "ep-1": entry }).to_string();
+    let map = parse_voice_blob(&blob, &CredentialDecryptor::disabled()).expect("parses");
+    let ep = map
+        .get("ep-1")
+        .expect("kept: it carries no credential to open");
+    assert_eq!(ep.provider_param("project_id"), Some("acme-speech"));
+    assert_eq!(ep.provider_param("location"), Some("us"));
 }
 
 /// The self-hosted case is the one FRD §5.2 turns on: a cluster deployment URL riding in the
@@ -150,6 +167,9 @@ fn no_contract_field_is_unmodelled_by_this_build() {
         "voice",
         "language",
         "pricing",
+        "config",
+        // Voice contract §3 (2026-09-26).
+        "provider_params",
     ];
 
     for (name, entry) in cases() {

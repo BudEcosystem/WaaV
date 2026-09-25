@@ -612,6 +612,15 @@ fn self_hosted_tts_metadata() -> ProviderMetadata {
         .with_description("An audio server the operator runs, addressed by api_base")
 }
 
+fn azure_openai_tts_metadata() -> ProviderMetadata {
+    ProviderMetadata::tts("azure_openai", "Azure OpenAI TTS")
+        .with_description(
+            "OpenAI speech models on an Azure OpenAI deployment, addressed by api_base \
+             (api-key auth). Not Azure AI Speech, which is `azure`.",
+        )
+        .with_models(["tts-1", "tts-1-hd", "gpt-4o-mini-tts"])
+}
+
 fn deepgram_tts_metadata() -> ProviderMetadata {
     ProviderMetadata::tts("deepgram", "Deepgram Aura")
         .with_description("Real-time TTS with Aura voice models")
@@ -1446,6 +1455,15 @@ fn create_self_hosted_tts(config: TTSConfig) -> crate::core::tts::TTSResult<Box<
     )?))
 }
 
+/// The flat registry path carries no provider extras, so this always sends the default
+/// `api-version`. The Bud voice route goes through `create_tts_standard`, whose `azure_openai`
+/// arm reads the deployment's own from `extras.api_version`.
+fn create_azure_openai_tts(config: TTSConfig) -> crate::core::tts::TTSResult<Box<dyn BaseTTS>> {
+    Ok(Box::new(
+        crate::core::tts::self_hosted::SelfHostedTTS::new_azure_openai(config, None)?,
+    ))
+}
+
 fn create_deepgram_tts(config: TTSConfig) -> crate::core::tts::TTSResult<Box<dyn BaseTTS>> {
     Ok(Box::new(DeepgramTTS::new(config)?))
 }
@@ -1801,6 +1819,14 @@ inventory::submit! {
         .with_aliases(&["self-hosted", "waav_self_hosted", "openai_compatible"])
 }
 
+// Azure OpenAI audio (voice contract §3). Its own id, NOT an alias of `microsoft-azure` (Azure AI
+// Speech): budapp publishes `azure/speech/*` as `azure` and every other Azure audio model as
+// `azure_openai`. The same spellings as `core::tts::self_hosted::AZURE_OPENAI_NAMES`.
+inventory::submit! {
+    PluginConstructor::tts("azure_openai", azure_openai_tts_metadata, create_azure_openai_tts)
+        .with_aliases(&["azure-openai"])
+}
+
 inventory::submit! {
     PluginConstructor::tts("deepgram", deepgram_tts_metadata, create_deepgram_tts)
 }
@@ -2132,6 +2158,30 @@ mod tests {
                 "`{alias}` must expose provider metadata so it appears as selectable"
             );
         }
+    }
+
+    /// Azure OpenAI audio resolves under both spellings budapp and callers use, and stays a
+    /// separate provider from Azure AI Speech -- the two share a cloud, not an API.
+    #[test]
+    fn the_azure_openai_tts_provider_is_registered_apart_from_azure_speech() {
+        let registry = global_registry();
+
+        for alias in crate::core::tts::self_hosted::AZURE_OPENAI_NAMES {
+            assert!(
+                registry.has_tts_provider(alias),
+                "`{alias}` must resolve to the Azure OpenAI TTS provider"
+            );
+            assert_eq!(
+                registry.get_tts_metadata(alias).map(|m| m.name),
+                Some("azure_openai".to_string()),
+                "`{alias}` must name the Azure OpenAI provider"
+            );
+        }
+        assert_eq!(
+            registry.get_tts_metadata("azure").map(|m| m.name),
+            Some("microsoft-azure".to_string()),
+            "`azure` must stay Azure AI Speech"
+        );
     }
 
     #[test]

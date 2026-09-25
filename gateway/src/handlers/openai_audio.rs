@@ -196,6 +196,21 @@ pub async fn speech_handler(
         return translation_error(&e);
     }
 
+    // A Google deployment names a voice FAMILY (`chirp-3-hd`, `wavenet`…), but Google's API has
+    // no family parameter: the family is only in the voice name. With no voice, Google picks one
+    // by language from any family — usually Standard — so the deployment's choice was replaced
+    // and the request billed at the family's rate (Chirp 3 HD is ~7x Standard). A voice from
+    // another family does the same. Both are refused, naming the pattern the voice must follow.
+    if let Some(refusal) = google_family_refusal(
+        &endpoint.vendor,
+        endpoint.model.as_deref().unwrap_or_default(),
+        voice.as_deref(),
+        voice_origin,
+        &settings.endpoint,
+    ) {
+        return refusal;
+    }
+
     // Refuse a format the vendor cannot produce BEFORE spending a vendor call on it. The
     // alternative was raw samples served under the codec's content type, which nothing can play.
     if let Some(supported) = vendor_output_formats(&endpoint.vendor)
@@ -251,6 +266,10 @@ pub async fn speech_handler(
             ),
             None,
         );
+    }
+    if let Some(refusal) = endpoint_misconfiguration(&endpoint, &settings.endpoint, &mut advisories)
+    {
+        return refusal;
     }
 
     // FRD-018 M6. The field names are the attribute names budmetrics' VoiceTurnFact reads —
@@ -403,12 +422,13 @@ pub async fn speech_handler(
     if !settings.format.accepts_sample_rate() {
         tts_settings.sample_rate = None;
     }
-    let std_config = settings_map::standard_tts(
+    let mut std_config = settings_map::standard_tts(
         tts_config,
         &tts_settings,
         mapped_language.as_deref(),
         &mut advisories,
     );
+    std_config.extras.0.extend(deployment_extras(&endpoint));
 
     let synthesis =
         crate::handlers::speak::synthesize_once_standard(&state, std_config, &settings.text)
@@ -513,6 +533,12 @@ fn mark_turn_failed(span: &tracing::Span, message: &str) {
 /// a format is producible when `output_format_for` sends that codec, and `wav`/`pcm` are
 /// producible because the vendor returns PCM and this route supplies the RIFF header. A format
 /// the mapping sends as PCM — `aac`, `flac` — is one ElevenLabs does not have.
+///
+/// The same holds for Google, Azure, Cartesia and Speechmatics: each maps a format it has no
+/// codec for to its PCM (or WAV) default, and the route then served those bytes under the
+/// requested type — raw samples labelled `audio/aac`, a 16 kHz WAV labelled `audio/mpeg`. A
+/// format is producible when the vendor's own mapping lands on that codec. Deepgram and OpenAI
+/// produce all six and stay `None`.
 fn vendor_output_formats(vendor: &str) -> Option<Vec<AudioFormat>> {
     const ALL: [AudioFormat; 6] = [
         AudioFormat::Mp3,
@@ -537,8 +563,64 @@ fn vendor_output_formats(vendor: &str) -> Option<Vec<AudioFormat>> {
                 })
                 .collect(),
         ),
+        "google" | "google-tts" => Some(producible(&ALL, |f| {
+            use crate::core::tts::google::GoogleAudioEncoding as E;
+            matches!(
+                (f, E::from_format_string(f.as_waav_format())),
+                (AudioFormat::Mp3, E::Mp3)
+                    | (AudioFormat::Opus, E::OggOpus)
+                    | (AudioFormat::Wav | AudioFormat::Pcm, E::Linear16)
+            )
+        })),
+        "azure" | "microsoft-azure" | "microsoft_azure" => Some(producible(&ALL, |f| {
+            let sent = crate::core::tts::azure::AzureAudioEncoding::from_format_string(
+                f.as_waav_format(),
+                24000,
+            );
+            match f {
+                AudioFormat::Mp3 => sent.content_type() == "audio/mpeg",
+                AudioFormat::Opus => sent.content_type() == "audio/ogg",
+                AudioFormat::Wav | AudioFormat::Pcm => sent.content_type() == "audio/pcm",
+                AudioFormat::Aac => sent.content_type() == "audio/aac",
+                AudioFormat::Flac => sent.content_type() == "audio/flac",
+            }
+        })),
+        "cartesia" => Some(producible(&ALL, |f| {
+            use crate::core::tts::cartesia::{CartesiaAudioContainer as C, CartesiaOutputFormat};
+            matches!(
+                (
+                    f,
+                    CartesiaOutputFormat::from_format_string(f.as_waav_format(), 24000).container
+                ),
+                (AudioFormat::Mp3, C::Mp3)
+                    | (AudioFormat::Wav, C::Wav)
+                    | (AudioFormat::Pcm, C::Raw)
+            )
+        })),
+        // Polly: its own mapping decides mp3/opus/wav, but `pcm` is excluded by hand. Polly's PCM
+        // is 8 or 16 kHz only, and OpenAI's `pcm` is 24 kHz by definition — the samples would be
+        // played at the wrong speed. WAV carries its rate in the header, so it is fine at 16 kHz.
+        "aws-polly" | "aws_polly" | "amazon-polly" | "polly" => Some(producible(&ALL, |f| {
+            f != AudioFormat::Pcm
+                && crate::core::tts::aws_polly::PollyOutputFormat::from_requested(
+                    f.as_waav_format(),
+                )
+                .is_ok()
+        })),
+        // WAV only. Its one PCM output is 16 kHz, and OpenAI's `pcm` is 24 kHz by definition,
+        // which is why the mapping has no name for the route's `linear16`.
+        "speechmatics" => Some(producible(&ALL, |f| {
+            f.as_waav_format()
+                .parse::<crate::core::tts::speechmatics::SpeechmaticsOutputFormat>()
+                .is_ok()
+        })),
         _ => None,
     }
+}
+
+/// The formats in `all` a vendor's mapping says it produces.
+fn producible(all: &[AudioFormat], produces: impl Fn(AudioFormat) -> bool) -> Vec<AudioFormat> {
+    all.iter().copied().filter(|f| produces(*f)).collect()
 }
 
 /// Whether a vendor model refuses `optimize_streaming_latency` outright.
@@ -630,6 +712,225 @@ fn serve_as_requested(
             substituted: Some(other.as_format_str()),
         }),
     }
+}
+
+/// Vendor strings that mean Azure AI Speech (not Azure OpenAI).
+fn is_azure_speech(vendor: &str) -> bool {
+    matches!(vendor, "azure" | "microsoft-azure" | "microsoft_azure")
+}
+
+/// Vendor strings that mean an AWS speech service (SigV4: key pair + region).
+fn is_aws_vendor(vendor: &str) -> bool {
+    matches!(
+        vendor,
+        "aws-polly"
+            | "aws_polly"
+            | "amazon-polly"
+            | "polly"
+            | "aws-transcribe"
+            | "aws_transcribe"
+            | "amazon-transcribe"
+    )
+}
+
+/// A deployment's own vendor parameters, as the providers read them from `extras`.
+///
+/// Before, `extras` was always empty on this route, so everything a vendor takes only from there
+/// was unreachable for a Bud deployment: AWS keys and region (Polly and Transcribe fell back to the
+/// GATEWAY's identity in us-east-1), a Google project and location, the Azure Speech host, the
+/// Azure OpenAI api-version. Only the keys named here are copied — never `endpoint_override`,
+/// which is a destination for the vendor's credential.
+fn deployment_extras(
+    endpoint: &bud_auth::credentials::VoiceEndpoint,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut extras = serde_json::Map::new();
+    let mut put = |key: &str, value: Option<&str>| {
+        if let Some(value) = value.map(str::trim).filter(|v| !v.is_empty()) {
+            extras.insert(
+                key.to_string(),
+                serde_json::Value::String(value.to_string()),
+            );
+        }
+    };
+    let vendor = endpoint.vendor.as_str();
+    if is_aws_vendor(vendor) {
+        // budapp's packed key pair uses AWS's own names without the `aws_` prefix.
+        let part = |name: &str| {
+            endpoint
+                .credential_parts
+                .as_ref()
+                .and_then(|parts| parts.get(name))
+                .map(String::as_str)
+        };
+        put("aws_access_key_id", part("access_key_id"));
+        put("aws_secret_access_key", part("secret_access_key"));
+        put("aws_session_token", part("session_token"));
+        put("region", endpoint.provider_param("region"));
+    } else if matches!(vendor, "google" | "google-tts") {
+        put("project_id", endpoint.provider_param("project_id"));
+        put("location", endpoint.provider_param("location"));
+    } else if crate::core::tts::self_hosted::is_azure_openai(vendor) {
+        put(
+            crate::core::tts::self_hosted::AZURE_OPENAI_API_VERSION_EXTRA,
+            endpoint.provider_param("api_version"),
+        );
+    } else if is_azure_speech(vendor) {
+        // The host (a region, or the resource's custom domain), validated before this point. The
+        // STT client reads it from extras; the TTS side reads `TTSConfig.api_base`.
+        put(
+            crate::core::stt::azure::AZURE_STT_API_BASE_EXTRA,
+            endpoint.api_base.as_deref(),
+        );
+    }
+    extras
+}
+
+/// A deployment whose configuration cannot reach its vendor, refused before any vendor call.
+///
+/// The operator's to fix, not the caller's, so it is a 500 naming the endpoint — the same shape as
+/// a missing credential. Neither message repeats the configured value: an `api_base` or a
+/// credential can carry a secret.
+///
+/// * **Azure AI Speech** — `api_base` decides the host. Before, it was ignored and every request
+///   went to `eastus`, so a key from any other region was refused with a 401 naming neither Bud
+///   nor the endpoint. A value that is not an Azure Speech host is refused rather than falling
+///   back to `eastus`, which would send the key to the wrong resource.
+/// * **Google** — a Bud deployment's credential must be a service-account key. Anything else was
+///   read as a FILE PATH on the WaaV pod, or as "use the gateway's own identity" when empty.
+fn endpoint_misconfiguration(
+    endpoint: &bud_auth::credentials::VoiceEndpoint,
+    name: &str,
+    advisories: &mut Advisories,
+) -> Option<Response> {
+    let refuse = |why: String| {
+        Some(openai_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "api_error",
+            format!(
+                "Endpoint '{name}' is misconfigured for vendor '{}': {why}",
+                endpoint.vendor
+            ),
+            None,
+        ))
+    };
+    if is_azure_speech(&endpoint.vendor)
+        && let Some(api_base) = endpoint
+            .api_base
+            .as_deref()
+            .filter(|b| !b.trim().is_empty())
+    {
+        match crate::core::providers::azure::AzureSpeechEndpoint::from_api_base_with_note(api_base)
+        {
+            Ok((_, Some(note))) => advisories.warn(note),
+            Ok((_, None)) => {}
+            Err(why) => return refuse(why),
+        }
+    }
+    if is_aws_vendor(&endpoint.vendor) {
+        let has = |name: &str| {
+            endpoint
+                .credential_parts
+                .as_ref()
+                .and_then(|parts| parts.get(name))
+                .is_some_and(|v| !v.trim().is_empty())
+        };
+        if !(has("access_key_id") && has("secret_access_key")) {
+            return refuse(
+                "the credential must be an AWS access key pair; without it the request would \
+                 authenticate as the gateway's own AWS identity"
+                    .to_string(),
+            );
+        }
+        if endpoint.provider_param("region").is_none() {
+            return refuse("no AWS region is configured for the deployment".to_string());
+        }
+    }
+    if crate::core::tts::self_hosted::is_azure_openai(&endpoint.vendor)
+        && endpoint
+            .api_base
+            .as_deref()
+            .is_none_or(|b| b.trim().is_empty())
+    {
+        return refuse(
+            "no api_base is configured (the Azure OpenAI resource endpoint, \
+             https://<resource>.openai.azure.com)"
+                .to_string(),
+        );
+    }
+    if matches!(endpoint.vendor.as_str(), "google" | "google-tts")
+        && !crate::core::providers::google::is_service_account_json(
+            endpoint.credential.as_deref().unwrap_or_default(),
+        )
+    {
+        return refuse(
+            "the credential must be a Google service-account key (the JSON file downloaded for \
+             the service account); API keys and file paths are not accepted"
+                .to_string(),
+        );
+    }
+    None
+}
+
+/// The voice-name segment of a Google Text-to-Speech family, for a catalog family name.
+///
+/// Google names voices `<locale>-<Family>-<Name>` (`en-US-Chirp3-HD-Charon`, `en-US-Wavenet-A`).
+/// Source: https://docs.cloud.google.com/text-to-speech/docs/voices
+fn google_voice_family(model: &str) -> Option<&'static str> {
+    match model.trim().to_ascii_lowercase().as_str() {
+        "chirp-3-hd" | "chirp3-hd" => Some("Chirp3-HD"),
+        "wavenet" => Some("Wavenet"),
+        "neural2" => Some("Neural2"),
+        "studio" => Some("Studio"),
+        "polyglot" => Some("Polyglot"),
+        "standard" => Some("Standard"),
+        _ => None,
+    }
+}
+
+/// A 400 when a Google deployment's family cannot be honoured by the voice it would synthesise
+/// with; `None` otherwise (another vendor, no known family, or a voice of that family).
+fn google_family_refusal(
+    vendor: &str,
+    model: &str,
+    voice: Option<&str>,
+    origin: VoiceOrigin,
+    endpoint: &str,
+) -> Option<Response> {
+    if !matches!(vendor, "google" | "google-tts") {
+        return None;
+    }
+    let family = google_voice_family(model)?;
+    let pattern = format!("<locale>-{family}-<Name>, e.g. en-US-{family}-…");
+    let message = match voice {
+        None => format!(
+            "`voice` is required: deployment '{endpoint}' is Google's {model} family, which Google \
+             selects only through the voice name. Pass a voice named {pattern}, or set one in the \
+             deployment's audio settings."
+        ),
+        Some(v)
+            if v.to_ascii_lowercase()
+                .contains(&format!("-{}-", family.to_ascii_lowercase())) =>
+        {
+            return None;
+        }
+        Some(v) => {
+            let fix = match origin {
+                VoiceOrigin::Request => "pass a voice of that family in `voice`",
+                _ => "change the voice in the deployment's audio settings, or pass one in `voice`",
+            };
+            format!(
+                "voice '{v}' is not a {model} voice, and deployment '{endpoint}' is Google's \
+                 {model} family: Google would synthesise and bill it as a different family. \
+                 Voices of this family are named {pattern}; {fix}."
+            )
+        }
+    };
+    Some(openai_error(
+        StatusCode::BAD_REQUEST,
+        "invalid_request_error",
+        message,
+        Some("voice"),
+    ))
 }
 
 /// The deployment's model, as the vendor should receive it.
@@ -1241,14 +1542,23 @@ async fn transcription_inner(
     // decoding would impose WaaV's WAV-only limit on a backend that may well accept mp3, and
     // the settle heuristic exists only because streaming providers never say "done" -- an
     // HTTP backend answers once and is finished.
-    if crate::core::tts::self_hosted::is_self_hosted(&endpoint.vendor) {
+    //
+    // Azure OpenAI takes the same OpenAI multipart request at its own deployment URL, so it rides
+    // the same passthrough with Azure's URL shape and `api-key` header.
+    let azure_openai = crate::core::tts::self_hosted::is_azure_openai(&endpoint.vendor);
+    if azure_openai || crate::core::tts::self_hosted::is_self_hosted(&endpoint.vendor) {
         let Some(api_base) = endpoint.api_base.clone() else {
             return openai_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "api_error",
                 format!(
-                    "Endpoint '{}' is self-hosted but has no deployment URL configured",
-                    settings.endpoint
+                    "Endpoint '{}' is {} but has no deployment URL configured",
+                    settings.endpoint,
+                    if azure_openai {
+                        "an Azure OpenAI deployment"
+                    } else {
+                        "self-hosted"
+                    }
                 ),
                 None,
             );
@@ -1269,17 +1579,32 @@ async fn transcription_inner(
         // Measured before `file_bytes` is moved into the call below. Header read only: no
         // samples are allocated, so a long upload costs nothing to measure.
         let measured_secs = waav_openai_audio::pcm::wav_duration_secs(&file_bytes);
-        return match crate::handlers::transcribe::transcribe_self_hosted(
-            &api_base,
-            &api_key,
-            &endpoint.model.clone().unwrap_or_default(),
-            file_bytes,
-            &filename,
-            &settings,
-        )
-        .instrument(turn_span.clone())
-        .await
-        {
+        let deployment = endpoint.model.clone().unwrap_or_default();
+        let forwarded = if azure_openai {
+            crate::handlers::transcribe::transcribe_azure_openai(
+                &api_base,
+                &deployment,
+                endpoint.provider_param("api_version"),
+                &api_key,
+                file_bytes,
+                &filename,
+                &settings,
+            )
+            .instrument(turn_span.clone())
+            .await
+        } else {
+            crate::handlers::transcribe::transcribe_self_hosted(
+                &api_base,
+                &api_key,
+                &deployment,
+                file_bytes,
+                &filename,
+                &settings,
+            )
+            .instrument(turn_span.clone())
+            .await
+        };
+        return match forwarded {
             Ok(body) => {
                 turn_span.record(
                     voice_attrs::leg::STT_DURATION_MS,
@@ -1343,6 +1668,10 @@ async fn transcription_inner(
             ),
             None,
         );
+    }
+    if let Some(refusal) = endpoint_misconfiguration(&endpoint, &settings.endpoint, &mut advisories)
+    {
+        return refusal;
     }
 
     info!(
@@ -1429,6 +1758,7 @@ async fn transcription_inner(
         &endpoint.vendor,
         &mut advisories,
     );
+    std_config.extras.0.extend(deployment_extras(&endpoint));
 
     match crate::handlers::transcribe::transcribe_once_standard(
         &endpoint.vendor,
@@ -2086,6 +2416,39 @@ mod speech_error_tests {
         );
     }
 
+    /// Each vendor's own mapping decides, so a format it has no codec for is refused up front
+    /// instead of being served as PCM (or a 16 kHz WAV) under the requested content type.
+    #[test]
+    fn formats_a_vendor_cannot_produce_are_refused_up_front() {
+        use AudioFormat::*;
+        let formats = |v| super::vendor_output_formats(v).expect(v);
+        assert_eq!(
+            formats("google"),
+            vec![Mp3, Opus, Wav, Pcm],
+            "no AAC/FLAC encoding"
+        );
+        assert_eq!(
+            formats("azure"),
+            vec![Mp3, Opus, Wav, Pcm],
+            "no AAC/FLAC output"
+        );
+        assert_eq!(
+            formats("cartesia"),
+            vec![Mp3, Wav, Pcm],
+            "raw, wav and mp3 only"
+        );
+        assert_eq!(
+            formats("speechmatics"),
+            vec![Wav],
+            "16 kHz WAV is its only fit"
+        );
+        assert_eq!(
+            formats("aws-polly"),
+            vec![Mp3, Opus, Wav],
+            "no AAC/FLAC, and its PCM is 16 kHz, not OpenAI's 24 kHz"
+        );
+    }
+
     #[test]
     fn streaming_latency_is_dropped_only_where_it_was_measured_to_fail() {
         assert!(super::rejects_streaming_latency("elevenlabs", "eleven_v3"));
@@ -2174,6 +2537,44 @@ mod speech_error_tests {
         // No default is known for these, and guessing one would pick a voice nobody chose.
         assert_eq!(vendor_default_voice("aws-polly"), None);
         assert_eq!(vendor_default_voice("hume"), None);
+    }
+
+    /// A Google family is honoured only by a voice of that family: none, or one from another
+    /// family, is a 400 — Google would otherwise choose (and bill) a different family.
+    #[test]
+    fn a_google_family_needs_a_voice_of_that_family() {
+        use super::{VoiceOrigin, google_family_refusal};
+        let refused = |model, voice, origin| {
+            google_family_refusal("google", model, voice, origin, "ep").map(|r| r.status())
+        };
+        let bad = Some(StatusCode::BAD_REQUEST);
+        assert_eq!(refused("chirp-3-hd", None, VoiceOrigin::Vendor), bad);
+        assert_eq!(
+            refused("chirp-3-hd", Some("en-US-Standard-C"), VoiceOrigin::Request),
+            bad
+        );
+        assert_eq!(
+            refused("wavenet", Some("en-US-Neural2-A"), VoiceOrigin::Deployment),
+            bad
+        );
+        assert_eq!(
+            refused(
+                "chirp-3-hd",
+                Some("en-US-Chirp3-HD-Charon"),
+                VoiceOrigin::Request
+            ),
+            None
+        );
+        assert_eq!(
+            refused("wavenet", Some("de-DE-Wavenet-B"), VoiceOrigin::Request),
+            None
+        );
+        // No known family (empty or other): Google's own default applies.
+        assert_eq!(refused("", None, VoiceOrigin::Vendor), None);
+        // Other vendors are untouched.
+        assert!(
+            google_family_refusal("azure", "chirp-3-hd", None, VoiceOrigin::Vendor, "ep").is_none()
+        );
     }
 
     /// WaaV picks a voice only where the vendor cannot synthesise without one. Deepgram and
