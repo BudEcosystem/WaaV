@@ -1262,3 +1262,30 @@ fn test_from_standard_maps_advanced_features_to_wire() {
     assert_eq!(norm.entries[0].replace, "you are");
     assert!(!norm.entries[0].case_sensitive);
 }
+
+#[test]
+fn test_wire_unset_language_is_an_empty_list_not_an_empty_tag() {
+    // The upload route hands over an empty language when neither the request nor the deployment
+    // names one. `[""]` is a zero-length BCP-47 tag nobody chose; the empty list lets the
+    // recognizer's own default apply (or Google name the gap itself).
+    let config = GoogleSTTConfig {
+        base: STTConfig {
+            language: String::new(),
+            ..Default::default()
+        },
+        project_id: "p".into(),
+        ..Default::default()
+    };
+    assert!(rec_config_of(&config).language_codes.is_empty());
+
+    // A chosen language still reaches the wire unchanged.
+    let config = GoogleSTTConfig {
+        base: STTConfig {
+            language: "de-DE".to_string(),
+            ..Default::default()
+        },
+        project_id: "p".into(),
+        ..Default::default()
+    };
+    assert_eq!(rec_config_of(&config).language_codes, vec!["de-DE"]);
+}

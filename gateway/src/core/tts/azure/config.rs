@@ -60,6 +60,7 @@ pub const AZURE_TTS_URL: &str = "https://eastus.tts.speech.microsoft.com/cogniti
 /// - **Raw PCM**: Uncompressed audio for real-time streaming
 /// - **MP3**: Compressed audio for storage/bandwidth optimization
 /// - **Opus**: Low-latency compressed audio for real-time applications
+/// - **Ogg Opus**: Opus in an Ogg container (what the `opus` format string selects)
 ///
 /// # Example
 ///
@@ -119,6 +120,16 @@ pub enum AzureAudioEncoding {
     Audio24Khz16Bit24KbpsMonoOpus,
     /// 24kHz, 16-bit, 48kbps Opus mono
     Audio24Khz16Bit48KbpsMonoOpus,
+
+    // =========================================================================
+    // Ogg Opus Formats (Opus in an Ogg container)
+    // =========================================================================
+    /// 16kHz, 16-bit Opus mono in an Ogg container
+    Ogg16Khz16BitMonoOpus,
+    /// 24kHz, 16-bit Opus mono in an Ogg container
+    Ogg24Khz16BitMonoOpus,
+    /// 48kHz, 16-bit Opus mono in an Ogg container
+    Ogg48Khz16BitMonoOpus,
 }
 
 impl AzureAudioEncoding {
@@ -155,6 +166,10 @@ impl AzureAudioEncoding {
             Self::Audio16Khz16Bit32KbpsMonoOpus => "audio-16khz-16bit-32kbps-mono-opus",
             Self::Audio24Khz16Bit24KbpsMonoOpus => "audio-24khz-16bit-24kbps-mono-opus",
             Self::Audio24Khz16Bit48KbpsMonoOpus => "audio-24khz-16bit-48kbps-mono-opus",
+            // Ogg Opus formats
+            Self::Ogg16Khz16BitMonoOpus => "ogg-16khz-16bit-mono-opus",
+            Self::Ogg24Khz16BitMonoOpus => "ogg-24khz-16bit-mono-opus",
+            Self::Ogg48Khz16BitMonoOpus => "ogg-48khz-16bit-mono-opus",
         }
     }
 
@@ -179,7 +194,8 @@ impl AzureAudioEncoding {
             Self::Raw16Khz16BitMonoPcm
             | Self::Audio16Khz32KbitrateMonoMp3
             | Self::Audio16Khz64KbitrateMonoMp3
-            | Self::Audio16Khz16Bit32KbpsMonoOpus => 16000,
+            | Self::Audio16Khz16Bit32KbpsMonoOpus
+            | Self::Ogg16Khz16BitMonoOpus => 16000,
 
             Self::Raw22050Hz16BitMonoPcm => 22050,
 
@@ -187,13 +203,15 @@ impl AzureAudioEncoding {
             | Self::Audio24Khz48KbitrateMonoMp3
             | Self::Audio24Khz96KbitrateMonoMp3
             | Self::Audio24Khz16Bit24KbpsMonoOpus
-            | Self::Audio24Khz16Bit48KbpsMonoOpus => 24000,
+            | Self::Audio24Khz16Bit48KbpsMonoOpus
+            | Self::Ogg24Khz16BitMonoOpus => 24000,
 
             Self::Raw44100Hz16BitMonoPcm => 44100,
 
             Self::Raw48Khz16BitMonoPcm
             | Self::Audio48Khz96KbitrateMonoMp3
-            | Self::Audio48Khz192KbitrateMonoMp3 => 48000,
+            | Self::Audio48Khz192KbitrateMonoMp3
+            | Self::Ogg48Khz16BitMonoOpus => 48000,
         }
     }
 
@@ -269,6 +287,11 @@ impl AzureAudioEncoding {
             Self::Audio16Khz16Bit32KbpsMonoOpus
             | Self::Audio24Khz16Bit24KbpsMonoOpus
             | Self::Audio24Khz16Bit48KbpsMonoOpus => "audio/opus",
+            // Opus inside an Ogg container: the bytes start with `OggS`, which the TTS sniffer
+            // (`core::tts::sniff`) also labels `ogg`, so the declared and sniffed types agree.
+            Self::Ogg16Khz16BitMonoOpus
+            | Self::Ogg24Khz16BitMonoOpus
+            | Self::Ogg48Khz16BitMonoOpus => "audio/ogg",
         }
     }
 
@@ -279,7 +302,7 @@ impl AzureAudioEncoding {
     /// - "mp3" → MP3 format at specified sample rate
     /// - "mulaw", "ulaw" → `Raw8Khz8BitMonoMulaw`
     /// - "alaw" → `Raw8Khz8BitMonoAlaw`
-    /// - "opus" → Opus format at specified sample rate
+    /// - "opus" → Ogg Opus (`ogg-*-16bit-mono-opus`) at specified sample rate
     /// - Unknown formats default to `Raw24Khz16BitMonoPcm`
     ///
     /// # Arguments
@@ -337,11 +360,18 @@ impl AzureAudioEncoding {
         }
     }
 
-    /// Select the best Opus format for a given sample rate (using highest bitrate).
+    /// Select the Ogg Opus format for a given sample rate.
+    ///
+    /// WaaV's `opus` follows OpenAI's meaning: Opus in an Ogg container, which is what every
+    /// player and the OpenAI-compatible route expect. Azure's `audio-*-opus` formats are NOT that
+    /// (they carry no Ogg container), so a caller asking for `opus` got bytes nothing could play.
+    /// Azure's `ogg-{16,24,48}khz-16bit-mono-opus` output formats are the Ogg Opus ones.
+    /// Doc: https://learn.microsoft.com/azure/ai-services/speech-service/rest-text-to-speech#audio-outputs
     fn opus_for_sample_rate(sample_rate: u32) -> Self {
         match sample_rate {
-            0..=16000 => Self::Audio16Khz16Bit32KbpsMonoOpus,
-            _ => Self::Audio24Khz16Bit48KbpsMonoOpus,
+            0..=16000 => Self::Ogg16Khz16BitMonoOpus,
+            16001..=24000 => Self::Ogg24Khz16BitMonoOpus,
+            _ => Self::Ogg48Khz16BitMonoOpus,
         }
     }
 }
@@ -1140,14 +1170,27 @@ impl AzureTTSConfig {
         // Split by '-' and try to extract language-region
         let parts: Vec<&str> = voice_name.split('-').collect();
 
-        // Need at least 2 parts for language-region (e.g., "en-US")
+        // Need at least 2 parts for language-region (e.g., "en-US"). Match case-INSENSITIVELY:
+        // Azure documents lowercase-locale voice names too (e.g. the HD voice
+        // `de-de-Florian:DragonHDLatestNeural`), and requiring an uppercase region sent those as
+        // `xml:lang="en-US"` — a language the caller never chose, on a German voice. The result
+        // is normalised to BCP-47 `ll-RR` form (lowercase language, uppercase region). The
+        // language subtag must be 2-3 letters (`en`, `wuu`, `fil`) so an arbitrary custom-voice
+        // name is not mistaken for a locale.
         if parts.len() >= 2 {
             let first_part = parts[0];
             let second_part = parts[1];
 
-            // If second part looks like a region code (2 uppercase letters), combine them
-            if second_part.len() == 2 && second_part.chars().all(|c| c.is_ascii_uppercase()) {
-                return format!("{first_part}-{second_part}");
+            let is_language = (2..=3).contains(&first_part.len())
+                && first_part.chars().all(|c| c.is_ascii_alphabetic());
+            let is_region =
+                second_part.len() == 2 && second_part.chars().all(|c| c.is_ascii_alphabetic());
+            if is_language && is_region {
+                return format!(
+                    "{}-{}",
+                    first_part.to_ascii_lowercase(),
+                    second_part.to_ascii_uppercase()
+                );
             }
         }
 
@@ -1156,8 +1199,12 @@ impl AzureTTSConfig {
 
     /// Returns the voice name for the API request.
     ///
-    /// Checks `voice_id` first, falling back to `model` if `voice_id` is empty.
-    /// Returns a default voice if both are empty.
+    /// Returns `voice_id` when set, else `en-US-JennyNeural`. SSML requires a voice
+    /// (`<voice name='...'>` is mandatory on the `cognitiveservices/v1` endpoint), so a last-resort
+    /// default is kept. `model` is deliberately NOT a fallback: it carries a catalog family name
+    /// (e.g. `speech/azure-tts`), not an Azure voice, and emitting `<voice name='speech/azure-tts'>`
+    /// would silently replace the caller's choice with a voice Azure rejects (the Deepgram
+    /// `aura-2` bug class).
     ///
     /// # Example
     ///
@@ -1177,19 +1224,11 @@ impl AzureTTSConfig {
     pub fn voice_name(&self) -> &str {
         const DEFAULT_VOICE: &str = "en-US-JennyNeural";
 
-        // Check voice_id first
-        if let Some(voice_id) = &self.base.voice_id
-            && !voice_id.is_empty()
-        {
-            return voice_id;
+        // Only the caller's voice_id names a voice; no model fallback (see the doc comment).
+        match self.base.voice_id.as_deref() {
+            Some(voice_id) if !voice_id.is_empty() => voice_id,
+            _ => DEFAULT_VOICE,
         }
-
-        // Fall back to model
-        if !self.base.model.is_empty() {
-            return &self.base.model;
-        }
-
-        DEFAULT_VOICE
     }
 
     /// Builds the SSML document for a given text input.
@@ -1455,6 +1494,20 @@ mod tests {
             AzureAudioEncoding::Audio24Khz16Bit48KbpsMonoOpus.as_str(),
             "audio-24khz-16bit-48kbps-mono-opus"
         );
+
+        // Ogg Opus formats
+        assert_eq!(
+            AzureAudioEncoding::Ogg16Khz16BitMonoOpus.as_str(),
+            "ogg-16khz-16bit-mono-opus"
+        );
+        assert_eq!(
+            AzureAudioEncoding::Ogg24Khz16BitMonoOpus.as_str(),
+            "ogg-24khz-16bit-mono-opus"
+        );
+        assert_eq!(
+            AzureAudioEncoding::Ogg48Khz16BitMonoOpus.as_str(),
+            "ogg-48khz-16bit-mono-opus"
+        );
     }
 
     #[test]
@@ -1579,6 +1632,25 @@ mod tests {
             AzureAudioEncoding::Audio24Khz16Bit48KbpsMonoOpus.content_type(),
             "audio/opus"
         );
+
+        // Ogg Opus formats are an Ogg container
+        assert_eq!(
+            AzureAudioEncoding::Ogg24Khz16BitMonoOpus.content_type(),
+            "audio/ogg"
+        );
+        assert!(!AzureAudioEncoding::Ogg24Khz16BitMonoOpus.is_pcm());
+        assert_eq!(
+            AzureAudioEncoding::Ogg16Khz16BitMonoOpus.sample_rate(),
+            16000
+        );
+        assert_eq!(
+            AzureAudioEncoding::Ogg24Khz16BitMonoOpus.sample_rate(),
+            24000
+        );
+        assert_eq!(
+            AzureAudioEncoding::Ogg48Khz16BitMonoOpus.sample_rate(),
+            48000
+        );
     }
 
     #[test]
@@ -1637,14 +1709,23 @@ mod tests {
             AzureAudioEncoding::Raw8Khz8BitMonoAlaw
         );
 
-        // Opus formats
+        // Opus → Ogg Opus (OpenAI's `opus` is Opus in an Ogg container). Azure's `audio-*-opus`
+        // formats carry no Ogg container, so they must not be selected for `opus`.
         assert_eq!(
             AzureAudioEncoding::from_format_string("opus", 24000),
-            AzureAudioEncoding::Audio24Khz16Bit48KbpsMonoOpus
+            AzureAudioEncoding::Ogg24Khz16BitMonoOpus
+        );
+        assert_eq!(
+            AzureAudioEncoding::from_format_string("opus", 24000).as_str(),
+            "ogg-24khz-16bit-mono-opus"
         );
         assert_eq!(
             AzureAudioEncoding::from_format_string("opus", 16000),
-            AzureAudioEncoding::Audio16Khz16Bit32KbpsMonoOpus
+            AzureAudioEncoding::Ogg16Khz16BitMonoOpus
+        );
+        assert_eq!(
+            AzureAudioEncoding::from_format_string("OPUS", 48000),
+            AzureAudioEncoding::Ogg48Khz16BitMonoOpus
         );
 
         // Unknown format defaults
@@ -2258,6 +2339,43 @@ mod tests {
         assert_eq!(config.language_code(), "en-US");
     }
 
+    // Azure documents lowercase-locale voice names (the DragonHD voices). Their locale must be
+    // derived case-insensitively and normalised to `ll-RR`, not replaced by `en-US`.
+    #[test]
+    fn test_azure_tts_config_language_code_is_case_insensitive() {
+        let lang_for = |voice: &str| {
+            AzureTTSConfig {
+                base: TTSConfig {
+                    voice_id: Some(voice.to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+            .language_code()
+        };
+        assert_eq!(lang_for("de-de-Florian:DragonHDLatestNeural"), "de-DE");
+        assert_eq!(lang_for("en-us-Ava:DragonHDLatestNeural"), "en-US");
+        assert_eq!(lang_for("EN-gb-SoniaNeural"), "en-GB");
+        // 3-letter language subtags still work.
+        assert_eq!(lang_for("wuu-CN-XiaotongNeural"), "wuu-CN");
+        // A non-locale prefix is not mistaken for a locale.
+        assert_eq!(lang_for("my-custom-voice"), "en-US");
+        assert_eq!(lang_for("x1-ab-Voice"), "en-US");
+
+        // And the SSML carries the derived locale, not en-US.
+        let config = AzureTTSConfig {
+            base: TTSConfig {
+                voice_id: Some("de-de-Florian:DragonHDLatestNeural".to_string()),
+                ..Default::default()
+            },
+            use_ssml: true,
+            ..Default::default()
+        };
+        let ssml = config.build_ssml_for_text("Hallo");
+        assert!(ssml.contains("de-DE"), "{ssml}");
+        assert!(!ssml.contains("en-US"), "{ssml}");
+    }
+
     #[test]
     fn test_azure_tts_config_voice_name() {
         // Has voice_id
@@ -2271,27 +2389,35 @@ mod tests {
         };
         assert_eq!(config.voice_name(), "en-US-JennyNeural");
 
-        // Empty voice_id falls back to model
+        // Empty voice_id does NOT fall back to model (a catalog family name, not a voice):
+        // SSML requires a voice, so the documented last-resort default is used instead.
         let config = AzureTTSConfig {
             base: TTSConfig {
                 voice_id: Some(String::new()),
-                model: "en-US-AriaNeural".to_string(),
+                model: "speech/azure-tts".to_string(),
                 ..Default::default()
             },
             ..Default::default()
         };
-        assert_eq!(config.voice_name(), "en-US-AriaNeural");
+        assert_eq!(config.voice_name(), "en-US-JennyNeural");
 
-        // None voice_id falls back to model
+        // Same for a missing voice_id.
         let config = AzureTTSConfig {
             base: TTSConfig {
                 voice_id: None,
-                model: "en-US-AriaNeural".to_string(),
+                model: "speech/azure-tts".to_string(),
                 ..Default::default()
             },
+            use_ssml: true,
             ..Default::default()
         };
-        assert_eq!(config.voice_name(), "en-US-AriaNeural");
+        assert_eq!(config.voice_name(), "en-US-JennyNeural");
+        let ssml = config.build_ssml_for_text("hi");
+        assert!(
+            !ssml.contains("speech/azure-tts"),
+            "model leaked into <voice name>: {ssml}"
+        );
+        assert!(ssml.contains("en-US-JennyNeural"), "{ssml}");
 
         // Both empty defaults to JennyNeural
         let config = AzureTTSConfig {

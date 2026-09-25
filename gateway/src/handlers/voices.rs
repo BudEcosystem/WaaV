@@ -719,6 +719,27 @@ pub async fn list_voices(
 /// every session that uses a [`crate::core::voice::VoiceDescriptor`].
 const VOICE_CATALOG_CACHE_TTL_SECS: u64 = 600;
 
+/// Whether a vendor's synthesis API REQUIRES a voice.
+///
+/// Only then does `/v1/audio/speech` pick one for a request that names none. Where the voice is
+/// optional the parameter is left off and the vendor applies its own default, so the voice is
+/// one the vendor chose rather than one WaaV did:
+///
+/// * Deepgram has no voice parameter; the voice is the optional `model` (its docs: "optional,
+///   default: aura-asteria-en").
+/// * Google's `voice.name` is optional; Google picks from `languageCode`, which WaaV always sends.
+///
+/// Every other vendor is treated as requiring one — ElevenLabs (a path segment), Cartesia,
+/// OpenAI, Azure (the SSML `<voice>`), Polly (`VoiceId`) and Speechmatics (a path segment) all
+/// do — so a vendor not listed keeps its previous behaviour: its default, or a 400 naming the
+/// missing voice.
+pub(crate) fn voice_required(provider: &str) -> bool {
+    !matches!(
+        provider.to_lowercase().as_str(),
+        "deepgram" | "google" | "google-tts"
+    )
+}
+
 /// The provider's DEFAULT `voice_id`, returned by descriptor resolution when no
 /// catalog voice matches (the hard "never a 400" requirement). These mirror each
 /// provider's documented default voice.

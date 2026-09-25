@@ -1145,8 +1145,8 @@ mod tests {
         let tts = HumeTTS::default();
         assert!(!tts.is_ready());
         assert_eq!(tts.hume_config().base.api_key, "");
-        // Default TTSConfig has voice_id "aura-asteria-en" which is parsed as custom voice
-        // The voice_name will be whatever the base config provides
+        // Default TTSConfig names no voice (it used to carry Deepgram's "aura-asteria-en", which
+        // Hume took as a custom voice name); Hume's own default voice is used.
         assert!(!tts.hume_config().voice_name().is_empty());
     }
 

@@ -477,19 +477,25 @@ impl DeepgramSTT {
         };
 
         url.push_str(endpoint);
-        // An omitted/empty model maps to Deepgram's recommended default (the
-        // WS-config contract: "each provider maps an empty model to its
-        // recommended default"). Emitting a literal `model=` empty param makes
-        // Deepgram reject the handshake with a misleading 401.
-        url.push_str("/v1/listen?model=");
-        if config.base.model.is_empty() {
-            url.push_str("nova-2");
-        } else {
-            url.push_str(&encode_query_value(&config.base.model));
+        url.push_str("/v1/listen?");
+        // Vendor contract: `model` and `language` are both OPTIONAL on `/v1/listen`, and Deepgram
+        // applies its own default when either is absent. So an unset value is OMITTED — never
+        // sent empty (a literal `model=` makes Deepgram reject the handshake with a misleading
+        // 401, and `language=` names no language at all) and never replaced by a value nobody
+        // chose (an empty model used to become `nova-2`).
+        let model = config.base.model.trim();
+        if !model.is_empty() {
+            url.push_str("model=");
+            url.push_str(&encode_query_value(model));
+            url.push('&');
         }
-        url.push_str("&language=");
-        url.push_str(&encode_query_value(&config.base.language));
-        url.push_str("&sample_rate=");
+        let language = config.base.language.trim();
+        if !language.is_empty() {
+            url.push_str("language=");
+            url.push_str(&encode_query_value(language));
+            url.push('&');
+        }
+        url.push_str("sample_rate=");
         url.push_str(&config.base.sample_rate.to_string());
         url.push_str("&channels=");
         url.push_str(&config.base.channels.to_string());
@@ -1641,6 +1647,37 @@ mod tests {
             !url.contains("encoding=linear16&punctuate=false"),
             "encoding must be encoded as one query value: {url}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_deepgram_unset_model_and_language_are_omitted_not_defaulted() {
+        // Both are optional on `/v1/listen`. An unset one used to become `model=nova-2` (a model
+        // nobody chose) and `language=` (an empty value); the vendor's own default is the only
+        // correct answer to "nobody said".
+        let stt = DeepgramSTT::default();
+        let config = DeepgramSTTConfig {
+            base: STTConfig {
+                model: String::new(),
+                provider: "deepgram".to_string(),
+                api_key: "test_key".to_string(),
+                language: String::new(),
+                sample_rate: 16000,
+                channels: 1,
+                punctuation: true,
+                encoding: "linear16".to_string(),
+            },
+            ..Default::default()
+        };
+
+        let url = stt.build_websocket_url(&config).unwrap();
+        let parsed = url::Url::parse(&url).unwrap();
+        let keys: Vec<String> = parsed.query_pairs().map(|(k, _)| k.into_owned()).collect();
+        assert!(!keys.iter().any(|k| k == "model"), "url: {url}");
+        assert!(!keys.iter().any(|k| k == "language"), "url: {url}");
+        assert!(!url.contains("nova-2"), "url: {url}");
+        // The query string is still well-formed: no `?&`, and the required audio params remain.
+        assert!(url.contains("/v1/listen?sample_rate=16000&"), "url: {url}");
+        assert!(keys.iter().any(|k| k == "encoding"), "url: {url}");
     }
 
     #[tokio::test]

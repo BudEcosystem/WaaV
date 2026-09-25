@@ -423,39 +423,38 @@ impl AwsTranscribeSTT {
     }
 
     /// Convert language code string to AWS SDK LanguageCode.
+    ///
+    /// Vendor contract: in single-language mode `LanguageCode` is REQUIRED on
+    /// `StartStreamTranscription`, so an unset language falls back to `en-US` — for EMPTY only. A
+    /// chosen code is normalised to AWS's `ll-RR` spelling (`en_us` / `EN-US` → `en-US`) and
+    /// handed to the SDK's own parser: a code the SDK knows becomes its variant, and one it does
+    /// not rides as `LanguageCode::Unknown`, for AWS to validate and name in its error. Every code
+    /// outside a 22-entry table used to become `en-US` with a log line — transcribing, say, Welsh
+    /// audio as English.
     fn convert_language_code(language: &str) -> Option<LanguageCode> {
-        // Map common language codes to AWS SDK enum variants
-        match language.to_lowercase().as_str() {
-            "en-us" | "en_us" => Some(LanguageCode::EnUs),
-            "en-gb" | "en_gb" => Some(LanguageCode::EnGb),
-            "en-au" | "en_au" => Some(LanguageCode::EnAu),
-            "es-us" | "es_us" => Some(LanguageCode::EsUs),
-            "es-es" | "es_es" => Some(LanguageCode::EsEs),
-            "fr-fr" | "fr_fr" => Some(LanguageCode::FrFr),
-            "fr-ca" | "fr_ca" => Some(LanguageCode::FrCa),
-            "de-de" | "de_de" => Some(LanguageCode::DeDe),
-            "it-it" | "it_it" => Some(LanguageCode::ItIt),
-            "pt-br" | "pt_br" => Some(LanguageCode::PtBr),
-            "pt-pt" | "pt_pt" => Some(LanguageCode::PtPt),
-            "ja-jp" | "ja_jp" => Some(LanguageCode::JaJp),
-            "ko-kr" | "ko_kr" => Some(LanguageCode::KoKr),
-            "zh-cn" | "zh_cn" => Some(LanguageCode::ZhCn),
-            "hi-in" | "hi_in" => Some(LanguageCode::HiIn),
-            "ar-sa" | "ar_sa" => Some(LanguageCode::ArSa),
-            "ru-ru" | "ru_ru" => Some(LanguageCode::RuRu),
-            "nl-nl" | "nl_nl" => Some(LanguageCode::NlNl),
-            "sv-se" | "sv_se" => Some(LanguageCode::SvSe),
-            "th-th" | "th_th" => Some(LanguageCode::ThTh),
-            "tr-tr" | "tr_tr" => Some(LanguageCode::TrTr),
-            "vi-vn" | "vi_vn" => Some(LanguageCode::ViVn),
-            _ => {
-                // For unsupported codes, default to en-US with a warning
-                warn!(
-                    "Unsupported language code '{}', defaulting to en-US",
-                    language
-                );
-                Some(LanguageCode::EnUs)
+        let language = language.trim();
+        if language.is_empty() {
+            return Some(LanguageCode::EnUs);
+        }
+        Some(LanguageCode::from(
+            Self::normalize_language_code(language).as_str(),
+        ))
+    }
+
+    /// `en_us` / `EN-US` / `en-us` → `en-US`: AWS spells every Transcribe code as a lowercase
+    /// language and an uppercase region, and the SDK's parser matches that spelling exactly. A
+    /// value without exactly one separator is passed through as written.
+    fn normalize_language_code(language: &str) -> String {
+        let mut parts = language.split(['-', '_']);
+        match (parts.next(), parts.next(), parts.next()) {
+            (Some(lang), Some(region), None) if !lang.is_empty() && !region.is_empty() => {
+                format!(
+                    "{}-{}",
+                    lang.to_ascii_lowercase(),
+                    region.to_ascii_uppercase()
+                )
             }
+            _ => language.to_string(),
         }
     }
 
@@ -1213,11 +1212,41 @@ mod tests {
             AwsTranscribeSTT::convert_language_code("ja-JP"),
             Some(LanguageCode::JaJp)
         );
-        // Unknown code should default to en-US
         assert_eq!(
-            AwsTranscribeSTT::convert_language_code("unknown"),
+            AwsTranscribeSTT::convert_language_code("en_gb"),
+            Some(LanguageCode::EnGb)
+        );
+        // Codes outside the old 22-entry table resolve through the SDK instead of becoming en-US.
+        assert_eq!(
+            AwsTranscribeSTT::convert_language_code("cy-wl"),
+            Some(LanguageCode::CyWl)
+        );
+        assert_eq!(
+            AwsTranscribeSTT::convert_language_code("zh-TW"),
+            Some(LanguageCode::ZhTw)
+        );
+        // Unset: `LanguageCode` is required in single-language mode, so the default applies —
+        // for empty only.
+        assert_eq!(
+            AwsTranscribeSTT::convert_language_code(""),
             Some(LanguageCode::EnUs)
         );
+        assert_eq!(
+            AwsTranscribeSTT::convert_language_code("   "),
+            Some(LanguageCode::EnUs)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unknown_language_code_is_passed_through_not_replaced_with_en_us() {
+        // A code the SDK does not know rides as `Unknown` for AWS to validate and name. It used to
+        // become en-US silently, transcribing the audio as English.
+        for (given, sent) in [("unknown", "unknown"), ("xx-yy", "xx-YY")] {
+            let code = AwsTranscribeSTT::convert_language_code(given).unwrap();
+            assert_ne!(code, LanguageCode::EnUs, "{given}");
+            assert_eq!(code.as_str(), sent, "{given}");
+            assert!(!LanguageCode::values().contains(&sent), "{given}");
+        }
     }
 
     #[tokio::test]
@@ -1271,6 +1300,31 @@ mod tests {
         };
         let cfg = AwsTranscribeSTTConfig::from_standard(&std);
         AwsTranscribeSTT::apply_request_params(&cfg, StartStreamTranscriptionInput::builder())
+    }
+
+    /// LanguageCode → x-amzn-transcribe-language-code: required in single-language mode, so an
+    /// unset language gets en-US; a chosen one is never replaced by it.
+    #[test]
+    fn language_code_reaches_the_request_and_defaults_only_when_unset() {
+        let language_code_for = |language: &str| {
+            let std = StandardSTTConfig::from_base(STTConfig {
+                provider: "aws-transcribe".into(),
+                language: language.into(),
+                encoding: "pcm".into(),
+                model: String::new(),
+                ..Default::default()
+            });
+            let cfg = AwsTranscribeSTTConfig::from_standard(&std);
+            AwsTranscribeSTT::apply_request_params(&cfg, StartStreamTranscriptionInput::builder())
+                .get_language_code()
+                .clone()
+        };
+        assert_eq!(language_code_for(""), Some(LanguageCode::EnUs));
+        assert_eq!(language_code_for("de-CH"), Some(LanguageCode::DeCh));
+        assert_eq!(
+            language_code_for("xx-YY").map(|c| c.as_str().to_string()),
+            Some("xx-YY".to_string())
+        );
     }
 
     /// LanguageOptions (extras) → x-amzn-transcribe-language-options. Accepts list OR csv string.

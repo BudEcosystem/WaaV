@@ -138,15 +138,18 @@ impl CartesiaRequestBuilder {
     /// Determines the language code for the request.
     ///
     /// Uses the standardized `language` override (`CartesiaTTSConfig::language`, populated from
-    /// `TtsFeatures::language`) when present, otherwise defaults to "en". Sent as the top-level
-    /// `language` field of the `/tts/bytes` body.
+    /// `TtsFeatures::language`) when present. Sent as the top-level `language` field of the
+    /// `/tts/bytes` body.
+    ///
+    /// Returns `None` when no language was chosen, and the field is then OMITTED: Cartesia's
+    /// `language` is optional/nullable, so the vendor applies its own default. Injecting "en"
+    /// here sent a language nobody chose (and, on a non-English voice, the wrong one).
     #[inline]
-    fn get_language(&self) -> &str {
+    fn get_language(&self) -> Option<&str> {
         self.cartesia_config
             .language
             .as_deref()
             .filter(|s| !s.is_empty())
-            .unwrap_or("en")
     }
 }
 
@@ -173,7 +176,7 @@ impl TTSRequestBuilder for CartesiaRequestBuilder {
     ///   "transcript": "Hello, world!",
     ///   "voice": { "mode": "id", "id": "uuid" },
     ///   "output_format": { ... },
-    ///   "language": "en"
+    ///   "language": "en"   // only when a language was chosen; omitted otherwise
     /// }
     /// ```
     ///
@@ -189,15 +192,16 @@ impl TTSRequestBuilder for CartesiaRequestBuilder {
 
         // Pass speaking_rate as speed (Cartesia API parameter)
         if let Some(rate) = self.config.speaking_rate {
-            // sonic-3 / sonic-turbo only accept generation_config.speed in [0.6, 2.0];
-            // out-of-range values are rejected by the API, so clamp (with a warning)
-            // rather than failing the synth request.
+            // sonic-3 / sonic-turbo only accept generation_config.speed in [0.6, 1.5]
+            // (Cartesia's GenerationConfig docs; 1.0 = normal). The upper bound was 2.0, which
+            // let an out-of-range speed reach the API. Out-of-range values are rejected by the
+            // API, so clamp (with a warning) rather than failing the synth request.
             let model = &self.cartesia_config.model;
             let rate = if model.contains("sonic-3") || model.contains("sonic-turbo") {
-                let clamped = rate.clamp(0.6, 2.0);
+                let clamped = rate.clamp(0.6, 1.5);
                 if clamped != rate {
                     warn!(
-                        "Cartesia speed {rate} out of range for model {model}; clamped to {clamped} (allowed 0.6..=2.0)"
+                        "Cartesia speed {rate} out of range for model {model}; clamped to {clamped} (allowed 0.6..=1.5)"
                     );
                 }
                 clamped
@@ -232,9 +236,14 @@ impl TTSRequestBuilder for CartesiaRequestBuilder {
             "model_id": &self.cartesia_config.model,
             "transcript": text,
             "voice": self.build_voice_json(),
-            "output_format": self.cartesia_config.build_output_format_json(),
-            "language": self.get_language()
+            "output_format": self.cartesia_config.build_output_format_json()
         });
+
+        // Optional top-level `language`: sent only when chosen; omitted (not `null`, not "en")
+        // otherwise, so Cartesia applies its own default.
+        if let Some(language) = self.get_language() {
+            body["language"] = json!(language);
+        }
 
         // Optional custom pronunciation dictionary (top-level body field).
         if let Some(ref dict_id) = self.cartesia_config.pronunciation_dict_id {
@@ -887,7 +896,7 @@ mod tests {
         );
     }
 
-    // WIRE-LEVEL: sonic-3 / sonic-turbo only accept generation_config.speed in [0.6, 2.0], so an
+    // WIRE-LEVEL: sonic-3 / sonic-turbo only accept generation_config.speed in [0.6, 1.5], so an
     // out-of-range speaking_rate must be clamped (exercising the warn! path) instead of being
     // sent verbatim and rejected by the API.
     #[test]
@@ -907,6 +916,29 @@ mod tests {
             (speed - 0.6).abs() < 0.001,
             "speed not clamped to 0.6: {body_json}"
         );
+    }
+
+    // WIRE-LEVEL: the sonic-3 upper bound is 1.5 (Cartesia GenerationConfig.speed), not 2.0 — a
+    // speed of 1.8 was previously sent verbatim and rejected by the API.
+    #[test]
+    fn build_http_request_clamps_speed_above_sonic_maximum() {
+        for (requested, expected) in [(1.8_f32, 1.5_f64), (2.0, 1.5), (1.5, 1.5), (1.4, 1.4)] {
+            let mut config = create_test_config();
+            config.speaking_rate = Some(requested);
+            let cartesia_config = CartesiaTTSConfig::from_base(config.clone());
+            assert_eq!(cartesia_config.model, "sonic-3");
+            let builder = CartesiaRequestBuilder::new(config, cartesia_config);
+
+            let client = reqwest::Client::new();
+            let request = builder.build_http_request(&client, "Hi").build().unwrap();
+            let body = request.body().unwrap().as_bytes().unwrap();
+            let body_json: serde_json::Value = serde_json::from_slice(body).unwrap();
+            let speed = body_json["generation_config"]["speed"].as_f64().unwrap();
+            assert!(
+                (speed - expected).abs() < 0.001,
+                "speed {requested} should be sent as {expected}: {body_json}"
+            );
+        }
     }
 
     // Non-sonic-3/turbo models keep the caller's speed untouched (no clamp applied).
@@ -965,8 +997,9 @@ mod tests {
         );
     }
 
-    // Negative wire assertion: with no language/volume/dict configured, the default "en" is sent
-    // and no pronunciation_dict_id / volume appears.
+    // Negative wire assertion: with no language/volume/dict configured, NO `language` is sent
+    // (Cartesia's `language` is optional/nullable — the vendor applies its own default rather
+    // than WaaV injecting "en") and no pronunciation_dict_id / volume appears.
     #[test]
     fn build_http_request_defaults_omit_new_fields() {
         let config = create_test_config();
@@ -978,7 +1011,10 @@ mod tests {
         let body = request.body().unwrap().as_bytes().unwrap();
         let body_json: serde_json::Value = serde_json::from_slice(body).unwrap();
 
-        assert_eq!(body_json["language"], "en");
+        assert!(
+            body_json.get("language").is_none(),
+            "language injected when none was chosen: {body_json}"
+        );
         assert!(body_json.get("pronunciation_dict_id").is_none());
         // No generation_config emitted at all when nothing prosody-related is set.
         assert!(body_json.get("generation_config").is_none());
@@ -1228,8 +1264,21 @@ mod tests {
         assert_eq!(body_json["output_format"]["encoding"], "pcm_s16le");
         assert_eq!(body_json["output_format"]["sample_rate"], 24000);
 
-        // Verify language
-        assert_eq!(body_json["language"], "en");
+        // Verify language: none was configured, so the optional field is omitted (not "en").
+        assert!(body_json.get("language").is_none(), "{body_json}");
+
+        // A chosen language is sent verbatim.
+        let config = create_test_config();
+        let mut cartesia_config = CartesiaTTSConfig::from_base(config.clone());
+        cartesia_config.language = Some("de".to_string());
+        let builder = CartesiaRequestBuilder::new(config, cartesia_config);
+        let request = builder
+            .build_http_request(&client, "Hallo")
+            .build()
+            .unwrap();
+        let body_json: serde_json::Value =
+            serde_json::from_slice(request.body().unwrap().as_bytes().unwrap()).unwrap();
+        assert_eq!(body_json["language"], "de");
     }
 
     #[test]

@@ -433,7 +433,7 @@ fn test_google_tts_speaking_rate_clamping() {
     );
     assert_eq!(config.speaking_rate(), Some(0.25));
 
-    // Above maximum (4.0)
+    // Above maximum (2.0, Google's documented range [0.25, 2.0])
     let config = GoogleTTSConfig::from_base_config(
         TTSConfig {
             speaking_rate: Some(10.0),
@@ -441,7 +441,7 @@ fn test_google_tts_speaking_rate_clamping() {
         },
         "test".to_string(),
     );
-    assert_eq!(config.speaking_rate(), Some(4.0));
+    assert_eq!(config.speaking_rate(), Some(2.0));
 }
 
 // ============================================================================

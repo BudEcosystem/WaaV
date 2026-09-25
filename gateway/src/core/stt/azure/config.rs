@@ -241,6 +241,24 @@ impl Default for AzureSTTConfig {
 }
 
 impl AzureSTTConfig {
+    /// The recognition language Azure requires when none was chosen.
+    pub const DEFAULT_LANGUAGE: &'static str = "en-US";
+
+    /// The language sent on the connect URL.
+    ///
+    /// Vendor contract: Azure's `language` is REQUIRED — an empty `language=` is a 400. So an
+    /// unset language (the upload route hands over an empty one when neither the request nor the
+    /// deployment names a language) falls back to [`Self::DEFAULT_LANGUAGE`]. That fallback applies
+    /// ONLY to empty: a chosen language is sent as chosen, for Azure to accept or name in its error.
+    pub fn effective_language(&self) -> &str {
+        let language = self.base.language.trim();
+        if language.is_empty() {
+            Self::DEFAULT_LANGUAGE
+        } else {
+            language
+        }
+    }
+
     /// Build the complete WebSocket URL with all query parameters.
     ///
     /// Constructs the full WebSocket URL for connecting to Azure Speech Service,
@@ -275,7 +293,7 @@ impl AzureSTTConfig {
             None => self.region.stt_websocket_base_url().to_string(),
         };
 
-        let language = encode_query_value(&self.base.language);
+        let language = encode_query_value(self.effective_language());
 
         // Start with the base path and required parameters
         let mut url = format!(
@@ -930,6 +948,43 @@ mod tests {
                 .iter()
                 .any(|(key, value)| key == "languages" && value == "en-US,es-ES&cid=evil")
         );
+    }
+
+    fn language_on_wire(config: &AzureSTTConfig) -> Vec<String> {
+        let url = config.build_websocket_url();
+        url::Url::parse(&url)
+            .expect("Azure STT websocket URL should parse")
+            .query_pairs()
+            .filter(|(key, _)| key == "language")
+            .map(|(_, value)| value.into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn test_azure_stt_unset_language_falls_back_to_the_required_default() {
+        // Azure requires `language` (an empty `language=` is a 400). The upload route hands over
+        // an empty language when neither the request nor the deployment names one, so the
+        // required default applies — for empty only.
+        let config = AzureSTTConfig {
+            base: STTConfig {
+                language: String::new(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(language_on_wire(&config), vec!["en-US"]);
+    }
+
+    #[test]
+    fn test_azure_stt_chosen_language_is_never_replaced() {
+        let config = AzureSTTConfig {
+            base: STTConfig {
+                language: "de-DE".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(language_on_wire(&config), vec!["de-DE"]);
     }
 
     // =========================================================================

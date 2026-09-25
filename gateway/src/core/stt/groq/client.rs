@@ -503,7 +503,8 @@ impl GroqSTT {
         let buffer_size = self.audio_buffer.len();
         info!(
             "Sending {} bytes of audio to Groq Whisper API (model: {})",
-            buffer_size, config.model
+            buffer_size,
+            config.wire_model()
         );
 
         // Check file size limit

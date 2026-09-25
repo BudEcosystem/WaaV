@@ -357,15 +357,17 @@ pub fn build_deepgram_prerecorded_with(
     let mut warnings = Vec::new();
     let mut qs: Vec<(String, String)> = Vec::new();
 
-    // Model (empty → Deepgram default nova-2, mirroring the streaming contract).
-    let model = if std.base.model.is_empty() {
-        "nova-2"
-    } else {
-        std.base.model.as_str()
-    };
-    qs.push(("model".into(), model.into()));
-    if !std.base.language.is_empty() && std.base.language != "auto" {
-        qs.push(("language".into(), std.base.language.clone()));
+    // Vendor contract: `model` and `language` are both OPTIONAL on `/v1/listen`; Deepgram applies
+    // its own default when either is absent. An unset value is therefore omitted rather than
+    // replaced by one nobody chose (an empty model used to become `nova-2`), mirroring the
+    // streaming client.
+    let model = std.base.model.trim();
+    if !model.is_empty() {
+        qs.push(("model".into(), model.to_string()));
+    }
+    let language = std.base.language.trim();
+    if !language.is_empty() && language != "auto" {
+        qs.push(("language".into(), language.to_string()));
     }
     qs.push(("punctuate".into(), std.base.punctuation.to_string()));
 
@@ -484,6 +486,22 @@ pub fn build_deepgram_prerecorded_with(
     })
 }
 
+/// The token the shared language mapper emits for AssemblyAI when the canonical language is
+/// `auto` (see `core::lang::mappers`). It is a marker for "detect", not a language code, so it
+/// must never reach `language_code`.
+pub(crate) const ASSEMBLYAI_DETECT_SENTINEL: &str = "__detect__";
+
+/// Whether `model` is one AssemblyAI's prerecorded `speech_models` field can carry.
+///
+/// The documented values are `universal-3-5-pro` and `universal-2`; the family prefix is accepted
+/// so a newly shipped `universal-*` prerecorded model is passed through rather than dropped. The
+/// streaming family shares the prefix (`universal-streaming-english`, …) and is excluded: it names
+/// a model the prerecorded endpoint does not serve.
+fn assemblyai_prerecorded_model(model: &str) -> bool {
+    let m = model.trim().to_ascii_lowercase();
+    m.starts_with("universal-") && !m.starts_with("universal-streaming")
+}
+
 /// Build the AssemblyAI async submission (`POST /v2/transcript`). Enables the batch-only
 /// Speech-Understanding models (`summarization`, `iab_categories`, `entity_detection`,
 /// `sentiment_analysis`, `language_detection`, …) that the v3 streaming WS cannot do. AssemblyAI is
@@ -507,11 +525,35 @@ pub fn build_assemblyai_transcript(
     let audio_url = validate_batch_audio_source_url("assemblyai", audio_url)?;
     body.insert("audio_url".into(), serde_json::Value::String(audio_url));
 
-    if !std.base.language.is_empty() && std.base.language != "auto" {
+    // Vendor contract: `language_code` is OPTIONAL, and when it is absent AssemblyAI detects the
+    // spoken language itself (`language_detection` defaults to on). So an unset language is
+    // omitted, and so is the shared mapper's sentinel for the canonical `auto`
+    // ([`ASSEMBLYAI_DETECT_SENTINEL`]) — sent verbatim, it is a language code AssemblyAI does not
+    // have. Neither adds `language_detection: true`: absence already means detection, and the flag
+    // is sent below only when the caller asked for it by name.
+    let language = std.base.language.trim();
+    if !language.is_empty() && language != "auto" && language != ASSEMBLYAI_DETECT_SENTINEL {
         body.insert(
             "language_code".into(),
-            serde_json::Value::String(std.base.language.clone()),
+            serde_json::Value::String(language.to_string()),
         );
+    }
+    // Model. `speech_models` (an array, in preference order) is the current field; the singular
+    // `speech_model` is deprecated and `best`/`nano` are legacy tiers. Its documented values are
+    // `universal-3-5-pro` and `universal-2`, and omitting it lets AssemblyAI choose. So a
+    // prerecorded `universal-*` model is sent exactly as chosen, and an unset one is omitted.
+    // Anything else — a streaming model (`universal-streaming-*`), a legacy tier — cannot be
+    // expressed on this endpoint: it is omitted too, but the omission is reported, never silent.
+    let model = std.base.model.trim();
+    if !model.is_empty() {
+        if assemblyai_prerecorded_model(model) {
+            body.insert("speech_models".into(), serde_json::json!([model]));
+        } else {
+            warnings.push(format!(
+                "model '{model}' is not an AssemblyAI prerecorded speech model (`speech_models` \
+                 takes universal-3-5-pro or universal-2); omitted, so AssemblyAI chose the model"
+            ));
+        }
     }
     // --- batch-only Speech-Understanding models ------------------------------------------------
     if b.detect_language == Some(true) || f.language_detection == Some(true) {
@@ -1131,6 +1173,61 @@ mod tests {
         }
     }
 
+    fn query_pairs_of(url: &str) -> Vec<(String, String)> {
+        url::Url::parse(url)
+            .unwrap()
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn deepgram_builder_omits_an_unset_model_and_language() {
+        // Both are optional on `/v1/listen`. An unset model used to go out as `model=nova-2` — a
+        // model nobody chose — and the upload route now hands over an empty language when neither
+        // the request nor the deployment names one.
+        let mut r = req_with(
+            "deepgram",
+            BatchAudioSource::Url {
+                url: "https://example.com/a.wav".into(),
+            },
+            Default::default(),
+            Default::default(),
+        );
+        r.config.base.model = String::new();
+        r.config.base.language = String::new();
+        let sub = build_deepgram_prerecorded(&r, "k", "https://api.deepgram.com").unwrap();
+        let q = query_pairs_of(&sub.request.url);
+        assert!(q.iter().all(|(k, _)| k != "model"), "{}", sub.request.url);
+        assert!(
+            q.iter().all(|(k, _)| k != "language"),
+            "{}",
+            sub.request.url
+        );
+        assert!(!sub.request.url.contains("nova-2"), "{}", sub.request.url);
+    }
+
+    #[test]
+    fn deepgram_builder_sends_a_chosen_model_and_language_verbatim() {
+        let mut r = req_with(
+            "deepgram",
+            BatchAudioSource::Url {
+                url: "https://example.com/a.wav".into(),
+            },
+            Default::default(),
+            Default::default(),
+        );
+        r.config.base.model = "nova-3-medical".into();
+        r.config.base.language = "de".into();
+        let sub = build_deepgram_prerecorded(&r, "k", "https://api.deepgram.com").unwrap();
+        let q = query_pairs_of(&sub.request.url);
+        assert!(
+            q.contains(&("model".into(), "nova-3-medical".into())),
+            "{q:?}"
+        );
+        assert!(q.contains(&("language".into(), "de".into())), "{q:?}");
+    }
+
     #[test]
     fn assemblyai_builder_enables_batch_only_models_and_degrades_intents() {
         let r = req_with(
@@ -1177,6 +1274,90 @@ mod tests {
             "intents should degrade: {:?}",
             sub.config_warnings
         );
+    }
+
+    fn assemblyai_body(language: &str, model: &str) -> (serde_json::Value, Vec<String>) {
+        let mut r = req_with(
+            "assemblyai",
+            BatchAudioSource::Url {
+                url: "https://example.com/a.wav".into(),
+            },
+            Default::default(),
+            Default::default(),
+        );
+        r.config.base.language = language.into();
+        r.config.base.model = model.into();
+        let sub = build_assemblyai_transcript(
+            &r,
+            "aai-key",
+            "https://api.assemblyai.com",
+            "https://example.com/a.wav",
+        )
+        .unwrap();
+        match sub.request.body {
+            BatchHttpBody::Json(v) => (v, sub.config_warnings),
+            other => panic!("expected JSON body, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assemblyai_unset_language_is_omitted_so_the_vendor_detects_it() {
+        // `language_code` is optional; absent, AssemblyAI detects the language. Detection is not
+        // requested by name either — nobody asked for the flag, and absence already means it.
+        let (body, _) = assemblyai_body("", "");
+        assert!(body.get("language_code").is_none(), "{body}");
+        assert!(body.get("language_detection").is_none(), "{body}");
+    }
+
+    #[test]
+    fn assemblyai_detect_sentinel_never_reaches_language_code() {
+        // The shared mapper renders canonical `auto` as `__detect__` for AssemblyAI. Sent verbatim
+        // it was a language code AssemblyAI does not have.
+        let (body, _) = assemblyai_body(ASSEMBLYAI_DETECT_SENTINEL, "");
+        assert!(body.get("language_code").is_none(), "{body}");
+        assert!(!body.to_string().contains("__detect__"), "{body}");
+    }
+
+    #[test]
+    fn assemblyai_chosen_language_is_sent() {
+        let (body, _) = assemblyai_body("de", "");
+        assert_eq!(body["language_code"], "de");
+    }
+
+    #[test]
+    fn assemblyai_universal_models_ride_as_speech_models() {
+        // The model used to be dropped entirely: every upload ran on AssemblyAI's default.
+        for model in ["universal-2", "universal-3-5-pro"] {
+            let (body, warnings) = assemblyai_body("en", model);
+            assert_eq!(body["speech_models"], serde_json::json!([model]), "{body}");
+            // The deprecated singular form is never sent.
+            assert!(body.get("speech_model").is_none(), "{body}");
+            assert!(warnings.iter().all(|w| !w.contains(model)), "{warnings:?}");
+        }
+    }
+
+    #[test]
+    fn assemblyai_unset_model_is_omitted_silently() {
+        let (body, warnings) = assemblyai_body("en", "");
+        assert!(body.get("speech_models").is_none(), "{body}");
+        assert!(
+            warnings.iter().all(|w| !w.contains("model")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn assemblyai_model_it_cannot_express_is_omitted_and_reported() {
+        // A streaming model shares the `universal-` prefix but is not served here; legacy tiers
+        // are gone. Omitted, because sending them fails the job — but never silently.
+        for model in ["universal-streaming-english", "best", "nano"] {
+            let (body, warnings) = assemblyai_body("en", model);
+            assert!(body.get("speech_models").is_none(), "{model}: {body}");
+            assert!(
+                warnings.iter().any(|w| w.contains(model)),
+                "{model}: the omission must be reported: {warnings:?}"
+            );
+        }
     }
 
     #[test]
@@ -1511,6 +1692,27 @@ mod tests {
         );
         r.config.base.language = "en-US".into();
         r.batch.detect_language = Some(true);
+        let sub =
+            build_elevenlabs_transcription(&r, "xi-key", "https://api.elevenlabs.io").unwrap();
+
+        assert!(
+            eleven_fields(&sub)
+                .iter()
+                .all(|(k, _)| k != "language_code")
+        );
+    }
+
+    #[test]
+    fn elevenlabs_unset_language_is_omitted_not_defaulted() {
+        // `language_code` is optional; absent, ElevenLabs detects the language. The upload route
+        // hands over an empty language when neither the request nor the deployment names one.
+        let mut r = eleven_req(
+            BatchAudioSource::Url {
+                url: "https://example.com/a.wav".into(),
+            },
+            SttFeatures::default(),
+        );
+        r.config.base.language = String::new();
         let sub =
             build_elevenlabs_transcription(&r, "xi-key", "https://api.elevenlabs.io").unwrap();
 

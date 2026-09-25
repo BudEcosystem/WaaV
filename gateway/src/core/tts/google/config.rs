@@ -498,8 +498,14 @@ impl GoogleTTSConfig {
 
     /// Returns the voice name for the API request.
     ///
-    /// Checks `voice_id` first, falling back to `model` if `voice_id` is empty.
-    /// Returns `None` if both are empty.
+    /// Returns the configured `voice_id`, or `None` when it is absent or empty. `model` is
+    /// deliberately NOT a fallback: it carries a catalog family name (e.g. `chirp-3-hd`), not a
+    /// Google voice name, and sending it as `voice.name` would silently REPLACE the caller's
+    /// choice with a value Google rejects (the Deepgram `aura-2` bug class). Google's
+    /// `VoiceSelectionParams.name` is optional — with no name, Google picks a voice from
+    /// `languageCode` (required, always sent) and `ssmlGender` — so `None` is omitted from the
+    /// request body rather than sent as `"name": ""`.
+    /// Doc: https://cloud.google.com/text-to-speech/docs/reference/rest/v1/VoiceSelectionParams
     ///
     /// # Example
     ///
@@ -514,24 +520,18 @@ impl GoogleTTSConfig {
     /// assert_eq!(config.voice_name(), Some("en-US-Wavenet-D"));
     /// ```
     pub fn voice_name(&self) -> Option<&str> {
-        // Check voice_id first
-        if let Some(voice_id) = &self.base.voice_id
-            && !voice_id.is_empty()
-        {
-            return Some(voice_id);
-        }
-
-        // Fall back to model
-        if !self.base.model.is_empty() {
-            return Some(&self.base.model);
-        }
-
-        None
+        // Only the caller's voice_id names a voice. No model fallback: see the doc comment above.
+        self.base.voice_id.as_deref().filter(|v| !v.is_empty())
     }
 
-    /// Returns the speaking rate, clamped to Google's valid range [0.25, 4.0].
+    /// Returns the speaking rate, clamped to Google's valid range [0.25, 2.0].
     ///
-    /// Returns `None` if no speaking rate is configured.
+    /// Google's `AudioConfig.speakingRate` documents [0.25, 2.0] (1.0 = normal speed). The upper
+    /// bound was previously 4.0, which let an out-of-range rate reach the wire.
+    /// Doc: https://cloud.google.com/text-to-speech/docs/reference/rest/v1/AudioConfig
+    ///
+    /// Returns `None` if no speaking rate is configured, so the field is omitted and Google
+    /// applies its own 1.0 default.
     ///
     /// # Example
     ///
@@ -543,12 +543,12 @@ impl GoogleTTSConfig {
     ///     },
     ///     ..Default::default()
     /// };
-    /// assert_eq!(config.speaking_rate(), Some(4.0)); // Clamped to max
+    /// assert_eq!(config.speaking_rate(), Some(2.0)); // Clamped to max
     /// ```
     pub fn speaking_rate(&self) -> Option<f64> {
         self.base.speaking_rate.map(|rate| {
             let rate = rate as f64;
-            rate.clamp(0.25, 4.0)
+            rate.clamp(0.25, 2.0)
         })
     }
 
@@ -992,27 +992,28 @@ mod tests {
         };
         assert_eq!(config.voice_name(), Some("en-US-Wavenet-D"));
 
-        // Falls back to model when voice_id is empty
+        // An empty voice_id does NOT fall back to model: model is a catalog family name, not a
+        // Google voice name, and sending it as `voice.name` would replace the caller's choice.
         let config = GoogleTTSConfig {
             base: TTSConfig {
                 voice_id: Some(String::new()),
-                model: "en-US-Standard-A".to_string(),
+                model: "chirp-3-hd".to_string(),
                 ..Default::default()
             },
             ..Default::default()
         };
-        assert_eq!(config.voice_name(), Some("en-US-Standard-A"));
+        assert_eq!(config.voice_name(), None);
 
-        // Falls back to model when voice_id is None
+        // Nor does a missing voice_id.
         let config = GoogleTTSConfig {
             base: TTSConfig {
                 voice_id: None,
-                model: "en-US-Standard-A".to_string(),
+                model: "chirp-3-hd".to_string(),
                 ..Default::default()
             },
             ..Default::default()
         };
-        assert_eq!(config.voice_name(), Some("en-US-Standard-A"));
+        assert_eq!(config.voice_name(), None);
 
         // Returns None when both are empty
         let config = GoogleTTSConfig {
@@ -1048,7 +1049,25 @@ mod tests {
         };
         assert_eq!(config.speaking_rate(), Some(0.25));
 
-        // Above maximum
+        // Upper bound is inclusive
+        let config = GoogleTTSConfig {
+            base: TTSConfig {
+                speaking_rate: Some(2.0),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(config.speaking_rate(), Some(2.0));
+
+        // Above maximum: Google's AudioConfig.speakingRate caps at 2.0 (not 4.0)
+        let config = GoogleTTSConfig {
+            base: TTSConfig {
+                speaking_rate: Some(3.0),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(config.speaking_rate(), Some(2.0));
         let config = GoogleTTSConfig {
             base: TTSConfig {
                 speaking_rate: Some(5.0),
@@ -1056,7 +1075,7 @@ mod tests {
             },
             ..Default::default()
         };
-        assert_eq!(config.speaking_rate(), Some(4.0));
+        assert_eq!(config.speaking_rate(), Some(2.0));
 
         // None
         let config = GoogleTTSConfig {

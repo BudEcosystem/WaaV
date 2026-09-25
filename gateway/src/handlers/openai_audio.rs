@@ -149,16 +149,29 @@ pub async fn speech_handler(
     // way to produce a request that worked. See `default_voice` for which default.
     // Where the voice came from decides who can change it, and so what a vendor's refusal of it
     // should say — see `rejection_error`.
+    //
+    // A default is picked only for a vendor whose API REQUIRES a voice. Where the voice is
+    // optional (Deepgram, Google) nothing is sent and the vendor applies its own default: a voice
+    // WaaV chose would be one neither the caller nor the operator asked for.
     let (voice, voice_origin) =
         match settings_map::resolve_voice(settings.voice.as_deref(), endpoint.voice.as_deref()) {
-            Some(v) if settings.voice.is_some() => (v, VoiceOrigin::Request),
-            Some(v) => (v, VoiceOrigin::Deployment),
+            Some(v) if settings.voice.is_some() => (Some(v), VoiceOrigin::Request),
+            Some(v) => (Some(v), VoiceOrigin::Deployment),
             None => match resolve_described_voice(&state, &endpoint, &mut advisories).await {
-                Some(v) => (v, VoiceOrigin::Described),
+                Some(v) => (Some(v), VoiceOrigin::Described),
+                None if !crate::handlers::voices::voice_required(&endpoint.vendor) => {
+                    advisories.warn(format!(
+                        "deployment '{}' has no voice configured, so {}'s own default voice was \
+                         used. Set a voice in the deployment's audio settings, or pass one in \
+                         `voice`, to choose it.",
+                        settings.endpoint, endpoint.vendor
+                    ));
+                    (None, VoiceOrigin::Vendor)
+                }
                 None => match default_voice(&state, &endpoint, &settings.endpoint, &mut advisories)
                     .await
                 {
-                    Some(v) => (v, VoiceOrigin::Default),
+                    Some(v) => (Some(v), VoiceOrigin::Default),
                     None => return no_voice_error(&settings.endpoint, &endpoint.vendor),
                 },
             },
@@ -177,7 +190,9 @@ pub async fn speech_handler(
     // TC-CFG-03: the ENDPOINT DEFAULT passes through this same gate. A default that went around
     // it would turn a config typo into a vendor 401 several seconds later, naming neither Bud
     // nor the endpoint -- and the operator would be looking at a form that accepted the value.
-    if let Err(e) = speech::validate_voice(&voice, known_voices_for(&endpoint.vendor)) {
+    if let Some(voice) = voice.as_deref()
+        && let Err(e) = speech::validate_voice(voice, known_voices_for(&endpoint.vendor))
+    {
         return translation_error(&e);
     }
 
@@ -333,13 +348,14 @@ pub async fn speech_handler(
     let deadline = tts_settings
         .request_timeout
         .map(std::time::Duration::from_secs);
-    let voice_for_errors = voice.clone();
+    let voice_for_errors = voice.clone().unwrap_or_default();
+    let model = vendor_model(&state, &endpoint, voice.as_deref()).await;
 
     let mut tts_config = crate::core::tts::TTSConfig {
         provider: endpoint.vendor.clone(),
         api_key,
-        voice_id: Some(voice),
-        model: endpoint.model.clone().unwrap_or_default(),
+        voice_id: voice,
+        model,
         speaking_rate: settings.speaking_rate,
         audio_format: Some(settings.format.as_waav_format().to_string()),
         // Cleared for every compressed format. TTSConfig defaults to Some(24000), and a vendor
@@ -364,10 +380,14 @@ pub async fn speech_handler(
 
     // C1/C3: the synthesis language, mapped into the vendor's own notation. OpenAI's schema has
     // no language field; this one is Bud's per-request override, else the deployment's choice.
+    //
+    // Mapped with the vendor's TTS mapper. A few vendors spell a language differently for
+    // synthesis than for recognition, and the bare vendor name selects the STT one: Google TTS
+    // was sent `cmn-Hans-CN`, its recogniser's notation. The WebSocket path already did this.
     let mapped_language = language.as_deref().and_then(|canonical| {
         settings_map::map_language_for(
             canonical,
-            &endpoint.vendor,
+            &super::ws::config::tts_provider_alias(&endpoint.vendor),
             &tts_config.model,
             &mut advisories,
         )
@@ -612,6 +632,46 @@ fn serve_as_requested(
     }
 }
 
+/// The deployment's model, as the vendor should receive it.
+///
+/// Verbatim for every vendor but Deepgram, which has no voice parameter: its voice id IS the
+/// `model` (`aura-2-thalia-en`), and the provider sends the voice there when one is named. When
+/// none is, the deployment's model would be sent instead — and a deployment published under its
+/// catalog FAMILY (`aura-2`) names no voice, so Deepgram refused every such request with
+/// `400 Invalid 'model' value of 'aura-2'`.
+///
+/// So with no voice the model is kept only when it is itself a voice on the account (a deployment
+/// published under a full voice id), and otherwise left empty: no `model` is sent and Deepgram
+/// applies its own default. The account's catalog decides, not a naming rule; it is the list
+/// `default_voice` already fetches and caches. An unreadable catalog leaves the model as it was.
+async fn vendor_model(
+    state: &Arc<AppState>,
+    endpoint: &bud_auth::credentials::VoiceEndpoint,
+    voice: Option<&str>,
+) -> String {
+    let model = endpoint.model.clone().unwrap_or_default();
+    if voice.is_some() || model.trim().is_empty() || endpoint.vendor != "deepgram" {
+        return model;
+    }
+    let catalog = crate::handlers::voices::fetch_provider_catalog_with_key(
+        state,
+        &endpoint.vendor,
+        endpoint.credential.as_deref(),
+    )
+    .await;
+    if model_names_a_voice(&model, &catalog) {
+        model
+    } else {
+        String::new()
+    }
+}
+
+/// Whether `model` is one of the catalog's voices. An empty catalog cannot say, so it answers yes
+/// and the model is sent as before.
+fn model_names_a_voice(model: &str, catalog: &[crate::handlers::voices::Voice]) -> bool {
+    catalog.is_empty() || catalog.iter().any(|v| v.id == model.trim())
+}
+
 /// The vendor's default voice, when it has one.
 ///
 /// `None` for a vendor whose default is unknown here. Guessing one would synthesise in a voice
@@ -713,6 +773,8 @@ enum VoiceOrigin {
     Described,
     /// Nothing named or described one; WaaV picked the vendor or account default.
     Default,
+    /// Nothing named or described one, and the vendor takes none: no voice was sent.
+    Vendor,
 }
 
 /// A vendor's refusal, as the caller should see it: 400, with the vendor's own sentence.
@@ -747,7 +809,8 @@ fn rejection_error(
                 .replace("voice_settings", "")
                 .contains("voice"));
     let (message, param) = match (about_voice, origin) {
-        (false, _) => (message, None),
+        // No voice was sent, so a refusal cannot be about one WaaV should explain.
+        (false, _) | (true, VoiceOrigin::Vendor) => (message, None),
         (true, VoiceOrigin::Request) => (
             format!(
                 "{message} `voice` takes a voice id from {vendor}; omit it to use this deployment's voice."
@@ -2111,6 +2174,40 @@ mod speech_error_tests {
         // No default is known for these, and guessing one would pick a voice nobody chose.
         assert_eq!(vendor_default_voice("aws-polly"), None);
         assert_eq!(vendor_default_voice("hume"), None);
+    }
+
+    /// WaaV picks a voice only where the vendor cannot synthesise without one. Deepgram and
+    /// Google take none, and then choose their own.
+    #[test]
+    fn a_voice_is_defaulted_only_where_the_vendor_requires_one() {
+        use crate::handlers::voices::voice_required;
+        assert!(!voice_required("deepgram"));
+        assert!(!voice_required("google"));
+        for vendor in [
+            "elevenlabs",
+            "cartesia",
+            "openai",
+            "azure",
+            "aws-polly",
+            "speechmatics",
+        ] {
+            assert!(voice_required(vendor), "{vendor}");
+        }
+    }
+
+    /// The live failure's no-voice half: a Deepgram deployment published as `aura-2` names no
+    /// voice, so with none chosen it must not be sent as the model. A deployment published under
+    /// a full voice id still is, and an unreadable catalog changes nothing.
+    #[test]
+    fn a_deepgram_family_model_is_not_sent_as_a_voice() {
+        let catalog = [
+            voice("aura-2-thalia-en", "Thalia"),
+            voice("aura-asteria-en", "Asteria"),
+        ];
+        assert!(!super::model_names_a_voice("aura-2", &catalog));
+        assert!(!super::model_names_a_voice("aura", &catalog));
+        assert!(super::model_names_a_voice("aura-asteria-en", &catalog));
+        assert!(super::model_names_a_voice("aura-2", &[]));
     }
 
     #[tokio::test]

@@ -498,7 +498,10 @@ impl BaseTTS for AzureTTS {
                 "audio-48khz-192kbitrate-mono-mp3",
                 "audio-16khz-16bit-32kbps-mono-opus",
                 "audio-24khz-16bit-24kbps-mono-opus",
-                "audio-24khz-16bit-48kbps-mono-opus"
+                "audio-24khz-16bit-48kbps-mono-opus",
+                "ogg-16khz-16bit-mono-opus",
+                "ogg-24khz-16bit-mono-opus",
+                "ogg-48khz-16bit-mono-opus"
             ],
             "supported_sample_rates": [8000, 16000, 22050, 24000, 44100, 48000],
             "documentation": "https://learn.microsoft.com/en-us/azure/ai-services/speech-service/rest-text-to-speech"
@@ -729,6 +732,43 @@ mod tests {
 
         let output_format = request.headers().get(AZURE_OUTPUT_FORMAT_HEADER).unwrap();
         assert_eq!(output_format.to_str().unwrap(), "raw-8khz-8bit-mono-mulaw");
+    }
+
+    // `opus` means Ogg Opus (OpenAI's meaning). Azure's `audio-*-opus` formats have no Ogg
+    // container, so the header must name an `ogg-*-opus` format.
+    #[test]
+    fn test_build_http_request_output_format_opus_is_ogg() {
+        let mut config = create_test_config();
+        config.audio_format = Some("opus".to_string());
+        config.sample_rate = Some(24000);
+
+        let azure_config = AzureTTSConfig::from_base(config.clone());
+        let builder = AzureRequestBuilder::new(config, azure_config);
+
+        let client = reqwest::Client::new();
+        let request = builder.build_http_request(&client, "Test").build().unwrap();
+
+        let output_format = request.headers().get(AZURE_OUTPUT_FORMAT_HEADER).unwrap();
+        assert_eq!(output_format.to_str().unwrap(), "ogg-24khz-16bit-mono-opus");
+    }
+
+    // A catalog family name in `model` must never become the SSML voice; with no voice chosen
+    // the SSML-required last-resort default (Jenny) is used.
+    #[test]
+    fn test_build_http_request_model_is_not_used_as_voice() {
+        let mut config = create_test_config();
+        config.voice_id = None;
+        config.model = "speech/azure-tts".to_string();
+
+        let azure_config = AzureTTSConfig::from_base(config.clone());
+        let builder = AzureRequestBuilder::new(config, azure_config);
+
+        let client = reqwest::Client::new();
+        let request = builder.build_http_request(&client, "Test").build().unwrap();
+        let body = std::str::from_utf8(request.body().unwrap().as_bytes().unwrap()).unwrap();
+
+        assert!(body.contains("<voice name='en-US-JennyNeural'>"), "{body}");
+        assert!(!body.contains("speech/azure-tts"), "{body}");
     }
 
     #[test]

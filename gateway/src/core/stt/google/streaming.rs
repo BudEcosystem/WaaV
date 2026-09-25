@@ -234,10 +234,20 @@ pub(super) fn build_config_request(config: &GoogleSTTConfig) -> StreamingRecogni
         })
     };
 
+    // An unset language is an EMPTY list, not `[""]`: a zero-length BCP-47 tag is a value nobody
+    // chose. With no code the recognizer's own default configuration applies, and if it has none
+    // Google names the missing language itself.
+    let language = config.base.language.trim();
+    let language_codes = if language.is_empty() {
+        Vec::new()
+    } else {
+        vec![language.to_string()]
+    };
+
     let recognition_config = Some(RecognitionConfig {
         decoding_config,
         model: config.base.model.clone(),
-        language_codes: vec![config.base.language.clone()],
+        language_codes,
         features,
         adaptation,
         transcript_normalization,
