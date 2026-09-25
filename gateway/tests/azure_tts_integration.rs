@@ -340,7 +340,8 @@ fn test_azure_audio_encoding_from_format_strings() {
     // Opus formats
     assert_eq!(
         AzureAudioEncoding::from_format_string("opus", 24000),
-        AzureAudioEncoding::Audio24Khz16Bit48KbpsMonoOpus
+        // Ogg-contained, which is what OpenAI's `opus` means; the raw-Opus stream is not.
+        AzureAudioEncoding::Ogg24Khz16BitMonoOpus
     );
 
     // Unknown defaults to PCM 24kHz

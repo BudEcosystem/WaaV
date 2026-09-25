@@ -71,7 +71,7 @@ pub mod client;
 pub mod error;
 
 // Re-export commonly used types
-pub use auth::{CredentialSource, GoogleAuthClient, TokenProvider};
+pub use auth::{CredentialSource, GoogleAuthClient, TokenProvider, is_service_account_json};
 pub use client::{AuthenticatedChannel, create_authenticated_channel, create_grpc_channel};
 pub use error::GoogleError;
 

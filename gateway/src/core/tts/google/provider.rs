@@ -1556,7 +1556,8 @@ mod tests {
     #[test]
     fn test_build_request_body_speaking_rate_clamped() {
         let mut config = create_test_config();
-        config.speaking_rate = Some(10.0); // Should clamp to 4.0
+        // Google's AudioConfig.speakingRate documents [0.25, 2.0]; clamp to 2.0, not 4.0.
+        config.speaking_rate = Some(10.0);
 
         let google_config =
             GoogleTTSConfig::from_base_config(config.clone(), "test-project".to_string());
@@ -1564,7 +1565,7 @@ mod tests {
         let builder = GoogleRequestBuilder::new(config, google_config, "test-token".to_string());
         let body = builder.build_request_body("test");
 
-        assert_eq!(body["audioConfig"]["speakingRate"], 4.0);
+        assert_eq!(body["audioConfig"]["speakingRate"], 2.0);
     }
 
     #[test]
@@ -1657,11 +1658,15 @@ mod tests {
         );
     }
 
+    // `model` carries a catalog family name (e.g. `chirp-3-hd`), not a Google voice name. With no
+    // voice chosen, `voice.name` must be OMITTED (Google's VoiceSelectionParams.name is optional
+    // and Google picks a voice for `languageCode`) — never filled in from `model`, and never sent
+    // as `"name": ""`. `languageCode` is required and still sent.
     #[test]
-    fn test_build_request_voice_name_from_model_fallback() {
+    fn test_build_request_no_voice_omits_name_and_ignores_model() {
         let mut config = create_test_config();
         config.voice_id = None;
-        config.model = "en-US-Neural2-A".to_string();
+        config.model = "chirp-3-hd".to_string();
 
         let google_config =
             GoogleTTSConfig::from_base_config(config.clone(), "test-project".to_string());
@@ -1669,7 +1674,24 @@ mod tests {
         let builder = GoogleRequestBuilder::new(config, google_config, "test-token".to_string());
         let body = builder.build_request_body("test");
 
-        assert_eq!(body["voice"]["name"], "en-US-Neural2-A");
+        assert!(
+            body["voice"].get("name").is_none(),
+            "model must not be sent as voice.name: {body}"
+        );
+        assert_eq!(body["voice"]["languageCode"], "en-US");
+        let raw = body.to_string();
+        assert!(!raw.contains("chirp-3-hd"), "model leaked into body: {raw}");
+        assert!(!raw.contains("\"name\""), "empty name emitted: {raw}");
+
+        // Same for an empty (rather than absent) voice_id.
+        let mut config = create_test_config();
+        config.voice_id = Some(String::new());
+        config.model = "chirp-3-hd".to_string();
+        let google_config =
+            GoogleTTSConfig::from_base_config(config.clone(), "test-project".to_string());
+        let builder = GoogleRequestBuilder::new(config, google_config, "test-token".to_string());
+        let body = builder.build_request_body("test");
+        assert!(body["voice"].get("name").is_none(), "{body}");
     }
 
     #[test]

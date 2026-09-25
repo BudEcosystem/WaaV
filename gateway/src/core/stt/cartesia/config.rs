@@ -162,7 +162,6 @@ impl CartesiaSTTConfig {
     /// Checks that:
     /// - API key is not empty
     /// - Sample rate is supported (8000, 16000, 22050, 24000, 44100, 48000)
-    /// - Language is not empty
     /// - min_volume is in range 0.0-1.0 if set
     /// - max_silence_duration_secs is positive if set
     ///
@@ -190,12 +189,10 @@ impl CartesiaSTTConfig {
             )));
         }
 
-        // Check language
-        if self.base.language.is_empty() {
-            return Err(STTError::ConfigurationError(
-                "Language code is required".to_string(),
-            ));
-        }
+        // No language check: Cartesia's `language` is OPTIONAL (it defaults to `en` on their
+        // side), so an empty one is a valid request and the URL builder omits it. Refusing it here
+        // turned "nobody named a language" — and language detection, which names none — into a
+        // configuration error.
 
         // Validate min_volume if set
         if let Some(min_vol) = self.min_volume
@@ -283,11 +280,16 @@ impl CartesiaSTTConfig {
             url.push_str(&encode(api_key));
         }
 
-        // Required parameters - URL encode model and language
+        // Required parameter - URL encode the model.
         url.push_str("&model=");
         url.push_str(&encode(&self.model));
-        url.push_str("&language=");
-        url.push_str(&encode(&self.base.language));
+        // Vendor contract: `language` is OPTIONAL (ISO-639-1; Cartesia defaults to `en`). An
+        // unset language is omitted — never sent as an empty `language=`, never replaced.
+        let language = self.base.language.trim();
+        if !language.is_empty() {
+            url.push_str("&language=");
+            url.push_str(&encode(language));
+        }
         url.push_str("&encoding=");
         url.push_str(self.encoding.as_str()); // Safe: enum value
         url.push_str("&sample_rate=");

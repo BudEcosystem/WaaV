@@ -118,7 +118,8 @@ mod tests {
             OpenAITTSModel::from_str_or_default("gpt-4o-mini-tts"),
             OpenAITTSModel::Gpt4oMiniTts
         );
-        // Unknown defaults to tts-1
+        // Unknown classifies as tts-1 (classification only: the wire sends it verbatim, see
+        // `config::openai_tts_model_id`).
         assert_eq!(
             OpenAITTSModel::from_str_or_default("unknown"),
             OpenAITTSModel::Tts1
@@ -136,7 +137,8 @@ mod tests {
             OpenAIVoice::from_str_or_default("SHIMMER"),
             OpenAIVoice::Shimmer
         );
-        // Unknown defaults to alloy
+        // Unknown classifies as alloy (classification only: the wire sends it verbatim, see
+        // `config::openai_tts_voice_id`).
         assert_eq!(
             OpenAIVoice::from_str_or_default("unknown"),
             OpenAIVoice::Alloy

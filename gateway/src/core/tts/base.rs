@@ -281,8 +281,11 @@ impl Default for TTSConfig {
             model: "".to_string(),
             provider: String::new(),
             api_key: String::new(),
-            voice_id: Some("aura-asteria-en".to_string()),
-            speaking_rate: Some(1.0),
+            // No voice and no speed: neither has a vendor-neutral value. This used to be
+            // Deepgram's `aura-asteria-en`, and every config built from the default — whichever
+            // vendor it was for — carried it.
+            voice_id: None,
+            speaking_rate: None,
             audio_format: Some("linear16".to_string()),
             sample_rate: Some(24000),
             connection_timeout: Some(30),

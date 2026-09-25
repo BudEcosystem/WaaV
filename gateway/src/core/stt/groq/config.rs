@@ -113,13 +113,22 @@ impl GroqSTTModel {
     }
 
     /// Parse from string, with fallback to default.
+    ///
+    /// The fallback makes this unfit for deciding what to SEND: an id this enum does not know
+    /// comes back as the turbo model. [`GroqSTTConfig::from_base`] uses [`Self::parse_known`] and
+    /// keeps an unknown id verbatim instead.
     pub fn from_str_or_default(s: &str) -> Self {
-        match s.to_lowercase().replace('_', "-").as_str() {
-            "whisper-large-v3" | "whisper-v3" | "large-v3" => Self::WhisperLargeV3,
+        Self::parse_known(s).unwrap_or_default()
+    }
+
+    /// Parse one of the ids (or WaaV's aliases for them) this enum names; `None` for anything else.
+    pub fn parse_known(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().replace('_', "-").as_str() {
+            "whisper-large-v3" | "whisper-v3" | "large-v3" => Some(Self::WhisperLargeV3),
             "whisper-large-v3-turbo" | "whisper-v3-turbo" | "turbo" | "large-v3-turbo" => {
-                Self::WhisperLargeV3Turbo
+                Some(Self::WhisperLargeV3Turbo)
             }
-            _ => Self::default(),
+            _ => None,
         }
     }
 
@@ -420,8 +429,16 @@ pub struct GroqSTTConfig {
     /// Base STT configuration (shared across all providers).
     pub base: STTConfig,
 
-    /// Groq STT model to use.
+    /// Groq STT model to use — or, when [`model_id`](Self::model_id) is set, the default family
+    /// used only for cost estimates (it is not what is sent).
     pub model: GroqSTTModel,
+
+    /// The configured model id, verbatim, when it is not one [`GroqSTTModel`] names.
+    ///
+    /// The enum's fallback used to rewrite any id it did not know to `whisper-large-v3-turbo` — a
+    /// different model than the one chosen. When set, this is what reaches the `model` field (see
+    /// [`wire_model`](GroqSTTConfig::wire_model)), for Groq to accept or name in its error.
+    pub model_id: Option<String>,
 
     /// Response format for transcription results.
     pub response_format: GroqResponseFormat,
@@ -430,7 +447,8 @@ pub struct GroqSTTConfig {
     ///
     /// Lower values make output more deterministic.
     /// Higher values make output more creative/varied.
-    /// Default is 0.0 for most deterministic results.
+    /// `None` (the default) omits the field and Groq applies its own default; only a caller's or
+    /// deployment's explicit value is sent.
     pub temperature: Option<f32>,
 
     /// Timestamp granularities to include in verbose_json output.
@@ -493,8 +511,10 @@ impl Default for GroqSTTConfig {
         Self {
             base: STTConfig::default(),
             model: GroqSTTModel::default(),
+            model_id: None,
             response_format: GroqResponseFormat::VerboseJson, // For word timestamps
-            temperature: Some(0.0),                           // Deterministic results
+            // Omitted unless someone sets it: Groq's own default applies.
+            temperature: None,
             timestamp_granularities: vec![TimestampGranularity::Segment],
             audio_input_format: AudioInputFormat::Wav,
             prompt: None,
@@ -513,19 +533,37 @@ impl Default for GroqSTTConfig {
 impl GroqSTTConfig {
     /// Create a new configuration from base STTConfig.
     ///
-    /// Automatically determines the model from the config if specified.
+    /// Vendor contract: `model` is REQUIRED on Groq's OpenAI-compatible transcription endpoint, so
+    /// an unset model becomes [`DEFAULT_MODEL`] — the one default here. A configured model is sent
+    /// as configured: a known id (or a WaaV alias for one) in its canonical spelling, anything else
+    /// verbatim through [`model_id`](Self::model_id). It used to become the turbo model too.
     pub fn from_base(base: STTConfig) -> Self {
-        let model = if base.model.is_empty() {
-            GroqSTTModel::default()
+        let requested = base.model.trim();
+        let (model, model_id) = if requested.is_empty() {
+            (GroqSTTModel::default(), None)
         } else {
-            GroqSTTModel::from_str_or_default(&base.model)
+            match GroqSTTModel::parse_known(requested) {
+                Some(known) => (known, None),
+                None => (GroqSTTModel::default(), Some(requested.to_string())),
+            }
         };
 
         Self {
             base,
             model,
+            model_id,
             ..Default::default()
         }
+    }
+
+    /// The model id that reaches the wire: [`model_id`](Self::model_id) when set, else
+    /// [`model`](Self::model)'s canonical spelling.
+    pub fn wire_model(&self) -> &str {
+        self.model_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .unwrap_or_else(|| self.model.as_str())
     }
 
     /// Build from the standardized config (W1 keystone — final STT batch). Groq is a batch
@@ -591,7 +629,7 @@ impl GroqSTTConfig {
     /// bug class). The audio `file`/`url` source itself is signalled by [`Self::audio_url`].
     pub fn build_form_text_fields(&self) -> Vec<(String, String)> {
         let mut fields = vec![
-            ("model".to_string(), self.model.as_str().to_string()),
+            ("model".to_string(), self.wire_model().to_string()),
             (
                 "response_format".to_string(),
                 self.response_format.as_str().to_string(),
@@ -907,11 +945,85 @@ mod tests {
     fn test_default_config() {
         let config = GroqSTTConfig::default();
         assert_eq!(config.model, GroqSTTModel::WhisperLargeV3Turbo);
+        assert_eq!(config.model_id, None);
         assert_eq!(config.response_format, GroqResponseFormat::VerboseJson);
-        assert_eq!(config.temperature, Some(0.0));
+        // Nobody chose a temperature, so none is sent.
+        assert_eq!(config.temperature, None);
         assert_eq!(config.flush_threshold_bytes, 1024 * 1024);
         assert_eq!(config.max_file_size_bytes, DEFAULT_MAX_FILE_SIZE);
         assert!(!config.translate_to_english);
+    }
+
+    fn groq_fields(model: &str, language: &str) -> Vec<(String, String)> {
+        GroqSTTConfig::from_base(STTConfig {
+            api_key: "gsk_test".into(),
+            model: model.into(),
+            language: language.into(),
+            ..Default::default()
+        })
+        .build_form_text_fields()
+    }
+
+    fn groq_field<'a>(fields: &'a [(String, String)], key: &str) -> Option<&'a str> {
+        fields
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn an_unknown_model_id_is_sent_verbatim_not_rewritten_to_turbo() {
+        // The enum's fallback used to send `whisper-large-v3-turbo` for any id it did not know.
+        let fields = groq_fields("distil-whisper-large-v3-en", "en");
+        assert_eq!(
+            groq_field(&fields, "model"),
+            Some("distil-whisper-large-v3-en"),
+            "{fields:?}"
+        );
+    }
+
+    #[test]
+    fn only_an_unset_model_gets_the_required_default() {
+        assert_eq!(
+            groq_field(&groq_fields("", "en"), "model"),
+            Some(DEFAULT_MODEL)
+        );
+        // WaaV's own aliases still resolve to the canonical id.
+        assert_eq!(
+            groq_field(&groq_fields("large-v3", "en"), "model"),
+            Some("whisper-large-v3")
+        );
+    }
+
+    #[test]
+    fn an_unset_language_and_temperature_are_omitted() {
+        // `language` and `temperature` are optional; the upload route hands over an empty
+        // language when nothing names one, and `temperature=0` used to go out on every request.
+        let fields = groq_fields("whisper-large-v3", "");
+        assert_eq!(groq_field(&fields, "language"), None, "{fields:?}");
+        assert_eq!(groq_field(&fields, "temperature"), None, "{fields:?}");
+        assert_eq!(
+            groq_field(&groq_fields("whisper-large-v3", "de"), "language"),
+            Some("de")
+        );
+    }
+
+    #[test]
+    fn a_chosen_temperature_is_sent() {
+        use crate::core::stt::standard::StandardSTTConfig;
+        let mut std = StandardSTTConfig::from_base(STTConfig {
+            api_key: "gsk_test".into(),
+            model: "whisper-large-v3".into(),
+            ..Default::default()
+        });
+        std.extras
+            .0
+            .insert("temperature".into(), serde_json::json!(0.4));
+        let fields = GroqSTTConfig::from_standard(&std).build_form_text_fields();
+        assert!(
+            groq_field(&fields, "temperature").is_some_and(|t| t.starts_with("0.4")),
+            "{fields:?}"
+        );
     }
 
     #[test]

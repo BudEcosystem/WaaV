@@ -31,6 +31,11 @@ use crate::core::websocket::reconnectable_stream::{
     WsTransport,
 };
 
+/// The operating point for a log line: the chosen one, or a note that the vendor's default applies.
+fn operating_point_label(op: Option<super::config::SpeechmaticsOperatingPoint>) -> String {
+    op.map_or_else(|| "vendor default".to_string(), |op| op.to_string())
+}
+
 type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 type WsSink = futures_util::stream::SplitSink<WsStream, Message>;
@@ -361,7 +366,7 @@ impl SpeechmaticsSTT {
             "Creating Speechmatics STT client (standardized): region={}, language={}, operating_point={}",
             speechmatics_config.region,
             speechmatics_config.language,
-            speechmatics_config.operating_point
+            operating_point_label(speechmatics_config.operating_point)
         );
 
         Ok(Self {
@@ -408,10 +413,16 @@ impl SpeechmaticsSTT {
     fn build_start_recognition(&self) -> StartRecognitionMessage {
         let audio_format = AudioFormat::raw(self.config.encoding, self.config.sample_rate);
 
+        // `enable_partials` and `max_delay` stay unconditional: the streaming client relies on
+        // partials for interim results, and both mirror the provider config's own defaults.
         let mut transcription_config = TranscriptionConfig::new(self.config.language)
-            .with_operating_point(self.config.operating_point)
             .with_partials(self.config.enable_partials)
             .with_max_delay(self.config.max_delay);
+        // `operating_point` is optional on the realtime API: sent only when the configured model
+        // chose one (see `speechmatics_operating_point`), else Speechmatics' default applies.
+        if let Some(op) = self.config.operating_point {
+            transcription_config = transcription_config.with_operating_point(op);
+        }
 
         // Diarization: an explicit channel/speaker mode override (from the standardized
         // `multichannel`/`diarization` features) takes precedence over the legacy speaker-only flag.
@@ -514,7 +525,7 @@ impl BaseSTT for SpeechmaticsSTT {
             "Creating Speechmatics STT client: region={}, language={}, operating_point={}",
             speechmatics_config.region,
             speechmatics_config.language,
-            speechmatics_config.operating_point
+            operating_point_label(speechmatics_config.operating_point)
         );
 
         Ok(Self {
@@ -1022,6 +1033,44 @@ mod tests {
         assert_eq!(msg.audio_format.format_type, "raw");
         assert_eq!(msg.audio_format.sample_rate, Some(44100));
         assert_eq!(msg.transcription_config.language, "fr");
+    }
+
+    // WIRE-LEVEL: the configured model reaches `transcription_config.operating_point`, and an
+    // unset one leaves it out. It used to be dropped, and `standard` sent on every session.
+    #[test]
+    fn model_reaches_operating_point_on_the_wire() {
+        let start_json = |model: &str| {
+            let stt = SpeechmaticsSTT::new(STTConfig {
+                api_key: "test-api-key".to_string(),
+                language: "en".to_string(),
+                model: model.to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+            serde_json::to_value(stt.build_start_recognition()).unwrap()
+        };
+        assert_eq!(
+            start_json("enhanced")["transcription_config"]["operating_point"],
+            "enhanced"
+        );
+        assert_eq!(
+            start_json("standard")["transcription_config"]["operating_point"],
+            "standard"
+        );
+        assert!(
+            start_json("")["transcription_config"]
+                .get("operating_point")
+                .is_none()
+        );
+        // A model the realtime API does not serve is refused at construction, by name.
+        let Err(err) = SpeechmaticsSTT::new(STTConfig {
+            api_key: "test-api-key".to_string(),
+            model: "batch-melia-1".to_string(),
+            ..Default::default()
+        }) else {
+            panic!("batch-melia-1 must be refused on the realtime API");
+        };
+        assert!(err.to_string().contains("batch-melia-1"), "{err}");
     }
 
     // WIRE-LEVEL: every standardized Speechmatics knob must travel from the standardized config

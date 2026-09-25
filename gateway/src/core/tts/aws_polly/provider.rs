@@ -9,8 +9,9 @@
 //! - Operation: SynthesizeSpeech
 //! - Engines: standard, neural, long-form, generative
 //! - Voices: 60+ voices across 30+ languages
-//! - Output formats: mp3, ogg_vorbis, pcm (16-bit signed little-endian)
-//! - Sample rates: mp3/ogg (8000, 16000, 22050, 24000), pcm (8000, 16000)
+//! - Output formats: pcm (16-bit signed little-endian), mp3, ogg_vorbis, ogg_opus
+//! - Sample rates: mp3/ogg_vorbis (8000, 16000, 22050, 24000, 44100, 48000), pcm (8000, 16000),
+//!   ogg_opus (48000)
 //!
 //! # Authentication
 //!
@@ -30,7 +31,7 @@
 //! async fn main() {
 //!     let config = AwsPollyTTSConfig {
 //!         voice: PollyVoice::Joanna,
-//!         engine: PollyEngine::Neural,
+//!         engine: Some(PollyEngine::Neural),
 //!         ..Default::default()
 //!     };
 //!
@@ -65,7 +66,6 @@ use tracing::{debug, error, info, warn};
 use super::config::{
     AwsPollyTTSConfig, MAX_TEXT_LENGTH, PollyEngine, PollyOutputFormat, PollyVoice, TextType,
 };
-use crate::core::stt::aws_transcribe::AwsRegion;
 use crate::core::tts::base::{
     AudioCallback, AudioData, BaseTTS, ConnectionState, TTSConfig, TTSError, TTSResult,
 };
@@ -93,6 +93,7 @@ fn output_format_to_sdk(format: PollyOutputFormat) -> OutputFormat {
     match format {
         PollyOutputFormat::Mp3 => OutputFormat::Mp3,
         PollyOutputFormat::OggVorbis => OutputFormat::OggVorbis,
+        PollyOutputFormat::OggOpus => OutputFormat::OggOpus,
         PollyOutputFormat::Pcm => OutputFormat::Pcm,
     }
 }
@@ -162,9 +163,9 @@ fn voice_to_sdk(voice: &PollyVoice) -> VoiceId {
     }
 }
 
-/// Convert AwsRegion to AWS SDK Region
-fn region_to_sdk(region: AwsRegion) -> Region {
-    Region::new(region.as_str())
+/// The engine as a log field: the name, or what Polly applies when none is sent.
+fn engine_label(engine: Option<PollyEngine>) -> &'static str {
+    engine.map_or("(unset: Polly default, standard)", |e| e.as_str())
 }
 
 // =============================================================================
@@ -177,7 +178,7 @@ fn region_to_sdk(region: AwsRegion) -> Region {
 /// SynthesizeSpeech API. It supports:
 /// - Multiple voices (60+ across 30+ languages)
 /// - Multiple engines (standard, neural, long-form, generative)
-/// - Multiple output formats (mp3, ogg_vorbis, pcm)
+/// - Multiple output formats (pcm, mp3, ogg_vorbis, ogg_opus)
 /// - SSML input for fine-grained control
 /// - AWS credential management (explicit keys, IAM roles, etc.)
 ///
@@ -199,68 +200,14 @@ pub struct AwsPollyTTS {
 impl AwsPollyTTS {
     /// Create a new Amazon Polly TTS instance from base TTSConfig.
     ///
-    /// This creates a default Polly configuration and overrides voice and
-    /// sample rate from the base config if provided.
+    /// Resolves voice, engine (`model`), output format and sample rate exactly as the
+    /// standardized path does ([`AwsPollyTTSConfig::from_base`]): an unsupported format or an
+    /// unknown engine is a configuration error, and an out-of-range pcm rate is sent — and
+    /// reported — as 16000.
     pub fn new(config: TTSConfig) -> TTSResult<Self> {
-        // Parse voice from config
-        let voice = config
-            .voice_id
-            .as_ref()
-            .map(|v| PollyVoice::from_str_or_default(v))
-            .unwrap_or_default();
-
-        // Parse engine from model field
-        let engine = if config.model.is_empty() {
-            PollyEngine::default()
-        } else {
-            PollyEngine::from_str_or_default(&config.model)
-        };
-
-        // Parse output format
-        let output_format = config
-            .audio_format
-            .as_ref()
-            .map(|f| PollyOutputFormat::from_str_or_default(f))
-            .unwrap_or_default();
-
-        // Adjust sample rate if not supported by the output format
-        // AWS Polly PCM only supports 8000 and 16000 Hz
-        let mut base_config = config;
-        if let Some(rate) = base_config.sample_rate {
-            if !output_format.supported_sample_rates().contains(&rate) {
-                debug!(
-                    "Sample rate {} not supported for {} format, using default {}",
-                    rate,
-                    output_format.as_str(),
-                    output_format.default_sample_rate()
-                );
-                base_config.sample_rate = Some(output_format.default_sample_rate());
-            }
-        } else {
-            base_config.sample_rate = Some(output_format.default_sample_rate());
-        }
-
-        // Build Polly-specific config from base config
-        let polly_config = AwsPollyTTSConfig {
-            base: base_config,
-            voice,
-            engine,
-            output_format,
-            ..Default::default()
-        };
-
-        // Validate configuration
-        polly_config
-            .validate()
-            .map_err(TTSError::InvalidConfiguration)?;
-
-        Ok(Self {
-            config: polly_config,
-            client: Arc::new(RwLock::new(None)),
-            connected: Arc::new(AtomicBool::new(false)),
-            audio_callback: Arc::new(RwLock::new(None)),
-            request_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        })
+        let polly_config =
+            AwsPollyTTSConfig::from_base(config).map_err(TTSError::InvalidConfiguration)?;
+        Self::new_from_polly_config(polly_config)
     }
 
     /// Build the provider from the standardized config (W1 keystone), mirroring
@@ -270,7 +217,8 @@ impl AwsPollyTTS {
     /// SynthesizeSpeech request through the standardized dispatch instead of being dropped at the
     /// flat boundary.
     pub fn from_standard(std: &crate::core::tts::standard::StandardTTSConfig) -> TTSResult<Self> {
-        let polly_config = AwsPollyTTSConfig::from_standard(std);
+        let polly_config =
+            AwsPollyTTSConfig::from_standard(std).map_err(TTSError::InvalidConfiguration)?;
         Self::new_from_polly_config(polly_config)
     }
 
@@ -291,8 +239,12 @@ impl AwsPollyTTS {
     }
 
     /// Initialize AWS Polly client with credentials.
+    ///
+    /// The region is the configured name passed straight to the SDK (`Region::new`), so any
+    /// AWS-shaped region works — not only the 16 an old enum listed (every other one used to
+    /// become us-east-1).
     async fn init_client(&self) -> TTSResult<PollyClient> {
-        let region = region_to_sdk(self.config.region);
+        let region: Region = self.config.region.to_sdk();
 
         // Build AWS config
         let aws_config =
@@ -370,11 +322,14 @@ impl AwsPollyTTS {
             aws_sdk_polly::operation::synthesize_speech::SynthesizeSpeechInput::builder()
                 .text(text)
                 .voice_id(voice_to_sdk(&self.config.voice))
-                .engine(engine_to_sdk(self.config.engine))
+                // Engine is optional on SynthesizeSpeech: with none Polly applies `standard`.
+                // `None` (an empty model) therefore sends nothing rather than a guessed engine.
+                .set_engine(self.config.engine.map(engine_to_sdk))
                 .output_format(output_format)
                 .text_type(text_type_to_sdk(self.config.text_type));
 
-        // Add sample rate if specified and supported
+        // The resolved rate (see `PollyOutputFormat::resolve_sample_rate`): always set for pcm and
+        // ogg_opus, set for mp3/ogg_vorbis only when the caller chose a rate Polly accepts.
         if let Some(sample_rate) = self.config.base.sample_rate {
             input = input.sample_rate(sample_rate.to_string());
         }
@@ -424,7 +379,7 @@ impl AwsPollyTTS {
             request_id = request_id,
             text_len = text.len(),
             voice = %self.config.voice,
-            engine = %self.config.engine,
+            engine = engine_label(self.config.engine),
             "Synthesizing text with Amazon Polly"
         );
 
@@ -476,11 +431,9 @@ impl AwsPollyTTS {
         };
 
         let format = self.config.output_format.as_str().to_string();
-        let sample_rate = self
-            .config
-            .base
-            .sample_rate
-            .unwrap_or_else(|| self.config.output_format.default_sample_rate());
+        // The rate Polly produced: the one sent, else its documented default for this format and
+        // engine. The OpenAI route wraps pcm in a WAV header / `x-sample-rate` at this rate.
+        let sample_rate = self.config.output_sample_rate();
 
         // For PCM, chunk the audio for streaming delivery
         // For compressed formats (MP3, OGG), deliver as single chunk
@@ -514,7 +467,7 @@ impl AwsPollyTTS {
                     offset = end;
                 }
             }
-            PollyOutputFormat::Mp3 | PollyOutputFormat::OggVorbis => {
+            PollyOutputFormat::Mp3 | PollyOutputFormat::OggVorbis | PollyOutputFormat::OggOpus => {
                 // Compressed formats: deliver as single chunk
                 // Duration calculation is complex for compressed audio
                 let audio_data = AudioData {
@@ -539,8 +492,8 @@ impl AwsPollyTTS {
         self.config.voice.clone()
     }
 
-    /// Get the configured engine
-    pub fn engine(&self) -> PollyEngine {
+    /// Get the configured engine (`None`: none is sent and Polly applies `standard`)
+    pub fn engine(&self) -> Option<PollyEngine> {
         self.config.engine
     }
 
@@ -570,7 +523,7 @@ impl BaseTTS for AwsPollyTTS {
         info!(
             region = %self.config.region,
             voice = %self.config.voice,
-            engine = %self.config.engine,
+            engine = engine_label(self.config.engine),
             "Connecting to Amazon Polly"
         );
 
@@ -682,12 +635,13 @@ impl BaseTTS for AwsPollyTTS {
             "api_type": "AWS SDK",
             "connection_pooling": false,
             "region": self.config.region.as_str(),
-            "supported_formats": ["mp3", "ogg_vorbis", "pcm"],
+            "supported_formats": ["mp3", "ogg_vorbis", "ogg_opus", "pcm"],
             "supported_engines": ["standard", "neural", "long-form", "generative"],
             "supported_sample_rates": {
-                "mp3": [8000, 16000, 22050, 24000],
-                "ogg_vorbis": [8000, 16000, 22050, 24000],
-                "pcm": [8000, 16000]
+                "mp3": PollyOutputFormat::Mp3.supported_sample_rates(),
+                "ogg_vorbis": PollyOutputFormat::OggVorbis.supported_sample_rates(),
+                "ogg_opus": PollyOutputFormat::OggOpus.supported_sample_rates(),
+                "pcm": PollyOutputFormat::Pcm.supported_sample_rates()
             },
             "max_text_length": MAX_TEXT_LENGTH,
             "supported_voices": [
@@ -734,7 +688,7 @@ mod tests {
         assert!(!tts.is_ready());
         assert_eq!(tts.get_connection_state(), ConnectionState::Disconnected);
         assert_eq!(tts.voice(), PollyVoice::Joanna);
-        assert_eq!(tts.engine(), PollyEngine::Neural);
+        assert_eq!(tts.engine(), Some(PollyEngine::Neural));
         assert_eq!(tts.output_format(), PollyOutputFormat::Pcm);
     }
 
@@ -764,7 +718,7 @@ mod tests {
         assert_eq!(tts.polly_config().language_code, Some("en-GB".to_string()));
         assert_eq!(tts.polly_config().base.sample_rate, Some(16000));
         assert_eq!(tts.voice(), PollyVoice::Matthew);
-        assert_eq!(tts.engine(), PollyEngine::Neural);
+        assert_eq!(tts.engine(), Some(PollyEngine::Neural));
     }
 
     #[tokio::test]
@@ -854,14 +808,14 @@ mod tests {
     async fn test_aws_polly_from_polly_config() {
         let config = AwsPollyTTSConfig {
             voice: PollyVoice::Matthew,
-            engine: PollyEngine::Neural,
+            engine: Some(PollyEngine::Neural),
             output_format: PollyOutputFormat::Mp3,
             ..Default::default()
         };
 
         let tts = AwsPollyTTS::new_from_polly_config(config).unwrap();
         assert_eq!(tts.voice(), PollyVoice::Matthew);
-        assert_eq!(tts.engine(), PollyEngine::Neural);
+        assert_eq!(tts.engine(), Some(PollyEngine::Neural));
         assert_eq!(tts.output_format(), PollyOutputFormat::Mp3);
     }
 
@@ -878,9 +832,14 @@ mod tests {
         let tts = AwsPollyTTS::new(config).unwrap();
         // With no voice_id, should use Polly defaults
         assert_eq!(tts.voice(), PollyVoice::Joanna); // Default Polly voice
-        assert_eq!(tts.engine(), PollyEngine::Neural);
-        // Default output format is Mp3 (based on PollyOutputFormat::default())
-        assert_eq!(tts.output_format(), PollyOutputFormat::Mp3);
+        // No model → no engine sent; Polly applies `standard`. (This was `neural`, a choice
+        // nobody made.)
+        assert_eq!(tts.engine(), None);
+        // No format → pcm, WaaV's canonical linear16 — the same answer the standardized path
+        // gives. (The flat path used to pick mp3 here and the standardized one pcm.)
+        assert_eq!(tts.output_format(), PollyOutputFormat::Pcm);
+        // TTSConfig's default 24000 is not a pcm rate: 16000 is sent and reported.
+        assert_eq!(tts.polly_config().base.sample_rate, Some(16000));
     }
 
     #[tokio::test]
@@ -919,6 +878,10 @@ mod tests {
     #[test]
     fn test_output_format_conversion() {
         assert!(matches!(
+            output_format_to_sdk(PollyOutputFormat::OggOpus),
+            OutputFormat::OggOpus
+        ));
+        assert!(matches!(
             output_format_to_sdk(PollyOutputFormat::Pcm),
             OutputFormat::Pcm
         ));
@@ -954,12 +917,231 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_region_conversion() {
-        let region = region_to_sdk(AwsRegion::UsEast1);
-        assert_eq!(region.to_string(), "us-east-1");
+    // =========================================================================
+    // WIRE-LEVEL: what the resolved config puts on the actual SynthesizeSpeech
+    // input, and what the provider REPORTS for the audio it delivers. The
+    // OpenAI route labels/wraps pcm with the reported rate, so reported must
+    // equal sent.
+    // =========================================================================
 
-        let region = region_to_sdk(AwsRegion::EuWest1);
-        assert_eq!(region.to_string(), "eu-west-1");
+    /// Records what `deliver_audio` reports on each chunk.
+    #[derive(Default)]
+    struct ReportedAudio {
+        chunks: std::sync::Mutex<Vec<(u32, String)>>,
+    }
+
+    impl AudioCallback for ReportedAudio {
+        fn on_audio(
+            &self,
+            audio: AudioData,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            self.chunks
+                .lock()
+                .unwrap()
+                .push((audio.sample_rate, audio.format));
+            Box::pin(async {})
+        }
+
+        fn on_error(
+            &self,
+            _: TTSError,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            Box::pin(async {})
+        }
+
+        fn on_complete(
+            &self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            Box::pin(async {})
+        }
+    }
+
+    /// Build the provider the way the OpenAI route does: flat fields in a standardized config.
+    fn route_like(audio_format: &str, model: &str, sample_rate: Option<u32>) -> AwsPollyTTS {
+        let std = crate::core::tts::standard::StandardTTSConfig::from_base(TTSConfig {
+            provider: "aws-polly".into(),
+            voice_id: Some("Joanna".into()),
+            model: model.into(),
+            audio_format: Some(audio_format.into()),
+            sample_rate,
+            ..Default::default()
+        });
+        AwsPollyTTS::from_standard(&std)
+            .unwrap_or_else(|e| panic!("{audio_format}/{model}/{sample_rate:?}: {e}"))
+    }
+
+    /// The rate the provider reports for delivered audio.
+    async fn reported_rate(tts: &AwsPollyTTS) -> (u32, String) {
+        let seen = Arc::new(ReportedAudio::default());
+        *tts.audio_callback.write().await = Some(seen.clone() as Arc<dyn AudioCallback>);
+        tts.deliver_audio(Bytes::from(vec![0u8; 640]))
+            .await
+            .unwrap();
+        let chunks = seen.chunks.lock().unwrap().clone();
+        assert!(!chunks.is_empty());
+        assert!(chunks.iter().all(|c| *c == chunks[0]), "one rate per clip");
+        chunks[0].clone()
+    }
+
+    /// Each OpenAI format the route sends (`as_waav_format`) reaches the request as the matching
+    /// Polly OutputFormat. `from_standard` used to send pcm for all of them.
+    #[tokio::test]
+    async fn requested_format_reaches_the_synthesize_request() {
+        for (requested, expected) in [
+            ("linear16", OutputFormat::Pcm),
+            ("wav", OutputFormat::Pcm),
+            ("mp3", OutputFormat::Mp3),
+            ("opus", OutputFormat::OggOpus),
+            ("ogg_vorbis", OutputFormat::OggVorbis),
+        ] {
+            let input = route_like(requested, "", None)
+                .build_synthesize_input("Hello")
+                .unwrap();
+            assert_eq!(
+                input.get_output_format().clone(),
+                Some(expected),
+                "{requested}"
+            );
+        }
+    }
+
+    /// `aac` / `flac` cannot be produced: refused at construction, before any vendor call.
+    #[tokio::test]
+    async fn unsupported_formats_are_refused_at_construction() {
+        for bad in ["aac", "flac"] {
+            let std = crate::core::tts::standard::StandardTTSConfig::from_base(TTSConfig {
+                provider: "aws-polly".into(),
+                audio_format: Some(bad.into()),
+                ..Default::default()
+            });
+            match AwsPollyTTS::from_standard(&std) {
+                Err(TTSError::InvalidConfiguration(m)) => assert!(m.contains(bad), "{m}"),
+                Err(other) => panic!("{bad}: expected InvalidConfiguration, got {other:?}"),
+                Ok(_) => panic!("{bad} must not be synthesised as another format"),
+            }
+            assert!(
+                AwsPollyTTS::new(std.base.clone()).is_err(),
+                "flat path, {bad}"
+            );
+        }
+    }
+
+    /// The route asks for 24 kHz pcm. Polly pcm takes 8000/16000 only, so 16000 is SENT and the
+    /// provider REPORTS 16000 — the rate the route then writes into `x-sample-rate` / the WAV
+    /// header. Every such request used to fail validation; had it passed, a 24000 label on 16 kHz
+    /// samples would have played at 1.5x.
+    #[tokio::test]
+    async fn pcm_rate_sent_and_reported_agree() {
+        for (format, requested, sent) in [
+            ("linear16", Some(24000), 16000),
+            ("linear16", Some(16000), 16000),
+            ("linear16", Some(8000), 8000),
+            ("wav", None, 16000),
+        ] {
+            let tts = route_like(format, "", requested);
+            let input = tts.build_synthesize_input("Hello").unwrap();
+            assert_eq!(
+                input.get_sample_rate().as_deref(),
+                Some(sent.to_string().as_str()),
+                "{format} {requested:?}"
+            );
+            assert_eq!(
+                reported_rate(&tts).await,
+                (sent, "pcm".to_string()),
+                "{format} {requested:?}"
+            );
+        }
+    }
+
+    /// ogg_opus: 48000 is sent and reported. mp3 with no rate: none is sent and the reported rate
+    /// is Polly's default for the engine (22050 standard / none, 24000 neural).
+    #[tokio::test]
+    async fn compressed_formats_report_the_rate_polly_produces() {
+        let tts = route_like("opus", "", None);
+        let input = tts.build_synthesize_input("Hello").unwrap();
+        assert_eq!(input.get_sample_rate().as_deref(), Some("48000"));
+        assert_eq!(reported_rate(&tts).await, (48000, "ogg_opus".to_string()));
+
+        let tts = route_like("mp3", "", None);
+        assert_eq!(
+            tts.build_synthesize_input("Hello")
+                .unwrap()
+                .get_sample_rate(),
+            &None
+        );
+        assert_eq!(reported_rate(&tts).await, (22050, "mp3".to_string()));
+
+        let tts = route_like("mp3", "neural", None);
+        assert_eq!(reported_rate(&tts).await, (24000, "mp3".to_string()));
+
+        let tts = route_like("mp3", "", Some(44100));
+        let input = tts.build_synthesize_input("Hello").unwrap();
+        assert_eq!(input.get_sample_rate().as_deref(), Some("44100"));
+        assert_eq!(reported_rate(&tts).await, (44100, "mp3".to_string()));
+    }
+
+    /// Engine: an empty model sends NO engine (Polly applies `standard`); a catalog name sends
+    /// that engine; an unknown model is refused. All three used to send `neural`.
+    #[tokio::test]
+    async fn engine_is_sent_only_when_the_model_names_one() {
+        let input = route_like("mp3", "", None)
+            .build_synthesize_input("Hello")
+            .unwrap();
+        assert_eq!(input.get_engine(), &None, "empty model sends no engine");
+
+        for (model, engine) in [
+            ("standard", Engine::Standard),
+            ("neural", Engine::Neural),
+            ("long-form", Engine::LongForm),
+            ("generative", Engine::Generative),
+        ] {
+            let input = route_like("mp3", model, None)
+                .build_synthesize_input("Hello")
+                .unwrap();
+            assert_eq!(input.get_engine(), &Some(engine), "{model}");
+        }
+
+        let std = crate::core::tts::standard::StandardTTSConfig::from_base(TTSConfig {
+            provider: "aws-polly".into(),
+            model: "polly-turbo".into(),
+            ..Default::default()
+        });
+        match AwsPollyTTS::from_standard(&std) {
+            Err(TTSError::InvalidConfiguration(m)) => assert!(m.contains("polly-turbo"), "{m}"),
+            Err(other) => panic!("expected InvalidConfiguration, got {other:?}"),
+            Ok(_) => panic!("an unknown model must not become neural"),
+        }
+    }
+
+    /// The region reaches the SDK client verbatim — including regions the old enum turned into
+    /// us-east-1. Explicit credentials, so building the client touches no default chain.
+    #[tokio::test]
+    async fn region_reaches_the_sdk_client() {
+        // Building the SDK client may build its default TLS client; make the provider unambiguous.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        for name in ["eu-north-1", "ap-northeast-3", "us-east-1"] {
+            let mut std = crate::core::tts::standard::StandardTTSConfig::from_base(TTSConfig {
+                provider: "aws-polly".into(),
+                ..Default::default()
+            });
+            for (k, v) in [
+                ("aws_access_key_id", "AKIAIOSFODNN7EXAMPLE"),
+                (
+                    "aws_secret_access_key",
+                    "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+                ),
+                ("region", name),
+            ] {
+                std.extras.0.insert(k.into(), serde_json::json!(v));
+            }
+            let tts = AwsPollyTTS::from_standard(&std).unwrap();
+            let client = tts.init_client().await.unwrap();
+            assert_eq!(
+                client.config().region().map(|r| r.as_ref()),
+                Some(name),
+                "{name}"
+            );
+            assert_eq!(tts.get_provider_info()["region"], name);
+        }
     }
 }

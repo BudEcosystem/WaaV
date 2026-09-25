@@ -498,9 +498,10 @@ fn test_tts_ws_config_conversion_with_defaults() {
     assert_eq!(tts_config.provider, "deepgram");
     assert_eq!(tts_config.api_key, api_key);
 
-    // Should use default values
-    assert_eq!(tts_config.voice_id, Some("aura-asteria-en".to_string()));
-    assert_eq!(tts_config.speaking_rate, Some(1.0));
+    // No voice and no speed invented: the provider applies its own (a Deepgram voice used to
+    // be filled in here for every vendor). The wire format keeps its protocol default.
+    assert_eq!(tts_config.voice_id, None);
+    assert_eq!(tts_config.speaking_rate, None);
     assert_eq!(tts_config.audio_format, Some("linear16".to_string()));
     assert_eq!(tts_config.sample_rate, Some(24000));
     assert_eq!(tts_config.connection_timeout, Some(30));
@@ -1134,7 +1135,7 @@ fn test_tts_ws_config_conversion_mixed_values() {
     assert_eq!(tts_config.provider, "deepgram");
     assert_eq!(tts_config.api_key, api_key);
     assert_eq!(tts_config.voice_id, Some("custom-voice".to_string()));
-    assert_eq!(tts_config.speaking_rate, Some(1.0)); // Default
+    assert_eq!(tts_config.speaking_rate, None); // not chosen → not sent
     assert_eq!(tts_config.audio_format, Some("pcm".to_string()));
     assert_eq!(tts_config.sample_rate, Some(24000)); // Default
     assert_eq!(tts_config.connection_timeout, Some(45));

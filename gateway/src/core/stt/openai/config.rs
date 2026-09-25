@@ -85,12 +85,32 @@ impl OpenAISTTModel {
     }
 
     /// Parse from string, with fallback to default.
+    ///
+    /// The fallback makes this unfit for deciding what to SEND: an id this enum does not know
+    /// (`gpt-4o-mini-transcribe-2025-12-15`, `gpt-transcribe`, …) comes back as `whisper-1`.
+    /// [`OpenAISTTConfig::from_base`] uses [`Self::parse_known`] and keeps the id verbatim instead.
     pub fn from_str_or_default(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
-            "whisper-1" | "whisper1" | "whisper" => Self::Whisper1,
-            "gpt-4o-transcribe" | "gpt4o-transcribe" => Self::Gpt4oTranscribe,
-            "gpt-4o-mini-transcribe" | "gpt4o-mini-transcribe" => Self::Gpt4oMiniTranscribe,
-            _ => Self::default(),
+        Self::parse_known(s).unwrap_or_default()
+    }
+
+    /// Parse one of the ids (or WaaV's aliases for them) this enum names; `None` for anything else.
+    pub fn parse_known(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "whisper-1" | "whisper1" | "whisper" => Some(Self::Whisper1),
+            "gpt-4o-transcribe" | "gpt4o-transcribe" => Some(Self::Gpt4oTranscribe),
+            "gpt-4o-mini-transcribe" | "gpt4o-mini-transcribe" => Some(Self::Gpt4oMiniTranscribe),
+            _ => None,
+        }
+    }
+
+    /// The closest known model FAMILY for any id, for descriptive use only: `whisper*` is the
+    /// Whisper family, everything else the GPT-4o transcribe family. Capability decisions read the
+    /// id itself (see [`OpenAISTTConfig::is_whisper_model`]), never this.
+    fn family_of(s: &str) -> Self {
+        match Self::parse_known(s) {
+            Some(m) => m,
+            None if s.trim().to_ascii_lowercase().starts_with("whisper") => Self::Whisper1,
+            None => Self::Gpt4oTranscribe,
         }
     }
 }
@@ -500,8 +520,18 @@ pub struct OpenAISTTConfig {
     /// Base STT configuration (shared across all providers).
     pub base: STTConfig,
 
-    /// OpenAI STT model to use.
+    /// OpenAI STT model to use — or, when [`model_id`](Self::model_id) is set, the closest known
+    /// family of that model (descriptive only; it is not what is sent).
     pub model: OpenAISTTModel,
+
+    /// The configured model id, verbatim, when it is not one [`OpenAISTTModel`] names.
+    ///
+    /// OpenAI ships dated snapshots and new transcription models faster than an enum can follow
+    /// (`gpt-4o-mini-transcribe-2025-12-15`, `gpt-transcribe`, …). They are real ids, and the
+    /// enum's fallback used to rewrite every one of them to `whisper-1` — a different model than
+    /// the one chosen. When set, this is what reaches the `model` field (see
+    /// [`wire_model`](OpenAISTTConfig::wire_model)). `None` sends [`model`](Self::model).
+    pub model_id: Option<String>,
 
     /// Response format for transcription results.
     pub response_format: ResponseFormat,
@@ -510,12 +540,15 @@ pub struct OpenAISTTConfig {
     ///
     /// Lower values make output more deterministic.
     /// Higher values make output more creative/varied.
-    /// Default is 0.0 for most deterministic results.
+    /// `None` (the default) omits the field and OpenAI applies its own default; only a caller's
+    /// or deployment's explicit value is sent.
     pub temperature: Option<f32>,
 
     /// Timestamp granularities to include in verbose_json output.
     ///
-    /// Only applicable when `response_format` is `VerboseJson`.
+    /// Only applicable when `response_format` is `VerboseJson`. Empty by default — OpenAI's own
+    /// default is segment-level — and `word` is requested only when word timestamps were asked
+    /// for (`SttFeatures::word_timestamps`); word granularity adds latency on OpenAI's side.
     pub timestamp_granularities: Vec<TimestampGranularity>,
 
     /// Audio input format for the API request.
@@ -605,9 +638,14 @@ impl Default for OpenAISTTConfig {
         Self {
             base: STTConfig::default(),
             model: OpenAISTTModel::default(),
-            response_format: ResponseFormat::VerboseJson, // For word timestamps
-            temperature: Some(0.0),                       // Deterministic results
-            timestamp_granularities: vec![TimestampGranularity::Word],
+            model_id: None,
+            // WaaV's own choice, not a vendor knob: `verbose_json` is the whisper-1 body that
+            // carries the detected `language` and the `duration` the result is built from.
+            response_format: ResponseFormat::VerboseJson,
+            // Omitted unless someone sets it: OpenAI's own default applies.
+            temperature: None,
+            // Omitted unless word timestamps were asked for (see `from_standard`).
+            timestamp_granularities: Vec::new(),
             audio_input_format: AudioInputFormat::Wav,
             prompt: None,
             flush_strategy: FlushStrategy::OnDisconnect,
@@ -625,21 +663,54 @@ impl Default for OpenAISTTConfig {
 impl OpenAISTTConfig {
     /// Create a new configuration from base STTConfig.
     ///
-    /// Automatically determines the model from the config if specified.
+    /// Vendor contract: `model` is REQUIRED on `POST /v1/audio/transcriptions`, so an unset model
+    /// becomes `whisper-1` — the one default here. A configured model is sent as configured: a
+    /// known id (or a WaaV alias for one) in its canonical spelling, and anything else verbatim
+    /// through [`model_id`](Self::model_id), for OpenAI to accept or name in its error. It used
+    /// to become `whisper-1` too, silently transcribing with a model nobody chose.
     pub fn from_base(base: STTConfig) -> Self {
-        let model = if base.model.is_empty() {
-            OpenAISTTModel::default()
+        let requested = base.model.trim();
+        let (model, model_id) = if requested.is_empty() {
+            (OpenAISTTModel::default(), None)
         } else {
-            OpenAISTTModel::from_str_or_default(&base.model)
+            match OpenAISTTModel::parse_known(requested) {
+                Some(known) => (known, None),
+                None => (
+                    OpenAISTTModel::family_of(requested),
+                    Some(requested.to_string()),
+                ),
+            }
         };
 
         let mut cfg = Self {
             base,
             model,
+            model_id,
             ..Default::default()
         };
         cfg.coerce_response_format_for_model();
         cfg
+    }
+
+    /// The model id that reaches the wire: [`model_id`](Self::model_id) when set, else
+    /// [`model`](Self::model)'s canonical spelling.
+    pub fn wire_model(&self) -> &str {
+        self.model_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .unwrap_or_else(|| self.model.as_str())
+    }
+
+    /// Whether the model on the wire is a Whisper model (`whisper-1`, or any `whisper*` id).
+    ///
+    /// Every model-dependent decision — which response formats are allowed, whether timestamp
+    /// granularities apply, whether `stream` and diarization are available — reads this, i.e. the
+    /// id actually sent, and never the enum's fallback.
+    pub fn is_whisper_model(&self) -> bool {
+        self.wire_model()
+            .to_ascii_lowercase()
+            .starts_with("whisper")
     }
 
     /// gpt-4o-transcribe / gpt-4o-mini-transcribe support ONLY `json`/`text`
@@ -648,11 +719,10 @@ impl OpenAISTTConfig {
     /// models so the default (and any word-timestamp request) degrades safely
     /// instead of erroring. Streaming (`stream=true`) is `json`-only too, and
     /// only those models stream, so this covers it. `DiarizedJson` is untouched
-    /// (its own model path).
+    /// (its own model path). Decided on the id sent ([`Self::is_whisper_model`]): every
+    /// non-Whisper transcription model shares the gpt-4o restriction.
     fn coerce_response_format_for_model(&mut self) {
-        if self.model != OpenAISTTModel::Whisper1
-            && self.response_format == ResponseFormat::VerboseJson
-        {
+        if !self.is_whisper_model() && self.response_format == ResponseFormat::VerboseJson {
             self.response_format = ResponseFormat::Json;
             // Word-timestamp granularities require verbose_json — drop them too.
             self.timestamp_granularities.clear();
@@ -777,7 +847,7 @@ impl OpenAISTTConfig {
     /// `known_speaker_references[]`) appear once per value, matching OpenAI's array-form encoding.
     pub fn transcription_text_fields(&self) -> Vec<(String, String)> {
         let mut fields: Vec<(String, String)> = Vec::new();
-        fields.push(("model".into(), self.model.as_str().to_string()));
+        fields.push(("model".into(), self.wire_model().to_string()));
         fields.push((
             "response_format".into(),
             self.response_format.as_str().to_string(),
@@ -898,7 +968,7 @@ impl OpenAISTTConfig {
         if self.response_format == ResponseFormat::DiarizedJson && !self.supports_diarization() {
             return Err(format!(
                 "Diarized JSON format requires gpt-4o-transcribe or gpt-4o-mini-transcribe model, got {}",
-                self.model
+                self.wire_model()
             ));
         }
 
@@ -906,12 +976,13 @@ impl OpenAISTTConfig {
     }
 
     /// Check if the current model supports diarization.
+    ///
+    /// Decided on the id actually sent: Whisper cannot diarize; the GPT-4o transcribe family (and
+    /// the ids OpenAI ships after it) can be asked to, and OpenAI names the model in its error if a
+    /// particular one cannot.
     #[inline]
     pub fn supports_diarization(&self) -> bool {
-        matches!(
-            self.model,
-            OpenAISTTModel::Gpt4oTranscribe | OpenAISTTModel::Gpt4oMiniTranscribe
-        )
+        !self.is_whisper_model()
     }
 
     /// Check if diarization is enabled.
@@ -1184,16 +1255,140 @@ mod tests {
 
         let config = OpenAISTTConfig::from_base(base);
         assert_eq!(config.model, OpenAISTTModel::Gpt4oTranscribe);
+        assert_eq!(config.model_id, None, "a known id needs no verbatim copy");
     }
 
     #[test]
     fn test_default_config() {
         let config = OpenAISTTConfig::default();
         assert_eq!(config.model, OpenAISTTModel::Whisper1);
+        assert_eq!(config.model_id, None);
         assert_eq!(config.response_format, ResponseFormat::VerboseJson);
-        assert_eq!(config.temperature, Some(0.0));
+        // Nobody chose a temperature or a timestamp granularity, so neither is sent.
+        assert_eq!(config.temperature, None);
+        assert!(config.timestamp_granularities.is_empty());
         assert_eq!(config.flush_threshold_bytes, 1024 * 1024);
         assert_eq!(config.max_file_size_bytes, 25 * 1024 * 1024);
+    }
+
+    // =========================================================================
+    // What reaches the wire: model, language, temperature, granularities
+    // =========================================================================
+
+    fn fields_for(model: &str, language: &str) -> Vec<(String, String)> {
+        OpenAISTTConfig::from_base(STTConfig {
+            api_key: "k".to_string(),
+            model: model.to_string(),
+            language: language.to_string(),
+            ..Default::default()
+        })
+        .transcription_text_fields()
+    }
+
+    fn field<'a>(fields: &'a [(String, String)], key: &str) -> Option<&'a str> {
+        fields
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn an_unknown_model_id_is_sent_verbatim_not_rewritten_to_whisper_1() {
+        // Real OpenAI ids the enum does not name. The fallback used to send `whisper-1` for every
+        // one of them — a different model than the one chosen.
+        for model in ["gpt-4o-mini-transcribe-2025-12-15", "gpt-transcribe"] {
+            let fields = fields_for(model, "en");
+            assert_eq!(field(&fields, "model"), Some(model), "{fields:?}");
+            // They are gpt-4o-family models, so the family's format rule still applies:
+            // verbose_json is a 400 there, and granularities ride only on verbose_json.
+            assert_eq!(field(&fields, "response_format"), Some("json"), "{model}");
+            assert_eq!(field(&fields, "timestamp_granularities[]"), None, "{model}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_whisper_model_keeps_whisper_rules() {
+        let cfg = OpenAISTTConfig::from_base(STTConfig {
+            api_key: "k".to_string(),
+            model: "whisper-large-v3".to_string(),
+            ..Default::default()
+        });
+        assert_eq!(cfg.wire_model(), "whisper-large-v3");
+        assert!(cfg.is_whisper_model());
+        assert!(!cfg.supports_diarization());
+        assert_eq!(cfg.response_format, ResponseFormat::VerboseJson);
+    }
+
+    #[test]
+    fn only_an_unset_model_gets_the_required_default() {
+        // `model` is required by OpenAI, so empty is the one case with a default.
+        assert_eq!(field(&fields_for("", "en"), "model"), Some("whisper-1"));
+        // WaaV's own aliases still resolve to the canonical id.
+        assert_eq!(
+            field(&fields_for("whisper", "en"), "model"),
+            Some("whisper-1")
+        );
+        assert_eq!(
+            field(&fields_for("gpt-4o-transcribe", "en"), "model"),
+            Some("gpt-4o-transcribe")
+        );
+    }
+
+    #[test]
+    fn a_dated_gpt4o_snapshot_is_treated_as_its_family() {
+        let cfg = OpenAISTTConfig::from_base(STTConfig {
+            api_key: "k".to_string(),
+            model: "gpt-4o-mini-transcribe-2025-12-15".to_string(),
+            ..Default::default()
+        });
+        assert!(!cfg.is_whisper_model());
+        assert!(cfg.supports_diarization());
+    }
+
+    #[test]
+    fn an_unset_language_is_omitted() {
+        // `language` is optional; absent, OpenAI detects it. The upload route now hands over an
+        // empty language when neither the request nor the deployment names one.
+        let fields = fields_for("whisper-1", "");
+        assert_eq!(field(&fields, "language"), None, "{fields:?}");
+        assert_eq!(
+            field(&fields_for("whisper-1", "de"), "language"),
+            Some("de")
+        );
+    }
+
+    #[test]
+    fn temperature_and_word_granularity_are_sent_only_when_asked_for() {
+        // Both used to go out on every whisper-1 request: `temperature=0` and
+        // `timestamp_granularities[]=word` (which costs latency on OpenAI's side).
+        let fields = fields_for("whisper-1", "en");
+        assert_eq!(field(&fields, "temperature"), None, "{fields:?}");
+        assert_eq!(
+            field(&fields, "timestamp_granularities[]"),
+            None,
+            "{fields:?}"
+        );
+
+        use crate::core::stt::standard::{StandardSTTConfig, SttFeatures};
+        let mut std = StandardSTTConfig::from_base(STTConfig {
+            api_key: "k".to_string(),
+            model: "whisper-1".to_string(),
+            ..Default::default()
+        });
+        std.features = SttFeatures {
+            word_timestamps: Some(true),
+            ..Default::default()
+        };
+        std.extras
+            .0
+            .insert("temperature".into(), serde_json::json!(0.2));
+        let fields = OpenAISTTConfig::from_standard(&std).transcription_text_fields();
+        assert_eq!(field(&fields, "timestamp_granularities[]"), Some("word"));
+        assert_eq!(field(&fields, "response_format"), Some("verbose_json"));
+        assert!(
+            field(&fields, "temperature").is_some_and(|t| t.starts_with("0.2")),
+            "{fields:?}"
+        );
     }
 
     // =========================================================================

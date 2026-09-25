@@ -222,7 +222,8 @@ mod config_tests {
         let config = GroqSTTConfig::default();
         assert_eq!(config.model, GroqSTTModel::WhisperLargeV3Turbo);
         assert_eq!(config.response_format, GroqResponseFormat::VerboseJson);
-        assert_eq!(config.temperature, Some(0.0));
+        // Optional on Groq's side and chosen by nobody, so it is omitted from the request.
+        assert_eq!(config.temperature, None);
         assert_eq!(config.flush_threshold_bytes, 1024 * 1024);
         assert_eq!(config.max_file_size_bytes, DEFAULT_MAX_FILE_SIZE);
         assert!(!config.translate_to_english);

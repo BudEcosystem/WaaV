@@ -95,9 +95,12 @@ pub fn map_language_for(
 
 /// The language an upload sends the vendor, in the vendor's notation (C1/C3 step 3).
 ///
-/// `language`, `channels`, `punctuation` and `encoding` were hardcoded in the handler; they keep
-/// the same values as defaults, so a deployment with no `stt` block behaves as it did — `en-US`
-/// when nothing names a language. The language is routed through the P2 mapper, which is what
+/// `language`, `channels`, `punctuation` and `encoding` were hardcoded in the handler. When
+/// nothing names a language the answer is now EMPTY — no language is sent — rather than the
+/// `en-US` that stood here: that literal switched off every vendor's detection, and went out
+/// unmapped, so OpenAI, Groq and Cartesia received a code in a notation they do not take. A
+/// vendor that requires a language supplies its own fallback. The language is routed through the
+/// P2 mapper, which is what
 /// makes an endpoint default work across vendors, and mapped against the model the vendor will be
 /// called with: `stt.model` replaces the endpoint's in [`apply_stt_flat`].
 ///
@@ -144,7 +147,7 @@ pub fn upload_language(
         return Ok(String::new());
     }
     let Some(canonical) = canonical else {
-        return Ok("en-US".to_string());
+        return Ok(String::new());
     };
     let model = stt
         .model
@@ -1377,14 +1380,19 @@ mod tests {
         assert!(!adv.is_empty());
     }
 
+    /// Nothing names a language → none is sent, and the vendor detects it or applies its own
+    /// default. The `en-US` that used to be returned here switched detection off everywhere.
     #[test]
-    fn nothing_named_still_defaults_to_en_us() {
+    fn nothing_named_sends_no_language() {
         let mut stt = SttSettings::default();
         let mut adv = Advisories::new();
-        assert_eq!(
-            upload_language(&mut stt, None, false, false, "deepgram", None, &mut adv).unwrap(),
-            "en-US"
-        );
+        for vendor in ["deepgram", "openai", "assemblyai", "elevenlabs"] {
+            assert_eq!(
+                upload_language(&mut stt, None, false, false, vendor, None, &mut adv).unwrap(),
+                "",
+                "{vendor}"
+            );
+        }
     }
 
     #[test]

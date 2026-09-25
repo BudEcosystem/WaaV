@@ -395,6 +395,9 @@ impl ElevenLabsBatchConfig {
         // ElevenLabs takes ISO-639-1/639-3, not BCP-47. The canonical mapper already downgrades
         // `en-US` to `en` for this vendor, but the flat path can hand over anything, and a
         // region-tagged value is a 422 rather than a degrade.
+        //
+        // Vendor contract: `language_code` is OPTIONAL and its absence means ElevenLabs detects
+        // the language. So an unset language is omitted — never sent empty, never replaced.
         if !detect_language && !self.base.language.trim().is_empty() {
             let mapped = crate::core::lang::map_language(
                 self.base.language.trim(),
@@ -646,10 +649,21 @@ mod tests {
 
     #[test]
     fn the_language_is_downgraded_to_iso_639_1() {
-        // ElevenLabs takes ISO-639-1/639-3. `en-US` is a 422, and the handler hands over exactly
-        // that when a deployment configures no language at all.
+        // ElevenLabs takes ISO-639-1/639-3. `en-US` is a 422, and the flat path can hand over
+        // exactly that.
         let fields = ElevenLabsBatchConfig::from_base(base("scribe_v2")).multipart_fields(false);
         assert_eq!(field(&fields, "language_code"), Some("en"));
+    }
+
+    #[test]
+    fn an_unset_language_is_omitted_rather_than_defaulted() {
+        // The upload route hands over an empty language when neither the request nor the
+        // deployment names one. `language_code` is optional — absent, ElevenLabs detects — so
+        // nothing is sent, and certainly not an empty value or a substituted `en`.
+        let mut b = base("scribe_v2");
+        b.language = String::new();
+        let fields = ElevenLabsBatchConfig::from_base(b).multipart_fields(false);
+        assert_eq!(field(&fields, "language_code"), None);
     }
 
     #[test]
