@@ -1226,6 +1226,15 @@ impl BaseSTT for GroqSTT {
         "Groq Whisper STT"
     }
 
+    /// Groq's STT API is `POST /openai/v1/audio/{transcriptions,translations}` — the prerecorded
+    /// endpoint an upload wants, the same shape as OpenAI's. It buffers and answers on close
+    /// (`FlushStrategy::OnDisconnect`, and `disconnect` awaits the POST), so without this marker
+    /// the upload driver waited out the full 45-second first-result timeout on EVERY Groq
+    /// transcription and then reported a complete transcript as truncated.
+    fn is_request_response(&self) -> bool {
+        true
+    }
+
     /// W-D2: attach the shared per-provider circuit breaker so every Groq STT session trips
     /// (and observes) the SAME breaker, uniform with the WS fleet. The REST transport consults
     /// it before each upstream attempt and feeds it the unified HTTP status classification.

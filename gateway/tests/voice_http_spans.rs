@@ -3040,28 +3040,54 @@ async fn child_prerecorded_vendor_spans() {
         });
     }
 
-    // The OpenAI client, through its endpoint override. (Groq's client makes its request the same
-    // way and is instrumented alike, but is not marked request/response, so the upload driver
-    // waits out its 45 s first-result timeout before closing it — too slow for this suite.)
+    // The OpenAI and Groq clients, through their endpoint overrides. Both make ONE request on
+    // close, so the upload driver must close them at once: before Groq carried the
+    // request/response marker, its case sat out the 45 s first-result timeout and came back
+    // marked truncated — hence the time bound and the `truncated` check.
     let whisper_answer = json!({"text": "hello", "language": "english", "duration": 6.25});
-    {
-        let (vendor_id, model, route) = ("openai", "whisper-1", "/v1/audio/transcriptions");
+    for (vendor_id, model, route, request_id) in [
+        (
+            "openai",
+            "whisper-1",
+            "/v1/audio/transcriptions",
+            "oa-req-9",
+        ),
+        (
+            "groq",
+            "whisper-large-v3",
+            "/openai/v1/audio/transcriptions",
+            "gq-req-7",
+        ),
+    ] {
         let mock = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path(route))
             .respond_with(
                 ResponseTemplate::new(200)
-                    .insert_header("x-request-id", "oa-req-9")
+                    .insert_header("x-request-id", request_id)
                     .set_body_json(whisper_answer.clone()),
             )
             .mount(&mock)
             .await;
+        let started = std::time::Instant::now();
         let result = prerecorded_in_a_turn(vendor_id, model, &mock.uri(), SAMPLES).await;
+        let took = started.elapsed();
         f.check(result.is_ok(), || {
             format!(
                 "{vendor_id} failed: {:?}",
                 result.as_ref().err().map(|e| e.to_string())
             )
+        });
+        if let Ok(t) = &result {
+            f.check(t.text == "hello" && !t.truncated, || {
+                format!(
+                    "{vendor_id}: transcript {:?}, truncated={}",
+                    t.text, t.truncated
+                )
+            });
+        }
+        f.check(took < std::time::Duration::from_secs(10), || {
+            format!("{vendor_id}: the upload took {took:?} — waited out the first-result timeout")
         });
         let spans = cap.take().await;
         every_span.extend(spans.iter().cloned());
@@ -3077,7 +3103,7 @@ async fn child_prerecorded_vendor_spans() {
             error_type: None,
         };
         if let Some(v) = check_vendor(&mut f, vendor_id, &spans, &want) {
-            f.eq_text(vendor_id, v, VENDOR_REQUEST_ID, Some("oa-req-9"));
+            f.eq_text(vendor_id, v, VENDOR_REQUEST_ID, Some(request_id));
             let req = text(v, VENDOR_REQUEST_BODY).unwrap_or_default();
             let sent = json_attr(v, VENDOR_REQUEST_BODY);
             f.check(
