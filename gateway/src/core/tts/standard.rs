@@ -229,6 +229,13 @@ pub fn create_tts_standard(
         "aws_polly" | "aws-polly" | "amazon-polly" | "polly" => Ok(Box::new(
             super::aws_polly::AwsPollyTTS::from_standard(&config)?,
         )),
+        // Azure OpenAI audio (voice contract §3): OpenAI's speech API on an Azure deployment
+        // URL with an `api-key` header, served by the OpenAI-shaped self-hosted client in its
+        // Azure mode. Kept apart from, and ahead of, `azure` -- that is Azure AI Speech, a
+        // different service. Reads `extras.api_version` (the deployment's provider_params).
+        "azure_openai" | "azure-openai" => Ok(Box::new(
+            super::self_hosted::SelfHostedTTS::azure_openai_from_standard(&config)?,
+        )),
         "azure" | "microsoft-azure" => {
             Ok(Box::new(super::azure::AzureTTS::from_standard(&config)?))
         }
@@ -523,6 +530,55 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(msg.contains("scheme"), "error names scheme contract: {msg}");
+    }
+
+    #[test]
+    fn azure_openai_dispatches_apart_from_azure_speech_and_is_ssrf_checked() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mk = |api_base: &str, api_version: Option<&str>| {
+            let mut cfg = StandardTTSConfig::from_base(TTSConfig {
+                provider: "azure_openai".into(),
+                api_key: "az-test-key".into(),
+                model: "tts-1".into(),
+                voice_id: Some("alloy".into()),
+                api_base: Some(api_base.into()),
+                ..Default::default()
+            });
+            if let Some(v) = api_version {
+                cfg.extras.0.insert(
+                    crate::core::tts::self_hosted::AZURE_OPENAI_API_VERSION_EXTRA.to_string(),
+                    serde_json::json!(v),
+                );
+            }
+            cfg
+        };
+        let azure_openai = "https://bud-test.openai.azure.com";
+
+        // Both spellings reach the Azure OpenAI client, not Azure AI Speech.
+        for name in ["azure_openai", "azure-openai", "Azure_OpenAI"] {
+            let tts = create_tts_standard(name, mk(azure_openai, None))
+                .unwrap_or_else(|e| panic!("{name} must construct: {e}"));
+            assert_eq!(
+                tts.get_provider_info()["provider"],
+                "azure_openai",
+                "{name}"
+            );
+        }
+        // The api-version reaches the provider through extras (the handler copies
+        // provider_params.api_version there).
+        assert!(
+            create_tts_standard("azure_openai", mk(azure_openai, Some("2025-03-01-preview")))
+                .is_ok()
+        );
+
+        // Loopback and plain http are refused before anything is dialled.
+        for bad in ["https://127.0.0.1:8443", "http://bud-test.openai.azure.com"] {
+            let err = match create_tts_standard("azure_openai", mk(bad, None)) {
+                Ok(_) => panic!("{bad} must be refused"),
+                Err(e) => e,
+            };
+            assert!(err.to_string().contains("SSRF protection"), "{bad}: {err}");
+        }
     }
 
     #[test]

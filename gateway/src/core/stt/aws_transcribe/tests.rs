@@ -7,21 +7,45 @@ use crate::core::stt::base::{BaseSTT, STTConfig};
 // Configuration Tests
 // =============================================================================
 
+/// The 16 regions the old closed enum listed, plus regions it silently turned into us-east-1.
+const REGIONS: &[&str] = &[
+    "us-east-1",
+    "us-east-2",
+    "us-west-1",
+    "us-west-2",
+    "ap-south-1",
+    "ap-southeast-1",
+    "ap-southeast-2",
+    "ap-northeast-1",
+    "ap-northeast-2",
+    "ca-central-1",
+    "eu-central-1",
+    "eu-west-1",
+    "eu-west-2",
+    "eu-west-3",
+    "sa-east-1",
+    "us-gov-west-1",
+    // Not in the old enum:
+    "eu-north-1",
+    "ap-northeast-3",
+    "af-south-1",
+    "me-south-1",
+    "eu-central-2",
+];
+
 #[test]
 fn test_aws_region_all_variants() {
-    let regions = AwsRegion::all();
-    assert!(regions.len() >= 15);
-    assert!(regions.contains(&AwsRegion::UsEast1));
-    assert!(regions.contains(&AwsRegion::EuWest1));
-    assert!(regions.contains(&AwsRegion::ApNortheast1));
+    for name in REGIONS {
+        assert!(AwsRegion::parse(name).is_ok(), "{name} must be accepted");
+    }
 }
 
 #[test]
 fn test_aws_region_roundtrip() {
-    for region in AwsRegion::all() {
-        let s = region.as_str();
-        let parsed = AwsRegion::from_str_or_default(s);
-        assert_eq!(*region, parsed);
+    for name in REGIONS {
+        let region = AwsRegion::parse(name).unwrap();
+        assert_eq!(region.as_str(), *name);
+        assert_eq!(AwsRegion::parse(region.as_str()).unwrap(), region);
     }
 }
 
@@ -57,7 +81,7 @@ fn test_partial_results_stability_roundtrip() {
 fn test_config_with_language() {
     let config = AwsTranscribeSTTConfig::with_language("ja-JP");
     assert_eq!(config.base.language, "ja-JP");
-    assert_eq!(config.region, AwsRegion::UsEast1);
+    assert_eq!(config.region, AwsRegion::US_EAST_1);
     assert!(config.enable_partial_results_stabilization);
 }
 
@@ -441,7 +465,7 @@ async fn test_client_with_custom_config() {
             encoding: "pcm".to_string(),
             model: String::new(),
         },
-        region: AwsRegion::ApNortheast1,
+        region: AwsRegion::parse("ap-northeast-1").unwrap(),
         enable_partial_results_stabilization: true,
         partial_results_stability: PartialResultsStability::Medium,
         show_speaker_label: true,
@@ -533,7 +557,7 @@ fn test_config_deserialization() {
     assert!(config.is_ok());
     let config = config.unwrap();
     assert_eq!(config.base.language, "de-DE");
-    assert_eq!(config.region, AwsRegion::EuCentral1);
+    assert_eq!(config.region.as_str(), "eu-central-1");
     assert_eq!(
         config.partial_results_stability,
         PartialResultsStability::Medium

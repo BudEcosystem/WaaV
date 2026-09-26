@@ -9,7 +9,15 @@ use super::provider::{TTSProvider, TTSRequestBuilder};
 use crate::utils::req_manager::ReqManager;
 
 /// Voice settings for ElevenLabs TTS
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Every field is optional, and `Default` sets none of them. ElevenLabs documents
+/// `voice_settings` as "overriding stored settings for the given voice": each voice carries its
+/// own tuning, saved on the account. The old default sent `stability 0.5, similarity_boost 0.8,
+/// style 0.0, use_speaker_boost false, speed 1.0` on every request, so every voice was re-tuned
+/// to WaaV's numbers — which are not even ElevenLabs' own defaults (0.75 similarity, speaker boost
+/// on) — whatever the account had saved. A field is sent only when the caller or the deployment
+/// set it, and the whole object is left off when none is.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct VoiceSettings {
     /// Voice stability (0.0 to 1.0)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -28,19 +36,12 @@ pub struct VoiceSettings {
     pub speed: Option<f32>,
 }
 
-impl Default for VoiceSettings {
-    fn default() -> Self {
-        Self {
-            stability: Some(0.5),
-            similarity_boost: Some(0.8),
-            style: Some(0.0),
-            use_speaker_boost: Some(false),
-            speed: Some(1.0),
-        }
-    }
-}
-
 impl VoiceSettings {
+    /// Nothing set: the request carries no `voice_settings` and the voice's saved ones apply.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
     /// Build ElevenLabs voice settings from the standardized TTS config (W1 keystone — TTS analog
     /// of the STT migration). ElevenLabs' voice settings map cleanly onto the canonical voice
     /// features (`stability`, `similarity_boost`, `style`, `use_speaker_boost`, `speed`), which
@@ -119,7 +120,10 @@ pub fn output_format_for(audio_format: Option<&str>, sample_rate: Option<u32>) -
             _ => "mp3_44100_128".to_string(),
         },
         "opus" => "opus_48000_64".to_string(),
-        "ulaw" => "ulaw_8000".to_string(),
+        // G.711 at its only rate. `mulaw` and `alaw` fell to the unknown-alias branch below and
+        // were requested as 24 kHz PCM, although ElevenLabs produces both.
+        "ulaw" | "mulaw" => "ulaw_8000".to_string(),
+        "alaw" => "alaw_8000".to_string(),
         other => {
             // If the caller already passed a canonical ElevenLabs format string
             // (e.g. "mp3_44100_128", "pcm_16000", "ulaw_8000", "opus_48000_64"),
@@ -233,10 +237,10 @@ impl TTSRequestBuilder for ElevenLabsRequestBuilder {
         };
 
         // Build request body
-        let mut body = json!({
-            "text": text,
-            "voice_settings": self.voice_settings,
-        });
+        let mut body = json!({ "text": text });
+        if !self.voice_settings.is_empty() {
+            body["voice_settings"] = json!(self.voice_settings);
+        }
 
         // Add previous_text for context continuity if available
         if let Some(prev) = previous_text {
@@ -289,15 +293,12 @@ impl TTSRequestBuilder for ElevenLabsRequestBuilder {
             body["use_pvc_as_ivc"] = json!(flag);
         }
 
-        // Add model_id if specified
+        // `model_id` only when one was chosen. It is optional (ElevenLabs defaults it to
+        // eleven_multilingual_v2), and the model is a choice with real trade-offs — latency,
+        // languages, which settings apply — that belongs to the caller or the deployment. It
+        // used to be filled with eleven_flash_v2_5 whenever none was named.
         if !self.config.model.is_empty() {
             body["model_id"] = json!(self.config.model);
-        } else {
-            // Default to eleven_flash_v2_5: ElevenLabs' low-latency realtime model
-            // (~75ms model inference), suited to this gateway's streaming voice pipeline.
-            // The previous default (eleven_v3) is a high-latency, non-realtime model.
-            // Callers that pass an explicit model are unaffected.
-            body["model_id"] = json!("eleven_flash_v2_5");
         }
 
         // Build the request with ElevenLabs-specific headers
@@ -306,7 +307,7 @@ impl TTSRequestBuilder for ElevenLabsRequestBuilder {
             "audio/pcm"
         } else if output_format.starts_with("mp3") {
             "audio/mpeg"
-        } else if output_format.starts_with("ulaw") {
+        } else if output_format.starts_with("ulaw") || output_format.starts_with("alaw") {
             "audio/basic"
         } else if output_format.starts_with("opus") {
             "audio/opus"
@@ -780,11 +781,11 @@ mod tests {
         assert_eq!(headers.get("accept").unwrap(), "audio/pcm");
     }
 
-    // When the caller provides no model, the request must default to eleven_flash_v2_5
-    // (ElevenLabs' realtime low-latency model), not a non-realtime model. Explicit models
-    // are passed through unchanged (covered by the wire tests that set a model above/below).
+    // No model named → no `model_id` on the wire, and no `voice_settings` either: both are
+    // optional, and ElevenLabs then applies its own default model and the voice's SAVED settings.
+    // WaaV used to send eleven_flash_v2_5 and its own 0.5/0.8/0/false tuning on every request.
     #[tokio::test]
-    async fn test_default_model_is_realtime_flash() {
+    async fn nothing_chosen_sends_neither_model_nor_voice_settings() {
         let config = TTSConfig {
             voice_id: Some("test_voice_id".to_string()),
             audio_format: Some("linear16".to_string()),
@@ -816,7 +817,53 @@ mod tests {
 
         let body_bytes = built_request.body().and_then(|b| b.as_bytes()).unwrap();
         let body_json: serde_json::Value = serde_json::from_slice(body_bytes).unwrap();
-        assert_eq!(body_json["model_id"], "eleven_flash_v2_5");
+        assert!(body_json.get("model_id").is_none(), "{body_json}");
+        assert!(body_json.get("voice_settings").is_none(), "{body_json}");
+    }
+
+    /// A setting the caller chose is sent, and ONLY that one — the others stay the voice's own.
+    #[tokio::test]
+    async fn only_the_chosen_voice_settings_are_sent() {
+        let builder = ElevenLabsRequestBuilder {
+            config: TTSConfig {
+                voice_id: Some("test_voice_id".to_string()),
+                api_key: "test_key".to_string(),
+                model: "eleven_multilingual_v2".to_string(),
+                ..Default::default()
+            },
+            voice_settings: VoiceSettings {
+                stability: Some(0.5),
+                ..Default::default()
+            },
+            seed: None,
+            optimize_streaming_latency: None,
+            language_code: None,
+            next_text: None,
+            previous_request_ids: None,
+            next_request_ids: None,
+            apply_text_normalization: None,
+            apply_language_text_normalization: None,
+            use_pvc_as_ivc: None,
+            enable_logging: None,
+        };
+        let built = builder
+            .build_http_request(&reqwest::Client::new(), "hi")
+            .build()
+            .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(built.body().and_then(|b| b.as_bytes()).unwrap()).unwrap();
+        assert_eq!(body["model_id"], "eleven_multilingual_v2");
+        assert_eq!(
+            body["voice_settings"],
+            serde_json::json!({ "stability": 0.5 })
+        );
+    }
+
+    #[test]
+    fn g711_formats_map_to_elevenlabs_native_outputs() {
+        assert_eq!(output_format_for(Some("mulaw"), None), "ulaw_8000");
+        assert_eq!(output_format_for(Some("ulaw"), None), "ulaw_8000");
+        assert_eq!(output_format_for(Some("alaw"), None), "alaw_8000");
     }
 
     #[tokio::test]
@@ -873,9 +920,8 @@ mod tests {
         assert!(!tts.is_ready());
         assert_eq!(tts.get_connection_state(), ConnectionState::Disconnected);
 
-        // The provider should be properly initialized
-        assert!(tts.request_builder.voice_settings.speed.is_some());
-        assert!(tts.request_builder.voice_settings.stability.is_some());
+        // Nothing was chosen, so nothing is set: the voice's saved settings apply.
+        assert!(tts.request_builder.voice_settings.is_empty());
     }
 
     #[tokio::test]

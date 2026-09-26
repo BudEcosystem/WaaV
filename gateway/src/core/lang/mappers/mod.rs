@@ -224,11 +224,11 @@ pub fn get_language_mapper(provider: &str) -> Box<dyn LanguageMapper> {
             // gpt-4o-mini-tts/tts-1 take NO language param (text auto-detect). Silent.
             DefaultLanguageMapper::new("openai-tts", NotationKind::None, "OpenAI TTS"),
         ),
-        "cartesia" => Box::new(
-            // Sonic: ISO-639-1; no auto flag (text-driven) -> Auto becomes "en" + warning via the
-            // gated fallback path (kind != None, no auto token).
-            DefaultLanguageMapper::new("cartesia", NotationKind::Iso6391, "Cartesia"),
-        ),
+        // ISO-639-1 for both Sonic TTS and ink STT; they differ only on `auto` — see
+        // `CartesiaLanguageMapper`. `cartesia-tts` always omits it; the shared `cartesia` key
+        // omits it on a Sonic (TTS) model, else "en" + warning (STT requires a language).
+        "cartesia" => Box::new(CartesiaLanguageMapper::shared()),
+        "cartesia-tts" => Box::new(CartesiaLanguageMapper::tts()),
         "assemblyai" => Box::new(
             DefaultLanguageMapper::new("assemblyai", NotationKind::Iso6391, "AssemblyAI")
                 .with_supported(ASSEMBLYAI_LANGS, CanonicalLanguage::EnUs)
@@ -284,6 +284,58 @@ pub fn get_language_mapper(provider: &str) -> Box<dyn LanguageMapper> {
     }
 }
 
+/// Cartesia: ISO-639-1 for both Sonic TTS and ink STT, which differ only on `auto`.
+///
+/// Sonic TTS's top-level `language` is optional/nullable, so `auto` OMITS it and Cartesia applies
+/// its own default — rendering it as "en" sent a language the caller never chose (and, on a
+/// non-English voice, the wrong one). The shared key keeps the generic "en" + warning fallback
+/// for ink STT (kind != None, no auto token), which is what STT callers have always received;
+/// ink's `language` is optional too (default `en`), so omitting it there would also be valid.
+///
+/// - `cartesia-tts` (the TTS-side key): `auto` is always omitted.
+/// - `cartesia` (shared by STT and any TTS caller still passing the bare vendor name): `auto` is
+///   omitted only on a Sonic model; any other model — including the empty model an STT request
+///   usually carries — keeps "en" + warning.
+struct CartesiaLanguageMapper {
+    inner: DefaultLanguageMapper,
+    /// True for the TTS-side key: `auto` is omitted whatever the model.
+    tts_only: bool,
+}
+
+impl CartesiaLanguageMapper {
+    fn shared() -> Self {
+        Self {
+            inner: DefaultLanguageMapper::new("cartesia", NotationKind::Iso6391, "Cartesia"),
+            tts_only: false,
+        }
+    }
+
+    fn tts() -> Self {
+        Self {
+            inner: DefaultLanguageMapper::new("cartesia-tts", NotationKind::Iso6391, "Cartesia"),
+            tts_only: true,
+        }
+    }
+
+    /// Sonic is Cartesia's TTS family (`sonic-3`, `sonic-2`, `sonic-turbo`, dated snapshots, …).
+    fn is_tts_model(model: &str) -> bool {
+        model.to_ascii_lowercase().contains("sonic")
+    }
+}
+
+impl LanguageMapper for CartesiaLanguageMapper {
+    fn support(&self) -> ProviderLanguageSupport {
+        self.inner.support()
+    }
+
+    fn map(&self, lang: CanonicalLanguage, model: &str) -> MappedLanguage {
+        if lang == CanonicalLanguage::Auto && (self.tts_only || Self::is_tts_model(model)) {
+            return MappedLanguage::omitted();
+        }
+        self.inner.map(lang, model)
+    }
+}
+
 /// The Indian-language set Reverie/Sarvam-family providers gate on (plus `en-IN`).
 pub(crate) const INDIAN_LANGS: &[CanonicalLanguage] = {
     use CanonicalLanguage::*;
@@ -324,6 +376,38 @@ mod tests {
         let m = to_provider_language(CanonicalLanguage::EnGb, "some-brand-new-provider", "");
         assert_eq!(m.native, "en-GB");
         assert!(!m.has_warnings());
+    }
+
+    #[test]
+    fn cartesia_auto_is_omitted_for_sonic_tts_but_not_for_stt() {
+        let ct = |l, model| to_provider_language(l, "cartesia", model);
+        // Sonic TTS: `language` is optional, so auto OMITS it (no injected "en", no warning).
+        for model in ["sonic-3", "sonic-2", "sonic-turbo", "Sonic-3-2025-10-27"] {
+            let a = ct(CanonicalLanguage::Auto, model);
+            assert!(a.omit, "{model}: auto must be omitted, got {:?}", a.native);
+            assert!(a.native.is_empty(), "{model}: {:?}", a.native);
+            assert!(!a.has_warnings(), "{model}");
+        }
+        // ink STT (and the empty model an STT request usually carries) requires a language: keep
+        // the "en" + warning fallback.
+        for model in ["ink-whisper", ""] {
+            let a = ct(CanonicalLanguage::Auto, model);
+            assert!(!a.omit, "{model}");
+            assert_eq!(a.native, "en", "{model}");
+            assert!(a.has_warnings(), "{model}");
+        }
+        // Non-auto languages are ISO-639-1 regardless of model.
+        assert_eq!(ct(CanonicalLanguage::DeDe, "sonic-3").native, "de");
+        assert_eq!(ct(CanonicalLanguage::DeDe, "ink-whisper").native, "de");
+
+        // The TTS-side key omits auto whatever the model (a TTS request often names none).
+        let tts = |l, model| to_provider_language(l, "cartesia-tts", model);
+        for model in ["", "sonic-3"] {
+            let a = tts(CanonicalLanguage::Auto, model);
+            assert!(a.omit && a.native.is_empty(), "{model}: {:?}", a.native);
+            assert!(!a.has_warnings(), "{model}");
+        }
+        assert_eq!(tts(CanonicalLanguage::FrFr, "").native, "fr");
     }
 
     #[test]

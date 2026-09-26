@@ -17,7 +17,10 @@ use async_trait::async_trait;
 use serde_json::json;
 use xxhash_rust::xxh3::xxh3_128;
 
-use super::config::{AudioOutputFormat, OpenAITTSModel, OpenAIVoice};
+use super::config::{
+    AudioOutputFormat, OpenAITTSModel, OpenAIVoice, openai_tts_model_id,
+    openai_tts_model_supports_instructions, openai_tts_voice_id,
+};
 use crate::core::tts::base::{
     AudioCallback, BaseTTS, ConnectionState, TTSConfig, TTSError, TTSResult,
 };
@@ -71,15 +74,15 @@ struct OpenAIRequestBuilder {
     config: TTSConfig,
     /// Validated endpoint URL
     endpoint_url: String,
-    /// Parsed OpenAI model
-    model: OpenAITTSModel,
-    /// Parsed OpenAI voice
-    voice: OpenAIVoice,
+    /// The `model` sent on the wire — the configured id verbatim (see `openai_tts_model_id`).
+    model: String,
+    /// The `voice` sent on the wire — the configured voice verbatim (see `openai_tts_voice_id`).
+    voice: String,
     /// Parsed audio output format
     response_format: AudioOutputFormat,
     /// Speaking speed (0.25 to 4.0)
     speed: f32,
-    /// Delivery/acting instructions (gpt-4o-mini-tts only; ignored by tts-1/tts-1-hd).
+    /// Delivery/acting instructions (sent to every model except the tts-1 family).
     instructions: Option<String>,
     /// Pronunciation replacer
     pronunciation_replacer: Option<PronunciationReplacer>,
@@ -90,9 +93,9 @@ impl TTSRequestBuilder for OpenAIRequestBuilder {
     fn build_http_request(&self, client: &reqwest::Client, text: &str) -> reqwest::RequestBuilder {
         // Build the request body
         let mut body = json!({
-            "model": self.model.as_str(),
+            "model": self.model,
             "input": text,
-            "voice": self.voice.as_str(),
+            "voice": self.voice,
             "response_format": self.response_format.as_str(),
         });
 
@@ -101,10 +104,12 @@ impl TTSRequestBuilder for OpenAIRequestBuilder {
             body["speed"] = json!(self.speed);
         }
 
-        // gpt-4o-mini-tts accepts delivery/acting `instructions`; older tts-1/tts-1-hd models do
-        // not (sending it there would be rejected), so it is gated on the model. (Review S3.)
+        // `instructions` is documented as unsupported on tts-1 / tts-1-hd only (sending it there
+        // would be rejected), so it is gated on "not a tts-1 family model" — which covers
+        // gpt-4o-mini-tts, its dated snapshots and newer models — rather than on the exact
+        // gpt-4o-mini-tts enum variant, which dropped it for every snapshot. (Review S3.)
         if let Some(instr) = &self.instructions
-            && matches!(self.model, OpenAITTSModel::Gpt4oMiniTts)
+            && openai_tts_model_supports_instructions(&self.model)
         {
             body["instructions"] = json!(instr);
         }
@@ -131,18 +136,27 @@ impl TTSRequestBuilder for OpenAIRequestBuilder {
 // Config Hash for Caching
 // =============================================================================
 
-/// Compute a hash of the TTS configuration for caching purposes
+/// Compute a hash of the TTS configuration for caching purposes.
+///
+/// Keyed on the model/voice actually SENT (verbatim ids), so two distinct models no longer
+/// collapse onto one key, and on the `instructions` when the model receives them — they change
+/// the produced audio, so omitting them served one request's audio for another's.
 fn compute_tts_config_hash(
     config: &TTSConfig,
-    model: &OpenAITTSModel,
-    voice: &OpenAIVoice,
+    model: &str,
+    voice: &str,
+    instructions: Option<&str>,
 ) -> String {
     let mut s = String::new();
     s.push_str("openai");
     s.push('|');
-    s.push_str(model.as_str());
+    s.push_str(model);
     s.push('|');
-    s.push_str(voice.as_str());
+    s.push_str(voice);
+    s.push('|');
+    if let Some(instr) = instructions.filter(|_| openai_tts_model_supports_instructions(model)) {
+        s.push_str(instr);
+    }
     s.push('|');
     s.push_str(config.audio_format.as_deref().unwrap_or("mp3"));
     s.push('|');
@@ -214,19 +228,11 @@ impl OpenAITTS {
     }
 
     fn build(config: TTSConfig, endpoint_url: String) -> Self {
-        // Parse model from config
-        let model = if config.model.is_empty() {
-            OpenAITTSModel::default()
-        } else {
-            OpenAITTSModel::from_str_or_default(&config.model)
-        };
-
-        // Parse voice from config
-        let voice = if let Some(ref voice_id) = config.voice_id {
-            OpenAIVoice::from_str_or_default(voice_id)
-        } else {
-            OpenAIVoice::default()
-        };
+        // Model and voice are sent VERBATIM. OpenAI requires both, so a default applies only when
+        // one is EMPTY; an id the enums do not list (a dated snapshot, a new voice) is NOT
+        // rewritten to tts-1 / alloy — that silently replaced the caller's choice.
+        let model = openai_tts_model_id(&config.model);
+        let voice = openai_tts_voice_id(config.voice_id.as_deref());
 
         // Parse audio format
         let response_format = if let Some(ref format) = config.audio_format {
@@ -246,8 +252,10 @@ impl OpenAITTS {
             None
         };
 
+        let config_hash = compute_tts_config_hash(&config, &model, &voice, None);
+
         let request_builder = OpenAIRequestBuilder {
-            config: config.clone(),
+            config,
             endpoint_url,
             model,
             voice,
@@ -256,8 +264,6 @@ impl OpenAITTS {
             instructions: None,
             pronunciation_replacer,
         };
-
-        let config_hash = compute_tts_config_hash(&config, &model, &voice);
 
         Self {
             provider: TTSProvider::new(),
@@ -282,21 +288,44 @@ impl OpenAITTS {
             base.speaking_rate = Some(speed);
         }
         let mut tts = OpenAITTS::new(base)?;
-        // gpt-4o-mini-tts delivery instructions (Review S3); gated to the right model in the body.
+        // Delivery instructions (Review S3); gated to the models that accept them in the body.
+        // They change the audio, so the cache key is recomputed to include them.
         if let Some(instr) = &f.instructions {
             tts.request_builder.instructions = Some(instr.clone());
+            tts.config_hash = compute_tts_config_hash(
+                &tts.request_builder.config,
+                &tts.request_builder.model,
+                &tts.request_builder.voice,
+                Some(instr),
+            );
         }
         Ok(tts)
     }
 
-    /// Get the configured model
+    /// Get the configured model, classified into the known-model enum.
+    ///
+    /// Classification only: an id the enum does not list classifies as `Tts1` but is still
+    /// sent verbatim — [`Self::model_id`] is the value on the wire.
     pub fn model(&self) -> OpenAITTSModel {
-        self.request_builder.model
+        OpenAITTSModel::from_str_or_default(&self.request_builder.model)
     }
 
-    /// Get the configured voice
+    /// The `model` sent to OpenAI (verbatim; `tts-1` only when none was configured).
+    pub fn model_id(&self) -> &str {
+        &self.request_builder.model
+    }
+
+    /// Get the configured voice, classified into the known-voice enum.
+    ///
+    /// Classification only: a voice the enum does not list classifies as `Alloy` but is still
+    /// sent verbatim — [`Self::voice_id`] is the value on the wire.
     pub fn voice(&self) -> OpenAIVoice {
-        self.request_builder.voice
+        OpenAIVoice::from_str_or_default(&self.request_builder.voice)
+    }
+
+    /// The `voice` sent to OpenAI (verbatim; `alloy` only when none was configured).
+    pub fn voice_id(&self) -> &str {
+        &self.request_builder.voice
     }
 
     /// Get the configured output format
@@ -470,16 +499,143 @@ mod tests {
 
     #[tokio::test]
     async fn test_openai_tts_default_values() {
+        // OpenAI requires `model` and `voice`: the defaults apply only when none is configured.
         let config = TTSConfig {
             provider: "openai".to_string(),
             api_key: "test_key".to_string(),
+            voice_id: None,
             ..Default::default()
         };
 
         let tts = OpenAITTS::new(config).unwrap();
         assert_eq!(tts.model(), OpenAITTSModel::Tts1);
+        assert_eq!(tts.model_id(), "tts-1");
         assert_eq!(tts.voice(), OpenAIVoice::Alloy);
+        assert_eq!(tts.voice_id(), "alloy");
         assert_eq!(tts.output_format(), AudioOutputFormat::Pcm);
+    }
+
+    /// Serialize the body a built OpenAI TTS would POST.
+    fn wire_body(tts: &OpenAITTS) -> serde_json::Value {
+        let client = reqwest::Client::new();
+        let built = tts
+            .request_builder
+            .build_http_request(&client, "Hello")
+            .build()
+            .unwrap();
+        serde_json::from_slice(built.body().unwrap().as_bytes().unwrap()).unwrap()
+    }
+
+    // Real OpenAI model ids the enum does not list must reach the wire VERBATIM — previously
+    // every one of them was silently sent as `tts-1`.
+    #[test]
+    fn unknown_model_is_sent_verbatim() {
+        for id in ["gpt-4o-mini-tts-2025-12-15", "tts-1-1106", "tts-1-hd-1106"] {
+            let tts = OpenAITTS::build(
+                TTSConfig {
+                    api_key: "k".into(),
+                    model: id.into(),
+                    voice_id: Some("nova".into()),
+                    ..Default::default()
+                },
+                OPENAI_TTS_URL.to_string(),
+            );
+            assert_eq!(tts.model_id(), id);
+            let body = wire_body(&tts);
+            assert_eq!(body["model"], id, "model rewritten: {body}");
+        }
+    }
+
+    // A voice the enum does not list must reach the wire VERBATIM — previously it silently
+    // became `alloy`.
+    #[test]
+    fn unknown_voice_is_sent_verbatim() {
+        let tts = OpenAITTS::build(
+            TTSConfig {
+                api_key: "k".into(),
+                model: "gpt-4o-mini-tts".into(),
+                voice_id: Some("some-new-voice".into()),
+                ..Default::default()
+            },
+            OPENAI_TTS_URL.to_string(),
+        );
+        assert_eq!(tts.voice_id(), "some-new-voice");
+        let body = wire_body(&tts);
+        assert_eq!(body["voice"], "some-new-voice", "voice replaced: {body}");
+
+        // Empty model/voice → OpenAI's required fields get the defaults.
+        let tts = OpenAITTS::build(
+            TTSConfig {
+                api_key: "k".into(),
+                model: String::new(),
+                voice_id: Some(String::new()),
+                ..Default::default()
+            },
+            OPENAI_TTS_URL.to_string(),
+        );
+        let body = wire_body(&tts);
+        assert_eq!(body["model"], "tts-1");
+        assert_eq!(body["voice"], "alloy");
+    }
+
+    // `instructions` is unsupported on tts-1/tts-1-hd only: it must reach gpt-4o-mini-tts
+    // snapshots (previously dropped because they were not the exact enum variant) and must not
+    // reach the tts-1 family.
+    #[test]
+    fn instructions_gated_on_tts1_family_not_enum_variant() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        // `from_standard` resolves OPENAI_BASE_URL; serialize against tests that mutate it.
+        let _env = crate::core::net::ssrf_env_lock();
+        let with_model = |model: &str| {
+            let std = StandardTTSConfig {
+                base: TTSConfig {
+                    api_key: "k".into(),
+                    model: model.into(),
+                    voice_id: Some("coral".into()),
+                    ..Default::default()
+                },
+                features: TtsFeatures {
+                    instructions: Some("speak cheerfully".into()),
+                    ..Default::default()
+                },
+                extras: Default::default(),
+            };
+            OpenAITTS::from_standard(&std).unwrap()
+        };
+        for model in ["gpt-4o-mini-tts", "gpt-4o-mini-tts-2025-12-15"] {
+            let body = wire_body(&with_model(model));
+            assert_eq!(body["instructions"], "speak cheerfully", "{model}: {body}");
+        }
+        for model in ["tts-1", "tts-1-hd", "tts-1-hd-1106"] {
+            let body = wire_body(&with_model(model));
+            assert!(body.get("instructions").is_none(), "{model}: {body}");
+        }
+    }
+
+    // Instructions change the audio, so they must be in the cache key (for models that get them).
+    #[test]
+    fn instructions_are_in_the_cache_key() {
+        use crate::core::tts::standard::{StandardTTSConfig, TtsFeatures};
+        // `from_standard` resolves OPENAI_BASE_URL; serialize against tests that mutate it.
+        let _env = crate::core::net::ssrf_env_lock();
+        let hash = |instructions: Option<&str>| {
+            let std = StandardTTSConfig {
+                base: TTSConfig {
+                    api_key: "k".into(),
+                    model: "gpt-4o-mini-tts".into(),
+                    voice_id: Some("coral".into()),
+                    ..Default::default()
+                },
+                features: TtsFeatures {
+                    instructions: instructions.map(String::from),
+                    ..Default::default()
+                },
+                extras: Default::default(),
+            };
+            OpenAITTS::from_standard(&std).unwrap().config_hash
+        };
+        assert_ne!(hash(Some("speak cheerfully")), hash(Some("whisper")));
+        assert_ne!(hash(Some("speak cheerfully")), hash(None));
     }
 
     #[tokio::test]
@@ -496,8 +652,8 @@ mod tests {
         let builder = OpenAIRequestBuilder {
             config,
             endpoint_url: OPENAI_TTS_URL.to_string(),
-            model: OpenAITTSModel::Tts1,
-            voice: OpenAIVoice::Nova,
+            model: "tts-1".to_string(),
+            voice: "nova".to_string(),
             response_format: AudioOutputFormat::Mp3,
             speed: 1.5,
             instructions: None,
@@ -634,9 +790,13 @@ mod tests {
             ..Default::default()
         };
 
-        let hash1 = compute_tts_config_hash(&config1, &OpenAITTSModel::Tts1, &OpenAIVoice::Alloy);
-        let hash2 = compute_tts_config_hash(&config2, &OpenAITTSModel::Tts1Hd, &OpenAIVoice::Alloy);
+        let hash1 = compute_tts_config_hash(&config1, "tts-1", "alloy", None);
+        let hash2 = compute_tts_config_hash(&config2, "tts-1-hd", "alloy", None);
 
         assert_ne!(hash1, hash2);
+
+        // Distinct verbatim ids no longer collapse onto one key (they were all `tts-1` before).
+        let hash3 = compute_tts_config_hash(&config1, "gpt-4o-mini-tts-2025-12-15", "alloy", None);
+        assert_ne!(hash1, hash3);
     }
 }

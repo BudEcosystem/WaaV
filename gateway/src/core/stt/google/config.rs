@@ -2,6 +2,24 @@ use std::time::Duration;
 
 use crate::core::stt::base::STTConfig;
 
+/// The Speech-to-Text v2 location used when the caller names none. `global` is served by the
+/// un-prefixed `speech.googleapis.com`; every other location needs its regional endpoint.
+pub(crate) const GOOGLE_STT_DEFAULT_LOCATION: &str = "global";
+
+/// Error text for a malformed location. Deliberately does not echo the value.
+const INVALID_LOCATION_MESSAGE: &str = "Google STT location must match ^[a-z0-9-]{1,40}$ \
+     (e.g. 'global', 'us', 'eu', 'us-central1')";
+
+/// `^[a-z0-9-]{1,40}$`. The location is interpolated into the recognizer resource name AND the
+/// regional hostname (`{location}-speech.googleapis.com`), so anything wider (a `.`, `/`, `@`,
+/// `:`) could redirect the host.
+pub(crate) fn is_valid_google_stt_location(location: &str) -> bool {
+    (1..=40).contains(&location.len())
+        && location
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
 fn validate_google_stt_endpoint(source: &str, endpoint: &str) -> Result<(), String> {
     let endpoint = endpoint.trim();
     if endpoint.is_empty() {
@@ -105,7 +123,7 @@ impl Default for GoogleSTTConfig {
                 ..STTConfig::default()
             },
             project_id: String::new(),
-            location: "global".to_string(),
+            location: GOOGLE_STT_DEFAULT_LOCATION.to_string(),
             recognizer_id: None,
             interim_results: true,
             enable_voice_activity_events: true,
@@ -135,7 +153,11 @@ impl GoogleSTTConfig {
     /// a small advanced surface, so this maps the two standardized features it can express:
     /// interim results (`interim_results`) and explicit voice-activity events (`vad_events` ->
     /// `enable_voice_activity_events`). Google's constructor needs a non-standard `project_id`,
-    /// which is read from the `provider_extras` passthrough. Features Google cannot express here
+    /// which is read from the `provider_extras` passthrough; when that is absent it is left empty
+    /// here and `GoogleSTT::new_standard` fills it from the service-account credential. The
+    /// recognizer `location` is read from `extras["location"]` (default `global`); a malformed
+    /// value is ignored here and rejected by `GoogleSTT::new_standard` (via
+    /// `location_from_extras`). Features Google cannot express here
     /// (diarization, smart_format, profanity_filter, word_timestamps, redaction, keyterms,
     /// language/entity detection) are capability gaps and stay at default.
     pub fn from_standard(std: &crate::core::stt::standard::StandardSTTConfig) -> Self {
@@ -148,6 +170,11 @@ impl GoogleSTTConfig {
             .unwrap_or_default();
         let mut cfg =
             crate::core::stt::google::GoogleSTT::create_google_config(std.base.clone(), project_id);
+        // Recognizer location (e.g. `us`/`eu`, which chirp_3 requires). It selects both the
+        // `locations/{location}` segment of the recognizer path and the regional endpoint.
+        if let Ok(Some(location)) = Self::location_from_extras(ex) {
+            cfg.location = location;
+        }
         // Endpoint + static-token overrides (mirrors GoogleTTSConfig::from_standard): the endpoint
         // override rides the open `endpoint_override` passthrough; the static access token comes
         // from `extras["access_token"]` (a pre-minted bearer that bypasses the OAuth network fetch).
@@ -210,11 +237,44 @@ impl GoogleSTTConfig {
         cfg
     }
 
+    /// Reads `extras["location"]`. Absent, `null` or `""` → `Ok(None)` (keep the `global`
+    /// default); a string matching `^[a-z0-9-]{1,40}$` → `Ok(Some(location))`; anything else
+    /// (wrong case, a dot or slash, too long, a non-string) → `Err`.
+    ///
+    /// Docs: https://docs.cloud.google.com/speech-to-text/docs/reference/rest/v2/projects.locations.recognizers/recognize
+    pub(crate) fn location_from_extras(
+        extras: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<Option<String>, String> {
+        match extras.get("location") {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::String(s)) if s.is_empty() => Ok(None),
+            Some(serde_json::Value::String(s)) if is_valid_google_stt_location(s) => {
+                Ok(Some(s.clone()))
+            }
+            Some(_) => Err(INVALID_LOCATION_MESSAGE.to_string()),
+        }
+    }
+
     pub(crate) fn validate_endpoint_override(&self) -> Result<(), String> {
         if let Some(endpoint) = self.endpoint_override.as_deref() {
             validate_google_stt_endpoint("endpoint_override", endpoint)?;
         }
         Ok(())
+    }
+
+    /// Rejects a `location` that is not `^[a-z0-9-]{1,40}$` (it is interpolated into a hostname).
+    pub(crate) fn validate_location(&self) -> Result<(), String> {
+        if is_valid_google_stt_location(&self.location) {
+            Ok(())
+        } else {
+            Err(INVALID_LOCATION_MESSAGE.to_string())
+        }
+    }
+
+    /// Every pre-connect check on the resolved config: endpoint override (SSRF) and location.
+    pub(crate) fn validate_runtime_config(&self) -> Result<(), String> {
+        self.validate_endpoint_override()?;
+        self.validate_location()
     }
 
     pub fn recognizer_path(&self) -> String {
@@ -295,6 +355,81 @@ mod tests {
         assert!(!cfg.interim_results);
         assert!(!cfg.enable_voice_activity_events);
         assert_eq!(cfg.project_id, "proj-123"); // from provider_extras passthrough
+        assert_eq!(cfg.location, "global"); // no extras.location → default
+    }
+
+    #[test]
+    fn location_from_extras_accepts_only_google_location_ids() {
+        let read = |v: serde_json::Value| {
+            let mut extras = serde_json::Map::new();
+            extras.insert("location".into(), v);
+            GoogleSTTConfig::location_from_extras(&extras)
+        };
+        assert_eq!(
+            GoogleSTTConfig::location_from_extras(&serde_json::Map::new()),
+            Ok(None)
+        );
+        assert_eq!(read(serde_json::Value::Null), Ok(None));
+        assert_eq!(read(serde_json::json!("")), Ok(None));
+        for ok in ["global", "us", "eu", "us-central1", "asia-northeast1"] {
+            assert_eq!(read(serde_json::json!(ok)), Ok(Some(ok.to_string())));
+        }
+        assert_eq!(
+            read(serde_json::json!("a".repeat(40))),
+            Ok(Some("a".repeat(40)))
+        );
+        for bad in [
+            serde_json::json!("US"),
+            serde_json::json!("us_central1"),
+            serde_json::json!("us.evil.com"),
+            serde_json::json!("us/x"),
+            serde_json::json!("us:443"),
+            serde_json::json!(" us"),
+            serde_json::json!("a".repeat(41)),
+            serde_json::json!(1),
+            serde_json::json!(false),
+            serde_json::json!({"region": "us"}),
+        ] {
+            match read(bad.clone()) {
+                Err(err) => assert!(err.contains("^[a-z0-9-]{1,40}$"), "{err}"),
+                Ok(v) => panic!("{bad} must be rejected, got {v:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn from_standard_maps_location_and_validate_location_rejects_bad_values() {
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig};
+        let mk = |location: serde_json::Value| {
+            let mut extras = serde_json::Map::new();
+            extras.insert("location".into(), location);
+            StandardSTTConfig {
+                extras: ProviderExtras(extras),
+                ..StandardSTTConfig::from_base(STTConfig {
+                    provider: "google".into(),
+                    ..Default::default()
+                })
+            }
+        };
+        let cfg = GoogleSTTConfig::from_standard(&mk(serde_json::json!("us")));
+        assert_eq!(cfg.location, "us");
+        assert_eq!(
+            cfg.recognizer_path(),
+            "projects//locations/us/recognizers/_" // project is resolved by GoogleSTT::new_standard
+        );
+        assert!(cfg.validate_runtime_config().is_ok());
+
+        // A malformed value is ignored by the infallible mapper (new_standard rejects it).
+        let cfg = GoogleSTTConfig::from_standard(&mk(serde_json::json!("US")));
+        assert_eq!(cfg.location, "global");
+
+        let mut cfg = GoogleSTTConfig::default();
+        assert!(cfg.validate_location().is_ok());
+        for bad in ["", "US", "us.evil.com", "us/x"] {
+            cfg.location = bad.to_string();
+            assert!(cfg.validate_location().is_err(), "{bad:?}");
+            assert!(cfg.validate_runtime_config().is_err(), "{bad:?}");
+        }
     }
 
     #[test]

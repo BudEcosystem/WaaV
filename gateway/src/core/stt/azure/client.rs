@@ -646,7 +646,8 @@ impl AzureSTT {
 
         // Clone necessary data for the connection task
         let api_key = config.base.api_key.clone();
-        let host = config.region.stt_hostname();
+        // The resource custom domain when `api_base` named one, else the regional STT host.
+        let host = config.websocket_host();
         let content_type = Self::build_content_type(&config);
         let connection_id = self.connection_id.clone();
         let interim_results_enabled = config.interim_results;
@@ -704,7 +705,8 @@ impl AzureSTT {
                         // it derives the 5 mandatory WS handshake headers (`Host`, `Connection`,
                         // `Upgrade`, `Sec-WebSocket-Version`, `Sec-WebSocket-Key`) from the dial
                         // URL; only Azure's auth/session headers ride on top. The explicit `Host`
-                        // is then pinned to the regional STT hostname: identical to the
+                        // is then pinned to the production STT hostname (regional, or the
+                        // resource custom domain from `api_base`): identical to the
                         // URL-derived value in production, and it preserves the historical
                         // behavior of keeping the production Host when an `endpoint_override`
                         // redirects the dial to a local mock.
@@ -1039,6 +1041,9 @@ impl BaseSTT for AzureSTT {
                 .as_ref()
                 .map(|c| c.region.clone())
                 .unwrap_or_default(),
+            // The api_base-derived endpoint is part of the credential's address, not of the base
+            // config being swapped; losing it would re-dial the default region with this key.
+            speech_endpoint: existing.as_ref().and_then(|c| c.speech_endpoint.clone()),
             output_format: existing
                 .as_ref()
                 .map(|c| c.output_format)
@@ -1101,7 +1106,7 @@ impl AzureSTT {
     ///
     /// # Arguments
     ///
-    /// * `region` - Optional new Azure region
+    /// * `region` - Optional new Azure region (replaces an endpoint derived from `api_base`)
     /// * `output_format` - Optional new output format (Simple or Detailed)
     /// * `profanity` - Optional profanity handling setting
     /// * `interim_results` - Optional interim results toggle
@@ -1119,6 +1124,9 @@ impl AzureSTT {
         if let Some(config) = &mut self.config {
             if let Some(r) = region {
                 config.region = r;
+                // An explicitly chosen region replaces an api_base-derived endpoint; otherwise
+                // the endpoint would keep winning and this call would silently do nothing.
+                config.speech_endpoint = None;
             }
             if let Some(f) = output_format {
                 config.output_format = f;
@@ -1258,6 +1266,45 @@ mod tests {
                 std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
             }
         }
+    }
+
+    // The handler passes the deployment's api_base under provider_extras.api_base; the session
+    // built from it must dial (and pin Host to) the credential's own endpoint, not eastus.
+    #[test]
+    fn test_new_standard_dials_the_api_base_endpoint() {
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
+
+        let mut extras = serde_json::Map::new();
+        extras.insert(
+            super::super::config::AZURE_STT_API_BASE_EXTRA.into(),
+            serde_json::json!("https://my-speech.cognitiveservices.azure.com/"),
+        );
+        let std = StandardSTTConfig {
+            base: STTConfig {
+                provider: "azure".into(),
+                api_key: "subscription-key".into(),
+                language: "en-US".into(),
+                sample_rate: 16000,
+                ..Default::default()
+            },
+            features: SttFeatures::default(),
+            extras: ProviderExtras(extras),
+            translation: None,
+        };
+
+        let stt = AzureSTT::new_standard(&std).expect("a valid api_base builds a session");
+        let config = stt.config.as_ref().unwrap();
+        assert_eq!(
+            config.websocket_host(),
+            "my-speech.cognitiveservices.azure.com"
+        );
+        assert!(
+            config
+                .build_websocket_url()
+                .starts_with("wss://my-speech.cognitiveservices.azure.com/stt/speech/recognition/"),
+            "{}",
+            config.build_websocket_url()
+        );
     }
 
     // Azure USP framing — converts the provider from BROKEN (unframed binary, no speech.config)

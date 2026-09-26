@@ -13,7 +13,9 @@ pub struct ElevenLabsLanguageMapper;
 /// Whether `model` honors the `language_code` enforcement (the v2.5 family).
 fn model_honors_language(model: &str) -> bool {
     let m = model.to_ascii_lowercase();
-    // Empty model == provider default (which is a v2.5-capable multilingual model) → assume honored.
+    // Empty model: no judgement. This mapper serves both directions, and "no model" means
+    // different things there — STT sends scribe_v2, which honours the code; TTS sends no
+    // `model_id` and ElevenLabs picks its own default — so a warning would be a guess.
     m.is_empty()
         || m.contains("v2_5")
         || m.contains("v2.5")
@@ -93,7 +95,7 @@ mod tests {
 
     #[test]
     fn elevenlabs_default_model_no_warning() {
-        // Empty model == provider default (v2.5-capable) → no warning.
+        // Empty model: which one ElevenLabs uses is not known here → no warning.
         let r = ElevenLabsLanguageMapper.map(CanonicalLanguage::EnUs, "");
         assert!(!r.has_warnings());
     }

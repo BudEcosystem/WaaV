@@ -42,7 +42,7 @@ use xxhash_rust::xxh3::xxh3_128;
 
 use super::config::{AZURE_OUTPUT_FORMAT_HEADER, AzureTTSConfig};
 use crate::core::providers::azure::{
-    AZURE_AUTHORIZATION_HEADER, AZURE_SUBSCRIPTION_KEY_HEADER, AzureRegion,
+    AZURE_AUTHORIZATION_HEADER, AZURE_SUBSCRIPTION_KEY_HEADER, AzureRegion, AzureSpeechEndpoint,
 };
 use crate::core::tts::base::{AudioCallback, BaseTTS, ConnectionState, TTSConfig, TTSResult};
 use crate::core::tts::provider::{PronunciationReplacer, TTSProvider, TTSRequestBuilder};
@@ -109,7 +109,9 @@ impl TTSRequestBuilder for AzureRequestBuilder {
     ///
     /// # Request Format
     ///
-    /// - **URL**: `https://{region}.tts.speech.microsoft.com/cognitiveservices/v1`
+    /// - **URL**: `https://{region}.tts.speech.microsoft.com/cognitiveservices/v1`, or
+    ///   `https://{name}.cognitiveservices.azure.com/tts/cognitiveservices/v1` when the
+    ///   deployment's `api_base` names a resource (see [`AzureTTSConfig::build_tts_url`])
     /// - **Method**: POST
     /// - **Headers**:
     ///   - `Ocp-Apim-Subscription-Key`: Azure subscription key
@@ -204,7 +206,14 @@ fn compute_azure_tts_config_hash(config: &TTSConfig, azure_config: &AzureTTSConf
         s.push_str(&format!("{rate:.3}"));
     }
     s.push('|');
-    s.push_str(azure_config.region.as_str());
+    // The endpoint that renders the audio. A resource host is keyed by itself: a custom voice or
+    // deployment exists only on its own resource, so two resources are two audio sources. A
+    // regional endpoint keeps keying by region, so every pre-existing key is unchanged.
+    match &azure_config.speech_endpoint {
+        Some(AzureSpeechEndpoint::Resource { host }) => s.push_str(host),
+        Some(AzureSpeechEndpoint::Region(region)) => s.push_str(region.as_str()),
+        None => s.push_str(azure_config.region.as_str()),
+    }
     s.push('|');
     // Emotion (mstts:express-as style) changes the audio, so it MUST be in the cache key — else two
     // requests with the same text/voice/rate but different emotion collide. (Review S1.)
@@ -498,7 +507,10 @@ impl BaseTTS for AzureTTS {
                 "audio-48khz-192kbitrate-mono-mp3",
                 "audio-16khz-16bit-32kbps-mono-opus",
                 "audio-24khz-16bit-24kbps-mono-opus",
-                "audio-24khz-16bit-48kbps-mono-opus"
+                "audio-24khz-16bit-48kbps-mono-opus",
+                "ogg-16khz-16bit-mono-opus",
+                "ogg-24khz-16bit-mono-opus",
+                "ogg-48khz-16bit-mono-opus"
             ],
             "supported_sample_rates": [8000, 16000, 22050, 24000, 44100, 48000],
             "documentation": "https://learn.microsoft.com/en-us/azure/ai-services/speech-service/rest-text-to-speech"
@@ -731,6 +743,43 @@ mod tests {
         assert_eq!(output_format.to_str().unwrap(), "raw-8khz-8bit-mono-mulaw");
     }
 
+    // `opus` means Ogg Opus (OpenAI's meaning). Azure's `audio-*-opus` formats have no Ogg
+    // container, so the header must name an `ogg-*-opus` format.
+    #[test]
+    fn test_build_http_request_output_format_opus_is_ogg() {
+        let mut config = create_test_config();
+        config.audio_format = Some("opus".to_string());
+        config.sample_rate = Some(24000);
+
+        let azure_config = AzureTTSConfig::from_base(config.clone());
+        let builder = AzureRequestBuilder::new(config, azure_config);
+
+        let client = reqwest::Client::new();
+        let request = builder.build_http_request(&client, "Test").build().unwrap();
+
+        let output_format = request.headers().get(AZURE_OUTPUT_FORMAT_HEADER).unwrap();
+        assert_eq!(output_format.to_str().unwrap(), "ogg-24khz-16bit-mono-opus");
+    }
+
+    // A catalog family name in `model` must never become the SSML voice; with no voice chosen
+    // the SSML-required last-resort default (Jenny) is used.
+    #[test]
+    fn test_build_http_request_model_is_not_used_as_voice() {
+        let mut config = create_test_config();
+        config.voice_id = None;
+        config.model = "speech/azure-tts".to_string();
+
+        let azure_config = AzureTTSConfig::from_base(config.clone());
+        let builder = AzureRequestBuilder::new(config, azure_config);
+
+        let client = reqwest::Client::new();
+        let request = builder.build_http_request(&client, "Test").build().unwrap();
+        let body = std::str::from_utf8(request.body().unwrap().as_bytes().unwrap()).unwrap();
+
+        assert!(body.contains("<voice name='en-US-JennyNeural'>"), "{body}");
+        assert!(!body.contains("speech/azure-tts"), "{body}");
+    }
+
     #[test]
     fn test_build_http_request_body_contains_ssml() {
         let config = create_test_config();
@@ -857,6 +906,108 @@ mod tests {
             "emotion not on the wire via from_standard: {body_str}"
         );
         assert!(body_str.contains("xmlns:mstts="));
+    }
+
+    // Wire-level: the deployment's emotion rides the flat `base.emotion_config` (the handler does
+    // not set `features.emotion` for a vendor with a mapper). It must still reach the body.
+    #[test]
+    fn from_standard_emotion_config_reaches_request_body() {
+        use crate::core::emotion::{AzureEmotionMapper, Emotion, EmotionConfig, EmotionMapper};
+        use crate::core::tts::standard::StandardTTSConfig;
+        let emotion_config = EmotionConfig::with_emotion(Emotion::Happy);
+        let style = AzureEmotionMapper::new()
+            .map_emotion(&emotion_config)
+            .ssml_style
+            .expect("Happy maps to a style");
+        let mut base = create_test_config();
+        base.emotion_config = Some(emotion_config);
+        let tts = AzureTTS::from_standard(&StandardTTSConfig::from_base(base)).unwrap();
+
+        let client = reqwest::Client::new();
+        let request = tts
+            .request_builder
+            .build_http_request(&client, "Great news")
+            .build()
+            .unwrap();
+        let body_str = std::str::from_utf8(request.body().unwrap().as_bytes().unwrap()).unwrap();
+        assert!(
+            body_str.contains(&format!("<mstts:express-as style=\"{style}\"")),
+            "emotion_config not on the wire via from_standard: {body_str}"
+        );
+    }
+
+    // Wire-level: the deployment's `api_base` decides the synthesis host — a resource endpoint
+    // on its custom domain, a regional one on its own region instead of the eastus default.
+    #[test]
+    fn from_standard_api_base_reaches_request_url() {
+        use crate::core::tts::standard::StandardTTSConfig;
+        for (api_base, expected) in [
+            (
+                "https://my-speech.cognitiveservices.azure.com/",
+                "https://my-speech.cognitiveservices.azure.com/tts/cognitiveservices/v1",
+            ),
+            (
+                "https://westeurope.api.cognitive.microsoft.com/",
+                "https://westeurope.tts.speech.microsoft.com/cognitiveservices/v1",
+            ),
+        ] {
+            let mut base = create_test_config();
+            base.api_base = Some(api_base.to_string());
+            let tts = AzureTTS::from_standard(&StandardTTSConfig::from_base(base)).unwrap();
+
+            let client = reqwest::Client::new();
+            let request = tts
+                .request_builder
+                .build_http_request(&client, "Hi")
+                .build()
+                .unwrap();
+            assert_eq!(request.url().as_str(), expected, "{api_base}");
+            // The subscription key still authenticates on either host.
+            assert_eq!(
+                request
+                    .headers()
+                    .get(AZURE_SUBSCRIPTION_KEY_HEADER)
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                "test-subscription-key"
+            );
+        }
+    }
+
+    // `endpoint_override` (mock/proxy) still wins over `api_base`: it swaps scheme://host and
+    // keeps the resource path, as it keeps the regional path today.
+    #[test]
+    fn endpoint_override_wins_over_api_base() {
+        let _env = crate::core::net::ssrf_env_lock();
+        let mut base = create_test_config();
+        base.api_base = Some("https://my-speech.cognitiveservices.azure.com/".to_string());
+        let std = crate::core::tts::standard::StandardTTSConfig::from_base(base)
+            .with_endpoint_override("https://azure-proxy.example.com");
+        let tts = AzureTTS::from_standard(&std).unwrap();
+
+        let client = reqwest::Client::new();
+        let request = tts
+            .request_builder
+            .build_http_request(&client, "Hi")
+            .build()
+            .unwrap();
+        assert_eq!(
+            request.url().as_str(),
+            "https://azure-proxy.example.com/tts/cognitiveservices/v1"
+        );
+    }
+
+    #[test]
+    fn from_standard_refuses_non_azure_api_base() {
+        let mut base = create_test_config();
+        base.api_base = Some("https://evil.example.com/".to_string());
+        match AzureTTS::from_standard(&crate::core::tts::standard::StandardTTSConfig::from_base(
+            base,
+        )) {
+            Ok(_) => panic!("a non-Azure api_base must be refused, not sent to eastus"),
+            Err(err) => assert!(err.to_string().contains("api_base"), "{err}"),
+        }
     }
 
     // WIRE-LEVEL: deploymentId (extras) must reach the request URL as `?deploymentId=...`. The
@@ -1109,6 +1260,34 @@ mod tests {
 
         // Different regions should produce different hashes
         assert_ne!(hash1, hash2);
+    }
+
+    #[test]
+    fn config_hash_keys_on_the_speech_endpoint() {
+        let config = create_test_config();
+        let regional = AzureTTSConfig::with_region(config.clone(), AzureRegion::WestEurope);
+
+        // A regional endpoint from api_base keys exactly like the same region without one, so
+        // existing cache entries stay valid.
+        let mut from_api_base = regional.clone();
+        from_api_base.speech_endpoint = Some(AzureSpeechEndpoint::Region(AzureRegion::WestEurope));
+        assert_eq!(
+            compute_azure_tts_config_hash(&config, &regional),
+            compute_azure_tts_config_hash(&config, &from_api_base)
+        );
+
+        // Two resources are two audio sources.
+        let mut res_a = regional.clone();
+        res_a.speech_endpoint = Some(AzureSpeechEndpoint::Resource {
+            host: "a.cognitiveservices.azure.com".into(),
+        });
+        let mut res_b = regional.clone();
+        res_b.speech_endpoint = Some(AzureSpeechEndpoint::Resource {
+            host: "b.cognitiveservices.azure.com".into(),
+        });
+        let hash_a = compute_azure_tts_config_hash(&config, &res_a);
+        assert_ne!(hash_a, compute_azure_tts_config_hash(&config, &regional));
+        assert_ne!(hash_a, compute_azure_tts_config_hash(&config, &res_b));
     }
 
     // =========================================================================

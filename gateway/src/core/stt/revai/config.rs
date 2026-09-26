@@ -22,6 +22,28 @@ fn validate_revai_stt_endpoint(source: &str, endpoint: &str) -> Result<(), STTEr
     })
 }
 
+/// Render a language in Rev AI's streaming notation, or `None` when none was chosen.
+///
+/// Vendor contract: the streaming `language` parameter is OPTIONAL (Rev AI defaults to English)
+/// and takes BARE codes — `en`, `fr`, `de`, `it`, `ja`, `ko`, `cmn`, `pt`, `es` — not the
+/// region-qualified BCP-47 (`de-DE`) the generic language mapper produces for this vendor. So the
+/// primary subtag is sent, with Mandarin (`zh*`) as Rev AI's `cmn`. An empty language is omitted
+/// rather than sent empty. A primary subtag Rev AI does not stream is passed through for Rev AI to
+/// refuse by name, never replaced.
+pub(crate) fn revai_language_code(language: &str) -> Option<String> {
+    let primary = language
+        .trim()
+        .split(['-', '_'])
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match primary.as_str() {
+        "" => None,
+        "zh" | "cmn" => Some("cmn".to_string()),
+        _ => Some(primary),
+    }
+}
+
 // =============================================================================
 // Sample Format
 // =============================================================================
@@ -438,8 +460,11 @@ impl RevAISTTConfig {
             encode(&self.build_content_type())
         );
 
-        // Add language
-        url.push_str(&format!("&language={}", encode(&self.language)));
+        // Language, in Rev AI's notation (see `revai_language_code`); omitted when unset, since
+        // Rev AI's `language` is optional (it defaults to English on their side).
+        if let Some(code) = revai_language_code(&self.language) {
+            url.push_str(&format!("&language={}", encode(&code)));
+        }
 
         // Add optional parameters
         if let Some(ref metadata) = self.metadata {
@@ -506,10 +531,24 @@ impl RevAISTTConfig {
         // Honor an explicitly configured model (Rev AI calls it the "transcriber":
         // machine / machine_v2 / human); otherwise use the default. Previously `config.model` was
         // dropped, so the configured transcriber was silently ignored.
-        let transcriber = match config.model.as_str() {
+        //
+        // `reverb` / `reverb-foreign-language` (the catalog's names) and an unset model mean the
+        // account's default streaming transcriber, so `transcriber` is omitted for them. A Whisper
+        // model is refused rather than quietly served by that default: Rev AI's STREAMING API —
+        // the one WaaV speaks for this vendor — has no Whisper transcriber, and answering with a
+        // different model than the one chosen is the defect this refuses to repeat.
+        let model = config.model.trim();
+        let transcriber = match model {
             "machine" => RevAITranscriber::Machine,
             "machine_v2" => RevAITranscriber::MachineV2,
             "human" => RevAITranscriber::Human,
+            m if m.to_ascii_lowercase().contains("whisper") => {
+                return Err(STTError::ConfigurationError(format!(
+                    "model '{m}' is not available on Rev AI's streaming API, which WaaV uses for \
+                     Rev AI: it has no Whisper transcriber. Use 'reverb' (or no model) for Rev \
+                     AI's default streaming transcriber, or 'machine_v2' for speaker switching."
+                )));
+            }
             _ => RevAITranscriber::default(),
         };
 
@@ -725,6 +764,67 @@ mod tests {
         };
         let cfg2 = RevAISTTConfig::from_base(&base2).unwrap();
         assert_eq!(cfg2.transcriber, RevAITranscriber::default());
+    }
+
+    #[test]
+    fn test_reverb_models_use_the_default_transcriber_and_omit_it() {
+        for model in ["reverb", "reverb-foreign-language", ""] {
+            let cfg = RevAISTTConfig::from_base(&STTConfig {
+                api_key: "k".to_string(),
+                model: model.to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+            assert_eq!(cfg.transcriber, RevAITranscriber::default(), "{model}");
+            assert!(
+                !cfg.build_websocket_url().contains("transcriber="),
+                "{model}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_whisper_model_is_refused_not_served_by_the_default_transcriber() {
+        // Rev AI's streaming API has no Whisper transcriber. `whisper-large` used to be answered
+        // by the default machine transcriber — a different model than the one chosen.
+        let err = RevAISTTConfig::from_base(&STTConfig {
+            api_key: "k".to_string(),
+            model: "whisper-large".to_string(),
+            ..Default::default()
+        })
+        .unwrap_err();
+        match err {
+            STTError::ConfigurationError(msg) => {
+                assert!(msg.contains("whisper-large"), "{msg}");
+                assert!(msg.contains("streaming"), "{msg}");
+            }
+            other => panic!("expected ConfigurationError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_language_is_sent_in_rev_ai_notation() {
+        // The generic mapper hands Rev AI region-qualified BCP-47; Rev AI takes bare codes.
+        let language_on_wire = |language: &str| -> Vec<String> {
+            let url = RevAISTTConfig::new("test-api-key")
+                .with_language(language)
+                .build_websocket_url();
+            url::Url::parse(&url)
+                .unwrap()
+                .query_pairs()
+                .filter(|(k, _)| k == "language")
+                .map(|(_, v)| v.into_owned())
+                .collect()
+        };
+        assert_eq!(language_on_wire("de-DE"), vec!["de"]);
+        assert_eq!(language_on_wire("es"), vec!["es"]);
+        assert_eq!(language_on_wire("zh-CN"), vec!["cmn"]);
+        assert_eq!(language_on_wire("cmn-Hans-CN"), vec!["cmn"]);
+        assert_eq!(revai_language_code("pt_BR").as_deref(), Some("pt"));
+        // Unset: no `language` parameter at all. It used to go out as `language=` with nothing
+        // after it; the upload route hands over an empty language when nothing names one.
+        assert!(language_on_wire("").is_empty());
+        assert_eq!(revai_language_code("  "), None);
     }
 
     #[test]

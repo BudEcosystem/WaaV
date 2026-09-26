@@ -92,35 +92,37 @@ fn test_polly_engine_variants() {
 #[test]
 fn test_polly_engine_from_str() {
     assert_eq!(
-        PollyEngine::from_str_or_default("standard"),
-        PollyEngine::Standard
+        PollyEngine::from_model("standard"),
+        Ok(Some(PollyEngine::Standard))
     );
     assert_eq!(
-        PollyEngine::from_str_or_default("neural"),
-        PollyEngine::Neural
+        PollyEngine::from_model("neural"),
+        Ok(Some(PollyEngine::Neural))
     );
     assert_eq!(
-        PollyEngine::from_str_or_default("long-form"),
-        PollyEngine::LongForm
+        PollyEngine::from_model("long-form"),
+        Ok(Some(PollyEngine::LongForm))
     );
     assert_eq!(
-        PollyEngine::from_str_or_default("longform"),
-        PollyEngine::LongForm
+        PollyEngine::from_model("longform"),
+        Ok(Some(PollyEngine::LongForm))
     );
     assert_eq!(
-        PollyEngine::from_str_or_default("generative"),
-        PollyEngine::Generative
+        PollyEngine::from_model("generative"),
+        Ok(Some(PollyEngine::Generative))
     );
-    assert_eq!(
-        PollyEngine::from_str_or_default("unknown"),
-        PollyEngine::Neural
-    ); // Default
+    // No model: no engine is sent (Polly applies `standard`).
+    assert_eq!(PollyEngine::from_model(""), Ok(None));
+    // An unknown model is an error naming it — it used to become `neural` silently.
+    let err = PollyEngine::from_model("unknown").unwrap_err();
+    assert!(err.contains("unknown"), "{err}");
 }
 
 #[test]
 fn test_polly_output_format_variants() {
     assert_eq!(PollyOutputFormat::Mp3.as_str(), "mp3");
     assert_eq!(PollyOutputFormat::OggVorbis.as_str(), "ogg_vorbis");
+    assert_eq!(PollyOutputFormat::OggOpus.as_str(), "ogg_opus");
     assert_eq!(PollyOutputFormat::Pcm.as_str(), "pcm");
 }
 
@@ -128,6 +130,7 @@ fn test_polly_output_format_variants() {
 fn test_polly_output_format_mime_types() {
     assert_eq!(PollyOutputFormat::Mp3.mime_type(), "audio/mpeg");
     assert_eq!(PollyOutputFormat::OggVorbis.mime_type(), "audio/ogg");
+    assert_eq!(PollyOutputFormat::OggOpus.mime_type(), "audio/ogg");
     assert_eq!(PollyOutputFormat::Pcm.mime_type(), "audio/pcm");
 }
 
@@ -139,12 +142,25 @@ fn test_polly_output_format_sample_rates() {
     assert!(mp3_rates.contains(&16000));
     assert!(mp3_rates.contains(&22050));
     assert!(mp3_rates.contains(&24000));
+    // Polly documents 44100 and 48000 for mp3/ogg_vorbis too.
+    assert!(mp3_rates.contains(&44100));
+    assert!(mp3_rates.contains(&48000));
+    assert_eq!(
+        PollyOutputFormat::OggVorbis.supported_sample_rates(),
+        mp3_rates
+    );
 
     // PCM only supports 8000 and 16000
     let pcm_rates = PollyOutputFormat::Pcm.supported_sample_rates();
     assert!(pcm_rates.contains(&8000));
     assert!(pcm_rates.contains(&16000));
     assert!(!pcm_rates.contains(&22050));
+
+    // ogg_opus only supports 48000
+    assert_eq!(
+        PollyOutputFormat::OggOpus.supported_sample_rates(),
+        &[48000]
+    );
 }
 
 #[test]
@@ -238,7 +254,7 @@ fn test_text_type_from_str() {
 fn test_config_default() {
     let config = AwsPollyTTSConfig::default();
     assert_eq!(config.voice, PollyVoice::Joanna);
-    assert_eq!(config.engine, PollyEngine::Neural);
+    assert_eq!(config.engine, Some(PollyEngine::Neural));
     assert_eq!(config.output_format, PollyOutputFormat::Pcm);
     assert_eq!(config.base.sample_rate, Some(16000));
     assert!(config.validate().is_ok());
@@ -278,7 +294,7 @@ fn test_config_validation_valid_mp3() {
     let mut config = AwsPollyTTSConfig::default();
     config.output_format = PollyOutputFormat::Mp3;
 
-    for rate in [8000, 16000, 22050, 24000] {
+    for rate in [8000, 16000, 22050, 24000, 44100, 48000] {
         config.base.sample_rate = Some(rate);
         assert!(
             config.validate().is_ok(),
@@ -345,7 +361,7 @@ async fn test_provider_creation_from_tts_config() {
     let tts = AwsPollyTTS::new(config).unwrap();
     assert!(!tts.is_ready());
     assert_eq!(tts.voice(), PollyVoice::Matthew);
-    assert_eq!(tts.engine(), PollyEngine::Neural);
+    assert_eq!(tts.engine(), Some(PollyEngine::Neural));
     assert_eq!(tts.output_format(), PollyOutputFormat::Pcm);
 }
 
@@ -353,15 +369,15 @@ async fn test_provider_creation_from_tts_config() {
 async fn test_provider_creation_from_polly_config() {
     let config = AwsPollyTTSConfig {
         voice: PollyVoice::Amy,
-        engine: PollyEngine::Standard,
+        engine: Some(PollyEngine::Standard),
         output_format: PollyOutputFormat::Mp3,
-        region: AwsRegion::EuWest1,
+        region: AwsRegion::parse("eu-west-1").unwrap(),
         ..Default::default()
     };
 
     let tts = AwsPollyTTS::new_from_polly_config(config).unwrap();
     assert_eq!(tts.voice(), PollyVoice::Amy);
-    assert_eq!(tts.engine(), PollyEngine::Standard);
+    assert_eq!(tts.engine(), Some(PollyEngine::Standard));
     assert_eq!(tts.output_format(), PollyOutputFormat::Mp3);
 }
 
@@ -478,6 +494,7 @@ fn test_engine_display() {
 fn test_output_format_display() {
     assert_eq!(format!("{}", PollyOutputFormat::Pcm), "pcm");
     assert_eq!(format!("{}", PollyOutputFormat::OggVorbis), "ogg_vorbis");
+    assert_eq!(format!("{}", PollyOutputFormat::OggOpus), "ogg_opus");
 }
 
 #[test]
@@ -521,7 +538,7 @@ fn test_config_deserialization() {
 
     let config: AwsPollyTTSConfig = serde_json::from_str(json).unwrap();
     assert_eq!(config.voice, PollyVoice::Matthew);
-    assert_eq!(config.engine, PollyEngine::Neural);
+    assert_eq!(config.engine, Some(PollyEngine::Neural));
     assert_eq!(config.output_format, PollyOutputFormat::Pcm);
 }
 
@@ -534,7 +551,7 @@ fn test_config_deserialization() {
 async fn test_integration_connect_and_synthesize() {
     let config = AwsPollyTTSConfig {
         voice: PollyVoice::Joanna,
-        engine: PollyEngine::Neural,
+        engine: Some(PollyEngine::Neural),
         output_format: PollyOutputFormat::Pcm,
         ..Default::default()
     };
@@ -578,7 +595,7 @@ async fn test_integration_multiple_voices() {
     for voice in voices {
         let config = AwsPollyTTSConfig {
             voice: voice.clone(),
-            engine: PollyEngine::Neural,
+            engine: Some(PollyEngine::Neural),
             output_format: PollyOutputFormat::Pcm,
             ..Default::default()
         };
@@ -609,7 +626,7 @@ async fn test_integration_multiple_voices() {
 async fn test_integration_ssml() {
     let config = AwsPollyTTSConfig {
         voice: PollyVoice::Joanna,
-        engine: PollyEngine::Neural,
+        engine: Some(PollyEngine::Neural),
         output_format: PollyOutputFormat::Pcm,
         text_type: TextType::Ssml,
         ..Default::default()

@@ -263,13 +263,14 @@ impl SpeechmaticsTtsConfig {
             ));
         }
 
-        // Parse voice from voice_id
-        // Note: TTSConfig::Default uses "aura-asteria-en" which is not valid for Speechmatics,
-        // so we fall back to the default Speechmatics voice (sarah)
-        let voice = if let Some(ref voice_id) = config.voice_id {
-            SpeechmaticsVoice::from_str(voice_id).unwrap_or_default()
-        } else {
-            SpeechmaticsVoice::default()
+        // Parse voice from voice_id. The voice is a required URL path segment
+        // (`/generate/{voice}`), so a default (sarah) applies only when NO voice was chosen. A
+        // voice that is not a Speechmatics voice is a configuration error naming it and the valid
+        // ones — it used to be silently replaced with sarah, synthesising in a voice nobody chose
+        // (the Deepgram `aura-2` bug class).
+        let voice = match config.voice_id.as_deref().map(str::trim) {
+            Some(voice_id) if !voice_id.is_empty() => SpeechmaticsVoice::from_str(voice_id)?,
+            _ => SpeechmaticsVoice::default(),
         };
 
         // Parse output format from audio_format
@@ -607,14 +608,61 @@ mod tests {
 
     #[test]
     fn test_config_from_base_defaults() {
+        // No voice chosen → the default voice (the path segment is required).
         let base_config = TTSConfig {
             api_key: "test-api-key".to_string(),
+            voice_id: None,
             ..Default::default()
         };
 
         let config = SpeechmaticsTtsConfig::from_base(&base_config).unwrap();
         assert_eq!(config.voice, SpeechmaticsVoice::Sarah);
         assert_eq!(config.output_format, SpeechmaticsOutputFormat::Wav16000);
+
+        // An empty voice is "none chosen" too.
+        let base_config = TTSConfig {
+            api_key: "test-api-key".to_string(),
+            voice_id: Some(String::new()),
+            ..Default::default()
+        };
+        let config = SpeechmaticsTtsConfig::from_base(&base_config).unwrap();
+        assert_eq!(config.voice, SpeechmaticsVoice::Sarah);
+    }
+
+    // A voice that is not a Speechmatics voice must be an error naming it and the valid ones —
+    // not silently replaced with sarah.
+    #[test]
+    fn test_config_from_base_unknown_voice_is_error() {
+        for voice in ["aura-2", "aura-asteria-en", "rachel"] {
+            let base_config = TTSConfig {
+                api_key: "test-api-key".to_string(),
+                voice_id: Some(voice.to_string()),
+                ..Default::default()
+            };
+            match SpeechmaticsTtsConfig::from_base(&base_config) {
+                Err(TTSError::InvalidConfiguration(msg)) => {
+                    assert!(msg.contains(voice), "error must name the voice: {msg}");
+                    for valid in SpeechmaticsVoice::all() {
+                        assert!(
+                            msg.contains(valid.as_str()),
+                            "error must list {valid}: {msg}"
+                        );
+                    }
+                }
+                other => panic!("expected InvalidConfiguration for {voice}, got {other:?}"),
+            }
+        }
+
+        // The standardized path surfaces the same error.
+        let std = crate::core::tts::standard::StandardTTSConfig::from_base(TTSConfig {
+            api_key: "test-api-key".into(),
+            voice_id: Some("aura-2".into()),
+            ..Default::default()
+        });
+        assert!(matches!(
+            SpeechmaticsTtsConfig::from_standard(&std),
+            Err(TTSError::InvalidConfiguration(_))
+        ));
     }
 
     #[test]

@@ -9,7 +9,9 @@
 //!
 //! The module is organized into two main components:
 //!
-//! - **region**: Regional endpoint configuration for all Azure Speech services
+//! - **region**: Regional endpoint configuration for all Azure Speech services, and
+//!   [`AzureSpeechEndpoint`], which resolves a deployment's `api_base` into the regional or
+//!   resource (custom-domain) endpoint its key is valid on
 //! - **auth**: Authentication helpers for subscription key and bearer token auth
 //!
 //! # Authentication
@@ -54,4 +56,4 @@ pub use auth::{
     AZURE_AUTHORIZATION_HEADER, AZURE_SUBSCRIPTION_KEY_HEADER, build_bearer_token_header,
     build_subscription_key_header, build_token_request_url,
 };
-pub use region::AzureRegion;
+pub use region::{AzureRegion, AzureSpeechEndpoint};

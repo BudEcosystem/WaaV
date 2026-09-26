@@ -527,17 +527,16 @@ impl GladiaSTTConfig {
         // Parse encoding
         let encoding = config.encoding.parse().unwrap_or(GladiaEncoding::WavPcm);
 
-        // Parse language
-        let language = if config.language.is_empty() {
-            "en".to_string()
+        // Vendor contract: `language_config.languages` is OPTIONAL, and an empty list means Gladia
+        // detects the language itself. So an unset language becomes automatic detection
+        // (`GladiaLanguageConfig::auto()`, which serializes no `languages` at all) — it used to
+        // become `["en"]`, pinning English on audio nobody said was English. A chosen language is
+        // sent as its ISO-639-1 base code (e.g. "en-US" -> "en").
+        let language = config.language.trim();
+        let language_config = if language.is_empty() {
+            GladiaLanguageConfig::auto()
         } else {
-            // Extract base language code (e.g., "en-US" -> "en")
-            config
-                .language
-                .split('-')
-                .next()
-                .unwrap_or("en")
-                .to_string()
+            GladiaLanguageConfig::new(language.split('-').next().unwrap_or(language))
         };
 
         // Gladia currently exposes a single model ("solaria-1"), so `config.model` is intentionally
@@ -548,7 +547,7 @@ impl GladiaSTTConfig {
             api_key,
             encoding,
             sample_rate: config.sample_rate,
-            language_config: GladiaLanguageConfig::new(language),
+            language_config,
             ..Default::default()
         })
     }
@@ -1225,6 +1224,23 @@ mod tests {
         assert_eq!(config.language_config.languages, vec!["fr"]);
         assert_eq!(config.sample_rate, 48000);
         assert_eq!(config.encoding, GladiaEncoding::WavPcm);
+    }
+
+    #[test]
+    fn test_config_from_base_unset_language_detects_rather_than_pins_english() {
+        // An empty `languages` list is Gladia's automatic detection. An unset language used to
+        // become `["en"]`; the upload route hands over an empty language when nothing names one.
+        let config = GladiaSTTConfig::from_base(&STTConfig {
+            api_key: "test-key".to_string(),
+            language: String::new(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(config.language_config.languages.is_empty());
+
+        // On the wire: no `languages` key at all.
+        let wire = serde_json::to_value(&config.language_config).unwrap();
+        assert!(wire.get("languages").is_none(), "{wire}");
     }
 
     #[test]

@@ -514,8 +514,9 @@ impl OpenAISTT {
         // SSE stream of `transcript.text.delta` → `transcript.text.done`, NOT a
         // single JSON doc. Parse it incrementally, emitting interim + final
         // STTResults. whisper-1 silently ignores `stream`, so it stays on the
-        // batch path below.
-        if config.stream && config.model.as_str() != "whisper-1" {
+        // batch path below. Decided on the model id actually sent, so a dated gpt-4o
+        // snapshot streams like its family instead of being mistaken for whisper-1.
+        if config.stream && !config.is_whisper_model() {
             // The span ends with the stream; the SSE body is its response, as sent.
             self.process_streaming_transcription(response, call).await?;
             self.audio_buffer.clear();

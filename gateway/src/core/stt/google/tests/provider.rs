@@ -147,6 +147,199 @@ async fn new_standard_unlocks_features_and_project_id() {
     assert!(GoogleSTT::new_standard(&bad).is_err());
 }
 
+/// A standardized Google config carrying `api_key` and the given extras (no endpoint override).
+fn standard_with(
+    api_key: &str,
+    extras: serde_json::Value,
+) -> crate::core::stt::standard::StandardSTTConfig {
+    use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};
+    let serde_json::Value::Object(extras) = extras else {
+        panic!("extras must be a JSON object");
+    };
+    StandardSTTConfig {
+        base: STTConfig {
+            provider: "google".into(),
+            api_key: api_key.into(),
+            language: "en-US".into(),
+            sample_rate: 16000,
+            ..Default::default()
+        },
+        features: SttFeatures::default(),
+        extras: ProviderExtras(extras),
+        translation: None,
+    }
+}
+
+// The OpenAI-compatible upload route sends NO extras: the project must come from the
+// service-account credential, else the recognizer is `projects//locations/global/recognizers/_`
+// and every request fails.
+#[tokio::test]
+async fn new_standard_takes_project_id_from_service_account_without_extras() {
+    let std = standard_with(TEST_SERVICE_ACCOUNT_JSON, serde_json::json!({}));
+    let stt = GoogleSTT::new_standard(&std).expect("SA credential carries project_id");
+    let cfg = stt.config.as_ref().expect("config should be set");
+    assert_eq!(cfg.project_id, "creds-project-123");
+    assert_eq!(
+        cfg.recognizer_path(),
+        "projects/creds-project-123/locations/global/recognizers/_"
+    );
+    assert_eq!(
+        super::super::provider::google_speech_grpc_endpoint(cfg),
+        "https://speech.googleapis.com"
+    );
+
+    // An empty extras.project_id is treated as absent, not as the project "".
+    let std = standard_with(
+        TEST_SERVICE_ACCOUNT_JSON,
+        serde_json::json!({"project_id": ""}),
+    );
+    let stt = GoogleSTT::new_standard(&std).expect("falls back to the SA project");
+    assert_eq!(stt.config.as_ref().unwrap().project_id, "creds-project-123");
+}
+
+#[tokio::test]
+async fn new_standard_explicit_project_id_wins_over_service_account() {
+    let std = standard_with(
+        TEST_SERVICE_ACCOUNT_JSON,
+        serde_json::json!({"project_id": "explicit-proj"}),
+    );
+    let stt = GoogleSTT::new_standard(&std).expect("valid config");
+    let cfg = stt.config.as_ref().unwrap();
+    assert_eq!(cfg.project_id, "explicit-proj");
+    assert_eq!(
+        cfg.recognizer_path(),
+        "projects/explicit-proj/locations/global/recognizers/_"
+    );
+}
+
+// chirp_3 is served only from the `us`/`eu` multi-regions: the recognizer path AND the host must
+// both name the location, or Google rejects the request.
+#[tokio::test]
+async fn new_standard_location_selects_recognizer_path_and_regional_host() {
+    for (location, host) in [
+        ("us", "https://us-speech.googleapis.com"),
+        ("eu", "https://eu-speech.googleapis.com"),
+        ("us-central1", "https://us-central1-speech.googleapis.com"),
+        ("global", "https://speech.googleapis.com"),
+    ] {
+        let std = standard_with(
+            TEST_SERVICE_ACCOUNT_JSON,
+            serde_json::json!({"location": location}),
+        );
+        let stt = GoogleSTT::new_standard(&std).expect("valid location");
+        let cfg = stt.config.as_ref().unwrap();
+        assert_eq!(cfg.location, location);
+        assert_eq!(
+            cfg.recognizer_path(),
+            format!("projects/creds-project-123/locations/{location}/recognizers/_")
+        );
+        assert_eq!(
+            super::super::provider::google_speech_grpc_endpoint(cfg),
+            host,
+            "location {location}"
+        );
+    }
+}
+
+#[test]
+fn google_speech_grpc_endpoint_override_beats_regional_host() {
+    let config = GoogleSTTConfig {
+        location: "eu".to_string(),
+        endpoint_override: Some("https://google-stt-proxy.example.com".to_string()),
+        ..Default::default()
+    };
+    assert_eq!(
+        super::super::provider::google_speech_grpc_endpoint(&config),
+        "https://google-stt-proxy.example.com"
+    );
+
+    // A location that slipped past validation never becomes a hostname.
+    let config = GoogleSTTConfig {
+        location: "evil.example.com/x".to_string(),
+        ..Default::default()
+    };
+    assert_eq!(
+        super::super::provider::google_speech_grpc_endpoint(&config),
+        "https://speech.googleapis.com"
+    );
+}
+
+#[tokio::test]
+async fn new_standard_rejects_malformed_location() {
+    for bad in [
+        serde_json::json!("US"),
+        serde_json::json!("us.example.com"),
+        serde_json::json!("us/../x"),
+        serde_json::json!("us-central1 "),
+        serde_json::json!("a".repeat(41)),
+        serde_json::json!(5),
+        serde_json::json!(true),
+        serde_json::json!(["us"]),
+    ] {
+        let std = standard_with(
+            TEST_SERVICE_ACCOUNT_JSON,
+            serde_json::json!({ "location": bad.clone() }),
+        );
+        match GoogleSTT::new_standard(&std) {
+            Err(STTError::ConfigurationError(msg)) => {
+                assert!(msg.contains("location"), "{msg}");
+            }
+            Err(other) => panic!("location {bad}: expected ConfigurationError, got {other:?}"),
+            Ok(_) => panic!("location {bad} must be rejected"),
+        }
+    }
+
+    // `connect()` re-validates a config that did not come through `new_standard`.
+    // (GoogleSTT implements Drop, so no struct-update syntax.)
+    let mut stt = GoogleSTT::default();
+    stt.config = Some(GoogleSTTConfig {
+        project_id: "p".to_string(),
+        location: "US".to_string(),
+        ..Default::default()
+    });
+    assert!(matches!(
+        stt.connect().await,
+        Err(STTError::ConfigurationError(_))
+    ));
+}
+
+// A caller who pastes an API key (not service-account JSON) into the credential field gets an
+// error that reaches the HTTP response: it must not contain what they pasted.
+#[tokio::test]
+async fn new_standard_credential_errors_do_not_echo_the_credential() {
+    let pasted = "AIzaSyD-not-a-real-key-0123456789abcdef";
+    for extras in [
+        serde_json::json!({}),
+        serde_json::json!({"project_id": "explicit-proj"}),
+    ] {
+        let std = standard_with(pasted, extras);
+        let err = match GoogleSTT::new_standard(&std) {
+            Err(e) => e,
+            Ok(_) => panic!("a pasted API key is not a usable Google credential"),
+        };
+        let msg = err.to_string();
+        assert!(!msg.contains(pasted), "error echoed the credential: {msg}");
+        assert!(
+            !msg.contains("AIza"),
+            "error echoed part of the credential: {msg}"
+        );
+    }
+
+    // Service-account JSON with no project_id and no extras.project_id: a project error that
+    // does not echo the private key.
+    let no_project = r#"{"type": "service_account", "client_email": "a@b.iam.gserviceaccount.com", "private_key": "-----BEGIN PRIVATE KEY-----\nSECRETSECRET\n-----END PRIVATE KEY-----\n"}"#;
+    let std = standard_with(no_project, serde_json::json!({}));
+    match GoogleSTT::new_standard(&std) {
+        Err(STTError::ConfigurationError(msg)) => {
+            assert!(msg.contains("project_id is required"), "{msg}");
+            assert!(!msg.contains("SECRETSECRET"), "{msg}");
+            assert!(!msg.contains("PRIVATE KEY"), "{msg}");
+        }
+        Err(other) => panic!("expected ConfigurationError, got {other:?}"),
+        Ok(_) => panic!("no project_id anywhere must be rejected"),
+    }
+}
+
 #[tokio::test]
 async fn test_new_standard_rejects_ssrf_endpoint_override() {
     use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig, SttFeatures};

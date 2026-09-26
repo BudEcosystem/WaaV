@@ -598,7 +598,15 @@ async fn handle_config(
     }
 
     let provider_name = config.provider.as_deref().unwrap_or(DEFAULT_PROVIDER);
-    let model = config.model.as_deref().unwrap_or(DEFAULT_MODEL);
+    // Reported in `session.created` only. `gpt-realtime` is OpenAI's model, so it is named for
+    // OpenAI alone; any other provider picks its own default and reports nothing here.
+    let model = config.model.as_deref().unwrap_or(
+        if provider_name.eq_ignore_ascii_case(DEFAULT_PROVIDER) {
+            DEFAULT_MODEL
+        } else {
+            ""
+        },
+    );
 
     // Validate provider
     let supported = get_supported_realtime_providers();
@@ -1063,10 +1071,12 @@ pub fn build_realtime_config(api_key: String, config: &RealtimeSessionConfig) ->
 
     RealtimeConfig {
         api_key,
-        model: config
-            .model
-            .clone()
-            .unwrap_or_else(|| DEFAULT_MODEL.to_string()),
+        // Only a model the client named. `gpt-realtime` is an OpenAI model, and filling it in
+        // here pre-empted every other provider's own default: Gemini, Grok, Ultravox, Nova Sonic
+        // and Yandex were handed an OpenAI model name, and Azure a deployment called
+        // `gpt-realtime` instead of its "requires a deployment name" error. Each protocol
+        // defaults an empty model itself; OpenAI's to `gpt-realtime`.
+        model: config.model.clone().unwrap_or_default(),
         voice: config.voice.clone(),
         instructions: config.instructions.clone(),
         temperature: config.temperature,
@@ -1093,7 +1103,8 @@ mod tests {
         let realtime_config = build_realtime_config("test-key".to_string(), &session_config);
 
         assert_eq!(realtime_config.api_key, "test-key");
-        assert_eq!(realtime_config.model, DEFAULT_MODEL);
+        // No model named → none set; the provider's protocol applies its own default.
+        assert_eq!(realtime_config.model, "");
     }
 
     #[test]

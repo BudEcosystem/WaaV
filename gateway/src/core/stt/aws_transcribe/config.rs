@@ -14,7 +14,7 @@
 //! use waav_gateway::core::stt::aws_transcribe::{AwsTranscribeSTTConfig, AwsRegion, MediaEncoding};
 //!
 //! let config = AwsTranscribeSTTConfig {
-//!     region: AwsRegion::UsEast1,
+//!     region: AwsRegion::parse("eu-north-1")?,
 //!     language_code: "en-US".to_string(),
 //!     media_encoding: MediaEncoding::Pcm,
 //!     sample_rate: 16000,
@@ -23,6 +23,8 @@
 //!     ..Default::default()
 //! };
 //! ```
+
+use std::borrow::Cow;
 
 use serde::{Deserialize, Serialize};
 
@@ -41,136 +43,117 @@ fn validate_aws_transcribe_endpoint(source: &str, endpoint: &str) -> Result<(), 
 // AWS Regions
 // =============================================================================
 
-/// AWS regions where Amazon Transcribe Streaming is available.
+/// An AWS region name — validated for shape, NOT limited to a fixed list.
 ///
-/// Amazon Transcribe Streaming is available in most major AWS regions.
-/// Select the region closest to your users for lowest latency.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum AwsRegion {
-    /// US East (N. Virginia)
-    #[default]
-    #[serde(rename = "us-east-1")]
-    UsEast1,
-    /// US East (Ohio)
-    #[serde(rename = "us-east-2")]
-    UsEast2,
-    /// US West (N. California)
-    #[serde(rename = "us-west-1")]
-    UsWest1,
-    /// US West (Oregon)
-    #[serde(rename = "us-west-2")]
-    UsWest2,
-    /// Asia Pacific (Mumbai)
-    #[serde(rename = "ap-south-1")]
-    ApSouth1,
-    /// Asia Pacific (Singapore)
-    #[serde(rename = "ap-southeast-1")]
-    ApSoutheast1,
-    /// Asia Pacific (Sydney)
-    #[serde(rename = "ap-southeast-2")]
-    ApSoutheast2,
-    /// Asia Pacific (Tokyo)
-    #[serde(rename = "ap-northeast-1")]
-    ApNortheast1,
-    /// Asia Pacific (Seoul)
-    #[serde(rename = "ap-northeast-2")]
-    ApNortheast2,
-    /// Canada (Central)
-    #[serde(rename = "ca-central-1")]
-    CaCentral1,
-    /// Europe (Frankfurt)
-    #[serde(rename = "eu-central-1")]
-    EuCentral1,
-    /// Europe (Ireland)
-    #[serde(rename = "eu-west-1")]
-    EuWest1,
-    /// Europe (London)
-    #[serde(rename = "eu-west-2")]
-    EuWest2,
-    /// Europe (Paris)
-    #[serde(rename = "eu-west-3")]
-    EuWest3,
-    /// South America (Sao Paulo)
-    #[serde(rename = "sa-east-1")]
-    SaEast1,
-    /// AWS GovCloud (US-West)
-    #[serde(rename = "us-gov-west-1")]
-    UsGovWest1,
-}
+/// Shared by Amazon Transcribe Streaming and Amazon Polly. The region is where the audio is
+/// processed and stored in transit, so it is a data-residency choice and must reach the SDK
+/// exactly as named. This used to be a closed enum of 16 regions whose parser mapped every other
+/// name — `eu-north-1`, `ap-northeast-3`, `af-south-1`, `me-south-1`, `eu-central-2`, … — to
+/// `us-east-1`, silently sending, say, a Stockholm tenant's audio to Virginia. AWS opens regions
+/// every year and the SDK needs no table to reach one (`Region::new(name)` resolves the regional
+/// endpoint), so any name of the AWS shape `^[a-z]{2}(-gov)?-[a-z]+-\d+$` is accepted and passed
+/// through verbatim; anything else is a configuration error — never a fallback region. Whether
+/// the service actually runs in that region is AWS's to say, and it says so on the request.
+///
+/// The field is private so every value went through [`AwsRegion::parse`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct AwsRegion(Cow<'static, str>);
 
 impl AwsRegion {
-    /// Convert to AWS region string.
+    /// US East (N. Virginia): the region used when none is configured anywhere.
+    pub const US_EAST_1: Self = Self(Cow::Borrowed("us-east-1"));
+
+    /// Parse a region name. Case-insensitive and whitespace-trimmed (`EU-NORTH-1` → `eu-north-1`);
+    /// a name that is not AWS-shaped is an error naming it.
+    pub fn parse(name: &str) -> Result<Self, String> {
+        let normalized = name.trim().to_ascii_lowercase();
+        if is_aws_region_name(&normalized) {
+            Ok(Self(Cow::Owned(normalized)))
+        } else {
+            Err(format!(
+                "invalid AWS region {:?}: expected a region name such as us-east-1, eu-north-1 \
+                 or us-gov-west-1",
+                name.trim()
+            ))
+        }
+    }
+
+    /// Read the `region` provider extra. Absent, `null` or blank means "not chosen" (`Ok(None)`)
+    /// so the caller's fallback applies; a string is parsed; any other JSON type is an error.
+    pub fn from_extra(value: Option<&serde_json::Value>) -> Result<Option<Self>, String> {
+        match value {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::String(s)) if s.trim().is_empty() => Ok(None),
+            Some(serde_json::Value::String(s)) => Self::parse(s).map(Some),
+            Some(other) => Err(format!(
+                "invalid AWS region: `region` must be a string, got {other}"
+            )),
+        }
+    }
+
+    /// The region name as sent to AWS.
     #[inline]
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::UsEast1 => "us-east-1",
-            Self::UsEast2 => "us-east-2",
-            Self::UsWest1 => "us-west-1",
-            Self::UsWest2 => "us-west-2",
-            Self::ApSouth1 => "ap-south-1",
-            Self::ApSoutheast1 => "ap-southeast-1",
-            Self::ApSoutheast2 => "ap-southeast-2",
-            Self::ApNortheast1 => "ap-northeast-1",
-            Self::ApNortheast2 => "ap-northeast-2",
-            Self::CaCentral1 => "ca-central-1",
-            Self::EuCentral1 => "eu-central-1",
-            Self::EuWest1 => "eu-west-1",
-            Self::EuWest2 => "eu-west-2",
-            Self::EuWest3 => "eu-west-3",
-            Self::SaEast1 => "sa-east-1",
-            Self::UsGovWest1 => "us-gov-west-1",
-        }
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 
-    /// Parse from string, with fallback to default (us-east-1).
-    pub fn from_str_or_default(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
-            "us-east-1" => Self::UsEast1,
-            "us-east-2" => Self::UsEast2,
-            "us-west-1" => Self::UsWest1,
-            "us-west-2" => Self::UsWest2,
-            "ap-south-1" => Self::ApSouth1,
-            "ap-southeast-1" => Self::ApSoutheast1,
-            "ap-southeast-2" => Self::ApSoutheast2,
-            "ap-northeast-1" => Self::ApNortheast1,
-            "ap-northeast-2" => Self::ApNortheast2,
-            "ca-central-1" => Self::CaCentral1,
-            "eu-central-1" => Self::EuCentral1,
-            "eu-west-1" => Self::EuWest1,
-            "eu-west-2" => Self::EuWest2,
-            "eu-west-3" => Self::EuWest3,
-            "sa-east-1" => Self::SaEast1,
-            "us-gov-west-1" => Self::UsGovWest1,
-            _ => Self::default(),
-        }
+    /// The SDK region — the name passed through unchanged, which is all the SDK needs to resolve
+    /// the regional endpoint.
+    pub fn to_sdk(&self) -> aws_config::Region {
+        aws_config::Region::new(self.0.clone())
     }
+}
 
-    /// Get all available regions.
-    pub fn all() -> &'static [AwsRegion] {
-        &[
-            Self::UsEast1,
-            Self::UsEast2,
-            Self::UsWest1,
-            Self::UsWest2,
-            Self::ApSouth1,
-            Self::ApSoutheast1,
-            Self::ApSoutheast2,
-            Self::ApNortheast1,
-            Self::ApNortheast2,
-            Self::CaCentral1,
-            Self::EuCentral1,
-            Self::EuWest1,
-            Self::EuWest2,
-            Self::EuWest3,
-            Self::SaEast1,
-            Self::UsGovWest1,
-        ]
+/// `^[a-z]{2}(-gov)?-[a-z]+-\d+$`, without pulling a regex into a config type: two-letter area,
+/// an optional `gov` partition marker, a lowercase direction/locality word, a number.
+fn is_aws_region_name(name: &str) -> bool {
+    fn word(p: &str) -> bool {
+        !p.is_empty() && p.bytes().all(|b| b.is_ascii_lowercase())
+    }
+    fn number(p: &str) -> bool {
+        !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())
+    }
+    let parts: Vec<&str> = name.split('-').collect();
+    match parts.as_slice() {
+        [area, locality, n] | [area, "gov", locality, n] => {
+            area.len() == 2 && word(area) && word(locality) && number(n)
+        }
+        _ => false,
+    }
+}
+
+impl Default for AwsRegion {
+    fn default() -> Self {
+        Self::US_EAST_1
+    }
+}
+
+impl TryFrom<String> for AwsRegion {
+    type Error = String;
+
+    fn try_from(name: String) -> Result<Self, Self::Error> {
+        Self::parse(&name)
+    }
+}
+
+impl From<AwsRegion> for String {
+    fn from(region: AwsRegion) -> Self {
+        region.0.into_owned()
+    }
+}
+
+impl std::str::FromStr for AwsRegion {
+    type Err = String;
+
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        Self::parse(name)
     }
 }
 
 impl std::fmt::Display for AwsRegion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.as_str())
+        f.write_str(self.as_str())
     }
 }
 
@@ -368,6 +351,43 @@ impl std::fmt::Display for ContentRedactionType {
 // =============================================================================
 // Main Configuration
 // =============================================================================
+
+/// Refuse a PARTIAL set of explicit AWS credentials.
+///
+/// Explicit credentials are used only when both the access key id and the secret are present;
+/// otherwise the client falls back to the SDK default chain — the gateway's OWN identity
+/// (environment, profile, instance role). A request that carried a key id without its secret, or a
+/// session token with no keys, meant to authenticate as someone else; quietly running it as the
+/// gateway is the wrong-identity outcome, so it is a configuration error instead. The message
+/// names the fields, never their values. Shared with Amazon Polly.
+pub(crate) fn validate_explicit_credentials(
+    access_key_id: &Option<String>,
+    secret_access_key: &Option<String>,
+    session_token: &Option<String>,
+) -> Result<(), String> {
+    let (key, secret) = (access_key_id.is_some(), secret_access_key.is_some());
+    if key && !secret {
+        return Err(
+            "aws_access_key_id was given without aws_secret_access_key; explicit AWS \
+                    credentials need both"
+                .to_string(),
+        );
+    }
+    if secret && !key {
+        return Err(
+            "aws_secret_access_key was given without aws_access_key_id; explicit AWS \
+                    credentials need both"
+                .to_string(),
+        );
+    }
+    if session_token.is_some() && !key {
+        return Err(
+            "aws_session_token was given without aws_access_key_id and aws_secret_access_key"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
 
 /// Minimum supported sample rate (Hz)
 pub const MIN_SAMPLE_RATE: u32 = 8000;
@@ -610,7 +630,12 @@ impl AwsTranscribeSTTConfig {
     /// Build from the standardized config (W1 keystone — 4th provider). Unlocks the diarization
     /// AND content-redaction that the flat factory hardcoded off (BRUTAL_REVIEW.md flagged both),
     /// plus partial-results stabilization, through the standardized API.
-    pub fn from_standard(std: &crate::core::stt::standard::StandardSTTConfig) -> Self {
+    ///
+    /// Fails on a malformed `region` extra (never a fallback region — see [`AwsRegion`]) and on
+    /// a partial set of credential extras (see `validate_explicit_credentials`).
+    pub fn from_standard(
+        std: &crate::core::stt::standard::StandardSTTConfig,
+    ) -> Result<Self, String> {
         let f = &std.features;
         let ex = &std.extras.0;
         let mut cfg = Self {
@@ -700,11 +725,19 @@ impl AwsTranscribeSTTConfig {
         if let Some(k) = ex.get("aws_session_token").and_then(|v| v.as_str()) {
             cfg.aws_session_token = Some(k.to_string());
         }
-        if let Some(r) = ex.get("region").and_then(|v| v.as_str()) {
-            cfg.region = AwsRegion::from_str_or_default(r);
+        validate_explicit_credentials(
+            &cfg.aws_access_key_id,
+            &cfg.aws_secret_access_key,
+            &cfg.aws_session_token,
+        )?;
+        // The region the caller chose, passed through; a malformed one is refused rather than
+        // replaced with us-east-1 (see `AwsRegion`). Unset keeps the default for `new_standard`
+        // to fill from the gateway's own AWS_REGION.
+        if let Some(r) = AwsRegion::from_extra(ex.get("region"))? {
+            cfg.region = r;
         }
 
-        cfg
+        Ok(cfg)
     }
 
     /// Create a new configuration with the given language code.
@@ -825,7 +858,7 @@ mod tests {
             extras: Default::default(),
             translation: None,
         };
-        let cfg = AwsTranscribeSTTConfig::from_standard(&std);
+        let cfg = AwsTranscribeSTTConfig::from_standard(&std).unwrap();
         assert!(cfg.show_speaker_label);
         assert_eq!(cfg.max_speaker_labels, Some(10));
         assert!(cfg.enable_content_redaction);
@@ -834,25 +867,156 @@ mod tests {
 
     #[test]
     fn test_aws_region_as_str() {
-        assert_eq!(AwsRegion::UsEast1.as_str(), "us-east-1");
-        assert_eq!(AwsRegion::EuWest1.as_str(), "eu-west-1");
-        assert_eq!(AwsRegion::ApNortheast1.as_str(), "ap-northeast-1");
+        assert_eq!(AwsRegion::US_EAST_1.as_str(), "us-east-1");
+        assert_eq!(AwsRegion::default(), AwsRegion::US_EAST_1);
+        assert_eq!(
+            AwsRegion::parse("ap-northeast-1").unwrap().as_str(),
+            "ap-northeast-1"
+        );
+        assert_eq!(
+            AwsRegion::parse("eu-west-1").unwrap().to_string(),
+            "eu-west-1"
+        );
     }
 
     #[test]
     fn test_aws_region_from_str() {
+        assert_eq!(AwsRegion::parse("us-west-2").unwrap().as_str(), "us-west-2");
+        // Case and surrounding whitespace are normalised to AWS's spelling.
         assert_eq!(
-            AwsRegion::from_str_or_default("us-west-2"),
-            AwsRegion::UsWest2
+            AwsRegion::parse(" EU-CENTRAL-1 ").unwrap().as_str(),
+            "eu-central-1"
+        );
+        // A malformed name is an error — it used to become us-east-1.
+        assert!(AwsRegion::parse("invalid").is_err());
+    }
+
+    /// Regions outside the old 16-entry enum pass through verbatim. Each of these used to parse to
+    /// us-east-1, sending the audio to a region the caller never chose (data residency).
+    #[test]
+    fn any_aws_shaped_region_is_accepted_and_passed_through() {
+        for name in [
+            "eu-north-1",
+            "ap-northeast-3",
+            "af-south-1",
+            "me-south-1",
+            "me-central-1",
+            "eu-central-2",
+            "eu-south-2",
+            "ap-southeast-5",
+            "ca-west-1",
+            "il-central-1",
+            "mx-central-1",
+            "us-gov-west-1",
+            "us-gov-east-1",
+            "cn-north-1",
+        ] {
+            let region = AwsRegion::parse(name).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(region.as_str(), name);
+            assert_eq!(region.to_sdk().as_ref(), name, "SDK region for {name}");
+            assert_ne!(region, AwsRegion::US_EAST_1, "{name}");
+        }
+    }
+
+    /// Anything not of the shape `^[a-z]{2}(-gov)?-[a-z]+-\d+$` is refused, naming the value.
+    #[test]
+    fn malformed_region_is_an_error_never_us_east_1() {
+        for bad in [
+            "",
+            "   ",
+            "invalid",
+            "us-east",
+            "useast1",
+            "us_east_1",
+            "u-east-1",
+            "usa-east-1",
+            "us-east-1a",
+            "us-east-",
+            "us--east-1",
+            "us-iso-east-1",
+            "eu-north-1/../x",
+            "Europe (Stockholm)",
+        ] {
+            let err = AwsRegion::parse(bad).expect_err(bad);
+            assert!(err.contains("invalid AWS region"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn region_serde_round_trips_and_rejects_malformed_names() {
+        let region: AwsRegion = serde_json::from_str(r#""eu-north-1""#).unwrap();
+        assert_eq!(region.as_str(), "eu-north-1");
+        assert_eq!(serde_json::to_string(&region).unwrap(), r#""eu-north-1""#);
+        assert!(serde_json::from_str::<AwsRegion>(r#""narnia""#).is_err());
+    }
+
+    #[test]
+    fn region_extra_blank_is_unset_and_non_string_is_an_error() {
+        assert_eq!(AwsRegion::from_extra(None), Ok(None));
+        assert_eq!(
+            AwsRegion::from_extra(Some(&serde_json::json!(null))),
+            Ok(None)
         );
         assert_eq!(
-            AwsRegion::from_str_or_default("EU-CENTRAL-1"),
-            AwsRegion::EuCentral1
+            AwsRegion::from_extra(Some(&serde_json::json!("  "))),
+            Ok(None)
         );
         assert_eq!(
-            AwsRegion::from_str_or_default("invalid"),
-            AwsRegion::UsEast1
+            AwsRegion::from_extra(Some(&serde_json::json!("eu-north-1"))),
+            Ok(Some(AwsRegion::parse("eu-north-1").unwrap()))
         );
+        assert!(AwsRegion::from_extra(Some(&serde_json::json!(1))).is_err());
+        assert!(AwsRegion::from_extra(Some(&serde_json::json!("narnia"))).is_err());
+    }
+
+    /// The `region` extra reaches the config verbatim; a malformed one fails construction instead
+    /// of being replaced with us-east-1.
+    #[test]
+    fn from_standard_passes_the_region_extra_through_or_refuses_it() {
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig};
+        let with_region = |region: serde_json::Value| {
+            let mut extras = serde_json::Map::new();
+            extras.insert("region".into(), region);
+            StandardSTTConfig {
+                extras: ProviderExtras(extras),
+                ..StandardSTTConfig::from_base(STTConfig {
+                    provider: "aws-transcribe".into(),
+                    ..Default::default()
+                })
+            }
+        };
+        let cfg =
+            AwsTranscribeSTTConfig::from_standard(&with_region(serde_json::json!("eu-north-1")))
+                .unwrap();
+        assert_eq!(cfg.region.as_str(), "eu-north-1");
+
+        let err = AwsTranscribeSTTConfig::from_standard(&with_region(serde_json::json!("narnia")))
+            .expect_err("a malformed region must not become us-east-1");
+        assert!(err.contains("narnia"), "{err}");
+    }
+
+    /// A partial credential set must not fall through to the gateway's own identity.
+    #[test]
+    fn partial_explicit_credentials_are_refused_without_echoing_them() {
+        const KEY: &str = "AKIAKEYVALUE";
+        const SECRET: &str = "SECRETVALUE";
+        const TOKEN: &str = "TOKENVALUE";
+        let s = |v: &str| Some(v.to_string());
+        assert!(validate_explicit_credentials(&None, &None, &None).is_ok());
+        assert!(validate_explicit_credentials(&s(KEY), &s(SECRET), &None).is_ok());
+        assert!(validate_explicit_credentials(&s(KEY), &s(SECRET), &s(TOKEN)).is_ok());
+        for (key, secret, token) in [
+            (s(KEY), None, None),
+            (None, s(SECRET), None),
+            (None, None, s(TOKEN)),
+            (s(KEY), None, s(TOKEN)),
+        ] {
+            let err = validate_explicit_credentials(&key, &secret, &token).unwrap_err();
+            assert!(
+                !err.contains(KEY) && !err.contains(SECRET) && !err.contains(TOKEN),
+                "credential values must not be echoed: {err}"
+            );
+        }
     }
 
     #[test]
@@ -899,7 +1063,7 @@ mod tests {
     fn test_config_default_values() {
         let config = AwsTranscribeSTTConfig::default();
         assert_eq!(config.base.sample_rate, 16000);
-        assert_eq!(config.region, AwsRegion::UsEast1);
+        assert_eq!(config.region, AwsRegion::US_EAST_1);
         assert_eq!(config.media_encoding, MediaEncoding::Pcm);
         assert!(config.enable_partial_results_stabilization);
         assert_eq!(
