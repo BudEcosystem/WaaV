@@ -624,9 +624,10 @@ pub struct CartesiaTTSConfig {
 
     /// Optional spoken-language override sent as the top-level `language` body field.
     ///
-    /// Cartesia's `/tts/bytes` accepts an optional `language` parameter (BCP-47-ish code,
-    /// e.g. "en", "fr", "de") that controls which language the model speaks. When `None`,
-    /// the request builder falls back to the default ("en"). Populated from the standardized
+    /// Cartesia's `/tts/bytes` accepts an optional, nullable `language` parameter (BCP-47-ish
+    /// code, e.g. "en", "fr", "de") that controls which language the model speaks. When `None`,
+    /// the request builder OMITS the field so Cartesia applies its own default — WaaV does not
+    /// inject a language nobody chose. Populated from the standardized
     /// [`TtsFeatures::language`].
     ///
     /// [`TtsFeatures::language`]: crate::core::tts::standard::TtsFeatures::language
@@ -711,8 +712,9 @@ impl CartesiaTTSConfig {
         if let Some(volume) = f.volume {
             cfg.volume = Some(volume);
         }
-        // Language → top-level `language` (replaces the request builder's hardcoded "en").
-        // Precedence: typed `features.language` > extras["language"] > builder default "en".
+        // Language → top-level `language`.
+        // Precedence: typed `features.language` > extras["language"] > omitted (Cartesia's own
+        // default: the field is optional/nullable, so WaaV sends none when nobody chose one).
         if let Some(language) = f.language.as_ref().filter(|s| !s.is_empty()) {
             cfg.language = Some(language.clone());
         } else if let Some(language) = std
@@ -999,7 +1001,7 @@ mod tests {
 
         let cfg = CartesiaTTSConfig::from_standard(&std);
         // Pure from_base passthrough: no features set, so the base is forwarded untouched
-        // (including its `TTSConfig::default()` values like `speaking_rate: Some(1.0)`).
+        // (including its `TTSConfig::default()` values such as `speaking_rate`).
         assert_eq!(cfg.base.api_key, "k");
         assert_eq!(cfg.model, "sonic-3-2025-10-27");
         assert_eq!(cfg.base.speaking_rate, TTSConfig::default().speaking_rate);

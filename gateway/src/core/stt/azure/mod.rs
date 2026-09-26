@@ -66,7 +66,9 @@ pub mod messages;
 
 // Re-export public types for convenient access
 pub use client::AzureSTT;
-pub use config::{AzureOutputFormat, AzureProfanityOption, AzureRegion, AzureSTTConfig};
+pub use config::{
+    AZURE_STT_API_BASE_EXTRA, AzureOutputFormat, AzureProfanityOption, AzureRegion, AzureSTTConfig,
+};
 pub use messages::{
     AzureMessage, AzureMessageError, NBestResult, RecognitionStatus, SpeechEndDetected,
     SpeechHypothesis, SpeechPhrase, SpeechStartDetected, WordTiming,

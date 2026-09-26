@@ -20,9 +20,11 @@
 //! # Authentication
 //!
 //! AWS credentials can be provided via:
-//! 1. Environment variables: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`
-//! 2. AWS credentials file (`~/.aws/credentials`)
-//! 3. IAM instance profiles (for EC2/ECS/Lambda)
+//! 1. Explicit `aws_access_key_id` / `aws_secret_access_key` (/ `aws_session_token`) in the
+//!    config or the standardized `extras` — these always win
+//! 2. Otherwise the SDK default chain: environment variables (`AWS_ACCESS_KEY_ID`,
+//!    `AWS_SECRET_ACCESS_KEY`), the credentials file (`~/.aws/credentials`), IAM instance profiles
+//!    (for EC2/ECS/Lambda)
 //!
 //! # Example
 //!
@@ -85,6 +87,7 @@ mod messages;
 mod tests;
 
 pub use client::AwsTranscribeSTT;
+pub(crate) use config::validate_explicit_credentials;
 pub use config::{
     AwsRegion, AwsTranscribeSTTConfig, ContentRedactionType, DEFAULT_CHUNK_DURATION_MS,
     MAX_SAMPLE_RATE, MIN_SAMPLE_RATE, MediaEncoding, PartialResultsStability,

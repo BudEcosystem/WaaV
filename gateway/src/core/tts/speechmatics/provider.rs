@@ -563,12 +563,32 @@ mod tests {
         ] {
             let config = TTSConfig {
                 api_key: "test-key".to_string(),
+                // No voice chosen → the default Speechmatics voice (an unknown one is rejected).
+                voice_id: None,
                 audio_format: Some(format.as_str().to_string()),
                 ..Default::default()
             };
 
             let tts = SpeechmaticsTts::new(config).unwrap();
             assert_eq!(tts.speechmatics_config().output_format, *format);
+        }
+    }
+
+    // An unknown voice is a construction error, not a silent switch to sarah.
+    #[test]
+    fn test_unknown_voice_is_rejected_not_replaced() {
+        let config = TTSConfig {
+            api_key: "test-key".to_string(),
+            voice_id: Some("aura-2".to_string()),
+            ..Default::default()
+        };
+        match SpeechmaticsTts::new(config) {
+            Err(TTSError::InvalidConfiguration(msg)) => {
+                assert!(msg.contains("aura-2"), "{msg}");
+                assert!(msg.contains("sarah") && msg.contains("jack"), "{msg}");
+            }
+            Err(other) => panic!("expected InvalidConfiguration, got {other:?}"),
+            Ok(_) => panic!("unknown voice must not construct a provider"),
         }
     }
 

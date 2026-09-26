@@ -674,9 +674,15 @@ impl TTSWebSocketConfig {
             provider: self.provider.clone(),
             api_key,
             model: self.model.clone(),
-            // Use provided values or fall back to defaults
-            voice_id: self.voice_id.clone().or(defaults.voice_id),
-            speaking_rate: self.speaking_rate.or(defaults.speaking_rate),
+            // Only what the client chose. There is no vendor-neutral voice or speed to fall back
+            // on: the old fallback was `aura-asteria-en`, a DEEPGRAM voice, which ElevenLabs
+            // received as a voice-id path segment and Cartesia as a voice id; and a speed of 1.0
+            // the client never asked for. Each provider applies its own default, or refuses a
+            // missing voice it requires.
+            voice_id: self.voice_id.clone(),
+            speaking_rate: self.speaking_rate,
+            // The wire format stays defaulted: the socket streams raw PCM, and the egress side
+            // reads the rate from here to frame it.
             audio_format: self.audio_format.clone().or(defaults.audio_format),
             sample_rate: self.sample_rate.or(defaults.sample_rate),
             connection_timeout: self.connection_timeout.or(defaults.connection_timeout),
@@ -860,7 +866,7 @@ impl TTSWebSocketConfig {
 /// (`{lang}_{gender}` composite vs ISO short code). Those have a dedicated `*-tts` mapper in
 /// [`crate::core::lang::mappers`]; everything else shares one mapper across STT/TTS, so the name
 /// passes through unchanged.
-fn tts_provider_alias(provider: &str) -> String {
+pub(crate) fn tts_provider_alias(provider: &str) -> String {
     match provider.to_lowercase().as_str() {
         "google" | "google-tts" | "google_tts" => "google-tts".to_string(),
         "baidu" | "baidu-tts" | "baidu_tts" => "baidu-tts".to_string(),
@@ -868,6 +874,8 @@ fn tts_provider_alias(provider: &str) -> String {
             "reverie-tts".to_string()
         }
         "openai" => "openai-tts".to_string(),
+        // Cartesia's STT takes `auto` as `en`; its TTS omits the field and lets the voice decide.
+        "cartesia" => "cartesia-tts".to_string(),
         other => other.to_string(),
     }
 }

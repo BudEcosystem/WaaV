@@ -476,6 +476,71 @@ impl FromStr for SpeechmaticsLanguage {
 }
 
 // =============================================================================
+// Language and model resolution
+// =============================================================================
+
+/// `STTConfig::default()`'s model — a Deepgram id standing in for "unset" wherever a config is
+/// built from the shared default. It is never a Speechmatics choice (Cartesia's `from_standard`
+/// treats it the same way), so it is read as no model at all.
+const SHARED_DEFAULT_PLACEHOLDER_MODEL: &str = "nova-3";
+
+/// Resolve the recognition language.
+///
+/// Vendor contract: `transcription_config.language` is REQUIRED on the realtime API. So an unset
+/// language falls back to English — for EMPTY only. A language that was chosen is honoured: a
+/// region- or script-qualified tag resolves by its primary subtag (`de-AT` is German), and one that
+/// still names no language Speechmatics transcribes is a configuration error. It used to become
+/// English silently, transcribing (say) Thai audio as English.
+pub(crate) fn speechmatics_language(raw: &str) -> Result<SpeechmaticsLanguage, STTError> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(SpeechmaticsLanguage::English);
+    }
+    if let Ok(language) = raw.parse::<SpeechmaticsLanguage>() {
+        return Ok(language);
+    }
+    let primary = raw.split(['-', '_']).next().unwrap_or(raw);
+    primary.parse::<SpeechmaticsLanguage>().map_err(|_| {
+        STTError::ConfigurationError(format!(
+            "language '{raw}' is not one Speechmatics' realtime API transcribes; name a supported \
+             language (ISO-639-1, e.g. 'en', 'de', 'cmn') or leave it unset"
+        ))
+    })
+}
+
+/// Map the configured model onto Speechmatics' `operating_point`.
+///
+/// Vendor contract: `operating_point` is OPTIONAL (Speechmatics defaults to `standard`) and is the
+/// only model choice the realtime API — the one WaaV speaks for this vendor — offers. So a model
+/// naming `enhanced` or `standard` selects that operating point, an unset model omits the field,
+/// and any other model (the batch-only `batch-melia-1`, `linden-1`, …) is refused by name rather
+/// than quietly served by the default.
+pub(crate) fn speechmatics_operating_point(
+    model: &str,
+) -> Result<Option<SpeechmaticsOperatingPoint>, STTError> {
+    let model = model.trim();
+    if model.is_empty() || model == SHARED_DEFAULT_PLACEHOLDER_MODEL {
+        return Ok(None);
+    }
+    let lower = model.to_ascii_lowercase();
+    if lower.contains("enhanced") {
+        return Ok(Some(SpeechmaticsOperatingPoint::Enhanced));
+    }
+    if lower.contains("standard") {
+        return Ok(Some(SpeechmaticsOperatingPoint::Standard));
+    }
+    // The operating point's own short aliases (`std`, `enh`, `high`).
+    if let Ok(op) = lower.parse::<SpeechmaticsOperatingPoint>() {
+        return Ok(Some(op));
+    }
+    Err(STTError::ConfigurationError(format!(
+        "model '{model}' is not available on Speechmatics' realtime API, which WaaV uses for \
+         Speechmatics: it offers only the 'standard' and 'enhanced' operating points. Use a model \
+         naming one of those, or leave the model unset for Speechmatics' default."
+    )))
+}
+
+// =============================================================================
 // STT Configuration
 // =============================================================================
 
@@ -492,8 +557,12 @@ pub struct SpeechmaticsSTTConfig {
     pub encoding: SpeechmaticsEncoding,
     /// API region (EU or US)
     pub region: SpeechmaticsRegion,
-    /// Operating point (standard or enhanced)
-    pub operating_point: SpeechmaticsOperatingPoint,
+    /// Operating point (standard or enhanced), mapped from the configured model.
+    ///
+    /// `None` omits `operating_point` from `transcription_config`, and Speechmatics applies its own
+    /// default (`standard`). It used to be sent as `standard` on every session, whatever model the
+    /// deployment named.
+    pub operating_point: Option<SpeechmaticsOperatingPoint>,
     /// Enable partial (interim) transcripts
     pub enable_partials: bool,
     /// Maximum delay in seconds (0.0-10.0)
@@ -581,7 +650,7 @@ impl Default for SpeechmaticsSTTConfig {
             sample_rate: 16000,
             encoding: SpeechmaticsEncoding::PcmS16le,
             region: SpeechmaticsRegion::EU,
-            operating_point: SpeechmaticsOperatingPoint::Standard,
+            operating_point: None,
             enable_partials: true,
             max_delay: super::DEFAULT_MAX_DELAY,
             enable_diarization: false,
@@ -629,11 +698,8 @@ impl SpeechmaticsSTTConfig {
                 )
             })?;
 
-        // Parse language
-        let language = config
-            .language
-            .parse()
-            .unwrap_or(SpeechmaticsLanguage::English);
+        let language = speechmatics_language(&config.language)?;
+        let operating_point = speechmatics_operating_point(&config.model)?;
 
         // Parse encoding
         let encoding = config
@@ -646,6 +712,7 @@ impl SpeechmaticsSTTConfig {
             language,
             sample_rate: config.sample_rate,
             encoding,
+            operating_point,
             ..Default::default()
         })
     }
@@ -844,7 +911,7 @@ impl SpeechmaticsSTTConfig {
 
     /// Set the operating point
     pub fn with_operating_point(mut self, operating_point: SpeechmaticsOperatingPoint) -> Self {
-        self.operating_point = operating_point;
+        self.operating_point = Some(operating_point);
         self
     }
 
@@ -1073,7 +1140,8 @@ mod tests {
         assert_eq!(config.sample_rate, 16000);
         assert_eq!(config.encoding, SpeechmaticsEncoding::PcmS16le);
         assert_eq!(config.region, SpeechmaticsRegion::EU);
-        assert_eq!(config.operating_point, SpeechmaticsOperatingPoint::Standard);
+        // Unset: omitted from the request, so Speechmatics applies its own default.
+        assert_eq!(config.operating_point, None);
         assert!(config.enable_partials);
         assert_eq!(config.max_delay, 2.0);
         assert!(!config.enable_diarization);
@@ -1195,7 +1263,10 @@ mod tests {
             .with_vocab(vec!["custom".to_string(), "words".to_string()]);
 
         assert_eq!(config.region, SpeechmaticsRegion::US);
-        assert_eq!(config.operating_point, SpeechmaticsOperatingPoint::Enhanced);
+        assert_eq!(
+            config.operating_point,
+            Some(SpeechmaticsOperatingPoint::Enhanced)
+        );
         assert!(!config.enable_partials);
         assert_eq!(config.max_delay, 5.0);
         assert!(config.enable_diarization);
@@ -1218,6 +1289,87 @@ mod tests {
         assert_eq!(config.language, SpeechmaticsLanguage::French);
         assert_eq!(config.sample_rate, 44100);
         assert_eq!(config.encoding, SpeechmaticsEncoding::PcmF32le);
+    }
+
+    fn from_base_with(language: &str, model: &str) -> Result<SpeechmaticsSTTConfig, STTError> {
+        SpeechmaticsSTTConfig::from_base(&STTConfig {
+            api_key: "test-key".to_string(),
+            language: language.to_string(),
+            model: model.to_string(),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn test_unset_language_falls_back_to_the_required_default() {
+        // `language` is required on the realtime API; the upload route hands over an empty one
+        // when neither the request nor the deployment names a language.
+        let config = from_base_with("", "").unwrap();
+        assert_eq!(config.language, SpeechmaticsLanguage::English);
+    }
+
+    #[test]
+    fn test_region_qualified_language_resolves_by_primary_subtag() {
+        assert_eq!(
+            from_base_with("de-AT", "").unwrap().language,
+            SpeechmaticsLanguage::German
+        );
+        assert_eq!(
+            from_base_with("en-US", "").unwrap().language,
+            SpeechmaticsLanguage::English
+        );
+    }
+
+    #[test]
+    fn test_unknown_language_is_an_error_not_english() {
+        // It used to become English silently: Klingon audio transcribed as English.
+        match from_base_with("tlh", "") {
+            Err(STTError::ConfigurationError(msg)) => assert!(msg.contains("tlh"), "{msg}"),
+            other => panic!("expected ConfigurationError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_model_selects_the_operating_point() {
+        // The model used to be dropped and `operating_point: standard` sent on every session.
+        for (model, op) in [
+            ("enhanced", SpeechmaticsOperatingPoint::Enhanced),
+            (
+                "speechmatics-enhanced",
+                SpeechmaticsOperatingPoint::Enhanced,
+            ),
+            ("rt-standard", SpeechmaticsOperatingPoint::Standard),
+            ("standard", SpeechmaticsOperatingPoint::Standard),
+        ] {
+            assert_eq!(
+                from_base_with("en", model).unwrap().operating_point,
+                Some(op),
+                "{model}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_unset_model_omits_the_operating_point() {
+        assert_eq!(from_base_with("en", "").unwrap().operating_point, None);
+        // `STTConfig::default()`'s Deepgram placeholder is not a Speechmatics choice.
+        assert_eq!(
+            from_base_with("en", "nova-3").unwrap().operating_point,
+            None
+        );
+    }
+
+    #[test]
+    fn test_model_the_realtime_api_cannot_serve_is_refused_by_name() {
+        for model in ["batch-melia-1", "linden-1"] {
+            match from_base_with("en", model) {
+                Err(STTError::ConfigurationError(msg)) => {
+                    assert!(msg.contains(model), "{msg}");
+                    assert!(msg.contains("realtime"), "{msg}");
+                }
+                other => panic!("{model}: expected ConfigurationError, got {other:?}"),
+            }
+        }
     }
 
     #[test]

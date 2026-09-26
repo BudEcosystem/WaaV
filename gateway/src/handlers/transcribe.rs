@@ -716,6 +716,113 @@ pub async fn transcribe_self_hosted(
         transcription_url(api_base)
     };
 
+    let form = openai_transcription_form(model, file_bytes, filename, settings);
+
+    let client = reqwest::Client::builder()
+        .timeout(OVERALL_DEADLINE)
+        .build()
+        .map_err(|e| format!("could not build the http client: {e}"))?;
+
+    let req = upstream_transcription_request(&client, &url, UpstreamAuth::Bearer(api_key), form);
+    send_upstream_transcription(req, &url, "self-hosted deployment").await
+}
+
+/// Forward an upload to an Azure OpenAI deployment (voice contract §3) and return its body
+/// verbatim.
+///
+/// `POST {api_base}/openai/deployments/{deployment}/audio/{transcriptions|translations}
+/// ?api-version={api_version}` with `api-key: <api_key>` and no `Authorization` header; the
+/// multipart body is OpenAI's, exactly as [`transcribe_self_hosted`] sends it. The route
+/// follows `settings.translate`, as it does there.
+///
+/// * `api_base` — `voice_table.api_base`, the resource endpoint
+///   (`https://<resource>.openai.azure.com`).
+/// * `deployment` — `voice_table.model`: budapp publishes the credential's `deployment_id` there
+///   when one is set, else the model name. Also sent as the form's `model`, as the OpenAI SDK's
+///   Azure client does.
+/// * `api_version` — `provider_params.api_version`; `None` or blank sends
+///   [`AZURE_OPENAI_DEFAULT_API_VERSION`](crate::core::tts::self_hosted::AZURE_OPENAI_DEFAULT_API_VERSION).
+/// * `api_key` — the decrypted `voice_table.credential`. Required: Azure OpenAI has no
+///   anonymous access.
+///
+/// Refuses a non-https target and a loopback, private, link-local or metadata host before
+/// anything is sent (the shared SSRF rules), and never follows a redirect to one.
+pub(crate) async fn transcribe_azure_openai(
+    api_base: &str,
+    deployment: &str,
+    api_version: Option<&str>,
+    api_key: &str,
+    file_bytes: Vec<u8>,
+    filename: &str,
+    settings: &waav_openai_audio::transcription::TranscriptionSettings,
+) -> Result<String, String> {
+    use crate::core::tts::self_hosted::{azure_openai_url_schemes, validate_azure_openai_url};
+
+    let api_key = api_key.trim();
+    if api_key.is_empty() {
+        return Err(
+            "the Azure OpenAI deployment has no API key configured; Azure OpenAI has no \
+             anonymous access"
+                .to_string(),
+        );
+    }
+    let url = azure_transcription_url(api_base, deployment, api_version, settings.translate)?;
+
+    // Resolve-then-validate does a blocking DNS lookup; keep it off the async workers.
+    let target = url.clone();
+    tokio::task::spawn_blocking(move || validate_azure_openai_url(&target))
+        .await
+        .map_err(|e| format!("the Azure OpenAI endpoint check did not complete: {e}"))?
+        .map_err(|msg| format!("Azure OpenAI api_base rejected (SSRF protection): {msg}"))?;
+
+    let client = crate::core::net::ssrf_protected_client_builder(azure_openai_url_schemes())
+        .timeout(OVERALL_DEADLINE)
+        .build()
+        .map_err(|e| format!("could not build the http client: {e}"))?;
+
+    let form = openai_transcription_form(deployment.trim(), file_bytes, filename, settings);
+    let req =
+        upstream_transcription_request(&client, &url, UpstreamAuth::AzureApiKey(api_key), form);
+    send_upstream_transcription(req, &url, "Azure OpenAI deployment").await
+}
+
+/// The Azure OpenAI transcription or translation URL for one upload.
+fn azure_transcription_url(
+    api_base: &str,
+    deployment: &str,
+    api_version: Option<&str>,
+    translate: bool,
+) -> Result<String, String> {
+    use crate::core::tts::self_hosted::{AzureAudioRoute, azure_openai_audio_url};
+
+    let route = if translate {
+        AzureAudioRoute::Translations
+    } else {
+        AzureAudioRoute::Transcriptions
+    };
+    azure_openai_audio_url(api_base, deployment, route, api_version)
+}
+
+/// How an OpenAI-shaped upstream expects its credential.
+///
+/// No `Debug`: both variants carry the key.
+#[derive(Clone, Copy)]
+enum UpstreamAuth<'a> {
+    /// `Authorization: Bearer <key>`, and no header at all for an empty key: a keyless
+    /// in-cluster deployment is normal, and an empty Bearer is a malformed credential, not an
+    /// anonymous one, which some servers reject outright.
+    Bearer(&'a str),
+    /// Azure OpenAI: `api-key: <key>`, and never `Authorization`.
+    AzureApiKey(&'a str),
+}
+
+/// OpenAI's transcription multipart body, shared by every OpenAI-shaped upstream.
+fn openai_transcription_form(
+    model: &str,
+    file_bytes: Vec<u8>,
+    filename: &str,
+    settings: &waav_openai_audio::transcription::TranscriptionSettings,
+) -> reqwest::multipart::Form {
     let part = reqwest::multipart::Part::bytes(file_bytes).file_name(filename.to_string());
     let mut form = reqwest::multipart::Form::new()
         .part("file", part)
@@ -748,34 +855,48 @@ pub async fn transcribe_self_hosted(
         };
         form = form.text("timestamp_granularities[]", name);
     }
+    form
+}
 
-    let client = reqwest::Client::builder()
-        .timeout(OVERALL_DEADLINE)
-        .build()
-        .map_err(|e| format!("could not build the http client: {e}"))?;
-
-    let mut req = client.post(&url).multipart(form);
-    // A keyless in-cluster deployment is normal; an empty Bearer is a malformed credential,
-    // not an anonymous one, and some servers reject it outright.
-    if !api_key.is_empty() {
-        req = req.bearer_auth(api_key);
+/// One upload to an OpenAI-shaped upstream: the URL, the credential in that upstream's header,
+/// the body.
+fn upstream_transcription_request(
+    client: &reqwest::Client,
+    url: &str,
+    auth: UpstreamAuth<'_>,
+    form: reqwest::multipart::Form,
+) -> reqwest::RequestBuilder {
+    let req = client.post(url).multipart(form);
+    match auth {
+        UpstreamAuth::Bearer("") => req,
+        UpstreamAuth::Bearer(key) => req.bearer_auth(key),
+        UpstreamAuth::AzureApiKey(key) => {
+            crate::core::tts::self_hosted::with_azure_openai_api_key(req, key)
+        }
     }
+}
 
+/// Send an upload and return the upstream's body verbatim, naming the upstream in every failure.
+async fn send_upstream_transcription(
+    req: reqwest::RequestBuilder,
+    url: &str,
+    upstream: &str,
+) -> Result<String, String> {
     let resp = req
         .send()
         .await
-        .map_err(|e| format!("self-hosted deployment at {url} is unreachable: {e}"))?;
+        .map_err(|e| format!("{upstream} at {url} is unreachable: {e}"))?;
 
     let status = resp.status();
     let body = resp
         .text()
         .await
-        .map_err(|e| format!("self-hosted deployment returned an unreadable body: {e}"))?;
+        .map_err(|e| format!("{upstream} returned an unreadable body: {e}"))?;
 
     if !status.is_success() {
         // The backend's own message is far more useful than anything synthesised here.
         return Err(format!(
-            "self-hosted deployment returned {status}: {}",
+            "{upstream} returned {status}: {}",
             body.chars().take(500).collect::<String>()
         ));
     }
@@ -1137,5 +1258,178 @@ mod collector_tests {
 
         assert_eq!(c.detected_language.as_deref(), Some("en"));
         assert_eq!(c.audio_duration, Some(10.0));
+    }
+}
+
+/// Azure OpenAI uploads (voice contract §3). Nothing here reaches the network: every refusal
+/// fires before a request is sent, and the request shape is checked on the built request.
+#[cfg(test)]
+mod azure_openai_tests {
+    use super::*;
+    use waav_openai_audio::transcription::{TranscriptionResponseFormat, TranscriptionSettings};
+
+    const AZ: &str = "https://bud-test.openai.azure.com";
+
+    fn upload(translate: bool) -> TranscriptionSettings {
+        TranscriptionSettings {
+            endpoint: "ep-azure".into(),
+            response_format: TranscriptionResponseFormat::Json,
+            language: Some("en".into()),
+            prompt: None,
+            temperature: None,
+            timestamp_granularities: None,
+            overrides: Default::default(),
+            unrecognised: Vec::new(),
+            translate,
+        }
+    }
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn transcription_and_translation_take_their_own_azure_routes() {
+        assert_eq!(
+            azure_transcription_url(AZ, "whisper-1", None, false).unwrap(),
+            "https://bud-test.openai.azure.com/openai/deployments/whisper-1/audio/transcriptions\
+             ?api-version=2025-04-01-preview"
+        );
+        assert_eq!(
+            azure_transcription_url(AZ, "whisper-1", Some("2024-06-01"), true).unwrap(),
+            "https://bud-test.openai.azure.com/openai/deployments/whisper-1/audio/translations\
+             ?api-version=2024-06-01"
+        );
+        // A blank api_version is the shape an unset value takes; it means the default.
+        assert!(
+            azure_transcription_url(AZ, "whisper-1", Some(""), false)
+                .unwrap()
+                .ends_with("?api-version=2025-04-01-preview")
+        );
+    }
+
+    #[test]
+    fn an_azure_upload_carries_api_key_and_no_authorization() {
+        let client = reqwest::Client::new();
+        let url = azure_transcription_url(AZ, "gpt-4o-transcribe", None, false).unwrap();
+        let form =
+            openai_transcription_form("gpt-4o-transcribe", vec![0u8; 8], "a.wav", &upload(false));
+        let req = upstream_transcription_request(
+            &client,
+            &url,
+            UpstreamAuth::AzureApiKey("az-test-key"),
+            form,
+        )
+        .build()
+        .unwrap();
+
+        assert_eq!(req.url().as_str(), url);
+        assert_eq!(
+            req.headers()
+                .get(crate::core::tts::self_hosted::AZURE_OPENAI_API_KEY_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("az-test-key")
+        );
+        assert!(
+            req.headers().get(reqwest::header::AUTHORIZATION).is_none(),
+            "Azure OpenAI takes `api-key`; a Bearer would put the key on the wire twice"
+        );
+        assert!(
+            req.headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|ct| ct.starts_with("multipart/form-data")),
+            "the body is OpenAI's multipart upload"
+        );
+    }
+
+    #[test]
+    fn a_self_hosted_upload_still_sends_a_bearer_and_nothing_when_keyless() {
+        let client = reqwest::Client::new();
+        let url = "http://whisper.ns.svc:8000/v1/audio/transcriptions";
+
+        let form = openai_transcription_form("whisper", vec![0u8; 8], "a.wav", &upload(false));
+        let req =
+            upstream_transcription_request(&client, url, UpstreamAuth::Bearer("sk-local"), form)
+                .build()
+                .unwrap();
+        assert_eq!(
+            req.headers()
+                .get(reqwest::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok()),
+            Some("Bearer sk-local")
+        );
+        assert!(req.headers().get("api-key").is_none());
+
+        let form = openai_transcription_form("whisper", vec![0u8; 8], "a.wav", &upload(false));
+        let req = upstream_transcription_request(&client, url, UpstreamAuth::Bearer(""), form)
+            .build()
+            .unwrap();
+        assert!(
+            req.headers().get(reqwest::header::AUTHORIZATION).is_none(),
+            "an empty key must send no Authorization header at all"
+        );
+    }
+
+    #[test]
+    fn an_azure_upload_to_a_loopback_or_plain_http_host_is_refused_before_sending() {
+        // Held for the whole check: another test may briefly open the loopback escape hatch.
+        let _env = crate::core::net::ssrf_env_lock();
+        let rt = runtime();
+        for base in [
+            "https://127.0.0.1:8443",
+            "https://localhost",
+            "https://169.254.169.254",
+            "http://bud-test.openai.azure.com",
+        ] {
+            let err = rt
+                .block_on(transcribe_azure_openai(
+                    base,
+                    "whisper-1",
+                    None,
+                    "az-test-key",
+                    vec![0u8; 4],
+                    "a.wav",
+                    &upload(false),
+                ))
+                .unwrap_err();
+            assert!(
+                err.contains("SSRF protection"),
+                "{base}: the refusal must name the SSRF guard, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_azure_upload_without_a_key_or_a_deployment_is_refused_by_name() {
+        let rt = runtime();
+        let err = rt
+            .block_on(transcribe_azure_openai(
+                AZ,
+                "whisper-1",
+                None,
+                "   ",
+                vec![0u8; 4],
+                "a.wav",
+                &upload(false),
+            ))
+            .unwrap_err();
+        assert!(err.contains("API key"), "{err}");
+
+        let err = rt
+            .block_on(transcribe_azure_openai(
+                AZ,
+                "",
+                None,
+                "az-test-key",
+                vec![0u8; 4],
+                "a.wav",
+                &upload(true),
+            ))
+            .unwrap_err();
+        assert!(err.contains("deployment"), "{err}");
     }
 }

@@ -235,6 +235,9 @@ mod config_tests {
 
     #[test]
     fn test_validate_empty_language() {
+        // Cartesia's `language` is optional (their default is `en`), so an unset language is a
+        // valid configuration — it used to be refused as "Language code is required", which made
+        // "nobody named a language" and language detection configuration errors.
         let config = CartesiaSTTConfig {
             base: STTConfig {
                 api_key: "test".to_string(),
@@ -244,15 +247,13 @@ mod config_tests {
             ..Default::default()
         };
 
-        let result = config.validate();
-        assert!(result.is_err());
+        assert!(config.validate().is_ok());
 
-        match result {
-            Err(STTError::ConfigurationError(msg)) => {
-                assert!(msg.contains("Language code is required"));
-            }
-            _ => panic!("Expected ConfigurationError"),
-        }
+        // And the wire carries no `language` at all — not an empty one, not a substituted `en`.
+        let url = config.build_websocket_url("test");
+        assert!(!url.contains("language="), "url: {url}");
+        assert!(url.contains("&model="), "url: {url}");
+        assert!(url.contains("&encoding="), "url: {url}");
     }
 
     #[test]

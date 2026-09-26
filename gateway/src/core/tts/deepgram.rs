@@ -36,6 +36,70 @@ pub fn deepgram_speak_url(model: &str) -> &'static str {
     }
 }
 
+/// The value for Deepgram's `model` parameter: the voice, else the deployment's model, else none.
+///
+/// Deepgram has no voice parameter — a voice id such as `aura-2-thalia-en` IS the model. So the
+/// voice wins. `model` preferred to the voice made every request to a deployment published under
+/// its catalog FAMILY name answer
+///
+/// > 400 INVALID_QUERY_PARAMETER — Invalid 'model' value of 'aura-2'.
+///
+/// whatever voice the caller or the deployment chose: the voice was resolved, then dropped.
+///
+/// `model` is still used when nothing names a voice. That is what a deployment published under a
+/// full voice id (`aura-asteria-en`) and a WebSocket client that sets only `model` rely on.
+///
+/// `None` when neither is set, and the parameter is then left off: Deepgram's `model` is optional,
+/// and choosing one here would be WaaV picking a voice nobody asked for.
+pub(crate) fn deepgram_model(config: &TTSConfig) -> Option<&str> {
+    config
+        .voice_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .or_else(|| Some(config.model.trim()).filter(|m| !m.is_empty()))
+}
+
+#[cfg(test)]
+mod model_param_tests {
+    use super::*;
+
+    fn cfg(model: &str, voice: Option<&str>) -> TTSConfig {
+        TTSConfig {
+            model: model.into(),
+            voice_id: voice.map(Into::into),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_voice_wins_over_a_family_model() {
+        // The live failure: a deployment published as `aura-2`, voice `aura-2-thalia-en`.
+        assert_eq!(
+            deepgram_model(&cfg("aura-2", Some("aura-2-thalia-en"))),
+            Some("aura-2-thalia-en")
+        );
+    }
+
+    #[test]
+    fn the_model_is_used_when_no_voice_is_named() {
+        assert_eq!(
+            deepgram_model(&cfg("aura-asteria-en", None)),
+            Some("aura-asteria-en")
+        );
+        assert_eq!(
+            deepgram_model(&cfg("aura-asteria-en", Some("  "))),
+            Some("aura-asteria-en")
+        );
+    }
+
+    #[test]
+    fn nothing_named_means_no_model() {
+        assert_eq!(deepgram_model(&cfg("", None)), None);
+        assert_eq!(deepgram_model(&cfg("  ", Some(""))), None);
+    }
+}
+
 #[cfg(test)]
 mod speak_url_tests {
     use super::*;
@@ -82,9 +146,24 @@ pub fn deepgram_encoding_and_container(format: &str) -> (&str, Option<&'static s
         // A WAV file is linear16 samples inside a RIFF container.
         "wav" => ("linear16", Some("wav")),
         // Container-less: an explicit "none" keeps a WAV header off raw samples, matching the
-        // WebSocket path which delivers bare frames.
-        "linear16" | "pcm" | "mulaw" | "ulaw" | "alaw" => (format, Some("none")),
+        // WebSocket path which delivers bare frames. `pcm` and `ulaw` are WaaV's spellings;
+        // Deepgram's encodings are `linear16` and `mulaw`, and it refuses the others.
+        "linear16" | "pcm" => ("linear16", Some("none")),
+        "mulaw" | "ulaw" => ("mulaw", Some("none")),
+        "alaw" => ("alaw", Some("none")),
         other => (other, None),
+    }
+}
+
+/// The rate Deepgram produces for a raw encoding when no `sample_rate` is sent.
+///
+/// Its documented defaults: 24000 for linear16, 8000 for the G.711 encodings (which accept only
+/// 8000 or 16000). WaaV no longer sends a rate nobody chose, but raw samples still have to be
+/// LABELLED with the rate they arrive at, so the label follows the vendor's default.
+pub(crate) fn deepgram_default_sample_rate(encoding: &str) -> u32 {
+    match encoding {
+        "mulaw" | "alaw" => 8000,
+        _ => 24000,
     }
 }
 
@@ -104,8 +183,19 @@ mod encoding_container_tests {
     #[test]
     fn raw_formats_keep_an_explicit_none_container() {
         // Without this a WAV header is prepended to what the caller asked to be raw samples.
-        for f in ["linear16", "pcm", "mulaw", "ulaw", "alaw"] {
-            assert_eq!(deepgram_encoding_and_container(f), (f, Some("none")), "{f}");
+        // `pcm` and `ulaw` are sent under Deepgram's own names; it refuses WaaV's.
+        for (f, encoding) in [
+            ("linear16", "linear16"),
+            ("pcm", "linear16"),
+            ("mulaw", "mulaw"),
+            ("ulaw", "mulaw"),
+            ("alaw", "alaw"),
+        ] {
+            assert_eq!(
+                deepgram_encoding_and_container(f),
+                (encoding, Some("none")),
+                "{f}"
+            );
         }
     }
 
@@ -203,22 +293,16 @@ impl TTSRequestBuilder for DeepgramRequestBuilder {
         // scheme+host while keeping the `/v1/speak` path the mock serves on).
         // v1 or v2 depending on the model: Deepgram serves Flux voices only from /v2/speak
         // and rejects them on /v1 with V2_MODEL_ON_V1_SPEAK_ENDPOINT.
-        let base = deepgram_speak_url(if self.config.model.is_empty() {
-            self.config.voice_id.as_deref().unwrap_or("")
-        } else {
-            &self.config.model
-        });
+        let model = deepgram_model(&self.config);
+        let base = deepgram_speak_url(model.unwrap_or(""));
         let mut url = crate::core::tts::standard::override_rest_endpoint(
             base,
             self.speak.endpoint_override.as_deref(),
         );
         let mut params: Vec<(&str, String)> = Vec::new();
 
-        // Use model field if provided, otherwise fall back to voice_id
-        if !self.config.model.is_empty() {
-            params.push(("model", self.config.model.clone()));
-        } else if let Some(voice_id) = &self.config.voice_id {
-            params.push(("model", voice_id.clone()));
+        if let Some(model) = model {
+            params.push(("model", model.to_string()));
         }
 
         // Encoding + container (default to raw linear PCM). WAV is a CONTAINER here, not an
@@ -238,19 +322,19 @@ impl TTSRequestBuilder for DeepgramRequestBuilder {
         //
         // Sending it unconditionally therefore made every compressed-format request fail, on
         // this route and on /speak alike, regardless of what the caller configured.
-        let takes_sample_rate = matches!(encoding, "linear16" | "pcm" | "mulaw" | "ulaw" | "alaw");
-        if takes_sample_rate {
-            match self.config.sample_rate {
-                Some(sample_rate) => params.push(("sample_rate", sample_rate.to_string())),
-                // Match the default used elsewhere (the WS path) rather than letting the vendor
-                // pick, so raw samples arrive at a predictable rate.
-                None => params.push(("sample_rate", "24000".to_string())),
-            }
+        //
+        // And only when one was chosen. It is optional; a fixed 24000 used to be sent in its
+        // place, which is Deepgram's own default for linear16 and INVALID for mulaw/alaw (8000
+        // or 16000 only), so every G.711 request without a rate was refused.
+        let takes_sample_rate = matches!(encoding, "linear16" | "mulaw" | "alaw");
+        if takes_sample_rate && let Some(sample_rate) = self.config.sample_rate {
+            params.push(("sample_rate", sample_rate.to_string()));
         }
 
-        // Speaking speed/rate (`speed`, Deepgram range 0.7–1.5). Only emitted when explicitly set
-        // via the standardized features, so existing default behavior (no `speed` param) is kept.
-        if let Some(speed) = self.speak.speed {
+        // Speaking speed (`speed`, Deepgram range 0.7–1.5), only when chosen: the standardized
+        // feature, else the flat `speaking_rate` — which is where `/v1/audio/speech` puts the
+        // caller's `speed`. Reading only the feature dropped that request field silently.
+        if let Some(speed) = self.speak.speed.or(self.config.speaking_rate) {
             params.push(("speed", speed.to_string()));
         }
 
@@ -868,6 +952,98 @@ mod tests {
             baseline, with_callback,
             "callback must NOT change the cache key (delivery-only)"
         );
+    }
+
+    fn speak_url(model: &str, voice: Option<&str>) -> String {
+        let builder = DeepgramRequestBuilder {
+            config: TTSConfig {
+                provider: "deepgram".into(),
+                api_key: "k".into(),
+                model: model.into(),
+                voice_id: voice.map(Into::into),
+                audio_format: Some("mp3".into()),
+                ..Default::default()
+            },
+            pronunciation_replacer: None,
+            speak: Default::default(),
+        };
+        builder
+            .build_http_request(&reqwest::Client::new(), "hi")
+            .build()
+            .unwrap()
+            .url()
+            .to_string()
+    }
+
+    /// The live failure, at the wire: `aura-2` deployment, voice `aura-2-thalia-en`. Deepgram
+    /// answered `400 Invalid 'model' value of 'aura-2'` because the family was sent and the
+    /// voice dropped.
+    #[test]
+    fn a_family_deployment_sends_the_voice_as_the_model() {
+        let url = speak_url("aura-2", Some("aura-2-thalia-en"));
+        let parsed = url::Url::parse(&url).unwrap();
+        let models: Vec<String> = parsed
+            .query_pairs()
+            .filter(|(k, _)| k == "model")
+            .map(|(_, v)| v.into_owned())
+            .collect();
+        assert_eq!(models, ["aura-2-thalia-en"], "{url}");
+    }
+
+    #[test]
+    fn a_flux_voice_goes_to_v2_even_on_a_family_deployment() {
+        let url = speak_url("flux", Some("flux-hannah-en"));
+        assert!(url.starts_with(DEEPGRAM_TTS_URL_V2), "{url}");
+        assert!(url.contains("model=flux-hannah-en"), "{url}");
+    }
+
+    fn url_for(config: TTSConfig) -> String {
+        DeepgramRequestBuilder {
+            config,
+            pronunciation_replacer: None,
+            speak: Default::default(),
+        }
+        .build_http_request(&reqwest::Client::new(), "hi")
+        .build()
+        .unwrap()
+        .url()
+        .to_string()
+    }
+
+    /// `/v1/audio/speech` carries the caller's `speed` in `speaking_rate`; it was never read.
+    #[test]
+    fn the_callers_speed_reaches_the_url() {
+        let url = url_for(TTSConfig {
+            voice_id: Some("aura-2-thalia-en".into()),
+            audio_format: Some("mp3".into()),
+            speaking_rate: Some(1.2),
+            ..Default::default()
+        });
+        assert!(url.contains("speed=1.2"), "{url}");
+    }
+
+    /// No rate chosen → none sent, even for a raw encoding: 24000 used to be forced, and for
+    /// mulaw/alaw that is a value Deepgram refuses.
+    #[test]
+    fn no_rate_chosen_sends_no_rate() {
+        for format in ["linear16", "mulaw", "alaw"] {
+            let url = url_for(TTSConfig {
+                voice_id: Some("aura-2-thalia-en".into()),
+                audio_format: Some(format.into()),
+                sample_rate: None,
+                ..Default::default()
+            });
+            assert!(!url.contains("sample_rate"), "{format}: {url}");
+        }
+    }
+
+    /// Deepgram's `model` is optional; with nothing named, the parameter is omitted and Deepgram
+    /// applies its own default rather than one WaaV picked.
+    #[test]
+    fn nothing_named_sends_no_model() {
+        let url = speak_url("", None);
+        assert!(!url.contains("model="), "{url}");
+        assert!(url.starts_with(DEEPGRAM_TTS_URL), "{url}");
     }
 
     /// The other half of the same rule: container-less encodings DO take a rate, and without

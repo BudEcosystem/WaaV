@@ -4,8 +4,11 @@
 //! It supports:
 //!
 //! - 60+ voices across 30+ languages
-//! - Multiple engines (standard, neural, long-form, generative)
-//! - Output formats: mp3, ogg_vorbis, pcm
+//! - Multiple engines (standard, neural, long-form, generative), chosen by `model`; an empty
+//!   model sends no engine and Polly applies `standard`
+//! - Output formats: pcm (`linear16` / `wav`), mp3, ogg_opus (`opus`), ogg_vorbis — anything else
+//!   is refused at construction (see [`PollyOutputFormat::from_requested`])
+//! - Any AWS region, passed through verbatim
 //! - SSML input for fine-grained control
 //! - AWS credential management (explicit keys, IAM roles, etc.)
 //!

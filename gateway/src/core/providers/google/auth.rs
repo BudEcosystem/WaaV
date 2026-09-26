@@ -46,7 +46,10 @@ use super::error::GoogleError;
 /// Determines the source of Google Cloud credentials based on the api_key value.
 ///
 /// This enum represents the three ways credentials can be provided to Google Cloud APIs.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `Debug` is implemented by hand and never prints the wrapped value: `JsonContent` carries a
+/// private key, and a `FilePath` is frequently a secret pasted into the wrong field.
+#[derive(Clone, PartialEq)]
 pub enum CredentialSource {
     /// Use Application Default Credentials (from `GOOGLE_APPLICATION_CREDENTIALS` env var,
     /// default service account on GCP, or `gcloud auth application-default login`).
@@ -58,6 +61,55 @@ pub enum CredentialSource {
 
     /// Path to a service account JSON file or user credentials file.
     FilePath(String),
+}
+
+impl std::fmt::Debug for CredentialSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CredentialSource::ApplicationDefault => f.write_str("ApplicationDefault"),
+            CredentialSource::JsonContent(json) => {
+                write!(f, "JsonContent(<redacted, {} bytes>)", json.len())
+            }
+            CredentialSource::FilePath(path) => {
+                write!(f, "FilePath(<redacted, {} bytes>)", path.len())
+            }
+        }
+    }
+}
+
+/// Returns `true` only when `credential` is inline service-account JSON: a JSON object whose
+/// `type` is `"service_account"` and which carries non-empty `private_key` and `client_email`
+/// strings.
+///
+/// Unlike [`CredentialSource::from_api_key`], which also accepts a file path (read from the
+/// gateway's own filesystem) and the empty string (Application Default Credentials, i.e. the
+/// gateway's own identity), this accepts neither. Use it to gate credentials supplied by a
+/// tenant, who must not be able to select a server-side file or borrow the gateway's identity.
+/// This is a shape check, not a full parse: the auth client can still reject the key later.
+///
+/// # Example
+///
+/// ```rust
+/// use waav_gateway::core::providers::google::is_service_account_json;
+///
+/// let sa = r#"{"type": "service_account", "private_key": "k", "client_email": "a@b.c"}"#;
+/// assert!(is_service_account_json(sa));
+/// assert!(!is_service_account_json(""));
+/// assert!(!is_service_account_json("/var/run/secrets/google/key.json"));
+/// ```
+pub fn is_service_account_json(credential: &str) -> bool {
+    let Ok(serde_json::Value::Object(obj)) = serde_json::from_str::<serde_json::Value>(credential)
+    else {
+        return false;
+    };
+    let non_empty_str = |key: &str| {
+        obj.get(key)
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.trim().is_empty())
+    };
+    obj.get("type").and_then(|v| v.as_str()) == Some("service_account")
+        && non_empty_str("private_key")
+        && non_empty_str("client_email")
 }
 
 impl CredentialSource {
@@ -136,9 +188,13 @@ impl CredentialSource {
                     ));
                 }
 
+                // Never echo the value: a caller who pastes an API key or token into the credential
+                // field lands here (it does not start with `{`), and this message reaches them.
                 if !Path::new(path).exists() {
                     return Err(GoogleError::ConfigurationError(format!(
-                        "Credential file not found: {path}"
+                        "Credential file not found (value not shown, {} characters). Provide \
+                         service account JSON content, or a path to a credentials file",
+                        path.chars().count()
                     )));
                 }
 
@@ -292,11 +348,14 @@ impl GoogleAuthClient {
                         ))
                     })?
             }
+            // Returned messages below name no path: they can reach the caller, and the path is
+            // server-side detail. The logs keep it (`validate` has already proven the file exists,
+            // so it is a real path on this host, not a pasted secret).
             CredentialSource::FilePath(ref path) => {
                 let json_content = std::fs::read_to_string(path).map_err(|e| {
                     error!(error = %e, path = %path, "Failed to read credentials file");
                     GoogleError::ConfigurationError(format!(
-                        "Failed to read credentials file '{path}': {e}"
+                        "Failed to read credentials file: {e}"
                     ))
                 })?;
 
@@ -304,7 +363,7 @@ impl GoogleAuthClient {
                     serde_json::from_str(&json_content).map_err(|e| {
                         error!(error = %e, path = %path, "Failed to parse credentials file");
                         GoogleError::ConfigurationError(format!(
-                            "Failed to parse credentials file '{path}': {e}"
+                            "Failed to parse credentials file: {e}"
                         ))
                     })?;
 
@@ -324,7 +383,7 @@ impl GoogleAuthClient {
                             .map_err(|e| {
                                 error!(error = %e, path = %path, "Failed to load service account credentials");
                                 GoogleError::AuthenticationFailed(format!(
-                                    "Failed to load service account credentials from '{path}': {e}"
+                                    "Failed to load service account credentials from file: {e}"
                                 ))
                             })?
                     }
@@ -336,15 +395,18 @@ impl GoogleAuthClient {
                             .map_err(|e| {
                                 error!(error = %e, path = %path, "Failed to load user account credentials");
                                 GoogleError::AuthenticationFailed(format!(
-                                    "Failed to load user account credentials from '{path}': {e}"
+                                    "Failed to load user account credentials from file: {e}"
                                 ))
                             })?
                     }
                     _ => {
-                        return Err(GoogleError::ConfigurationError(format!(
-                            "Unsupported credential type '{cred_type}' in file '{path}'. \
+                        // The `type` value is file content; keep it in the log, not the reply.
+                        error!(cred_type = %cred_type, path = %path, "Unsupported credential type");
+                        return Err(GoogleError::ConfigurationError(
+                            "Unsupported credential type in credentials file. \
                              Expected 'service_account' or 'authorized_user'"
-                        )));
+                                .to_string(),
+                        ));
                     }
                 }
             }
@@ -543,6 +605,105 @@ mod tests {
         } else {
             panic!("Expected ConfigurationError");
         }
+    }
+
+    // A caller who pastes an API key into the credential field gets a FilePath source; the
+    // not-found error reaches them, so it must not echo what they pasted.
+    #[test]
+    fn test_credential_source_validate_nonexistent_file_does_not_echo_value() {
+        let pasted = "AIzaSyD-not-a-real-key-0123456789abcdef";
+        let err = CredentialSource::from_api_key(pasted)
+            .validate()
+            .expect_err("a pasted API key is not an existing file");
+        let msg = err.to_string();
+        assert!(msg.contains("Credential file not found"), "{msg}");
+        assert!(!msg.contains(pasted), "error echoed the credential: {msg}");
+        assert!(
+            !msg.contains("AIza"),
+            "error echoed part of the credential: {msg}"
+        );
+
+        // The same value through the auth-client constructor (the path STT/TTS take).
+        let err = GoogleAuthClient::from_api_key(
+            pasted,
+            &[crate::core::providers::google::GOOGLE_CLOUD_PLATFORM_SCOPE],
+        )
+        .expect_err("a pasted API key is not an existing file");
+        assert!(!err.to_string().contains(pasted), "{err}");
+    }
+
+    #[test]
+    fn test_credential_source_debug_redacts_value() {
+        let secret = r#"{"type": "service_account", "private_key": "-----BEGIN PRIVATE KEY-----"}"#;
+        let debug = format!("{:?}", CredentialSource::from_api_key(secret));
+        assert!(!debug.contains("PRIVATE KEY"), "{debug}");
+        assert!(debug.starts_with("JsonContent("), "{debug}");
+
+        let pasted = "sk-live-not-a-real-key";
+        let debug = format!("{:?}", CredentialSource::from_api_key(pasted));
+        assert!(!debug.contains(pasted), "{debug}");
+        assert!(debug.starts_with("FilePath("), "{debug}");
+
+        assert_eq!(
+            format!("{:?}", CredentialSource::ApplicationDefault),
+            "ApplicationDefault"
+        );
+    }
+
+    #[test]
+    fn test_is_service_account_json_truth_table() {
+        let full = r#"{"type": "service_account", "project_id": "p", "private_key": "k", "client_email": "a@p.iam.gserviceaccount.com"}"#;
+        assert!(is_service_account_json(full));
+        // Leading/trailing whitespace is still inline JSON (`from_api_key` trims the start too).
+        assert!(is_service_account_json(&format!("  {full}\n")));
+        // project_id is not part of the shape check (it may come from the request instead).
+        assert!(is_service_account_json(
+            r#"{"type": "service_account", "private_key": "k", "client_email": "a@b.c"}"#
+        ));
+
+        // Rejected: ADC (the gateway's own identity) and anything read from the gateway's disk.
+        assert!(!is_service_account_json(""));
+        assert!(!is_service_account_json("   "));
+        assert!(!is_service_account_json("/var/run/secrets/google/key.json"));
+        assert!(!is_service_account_json("Cargo.toml"));
+        // Rejected: a pasted API key / bearer token.
+        assert!(!is_service_account_json(
+            "AIzaSyD-not-a-real-key-0123456789abcdef"
+        ));
+        // Rejected: other credential types, even when well-formed.
+        assert!(!is_service_account_json(
+            r#"{"type": "authorized_user", "client_id": "c", "client_secret": "s", "refresh_token": "r"}"#
+        ));
+        assert!(!is_service_account_json(
+            r#"{"type": "external_account", "private_key": "k", "client_email": "a@b.c"}"#
+        ));
+        // Rejected: missing / empty / non-string required fields.
+        assert!(!is_service_account_json(
+            r#"{"private_key": "k", "client_email": "a@b.c"}"#
+        ));
+        assert!(!is_service_account_json(
+            r#"{"type": "service_account", "client_email": "a@b.c"}"#
+        ));
+        assert!(!is_service_account_json(
+            r#"{"type": "service_account", "private_key": "k"}"#
+        ));
+        assert!(!is_service_account_json(
+            r#"{"type": "service_account", "private_key": "", "client_email": "a@b.c"}"#
+        ));
+        assert!(!is_service_account_json(
+            r#"{"type": "service_account", "private_key": "k", "client_email": " "}"#
+        ));
+        assert!(!is_service_account_json(
+            r#"{"type": "service_account", "private_key": 1, "client_email": "a@b.c"}"#
+        ));
+        assert!(!is_service_account_json(
+            r#"{"type": ["service_account"], "private_key": "k", "client_email": "a@b.c"}"#
+        ));
+        // Rejected: not a JSON object.
+        assert!(!is_service_account_json("{not json"));
+        assert!(!is_service_account_json(r#"["service_account"]"#));
+        assert!(!is_service_account_json(r#""service_account""#));
+        assert!(!is_service_account_json("null"));
     }
 
     #[test]

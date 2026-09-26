@@ -571,7 +571,10 @@ impl SttSettingsDelta {
 impl Default for STTConfig {
     fn default() -> Self {
         Self {
-            model: "nova-3".to_string(),
+            // No model: each provider applies its own default. This was Deepgram's `nova-3`, and
+            // every config built from the default carried it to whichever vendor it was for —
+            // an OpenAI or Groq request built this way sent `model=nova-3`.
+            model: String::new(),
             provider: String::new(),
             api_key: String::new(),
             language: "en-US".to_string(),
@@ -1152,6 +1155,7 @@ mod tests {
     #[test]
     fn test_stt_config_default() {
         let config = STTConfig::default();
+        assert_eq!(config.model, "", "no vendor's model is a neutral default");
         assert_eq!(config.language, "en-US");
         assert_eq!(config.sample_rate, 16000);
         assert_eq!(config.channels, 1);

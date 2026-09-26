@@ -22,7 +22,7 @@ use crate::core::websocket::reconnectable_stream::{
     WsTransport,
 };
 
-use super::config::GoogleSTTConfig;
+use super::config::{GOOGLE_STT_DEFAULT_LOCATION, GoogleSTTConfig, is_valid_google_stt_location};
 use super::streaming::{
     KEEPALIVE_INTERVAL_SECS, KeepaliveTracker, build_audio_request, build_config_request,
     chunk_audio, handle_grpc_error, handle_streaming_response, validate_keepalive_audio_geometry,
@@ -32,14 +32,25 @@ use super::streaming::{
 /// Catches stuck/dead connections while allowing active streams to continue.
 const GRPC_MESSAGE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// The gRPC endpoint for this config: an explicit `endpoint_override` wins; otherwise a non-global
+/// location uses its regional host (`https://{location}-speech.googleapis.com`, e.g. `us`/`eu`
+/// for chirp_3), and `global` uses `speech.googleapis.com`. A recognizer in `locations/us` is only
+/// served by the `us` endpoint, so the path and the host must agree.
 pub(super) fn google_speech_grpc_endpoint(config: &GoogleSTTConfig) -> String {
-    config
+    if let Some(endpoint) = config
         .endpoint_override
         .as_deref()
         .map(str::trim)
         .filter(|endpoint| !endpoint.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| GOOGLE_SPEECH_ENDPOINT.to_string())
+    {
+        return endpoint.to_string();
+    }
+    let location = config.location.as_str();
+    // The location is validated before connect; re-check here because it becomes a hostname.
+    if location != GOOGLE_STT_DEFAULT_LOCATION && is_valid_google_stt_location(location) {
+        return format!("https://{location}-speech.googleapis.com");
+    }
+    GOOGLE_SPEECH_ENDPOINT.to_string()
 }
 
 /// A [`WsTransport`] (the trait is transport-agnostic despite the `Ws` name) that adapts Google
@@ -382,6 +393,12 @@ impl GoogleSTT {
     /// (read from `extras`) are honored END-TO-END. Mirrors `DeepgramSTT::new_standard`: the
     /// credential is `std.base.api_key` (a Google credential source), used to build the auth
     /// client exactly as `BaseSTT::new` does. Features Google can't express stay at default.
+    ///
+    /// `project_id`: an explicit `extras["project_id"]` wins; otherwise it is taken from the
+    /// credential (the service-account JSON's `project_id`, as `BaseSTT::new` does), so the
+    /// OpenAI-compatible upload route — which sends no extras — still gets a real recognizer path
+    /// instead of `projects//…`. `extras["location"]` selects the recognizer location and the
+    /// regional endpoint (default `global`).
     pub fn new_standard(
         std: &crate::core::stt::standard::StandardSTTConfig,
     ) -> Result<Self, STTError> {
@@ -398,11 +415,33 @@ impl GoogleSTT {
                 "API key is required".to_string(),
             ));
         }
-        let google_config = GoogleSTTConfig::from_standard(std);
-        google_config
-            .validate_endpoint_override()
+        // `from_standard` silently ignores a malformed location; reject it here instead.
+        GoogleSTTConfig::location_from_extras(&std.extras.0)
             .map_err(STTError::ConfigurationError)?;
-        let auth_client = STTGoogleAuthClient::from_api_key(&std.base.api_key)?;
+        let mut google_config = GoogleSTTConfig::from_standard(std);
+        google_config
+            .validate_runtime_config()
+            .map_err(STTError::ConfigurationError)?;
+
+        // Check the credential before resolving the project from it, so a pasted API key reports
+        // the (redacted) credential error rather than a misleading missing-project_id one. Both
+        // checks are pure: the auth client (which needs a tokio reactor) is built only after.
+        let credential_source = CredentialSource::from_api_key(&std.base.api_key);
+        credential_source.validate().map_err(google_error_to_stt)?;
+        if google_config.project_id.is_empty() {
+            google_config.project_id = credential_source.extract_project_id().unwrap_or_default();
+        }
+        if google_config.project_id.is_empty() {
+            // Static text only: never interpolate the credential into this message.
+            return Err(STTError::ConfigurationError(
+                "Google Cloud project_id is required. Provide it either:\n\
+                 1. As the 'project_id' provider parameter\n\
+                 2. In the service account credentials JSON (project_id field)"
+                    .to_string(),
+            ));
+        }
+
+        let auth_client = STTGoogleAuthClient::new(credential_source)?;
         Ok(Self {
             config: Some(google_config),
             state: ConnectionState::Disconnected,
@@ -426,7 +465,7 @@ impl GoogleSTT {
         GoogleSTTConfig {
             base: config,
             project_id,
-            location: "global".to_string(),
+            location: GOOGLE_STT_DEFAULT_LOCATION.to_string(),
             recognizer_id: None,
             interim_results: true,
             enable_voice_activity_events: true,
@@ -720,7 +759,7 @@ impl BaseSTT for GoogleSTT {
             STTError::ConfigurationError("No configuration available".to_string())
         })?;
         config
-            .validate_endpoint_override()
+            .validate_runtime_config()
             .map_err(STTError::ConfigurationError)?;
 
         self.start_connection(config.clone()).await

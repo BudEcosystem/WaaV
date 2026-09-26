@@ -37,12 +37,8 @@ use super::websocket::{WebSocketTtsClient, WsTtsConnectSpec, WsTtsEvent, WsTtsPr
 /// Deepgram streaming TTS (Aura) WebSocket endpoint.
 pub const DEEPGRAM_TTS_WS_URL: &str = "wss://api.deepgram.com/v1/speak";
 
-/// Default voice when neither `model` nor `voice_id` is set (matches the flat default).
-const DEFAULT_AURA_MODEL: &str = "aura-asteria-en";
 /// Default raw-PCM encoding (matches the HTTP request builder).
 const DEFAULT_ENCODING: &str = "linear16";
-/// Default output sample rate (matches the HTTP request builder / WS path defaults).
-const DEFAULT_SAMPLE_RATE: u32 = 24000;
 
 /// Deepgram `/v1/speak` WS wire protocol for the generic client.
 struct DeepgramAuraProtocol {
@@ -116,17 +112,25 @@ impl WsTtsProtocol for DeepgramAuraProtocol {
     }
 }
 
-/// Resolve the effective Aura model: `model` wins, then `voice_id`, then the default
-/// (same precedence as the HTTP request builder).
-fn effective_model(config: &TTSConfig) -> String {
-    if !config.model.is_empty() {
-        config.model.clone()
-    } else {
-        config
-            .voice_id
-            .clone()
-            .unwrap_or_else(|| DEFAULT_AURA_MODEL.to_string())
-    }
+/// The Aura model to request — the same answer as the HTTP request builder: the voice, else
+/// `model`, else none (Deepgram then applies its own default).
+fn effective_model(config: &TTSConfig) -> Option<&str> {
+    super::deepgram::deepgram_model(config)
+}
+
+/// Deepgram's name for the requested encoding. The socket streams bare frames, so a WAV request
+/// is linear16 here, and WaaV's `pcm`/`ulaw` become Deepgram's `linear16`/`mulaw` — it refuses
+/// the others.
+fn ws_encoding(config: &TTSConfig) -> &str {
+    let requested = config.audio_format.as_deref().unwrap_or(DEFAULT_ENCODING);
+    super::deepgram::deepgram_encoding_and_container(requested).0
+}
+
+/// The rate the audio arrives at: the one requested, else Deepgram's default for the encoding.
+fn output_sample_rate(config: &TTSConfig) -> u32 {
+    config
+        .sample_rate
+        .unwrap_or_else(|| super::deepgram::deepgram_default_sample_rate(ws_encoding(config)))
 }
 
 /// Normalize an endpoint override base for a WS dial: `http(s)://` → `ws(s)://`.
@@ -150,19 +154,23 @@ fn build_ws_url(config: &TTSConfig, endpoint_override: Option<&str>) -> String {
         normalized.as_deref(),
     );
 
-    let mut params = vec![format!("model={}", effective_model(config))];
+    let mut params = Vec::new();
+    if let Some(model) = effective_model(config) {
+        params.push(format!("model={model}"));
+    }
 
-    let encoding = config.audio_format.as_deref().unwrap_or(DEFAULT_ENCODING);
+    let encoding = ws_encoding(config);
     params.push(format!("encoding={encoding}"));
 
-    params.push(format!(
-        "sample_rate={}",
-        config.sample_rate.unwrap_or(DEFAULT_SAMPLE_RATE)
-    ));
+    // Only a rate someone chose. It is optional, and the fixed 24000 that stood here is
+    // invalid for mulaw/alaw (8000 or 16000 only).
+    if let Some(rate) = config.sample_rate {
+        params.push(format!("sample_rate={rate}"));
+    }
 
     // Raw PCM-family encodings must not be wrapped in a container (WS delivers raw
     // binary frames) — mirrors the HTTP builder's container handling.
-    if matches!(encoding, "linear16" | "pcm" | "mulaw" | "ulaw" | "alaw") {
+    if matches!(encoding, "linear16" | "mulaw" | "alaw") {
         params.push("container=none".to_string());
     }
 
@@ -188,13 +196,9 @@ impl DeepgramAuraTTS {
     /// connect time by the generic client).
     fn new_with_override(config: TTSConfig, endpoint_override: Option<&str>) -> TTSResult<Self> {
         let ws_url = build_ws_url(&config, endpoint_override);
-        let encoding = config
-            .audio_format
-            .clone()
-            .unwrap_or_else(|| DEFAULT_ENCODING.to_string());
         let protocol: Arc<dyn WsTtsProtocol> = Arc::new(DeepgramAuraProtocol {
-            sample_rate: config.sample_rate.unwrap_or(DEFAULT_SAMPLE_RATE),
-            audio_format: encoding,
+            sample_rate: output_sample_rate(&config),
+            audio_format: ws_encoding(&config).to_string(),
         });
         let spec = WsTtsConnectSpec {
             url: ws_url.clone(),
@@ -297,8 +301,8 @@ impl BaseTTS for DeepgramAuraTTS {
             "transport": "websocket",
             "streaming": true,
             "model": effective_model(&self.config),
-            "encoding": self.config.audio_format.as_deref().unwrap_or(DEFAULT_ENCODING),
-            "sample_rate": self.config.sample_rate.unwrap_or(DEFAULT_SAMPLE_RATE),
+            "encoding": ws_encoding(&self.config),
+            "sample_rate": output_sample_rate(&self.config),
             "endpoint": self.ws_url,
             "in_flight": self.client.in_flight(),
             "last_ttfb_ms": self.client.last_ttfb_ns().map(|ns| ns / 1_000_000),
@@ -333,15 +337,54 @@ mod tests {
         assert!(url.contains("container=none"), "{url}");
     }
 
+    /// Deepgram's voice id IS the model, so a named voice wins over a deployment's family name.
+    /// The reverse order sent `model=aura-2` and Deepgram refused it.
     #[test]
-    fn ws_url_model_field_wins_over_voice_id_and_containers_skip_none() {
+    fn ws_url_voice_wins_over_a_family_model_and_containers_skip_none() {
         let mut config = cfg();
-        config.model = "aura-asteria-en".into();
+        config.model = "aura-2".into();
         config.audio_format = Some("mp3".into());
         let url = build_ws_url(&config, None);
-        assert!(url.contains("model=aura-asteria-en"), "{url}");
+        assert!(url.contains("model=aura-2-thalia-en"), "{url}");
+        assert!(!url.contains("model=aura-2&"), "{url}");
         assert!(url.contains("encoding=mp3"), "{url}");
         assert!(!url.contains("container=none"), "{url}");
+    }
+
+    #[test]
+    fn ws_url_uses_the_model_when_no_voice_is_named() {
+        let mut config = cfg();
+        config.voice_id = None;
+        config.model = "aura-asteria-en".into();
+        let url = build_ws_url(&config, None);
+        assert!(url.contains("model=aura-asteria-en"), "{url}");
+    }
+
+    /// WaaV's `ulaw`/`pcm` go out under Deepgram's names, no rate is sent that nobody chose, and
+    /// the audio is labelled with the rate Deepgram then produces (8000 for G.711, not 24000).
+    #[test]
+    fn ws_url_uses_deepgram_encodings_and_sends_no_unchosen_rate() {
+        let mut config = cfg();
+        config.audio_format = Some("ulaw".into());
+        config.sample_rate = None;
+        let url = build_ws_url(&config, None);
+        assert!(url.contains("encoding=mulaw"), "{url}");
+        assert!(!url.contains("sample_rate"), "{url}");
+        assert_eq!(output_sample_rate(&config), 8000);
+
+        config.audio_format = Some("pcm".into());
+        let url = build_ws_url(&config, None);
+        assert!(url.contains("encoding=linear16"), "{url}");
+        assert_eq!(output_sample_rate(&config), 24000);
+    }
+
+    /// Nothing named: no `model` at all, so Deepgram applies its own default voice.
+    #[test]
+    fn ws_url_omits_model_when_nothing_is_named() {
+        let mut config = cfg();
+        config.voice_id = None;
+        let url = build_ws_url(&config, None);
+        assert!(!url.contains("model="), "{url}");
     }
 
     #[test]
