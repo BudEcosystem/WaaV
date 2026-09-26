@@ -28,8 +28,12 @@ use waav_openai_audio::{
 
 use tracing::Instrument;
 
+use crate::core::voice_cost::voice_cost;
+use crate::core::voice_error::VoiceErrorType;
+use crate::observability::vendor_span;
 use crate::observability::voice_attrs;
-use crate::state::AppState;
+use crate::observability::voice_span::{FormCapture, Root, RootSpan, VoiceSpans};
+use crate::state::{AppState, ResolvedVoiceEndpoint};
 
 use super::advisories::Advisories;
 use super::endpoint_settings as settings_map;
@@ -70,12 +74,109 @@ fn model_not_found(endpoint: &str, capability: &str) -> Response {
     )
 }
 
+/// Mark the call failed and answer with OpenAI's error envelope, in one step, so no failure path
+/// after endpoint resolution can do one without the other (FRD-021 FR-4). Before, three STT
+/// paths returned an error and left the turn `Unset` — counted as successes.
+fn fail_call(
+    spans: &VoiceSpans,
+    class: VoiceErrorType,
+    vendor_status: Option<u16>,
+    status: StatusCode,
+    kind: &str,
+    message: String,
+    param: Option<&str>,
+) -> Response {
+    spans.fail(class, vendor_status, &message);
+    openai_error(status, kind, message, param)
+}
+
+/// [`translation_error`] for a request whose turn is already open: a Bud-side validation failure
+/// after resolution is still a failed call.
+fn fail_translation(spans: &VoiceSpans, class: VoiceErrorType, err: &AudioError) -> Response {
+    spans.fail(class, None, &err.to_string());
+    translation_error(err)
+}
+
+/// Open the call's `voice.turn` and record who it is for (FRD-021 §6.1).
+///
+/// * `bud.endpoint_id` — the endpoint UUID, never the alias; `bud.voice.endpoint_name` — the
+///   alias the caller sent.
+/// * `bud.model_id` and `bud.project_id` — from the alias entry, i.e. the ENDPOINT's model and
+///   project. `bud.project_id` falls back to the principal's when the caller named the endpoint id
+///   itself and there is no entry (DEG-3).
+/// * `bud.api_key_project_id` — the project of the key that made the call: what this span called
+///   `bud.project_id` before FRD-021, and what customer scoping keys on.
+///
+/// Attribution was always resolvable — `resolve_principal` reads the in-memory snapshot — so the
+/// ids are recorded before any work that can fail. `recordable` filters `Some("")`: an empty
+/// string is not NULL, and would make the column look populated.
+async fn open_turn(
+    state: &AppState,
+    capability: &'static str,
+    resolved: &ResolvedVoiceEndpoint,
+    endpoint_name: &str,
+    bearer: Option<&str>,
+    root: &Root,
+    (vendor_key, model_key): (&'static str, &'static str),
+) -> VoiceSpans {
+    use voice_attrs::turn;
+    use waav_openai_audio::recordable;
+
+    let spans = VoiceSpans::open(capability, root);
+    spans.record_text(turn::ENDPOINT_ID, Some(resolved.endpoint_id.as_str()));
+    spans.record_text(turn::ENDPOINT_NAME, Some(endpoint_name));
+    let alias = resolved.alias.as_ref();
+    spans.record_text(turn::MODEL_ID, alias.and_then(|a| a.model_id.as_deref()));
+
+    let principal = state.resolve_principal(bearer).await;
+    let key_project = principal
+        .as_ref()
+        .and_then(|p| recordable(p.project_id.as_deref()));
+    let endpoint_project = alias.and_then(|a| recordable(a.project_id.as_deref()));
+    spans.record_text(turn::PROJECT_ID, endpoint_project.or(key_project));
+    spans.record_text(turn::API_KEY_PROJECT_ID, key_project);
+    spans.record_text(
+        turn::USER_ID,
+        principal.as_ref().and_then(|p| p.user_id.as_deref()),
+    );
+    spans.record_text(
+        turn::API_KEY_ID,
+        principal.as_ref().and_then(|p| p.api_key_id.as_deref()),
+    );
+    spans.record_vendor(
+        vendor_key,
+        model_key,
+        &resolved.endpoint.vendor,
+        resolved.endpoint.model.as_deref(),
+    );
+    spans
+}
+
 /// `POST /v1/audio/speech`
 pub async fn speech_handler(
     State(state): State<Arc<AppState>>,
+    root: Option<axum::Extension<RootSpan>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let root = Root::from_extension(root);
+    // FRD-021 §6.8: the request as the caller sent it. The response is audio and is not
+    // captured; an error response is, as the JSON the caller was shown.
+    if root.captures() {
+        root.record_request_body(&String::from_utf8_lossy(&body));
+    }
+    let response = speech_inner(state, &root, headers, body).await;
+    root.capture_response(response, false).await
+}
+
+async fn speech_inner(
+    state: Arc<AppState>,
+    root: &Root,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    use voice_attrs::{leg, turn};
+
     // The bearer resolves the caller's alias map, which is both the alias -> endpoint id
     // mapping and the authorization boundary. Auth has already passed by the time we get here;
     // this is resolution, not a second check.
@@ -84,6 +185,8 @@ pub async fn speech_handler(
         .and_then(|v| v.to_str().ok())
         .map(|v| v.trim().strip_prefix("Bearer ").unwrap_or(v).to_string());
 
+    // Refusals before the endpoint resolves are not calls: no `voice.turn` (DEG-2). They are
+    // failed HTTP requests on the root, which `request_id_middleware` records.
     let req: SpeechRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => {
@@ -101,11 +204,31 @@ pub async fn speech_handler(
         Err(e) => return translation_error(&e),
     };
 
-    let Some(endpoint) =
+    let Some(resolved) =
         state.resolve_voice_endpoint(&settings.endpoint, "text_to_speech", bearer.as_deref())
     else {
         return model_not_found(&settings.endpoint, "text_to_speech");
     };
+
+    // FRD-021: the turn opens HERE, as soon as there is an endpoint to attribute it to, so every
+    // failure after this point — a bad override, a voice the vendor lacks, a missing credential —
+    // is a failed call with a class, not a request that never happened. It used to open after
+    // all of them, and those failures reached no fact row at all.
+    //
+    // NOT `turn_span.enter()` anywhere below. A span guard held across an `.await` attaches the
+    // span to whatever task the executor resumes next, so the attributes land on someone else's
+    // work. `.instrument()` on the future is the async-correct form.
+    let spans = open_turn(
+        &state,
+        "text_to_speech",
+        &resolved,
+        &settings.endpoint,
+        bearer.as_deref(),
+        root,
+        (leg::TTS_VENDOR, leg::TTS_MODEL),
+    )
+    .await;
+    let ResolvedVoiceEndpoint { endpoint, .. } = resolved;
 
     let mut advisories = Advisories::new();
     warn_unrecognised(&settings.unrecognised, &mut advisories);
@@ -117,7 +240,10 @@ pub async fn speech_handler(
     if let Err((field, reason)) =
         settings_map::apply_speech_overrides(&mut tts_overridden, &settings.overrides)
     {
-        return openai_error(
+        return fail_call(
+            &spans,
+            VoiceErrorType::InvalidRequest,
+            None,
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             format!("`{field}`: {reason}"),
@@ -159,10 +285,19 @@ pub async fn speech_handler(
                     .await
                 {
                     Some(v) => (v, VoiceOrigin::Default),
-                    None => return no_voice_error(&settings.endpoint, &endpoint.vendor),
+                    None => {
+                        spans.fail(
+                            VoiceErrorType::InvalidRequest,
+                            None,
+                            "`voice` is required: no voice was named, configured or defaulted",
+                        );
+                        return no_voice_error(&settings.endpoint, &endpoint.vendor);
+                    }
                 },
             },
         };
+    // The voice the synthesis runs with, whoever chose it (FRD-021 §6.1, Phase 5).
+    spans.record_text(leg::TTS_VOICE, Some(voice.as_str()));
 
     // FRD-018 M7 exit criterion 3: a bad voice name must say which voices exist.
     //
@@ -178,7 +313,7 @@ pub async fn speech_handler(
     // it would turn a config typo into a vendor 401 several seconds later, naming neither Bud
     // nor the endpoint -- and the operator would be looking at a form that accepted the value.
     if let Err(e) = speech::validate_voice(&voice, known_voices_for(&endpoint.vendor)) {
-        return translation_error(&e);
+        return fail_translation(&spans, VoiceErrorType::InvalidRequest, &e);
     }
 
     // Refuse a format the vendor cannot produce BEFORE spending a vendor call on it. The
@@ -187,7 +322,10 @@ pub async fn speech_handler(
         && !supported.contains(&settings.format)
     {
         let names: Vec<&str> = supported.iter().map(|f| f.as_str()).collect();
-        return openai_error(
+        return fail_call(
+            &spans,
+            VoiceErrorType::InvalidRequest,
+            None,
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
             format!(
@@ -227,7 +365,10 @@ pub async fn speech_handler(
     // 401 from the vendor several seconds later that mentions neither Bud nor the endpoint.
     let api_key = endpoint.credential.clone().unwrap_or_default();
     if api_key.is_empty() && !crate::core::tts::self_hosted::is_self_hosted(&endpoint.vendor) {
-        return openai_error(
+        return fail_call(
+            &spans,
+            VoiceErrorType::Config,
+            None,
             StatusCode::INTERNAL_SERVER_ERROR,
             "api_error",
             format!(
@@ -238,45 +379,19 @@ pub async fn speech_handler(
         );
     }
 
-    // FRD-018 M6. The field names are the attribute names budmetrics' VoiceTurnFact reads —
-    // `tracing_opentelemetry` maps span fields straight onto OTel attributes, so a typo here is
-    // a permanently NULL column rather than an error. They come from `voice_attrs`, which the
-    // cross-repo contract test pins against budmetrics' own registry.
-    //
-    // `duration_ms` is declared Empty and recorded after synthesis: a field not declared at
-    // span creation cannot be recorded later, and silently does nothing if you try.
+    // `characters` is the billing dimension for synthesis and is recorded on SUCCESS only: set
+    // at creation it counted every refused request — a voice the account lacks, text the vendor
+    // would not speak — as characters synthesised. It is the text the caller sent, BEFORE
+    // pronunciation replacement: what the customer is billed for (FRD-021 §6.4).
     let chars = settings.text.chars().count();
     // The request's own `language` (a Bud per-request override), then the tts block's, then the
-    // endpoint default.
+    // endpoint default. Recorded only when there is one: `""` is not NULL (FRD-021 GT-12).
     let language = settings_map::resolve_language(
         settings.overrides.language.as_deref(),
         endpoint.language.as_deref(),
         endpoint.config.tts().language.as_deref(),
     );
-    let turn_span = tracing::info_span!(
-        "voice.turn",
-        { voice_attrs::turn::CAPABILITY } = "text_to_speech",
-        { voice_attrs::turn::TRANSPORT } = "http",
-        { voice_attrs::turn::ENDPOINT_ID } = %settings.endpoint,
-        // Recorded on SUCCESS only. It is the billing dimension for synthesis, and set here at
-        // creation it counted every refused request — a voice the account lacks, text the vendor
-        // would not speak — as characters synthesised.
-        { voice_attrs::turn::CHARACTERS } = tracing::field::Empty,
-        // Now describes what the request was actually CONFIGURED with, rather than a field
-        // nothing read: C1 makes the endpoint language reach the provider.
-        { voice_attrs::turn::LANGUAGE } = language.as_deref().unwrap_or(""),
-        { voice_attrs::leg::TTS_VENDOR } = %endpoint.vendor,
-        { voice_attrs::turn::PROJECT_ID } = tracing::field::Empty,
-        { voice_attrs::turn::USER_ID } = tracing::field::Empty,
-        { voice_attrs::turn::API_KEY_ID } = tracing::field::Empty,
-        { voice_attrs::leg::TTS_DURATION_MS } = tracing::field::Empty,
-        otel.status_code = tracing::field::Empty,
-        otel.status_message = tracing::field::Empty,
-    );
-    // NOT `turn_span.enter()`. A span guard held across an `.await` attaches the span to
-    // whatever task the executor resumes next, so the attributes land on someone else's work
-    // and this turn's span is missing them. `.instrument()` on the future is the async-correct
-    // form; the guard form is the single most common way to produce confidently wrong traces.
+    spans.record_text(turn::LANGUAGE, language.as_deref());
     info!(
         endpoint = %settings.endpoint,
         vendor = %endpoint.vendor,
@@ -286,25 +401,6 @@ pub async fn speech_handler(
     );
 
     let started = std::time::Instant::now();
-
-    // Attribution. The identity was always resolvable — `resolve_voice_endpoint` just never
-    // asked for it — so project_id, user_id and api_key_id were NULL for every voice turn ever
-    // recorded, and VoiceTurnFact could not attribute usage to a project at all.
-    //
-    // `recordable` filters `Some("")`: an empty string is not NULL, and recording one makes the
-    // column look populated to the live check that asks whether a value ever arrived.
-    if let Some(p) = state.resolve_principal(bearer.as_deref()).await {
-        use waav_openai_audio::recordable;
-        if let Some(v) = recordable(p.project_id.as_deref()) {
-            turn_span.record(voice_attrs::turn::PROJECT_ID, v);
-        }
-        if let Some(v) = recordable(p.user_id.as_deref()) {
-            turn_span.record(voice_attrs::turn::USER_ID, v);
-        }
-        if let Some(v) = recordable(p.api_key_id.as_deref()) {
-            turn_span.record(voice_attrs::turn::API_KEY_ID, v);
-        }
-    }
 
     let mut tts_settings = tts_overridden;
 
@@ -390,9 +486,16 @@ pub async fn speech_handler(
         &mut advisories,
     );
 
-    let synthesis =
-        crate::handlers::speak::synthesize_once_standard(&state, std_config, &settings.text)
-            .instrument(turn_span.clone());
+    // The vendor request runs in the call's scope, so its CLIENT span is a child of `voice.turn`
+    // carrying the call's ids (CONTRACTS §1.2a).
+    let synthesis = spans
+        .vendor_scope(vendor_span::operation::TEXT_TO_SPEECH)
+        .run(crate::handlers::speak::synthesize_once_standard(
+            &state,
+            std_config,
+            &settings.text,
+        ))
+        .instrument(spans.turn().clone());
     // The deployment's `request_timeout`, as a bound on the whole synthesis. It used to reach
     // only an HTTP client this path never builds (the shared per-vendor pool is used instead),
     // so `request_timeout: 1` let a 2.2 s request through.
@@ -406,25 +509,39 @@ pub async fn speech_handler(
                     limit.as_secs()
                 );
                 warn!(endpoint = %settings.endpoint, "{message}");
-                mark_turn_failed(&turn_span, &message);
-                return openai_error(StatusCode::GATEWAY_TIMEOUT, "api_error", message, None);
+                return fail_call(
+                    &spans,
+                    VoiceErrorType::Deadline,
+                    None,
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "api_error",
+                    message,
+                    None,
+                );
             }
         },
         None => synthesis.await,
     };
+    let elapsed_ms = started.elapsed().as_millis() as u64;
     match outcome {
-        Ok((audio, format, sample_rate)) => {
-            turn_span.record(
-                voice_attrs::leg::TTS_DURATION_MS,
-                started.elapsed().as_millis() as u64,
-            );
-            turn_span.record(voice_attrs::turn::CHARACTERS, chars);
-            let served = match serve_as_requested(settings.format, audio, sample_rate) {
+        Ok(synth) => {
+            let sample_rate = synth.sample_rate;
+            let format = synth.format;
+            // Packaged BEFORE anything billable is recorded: a clip that cannot be served is a
+            // failed call, and units or cost on a failure would bill it (FRD-021 TC-EMIT-04).
+            let served = match serve_as_requested(settings.format, synth.audio, sample_rate) {
                 Ok(served) => served,
                 Err(e) => {
                     warn!(endpoint = %settings.endpoint, error = %e, "could not package audio");
-                    mark_turn_failed(&turn_span, &e);
-                    return openai_error(StatusCode::BAD_GATEWAY, "api_error", e, None);
+                    return fail_call(
+                        &spans,
+                        VoiceErrorType::Internal,
+                        None,
+                        StatusCode::BAD_GATEWAY,
+                        "api_error",
+                        e,
+                        None,
+                    );
                 }
             };
             if let Some(actual) = served.substituted {
@@ -434,6 +551,31 @@ pub async fn speech_handler(
                     endpoint.vendor
                 ));
             }
+
+            // The success-only record: duration, units, and what they cost (FRD-021 §6.1, §6.4).
+            let served_format = served.format_label.unwrap_or(settings.format.as_str());
+            let (output_secs, output_rate) =
+                output_audio_meta(&served.bytes, settings.format, sample_rate);
+            spans.record(leg::TTS_DURATION_MS, elapsed_ms);
+            if let Some(ttfb) = synth.ttfb {
+                spans.record(leg::TTS_TTFB_MS, ttfb.as_secs_f64() * 1000.0);
+            }
+            spans.record(turn::CHARACTERS, chars as u64);
+            if let Some(secs) = output_secs {
+                spans.record(turn::OUTPUT_AUDIO_SECONDS, secs);
+            }
+            spans.record_text(turn::AUDIO_FORMAT, Some(served_format));
+            if let Some(rate) = output_rate {
+                spans.record(turn::SAMPLE_RATE, i64::from(rate));
+            }
+            spans.record_cost(voice_cost(
+                endpoint.pricing.as_ref(),
+                "text_to_speech",
+                Some(chars as u64),
+                None,
+                output_secs,
+            ));
+
             let audio = served.bytes;
             let mut headers = HeaderMap::new();
             if let Ok(ct) = served.content_type.parse() {
@@ -454,37 +596,120 @@ pub async fn speech_handler(
             advisories.apply(&mut headers);
             (StatusCode::OK, headers, audio).into_response()
         }
-        Err(crate::handlers::speak::SynthesisError::Rejected(message)) => {
-            warn!(endpoint = %settings.endpoint, error = %message, "vendor rejected synthesis");
-            mark_turn_failed(&turn_span, &message);
+        Err(crate::handlers::speak::SynthesisError::Rejected(failure)) => {
+            warn!(endpoint = %settings.endpoint, error = %failure, "vendor rejected synthesis");
+            spans.fail(failure.class, failure.vendor_status, &failure.message);
             rejection_error(
-                message,
+                failure.message,
                 &voice_for_errors,
                 voice_origin,
                 &endpoint.vendor,
                 &settings.endpoint,
             )
         }
-        Err(e) => {
-            warn!(endpoint = %settings.endpoint, error = %e, "synthesis failed");
-            mark_turn_failed(&turn_span, &e.to_string());
+        Err(crate::handlers::speak::SynthesisError::Failed(failure)) => {
+            warn!(endpoint = %settings.endpoint, error = %failure, "synthesis failed");
             // 502, not 500: the failure is upstream of WaaV, and the distinction is what tells
             // an operator whether to look at the vendor or at us.
-            openai_error(StatusCode::BAD_GATEWAY, "api_error", e.to_string(), None)
+            fail_call(
+                &spans,
+                failure.class,
+                failure.vendor_status,
+                StatusCode::BAD_GATEWAY,
+                "api_error",
+                failure.message,
+                None,
+            )
         }
     }
 }
 
-/// Mark a voice turn as failed on its span.
+/// How long the audio a synthesis produced lasts, and at what rate — where that is known WITHOUT
+/// decoding (FRD-021 §6.1, WP-5.2).
 ///
-/// Every turn span used to end `Unset` whether the vendor produced audio or refused the request,
-/// so a failed turn was told apart from a successful one only by a missing duration. The OTel
-/// status is set for 4xx outcomes too: `voice.turn` is the domain operation — "synthesise this"
-/// — not the HTTP server span, and a turn that produced nothing failed, whoever's fault it was.
-/// The HTTP span still carries the status code that says whose.
-fn mark_turn_failed(span: &tracing::Span, message: &str) {
-    span.record("otel.status_code", "ERROR");
-    span.record("otel.status_message", message);
+/// * a WAV container → both from its header;
+/// * raw PCM (what `response_format=pcm` serves) → `bytes / (rate × 2)`: WaaV's canonical PCM is
+///   16-bit little-endian mono (`linear16`), the shape `serve_as_requested` also assumes;
+/// * a compressed container → neither. Its duration needs a demuxer (Q-2 is undecided), and a
+///   guessed number in a billing input is worse than none (DEG-4).
+fn output_audio_meta(
+    bytes: &[u8],
+    requested: AudioFormat,
+    sample_rate: u32,
+) -> (Option<f64>, Option<u32>) {
+    use crate::core::tts::sniff::{SniffedContainer, sniff_container};
+    match sniff_container(bytes) {
+        Some(SniffedContainer::Wav) => (
+            waav_openai_audio::pcm::wav_duration_secs(bytes),
+            wav_sample_rate(bytes),
+        ),
+        None if matches!(requested, AudioFormat::Pcm) && sample_rate > 0 => (
+            Some(bytes.len() as f64 / (f64::from(sample_rate) * 2.0)),
+            Some(sample_rate),
+        ),
+        _ => (None, None),
+    }
+}
+
+/// A WAV file's sample rate, from its `fmt ` chunk — the header only, like
+/// `waav_openai_audio::pcm::wav_duration_secs`. `None` for anything it cannot read with certainty.
+fn wav_sample_rate(bytes: &[u8]) -> Option<u32> {
+    if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return None;
+    }
+    let mut pos = 12usize;
+    while pos + 8 <= bytes.len() {
+        let size = u32::from_le_bytes([
+            bytes[pos + 4],
+            bytes[pos + 5],
+            bytes[pos + 6],
+            bytes[pos + 7],
+        ]) as usize;
+        let body = pos + 8;
+        if &bytes[pos..pos + 4] == b"fmt " && size >= 16 && body + 8 <= bytes.len() {
+            let rate = u32::from_le_bytes([
+                bytes[body + 4],
+                bytes[body + 5],
+                bytes[body + 6],
+                bytes[body + 7],
+            ]);
+            return (rate > 0).then_some(rate);
+        }
+        let next = body.saturating_add(size).min(bytes.len());
+        if next <= pos {
+            break;
+        }
+        pos = next;
+    }
+    None
+}
+
+/// The container of an uploaded file (FRD-021 §6.1 `audio_format`): the bytes' own magic first,
+/// then the filename's extension, then the part's content type.
+fn upload_format(bytes: &[u8], filename: &str, content_type: Option<&str>) -> Option<String> {
+    use crate::core::tts::sniff::sniff_container;
+    if let Some(container) = sniff_container(bytes) {
+        return Some(container.as_format_str().to_string());
+    }
+    // Caller-supplied text, bounded before it becomes an attribute.
+    let clean = |s: &str| {
+        let s = s.trim().to_ascii_lowercase();
+        (!s.is_empty() && s.len() <= 16 && s.chars().all(|c| c.is_ascii_alphanumeric()))
+            .then_some(s)
+    };
+    if let Some((_, ext)) = filename.rsplit_once('.')
+        && let Some(ext) = clean(ext)
+    {
+        return Some(ext);
+    }
+    let subtype = content_type?.split(';').next()?.trim().to_ascii_lowercase();
+    let subtype = subtype.strip_prefix("audio/")?;
+    let subtype = match subtype {
+        "x-wav" | "wave" | "vnd.wave" => "wav",
+        "mpeg" | "mpeg3" | "x-mpeg-3" => "mp3",
+        other => other,
+    };
+    clean(subtype)
 }
 
 /// The OpenAI output formats a vendor can produce, when WaaV knows; `None` = unknown, allow.
@@ -780,11 +1005,10 @@ fn rejection_error(
 
 /// Whether this transcription ran through WaaV's own denoiser.
 ///
-/// Deliberately NOT a member of `voice_attrs::ALL`. That registry is a cross-repo contract with
-/// budmetrics' `VoiceTurnFact`, and a name added to it without a matching column is a column that
-/// is NULL forever. This is a trace attribute an operator reads in the span, which is exactly what
-/// N1 asks for: telling a denoised transcription from a raw one after the fact.
-const NOISE_SUPPRESSION_ATTR: &str = "bud.voice.stt.noise_suppression";
+/// A member of `voice_attrs::ALL` since FRD-021 (WP-5.4), when `VoiceTurnFact` gained the
+/// `noise_suppression` column that reads it. Before, it was a trace-only attribute, deliberately
+/// kept out of the contract until a column existed for it.
+const NOISE_SUPPRESSION_ATTR: &str = voice_attrs::leg::STT_NOISE_SUPPRESSION;
 
 /// Run the decoded PCM through DeepFilterNet before it reaches the vendor (FRD-018 Part III N1).
 ///
@@ -954,33 +1178,47 @@ fn known_voices_for(vendor: &str) -> &'static [&'static str] {
 /// so the batch shape is synthesised from the streaming one.
 pub async fn transcription_handler(
     State(state): State<Arc<AppState>>,
+    root: Option<axum::Extension<RootSpan>>,
     headers: HeaderMap,
     multipart: axum::extract::Multipart,
 ) -> Response {
-    transcription_inner(state, headers, multipart, false).await
+    let root = Root::from_extension(root);
+    let response = transcription_inner(state, &root, headers, multipart, false).await;
+    // FRD-021 §6.8: the transcript returned, or the error JSON — whichever the caller got.
+    root.capture_response(response, true).await
 }
 
 /// `POST /v1/audio/translations` — same path, but the target language is always English.
 pub async fn translation_handler(
     State(state): State<Arc<AppState>>,
+    root: Option<axum::Extension<RootSpan>>,
     headers: HeaderMap,
     multipart: axum::extract::Multipart,
 ) -> Response {
-    transcription_inner(state, headers, multipart, true).await
+    let root = Root::from_extension(root);
+    let response = transcription_inner(state, &root, headers, multipart, true).await;
+    root.capture_response(response, true).await
 }
 
 async fn transcription_inner(
     state: Arc<AppState>,
+    root: &Root,
     headers: HeaderMap,
     mut multipart: axum::extract::Multipart,
     translate: bool,
 ) -> Response {
+    use voice_attrs::{leg, turn};
+
     let bearer = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .map(|v| v.trim().strip_prefix("Bearer ").unwrap_or(v).to_string());
 
+    // FRD-021 §6.8: the form as sent, and the file as metadata — never the audio. Recorded on the
+    // root when this function returns, whichever return that is.
+    let mut form = FormCapture::new(root);
     let mut file: Option<Vec<u8>> = None;
+    let mut file_content_type: Option<String> = None;
     let mut filename = String::new();
     let mut model = String::new();
     let mut response_format: Option<String> = None;
@@ -1010,8 +1248,12 @@ async fn transcription_inner(
         let name = field.name().unwrap_or_default().to_string();
         if name == "file" {
             filename = field.file_name().unwrap_or_default().to_string();
+            file_content_type = field.content_type().map(str::to_string);
             match field.bytes().await {
-                Ok(b) => file = Some(b.to_vec()),
+                Ok(b) => {
+                    form.file(&filename, file_content_type.as_deref(), b.len());
+                    file = Some(b.to_vec());
+                }
                 Err(e) => {
                     // The body limit is enforced LAZILY, as the body streams, so exceeding it
                     // lands here rather than as a rejection of the `Multipart` extractor -- and
@@ -1042,6 +1284,7 @@ async fn transcription_inner(
             continue;
         }
         let value = field.text().await.unwrap_or_default();
+        form.field(&name, &value);
         match name.as_str() {
             "model" => model = value,
             "response_format" => response_format = Some(value),
@@ -1110,66 +1353,57 @@ async fn transcription_inner(
 
     let mut advisories = Advisories::new();
     warn_unrecognised(&settings.unrecognised, &mut advisories);
-    // Resolved BEFORE the span so the recorded language is the one that will be used. The
-    // endpoint is looked up first for the same reason; it was already being resolved a few
-    // lines further down, so nothing new is on the request path.
-    let Some(endpoint) =
+    // Resolved BEFORE the span: the turn opens only once there is an endpoint to attribute it
+    // to (a refusal before this is not a call, DEG-2), and the recorded language is then the
+    // one that will be used.
+    let Some(resolved) =
         state.resolve_voice_endpoint(&settings.endpoint, capability, bearer.as_deref())
     else {
         return model_not_found(&settings.endpoint, capability);
     };
+
+    // The STT leg's span, mirroring the TTS one: opened as soon as the endpoint resolves, so
+    // every failure after this is a failed call with a class (FRD-021 FR-4). `audio_seconds` is
+    // the billing dimension for transcription exactly as `characters` is for synthesis, and is
+    // recorded on success only.
+    let spans = open_turn(
+        &state,
+        capability,
+        &resolved,
+        &settings.endpoint,
+        bearer.as_deref(),
+        root,
+        (leg::STT_VENDOR, leg::STT_MODEL),
+    )
+    .await;
+    let ResolvedVoiceEndpoint { endpoint, .. } = resolved;
+
+    // The language that will actually be used, not just the one the request named: the request,
+    // then the stt block's `language`, then the endpoint default (C1 — the precedence is
+    // `settings_map::resolve_language`'s; the section outranks the endpoint default). Recorded
+    // only when there is one: `""` is not NULL (FRD-021 GT-12).
     let canonical_language = settings_map::resolve_language(
         settings.language.as_deref(),
         endpoint.language.as_deref(),
         endpoint.config.stt().language.as_deref(),
     );
-
-    // The STT leg's span, mirroring the TTS one. `audio_seconds` is the billing dimension for
-    // transcription exactly as `characters` is for synthesis, and both are declared Empty
-    // because they are only known after the work: a field not declared at creation cannot be
-    // recorded later, and attempting it silently does nothing.
-    let turn_span = tracing::info_span!(
-        "voice.turn",
-        { voice_attrs::turn::CAPABILITY } = capability,
-        { voice_attrs::turn::TRANSPORT } = "http",
-        { voice_attrs::turn::ENDPOINT_ID } = %settings.endpoint,
-        // The language that will actually be used, not just the one the request named:
-        // request > endpoint default > the stt block's override (C1).
-        { voice_attrs::turn::LANGUAGE } = canonical_language.as_deref().unwrap_or(""),
-        { voice_attrs::turn::AUDIO_SECONDS } = tracing::field::Empty,
-        { voice_attrs::turn::PROJECT_ID } = tracing::field::Empty,
-        { voice_attrs::turn::USER_ID } = tracing::field::Empty,
-        { voice_attrs::turn::API_KEY_ID } = tracing::field::Empty,
-        { voice_attrs::leg::STT_VENDOR } = tracing::field::Empty,
-        { voice_attrs::leg::STT_DURATION_MS } = tracing::field::Empty,
-        // Declared here because a field not declared at span creation cannot be recorded later
-        // and silently does nothing if you try.
-        { NOISE_SUPPRESSION_ATTR } = tracing::field::Empty,
-        otel.status_code = tracing::field::Empty,
-        otel.status_message = tracing::field::Empty,
+    spans.record_text(turn::LANGUAGE, canonical_language.as_deref());
+    // What was uploaded, read from the bytes in hand — no decoding (FRD-021 §6.1, Phase 5).
+    spans.record(turn::INPUT_AUDIO_BYTES, file_bytes.len() as i64);
+    spans.record_text(
+        turn::AUDIO_FORMAT,
+        upload_format(&file_bytes, &filename, file_content_type.as_deref()).as_deref(),
     );
-
-    turn_span.record(voice_attrs::leg::STT_VENDOR, endpoint.vendor.as_str());
-
-    // Attribution. The identity was always resolvable — `resolve_voice_endpoint` just never
-    // asked for it — so project_id, user_id and api_key_id were NULL for every voice turn ever
-    // recorded, and VoiceTurnFact could not attribute usage to a project at all.
-    //
-    // `recordable` filters `Some("")`: an empty string is not NULL, and recording one makes the
-    // column look populated to the live check that asks whether a value ever arrived.
-    if let Some(p) = state.resolve_principal(bearer.as_deref()).await {
-        use waav_openai_audio::recordable;
-        if let Some(v) = recordable(p.project_id.as_deref()) {
-            turn_span.record(voice_attrs::turn::PROJECT_ID, v);
-        }
-        if let Some(v) = recordable(p.user_id.as_deref()) {
-            turn_span.record(voice_attrs::turn::USER_ID, v);
-        }
-        if let Some(v) = recordable(p.api_key_id.as_deref()) {
-            turn_span.record(voice_attrs::turn::API_KEY_ID, v);
-        }
+    if let Some(rate) = wav_sample_rate(&file_bytes) {
+        spans.record(turn::SAMPLE_RATE, i64::from(rate));
     }
     let stt_started = std::time::Instant::now();
+    // What the vendor request does, as its CLIENT span names it (CONTRACTS §1.2a).
+    let vendor_operation = if translate {
+        vendor_span::operation::TRANSLATION
+    } else {
+        vendor_span::operation::TRANSCRIPTION
+    };
 
     let api_key = endpoint.credential.clone().unwrap_or_default();
 
@@ -1180,7 +1414,12 @@ async fn transcription_inner(
     // HTTP backend answers once and is finished.
     if crate::core::tts::self_hosted::is_self_hosted(&endpoint.vendor) {
         let Some(api_base) = endpoint.api_base.clone() else {
-            return openai_error(
+            // Returned without marking the turn before FRD-021 (GT-9): a failure counted as a
+            // success.
+            return fail_call(
+                &spans,
+                VoiceErrorType::Config,
+                None,
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "api_error",
                 format!(
@@ -1206,20 +1445,23 @@ async fn transcription_inner(
         // Measured before `file_bytes` is moved into the call below. Header read only: no
         // samples are allocated, so a long upload costs nothing to measure.
         let measured_secs = waav_openai_audio::pcm::wav_duration_secs(&file_bytes);
-        return match crate::handlers::transcribe::transcribe_self_hosted(
-            &api_base,
-            &api_key,
-            &endpoint.model.clone().unwrap_or_default(),
-            file_bytes,
-            &filename,
-            &settings,
-        )
-        .instrument(turn_span.clone())
-        .await
+        return match spans
+            .vendor_scope(vendor_operation)
+            .run(crate::handlers::transcribe::transcribe_self_hosted(
+                &endpoint.vendor,
+                &api_base,
+                &api_key,
+                &endpoint.model.clone().unwrap_or_default(),
+                file_bytes,
+                &filename,
+                &settings,
+            ))
+            .instrument(spans.turn().clone())
+            .await
         {
-            Ok(body) => {
-                turn_span.record(
-                    voice_attrs::leg::STT_DURATION_MS,
+            Ok(answer) => {
+                spans.record(
+                    leg::STT_DURATION_MS,
                     stt_started.elapsed().as_millis() as u64,
                 );
                 // `audio_seconds` is the billing dimension for transcription. This branch
@@ -1229,14 +1471,35 @@ async fn transcription_inner(
                 // are allocated. A container the header read cannot parse stays NULL, which is
                 // the honest answer: a guessed number in a billing column is worse than none.
                 if let Some(secs) = measured_secs {
-                    turn_span.record(voice_attrs::turn::AUDIO_SECONDS, secs);
+                    spans.record(turn::AUDIO_SECONDS, secs);
                 }
-                passthrough_response(&settings.response_format, body, &advisories)
+                spans.record_cost(voice_cost(
+                    endpoint.pricing.as_ref(),
+                    capability,
+                    None,
+                    measured_secs,
+                    None,
+                ));
+                // The backend's own answer to "what language was this", where its body says —
+                // `verbose_json` does; the other formats carry none.
+                spans.record_text(
+                    turn::DETECTED_LANGUAGE,
+                    passthrough_language(&answer.body).as_deref(),
+                );
+                spans.record_text(turn::VENDOR_REQUEST_ID, answer.vendor_request_id.as_deref());
+                passthrough_response(&settings.response_format, answer.body, &advisories)
             }
-            Err(e) => {
-                warn!(endpoint = %settings.endpoint, error = %e, "self-hosted transcription failed");
-                mark_turn_failed(&turn_span, &e);
-                openai_error(StatusCode::BAD_GATEWAY, "api_error", e, None)
+            Err(failure) => {
+                warn!(endpoint = %settings.endpoint, error = %failure, "self-hosted transcription failed");
+                fail_call(
+                    &spans,
+                    failure.class,
+                    failure.vendor_status,
+                    StatusCode::BAD_GATEWAY,
+                    "api_error",
+                    failure.message,
+                    None,
+                )
             }
         };
     }
@@ -1254,14 +1517,14 @@ async fn transcription_inner(
     .await;
     let audio = match decoded {
         Ok(Ok(a)) => a,
-        Ok(Err(e)) => {
-            mark_turn_failed(&turn_span, &e.to_string());
-            return translation_error(&e);
-        }
+        // A container WaaV cannot read, a truncated file, an Opus upload: the caller's audio.
+        Ok(Err(e)) => return fail_translation(&spans, VoiceErrorType::InputDecode, &e),
         Err(e) => {
             warn!(endpoint = %settings.endpoint, error = %e, "audio decode task failed");
-            mark_turn_failed(&turn_span, "audio decode task failed");
-            return openai_error(
+            return fail_call(
+                &spans,
+                VoiceErrorType::Internal,
+                None,
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "api_error",
                 "the uploaded audio could not be decoded".to_string(),
@@ -1271,7 +1534,11 @@ async fn transcription_inner(
     };
 
     if api_key.is_empty() && !crate::core::tts::self_hosted::is_self_hosted(&endpoint.vendor) {
-        return openai_error(
+        // Returned without marking the turn before FRD-021 (GT-9).
+        return fail_call(
+            &spans,
+            VoiceErrorType::Config,
+            None,
             StatusCode::INTERNAL_SERVER_ERROR,
             "api_error",
             format!(
@@ -1314,7 +1581,11 @@ async fn transcription_inner(
     ) {
         Ok(language) => language,
         Err(message) => {
-            return openai_error(
+            // Returned without marking the turn before FRD-021 (GT-9).
+            return fail_call(
+                &spans,
+                VoiceErrorType::InvalidRequest,
+                None,
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
                 message,
@@ -1342,7 +1613,7 @@ async fn transcription_inner(
     let audio = apply_noise_suppression(
         audio,
         stt_settings.noise_suppression == Some(true),
-        &turn_span,
+        spans.turn(),
         &mut advisories,
     )
     .await;
@@ -1367,22 +1638,38 @@ async fn transcription_inner(
         &mut advisories,
     );
 
-    match crate::handlers::transcribe::transcribe_once_standard(
-        &endpoint.vendor,
-        std_config,
-        &audio,
-    )
-    .instrument(turn_span.clone())
-    .await
+    match spans
+        .vendor_scope(vendor_operation)
+        .run(crate::handlers::transcribe::transcribe_once_standard(
+            &endpoint.vendor,
+            std_config,
+            &audio,
+        ))
+        .instrument(spans.turn().clone())
+        .await
     {
         Ok(t) => {
-            turn_span.record(
-                voice_attrs::leg::STT_DURATION_MS,
+            spans.record(
+                leg::STT_DURATION_MS,
                 stt_started.elapsed().as_millis() as u64,
             );
             // The billing dimension, recorded on success only: set before the call, it counted
             // every refused transcription's audio as transcribed.
-            turn_span.record(voice_attrs::turn::AUDIO_SECONDS, audio.duration_secs());
+            spans.record(turn::AUDIO_SECONDS, audio.duration_secs());
+            spans.record_cost(voice_cost(
+                endpoint.pricing.as_ref(),
+                capability,
+                None,
+                Some(audio.duration_secs()),
+                None,
+            ));
+            // Phase 5 signals, each only where the vendor reported it: a confidence it did not
+            // send is absent, never 1.0 (DEG-5).
+            if let Some(confidence) = t.confidence.filter(|c| c.is_finite()) {
+                spans.record(leg::STT_CONFIDENCE, f64::from(confidence));
+            }
+            spans.record_text(turn::DETECTED_LANGUAGE, t.detected_language.as_deref());
+            spans.record_text(turn::VENDOR_REQUEST_ID, t.vendor_request_id.as_deref());
             // What the provider could not honour — a translation target list on a vendor that
             // cannot translate, a batch knob with no equivalent. Produced since the prerecorded
             // driver was written and, until now, logged and nothing else: the response was
@@ -1430,28 +1717,49 @@ async fn transcription_inner(
         }
         Err(e) => {
             warn!(endpoint = %settings.endpoint, error = %e, "transcription failed");
-            mark_turn_failed(&turn_span, &e.to_string());
             match e {
                 // The deployment cannot be served as configured: the caller's problem and
                 // fixable, so it is a 400 carrying the reason. Returning 502 here — as this
                 // path used to for everything — sends an operator to look at the vendor's
                 // status page for a model id they typed themselves.
-                crate::handlers::transcribe::TranscribeFailure::Configuration(message) => {
-                    openai_error(
+                crate::handlers::transcribe::TranscribeFailure::Configuration(failure) => {
+                    fail_call(
+                        &spans,
+                        failure.class,
+                        failure.vendor_status,
                         StatusCode::BAD_REQUEST,
                         "invalid_request_error",
-                        message,
+                        failure.message,
                         Some("model"),
                     )
                 }
                 // 502, not 500: the failure is upstream of WaaV, and the distinction is what
-                // tells an operator whether to look at the vendor or at us.
-                crate::handlers::transcribe::TranscribeFailure::Upstream(message) => {
-                    openai_error(StatusCode::BAD_GATEWAY, "api_error", message, None)
-                }
+                // tells an operator whether to look at the vendor or at us. The class says
+                // which upstream failure: a 429 and a 408 used to be one variant here.
+                crate::handlers::transcribe::TranscribeFailure::Upstream(failure) => fail_call(
+                    &spans,
+                    failure.class,
+                    failure.vendor_status,
+                    StatusCode::BAD_GATEWAY,
+                    "api_error",
+                    failure.message,
+                    None,
+                ),
             }
         }
     }
+}
+
+/// The language a self-hosted backend reported in its body, when it is JSON that carries one
+/// (`verbose_json` does). Read, never re-rendered: the body is passed through untouched.
+fn passthrough_language(body: &str) -> Option<String> {
+    let parsed: serde_json::Value = serde_json::from_str(body).ok()?;
+    parsed
+        .get("language")?
+        .as_str()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && l.len() <= 64)
+        .map(str::to_string)
 }
 
 /// Name each request field nothing reads. serde and the multipart loop both dropped unknown fields
@@ -2447,5 +2755,104 @@ mod request_field_tests {
         let mut adv = Advisories::new();
         let segs = transcript_segments("  ", &[], Some(3.0), &settings(F::Srt), "x", &mut adv);
         assert!(segs.is_empty() && adv.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod voice_signal_tests {
+    //! FRD-021 Phase 5: what the handlers can say about the audio without decoding it.
+    use super::{output_audio_meta, passthrough_language, upload_format, wav_sample_rate};
+    use waav_openai_audio::speech::AudioFormat;
+
+    fn wav(secs: f64, rate: u32) -> Vec<u8> {
+        let samples = (secs * f64::from(rate)).round() as u32;
+        let data = samples * 2;
+        let mut v = Vec::new();
+        v.extend_from_slice(b"RIFF");
+        v.extend_from_slice(&(36 + data).to_le_bytes());
+        v.extend_from_slice(b"WAVEfmt ");
+        v.extend_from_slice(&16u32.to_le_bytes());
+        v.extend_from_slice(&1u16.to_le_bytes());
+        v.extend_from_slice(&1u16.to_le_bytes());
+        v.extend_from_slice(&rate.to_le_bytes());
+        v.extend_from_slice(&(rate * 2).to_le_bytes());
+        v.extend_from_slice(&2u16.to_le_bytes());
+        v.extend_from_slice(&16u16.to_le_bytes());
+        v.extend_from_slice(b"data");
+        v.extend_from_slice(&data.to_le_bytes());
+        v.resize(v.len() + data as usize, 0);
+        v
+    }
+
+    /// TC-EMIT-09: PCM 24 kHz 48,000 bytes is 1.0 s; a 1.5 s WAV is 1.5 s; mp3 is unknown.
+    #[test]
+    fn output_duration_is_exact_for_pcm_and_wav_and_absent_for_compressed() {
+        assert_eq!(
+            output_audio_meta(&vec![0u8; 48_000], AudioFormat::Pcm, 24_000),
+            (Some(1.0), Some(24_000))
+        );
+        assert_eq!(
+            output_audio_meta(&wav(1.5, 24_000), AudioFormat::Wav, 24_000),
+            (Some(1.5), Some(24_000))
+        );
+        let mut mp3 = b"ID3\x04\x00\x00\x00\x00\x00\x00".to_vec();
+        mp3.resize(4_000, 0x55);
+        assert_eq!(
+            output_audio_meta(&mp3, AudioFormat::Mp3, 24_000),
+            (None, None)
+        );
+        // Raw bytes served for a compressed request are not assumed to be PCM.
+        assert_eq!(
+            output_audio_meta(&vec![0u8; 4_800], AudioFormat::Opus, 24_000),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn the_wav_rate_is_read_from_the_header_only() {
+        assert_eq!(wav_sample_rate(&wav(0.1, 16_000)), Some(16_000));
+        assert_eq!(wav_sample_rate(b"RIFF\0\0\0\0WAVE"), None);
+        assert_eq!(wav_sample_rate(b"not a wav"), None);
+    }
+
+    #[test]
+    fn the_upload_format_prefers_the_bytes_then_the_name_then_the_content_type() {
+        // An MP3 named `speech.wav` — a browser recorder's default — is an MP3.
+        assert_eq!(
+            upload_format(b"ID3\x04\x00\x00\x00", "speech.wav", Some("audio/wav")).as_deref(),
+            Some("mp3")
+        );
+        assert_eq!(
+            upload_format(&wav(0.1, 16_000), "x.bin", None).as_deref(),
+            Some("wav")
+        );
+        assert_eq!(
+            upload_format(b"\x1a\x45\xdf\xa3", "clip.WEBM", None).as_deref(),
+            Some("webm")
+        );
+        assert_eq!(
+            upload_format(b"????", "blob", Some("audio/x-wav; codecs=1")).as_deref(),
+            Some("wav")
+        );
+        // Nothing usable, and nothing caller-supplied that is not a plain token.
+        assert_eq!(upload_format(b"????", "blob", None), None);
+        assert_eq!(
+            upload_format(b"????", "x.../../etc", Some("text/plain")),
+            None
+        );
+    }
+
+    #[test]
+    fn a_self_hosted_language_is_read_only_from_json_that_carries_one() {
+        assert_eq!(
+            passthrough_language(r#"{"text":"hola","language":"es"}"#).as_deref(),
+            Some("es")
+        );
+        assert_eq!(passthrough_language(r#"{"text":"hola"}"#), None);
+        assert_eq!(passthrough_language(r#"{"language":""}"#), None);
+        assert_eq!(
+            passthrough_language("1\n00:00:00,000 --> 00:00:01,000\nhola\n"),
+            None
+        );
     }
 }

@@ -16,7 +16,7 @@ use crate::hydrate::{self, HydrationStats, KeyEvent};
 use crate::jwt::JwtVerifier;
 use crate::snapshot::BudAuth;
 use crate::store::ControlPlaneStore;
-use crate::types::AliasMap;
+use crate::types::{AliasMap, AliasMetadata};
 
 /// Who is calling, once resolved.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -622,6 +622,23 @@ impl BudPlane {
         let entry = jwt.cached_authz(&identity.sub)?;
         entry.aliases.get(alias).and_then(|m| m.endpoint_id.clone())
     }
+
+    /// The whole alias entry a caller's allowlist carries for `alias`, from the same two places
+    /// [`BudPlane::alias_endpoint_id`] reads.
+    ///
+    /// budapp stamps every entry with the endpoint's `model_id` and `project_id` (FRD-021 GT-5);
+    /// `alias_endpoint_id` keeps only the id, so a voice call could not be attributed to the
+    /// model it served or to the project that owns the endpoint.
+    pub fn alias_metadata(&self, raw_token: &str, alias: &str) -> Option<AliasMetadata> {
+        let hashed = hash_api_key(raw_token);
+        if let Some(meta) = self.auth.lookup_alias(&hashed, alias) {
+            return Some(meta);
+        }
+        let jwt = self.jwt.as_ref()?;
+        let identity = jwt.cached_identity(&hashed)?;
+        let entry = jwt.cached_authz(&identity.sub)?;
+        entry.aliases.get(alias).cloned()
+    }
 }
 
 #[cfg(test)]
@@ -677,6 +694,28 @@ mod alias_tests {
         assert!(
             plane
                 .alias_endpoint_id("bud_not_a_key", "tts-deepgram")
+                .is_none()
+        );
+    }
+
+    /// FRD-021 GT-5: the entry carries the endpoint's own project, which is what a voice call is
+    /// attributed to — not the id alone.
+    #[tokio::test]
+    async fn the_whole_alias_entry_is_available() {
+        let (_s, plane) = plane_with_alias().await;
+        let meta = plane
+            .alias_metadata("bud_alias_test", "tts-deepgram")
+            .expect("the key lists the alias");
+        assert_eq!(meta.endpoint_id.as_deref(), Some("ep-1"));
+        assert_eq!(meta.project_id.as_deref(), Some("p1"));
+        assert!(
+            plane
+                .alias_metadata("bud_alias_test", "someone-elses-endpoint")
+                .is_none()
+        );
+        assert!(
+            plane
+                .alias_metadata("bud_not_a_key", "tts-deepgram")
                 .is_none()
         );
     }

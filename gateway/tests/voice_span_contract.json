@@ -10,6 +10,13 @@
       ]
     },
     {
+      "column": "api_key_project_id",
+      "attribute": "bud.api_key_project_id",
+      "roles": [
+        "turn"
+      ]
+    },
+    {
       "column": "endpoint_id",
       "attribute": "bud.endpoint_id",
       "roles": [
@@ -33,6 +40,13 @@
     {
       "column": "user_id",
       "attribute": "bud.user_id",
+      "roles": [
+        "turn"
+      ]
+    },
+    {
+      "column": "audio_format",
+      "attribute": "bud.voice.audio_format",
       "roles": [
         "turn"
       ]
@@ -73,6 +87,34 @@
       ]
     },
     {
+      "column": "detected_language",
+      "attribute": "bud.voice.detected_language",
+      "roles": [
+        "turn"
+      ]
+    },
+    {
+      "column": "endpoint_name",
+      "attribute": "bud.voice.endpoint_name",
+      "roles": [
+        "turn"
+      ]
+    },
+    {
+      "column": "error_type",
+      "attribute": "bud.voice.error_type",
+      "roles": [
+        "turn"
+      ]
+    },
+    {
+      "column": "input_audio_bytes",
+      "attribute": "bud.voice.input_audio_bytes",
+      "roles": [
+        "turn"
+      ]
+    },
+    {
       "column": "language",
       "attribute": "bud.voice.language",
       "roles": [
@@ -87,8 +129,29 @@
       ]
     },
     {
+      "column": "output_audio_seconds",
+      "attribute": "bud.voice.output_audio_seconds",
+      "roles": [
+        "turn"
+      ]
+    },
+    {
+      "column": "pricing_unit",
+      "attribute": "bud.voice.pricing_unit",
+      "roles": [
+        "turn"
+      ]
+    },
+    {
       "column": "response_latency_ms",
       "attribute": "bud.voice.response_latency_ms",
+      "roles": [
+        "turn"
+      ]
+    },
+    {
+      "column": "sample_rate",
+      "attribute": "bud.voice.sample_rate",
       "roles": [
         "turn"
       ]
@@ -101,8 +164,29 @@
       ]
     },
     {
+      "column": "stt_confidence",
+      "attribute": "bud.voice.stt.confidence",
+      "roles": [
+        "leg"
+      ]
+    },
+    {
       "column": "stt_duration_ms",
       "attribute": "bud.voice.stt.duration_ms",
+      "roles": [
+        "leg"
+      ]
+    },
+    {
+      "column": "stt_model",
+      "attribute": "bud.voice.stt.model",
+      "roles": [
+        "leg"
+      ]
+    },
+    {
+      "column": "noise_suppression",
+      "attribute": "bud.voice.stt.noise_suppression",
       "roles": [
         "leg"
       ]
@@ -150,6 +234,13 @@
       ]
     },
     {
+      "column": "tts_model",
+      "attribute": "bud.voice.tts.model",
+      "roles": [
+        "leg"
+      ]
+    },
+    {
       "column": "tts_ttfb_ms",
       "attribute": "bud.voice.tts.ttfb_ms",
       "roles": [
@@ -164,6 +255,13 @@
       ]
     },
     {
+      "column": "tts_voice",
+      "attribute": "bud.voice.tts.voice",
+      "roles": [
+        "leg"
+      ]
+    },
+    {
       "column": "turn_detector",
       "attribute": "bud.voice.turn_detector",
       "roles": [
@@ -173,6 +271,20 @@
     {
       "column": "turn_index",
       "attribute": "bud.voice.turn_index",
+      "roles": [
+        "turn"
+      ]
+    },
+    {
+      "column": "vendor_request_id",
+      "attribute": "bud.voice.vendor_request_id",
+      "roles": [
+        "turn"
+      ]
+    },
+    {
+      "column": "vendor_status_code",
+      "attribute": "bud.voice.vendor_status_code",
       "roles": [
         "turn"
       ]

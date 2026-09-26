@@ -18,6 +18,17 @@ mod sip_hooks_state;
 
 pub use sip_hooks_state::SipHooksState;
 
+/// A voice endpoint as a caller reached it (FRD-021 FR-1).
+#[derive(Debug, Clone)]
+pub struct ResolvedVoiceEndpoint {
+    /// The endpoint's UUID: the `voice_table` key, never the alias the caller typed.
+    pub endpoint_id: String,
+    /// The caller's alias entry for it — the endpoint's `model_id` and `project_id` — when the
+    /// caller named it by alias. `None` when they named the endpoint id itself (DEG-3).
+    pub alias: Option<bud_auth::AliasMetadata>,
+    pub endpoint: bud_auth::credentials::VoiceEndpoint,
+}
+
 /// Application state that can be shared across handlers
 #[derive(Clone)]
 pub struct AppState {
@@ -70,12 +81,6 @@ impl AppState {
         self.bud_mode.is_none()
     }
 
-    /// Resolve a Bud voice endpoint by the name the caller used, checking it serves what was
-    /// asked for.
-    ///
-    /// The capability check is not decoration: an endpoint registered for transcription would
-    /// otherwise accept a synthesis request and fail deep inside a vendor call, with an error
-    /// naming neither the endpoint nor the mistake.
     /// Who the caller is, for attribution on the turn span.
     ///
     /// `resolve_voice_endpoint` deliberately does not return this: it resolves an ALIAS through
@@ -95,12 +100,23 @@ impl AppState {
         plane.authenticate(bearer?).await.ok()
     }
 
+    /// Resolve a Bud voice endpoint by the name the caller used, checking it serves what was
+    /// asked for — and say which endpoint it was.
+    ///
+    /// The capability check is not decoration: an endpoint registered for transcription would
+    /// otherwise accept a synthesis request and fail deep inside a vendor call, with an error
+    /// naming neither the endpoint nor the mistake.
+    ///
+    /// Returns the endpoint UUID and the caller's alias entry beside the endpoint (FRD-021 FR-1).
+    /// The turn span used to record the NAME the caller typed as `bud.endpoint_id`, because the
+    /// id was resolved here and thrown away; and the alias entry carries the endpoint's model and
+    /// project, which attribution needs and nothing else on the request has.
     pub fn resolve_voice_endpoint(
         &self,
         name: &str,
         capability: &str,
         bearer: Option<&str>,
-    ) -> Option<bud_auth::credentials::VoiceEndpoint> {
+    ) -> Option<ResolvedVoiceEndpoint> {
         let plane = self.bud_mode.as_ref()?.plane();
 
         // A caller names an ALIAS ("tts-deepgram"); the voice table is keyed by ENDPOINT ID
@@ -110,10 +126,19 @@ impl AppState {
         let endpoint_id = bearer
             .and_then(|token| plane.alias_endpoint_id(token, name))
             .unwrap_or_else(|| name.to_string());
+        // The entry that resolved it, and only that one: a caller who named the endpoint id
+        // directly has no alias entry, so no model id and no endpoint project (DEG-3).
+        let alias = bearer
+            .and_then(|token| plane.alias_metadata(token, name))
+            .filter(|meta| meta.endpoint_id.as_deref() == Some(endpoint_id.as_str()));
 
         let endpoint = plane.voice_endpoint(&endpoint_id)?;
         if endpoint.serves(capability) {
-            Some(endpoint)
+            Some(ResolvedVoiceEndpoint {
+                endpoint_id,
+                alias,
+                endpoint,
+            })
         } else {
             tracing::warn!(
                 endpoint = %name,

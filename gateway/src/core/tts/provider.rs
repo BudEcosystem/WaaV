@@ -10,6 +10,7 @@ use tracing::{debug, error, info, warn};
 
 use super::base::{AudioCallback, AudioData, ConnectionState, TTSConfig, TTSError, TTSResult};
 use crate::core::cache::store::CacheStore;
+use crate::observability::vendor_span::{VendorCall, VendorScope};
 use crate::utils::req_manager::{ReqManager, ReqManagerConfig};
 use regex::Regex;
 use std::time::Duration;
@@ -71,6 +72,10 @@ struct SpeakJob {
     req_manager: Arc<ReqManager>,
     /// Optional cache store and full cache key (config_hash:text_hash)
     cache_and_key: Option<(Arc<CacheStore>, String)>,
+    /// The call this synthesis belongs to, captured on the caller's task when it was queued: the
+    /// request runs on the queue worker, which the task-local scope does not reach
+    /// (CONTRACTS §1.2a). `None` outside the HTTP audio routes — no vendor span.
+    vendor_scope: Option<VendorScope>,
 }
 
 /// Trait object-safe version of TTSRequestBuilder for dynamic dispatch
@@ -377,6 +382,11 @@ impl TTSProvider {
 
     /// Generic send_request implementation that handles all the common logic
     /// Now accepts trait object for dynamic dispatch in the queue worker
+    ///
+    /// The one place every HTTP TTS vendor's request is sent, so the vendor call span
+    /// (CONTRACTS §1.2a) is opened here: just before the request, ended after the last audio
+    /// chunk, beneath `vendor_scope`'s turn.
+    #[allow(clippy::too_many_arguments)]
     async fn send_request_dyn(
         request_builder: &dyn TTSRequestBuilderDyn,
         req_manager: Arc<ReqManager>,
@@ -385,6 +395,7 @@ impl TTSProvider {
         token: CancellationToken,
         cache_and_key: Option<(Arc<CacheStore>, String)>,
         previous_text_store: Arc<RwLock<Option<String>>>,
+        vendor_scope: Option<VendorScope>,
     ) {
         if token.is_cancelled() {
             let _ = sender
@@ -481,13 +492,49 @@ impl TTSProvider {
             &processed_text,
             previous_text.as_deref(),
         );
+        let config = request_builder.get_config();
+
+        // Built before it is sent, so the vendor span can show exactly what goes out: the URL and
+        // the body, never a header (CONTRACTS §1.2a). `send()` on the builder is this, in one step.
+        let (client, request) = request.build_split();
+        let request = match request {
+            Ok(request) => request,
+            Err(e) => {
+                error!("HTTP request failed: {}", e);
+                let _ = sender
+                    .send(Err(TTSError::NetworkError(format!("Request failed: {e}"))))
+                    .await;
+                return;
+            }
+        };
+        let mut call = VendorCall::open(
+            vendor_scope.as_ref(),
+            &config.provider,
+            &config.model,
+            request.method().as_str(),
+            request.url().as_str(),
+            &config.api_key,
+        );
+        if call.captures() {
+            call.request_body_bytes(
+                request.body().and_then(|b| b.as_bytes()),
+                request
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok()),
+            );
+        }
 
         // Send request
-        let response_result = request.send().await;
-        let config = request_builder.get_config();
+        let response_result = client.execute(request).await;
 
         match response_result {
             Ok(response) => {
+                call.status(response.status().as_u16());
+                call.vendor_request_id(
+                    crate::observability::vendor_span::request_id_from_headers(response.headers())
+                        .as_deref(),
+                );
                 if !response.status().is_success() {
                     info!("ERROR Response for text: {}", processed_text);
                     let status = response.status();
@@ -503,22 +550,38 @@ impl TTSProvider {
                         .text()
                         .await
                         .unwrap_or_else(|_| "Unknown error".to_string());
+                    // The vendor's own error body: what it said, as it said it.
+                    call.response_body(&error_body);
+                    call.finish();
 
-                    let tts_error = classify_tts_status(
-                        &request_builder.get_config().provider,
-                        status,
-                        error_body,
-                        retry_after_secs,
-                    );
+                    // The status rides with the error (FRD-021 §6.5): the variant decides what the
+                    // caller is shown, but 401/402/403 and 408/5xx each fold into one variant, and
+                    // only the number says which failure this was.
+                    let tts_error = TTSError::VendorStatus {
+                        status: status.as_u16(),
+                        error: Box::new(classify_tts_status(
+                            &request_builder.get_config().provider,
+                            status,
+                            error_body,
+                            retry_after_secs,
+                        )),
+                    };
 
                     let _ = sender.send(Err(tts_error)).await;
                     return;
                 }
 
+                let response_content_type = response
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
+
                 if request_builder.expects_provider_audio_url_response() {
                     let body = match response.bytes().await {
                         Ok(body) => body,
                         Err(e) => {
+                            call.transport_error(&e);
                             let _ = sender
                                 .send(Err(TTSError::NetworkError(format!(
                                     "Failed to read response body: {e}"
@@ -530,6 +593,12 @@ impl TTSProvider {
                     let audio_url = match request_builder.parse_provider_audio_url_response(&body) {
                         Ok(Some(audio_url)) => audio_url,
                         Ok(None) => {
+                            // Not audio, but not a usable answer either: the vendor's body, as is.
+                            call.response_body(&String::from_utf8_lossy(&body));
+                            call.fail(
+                                "invalid_response",
+                                "the vendor's response did not include an audio URL",
+                            );
                             let _ = sender
                                 .send(Err(TTSError::ProviderError(format!(
                                     "{} response did not include an audio URL",
@@ -539,11 +608,15 @@ impl TTSProvider {
                             return;
                         }
                         Err(e) => {
+                            call.response_body(&String::from_utf8_lossy(&body));
+                            call.fail("invalid_response", &e.to_string());
                             let _ = sender.send(Err(e)).await;
                             return;
                         }
                     };
 
+                    // The audio the envelope points at is part of this exchange: the span ends
+                    // once it is downloaded, described like any other synthesis.
                     match Self::download_provider_audio_url(
                         request_builder.provider_audio_url_label(),
                         &audio_url,
@@ -551,6 +624,12 @@ impl TTSProvider {
                     .await
                     {
                         Ok(audio) => {
+                            call.audio_response(
+                                response_content_type.as_deref(),
+                                audio.len(),
+                                config.sample_rate,
+                            );
+                            call.finish();
                             match Self::send_buffered_audio_payload(
                                 audio,
                                 config,
@@ -576,6 +655,7 @@ impl TTSProvider {
                             }
                         }
                         Err(e) => {
+                            call.fail("audio_download", &e.to_string());
                             let _ = sender.send(Err(e)).await;
                         }
                     }
@@ -597,6 +677,8 @@ impl TTSProvider {
                     None
                 };
 
+                // Bytes the vendor sent, for the span's description of the answer.
+                let mut received_bytes: usize = 0;
                 let mut stream = response.bytes_stream();
                 // P0.1: sniff the stream PRELUDE. If the provider returned a
                 // container (WAV/MP3/OGG/FLAC) while a PCM family is declared,
@@ -616,6 +698,10 @@ impl TTSProvider {
 
                     match item {
                         Ok(bytes) => {
+                            if !bytes.is_empty() {
+                                call.first_byte();
+                                received_bytes += bytes.len();
+                            }
                             let mut incoming = bytes.as_ref();
 
                             if sniff_pending && !incoming.is_empty() {
@@ -701,6 +787,7 @@ impl TTSProvider {
                         }
                         Err(e) => {
                             error!("Failed to read audio chunk: {}", e);
+                            call.transport_error(&e);
                             let _ = sender
                                 .send(Err(TTSError::AudioGenerationFailed(format!(
                                     "Failed to read audio: {e}"
@@ -741,6 +828,17 @@ impl TTSProvider {
                     debug!("Final buffer sent and received");
                 }
 
+                // The exchange is over: the last chunk is delivered. A synthesis cleared part-way
+                // is left to end as cancelled.
+                if !token.is_cancelled() {
+                    call.audio_response(
+                        response_content_type.as_deref(),
+                        received_bytes,
+                        config.sample_rate,
+                    );
+                    call.finish();
+                }
+
                 // Store the full audio in cache if provided. NEVER cache a
                 // format-mismatched payload — the cache key encodes the
                 // DECLARED format, so storing the container would poison the
@@ -770,9 +868,16 @@ impl TTSProvider {
             }
             Err(e) => {
                 error!("HTTP request failed: {}", e);
-                let _ = sender
-                    .send(Err(TTSError::NetworkError(format!("Request failed: {e}"))))
-                    .await;
+                call.transport_error(&e);
+                // A request that timed out reached a vendor that did not answer in time; one that
+                // never connected did not reach it. They are different operator actions
+                // (FRD-021 §6.5 `vendor_timeout` vs `network`), and reqwest can tell them apart.
+                let error = if e.is_timeout() {
+                    TTSError::TimeoutError(format!("Request failed: {e}"))
+                } else {
+                    TTSError::NetworkError(format!("Request failed: {e}"))
+                };
+                let _ = sender.send(Err(error)).await;
             }
         }
     }
@@ -892,7 +997,7 @@ impl TTSProvider {
                                     // A vendor refusal is the request's fault — a voice the
                                     // account lacks, an unknown model — and already surfaces as a
                                     // 400. Logging it at ERROR made every caller typo page someone.
-                                    if matches!(err, TTSError::RequestRejected(_)) {
+                                    if matches!(err.inner(), TTSError::RequestRejected(_)) {
                                         warn!("TTS dispatcher received a vendor refusal: {:?}", err);
                                     } else {
                                         error!("TTS dispatcher received error: {:?}", err);
@@ -1007,6 +1112,7 @@ impl TTSProvider {
                             job.cancel_token,
                             job.cache_and_key,
                             previous_text_store.clone(),
+                            job.vendor_scope,
                         )
                         .await;
 
@@ -1224,6 +1330,8 @@ impl TTSProvider {
             cancel_token: token,
             req_manager: req_mgr,
             cache_and_key,
+            // Here, on the caller's task, where the handler's scope is visible.
+            vendor_scope: VendorScope::current(),
         };
 
         // Add job to speak queue

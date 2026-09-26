@@ -57,6 +57,7 @@ use super::batch::{
 };
 use super::http_resilience::HttpBreaker;
 use super::standard::StandardSTTConfig;
+use crate::observability::vendor_span::{UploadBody, VendorCall};
 
 // =============================================================================
 // Limits
@@ -194,6 +195,9 @@ pub struct PrerecordedSTT {
     resilience: HttpBreaker,
     /// Degrades collected while building the request (`config_warnings`), surfaced as warnings.
     warnings: Vec<String>,
+    /// The vendor's id for the last request, from its response headers — the fallback for a
+    /// vendor whose body does not carry one (FRD-021 §6.1 `vendor_request_id`).
+    last_request_id: Option<String>,
 }
 
 impl PrerecordedSTT {
@@ -229,6 +233,7 @@ impl PrerecordedSTT {
             total_bytes_received: 0,
             resilience: HttpBreaker::new(vendor.id()),
             warnings: Vec::new(),
+            last_request_id: None,
         })
     }
 
@@ -340,7 +345,12 @@ impl PrerecordedSTT {
         };
 
         self.buffer.clear();
-        for result in results {
+        for mut result in results {
+            // The body's own id wins (Deepgram's `metadata.request_id`); the header is the
+            // fallback for vendors that only send one there.
+            if result.vendor_request_id.is_none() {
+                result.vendor_request_id = self.last_request_id.clone();
+            }
             info!(
                 vendor = vendor.id(),
                 chars = result.transcript.len(),
@@ -396,6 +406,22 @@ impl PrerecordedSTT {
         } else {
             Ok(submit)
         }
+    }
+
+    /// The vendor call span for one request of this client (CONTRACTS §1.2a): named for the
+    /// deployment's vendor and model, as `voice.turn` records them.
+    fn vendor_call(&self, method: &str, url: &str) -> VendorCall {
+        let provider = match self.config.base.provider.trim() {
+            "" => self.vendor.id(),
+            p => p,
+        };
+        VendorCall::start(
+            provider,
+            &self.config.base.model,
+            method,
+            url,
+            &self.config.base.api_key,
+        )
     }
 
     /// Run one built request and return its JSON body, classifying the status for the breaker.
@@ -454,23 +480,63 @@ impl PrerecordedSTT {
             }
         };
 
+        let call = self.vendor_call(&r.method, &r.url);
+        if call.captures() {
+            // The parameters as sent and the audio as metadata — never its bytes.
+            let described = UploadBody::new().query(&r.url);
+            let described = match &r.body {
+                BatchHttpBody::Empty => described,
+                BatchHttpBody::Json(v) => described.json(v),
+                BatchHttpBody::Raw {
+                    bytes,
+                    content_type,
+                } => described.file(None, Some(content_type), bytes.len()),
+                BatchHttpBody::Multipart { fields, file } => {
+                    let described =
+                        described.fields(fields.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+                    match file {
+                        Some((_, filename, ct, bytes)) => {
+                            described.file(Some(filename), Some(ct), bytes.len())
+                        }
+                        None => described,
+                    }
+                }
+            };
+            call.request_body(&described.render());
+        }
         let response = match builder.send().await {
             Ok(r) => r,
             Err(e) => {
+                call.transport_error(&e);
                 self.resilience.record_send_error();
                 return Err(STTError::NetworkError(format!("Request failed: {e}")));
             }
         };
         let status = response.status();
+        call.status(status.as_u16());
         self.resilience.record_status(status);
+        self.last_request_id = header_request_id(response.headers());
         let text = response.text().await.unwrap_or_default();
+        // The vendor's raw answer: the transcript, or its error body.
+        call.response_body(&text);
         if !status.is_success() {
-            return Err(classify_vendor_status(
+            call.vendor_request_id(self.last_request_id.as_deref());
+            call.finish();
+            return Err(vendor_status_error(
                 status,
                 describe_error(self.vendor, status, &text),
             ));
         }
-        serde_json::from_str(&text).map_err(|e| {
+        let parsed: Result<serde_json::Value, _> = serde_json::from_str(&text);
+        // The body's own id wins, as it does on `voice.turn`; the header is the fallback.
+        let body_id = parsed.as_ref().ok().and_then(|v| {
+            v.pointer("/metadata/request_id")
+                .and_then(|id| id.as_str())
+                .map(str::to_string)
+        });
+        call.vendor_request_id(body_id.as_deref().or(self.last_request_id.as_deref()));
+        call.finish();
+        parsed.map_err(|e| {
             STTError::ProviderError(format!(
                 "{} returned a body that is not JSON: {e}",
                 self.vendor.id()
@@ -487,6 +553,14 @@ impl PrerecordedSTT {
         base_url: &str,
     ) -> Result<String, STTError> {
         let url = format!("{}/v2/upload", base_url.trim_end_matches('/'));
+        let call = self.vendor_call("POST", &url);
+        if call.captures() {
+            call.request_body(
+                &UploadBody::new()
+                    .file(None, Some("application/octet-stream"), wav.len())
+                    .render(),
+            );
+        }
         let response = match http
             .post(&url)
             .header("Authorization", api_key)
@@ -497,6 +571,7 @@ impl PrerecordedSTT {
         {
             Ok(r) => r,
             Err(e) => {
+                call.transport_error(&e);
                 self.resilience.record_send_error();
                 return Err(STTError::NetworkError(format!(
                     "assemblyai upload failed: {e}"
@@ -504,12 +579,16 @@ impl PrerecordedSTT {
             }
         };
         let status = response.status();
+        call.status(status.as_u16());
+        call.vendor_request_id(header_request_id(response.headers()).as_deref());
         self.resilience.record_status(status);
         let text = response.text().await.unwrap_or_default();
+        call.response_body(&text);
+        call.finish();
         if !status.is_success() {
             // The same classification as every other vendor status: a revoked key here is an
             // authentication failure, not the vendor having a bad day.
-            return Err(classify_vendor_status(
+            return Err(vendor_status_error(
                 status,
                 format!(
                     "assemblyai upload rejected: {}",
@@ -563,9 +642,12 @@ impl PrerecordedSTT {
                     POLL_DEADLINE.as_secs()
                 )));
             }
+            // One vendor span per poll: each is a vendor request of its own (CONTRACTS §1.2a).
+            let call = self.vendor_call("GET", &url);
             let response = match http.get(&url).header("Authorization", api_key).send().await {
                 Ok(r) => r,
                 Err(e) => {
+                    call.transport_error(&e);
                     // A single failed poll is not a failed job — the transcript is still running
                     // on their side. Keep polling until the deadline decides.
                     warn!(%id, error = %e, "assemblyai poll failed; retrying");
@@ -573,12 +655,19 @@ impl PrerecordedSTT {
                 }
             };
             let status = response.status();
+            call.status(status.as_u16());
+            call.vendor_request_id(header_request_id(response.headers()).as_deref());
             self.resilience.record_status(status);
             let text = response.text().await.unwrap_or_default();
+            call.response_body(&text);
+            call.finish();
             if !status.is_success() {
-                return Err(STTError::ProviderError(format!(
-                    "assemblyai poll rejected ({status}): {text}"
-                )));
+                return Err(STTError::VendorStatus {
+                    status: status.as_u16(),
+                    error: Box::new(STTError::ProviderError(format!(
+                        "assemblyai poll rejected ({status}): {text}"
+                    ))),
+                });
             }
             let body: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
                 STTError::ProviderError(format!("assemblyai poll body is not JSON: {e}"))
@@ -626,6 +715,29 @@ fn classify_vendor_status(status: reqwest::StatusCode, message: String) -> STTEr
         code if (400..500).contains(&code) => STTError::ConfigurationError(message),
         _ => STTError::ProviderError(message),
     }
+}
+
+/// [`classify_vendor_status`], with the numeric status kept beside the variant.
+///
+/// The variant decides what the CALLER sees; the status decides the error class analytics count
+/// (FRD-021 §6.5). A 408 and a 429 are the same variant — both upstream, both a 502 — and only
+/// the status says which one is the vendor's capacity and which one a slow vendor.
+fn vendor_status_error(status: reqwest::StatusCode, message: String) -> STTError {
+    STTError::VendorStatus {
+        status: status.as_u16(),
+        error: Box::new(classify_vendor_status(status, message)),
+    }
+}
+
+/// The vendor's id for a request, from the response headers the three vendors use.
+fn header_request_id(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    ["dg-request-id", "request-id", "x-request-id"]
+        .iter()
+        .find_map(|name| headers.get(*name))
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty() && v.len() <= 200)
+        .map(str::to_string)
 }
 
 /// Render a vendor's error body as one line that names what was wrong.
@@ -718,6 +830,12 @@ fn parse_deepgram(body: &serde_json::Value) -> Result<Vec<STTResult>, String> {
         .pointer("/results/channels/0/detected_language")
         .and_then(|v| v.as_str())
         .map(str::to_string);
+    let request_id = body
+        .pointer("/metadata/request_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string);
 
     let mut out = Vec::with_capacity(channels.len());
     for channel in channels {
@@ -730,10 +848,11 @@ fn parse_deepgram(body: &serde_json::Value) -> Result<Vec<STTResult>, String> {
             .unwrap_or_default()
             .trim()
             .to_string();
-        let confidence = alt
+        let reported_confidence = alt
             .get("confidence")
             .and_then(serde_json::Value::as_f64)
-            .unwrap_or(1.0) as f32;
+            .filter(|c| c.is_finite());
+        let confidence = reported_confidence.unwrap_or(1.0) as f32;
 
         let words: Option<Vec<WordTiming>> =
             alt.get("words").and_then(|w| w.as_array()).map(|ws| {
@@ -772,6 +891,10 @@ fn parse_deepgram(body: &serde_json::Value) -> Result<Vec<STTResult>, String> {
             });
 
         let mut result = STTResult::new(transcript, true, true, confidence);
+        // Only what Deepgram actually said: the 1.0 above is a default, and analytics must not
+        // count "no confidence" as "fully confident" (FRD-021 DEG-5).
+        result.vendor_confidence = reported_confidence.map(|c| c as f32);
+        result.vendor_request_id = request_id.clone();
         result.speakers = speakers_from(words.as_deref());
         result.words = words;
         result.detected_language = detected_language.clone();
@@ -810,10 +933,11 @@ fn parse_assemblyai(body: &serde_json::Value) -> Result<Vec<STTResult>, String> 
         .ok_or("no text in the transcript")?
         .trim()
         .to_string();
-    let confidence = body
+    let reported_confidence = body
         .get("confidence")
         .and_then(serde_json::Value::as_f64)
-        .unwrap_or(1.0) as f32;
+        .filter(|c| c.is_finite());
+    let confidence = reported_confidence.unwrap_or(1.0) as f32;
 
     let words: Option<Vec<WordTiming>> = body.get("words").and_then(|w| w.as_array()).map(|ws| {
         ws.iter()
@@ -842,6 +966,7 @@ fn parse_assemblyai(body: &serde_json::Value) -> Result<Vec<STTResult>, String> 
     });
 
     let mut result = STTResult::new(transcript, true, true, confidence);
+    result.vendor_confidence = reported_confidence.map(|c| c as f32);
     result.speakers = speakers_from(words.as_deref());
     result.words = words;
     result.detected_language = body
@@ -1344,6 +1469,80 @@ mod tests {
         assert_eq!(words[1].word, "world");
         assert_eq!(words[0].speaker_id.as_deref(), Some("speaker_0"));
         assert_eq!(out[0].speakers.as_ref().unwrap().len(), 2);
+    }
+
+    /// FRD-021 TC-EMIT-10 / TC-EMIT-11 at the parser: a confidence and a request id reach the
+    /// result only when Deepgram sent them. The `confidence` field keeps its 1.0 default for the
+    /// callers that read it; analytics read `vendor_confidence`, which stays `None`.
+    #[test]
+    fn deepgram_confidence_and_request_id_are_only_what_it_sent() {
+        let with = json!({
+            "metadata": {"request_id": "dg-req-1", "duration": 1.0},
+            "results": {"channels": [{
+                "detected_language": "es",
+                "alternatives": [{"transcript": "hola", "confidence": 0.83}]
+            }]}
+        });
+        let out = parse_response(PrerecordedVendor::Deepgram, &with).unwrap();
+        assert_eq!(out[0].vendor_confidence, Some(0.83));
+        assert_eq!(out[0].vendor_request_id.as_deref(), Some("dg-req-1"));
+        assert_eq!(out[0].detected_language.as_deref(), Some("es"));
+
+        let without = json!({"results": {"channels": [{
+            "alternatives": [{"transcript": "hola"}]
+        }]}});
+        let out = parse_response(PrerecordedVendor::Deepgram, &without).unwrap();
+        assert_eq!(out[0].vendor_confidence, None);
+        assert_eq!(out[0].vendor_request_id, None);
+        assert!((out[0].confidence - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn elevenlabs_reports_no_transcript_confidence() {
+        // Its `language_probability` is about the language, not the words (DEG-5).
+        let body = json!({"text": "hi", "language_code": "en", "language_probability": 0.98});
+        let out = parse_response(PrerecordedVendor::ElevenLabs, &body).unwrap();
+        assert_eq!(out[0].vendor_confidence, None);
+    }
+
+    /// FRD-021 GT-10: 408 and 429 were one variant and nothing else; the status now rides with
+    /// it, while the caller still sees the same upstream failure.
+    #[test]
+    fn a_vendor_status_is_kept_beside_the_callers_classification() {
+        for code in [401, 402, 403, 404, 408, 429, 500] {
+            let status = reqwest::StatusCode::from_u16(code).unwrap();
+            let e = vendor_status_error(status, "x".into());
+            assert_eq!(e.vendor_status(), Some(code));
+            assert_eq!(
+                std::mem::discriminant(e.inner()),
+                std::mem::discriminant(&classify_vendor_status(status, "x".into())),
+                "{code}: the caller-facing classification changed"
+            );
+            assert_eq!(
+                e.to_string(),
+                classify_vendor_status(status, "x".into()).to_string()
+            );
+        }
+        let (a, _) = crate::core::voice_error::classify_stt_error(&vendor_status_error(
+            reqwest::StatusCode::REQUEST_TIMEOUT,
+            "x".into(),
+        ));
+        let (b, _) = crate::core::voice_error::classify_stt_error(&vendor_status_error(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            "x".into(),
+        ));
+        assert_eq!(a.as_str(), "vendor_timeout");
+        assert_eq!(b.as_str(), "rate_limited");
+    }
+
+    #[test]
+    fn the_request_id_header_is_read_from_any_of_the_vendor_names() {
+        let mut h = reqwest::header::HeaderMap::new();
+        assert_eq!(header_request_id(&h), None);
+        h.insert("request-id", "el-7".parse().unwrap());
+        assert_eq!(header_request_id(&h).as_deref(), Some("el-7"));
+        h.insert("dg-request-id", "dg-7".parse().unwrap());
+        assert_eq!(header_request_id(&h).as_deref(), Some("dg-7"));
     }
 
     #[test]
