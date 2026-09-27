@@ -18,6 +18,18 @@ mod sip_hooks_state;
 
 pub use sip_hooks_state::SipHooksState;
 
+/// A voice endpoint as a caller reached it (FRD-021 FR-1).
+#[derive(Debug, Clone)]
+pub struct ResolvedVoiceEndpoint {
+    /// The endpoint's UUID: the `voice_table` key, never the alias the caller typed.
+    pub endpoint_id: String,
+    /// The caller's allowlist entry for it — the endpoint's `model_id` and `project_id` — whether
+    /// the caller named it by alias or by the endpoint id itself (DEG-3). Always present for a
+    /// resolved endpoint; `Option` for the handlers that read it.
+    pub alias: Option<bud_auth::AliasMetadata>,
+    pub endpoint: bud_auth::credentials::VoiceEndpoint,
+}
+
 /// Application state that can be shared across handlers
 #[derive(Clone)]
 pub struct AppState {
@@ -70,12 +82,6 @@ impl AppState {
         self.bud_mode.is_none()
     }
 
-    /// Resolve a Bud voice endpoint by the name the caller used, checking it serves what was
-    /// asked for.
-    ///
-    /// The capability check is not decoration: an endpoint registered for transcription would
-    /// otherwise accept a synthesis request and fail deep inside a vendor call, with an error
-    /// naming neither the endpoint nor the mistake.
     /// Who the caller is, for attribution on the turn span.
     ///
     /// `resolve_voice_endpoint` deliberately does not return this: it resolves an ALIAS through
@@ -95,25 +101,48 @@ impl AppState {
         plane.authenticate(bearer?).await.ok()
     }
 
+    /// Resolve a Bud voice endpoint by the name the caller used, checking it serves what was
+    /// asked for — and say which endpoint it was.
+    ///
+    /// The capability check is not decoration: an endpoint registered for transcription would
+    /// otherwise accept a synthesis request and fail deep inside a vendor call, with an error
+    /// naming neither the endpoint nor the mistake.
+    ///
+    /// Returns the endpoint UUID and the caller's alias entry beside the endpoint (FRD-021 FR-1).
+    /// The turn span used to record the NAME the caller typed as `bud.endpoint_id`, because the
+    /// id was resolved here and thrown away; and the alias entry carries the endpoint's model and
+    /// project, which attribution needs and nothing else on the request has.
     pub fn resolve_voice_endpoint(
         &self,
         name: &str,
         capability: &str,
         bearer: Option<&str>,
-    ) -> Option<bud_auth::credentials::VoiceEndpoint> {
+    ) -> Option<ResolvedVoiceEndpoint> {
         let plane = self.bud_mode.as_ref()?.plane();
+        let token = bearer?;
 
         // A caller names an ALIAS ("tts-deepgram"); the voice table is keyed by ENDPOINT ID
-        // ("ep-e2e"). The mapping lives in the caller's own api_key blob, which is also the
-        // authorization boundary — resolving through it means a caller can only reach endpoints
-        // their key actually lists, rather than any endpoint whose id they can guess.
-        let endpoint_id = bearer
-            .and_then(|token| plane.alias_endpoint_id(token, name))
-            .unwrap_or_else(|| name.to_string());
+        // ("ep-e2e"). The mapping lives in the caller's allowlist — its own api_key blob, plus the
+        // published overlay for a customer (`bud_client_*`) key, as budgateway does — and that
+        // allowlist is also the authorization boundary.
+        //
+        // A caller may also name the endpoint id itself (DEG-3), but only an id its allowlist
+        // reaches. This used to fall back to ANY id in the voice table: an authenticated key
+        // reached every voice deployment whose id it knew, published or not, in any project.
+        let (endpoint_id, entry) = match plane.alias_metadata(token, name) {
+            // An alias that is not a voice deployment (an agent, a router) is not found here.
+            Some(meta) => (meta.endpoint_id.clone()?, meta),
+            None => (name.to_string(), plane.endpoint_entry(token, name)?),
+        };
+        let alias = Some(entry);
 
         let endpoint = plane.voice_endpoint(&endpoint_id)?;
         if endpoint.serves(capability) {
-            Some(endpoint)
+            Some(ResolvedVoiceEndpoint {
+                endpoint_id,
+                alias,
+                endpoint,
+            })
         } else {
             tracing::warn!(
                 endpoint = %name,

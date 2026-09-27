@@ -210,6 +210,90 @@ pub struct VoiceEndpointBlob {
     /// parameters", not drop the endpoint. Filtered and validated in [`parse_provider_params`].
     #[serde(default)]
     pub provider_params: Option<serde_json::Value>,
+    /// Bud's price for this endpoint (FRD-021 §6.4), `{unit, cost_per_unit, currency, per_units}`.
+    ///
+    /// A raw `Value` for the same reason as `config`: deserialising the entry is all-or-nothing,
+    /// and a price that does not parse must leave the endpoint unpriced, not unresolvable. It is
+    /// read by [`parse_pricing`].
+    #[serde(default)]
+    pub pricing: Option<serde_json::Value>,
+}
+
+/// Bud's price for a voice endpoint, as budapp publishes it (FRD-021 §6.4).
+///
+/// `cost = billable_units / per_units × cost_per_unit`, where `unit` says what is counted:
+/// `character`, `second`, `minute` or `request`. There is no input/output split; a voice vendor
+/// bills one dimension per capability.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VoicePricing {
+    /// Lower-cased, as published: `character` | `second` | `minute` | `request`. Kept as a string
+    /// so a unit added on budapp's side is carried rather than rejected; a unit the cost rule
+    /// does not know simply prices nothing.
+    pub unit: String,
+    pub cost_per_unit: f64,
+    pub currency: Option<String>,
+    /// How many units `cost_per_unit` covers. `0` is carried as published and prices nothing,
+    /// rather than dividing by it.
+    pub per_units: u64,
+}
+
+/// Read a published `pricing` block, or `None` with a warning when it cannot be used.
+///
+/// Tolerant of the shapes a Python publisher produces: numbers or numeric strings, a missing
+/// `per_units` (budapp's dataclass defaults it to 1) and a missing `currency`. Anything else —
+/// no unit, a negative or non-finite price, a fractional `per_units` — is refused here, once, at
+/// hydration, and the endpoint stays usable and unpriced.
+pub fn parse_pricing(endpoint_id: &str, raw: &serde_json::Value) -> Option<VoicePricing> {
+    if raw.is_null() {
+        return None;
+    }
+    let refuse = |why: &str| {
+        tracing::warn!(
+            endpoint_id = %endpoint_id,
+            reason = why,
+            "voice_table pricing is unusable; the endpoint is served unpriced"
+        );
+        None
+    };
+    let serde_json::Value::Object(fields) = raw else {
+        return refuse("pricing is not an object");
+    };
+    let number = |v: &serde_json::Value| -> Option<f64> {
+        match v {
+            serde_json::Value::Number(n) => n.as_f64(),
+            serde_json::Value::String(s) => s.trim().parse::<f64>().ok(),
+            _ => None,
+        }
+    };
+    let unit = match fields.get("unit").and_then(|u| u.as_str()).map(str::trim) {
+        Some(u) if !u.is_empty() => u.to_ascii_lowercase(),
+        _ => return refuse("no unit"),
+    };
+    let cost_per_unit = match fields.get("cost_per_unit").and_then(number) {
+        Some(c) if c.is_finite() && c >= 0.0 => c,
+        _ => return refuse("cost_per_unit is not a non-negative number"),
+    };
+    let per_units = match fields.get("per_units") {
+        None | Some(serde_json::Value::Null) => 1,
+        Some(v) => match number(v) {
+            Some(p) if p.is_finite() && p >= 0.0 && p.fract() == 0.0 && p <= u64::MAX as f64 => {
+                p as u64
+            }
+            _ => return refuse("per_units is not a whole number"),
+        },
+    };
+    let currency = fields
+        .get("currency")
+        .and_then(|c| c.as_str())
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .map(str::to_string);
+    Some(VoicePricing {
+        unit,
+        cost_per_unit,
+        currency,
+        per_units,
+    })
 }
 
 /// A voice endpoint after hydration: the credential is already plaintext.
@@ -236,6 +320,8 @@ pub struct VoiceEndpoint {
     pub language: Option<String>,
     /// Parsed at hydration, like the credential: the request path does no JSON work.
     pub config: VoiceEndpointSettings,
+    /// Bud's price for the endpoint, when budapp published a usable one (FRD-021 §6.4).
+    pub pricing: Option<VoicePricing>,
     /// Non-secret vendor parameters, already restricted to [`allowed_provider_params`] for this
     /// vendor and validated. A key a vendor does not allow never reaches this map, so nothing
     /// downstream can forward it into a provider's extras.
@@ -476,6 +562,10 @@ pub fn parse_voice_blob(
             .as_ref()
             .map(|raw| parse_endpoint_settings(&endpoint_id, raw))
             .unwrap_or_default();
+        let pricing = blob
+            .pricing
+            .as_ref()
+            .and_then(|raw| parse_pricing(&endpoint_id, raw));
         let provider_params =
             parse_provider_params(&endpoint_id, &blob.vendor, blob.provider_params.as_ref());
         let credential_parts = credential.as_deref().and_then(split_credential);
@@ -492,6 +582,7 @@ pub fn parse_voice_blob(
                 voice: blob.voice,
                 language: blob.language,
                 config,
+                pricing,
                 provider_params,
             },
         );
@@ -597,6 +688,68 @@ mod tests {
         assert!(ep.serves("audio_transcription"));
     }
 
+    /// FRD-021 GT-7: budapp published `pricing` and serde dropped it, because the blob had no
+    /// field for it — and `pricing` sat on the known-fields list, so no drift warning fired either.
+    #[test]
+    fn the_published_price_reaches_the_endpoint() {
+        let json = r#"{"ep-p":{"vendor":"deepgram","endpoints":["audio_transcription"],
+            "pricing":{"unit":"second","cost_per_unit":0.0001,"currency":"USD","per_units":1}}}"#;
+        let map = parse_voice_blob(json, &CredentialDecryptor::disabled()).unwrap();
+        assert_eq!(
+            map["ep-p"].pricing,
+            Some(VoicePricing {
+                unit: "second".into(),
+                cost_per_unit: 0.0001,
+                currency: Some("USD".into()),
+                per_units: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn an_endpoint_without_a_price_is_unpriced_not_dropped() {
+        let json = r#"{"ep-n":{"vendor":"deepgram","endpoints":["text_to_speech"]}}"#;
+        let map = parse_voice_blob(json, &CredentialDecryptor::disabled()).unwrap();
+        assert_eq!(map["ep-n"].pricing, None);
+    }
+
+    /// A price that cannot be used must cost the endpoint its price, never the endpoint itself:
+    /// the entry deserialises all-or-nothing, which is why `pricing` is read separately.
+    #[test]
+    fn an_unusable_price_leaves_the_endpoint_resolvable_and_unpriced() {
+        for pricing in [
+            r#""thirty""#,
+            r#"{"cost_per_unit":1}"#,
+            r#"{"unit":"character","cost_per_unit":"thirty"}"#,
+            r#"{"unit":"character","cost_per_unit":-1}"#,
+            r#"{"unit":"character","cost_per_unit":1,"per_units":1.5}"#,
+        ] {
+            let json = format!(
+                r#"{{"ep-u":{{"vendor":"deepgram","endpoints":["text_to_speech"],"pricing":{pricing}}}}}"#
+            );
+            let map = parse_voice_blob(&json, &CredentialDecryptor::disabled()).unwrap();
+            let ep = map
+                .get("ep-u")
+                .unwrap_or_else(|| panic!("pricing {pricing} dropped the endpoint"));
+            assert_eq!(ep.pricing, None, "pricing {pricing} was accepted");
+        }
+    }
+
+    #[test]
+    fn a_python_shaped_price_is_read() {
+        // Numeric strings (a Decimal serialised as text), no currency, and no per_units — which
+        // budapp's dataclass defaults to 1.
+        let raw = serde_json::json!({"unit": " Character ", "cost_per_unit": "30"});
+        let p = parse_pricing("ep", &raw).expect("usable");
+        assert_eq!(p.unit, "character");
+        assert_eq!(p.cost_per_unit, 30.0);
+        assert_eq!(p.per_units, 1);
+        assert_eq!(p.currency, None);
+        // `per_units: 0` is carried as published; the cost rule refuses to divide by it.
+        let zero = serde_json::json!({"unit": "character", "cost_per_unit": 30, "per_units": 0});
+        assert_eq!(parse_pricing("ep", &zero).map(|p| p.per_units), Some(0));
+    }
+
     /// TC-CRED-03 — an unknown field must not silently drop the entry.
     #[test]
     fn an_unknown_field_is_accepted_rather_than_dropping_the_entry() {
@@ -650,6 +803,7 @@ mod tests {
             voice: None,
             language: None,
             config: Default::default(),
+            pricing: None,
             provider_params: Default::default(),
         };
         let rendered = format!("{ep:?}");

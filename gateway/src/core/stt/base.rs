@@ -317,6 +317,17 @@ pub struct STTResult {
     /// so the field is additive and the existing construction sites are
     /// unaffected. The WS egress skips it when empty.
     pub translations: Vec<crate::core::stt::standard::Translation>,
+
+    /// The result-level confidence the VENDOR reported, and only that (FRD-021 M-B4).
+    ///
+    /// [`confidence`](Self::confidence) is a non-optional `f32`, and every parser that has no
+    /// value fills it with a default — Deepgram's with 1.0 — so it cannot tell "the vendor was
+    /// sure" from "the vendor said nothing". Analytics read this instead: `None` means no real
+    /// confidence, which must never be counted as 1.0.
+    pub vendor_confidence: Option<f32>,
+
+    /// The vendor's own id for the request that produced this result, when it returned one.
+    pub vendor_request_id: Option<String>,
 }
 
 impl STTResult {
@@ -356,6 +367,8 @@ impl STTResult {
             detected_language: None,
             audio_duration: None,
             translations: Vec::new(),
+            vendor_confidence: None,
+            vendor_request_id: None,
         }
     }
 
@@ -420,6 +433,8 @@ impl STTResult {
             detected_language,
             audio_duration,
             translations: Vec::new(),
+            vendor_confidence: None,
+            vendor_request_id: None,
         }
     }
 
@@ -603,6 +618,31 @@ pub enum STTError {
     NetworkError(String),
     #[error("Invalid audio format: {0}")]
     InvalidAudioFormat(String),
+    /// A vendor HTTP response caused `error`, and `status` is what it answered (FRD-021 §6.5).
+    ///
+    /// A wrapper so every consumer of the inner error keeps working through
+    /// [`STTError::inner`], and the display is the inner error's, unchanged. The status is what
+    /// the variants cannot give back: a 408 and a 429 are both `ProviderError`.
+    #[error("{error}")]
+    VendorStatus { status: u16, error: Box<STTError> },
+}
+
+impl STTError {
+    /// The error beneath any [`STTError::VendorStatus`] wrapper.
+    pub fn inner(&self) -> &STTError {
+        match self {
+            Self::VendorStatus { error, .. } => error.inner(),
+            other => other,
+        }
+    }
+
+    /// The vendor's HTTP status, when a vendor response caused this error.
+    pub fn vendor_status(&self) -> Option<u16> {
+        match self {
+            Self::VendorStatus { status, .. } => Some(*status),
+            _ => None,
+        }
+    }
 }
 
 /// Type alias for STT result callback

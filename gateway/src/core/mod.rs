@@ -51,6 +51,10 @@ pub mod vendor_error;
 /// catalog. Mirrors the [`emotion`] / [`lang`] mapper chassis; raw `voice_id` is the
 /// escape hatch, no-match → provider default + `config_warning` (never a 400).
 pub mod voice;
+/// A voice call's cost by its deployment's published price (FRD-021 §6.4).
+pub mod voice_cost;
+/// Why a voice call failed, as the closed class vocabulary analytics count (FRD-021 §6.5).
+pub mod voice_error;
 pub mod voice_manager;
 pub mod websocket;
 

@@ -1037,4 +1037,21 @@ mod tests {
         assert!(p.is_request_response());
         assert!(p.get_provider_info().contains("OpenAI"));
     }
+
+    #[test]
+    fn groq_answers_on_close_without_a_second_client() {
+        // Groq's STT client is the same shape as OpenAI's — one `POST /v1/audio/transcriptions`
+        // made on close — and the note in `create_stt_standard_prerecorded` says it needed only
+        // the marker. Without it, every Groq upload sat out the 45-second first-result timeout
+        // and a complete transcript was reported as truncated.
+        let cfg = StandardSTTConfig::from_base(STTConfig {
+            provider: "groq".into(),
+            api_key: "gsk-test".into(),
+            model: "whisper-large-v3".into(),
+            ..Default::default()
+        });
+        let p = create_stt_standard_prerecorded("groq", cfg).unwrap();
+        assert!(p.is_request_response());
+        assert!(p.get_provider_info().contains("Groq"));
+    }
 }

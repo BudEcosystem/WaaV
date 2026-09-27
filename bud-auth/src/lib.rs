@@ -27,7 +27,7 @@ pub mod store;
 pub mod types;
 
 pub use authz::{AuthzTier, Resolution};
-pub use credentials::{CredentialDecryptor, CredentialError, VoiceEndpoint};
+pub use credentials::{CredentialDecryptor, CredentialError, VoiceEndpoint, VoicePricing};
 pub use endpoint_config::{
     Pronunciation, SttSettings, TranslationSettings, TtsSettings, VoiceDescriptor,
     VoiceEndpointSettings,

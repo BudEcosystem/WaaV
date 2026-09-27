@@ -48,6 +48,38 @@ pub mod turn {
     /// Content. Carries a shorter retention than the row that holds it.
     pub const TRANSCRIPT: &str = "bud.voice.transcript";
     pub const SYNTHESIS_INPUT: &str = "bud.voice.synthesis_input";
+
+    // ---- FRD-021 §6.1, Phase 1 -------------------------------------------------------------
+
+    /// The `model` string the caller sent — the alias. `ENDPOINT_ID` is the endpoint UUID it
+    /// resolved to; before FRD-021 that column held this name instead.
+    pub const ENDPOINT_NAME: &str = "bud.voice.endpoint_name";
+    /// The project of the API key that made the call. `PROJECT_ID` is the ENDPOINT's project
+    /// (from the alias metadata) and falls back to this one when there is no alias entry.
+    pub const API_KEY_PROJECT_ID: &str = "bud.api_key_project_id";
+    /// What `COST` was computed from: `character` | `second` | `minute` | `request`. Recorded
+    /// only together with `COST`.
+    pub const PRICING_UNIT: &str = "bud.voice.pricing_unit";
+    /// The closed error-class vocabulary of FRD-021 §6.5, on every failed call.
+    pub const ERROR_TYPE: &str = "bud.voice.error_type";
+    /// The vendor's HTTP status, when a vendor response caused the failure.
+    pub const VENDOR_STATUS_CODE: &str = "bud.voice.vendor_status_code";
+
+    // ---- FRD-021 §6.1, Phase 5 -------------------------------------------------------------
+
+    /// Seconds of audio a synthesis produced. Exact for PCM and WAV; absent for compressed
+    /// formats, whose duration cannot be read without decoding (DEG-4).
+    pub const OUTPUT_AUDIO_SECONDS: &str = "bud.voice.output_audio_seconds";
+    /// The language the vendor says it heard, where it reports one.
+    pub const DETECTED_LANGUAGE: &str = "bud.voice.detected_language";
+    /// TTS: the format served. STT: the upload's container.
+    pub const AUDIO_FORMAT: &str = "bud.voice.audio_format";
+    /// Samples per second, where known without decoding (PCM, WAV headers).
+    pub const SAMPLE_RATE: &str = "bud.voice.sample_rate";
+    /// STT: the size of the uploaded file.
+    pub const INPUT_AUDIO_BYTES: &str = "bud.voice.input_audio_bytes";
+    /// The vendor's own id for the request, from its response.
+    pub const VENDOR_REQUEST_ID: &str = "bud.voice.vendor_request_id";
 }
 
 /// Attributes carried by a CLIENT span covering one leg of a turn.
@@ -67,6 +99,18 @@ pub mod leg {
     /// a voice turn's model attribution matches every other model call in the mesh.
     pub const LLM_MODEL: &str = "gen_ai.request.model";
     pub const LLM_DURATION_MS: &str = "bud.voice.llm.duration_ms";
+
+    /// The VENDOR's model for the leg (`voice_table.model`), as distinct from the Bud model the
+    /// endpoint belongs to (`turn::MODEL_ID`).
+    pub const STT_MODEL: &str = "bud.voice.stt.model";
+    pub const TTS_MODEL: &str = "bud.voice.tts.model";
+    /// A result-level confidence the vendor itself reported. Never a default: a vendor with no
+    /// confidence leaves it absent rather than contributing 1.0 (DEG-5).
+    pub const STT_CONFIDENCE: &str = "bud.voice.stt.confidence";
+    /// The voice a synthesis ran with.
+    pub const TTS_VOICE: &str = "bud.voice.tts.voice";
+    /// Whether the transcription ran through WaaV's own denoiser (FRD-018 Part III N1).
+    pub const STT_NOISE_SUPPRESSION: &str = "bud.voice.stt.noise_suppression";
 }
 
 /// Every attribute this crate emits, for the contract test.
@@ -89,6 +133,17 @@ pub const ALL: &[&str] = &[
     turn::LANGUAGE,
     turn::TRANSCRIPT,
     turn::SYNTHESIS_INPUT,
+    turn::ENDPOINT_NAME,
+    turn::API_KEY_PROJECT_ID,
+    turn::PRICING_UNIT,
+    turn::ERROR_TYPE,
+    turn::VENDOR_STATUS_CODE,
+    turn::OUTPUT_AUDIO_SECONDS,
+    turn::DETECTED_LANGUAGE,
+    turn::AUDIO_FORMAT,
+    turn::SAMPLE_RATE,
+    turn::INPUT_AUDIO_BYTES,
+    turn::VENDOR_REQUEST_ID,
     leg::STT_VENDOR,
     leg::STT_DURATION_MS,
     leg::STT_TTFB_MS,
@@ -97,6 +152,11 @@ pub const ALL: &[&str] = &[
     leg::TTS_TTFB_MS,
     leg::LLM_MODEL,
     leg::LLM_DURATION_MS,
+    leg::STT_MODEL,
+    leg::TTS_MODEL,
+    leg::STT_CONFIDENCE,
+    leg::TTS_VOICE,
+    leg::STT_NOISE_SUPPRESSION,
 ];
 
 /// Open a `voice.turn` span that declares EVERY attribute in [`ALL`] up front.
@@ -112,9 +172,14 @@ pub const ALL: &[&str] = &[
 /// which costs nothing.
 ///
 /// The caller supplies only what is known at turn start; everything else is recorded later.
+///
+/// `otel.status_code` / `otel.status_message` are declared too (FRD-021 FR-6): a failed turn
+/// records them, and a span built here that did not declare them would end `Unset` — a failure
+/// counted as a success. Anything after `transport` is passed to `info_span!` unchanged, so an
+/// extra field can be written in any form tracing accepts, `{ CONST } = value` included.
 #[macro_export]
 macro_rules! voice_turn_span {
-    (capability = $capability:expr, transport = $transport:expr $(, $extra:ident = $value:expr)* $(,)?) => {
+    (capability = $capability:expr, transport = $transport:expr $(, $($extra:tt)*)?) => {
         ::tracing::info_span!(
             "voice.turn",
             { $crate::observability::voice_attrs::turn::CAPABILITY } = $capability,
@@ -143,7 +208,25 @@ macro_rules! voice_turn_span {
             { $crate::observability::voice_attrs::leg::TTS_TTFB_MS } = ::tracing::field::Empty,
             { $crate::observability::voice_attrs::leg::LLM_MODEL } = ::tracing::field::Empty,
             { $crate::observability::voice_attrs::leg::LLM_DURATION_MS } = ::tracing::field::Empty,
-            $( $extra = $value, )*
+            { $crate::observability::voice_attrs::turn::ENDPOINT_NAME } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::turn::API_KEY_PROJECT_ID } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::turn::PRICING_UNIT } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::turn::ERROR_TYPE } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::turn::VENDOR_STATUS_CODE } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::turn::OUTPUT_AUDIO_SECONDS } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::turn::DETECTED_LANGUAGE } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::turn::AUDIO_FORMAT } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::turn::SAMPLE_RATE } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::turn::INPUT_AUDIO_BYTES } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::turn::VENDOR_REQUEST_ID } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::leg::STT_MODEL } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::leg::TTS_MODEL } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::leg::STT_CONFIDENCE } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::leg::TTS_VOICE } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::leg::STT_NOISE_SUPPRESSION } = ::tracing::field::Empty,
+            otel.status_code = ::tracing::field::Empty,
+            otel.status_message = ::tracing::field::Empty
+            $(, $($extra)*)?
         )
     };
 }
@@ -263,6 +346,62 @@ mod tests {
             "voice_turn_span! does not declare {missing:?}; recording them is a silent no-op, \
              so those columns would arrive empty with nothing reporting a problem"
         );
+    }
+
+    #[test]
+    fn the_turn_span_macro_declares_the_otel_status_and_passes_extras_through() {
+        // FRD-021 GT-3: the HTTP spans were hand-rolled because the macro declared no
+        // `otel.status_*` — so a turn built with it could not be marked failed — and took extras
+        // only as plain idents, which a `bud.voice.*` constant is not.
+        const EXTRA: &str = "bud.voice.macro_extra_probe";
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        tracing::subscriber::with_default(capture::Sub(seen.clone()), || {
+            let span = crate::voice_turn_span!(
+                capability = "text_to_speech",
+                transport = "http",
+                { EXTRA } = tracing::field::Empty
+            );
+            span.record("otel.status_code", "ERROR");
+            span.record("otel.status_message", "the vendor refused");
+            span.record(EXTRA, "x");
+        });
+        let seen = seen.lock().unwrap();
+        for name in ["otel.status_code", "otel.status_message", EXTRA] {
+            assert!(
+                seen.contains(name),
+                "voice_turn_span! does not declare {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_frd_021_names_are_the_contract_names() {
+        // Written out rather than derived: these are the names budmetrics' registry reads
+        // (CONTRACTS §1.1), and a constant renamed here alone would move the column to NULL.
+        for (constant, name) in [
+            (turn::ENDPOINT_NAME, "bud.voice.endpoint_name"),
+            (turn::API_KEY_PROJECT_ID, "bud.api_key_project_id"),
+            (turn::PRICING_UNIT, "bud.voice.pricing_unit"),
+            (turn::ERROR_TYPE, "bud.voice.error_type"),
+            (turn::VENDOR_STATUS_CODE, "bud.voice.vendor_status_code"),
+            (turn::OUTPUT_AUDIO_SECONDS, "bud.voice.output_audio_seconds"),
+            (turn::DETECTED_LANGUAGE, "bud.voice.detected_language"),
+            (turn::AUDIO_FORMAT, "bud.voice.audio_format"),
+            (turn::SAMPLE_RATE, "bud.voice.sample_rate"),
+            (turn::INPUT_AUDIO_BYTES, "bud.voice.input_audio_bytes"),
+            (turn::VENDOR_REQUEST_ID, "bud.voice.vendor_request_id"),
+            (leg::STT_MODEL, "bud.voice.stt.model"),
+            (leg::TTS_MODEL, "bud.voice.tts.model"),
+            (leg::STT_CONFIDENCE, "bud.voice.stt.confidence"),
+            (leg::TTS_VOICE, "bud.voice.tts.voice"),
+            (
+                leg::STT_NOISE_SUPPRESSION,
+                "bud.voice.stt.noise_suppression",
+            ),
+        ] {
+            assert_eq!(constant, name);
+            assert!(ALL.contains(&constant), "{name} is not in ALL");
+        }
     }
 
     #[test]

@@ -190,6 +190,33 @@ pub enum TTSError {
     /// The message is the vendor's own sentence, prefixed with who refused and the status.
     #[error("{0}")]
     RequestRejected(String),
+
+    /// A vendor HTTP response caused `error`, and `status` is what it answered (FRD-021 §6.5).
+    ///
+    /// A wrapper rather than a field on each variant, so every consumer that renders or matches
+    /// the error it already knew keeps doing so through [`TTSError::inner`] — the display is the
+    /// inner error's, unchanged. The status is what the variants alone cannot give back: 401,
+    /// 402 and 403 fold into two variants, 408 and 5xx into one.
+    #[error("{error}")]
+    VendorStatus { status: u16, error: Box<TTSError> },
+}
+
+impl TTSError {
+    /// The error beneath any [`TTSError::VendorStatus`] wrapper.
+    pub fn inner(&self) -> &TTSError {
+        match self {
+            Self::VendorStatus { error, .. } => error.inner(),
+            other => other,
+        }
+    }
+
+    /// The vendor's HTTP status, when a vendor response caused this error.
+    pub fn vendor_status(&self) -> Option<u16> {
+        match self {
+            Self::VendorStatus { status, .. } => Some(*status),
+            _ => None,
+        }
+    }
 }
 
 /// Result type for TTS operations

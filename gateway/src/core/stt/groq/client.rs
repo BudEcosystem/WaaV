@@ -673,15 +673,18 @@ impl GroqSTT {
         // remote `url` form field (when `config.audio_url` is set) — never both, per the
         // Groq/OpenAI-Whisper REST contract.
         let mut form = Form::new();
+        let wav_len = wav_data.len();
+        let file_name = format!("audio.{}", config.audio_input_format.extension());
         if config.audio_url.is_none() {
             // wav_data ownership is transferred here (no copy).
             let file_part = Part::bytes(wav_data)
-                .file_name(format!("audio.{}", config.audio_input_format.extension()))
+                .file_name(file_name.clone())
                 .mime_str(config.audio_input_format.mime_type())
                 .map_err(|e| STTError::ConfigurationError(format!("Invalid MIME type: {e}")))?;
             form = form.part("file", file_part);
         }
-        for (name, value) in config.build_form_text_fields() {
+        let text_fields = config.build_form_text_fields();
+        for (name, value) in text_fields.iter().cloned() {
             form = form.text(name, value);
         }
 
@@ -691,17 +694,47 @@ impl GroqSTT {
         // (`is_retryable_error` does not retry `ConnectionFailed`).
         self.resilience.check()?;
 
+        // The vendor call span, one per attempt (CONTRACTS §1.2a): the form fields as sent and
+        // the file as metadata, never its bytes.
+        let api_url = config.api_url();
+        let call = crate::observability::vendor_span::VendorCall::start(
+            &config.base.provider,
+            config.model.as_str(),
+            "POST",
+            &api_url,
+            &config.base.api_key,
+        );
+        if call.captures() {
+            let described = crate::observability::vendor_span::UploadBody::new()
+                .query(&api_url)
+                .fields(text_fields.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+            let described = if config.audio_url.is_none() {
+                described.file(
+                    Some(&file_name),
+                    Some(config.audio_input_format.mime_type()),
+                    wav_len,
+                )
+            } else {
+                described
+            };
+            call.request_body(&described.render());
+        }
+
         // Send request to Groq API
-        let response = http_client
-            .post(config.api_url())
+        let response = match http_client
+            .post(&api_url)
             .header("Authorization", format!("Bearer {}", config.base.api_key))
             .multipart(form)
             .send()
             .await
-            .map_err(|e| {
+        {
+            Ok(response) => response,
+            Err(e) => {
+                call.transport_error(&e);
                 self.resilience.record_send_error();
-                STTError::NetworkError(format!("Request failed: {e}"))
-            })?;
+                return Err(STTError::NetworkError(format!("Request failed: {e}")));
+            }
+        };
 
         // Extract rate limit headers before consuming response
         let rate_limit_info = RateLimitInfo::from_headers(response.headers());
@@ -725,11 +758,21 @@ impl GroqSTT {
 
         // Check response status
         let status = response.status();
+        call.status(status.as_u16());
+        call.vendor_request_id(self.last_request_id.as_deref());
         self.resilience.record_status(status);
-        let response_text = response
-            .text()
-            .await
-            .map_err(|e| STTError::NetworkError(format!("Failed to read response: {e}")))?;
+        let response_text = match response.text().await {
+            Ok(text) => text,
+            Err(e) => {
+                call.transport_error(&e);
+                return Err(STTError::NetworkError(format!(
+                    "Failed to read response: {e}"
+                )));
+            }
+        };
+        // The vendor's raw answer: the transcript, or its error body.
+        call.response_body(&response_text);
+        call.finish();
 
         if !status.is_success() {
             // Try to parse as Groq error
@@ -1182,6 +1225,15 @@ impl BaseSTT for GroqSTT {
     /// Get provider information string.
     fn get_provider_info(&self) -> &'static str {
         "Groq Whisper STT"
+    }
+
+    /// Groq's STT API is `POST /openai/v1/audio/{transcriptions,translations}` — the prerecorded
+    /// endpoint an upload wants, the same shape as OpenAI's. It buffers and answers on close
+    /// (`FlushStrategy::OnDisconnect`, and `disconnect` awaits the POST), so without this marker
+    /// the upload driver waited out the full 45-second first-result timeout on EVERY Groq
+    /// transcription and then reported a complete transcript as truncated.
+    fn is_request_response(&self) -> bool {
+        true
     }
 
     /// W-D2: attach the shared per-provider circuit breaker so every Groq STT session trips

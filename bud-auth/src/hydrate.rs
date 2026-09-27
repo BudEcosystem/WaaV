@@ -21,6 +21,32 @@ use crate::types::{AliasMap, AliasMetadata, AuthMetadata};
 pub const API_KEY_PREFIX: &str = "api_key:";
 pub const VOICE_TABLE_PREFIX: &str = "voice_table:";
 
+/// budapp's published overlay (`budapp/shared/publication_cache.py`): every published deployment,
+/// agent and router, keyed by the name a customer calls it by — `{endpoint_id, model_id,
+/// project_id, kind, created_at}` per deployment, the endpoint's OWN project. Written whole on
+/// every publication change; budgateway extends a `bud_client_*` key's map with it (auth.rs).
+pub const PUBLISHED_MODEL_INFO_KEY: &str = "published_model_info";
+
+/// Parse the published overlay.
+///
+/// A malformed ENTRY is skipped with a warning — one bad entry must not unpublish the rest. A
+/// document that is not a JSON object is an error, and the caller keeps the overlay it had.
+pub fn parse_published_overlay(raw: &str) -> Result<AliasMap, serde_json::Error> {
+    let doc: serde_json::Map<String, serde_json::Value> = serde_json::from_str(raw)?;
+    let mut overlay = AliasMap::with_capacity(doc.len());
+    for (name, entry) in doc {
+        match serde_json::from_value::<AliasMetadata>(entry) {
+            Ok(meta) => {
+                overlay.insert(name, meta);
+            }
+            Err(e) => {
+                tracing::warn!(name = %name, error = %e, "skipping unparseable published_model_info entry");
+            }
+        }
+    }
+    Ok(overlay)
+}
+
 /// Outcome of one hydration sweep.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct HydrationStats {

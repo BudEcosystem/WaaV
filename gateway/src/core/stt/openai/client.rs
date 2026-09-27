@@ -404,6 +404,7 @@ impl OpenAISTT {
         .map_err(|err| STTError::AudioProcessingError(format!("Invalid WAV parameters: {err}")))?;
 
         // Build multipart form
+        let wav_len = wav_data.len();
         let file_part = Part::bytes(wav_data)
             .file_name("audio.wav")
             .mime_str(config.audio_input_format.mime_type())
@@ -415,7 +416,8 @@ impl OpenAISTT {
         // timestamp_granularities[], stream, include[]=logprobs, chunking_strategy,
         // known_speaker_names[], known_speaker_references[]) come from the single wire-surface
         // builder so what is tested is exactly what is sent. See `transcription_text_fields`.
-        for (key, value) in config.transcription_text_fields() {
+        let text_fields = config.transcription_text_fields();
+        for (key, value) in text_fields.iter().cloned() {
             form = form.text(key, value);
         }
 
@@ -431,24 +433,58 @@ impl OpenAISTT {
         // open breaker fails fast with a typed classified refusal (uniform with the WS fleet).
         self.resilience.check()?;
 
+        // The vendor call span (CONTRACTS §1.2a): the form fields as sent and the file as
+        // metadata, never its bytes.
+        let call = crate::observability::vendor_span::VendorCall::start(
+            &config.base.provider,
+            config.model.as_str(),
+            "POST",
+            &api_url,
+            &config.base.api_key,
+        );
+        if call.captures() {
+            call.request_body(
+                &crate::observability::vendor_span::UploadBody::new()
+                    .query(&api_url)
+                    .fields(text_fields.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+                    .file(
+                        Some("audio.wav"),
+                        Some(config.audio_input_format.mime_type()),
+                        wav_len,
+                    )
+                    .render(),
+            );
+        }
+
         // Send request to OpenAI API
-        let response = http_client
-            .post(api_url)
+        let response = match http_client
+            .post(&api_url)
             .header("Authorization", format!("Bearer {}", config.base.api_key))
             .multipart(form)
             .send()
             .await
-            .map_err(|e| {
+        {
+            Ok(response) => response,
+            Err(e) => {
+                call.transport_error(&e);
                 self.resilience.record_send_error();
-                STTError::NetworkError(format!("Request failed: {e}"))
-            })?;
+                return Err(STTError::NetworkError(format!("Request failed: {e}")));
+            }
+        };
 
         // Check response status
         let status = response.status();
+        call.status(status.as_u16());
+        call.vendor_request_id(
+            crate::observability::vendor_span::request_id_from_headers(response.headers())
+                .as_deref(),
+        );
         self.resilience.record_status(status);
 
         if !status.is_success() {
             let response_text = response.text().await.unwrap_or_default();
+            call.response_body(&response_text);
+            call.finish();
             // Try to parse as OpenAI error
             let error_msg = if let Ok(error_response) =
                 serde_json::from_str::<OpenAIErrorResponse>(&response_text)
@@ -481,15 +517,23 @@ impl OpenAISTT {
         // batch path below. Decided on the model id actually sent, so a dated gpt-4o
         // snapshot streams like its family instead of being mistaken for whisper-1.
         if config.stream && !config.is_whisper_model() {
-            self.process_streaming_transcription(response).await?;
+            // The span ends with the stream; the SSE body is its response, as sent.
+            self.process_streaming_transcription(response, call).await?;
             self.audio_buffer.clear();
             return Ok(());
         }
 
-        let response_text = response
-            .text()
-            .await
-            .map_err(|e| STTError::NetworkError(format!("Failed to read response: {e}")))?;
+        let response_text = match response.text().await {
+            Ok(text) => text,
+            Err(e) => {
+                call.transport_error(&e);
+                return Err(STTError::NetworkError(format!(
+                    "Failed to read response: {e}"
+                )));
+            }
+        };
+        call.response_body(&response_text);
+        call.finish();
 
         // Parse response based on format
         let transcription_result = self.parse_response(&response_text, config)?;
@@ -526,15 +570,30 @@ impl OpenAISTT {
     async fn process_streaming_transcription(
         &self,
         response: reqwest::Response,
+        call: crate::observability::vendor_span::VendorCall,
     ) -> Result<(), STTError> {
         use futures_util::StreamExt;
         let mut stream = response.bytes_stream();
         let mut buf: Vec<u8> = Vec::new();
         let mut accumulated = String::new();
         let mut got_final = false;
+        // The raw SSE body for the vendor span, kept only while content is captured and bounded:
+        // the span caps it anyway, and a long stream must not grow without limit to be cut.
+        const RAW_KEEP: usize = 256 * 1024;
+        let mut raw = call.captures().then(String::new);
         while let Some(chunk) = stream.next().await {
-            let chunk =
-                chunk.map_err(|e| STTError::NetworkError(format!("stream read failed: {e}")))?;
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(e) => {
+                    call.transport_error(&e);
+                    return Err(STTError::NetworkError(format!("stream read failed: {e}")));
+                }
+            };
+            if let Some(raw) = raw.as_mut()
+                && raw.len() < RAW_KEEP
+            {
+                raw.push_str(&String::from_utf8_lossy(&chunk));
+            }
             buf.extend_from_slice(&chunk);
             // Drain complete `\n`-terminated lines; SSE events are `data: {json}`.
             while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
@@ -579,6 +638,10 @@ impl OpenAISTT {
                 }
             }
         }
+        if let Some(raw) = raw {
+            call.response_body(&raw);
+        }
+        call.finish();
         // Stream ended without an explicit done event → finalize what we have.
         if !got_final && !accumulated.is_empty() {
             if let Some(cb) = self.result_callback.lock().await.as_ref() {

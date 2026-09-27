@@ -156,6 +156,22 @@ impl BudMode {
         }))
     }
 
+    /// Wrap an already-booted plane, with no Redis behind it.
+    ///
+    /// For in-process harnesses that drive the audio handlers against a plane hydrated from a
+    /// `MemoryStore`: the handlers read only [`BudMode::plane`]. The store is a client for an
+    /// address nothing listens on and is never connected, so neither the keyspace loop nor the
+    /// voice-catalog publisher may be started on the result.
+    #[doc(hidden)]
+    pub fn for_plane(plane: Arc<BudPlane>) -> Result<Arc<Self>, String> {
+        let store = Arc::new(RedisStore::new("redis://127.0.0.1:1/").map_err(|e| e.to_string())?);
+        Ok(Arc::new(Self {
+            plane,
+            store,
+            db: 0,
+        }))
+    }
+
     /// The Redis store the plane reads — and the voice-catalog publisher writes to.
     pub fn store(&self) -> &Arc<RedisStore> {
         &self.store

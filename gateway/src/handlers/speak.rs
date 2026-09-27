@@ -18,6 +18,7 @@ const DEFAULT_SPEAK_TIMEOUT_SECS: u64 = 30;
 const MAX_TEXT_LENGTH: usize = 10 * 1024;
 
 use crate::core::tts::{AudioCallback, AudioData, TTSError, create_tts_provider};
+use crate::core::voice_error::{VoiceErrorType, VoiceFailure};
 use crate::handlers::ws::config::{TTSWebSocketConfig, client_api_key};
 use crate::state::AppState;
 
@@ -549,6 +550,7 @@ pub async fn synthesize_once(
         text,
     )
     .await
+    .map(|s| (s.audio, s.format, s.sample_rate))
     .map_err(|e| e.to_string())
 }
 
@@ -568,36 +570,78 @@ pub(crate) fn apply_pronunciations(
     crate::core::tts::provider::PronunciationReplacer::new(pronunciations).apply(text)
 }
 
-/// Why a one-shot synthesis failed, split by who can fix it.
+/// Why a one-shot synthesis failed, split by who can fix it — and classified for analytics.
 ///
-/// The OpenAI route answers these two differently — 400 and 502 — and a single string could not
-/// tell them apart, so a vendor's "that voice does not exist" reached the caller as a gateway
-/// fault.
+/// The OpenAI route answers the two variants differently — 400 and 502 — and a single string
+/// could not tell them apart, so a vendor's "that voice does not exist" reached the caller as a
+/// gateway fault. Each also carries its FRD-021 §6.5 class and, when a vendor response caused it,
+/// the vendor's status: before, every failure but a refusal collapsed into one string here, and
+/// a 429 could not be told from a 500 by anything downstream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SynthesisError {
-    /// The vendor refused the request as built ([`TTSError::RequestRejected`]). Fixed by changing
-    /// the request or the deployment.
-    Rejected(String),
+    /// The vendor refused the request as built ([`TTSError::RequestRejected`]), or the request
+    /// was refused before reaching it. Fixed by changing the request or the deployment.
+    Rejected(VoiceFailure),
     /// Anything else: provider construction, the connection, a timeout, or the vendor failing a
     /// well-formed request.
-    Failed(String),
+    Failed(VoiceFailure),
+}
+
+impl SynthesisError {
+    /// The classified failure, whichever side of the 400/502 split it is on.
+    pub fn failure(&self) -> &VoiceFailure {
+        match self {
+            Self::Rejected(f) | Self::Failed(f) => f,
+        }
+    }
+
+    /// A failure classified from the provider error that caused it, with `context` in front.
+    fn failed(context: &str, e: &TTSError) -> Self {
+        let (class, vendor_status) = crate::core::voice_error::classify_tts_error(e);
+        Self::Failed(VoiceFailure {
+            class,
+            vendor_status,
+            message: format!("{context}: {e}"),
+        })
+    }
 }
 
 impl std::fmt::Display for SynthesisError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Rejected(m) | Self::Failed(m) => f.write_str(m),
-        }
+        f.write_str(&self.failure().message)
     }
 }
 
 impl From<TTSError> for SynthesisError {
     fn from(e: TTSError) -> Self {
-        match e {
-            TTSError::RequestRejected(m) => Self::Rejected(m),
-            other => Self::Failed(format!("synthesis error: {other}")),
+        let (class, vendor_status) = crate::core::voice_error::classify_tts_error(&e);
+        match e.inner() {
+            TTSError::RequestRejected(m) => Self::Rejected(VoiceFailure {
+                class,
+                vendor_status,
+                message: m.clone(),
+            }),
+            other => Self::Failed(VoiceFailure {
+                class,
+                vendor_status,
+                message: format!("synthesis error: {other}"),
+            }),
         }
     }
+}
+
+/// One whole synthesis.
+#[derive(Debug)]
+pub struct Synthesized {
+    pub audio: Vec<u8>,
+    /// The provider's label for the audio (`linear16`, `mp3`, …).
+    pub format: String,
+    pub sample_rate: u32,
+    /// From the request to the vendor's first audio byte (FRD-021 M-B1).
+    ///
+    /// The VENDOR's first audio: `/v1/audio/speech` buffers the whole clip before replying, so
+    /// the caller's first byte is the whole call, not this.
+    pub ttfb: Option<Duration>,
 }
 
 /// Synthesise once from the STANDARD config, so a caller's canonical features reach the provider.
@@ -610,7 +654,7 @@ pub async fn synthesize_once_standard(
     state: &AppState,
     std_config: crate::core::tts::standard::StandardTTSConfig,
     text: &str,
-) -> Result<(Vec<u8>, String, u32), SynthesisError> {
+) -> Result<Synthesized, SynthesisError> {
     let tts_config = std_config.base.clone();
 
     // Pronunciation replacements apply to every synthesis path, not just the native one.
@@ -620,15 +664,15 @@ pub async fn synthesize_once_standard(
     // The provider skips blank text without queueing a request, so nothing would ever complete
     // and this would wait out the full timeout before failing as if the vendor were down.
     if processed.trim().is_empty() {
-        return Err(SynthesisError::Rejected(
-            "the text to synthesise is empty or whitespace; nothing was sent to the vendor"
-                .to_string(),
-        ));
+        return Err(SynthesisError::Rejected(VoiceFailure::new(
+            VoiceErrorType::InvalidRequest,
+            "the text to synthesise is empty or whitespace; nothing was sent to the vendor",
+        )));
     }
 
     let mut provider =
         crate::core::tts::standard::create_tts_standard(&tts_config.provider, std_config)
-            .map_err(|e| SynthesisError::Failed(format!("failed to create TTS provider: {e}")))?;
+            .map_err(|e| SynthesisError::failed("failed to create TTS provider", &e))?;
 
     // Connection pooling and per-provider metrics come from the shared manager; without this
     // the OpenAI route would open a fresh connection per request while `/speak` reuses them.
@@ -642,16 +686,19 @@ pub async fn synthesize_once_standard(
     provider
         .connect()
         .await
-        .map_err(|e| SynthesisError::Failed(format!("failed to connect to TTS provider: {e}")))?;
+        .map_err(|e| SynthesisError::failed("failed to connect to TTS provider", &e))?;
 
     let collector = Arc::new(AudioCollector::new());
-    provider
-        .on_audio(collector.clone())
-        .map_err(|e| SynthesisError::Failed(format!("failed to register audio callback: {e}")))?;
+    provider.on_audio(collector.clone()).map_err(|e| {
+        SynthesisError::Failed(VoiceFailure::new(
+            VoiceErrorType::Internal,
+            format!("failed to register audio callback: {e}"),
+        ))
+    })?;
 
     if let Err(e) = provider.speak(&processed, true).await {
         let _ = provider.disconnect().await;
-        return Err(SynthesisError::Failed(format!("synthesis failed: {e}")));
+        return Err(SynthesisError::failed("synthesis failed", &e));
     }
 
     if let Err(e) = collector
@@ -661,12 +708,24 @@ pub async fn synthesize_once_standard(
         // Always disconnect on the timeout path: leaking the connection is how a slow vendor
         // turns into exhausted file descriptors.
         let _ = provider.disconnect().await;
-        return Err(SynthesisError::Failed(e.to_string()));
+        // WaaV's own bound on the synthesis elapsed, not a vendor answer.
+        return Err(SynthesisError::Failed(VoiceFailure::new(
+            VoiceErrorType::Deadline,
+            e.to_string(),
+        )));
     }
 
     let _ = provider.disconnect().await;
 
-    collector.get_result().await.map_err(SynthesisError::from)
+    let ttfb = collector.ttfb();
+    let (audio, format, sample_rate) =
+        collector.get_result().await.map_err(SynthesisError::from)?;
+    Ok(Synthesized {
+        audio,
+        format,
+        sample_rate,
+        ttfb,
+    })
 }
 
 #[cfg(test)]
@@ -691,9 +750,14 @@ mod tests {
 
     #[test]
     fn only_a_vendor_refusal_is_a_rejection() {
+        // FRD-021: the payload became a classified `VoiceFailure` (it was a bare `String`); the
+        // 400/502 split this pins is unchanged.
         assert_eq!(
             SynthesisError::from(TTSError::RequestRejected("elevenlabs rejected".into())),
-            SynthesisError::Rejected("elevenlabs rejected".into())
+            SynthesisError::Rejected(VoiceFailure::new(
+                VoiceErrorType::VendorRejected,
+                "elevenlabs rejected"
+            ))
         );
         for other in [
             TTSError::ProviderError("down".into()),
@@ -708,6 +772,63 @@ mod tests {
                 "{other:?} must stay a failure"
             );
         }
+    }
+
+    /// FRD-021 GT-10: the vendor's status used to be lost here — every failure but a refusal
+    /// became `Failed(String)`. It now survives, and the class follows it.
+    #[test]
+    fn a_vendor_status_survives_into_the_synthesis_error() {
+        for (status, inner, class, rejected) in [
+            (
+                429,
+                TTSError::RateLimited {
+                    retry_after_secs: None,
+                    message: "busy".into(),
+                },
+                VoiceErrorType::RateLimited,
+                false,
+            ),
+            (
+                408,
+                TTSError::ProviderError("slow".into()),
+                VoiceErrorType::VendorTimeout,
+                false,
+            ),
+            (
+                402,
+                TTSError::RequestRejected("pay".into()),
+                VoiceErrorType::Auth,
+                true,
+            ),
+            (
+                404,
+                TTSError::RequestRejected("no voice".into()),
+                VoiceErrorType::VendorRejected,
+                true,
+            ),
+            (
+                503,
+                TTSError::ProviderError("down".into()),
+                VoiceErrorType::Vendor5xx,
+                false,
+            ),
+        ] {
+            let e = SynthesisError::from(TTSError::VendorStatus {
+                status,
+                error: Box::new(inner),
+            });
+            assert_eq!(e.failure().class, class, "{status}");
+            assert_eq!(e.failure().vendor_status, Some(status));
+            assert_eq!(
+                matches!(e, SynthesisError::Rejected(_)),
+                rejected,
+                "{status}"
+            );
+        }
+        // No vendor answer, no status.
+        let e = SynthesisError::from(TTSError::NetworkError("refused".into()));
+        assert_eq!(e.failure().class, VoiceErrorType::Network);
+        assert_eq!(e.failure().vendor_status, None);
     }
 
     #[test]

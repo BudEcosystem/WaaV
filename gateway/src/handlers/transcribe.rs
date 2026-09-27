@@ -62,6 +62,7 @@ use crate::core::stt::batch::{
     build_openai_transcription, decode_inline_batch_audio, validate_batch_base_url,
 };
 use crate::core::stt::{STTConfig, STTErrorCallback, STTResult, STTResultCallback};
+use crate::core::voice_error::{VoiceErrorType, VoiceFailure};
 use crate::state::AppState;
 
 /// Audio handed to a provider in frames rather than one buffer.
@@ -113,6 +114,11 @@ pub struct Transcript {
     /// The provider's own measurement of the audio, when it reports one. The decoder's reading is
     /// the fallback and is what `duration` carried before.
     pub audio_duration: Option<f64>,
+    /// A result-level confidence the vendor itself reported (FRD-021 M-B4); `None` when it
+    /// reported none, which is never the same as 1.0.
+    pub confidence: Option<f32>,
+    /// The vendor's own id for the request (FRD-021 §6.1).
+    pub vendor_request_id: Option<String>,
 }
 
 #[derive(Default)]
@@ -123,6 +129,8 @@ struct Collector {
     speakers: Vec<crate::core::stt::SpeakerInfo>,
     detected_language: Option<String>,
     audio_duration: Option<f64>,
+    confidence: Option<f32>,
+    vendor_request_id: Option<String>,
     last_result_at: Option<Instant>,
     /// The first error, already classified. Carrying the CLASSIFICATION rather than just the text
     /// is what lets a vendor's "no such model/language combination" reach the caller as a 400
@@ -157,20 +165,41 @@ pub async fn transcribe_once(
 /// realtime API does not accept was told "Connection failed: Connection channel closed before
 /// session started" — a message about sockets, for a problem about a model, with no way to tell
 /// the two apart.
+///
+/// Each side also carries its FRD-021 §6.5 class and, when a vendor response caused it, the
+/// vendor's status — the split below decides what the CALLER sees, the class what analytics
+/// count, and the two do not always agree (a vendor 408 and 429 are both upstream).
 #[derive(Debug, Clone)]
 pub enum TranscribeFailure {
     /// The deployment cannot be served as configured. Fixable by whoever configured it, so it is
     /// a 400 naming the field — not a 502 that reads as "the vendor is down".
-    Configuration(String),
+    Configuration(VoiceFailure),
     /// The vendor failed, or the connection did. Genuinely upstream: 502.
-    Upstream(String),
+    Upstream(VoiceFailure),
+}
+
+impl TranscribeFailure {
+    /// The classified failure, whichever side of the 400/502 split it is on.
+    pub fn failure(&self) -> &VoiceFailure {
+        match self {
+            Self::Configuration(f) | Self::Upstream(f) => f,
+        }
+    }
+
+    /// An upstream failure classified from the provider error that caused it.
+    fn upstream(e: &crate::core::stt::STTError) -> Self {
+        let (class, vendor_status) = crate::core::voice_error::classify_stt_error(e);
+        Self::Upstream(VoiceFailure {
+            class,
+            vendor_status,
+            message: e.to_string(),
+        })
+    }
 }
 
 impl std::fmt::Display for TranscribeFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Configuration(m) | Self::Upstream(m) => write!(f, "{m}"),
-        }
+        f.write_str(&self.failure().message)
     }
 }
 
@@ -228,15 +257,15 @@ pub async fn transcribe_once_standard(
     provider
         .on_result(on_result)
         .await
-        .map_err(|e| TranscribeFailure::Upstream(format!("{e}")))?;
+        .map_err(|e| TranscribeFailure::upstream(&e))?;
     provider
         .on_error(on_error)
         .await
-        .map_err(|e| TranscribeFailure::Upstream(format!("{e}")))?;
+        .map_err(|e| TranscribeFailure::upstream(&e))?;
     provider
         .connect()
         .await
-        .map_err(|e| TranscribeFailure::Upstream(format!("{e}")))?;
+        .map_err(|e| TranscribeFailure::upstream(&e))?;
 
     let started = Instant::now();
     let frame_samples = (pcm.sample_rate as usize * FRAME_MS / 1000).max(1);
@@ -253,7 +282,7 @@ pub async fn transcribe_once_standard(
         }
         if let Err(e) = provider.send_audio(bytes.into()).await {
             let _ = provider.disconnect().await;
-            return Err(TranscribeFailure::Upstream(format!("{e}")));
+            return Err(TranscribeFailure::upstream(&e));
         }
     }
     debug!(
@@ -298,6 +327,8 @@ pub async fn transcribe_once_standard(
         speakers: c.speakers.clone(),
         detected_language: c.detected_language.clone(),
         audio_duration: c.audio_duration,
+        confidence: c.confidence,
+        vendor_request_id: c.vendor_request_id.clone(),
     })
 }
 
@@ -342,6 +373,14 @@ fn accumulate(c: &mut Collector, r: STTResult) {
     if c.audio_duration.is_none() {
         c.audio_duration = r.audio_duration;
     }
+    // The first result's, like the language: a multi-channel file restates the request, and
+    // averaging per-channel confidences would be a number no vendor reported.
+    if c.confidence.is_none() {
+        c.confidence = r.vendor_confidence;
+    }
+    if c.vendor_request_id.is_none() {
+        c.vendor_request_id = r.vendor_request_id;
+    }
     if !r.transcript.trim().is_empty() {
         c.segments.push(r.transcript);
     }
@@ -356,11 +395,25 @@ fn accumulate(c: &mut Collector, r: STTResult) {
 ///
 /// `InvalidAudioFormat` is grouped with configuration because it describes the request's own
 /// audio, which the caller controls.
+///
+/// The split reads the error beneath any vendor-status wrapper, so a vendor 4xx still reaches
+/// the caller as a 400; the class and status come from the wrapper (FRD-021 §6.5).
 fn classify(e: crate::core::stt::STTError) -> TranscribeFailure {
-    match e {
+    let (class, vendor_status) = crate::core::voice_error::classify_stt_error(&e);
+    match e.inner() {
         crate::core::stt::STTError::ConfigurationError(m)
-        | crate::core::stt::STTError::InvalidAudioFormat(m) => TranscribeFailure::Configuration(m),
-        other => TranscribeFailure::Upstream(other.to_string()),
+        | crate::core::stt::STTError::InvalidAudioFormat(m) => {
+            TranscribeFailure::Configuration(VoiceFailure {
+                class,
+                vendor_status,
+                message: m.clone(),
+            })
+        }
+        _ => TranscribeFailure::Upstream(VoiceFailure {
+            class,
+            vendor_status,
+            message: e.to_string(),
+        }),
     }
 }
 
@@ -695,19 +748,33 @@ fn err(code: StatusCode, msg: &str) -> Response {
     (code, Json(json!({ "error": msg }))).into_response()
 }
 
+/// What a self-hosted backend answered.
+#[derive(Debug, Clone)]
+pub struct SelfHostedTranscript {
+    /// The backend's body, verbatim.
+    pub body: String,
+    /// The backend's own id for the request, when it sent one in a response header.
+    pub vendor_request_id: Option<String>,
+}
+
 /// Forward an upload to a self-hosted OpenAI-compatible backend and return its body verbatim.
 ///
 /// `/audio/translations` is a DIFFERENT route on these servers, not a parameter, so the
 /// translate flag selects the URL. Sending a translation request to the transcription route
 /// returns source-language text with a 200 — correct-looking and wrong.
+///
+/// A failure comes back classified (FRD-021 §6.5) with the backend's HTTP status when one caused
+/// it. `vendor` is the deployment's vendor id as `voice.turn` records it, for the vendor call
+/// span (CONTRACTS §1.2a).
 pub async fn transcribe_self_hosted(
+    vendor: &str,
     api_base: &str,
     api_key: &str,
     model: &str,
     file_bytes: Vec<u8>,
     filename: &str,
     settings: &waav_openai_audio::transcription::TranscriptionSettings,
-) -> Result<String, String> {
+) -> Result<SelfHostedTranscript, VoiceFailure> {
     use crate::core::tts::self_hosted::{transcription_url, translation_url};
 
     let url = if settings.translate {
@@ -716,15 +783,29 @@ pub async fn transcribe_self_hosted(
         transcription_url(api_base)
     };
 
-    let form = openai_transcription_form(model, file_bytes, filename, settings);
-
     let client = reqwest::Client::builder()
         .timeout(OVERALL_DEADLINE)
         .build()
-        .map_err(|e| format!("could not build the http client: {e}"))?;
+        .map_err(|e| {
+            VoiceFailure::new(
+                VoiceErrorType::Internal,
+                format!("could not build the http client: {e}"),
+            )
+        })?;
 
+    let fields = openai_transcription_fields(model, settings);
+    let call = upload_call(
+        vendor,
+        model,
+        &url,
+        api_key,
+        &fields,
+        filename,
+        file_bytes.len(),
+    );
+    let form = openai_transcription_form_from(&fields, file_bytes, filename);
     let req = upstream_transcription_request(&client, &url, UpstreamAuth::Bearer(api_key), form);
-    send_upstream_transcription(req, &url, "self-hosted deployment").await
+    send_upstream_transcription(req, &url, "self-hosted deployment", call).await
 }
 
 /// Forward an upload to an Azure OpenAI deployment (voice contract §3) and return its body
@@ -735,6 +816,7 @@ pub async fn transcribe_self_hosted(
 /// multipart body is OpenAI's, exactly as [`transcribe_self_hosted`] sends it. The route
 /// follows `settings.translate`, as it does there.
 ///
+/// * `vendor` — the deployment's vendor id, for the vendor call span.
 /// * `api_base` — `voice_table.api_base`, the resource endpoint
 ///   (`https://<resource>.openai.azure.com`).
 /// * `deployment` — `voice_table.model`: budapp publishes the credential's `deployment_id` there
@@ -746,8 +828,11 @@ pub async fn transcribe_self_hosted(
 ///   anonymous access.
 ///
 /// Refuses a non-https target and a loopback, private, link-local or metadata host before
-/// anything is sent (the shared SSRF rules), and never follows a redirect to one.
+/// anything is sent (the shared SSRF rules), and never follows a redirect to one. A refusal
+/// before sending is a configuration failure: nothing reached the vendor, so no vendor span.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn transcribe_azure_openai(
+    vendor: &str,
     api_base: &str,
     deployment: &str,
     api_version: Option<&str>,
@@ -755,35 +840,62 @@ pub(crate) async fn transcribe_azure_openai(
     file_bytes: Vec<u8>,
     filename: &str,
     settings: &waav_openai_audio::transcription::TranscriptionSettings,
-) -> Result<String, String> {
+) -> Result<SelfHostedTranscript, VoiceFailure> {
     use crate::core::tts::self_hosted::{azure_openai_url_schemes, validate_azure_openai_url};
 
+    let config = |msg: String| VoiceFailure::new(VoiceErrorType::Config, msg);
     let api_key = api_key.trim();
     if api_key.is_empty() {
-        return Err(
+        return Err(config(
             "the Azure OpenAI deployment has no API key configured; Azure OpenAI has no \
              anonymous access"
                 .to_string(),
-        );
+        ));
     }
-    let url = azure_transcription_url(api_base, deployment, api_version, settings.translate)?;
+    let url = azure_transcription_url(api_base, deployment, api_version, settings.translate)
+        .map_err(config)?;
 
     // Resolve-then-validate does a blocking DNS lookup; keep it off the async workers.
     let target = url.clone();
     tokio::task::spawn_blocking(move || validate_azure_openai_url(&target))
         .await
-        .map_err(|e| format!("the Azure OpenAI endpoint check did not complete: {e}"))?
-        .map_err(|msg| format!("Azure OpenAI api_base rejected (SSRF protection): {msg}"))?;
+        .map_err(|e| {
+            VoiceFailure::new(
+                VoiceErrorType::Internal,
+                format!("the Azure OpenAI endpoint check did not complete: {e}"),
+            )
+        })?
+        .map_err(|msg| {
+            config(format!(
+                "Azure OpenAI api_base rejected (SSRF protection): {msg}"
+            ))
+        })?;
 
     let client = crate::core::net::ssrf_protected_client_builder(azure_openai_url_schemes())
         .timeout(OVERALL_DEADLINE)
         .build()
-        .map_err(|e| format!("could not build the http client: {e}"))?;
+        .map_err(|e| {
+            VoiceFailure::new(
+                VoiceErrorType::Internal,
+                format!("could not build the http client: {e}"),
+            )
+        })?;
 
-    let form = openai_transcription_form(deployment.trim(), file_bytes, filename, settings);
+    let model = deployment.trim();
+    let fields = openai_transcription_fields(model, settings);
+    let call = upload_call(
+        vendor,
+        model,
+        &url,
+        api_key,
+        &fields,
+        filename,
+        file_bytes.len(),
+    );
+    let form = openai_transcription_form_from(&fields, file_bytes, filename);
     let req =
         upstream_transcription_request(&client, &url, UpstreamAuth::AzureApiKey(api_key), form);
-    send_upstream_transcription(req, &url, "Azure OpenAI deployment").await
+    send_upstream_transcription(req, &url, "Azure OpenAI deployment", call).await
 }
 
 /// The Azure OpenAI transcription or translation URL for one upload.
@@ -816,36 +928,33 @@ enum UpstreamAuth<'a> {
     AzureApiKey(&'a str),
 }
 
-/// OpenAI's transcription multipart body, shared by every OpenAI-shaped upstream.
-fn openai_transcription_form(
+/// The text fields of OpenAI's transcription upload, in the order they are sent — collected
+/// before the form so the vendor call span can show exactly what went out.
+fn openai_transcription_fields(
     model: &str,
-    file_bytes: Vec<u8>,
-    filename: &str,
     settings: &waav_openai_audio::transcription::TranscriptionSettings,
-) -> reqwest::multipart::Form {
-    let part = reqwest::multipart::Part::bytes(file_bytes).file_name(filename.to_string());
-    let mut form = reqwest::multipart::Form::new()
-        .part("file", part)
-        // The backend's own model name, not the Bud endpoint alias -- the alias means nothing
-        // to a server that has never heard of Bud.
-        .text("model", model.to_string())
-        .text(
+) -> Vec<(&'static str, String)> {
+    // The backend's own model name, not the Bud endpoint alias -- the alias means nothing to a
+    // server that has never heard of Bud.
+    let mut fields: Vec<(&'static str, String)> = vec![
+        ("model", model.to_string()),
+        (
             "response_format",
             settings.response_format.as_str().to_string(),
-        );
-
+        ),
+    ];
     // Only forward what the caller actually set. Sending `language: ""` makes some servers
     // fail validation on a field the caller never mentioned.
     if let Some(lang) = &settings.language
         && !settings.translate
     {
-        form = form.text("language", lang.clone());
+        fields.push(("language", lang.clone()));
     }
     if let Some(prompt) = &settings.prompt {
-        form = form.text("prompt", prompt.clone());
+        fields.push(("prompt", prompt.clone()));
     }
     if let Some(t) = settings.temperature {
-        form = form.text("temperature", t.to_string());
+        fields.push(("temperature", t.to_string()));
     }
     // The backend speaks this API, so the caller's own choice goes through as it was sent.
     for g in settings.timestamp_granularities.iter().flatten() {
@@ -853,7 +962,34 @@ fn openai_transcription_form(
             waav_openai_audio::transcription::TimestampGranularity::Word => "word",
             waav_openai_audio::transcription::TimestampGranularity::Segment => "segment",
         };
-        form = form.text("timestamp_granularities[]", name);
+        fields.push(("timestamp_granularities[]", name.to_string()));
+    }
+    fields
+}
+
+/// OpenAI's transcription multipart body, shared by every OpenAI-shaped upstream.
+fn openai_transcription_form(
+    model: &str,
+    file_bytes: Vec<u8>,
+    filename: &str,
+    settings: &waav_openai_audio::transcription::TranscriptionSettings,
+) -> reqwest::multipart::Form {
+    openai_transcription_form_from(
+        &openai_transcription_fields(model, settings),
+        file_bytes,
+        filename,
+    )
+}
+
+fn openai_transcription_form_from(
+    fields: &[(&'static str, String)],
+    file_bytes: Vec<u8>,
+    filename: &str,
+) -> reqwest::multipart::Form {
+    let part = reqwest::multipart::Part::bytes(file_bytes).file_name(filename.to_string());
+    let mut form = reqwest::multipart::Form::new().part("file", part);
+    for (name, value) in fields {
+        form = form.text(*name, value.clone());
     }
     form
 }
@@ -876,31 +1012,96 @@ fn upstream_transcription_request(
     }
 }
 
-/// Send an upload and return the upstream's body verbatim, naming the upstream in every failure.
+/// The vendor call span for one upload (CONTRACTS §1.2a): the fields as sent and the file as
+/// metadata — the upload is forwarded whole, but only its size and name reach the span.
+fn upload_call(
+    vendor: &str,
+    model: &str,
+    url: &str,
+    credential: &str,
+    fields: &[(&'static str, String)],
+    filename: &str,
+    file_len: usize,
+) -> crate::observability::vendor_span::VendorCall {
+    let call = crate::observability::vendor_span::VendorCall::start(
+        vendor, model, "POST", url, credential,
+    );
+    if call.captures() {
+        call.request_body(
+            &crate::observability::vendor_span::UploadBody::new()
+                .fields(fields.iter().map(|(k, v)| (*k, v.as_str())))
+                // The part is sent without a Content-Type of its own.
+                .file(Some(filename), None, file_len)
+                .render(),
+        );
+    }
+    call
+}
+
+/// Send an upload and return the upstream's body verbatim, naming the upstream in every failure
+/// and classifying it (FRD-021 §6.5); the vendor call span records the status, the upstream's
+/// request id and its answer as sent.
 async fn send_upstream_transcription(
     req: reqwest::RequestBuilder,
     url: &str,
     upstream: &str,
-) -> Result<String, String> {
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| format!("{upstream} at {url} is unreachable: {e}"))?;
+    call: crate::observability::vendor_span::VendorCall,
+) -> Result<SelfHostedTranscript, VoiceFailure> {
+    let resp = match req.send().await {
+        Ok(resp) => resp,
+        Err(e) => {
+            call.transport_error(&e);
+            // Reached and too slow, or never reached: different operator actions.
+            let class = if e.is_timeout() {
+                VoiceErrorType::VendorTimeout
+            } else {
+                VoiceErrorType::Network
+            };
+            return Err(VoiceFailure::new(
+                class,
+                format!("{upstream} at {url} is unreachable: {e}"),
+            ));
+        }
+    };
 
     let status = resp.status();
-    let body = resp
-        .text()
-        .await
-        .map_err(|e| format!("{upstream} returned an unreadable body: {e}"))?;
+    call.status(status.as_u16());
+    let vendor_request_id = ["x-request-id", "request-id"]
+        .iter()
+        .find_map(|name| resp.headers().get(*name))
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty() && v.len() <= 200)
+        .map(str::to_string);
+    call.vendor_request_id(vendor_request_id.as_deref());
+    let body = match resp.text().await {
+        Ok(body) => body,
+        Err(e) => {
+            call.transport_error(&e);
+            return Err(VoiceFailure::new(
+                VoiceErrorType::Network,
+                format!("{upstream} returned an unreadable body: {e}"),
+            ));
+        }
+    };
+    // The backend's answer as it sent it: the transcript, or its error body.
+    call.response_body(&body);
+    call.finish();
 
     if !status.is_success() {
         // The backend's own message is far more useful than anything synthesised here.
-        return Err(format!(
-            "{upstream} returned {status}: {}",
-            body.chars().take(500).collect::<String>()
+        return Err(VoiceFailure::vendor(
+            status.as_u16(),
+            format!(
+                "{upstream} returned {status}: {}",
+                body.chars().take(500).collect::<String>()
+            ),
         ));
     }
-    Ok(body)
+    Ok(SelfHostedTranscript {
+        body,
+        vendor_request_id,
+    })
 }
 
 #[cfg(test)]
@@ -1162,8 +1363,9 @@ mod tests {
 
 #[cfg(test)]
 mod collector_tests {
-    use super::{Collector, accumulate};
+    use super::{Collector, TranscribeFailure, accumulate, classify};
     use crate::core::stt::{STTResult, SpeakerInfo, WordTiming};
+    use crate::core::voice_error::VoiceErrorType;
 
     fn word(w: &str, start: f64, speaker: Option<&str>) -> WordTiming {
         WordTiming {
@@ -1258,6 +1460,50 @@ mod collector_tests {
 
         assert_eq!(c.detected_language.as_deref(), Some("en"));
         assert_eq!(c.audio_duration, Some(10.0));
+    }
+
+    /// FRD-021 M-B4: only a confidence the vendor reported reaches the transcript. `confidence`
+    /// on the result is 0.9 here and is NOT it.
+    #[test]
+    fn only_a_vendor_reported_confidence_survives() {
+        let mut c = Collector::default();
+        accumulate(&mut c, STTResult::new("a".into(), true, true, 0.9));
+        assert_eq!(c.confidence, None);
+
+        let mut reported = STTResult::new("b".into(), true, true, 0.9);
+        reported.vendor_confidence = Some(0.83);
+        reported.vendor_request_id = Some("req-1".into());
+        accumulate(&mut c, reported);
+        assert_eq!(c.confidence, Some(0.83));
+        assert_eq!(c.vendor_request_id.as_deref(), Some("req-1"));
+    }
+
+    /// FRD-021 §6.5: the 400/502 split is unchanged; the class and status now ride with it.
+    #[test]
+    fn a_classified_failure_keeps_the_callers_split() {
+        use crate::core::stt::STTError;
+        let rejected = classify(STTError::VendorStatus {
+            status: 400,
+            error: Box::new(STTError::ConfigurationError("no such model".into())),
+        });
+        match &rejected {
+            TranscribeFailure::Configuration(f) => {
+                assert_eq!(f.message, "no such model");
+                assert_eq!(f.class, VoiceErrorType::VendorRejected);
+                assert_eq!(f.vendor_status, Some(400));
+            }
+            other => panic!("a vendor 400 must stay the caller's problem: {other:?}"),
+        }
+        let throttled = classify(STTError::VendorStatus {
+            status: 429,
+            error: Box::new(STTError::ProviderError("busy".into())),
+        });
+        assert!(matches!(throttled, TranscribeFailure::Upstream(_)));
+        assert_eq!(throttled.failure().class, VoiceErrorType::RateLimited);
+        assert_eq!(throttled.to_string(), "Provider error: busy");
+        let decode = classify(STTError::InvalidAudioFormat("opus".into()));
+        assert_eq!(decode.failure().class, VoiceErrorType::InputDecode);
+        assert_eq!(decode.failure().vendor_status, None);
     }
 }
 
@@ -1387,6 +1633,7 @@ mod azure_openai_tests {
         ] {
             let err = rt
                 .block_on(transcribe_azure_openai(
+                    "azure_openai",
                     base,
                     "whisper-1",
                     None,
@@ -1397,7 +1644,7 @@ mod azure_openai_tests {
                 ))
                 .unwrap_err();
             assert!(
-                err.contains("SSRF protection"),
+                err.message.contains("SSRF protection"),
                 "{base}: the refusal must name the SSRF guard, got: {err}"
             );
         }
@@ -1408,6 +1655,7 @@ mod azure_openai_tests {
         let rt = runtime();
         let err = rt
             .block_on(transcribe_azure_openai(
+                "azure_openai",
                 AZ,
                 "whisper-1",
                 None,
@@ -1417,10 +1665,16 @@ mod azure_openai_tests {
                 &upload(false),
             ))
             .unwrap_err();
-        assert!(err.contains("API key"), "{err}");
+        assert!(err.message.contains("API key"), "{err}");
+        assert_eq!(
+            err.class,
+            VoiceErrorType::Config,
+            "nothing reached Azure: a config failure"
+        );
 
         let err = rt
             .block_on(transcribe_azure_openai(
+                "azure_openai",
                 AZ,
                 "",
                 None,
@@ -1430,6 +1684,6 @@ mod azure_openai_tests {
                 &upload(true),
             ))
             .unwrap_err();
-        assert!(err.contains("deployment"), "{err}");
+        assert!(err.message.contains("deployment"), "{err}");
     }
 }

@@ -15,6 +15,17 @@
 //!
 //! It is mounted as the outermost layer (in `main.rs`) so it wraps auth, rate-limit, and the
 //! handlers — the id exists before anything else logs.
+//!
+//! **Which span** (FRD-021 §6.7) depends on the route:
+//!
+//! * `/`, `/ready`, `/livez`, `/readyz`, `/metrics` — none. The id is still resolved, stashed and
+//!   echoed; only the exported span goes. Before, every kubelet probe and every scrape exported a
+//!   single-span trace: 99.5% of WaaV's traces, ~68k a day, none of them a call.
+//! * `/v1/audio/speech|transcriptions|translations` — an HTTP SERVER span named
+//!   `POST /v1/audio/speech` (etc.), carrying the OTel HTTP conventions, the call's attribution
+//!   and its bodies, so a voice call is listed in the trace UI like an LLM call. Switched off by
+//!   `WAAV_HTTP_SERVER_SPAN=false` (the deploy-order escape of the FRD-021 plan).
+//! * everything else — today's INTERNAL `request` span, unchanged (NG-10).
 
 use axum::{
     extract::Request,
@@ -23,6 +34,88 @@ use axum::{
     response::Response,
 };
 use tracing::Instrument;
+
+use crate::observability::voice_span::{self, RootSpan};
+
+/// Env var: whether `/v1/audio/*` requests get the HTTP SERVER root span. Default on.
+pub const HTTP_SERVER_SPAN_ENV: &str = "WAAV_HTTP_SERVER_SPAN";
+
+/// The operability routes: the kubelet's probes and Prometheus' scrape. No span.
+const PROBE_PATHS: &[&str] = &["/", "/ready", "/livez", "/readyz", "/metrics"];
+
+/// The routes whose root is the HTTP SERVER span. Each is its own route template (none takes a
+/// path parameter), so the path is the route.
+const AUDIO_ROUTES: &[&str] = &[
+    "/v1/audio/speech",
+    "/v1/audio/transcriptions",
+    "/v1/audio/translations",
+];
+
+/// What a request's root span is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootKind {
+    /// No span at all.
+    Probe,
+    /// The HTTP SERVER span, for this route template.
+    Server(&'static str),
+    /// The INTERNAL `request` span every route had before FRD-021.
+    Internal,
+}
+
+fn root_kind(path: &str, server_span_enabled: bool) -> RootKind {
+    if PROBE_PATHS.contains(&path) {
+        return RootKind::Probe;
+    }
+    match AUDIO_ROUTES.iter().copied().find(|r| *r == path) {
+        Some(route) if server_span_enabled => RootKind::Server(route),
+        _ => RootKind::Internal,
+    }
+}
+
+/// Whether the HTTP SERVER root is on: read once; `false`/`0`/`no`/`off` disable it.
+pub fn http_server_span_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| server_span_flag(std::env::var(HTTP_SERVER_SPAN_ENV).ok().as_deref()))
+}
+
+/// The pure parse behind [`http_server_span_enabled`].
+fn server_span_flag(raw: Option<&str>) -> bool {
+    !matches!(
+        raw.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("false" | "0" | "no" | "off")
+    )
+}
+
+/// The scheme the CLIENT used: the proxy's `x-forwarded-proto` when it is one we recognise,
+/// else the request URI's, else `http` — WaaV itself listens in plain HTTP behind the ingress.
+fn request_scheme(req: &Request) -> String {
+    req.headers()
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| v == "http" || v == "https")
+        .or_else(|| req.uri().scheme_str().map(str::to_string))
+        .unwrap_or_else(|| "http".to_string())
+}
+
+/// The host the client addressed, without its port (OTel `server.address`).
+fn server_address(req: &Request) -> Option<String> {
+    let host = req
+        .headers()
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| req.uri().host().map(str::to_string))?;
+    let host = host.trim();
+    let bare = if host.starts_with('[') {
+        // An IPv6 literal keeps its brackets; only a port after them is dropped.
+        host.split_inclusive(']').next().unwrap_or(host)
+    } else {
+        host.split(':').next().unwrap_or(host)
+    };
+    Some(bare.to_string()).filter(|h| !h.is_empty() && h.len() <= 255)
+}
 
 /// Canonical correlation-id header.
 pub const REQUEST_ID_HEADER: &str = "x-request-id";
@@ -137,8 +230,8 @@ fn hex_of(bytes: &[u8]) -> String {
     out
 }
 
-/// Axum middleware: resolve + propagate the correlation id, run the handler inside a span that
-/// carries `request_id`, and echo the id on the response.
+/// Axum middleware: resolve + propagate the correlation id, run the handler inside the route's
+/// root span (see the module docs for which), and echo the id on the response.
 pub async fn request_id_middleware(mut req: Request, next: Next) -> Response {
     let request_id = resolve_request_id(&req);
 
@@ -150,10 +243,43 @@ pub async fn request_id_middleware(mut req: Request, next: Next) -> Response {
             .insert(HeaderName::from_static(REQUEST_ID_HEADER), hv);
     }
 
-    // Enter a span so every nested `tracing` event inherits `request_id`.
-    let span = tracing::info_span!("request", request_id = %request_id);
-
-    let mut response = next.run(req).instrument(span).await;
+    let mut response = match root_kind(req.uri().path(), http_server_span_enabled()) {
+        // No span: a probe is not a call, and exporting one per poll buried every call there was.
+        RootKind::Probe => next.run(req).await,
+        RootKind::Server(route) => {
+            let method = req.method().as_str().to_string();
+            let path = req.uri().path().to_string();
+            let span = voice_span::server_root_span(
+                &method,
+                route,
+                &path,
+                &request_scheme(&req),
+                &request_id,
+            );
+            if let Some(agent) = req
+                .headers()
+                .get(axum::http::header::USER_AGENT)
+                .and_then(|v| v.to_str().ok())
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+            {
+                span.record(voice_span::http::USER_AGENT, agent);
+            }
+            if let Some(host) = server_address(&req) {
+                span.record(voice_span::http::SERVER_ADDRESS, host.as_str());
+            }
+            // The handler records the call's attribution, units and bodies on this same span.
+            req.extensions_mut().insert(RootSpan(span.clone()));
+            let response = next.run(req).instrument(span.clone()).await;
+            voice_span::record_http_outcome(&span, response.status());
+            response
+        }
+        // Enter a span so every nested `tracing` event inherits `request_id`.
+        RootKind::Internal => {
+            let span = tracing::info_span!("request", request_id = %request_id);
+            next.run(req).instrument(span).await
+        }
+    };
 
     // Echo the id back to the caller.
     if let Ok(hv) = HeaderValue::from_str(&request_id) {
@@ -175,6 +301,64 @@ mod tests {
             b = b.header(*k, *v);
         }
         b.body(Body::empty()).unwrap()
+    }
+
+    /// FRD-021 §6.7 / TC-TRACE-02: which root each route gets.
+    #[test]
+    fn probes_get_no_span_audio_gets_the_server_root_and_the_rest_is_unchanged() {
+        for probe in ["/", "/ready", "/livez", "/readyz", "/metrics"] {
+            assert_eq!(root_kind(probe, true), RootKind::Probe, "{probe}");
+            assert_eq!(root_kind(probe, false), RootKind::Probe, "{probe}");
+        }
+        for route in [
+            "/v1/audio/speech",
+            "/v1/audio/transcriptions",
+            "/v1/audio/translations",
+        ] {
+            assert_eq!(root_kind(route, true), RootKind::Server(route));
+            // TC-TRACE-07: the switch restores today's root.
+            assert_eq!(root_kind(route, false), RootKind::Internal);
+        }
+        for other in [
+            "/voices",
+            "/speak",
+            "/ws",
+            "/v1/realtime",
+            "/v1/audio/speech/extra",
+            "/metricsx",
+        ] {
+            assert_eq!(root_kind(other, true), RootKind::Internal, "{other}");
+        }
+    }
+
+    #[test]
+    fn the_server_span_switch_defaults_on() {
+        assert!(server_span_flag(None));
+        assert!(server_span_flag(Some("true")));
+        assert!(server_span_flag(Some("1")));
+        assert!(server_span_flag(Some("")));
+        for off in ["false", "0", "no", "off", " OFF ", "False"] {
+            assert!(!server_span_flag(Some(off)), "{off}");
+        }
+    }
+
+    #[test]
+    fn the_server_address_drops_the_port_and_the_scheme_follows_the_proxy() {
+        let r = req_with(&[("host", "waav.test:3001")]);
+        assert_eq!(server_address(&r).as_deref(), Some("waav.test"));
+        let r = req_with(&[("host", "[::1]:3001")]);
+        assert_eq!(server_address(&r).as_deref(), Some("[::1]"));
+        assert_eq!(server_address(&req_with(&[])), None);
+
+        assert_eq!(request_scheme(&req_with(&[])), "http");
+        assert_eq!(
+            request_scheme(&req_with(&[("x-forwarded-proto", "https")])),
+            "https"
+        );
+        assert_eq!(
+            request_scheme(&req_with(&[("x-forwarded-proto", "gopher")])),
+            "http"
+        );
     }
 
     #[test]
