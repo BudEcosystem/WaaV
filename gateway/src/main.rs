@@ -215,11 +215,30 @@ async fn main() -> anyhow::Result<()> {
     // 401 to every valid credential — a total outage from a pod that looks perfectly healthy.
     // Failing here stalls the rollout instead, which is the outcome an operator can act on.
     if let Some(bud_cfg) = waav_gateway::auth::bud_mode::BudModeConfig::from_env() {
+        let (policy_redis_url, policy_redis_db) = (bud_cfg.redis_url.clone(), bud_cfg.redis_db);
         match waav_gateway::auth::bud_mode::BudMode::start(bud_cfg).await {
             Ok(bud) => {
                 bud.spawn_keyspace_loop();
+                // FRD-022: each deployment's rate limits, concurrency cap, retry, fallback and
+                // breakers, enforced across replicas through the same Redis.
+                let policies =
+                    match waav_gateway::core::deployment_policy::DeploymentPolicies::connect(
+                        &policy_redis_url,
+                        policy_redis_db,
+                    )
+                    .await
+                    {
+                        Ok(p) => p,
+                        Err(e) => {
+                            eprintln!(
+                                "WARNING: deployment limits fall back to per-replica enforcement: {e}"
+                            );
+                            waav_gateway::core::deployment_policy::DeploymentPolicies::local()
+                        }
+                    };
                 if let Some(state) = std::sync::Arc::get_mut(&mut app_state) {
                     state.bud_mode = Some(bud);
+                    state.policies = Some(policies);
                 } else {
                     eprintln!(
                         "FATAL: application state was already shared; cannot install the Bud control plane"
@@ -441,6 +460,7 @@ async fn main() -> anyhow::Result<()> {
     // drain begins, so every live WebSocket session loop (which selects on this token)
     // can send a final protocol notice and tear down its providers within the drain window.
     let shutdown_token = app_state.shutdown.clone();
+    let policies_for_shutdown = app_state.policies.clone();
 
     // Combine all routes: webhook + protected + websocket + realtime + debug, rate-limited;
     // then the public operability routes merged on top, deliberately OUTSIDE the governor.
@@ -532,6 +552,12 @@ async fn main() -> anyhow::Result<()> {
             shutdown_token.cancel();
         })
         .await?;
+    }
+
+    // FRD-022: push the hits this replica admitted and hand its reserved share of every
+    // deployment's budget back to the other replicas.
+    if let Some(policies) = policies_for_shutdown {
+        policies.shutdown().await;
     }
 
     // Flush batched spans BEFORE returning. Without this the exporter is dropped with its

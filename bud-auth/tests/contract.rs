@@ -37,7 +37,7 @@ fn every_contract_case_parses() {
         match name.as_str() {
             // A case carrying a credential needs a decryptor; without one the endpoint is
             // correctly dropped rather than used with an unopened secret.
-            "vendor_backed" | "aws_polly" => {
+            "vendor_backed" | "aws_polly" | "with_deployment_policy" => {
                 let map = parsed.unwrap_or_else(|e| panic!("case {name} must parse: {e}"));
                 assert!(
                     map.is_empty(),
@@ -170,6 +170,11 @@ fn no_contract_field_is_unmodelled_by_this_build() {
         "config",
         // Voice contract §3 (2026-09-26).
         "provider_params",
+        // FRD-022 §6.1: the deployment's Rate limiting and Resilience settings.
+        "rate_limits",
+        "max_concurrent",
+        "retry_config",
+        "fallback_models",
     ];
 
     for (name, entry) in cases() {
@@ -187,4 +192,44 @@ fn no_contract_field_is_unmodelled_by_this_build() {
              KNOWN list in credentials.rs, or remove it from the shared fixture."
         );
     }
+}
+
+/// FRD-022 §6.1 / TC-CT-01: the deployment policy budapp publishes reaches the endpoint intact.
+///
+/// The fixture's credential is a placeholder, so it is stripped here: this checks the SHAPE of
+/// the policy blocks, which is independent of the credential.
+#[test]
+fn the_policy_case_carries_its_deployment_policy() {
+    let mut entry = cases()
+        .remove("with_deployment_policy")
+        .expect("the shared fixture has a policy case");
+    entry.as_object_mut().unwrap().remove("credential");
+    let blob = serde_json::json!({ "ep-1": entry }).to_string();
+    let map = parse_voice_blob(&blob, &CredentialDecryptor::disabled()).expect("parses");
+    let ep = map.get("ep-1").expect("endpoint kept");
+    let p = &ep.policy;
+    let rl = p.rate_limits.as_ref().expect("rate_limits parsed");
+    assert_eq!(rl.algorithm, resil::RateLimitAlgorithm::TokenBucket);
+    assert_eq!(rl.requests_per_second, Some(10));
+    assert_eq!(rl.burst_size, Some(15));
+    assert_eq!(rl.cache_ttl_ms, 500);
+    assert_eq!(rl.local_allowance, 0.8);
+    assert_eq!(p.max_concurrent, Some(20));
+    let retry = p.retry_config.expect("retry_config parsed");
+    assert_eq!(retry.num_retries, 2);
+    assert_eq!(retry.max_delay_s, 5.0);
+    assert_eq!(p.fallback_models.len(), 2);
+    assert_eq!(
+        &*p.fallback_models[0],
+        "3f2c1a9e-7b4d-4e61-9a0f-2d5c8b7e6a14"
+    );
+}
+
+/// An entry without policy fields (every entry published before FRD-022) has no policy.
+#[test]
+fn entries_without_policy_have_none() {
+    let entry = cases().remove("minimal").expect("minimal case");
+    let blob = serde_json::json!({ "ep-1": entry }).to_string();
+    let map = parse_voice_blob(&blob, &CredentialDecryptor::disabled()).expect("parses");
+    assert!(map["ep-1"].policy.is_empty());
 }

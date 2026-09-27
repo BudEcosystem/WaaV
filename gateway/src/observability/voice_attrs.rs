@@ -82,6 +82,21 @@ pub mod turn {
     pub const VENDOR_REQUEST_ID: &str = "bud.voice.vendor_request_id";
 }
 
+/// What the deployment's Rate limiting and Resilience settings did to this turn (FRD-022 §6.4).
+///
+/// Usage is billed to the deployment that SERVED the turn, which is not the one the caller named
+/// when the fallback chain served it — hence a column of its own rather than `bud.endpoint_id`.
+pub mod resilience {
+    /// The deployment that actually served the turn.
+    pub const SERVED_ENDPOINT_ID: &str = "bud.voice.served_endpoint_id";
+    /// The primary deployment, when a fallback served the turn.
+    pub const FALLBACK_FROM: &str = "bud.voice.fallback_from";
+    /// Vendor retries performed for the turn, across every hop.
+    pub const RETRY_COUNT: &str = "bud.voice.retry_count";
+    /// The deployment's rate-limit decision for the admitted request: `allow` | `unlimited`.
+    pub const RATE_LIMIT_OUTCOME: &str = "bud.rate_limit.outcome";
+}
+
 /// Attributes carried by a CLIENT span covering one leg of a turn.
 ///
 /// Per-leg rather than a single `provider`/`duration` pair, because a turn routinely spans two
@@ -157,6 +172,10 @@ pub const ALL: &[&str] = &[
     leg::STT_CONFIDENCE,
     leg::TTS_VOICE,
     leg::STT_NOISE_SUPPRESSION,
+    resilience::SERVED_ENDPOINT_ID,
+    resilience::FALLBACK_FROM,
+    resilience::RETRY_COUNT,
+    resilience::RATE_LIMIT_OUTCOME,
 ];
 
 /// Open a `voice.turn` span that declares EVERY attribute in [`ALL`] up front.
@@ -224,6 +243,10 @@ macro_rules! voice_turn_span {
             { $crate::observability::voice_attrs::leg::STT_CONFIDENCE } = ::tracing::field::Empty,
             { $crate::observability::voice_attrs::leg::TTS_VOICE } = ::tracing::field::Empty,
             { $crate::observability::voice_attrs::leg::STT_NOISE_SUPPRESSION } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::resilience::SERVED_ENDPOINT_ID } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::resilience::FALLBACK_FROM } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::resilience::RETRY_COUNT } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::resilience::RATE_LIMIT_OUTCOME } = ::tracing::field::Empty,
             otel.status_code = ::tracing::field::Empty,
             otel.status_message = ::tracing::field::Empty
             $(, $($extra)*)?

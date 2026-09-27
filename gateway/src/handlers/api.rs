@@ -272,6 +272,15 @@ pub async fn readiness_check(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
 
+    // Draining (SIGTERM received): leave the Service endpoints before the listener closes, so
+    // new sessions land on another replica (FRD-022 Phase 0.2).
+    if state.shutdown.is_cancelled() {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({ "status": "draining" })),
+        )
+            .into_response();
+    }
     match &state.bud_mode {
         Some(bud) if !bud.is_ready() => (
             axum::http::StatusCode::SERVICE_UNAVAILABLE,

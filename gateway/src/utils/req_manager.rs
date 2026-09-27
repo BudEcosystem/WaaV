@@ -280,6 +280,36 @@ pub struct ReqManagerConfig {
     pub retry_max_delay: Duration,
     /// Per-request timeout (independent of global timeout)
     pub per_request_timeout: Duration,
+    /// Longest a caller waits for a free slot before [`Saturated`] (FRD-022 §6.6). `None` waits
+    /// forever — the unbounded queue this replaced.
+    pub acquire_timeout: Option<Duration>,
+}
+
+/// The pool stayed full for the whole bounded wait. Local back-pressure: the caller is told
+/// 503 + `Retry-After: 1` rather than joining an unbounded queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Saturated {
+    pub max_concurrent: usize,
+    pub waited: Duration,
+}
+
+impl std::fmt::Display for Saturated {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "all {} vendor connections of this WaaV replica were busy for {} ms; raise \
+             WAAV_TTS_MAX_CONCURRENT_PER_VENDOR or add replicas",
+            self.max_concurrent,
+            self.waited.as_millis()
+        )
+    }
+}
+
+impl std::error::Error for Saturated {}
+
+/// Whether an [`ReqManager::acquire`] error is [`Saturated`].
+pub fn is_saturated(e: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    e.downcast_ref::<Saturated>().is_some()
 }
 
 impl Default for ReqManagerConfig {
@@ -298,6 +328,7 @@ impl Default for ReqManagerConfig {
             retry_initial_delay: Duration::from_millis(100),
             retry_max_delay: Duration::from_millis(500),
             per_request_timeout: Duration::from_secs(30), // 30s per request for TTS
+            acquire_timeout: Some(Duration::from_secs(2)),
         }
     }
 }
@@ -319,6 +350,7 @@ impl ReqManagerConfig {
             retry_initial_delay: Duration::from_millis(50),
             retry_max_delay: Duration::from_millis(300),
             per_request_timeout: Duration::from_secs(2),
+            acquire_timeout: Some(Duration::from_secs(2)),
         }
     }
 
@@ -338,6 +370,7 @@ impl ReqManagerConfig {
             retry_initial_delay: Duration::from_millis(200),
             retry_max_delay: Duration::from_secs(1),
             per_request_timeout: Duration::from_secs(5),
+            acquire_timeout: Some(Duration::from_secs(2)),
         }
     }
 }
@@ -438,8 +471,20 @@ impl ReqManager {
     pub async fn acquire(
         &self,
     ) -> Result<ClientGuard<'_>, Box<dyn std::error::Error + Send + Sync>> {
-        // Acquire semaphore permit to ensure we don't exceed max concurrent requests
-        let permit = self.semaphore.acquire().await?;
+        // Acquire semaphore permit to ensure we don't exceed max concurrent requests, waiting at
+        // most `acquire_timeout` (FRD-022 §6.6: a bounded wait, not an unbounded queue).
+        let permit = match self.config.acquire_timeout {
+            Some(limit) => match tokio::time::timeout(limit, self.semaphore.acquire()).await {
+                Ok(permit) => permit?,
+                Err(_) => {
+                    return Err(Box::new(Saturated {
+                        max_concurrent: self.max_concurrent_requests,
+                        waited: limit,
+                    }));
+                }
+            },
+            None => self.semaphore.acquire().await?,
+        };
 
         // Update metrics
         let active = self.metrics.active_requests.fetch_add(1, Ordering::Relaxed) + 1;
@@ -813,6 +858,25 @@ mod tests {
             err.to_string().contains("max_retries"),
             "error should name invalid retry config: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_full_pool_is_saturated_after_the_bounded_wait() {
+        let manager = ReqManager::with_config(ReqManagerConfig {
+            max_concurrent_requests: 1,
+            acquire_timeout: Some(Duration::from_millis(50)),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let _held = manager.acquire().await.unwrap();
+        let started = Instant::now();
+        let err = match manager.acquire().await {
+            Ok(_) => panic!("a full pool must not hand out a client"),
+            Err(e) => e,
+        };
+        assert!(is_saturated(err.as_ref()), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[tokio::test]

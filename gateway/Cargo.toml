@@ -120,6 +120,12 @@ bud-auth = { path = "../bud-auth" }
 # OpenAI-compatible audio request translation (FRD-018). Separate crate for the same reason
 # as bud-auth: pure mapping logic that tests in milliseconds instead of minutes.
 waav-openai-audio = { path = "../waav-openai-audio" }
+# FRD-022: a Bud deployment's Rate limiting and Resilience settings — the local-first limiter
+# shared with budgateway, plus retry/breaker/fallback primitives. Pinned by rev; the Redis
+# adapter matches the `redis` 0.27 bud-auth already links.
+resil = { git = "https://github.com/BudEcosystem/resil", rev = "9be62f18ac968cb98e4ccc621c42cd73e960f9ba", features = ["redis-0-27"] }
+# The same `redis` bud-auth links, for the limiter's own connection.
+redis = { version = "0.27", default-features = false, features = ["tokio-comp", "aio", "connection-manager"] }
 async-trait = "0.1.88"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"

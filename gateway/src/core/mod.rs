@@ -9,6 +9,8 @@ pub mod cache;
 pub mod capabilities;
 pub mod conversation;
 pub mod credentials;
+/// FRD-022: a Bud deployment's rate limits, concurrency cap, retry, fallback and breakers.
+pub mod deployment_policy;
 pub mod emotion;
 pub mod flow;
 /// Unified language system (P2): one canonical region-qualified BCP-47 token per request, mapped to

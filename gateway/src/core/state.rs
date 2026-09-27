@@ -113,16 +113,21 @@ impl CoreState {
         // on every boot, regardless of which providers are actually configured. Connection
         // pools establish lazily on first real use. Opt in with WAAV_EAGER_WARMUP=1.
         let eager_warmup = parse_env_bool("WAAV_EAGER_WARMUP")?.unwrap_or(false);
+        // FRD-022 §6.6: per-vendor transport concurrency per replica, with a bounded wait
+        // (ReqManagerConfig::acquire_timeout). Vendor-ACCOUNT concurrency is each deployment's
+        // `max_concurrent`, not this knob.
+        let per_vendor = tts_max_concurrent_per_vendor();
         for (provider, url) in tts_provider_urls {
-            match ReqManager::new(4).await {
+            match ReqManager::new(per_vendor).await {
                 Ok(manager) => {
                     if eager_warmup {
                         let _ = manager.warmup(url.as_str(), "OPTIONS").await;
                     }
                     tts_req_managers.insert(provider.clone(), Arc::new(manager));
-                    tracing::info!(
-                        "Initialized {} ReqManager with 4 concurrent connections",
-                        provider
+                    tracing::debug!(
+                        "Initialized {} ReqManager with {} concurrent connections",
+                        provider,
+                        per_vendor
                     );
                 }
                 Err(e) => {
@@ -339,6 +344,16 @@ fn parse_env_positive_usize(name: &str) -> Result<Option<usize>, String> {
             Err(format!("{name} environment variable must be valid UTF-8"))
         }
     }
+}
+
+/// `WAAV_TTS_MAX_CONCURRENT_PER_VENDOR` (default 64, 1–1000): concurrent vendor requests per TTS
+/// vendor per replica. It was a hard-coded 4 with an unbounded queue behind it.
+pub fn tts_max_concurrent_per_vendor() -> usize {
+    std::env::var("WAAV_TTS_MAX_CONCURRENT_PER_VENDOR")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| (1..=1000).contains(n))
+        .unwrap_or(64)
 }
 
 #[cfg(test)]

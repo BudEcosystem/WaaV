@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::auth::Auth;
-use crate::middleware::ClientIp;
+use crate::middleware::{ClientIp, ConnectionSlot};
 use crate::state::AppState;
 
 use super::{
@@ -70,6 +70,7 @@ pub async fn ws_voice_handler(
     State(state): State<Arc<AppState>>,
     Extension(auth): Extension<Auth>,
     client_ip: Option<Extension<ClientIp>>,
+    slot: Option<Extension<ConnectionSlot>>,
 ) -> Response {
     info!(
         auth_id = ?auth.id,
@@ -78,8 +79,10 @@ pub async fn ws_voice_handler(
     );
     debug!("AppState extracted successfully, preparing upgrade");
 
-    // Extract the IP address if present (used for connection limit tracking)
     let ip = client_ip.map(|Extension(ClientIp(ip))| ip);
+    // The connection slot rides into the session and is released when it ends; if the upgrade
+    // never happens, the closure (and the slot) is dropped with it.
+    let slot = slot.map(|Extension(s)| s);
 
     // Apply message size limits to prevent memory exhaustion attacks
     let response = ws
@@ -87,7 +90,7 @@ pub async fn ws_voice_handler(
         .max_message_size(MAX_WS_MESSAGE_SIZE)
         .on_upgrade(move |socket| {
             debug!("WebSocket upgrade callback triggered");
-            handle_voice_socket(socket, state, auth, ip)
+            handle_voice_socket(socket, state, auth, ip, slot)
         });
 
     debug!("WebSocket upgrade response created");
@@ -121,6 +124,7 @@ async fn handle_voice_socket(
     app_state: Arc<AppState>,
     auth: Auth,
     client_ip: Option<IpAddr>,
+    slot: Option<ConnectionSlot>,
 ) {
     // Multi-tenant panic isolation (W-E1 / E6).
     //
@@ -134,10 +138,7 @@ async fn handle_voice_socket(
     // `AssertUnwindSafe` is sound here: on panic we abandon this session entirely
     // (no shared state is observed after the unwind), so there is no risk of
     // exposing a logically-torn invariant to another session.
-    let _connection_guard = client_ip.map(|ip| ConnectionGuard {
-        app_state: app_state.clone(),
-        ip,
-    });
+    let _connection_slot = slot;
 
     let session =
         std::panic::AssertUnwindSafe(run_voice_socket_session(socket, app_state, auth, client_ip));
@@ -722,22 +723,6 @@ async fn process_message(
             info!("WebSocket connection closed by client");
             false
         }
-    }
-}
-
-/// Guard struct that releases a connection slot when dropped
-///
-/// This implements RAII pattern to ensure connection slots are always released,
-/// even if the WebSocket handler panics or encounters errors.
-struct ConnectionGuard {
-    app_state: Arc<AppState>,
-    ip: IpAddr,
-}
-
-impl Drop for ConnectionGuard {
-    fn drop(&mut self) {
-        debug!(ip = %self.ip, "Releasing connection slot");
-        self.app_state.release_connection(self.ip);
     }
 }
 
