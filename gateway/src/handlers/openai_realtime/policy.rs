@@ -171,9 +171,7 @@ fn apply_session_update(
     rules: &ClientRules,
     event_id: Option<&str>,
 ) -> Option<ClientOutcome<'static>> {
-    let Some(session) = event.get_mut("session").and_then(Value::as_object_mut) else {
-        return None;
-    };
+    let session = event.get_mut("session").and_then(Value::as_object_mut)?;
     // Routine: SDKs send both on every update. `model` is the deployment's (D-3); `tracing`
     // would open a trace in the vendor org every project on the credential shares (D-11).
     session.remove("model");
@@ -217,9 +215,7 @@ fn apply_response_create(
     rules: &ClientRules,
     event_id: Option<&str>,
 ) -> Option<ClientOutcome<'static>> {
-    let Some(response) = event.get_mut("response").and_then(Value::as_object_mut) else {
-        return None;
-    };
+    let response = event.get_mut("response").and_then(Value::as_object_mut)?;
     response.remove("model");
     if let Some(refused) = check_overridable(response, "response", rules, event_id) {
         return Some(refused);

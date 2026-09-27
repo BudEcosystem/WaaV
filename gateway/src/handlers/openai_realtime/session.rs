@@ -593,7 +593,7 @@ impl Relay<'_> {
         }
     }
 
-    async fn to_vendor(&mut self, text: String) -> Result<(), End> {
+    async fn send_to_vendor(&mut self, text: String) -> Result<(), End> {
         let started = std::time::Instant::now();
         match tokio::time::timeout(
             self.timings.upstream_send,
@@ -651,7 +651,7 @@ impl Relay<'_> {
                     .await;
             }
         }
-        self.to_vendor(text).await
+        self.send_to_vendor(text).await
     }
 
     async fn release_held(&mut self) -> Result<(), End> {
@@ -731,7 +731,7 @@ impl Relay<'_> {
                             &event_id,
                         ) {
                             Some(update) => {
-                                self.to_vendor(update).await?;
+                                self.send_to_vendor(update).await?;
                                 self.awaiting_defaults = Some(event_id);
                                 self.hold_deadline = Some(Instant::now() + self.timings.hold);
                                 Ok(())
