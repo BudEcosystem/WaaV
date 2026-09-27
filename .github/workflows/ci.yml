@@ -368,6 +368,10 @@ jobs:
     name: required (merge gate)
     runs-on: ubuntu-latest
     if: always()
+    # No checkout here, so the workflow-wide `working-directory: gateway` does not exist.
+    defaults:
+      run:
+        working-directory: .
     needs:
       - fmt
       - clippy
