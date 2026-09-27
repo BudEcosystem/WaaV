@@ -55,8 +55,9 @@ use crate::core::realtime::scaffold::{
 };
 use std::sync::Arc;
 
-/// Default Bedrock model id for Nova Sonic (speech-to-speech v1).
-pub(crate) const DEFAULT_MODEL: &str = "amazon.nova-sonic-v1:0";
+/// Default Bedrock model id: Nova 2 Sonic (FRD-023 F-4). Nova Sonic v1 (`amazon.nova-sonic-v1:0`)
+/// reached end of life on 2026-09-14.
+pub(crate) const DEFAULT_MODEL: &str = "amazon.nova-2-sonic-v1:0";
 
 /// Default Nova Sonic voice when none is configured (an English voice from the
 /// documented `voiceId` set: matthew | tiffany | amy | …).
@@ -672,6 +673,12 @@ mod tests {
     }
 
     /// from_config defaults the model + voice when omitted.
+    /// F-4 — Nova Sonic v1 reached end of life on 2026-09-14; the default is Nova 2 Sonic.
+    #[test]
+    fn f4_the_default_model_is_nova_2_sonic() {
+        assert_eq!(DEFAULT_MODEL, "amazon.nova-2-sonic-v1:0");
+    }
+
     #[test]
     fn from_config_defaults_model_and_voice() {
         let cfg = RealtimeConfig {

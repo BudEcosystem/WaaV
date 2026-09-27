@@ -675,6 +675,48 @@ impl<P: RealtimeProtocol> RealtimeSession<P> {
     }
 }
 
+/// Fold a session update into the session's config (F-3).
+///
+/// An update names only what it changes, so a field it leaves unset keeps its value. The
+/// server-held fields — the key, the endpoint and its server-config override, reconnection,
+/// the trace parent — are never taken from an update unless it sets them: replacing the config
+/// wholesale used to drop the key, and the next reconnect dialled without one.
+fn merge_session_update(current: &mut RealtimeConfig, update: RealtimeConfig) {
+    fn keep<T>(slot: &mut Option<T>, new: Option<T>) {
+        if new.is_some() {
+            *slot = new;
+        }
+    }
+    if !update.api_key.is_empty() {
+        current.api_key = update.api_key;
+    }
+    if !update.model.trim().is_empty() {
+        current.model = update.model;
+    }
+    keep(&mut current.voice, update.voice);
+    keep(&mut current.instructions, update.instructions);
+    keep(&mut current.temperature, update.temperature);
+    keep(
+        &mut current.max_response_output_tokens,
+        update.max_response_output_tokens,
+    );
+    keep(&mut current.input_audio_format, update.input_audio_format);
+    keep(&mut current.output_audio_format, update.output_audio_format);
+    keep(
+        &mut current.input_audio_transcription,
+        update.input_audio_transcription,
+    );
+    keep(&mut current.turn_detection, update.turn_detection);
+    keep(&mut current.tools, update.tools);
+    keep(&mut current.tool_choice, update.tool_choice);
+    keep(&mut current.modalities, update.modalities);
+    keep(&mut current.reasoning_effort, update.reasoning_effort);
+    keep(
+        &mut current.input_audio_noise_reduction,
+        update.input_audio_noise_reduction,
+    );
+}
+
 #[async_trait]
 impl<P: RealtimeProtocol> BaseRealtime for RealtimeSession<P> {
     fn new(config: RealtimeConfig) -> RealtimeResult<Self> {
@@ -817,7 +859,7 @@ impl<P: RealtimeProtocol> BaseRealtime for RealtimeSession<P> {
     }
 
     async fn update_session(&mut self, config: RealtimeConfig) -> RealtimeResult<()> {
-        self.config = config;
+        merge_session_update(&mut self.config, config);
         self.push_wires(self.protocol.build_session_config(&self.config, None))
             .await
     }
@@ -897,6 +939,53 @@ impl<P: RealtimeProtocol> BaseRealtime for RealtimeSession<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F-3 — an update MERGES into the session's config. It used to REPLACE it, so the api key,
+    /// the server-set endpoint override and every field the update did not name were lost, and
+    /// the next reconnect dialled without a key.
+    #[tokio::test]
+    async fn f3_update_session_merges_and_keeps_the_server_held_fields() {
+        use crate::core::realtime::base::{FunctionDefinition, ToolDefinition};
+        use crate::core::realtime::gemini::GeminiProtocol;
+        let cfg = RealtimeConfig {
+            provider: "gemini".into(),
+            api_key: "gkey".into(),
+            model: "m1".into(),
+            instructions: Some("be brief".into()),
+            realtime_endpoint_override: Some("ws://127.0.0.1:9/x".into()),
+            ..Default::default()
+        };
+        let mut s = RealtimeSession::<GeminiProtocol>::new(cfg).unwrap();
+        let update = RealtimeConfig {
+            voice: Some("Puck".into()),
+            tools: Some(vec![ToolDefinition {
+                tool_type: "function".into(),
+                function: FunctionDefinition {
+                    name: "lookup".into(),
+                    description: None,
+                    parameters: None,
+                },
+            }]),
+            turn_detection: Some(crate::core::realtime::base::TurnDetectionConfig::None),
+            ..Default::default()
+        };
+        // Not connected: the wire send fails, the merge still happens.
+        let _ = s.update_session(update).await;
+        let c = s.config();
+        assert_eq!(c.api_key, "gkey");
+        assert_eq!(c.model, "m1");
+        assert_eq!(c.instructions.as_deref(), Some("be brief"));
+        assert_eq!(
+            c.realtime_endpoint_override.as_deref(),
+            Some("ws://127.0.0.1:9/x")
+        );
+        assert_eq!(c.voice.as_deref(), Some("Puck"));
+        assert_eq!(c.tools.as_ref().map(Vec::len), Some(1));
+        assert!(matches!(
+            c.turn_detection,
+            Some(crate::core::realtime::base::TurnDetectionConfig::None)
+        ));
+    }
 
     #[test]
     fn connection_state_helpers_recover_from_poisoned_rwlock() {

@@ -1007,15 +1007,19 @@ async fn handle_session_update(
         return true;
     };
 
-    // Build update config (reuse existing API key)
+    // Build the update. Only the fields the client named: the provider MERGES it into the
+    // session's config and keeps the key and everything else (F-3). Tools and turn detection
+    // used to be dropped here, so an update that changed them changed nothing.
     let update_config = RealtimeConfig {
         api_key: String::new(), // Provider should retain existing key
-        model: config.model.unwrap_or_default(),
-        voice: config.voice,
-        instructions: config.instructions,
+        model: config.model.clone().unwrap_or_default(),
+        voice: config.voice.clone(),
+        instructions: config.instructions.clone(),
         temperature: config.temperature,
         max_response_output_tokens: config.max_response_tokens,
-        modalities: config.modalities,
+        turn_detection: map_turn_detection(&config),
+        tools: map_tools(&config),
+        modalities: config.modalities.clone(),
         reasoning_effort: config.reasoning_effort, // S2S
         input_audio_noise_reduction: config.input_audio_noise_reduction.clone(),
         ..Default::default()
@@ -1077,45 +1081,10 @@ fn canonical_realtime_provider(provider_name: &str) -> Option<&'static str> {
 /// field, and the upstream override is injected SEPARATELY by the handler from
 /// trusted server config only. Keep it that way (no SSRF via client input).
 pub fn build_realtime_config(api_key: String, config: &RealtimeSessionConfig) -> RealtimeConfig {
-    use crate::core::realtime::{InputTranscriptionConfig, TurnDetectionConfig};
+    use crate::core::realtime::InputTranscriptionConfig;
 
-    let turn_detection = config.turn_detection.as_ref().map(|td| match td {
-        crate::handlers::realtime::messages::TurnDetectionConfig::ServerVad {
-            threshold,
-            silence_duration_ms,
-            prefix_padding_ms,
-        } => TurnDetectionConfig::ServerVad {
-            threshold: *threshold,
-            prefix_padding_ms: *prefix_padding_ms,
-            silence_duration_ms: *silence_duration_ms,
-            create_response: Some(true),
-            interrupt_response: Some(true),
-        },
-        crate::handlers::realtime::messages::TurnDetectionConfig::Semantic { eagerness } => {
-            TurnDetectionConfig::SemanticVad {
-                eagerness: eagerness.clone(),
-                create_response: Some(true),
-                interrupt_response: Some(true),
-            }
-        }
-        crate::handlers::realtime::messages::TurnDetectionConfig::Manual => {
-            TurnDetectionConfig::None
-        }
-    });
-
-    let tools = config.tools.as_ref().map(|tools| {
-        tools
-            .iter()
-            .map(|t| crate::core::realtime::ToolDefinition {
-                tool_type: t.tool_type.clone(),
-                function: crate::core::realtime::FunctionDefinition {
-                    name: t.function.name.clone(),
-                    description: t.function.description.clone(),
-                    parameters: t.function.parameters.clone(),
-                },
-            })
-            .collect()
-    });
+    let turn_detection = map_turn_detection(config);
+    let tools = map_tools(config);
 
     let input_audio_transcription = if config.transcribe_input.unwrap_or(true) {
         Some(InputTranscriptionConfig {
@@ -1151,6 +1120,53 @@ pub fn build_realtime_config(api_key: String, config: &RealtimeSessionConfig) ->
         input_audio_noise_reduction: config.input_audio_noise_reduction.clone(),
         ..Default::default()
     }
+}
+
+/// The client's turn detection in the provider vocabulary (shared by config and update, F-3).
+fn map_turn_detection(
+    config: &RealtimeSessionConfig,
+) -> Option<crate::core::realtime::TurnDetectionConfig> {
+    use crate::core::realtime::TurnDetectionConfig;
+    config.turn_detection.as_ref().map(|td| match td {
+        crate::handlers::realtime::messages::TurnDetectionConfig::ServerVad {
+            threshold,
+            silence_duration_ms,
+            prefix_padding_ms,
+        } => TurnDetectionConfig::ServerVad {
+            threshold: *threshold,
+            prefix_padding_ms: *prefix_padding_ms,
+            silence_duration_ms: *silence_duration_ms,
+            create_response: Some(true),
+            interrupt_response: Some(true),
+        },
+        crate::handlers::realtime::messages::TurnDetectionConfig::Semantic { eagerness } => {
+            TurnDetectionConfig::SemanticVad {
+                eagerness: eagerness.clone(),
+                create_response: Some(true),
+                interrupt_response: Some(true),
+            }
+        }
+        crate::handlers::realtime::messages::TurnDetectionConfig::Manual => {
+            TurnDetectionConfig::None
+        }
+    })
+}
+
+/// The client's tools in the provider vocabulary (shared by config and update, F-3).
+fn map_tools(config: &RealtimeSessionConfig) -> Option<Vec<crate::core::realtime::ToolDefinition>> {
+    config.tools.as_ref().map(|tools| {
+        tools
+            .iter()
+            .map(|t| crate::core::realtime::ToolDefinition {
+                tool_type: t.tool_type.clone(),
+                function: crate::core::realtime::FunctionDefinition {
+                    name: t.function.name.clone(),
+                    description: t.function.description.clone(),
+                    parameters: t.function.parameters.clone(),
+                },
+            })
+            .collect()
+    })
 }
 
 #[cfg(test)]
@@ -1573,5 +1589,110 @@ mod frd023_native_tests {
         assert!(provider.is_some(), "the first provider is still in place");
         assert!(!disconnected.load(Ordering::SeqCst), "and still connected");
         assert_eq!(session_id.as_deref(), Some("sess-1"));
+    }
+
+    /// Records the config each `update_session` receives.
+    struct RecordingRt(Arc<std::sync::Mutex<Vec<RealtimeConfig>>>);
+
+    #[async_trait::async_trait]
+    impl BaseRealtime for RecordingRt {
+        fn new(_c: RealtimeConfig) -> RealtimeResult<Self> {
+            unreachable!()
+        }
+        async fn connect(&mut self) -> RealtimeResult<()> {
+            Ok(())
+        }
+        async fn disconnect(&mut self) -> RealtimeResult<()> {
+            Ok(())
+        }
+        fn is_ready(&self) -> bool {
+            true
+        }
+        fn get_connection_state(&self) -> ConnectionState {
+            ConnectionState::Connected
+        }
+        async fn send_audio(&mut self, _a: bytes::Bytes) -> RealtimeResult<()> {
+            Ok(())
+        }
+        async fn send_text(&mut self, _t: &str) -> RealtimeResult<()> {
+            Ok(())
+        }
+        async fn create_response(&mut self) -> RealtimeResult<()> {
+            Ok(())
+        }
+        async fn cancel_response(&mut self) -> RealtimeResult<()> {
+            Ok(())
+        }
+        async fn commit_audio_buffer(&mut self) -> RealtimeResult<()> {
+            Ok(())
+        }
+        async fn clear_audio_buffer(&mut self) -> RealtimeResult<()> {
+            Ok(())
+        }
+        fn on_transcript(&mut self, _c: TranscriptCallback) -> RealtimeResult<()> {
+            Ok(())
+        }
+        fn on_audio(&mut self, _c: AudioOutputCallback) -> RealtimeResult<()> {
+            Ok(())
+        }
+        fn on_error(&mut self, _c: RealtimeErrorCallback) -> RealtimeResult<()> {
+            Ok(())
+        }
+        fn on_function_call(&mut self, _c: FunctionCallCallback) -> RealtimeResult<()> {
+            Ok(())
+        }
+        fn on_speech_event(&mut self, _c: SpeechEventCallback) -> RealtimeResult<()> {
+            Ok(())
+        }
+        fn on_response_done(&mut self, _c: ResponseDoneCallback) -> RealtimeResult<()> {
+            Ok(())
+        }
+        fn on_reconnection(&mut self, _c: ReconnectionCallback) -> RealtimeResult<()> {
+            Ok(())
+        }
+        async fn update_session(&mut self, c: RealtimeConfig) -> RealtimeResult<()> {
+            self.0.lock().unwrap().push(c);
+            Ok(())
+        }
+        async fn submit_function_result(&mut self, _id: &str, _r: &str) -> RealtimeResult<()> {
+            Ok(())
+        }
+        fn get_provider_info(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+    }
+
+    /// F-3 — a native `update_session` carries the tools and the turn detection it was sent;
+    /// before, both were dropped and the vendor kept the old ones without a word.
+    #[tokio::test]
+    async fn f3_update_session_carries_tools_and_turn_detection() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut provider: Option<Box<dyn BaseRealtime>> =
+            Some(Box::new(RecordingRt(Arc::clone(&seen))));
+        let (tx, _rx) = mpsc::channel(8);
+        let update: RealtimeSessionConfig = serde_json::from_value(serde_json::json!({
+            "voice": "marin",
+            "turn_detection": {"mode": "semantic", "eagerness": "low"},
+            "tools": [{"type": "function", "function": {"name": "lookup", "description": "d",
+                "parameters": {"type": "object"}}}]
+        }))
+        .unwrap();
+
+        handle_session_update(update, &mut provider, &tx).await;
+
+        let seen = seen.lock().unwrap();
+        let cfg = seen.last().expect("update_session was called");
+        assert_eq!(cfg.voice.as_deref(), Some("marin"));
+        let tools = cfg.tools.as_ref().expect("tools carried");
+        assert_eq!(tools[0].function.name, "lookup");
+        assert!(
+            matches!(
+                cfg.turn_detection,
+                Some(crate::core::realtime::TurnDetectionConfig::SemanticVad { ref eagerness, .. })
+                    if eagerness.as_deref() == Some("low")
+            ),
+            "turn detection carried: {:?}",
+            cfg.turn_detection
+        );
     }
 }

@@ -49,10 +49,11 @@ use crate::core::realtime::scaffold::{
 /// query is appended in `connect_spec` (Gemini auths by QUERY param, not header).
 pub(crate) const GEMINI_LIVE_URL: &str = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
 
-/// Current Gemini Live model (the half-cascade audio model). Used when
-/// `cfg.model` is empty. Pipecat's default is a `gemini-2.5-flash-native-audio-*`
-/// preview; the broadly-available stable Live model is `gemini-2.0-flash-live-001`.
-pub(crate) const GEMINI_LIVE_DEFAULT_MODEL: &str = "gemini-2.0-flash-live-001";
+/// The Gemini Live model used when `cfg.model` is empty (FRD-023 F-4). It was
+/// `gemini-2.0-flash-live-001`, which Google shut down on 2025-12-09; `gemini-3.8-live` is on
+/// Google's pricing page as of 2026-09-24. A Bud deployment always names its model
+/// (`voice_table.model`), so this default serves only the native `/realtime` path.
+pub(crate) const GEMINI_LIVE_DEFAULT_MODEL: &str = "gemini-3.8-live";
 
 /// Gemini Live OUTPUT is 24 kHz mono 16-bit PCM ⇒ 2 B/sample × 24 samples/ms =
 /// 48 B/ms. (Pipecat: `self._sample_rate = 24000`, output mime
@@ -559,6 +560,13 @@ mod tests {
         };
         let p = GeminiProtocol::from_config(&cfg).unwrap();
         assert_eq!(p.model(), GEMINI_LIVE_DEFAULT_MODEL);
+    }
+
+    /// F-4 — the default is a model Google still serves. `gemini-2.0-flash-live-001` was shut
+    /// down on 2025-12-09; a default that no longer exists fails every session that relies on it.
+    #[test]
+    fn f4_the_default_model_is_current() {
+        assert_eq!(GEMINI_LIVE_DEFAULT_MODEL, "gemini-3.8-live");
     }
 
     /// connect_spec: the api key is in the `?key=` QUERY (NOT a header), on the

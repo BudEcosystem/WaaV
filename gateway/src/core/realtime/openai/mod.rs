@@ -124,9 +124,13 @@ mod tests {
             OpenAIRealtimeModel::from_str_or_default("gpt-realtime"),
             OpenAIRealtimeModel::GptRealtime
         );
-        // Default is now the GA gpt-realtime.
+        // F-1: an id the gateway does not list is kept verbatim; only an empty one defaults.
         assert_eq!(
-            OpenAIRealtimeModel::from_str_or_default("unknown"),
+            OpenAIRealtimeModel::from_str_or_default("unknown").as_str(),
+            "unknown"
+        );
+        assert_eq!(
+            OpenAIRealtimeModel::from_str_or_default("  "),
             OpenAIRealtimeModel::GptRealtime
         );
     }
