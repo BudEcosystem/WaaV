@@ -22,6 +22,7 @@ pub mod debug_profile;
 pub mod endpoint_settings;
 pub mod livekit;
 pub mod openai_audio;
+pub mod openai_realtime;
 pub mod realtime;
 pub mod recording;
 pub mod sip;

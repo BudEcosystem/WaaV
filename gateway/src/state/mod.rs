@@ -72,6 +72,9 @@ pub struct AppState {
     /// `GET /transcribe/batch/{job_id}` can return them. In-process (single-node); a multi-node
     /// deployment would back this with a shared store.
     pub batch_jobs: Arc<DashMap<String, crate::core::stt::batch::BatchJob>>,
+
+    /// FRD-023: `/v1/realtime` session timings and the `ek_bud_` sealing keys.
+    pub realtime: Arc<crate::handlers::openai_realtime::RealtimeRuntime>,
 }
 
 impl AppState {
@@ -441,6 +444,10 @@ impl AppState {
             None
         };
 
+        // FRD-023: a bad WAAV_CLIENT_SECRET_KEYS must stop the pod (TC-EK-16), not leave a gateway
+        // whose client secrets silently never open.
+        let realtime = Arc::new(crate::handlers::openai_realtime::RealtimeRuntime::from_env()?);
+
         Ok(Arc::new(Self {
             // Installed after construction by main(), once the control-plane connection is up:
             // AppState::try_new runs before the Redis URL is known.
@@ -457,6 +464,7 @@ impl AppState {
             connections_per_ip: Arc::new(DashMap::new()),
             shutdown: CancellationToken::new(),
             batch_jobs: Arc::new(DashMap::new()),
+            realtime,
         }))
     }
 

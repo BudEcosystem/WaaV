@@ -822,7 +822,10 @@ mod realtime_reach_tests {
         r#"{"rt":{"endpoint_id":"ep-rt","project_id":"p1","model_id":"m1"},"__metadata__":{"api_key_id":"ak1","user_id":"u1","api_key_project_id":"p1"}}"#.to_string()
     }
 
-    async fn plane_with(keys: &[(&str, String)], jwt: Option<Arc<JwtVerifier>>) -> (Arc<MemoryStore>, BudPlane) {
+    async fn plane_with(
+        keys: &[(&str, String)],
+        jwt: Option<Arc<JwtVerifier>>,
+    ) -> (Arc<MemoryStore>, BudPlane) {
         let store = Arc::new(MemoryStore::new());
         for (k, v) in keys {
             store.set(k, v);
@@ -856,7 +859,9 @@ mod realtime_reach_tests {
         let key = format!("api_key:{hashed}");
         let (store, plane) = plane_with(&[(&key, key_blob())], None).await;
 
-        let entry = plane.hash_reaches(&hashed, "ep-rt", false).expect("reaches");
+        let entry = plane
+            .hash_reaches(&hashed, "ep-rt", false)
+            .expect("reaches");
         assert_eq!(entry.project_id.as_deref(), Some("p1"));
         assert!(plane.hash_reaches(&hashed, "ep-other", false).is_none());
 
@@ -873,7 +878,10 @@ mod realtime_reach_tests {
         let hashed = hash_api_key("bud_client_x");
         let (_s, plane) = plane_with(
             &[
-                (&format!("api_key:{hashed}"), r#"{"__metadata__":{"api_key_id":"ak"}}"#.to_string()),
+                (
+                    &format!("api_key:{hashed}"),
+                    r#"{"__metadata__":{"api_key_id":"ak"}}"#.to_string(),
+                ),
                 (
                     crate::hydrate::PUBLISHED_MODEL_INFO_KEY,
                     r#"{"pub-rt":{"endpoint_id":"ep-pub","project_id":"p9"}}"#.to_string(),
@@ -891,14 +899,23 @@ mod realtime_reach_tests {
         let jwt = verifier();
         let (store, plane) = plane_with(
             &[
-                ("user_projects:sub-1", r#"{"user_id":"u1","projects":["p1"]}"#.to_string()),
-                ("project_models:p1", r#"{"rt":{"endpoint_id":"ep-rt","project_id":"p1"}}"#.to_string()),
+                (
+                    "user_projects:sub-1",
+                    r#"{"user_id":"u1","projects":["p1"]}"#.to_string(),
+                ),
+                (
+                    "project_models:p1",
+                    r#"{"rt":{"endpoint_id":"ep-rt","project_id":"p1"}}"#.to_string(),
+                ),
             ],
             Some(Arc::clone(&jwt)),
         )
         .await;
         assert!(plane.subject_reaches("sub-1", "ep-rt").await.is_some());
-        assert!(jwt.cached_authz("sub-1").is_some(), "the resolution is cached");
+        assert!(
+            jwt.cached_authz("sub-1").is_some(),
+            "the resolution is cached"
+        );
 
         // The user is removed from the project.
         store.set("user_projects:sub-1", r#"{"user_id":"u1","projects":[]}"#);
@@ -918,8 +935,14 @@ mod realtime_reach_tests {
         let jwt = verifier();
         let (store, plane) = plane_with(
             &[
-                ("user_projects:sub-1", r#"{"user_id":"u1","projects":["p1"]}"#.to_string()),
-                ("project_models:p1", r#"{"rt":{"endpoint_id":"ep-rt","project_id":"p1"}}"#.to_string()),
+                (
+                    "user_projects:sub-1",
+                    r#"{"user_id":"u1","projects":["p1"]}"#.to_string(),
+                ),
+                (
+                    "project_models:p1",
+                    r#"{"rt":{"endpoint_id":"ep-rt","project_id":"p1"}}"#.to_string(),
+                ),
             ],
             Some(Arc::clone(&jwt)),
         )

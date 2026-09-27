@@ -176,6 +176,8 @@ jsonwebtoken = { version = "10.2.0", features = ["rust_crypto"] }
 tokio-tungstenite = { version = "0.28.0", features = ["rustls-tls-webpki-roots"] }
 url = "2.5.0"
 base64 = "0.22.0"
+# FRD-023 §5.8: sealed ek_bud_ client secrets (XChaCha20-Poly1305).
+chacha20poly1305 = "0.10"
 http = "1.0"
 
 # TLS support

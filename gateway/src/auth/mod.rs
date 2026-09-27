@@ -2,6 +2,7 @@ pub mod api_secret;
 pub mod bud_mode;
 pub mod client;
 pub mod context;
+pub mod ephemeral;
 pub mod jwt;
 
 // Re-export commonly used items

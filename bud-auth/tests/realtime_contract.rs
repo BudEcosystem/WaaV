@@ -32,8 +32,14 @@ fn the_realtime_block_round_trips() {
 
     let d = rt.defaults.as_ref().expect("defaults");
     assert_eq!(d.voice.as_deref(), Some("marin"));
-    assert_eq!(d.instructions.as_deref(), Some("You are a helpful assistant."));
-    assert_eq!(d.output_modalities.as_deref(), Some(&["audio".to_string()][..]));
+    assert_eq!(
+        d.instructions.as_deref(),
+        Some("You are a helpful assistant.")
+    );
+    assert_eq!(
+        d.output_modalities.as_deref(),
+        Some(&["audio".to_string()][..])
+    );
     assert_eq!(
         d.turn_detection,
         Some(serde_json::json!({"type": "semantic_vad", "eagerness": "auto"}))
@@ -101,8 +107,14 @@ fn a_malformed_field_inside_realtime_drops_only_that_field() {
     let ep = parse(&blob);
     let rt = ep.config.realtime.expect("block kept");
     assert_eq!(rt.session_type.as_deref(), Some("realtime"));
-    assert!(rt.defaults.is_none(), "the malformed defaults block is dropped");
-    assert!(rt.policy.unwrap().allows_mcp_tools(), "the good sibling survives");
+    assert!(
+        rt.defaults.is_none(),
+        "the malformed defaults block is dropped"
+    );
+    assert!(
+        rt.policy.unwrap().allows_mcp_tools(),
+        "the good sibling survives"
+    );
 }
 
 #[test]
@@ -129,7 +141,11 @@ fn unknown_rate_keys_are_ignored_not_fatal() {
     .to_string();
     let pricing = parse(&blob).pricing.expect("usable");
     assert_eq!(pricing.rates.get("input_video"), None);
-    assert_eq!(pricing.rates.get("output_text"), Some(&24.0), "numeric strings are numbers");
+    assert_eq!(
+        pricing.rates.get("output_text"),
+        Some(&24.0),
+        "numeric strings are numbers"
+    );
     assert_eq!(pricing.rates.len(), 3);
 }
 
@@ -165,10 +181,16 @@ fn absent_policy_fields_take_the_secure_defaults() {
     .to_string();
     let policy = parse(&blob).config.realtime.expect("block").policy();
     assert!(!policy.allows_mcp_tools(), "MCP tools reach the vendor org");
-    assert!(!policy.allows_prompt_references(), "stored prompts belong to the vendor org");
+    assert!(
+        !policy.allows_prompt_references(),
+        "stored prompts belong to the vendor org"
+    );
     assert!(policy.allows_client_instructions());
     assert!(policy.allows_image_input());
-    assert!(policy.allows_transcription_model("anything"), "no allowlist = any model");
+    assert!(
+        policy.allows_transcription_model("anything"),
+        "no allowlist = any model"
+    );
 
     let none = bud_auth::RealtimePolicy::default();
     assert!(!none.allows_mcp_tools() && !none.allows_prompt_references());

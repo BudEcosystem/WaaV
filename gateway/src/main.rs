@@ -296,6 +296,14 @@ async fn main() -> anyhow::Result<()> {
             connection_limit_middleware,
         ));
 
+    // FRD-023: `/v1/realtime` (OpenAI Realtime GA on Bud deployments) and the client-secret mint.
+    // No auth_middleware: the handlers authenticate themselves (subprotocol and `api-key`
+    // credentials, `ek_bud_` secrets, `?token=` refused). The connection limit still applies, so
+    // every session holds a slot (FRD-022).
+    let openai_realtime_routes = routes::openai_realtime::create_openai_realtime_router().layer(
+        middleware::from_fn_with_state(app_state.clone(), connection_limit_middleware),
+    );
+
     // Live latency-profile debug surface (`WAAV_DEBUG_PROFILE=1`): JSON snapshot
     // + per-turn SSE. Auth-gated exactly like the protected API; without the env
     // flag the routes are not mounted at all (double lock, never public).
@@ -475,6 +483,7 @@ async fn main() -> anyhow::Result<()> {
         .merge(protected_routes)
         .merge(ws_routes)
         .merge(realtime_routes)
+        .merge(openai_realtime_routes)
         .merge(debug_profile_routes)
         .with_state(app_state.clone())
         .layer(tower::util::option_layer(governor_layer));

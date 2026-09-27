@@ -64,6 +64,7 @@ mod tests {
             cost_per_unit,
             currency: Some("USD".to_string()),
             per_units,
+            rates: Default::default(),
         }
     }
 

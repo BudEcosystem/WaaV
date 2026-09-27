@@ -1,40 +1,48 @@
 {
-  "_comment": "Span attributes VoiceTurnFact reads. WaaV EMITS these; budmetrics READS them. Neither repo can see the other at build time, so both assert against this file. A name changed on one side only is invisible: the column simply stays NULL, which looks exactly like a feature nobody uses.",
-  "_generated_from": "services/budmetrics/budmetrics/observability/voice_turn_fact_ddl.py",
+  "_comment": "Span attributes VoiceTurnFact (roles turn, leg: voice.turn) and VoiceSessionFact (role session: voice.session) read. WaaV EMITS these; budmetrics READS them. Neither repo can see the other at build time, so both assert against this file. A name changed on one side only is invisible: the column simply stays NULL, which looks exactly like a feature nobody uses.",
+  "_generated_from": [
+    "services/budmetrics/budmetrics/observability/voice_turn_fact_ddl.py",
+    "services/budmetrics/budmetrics/observability/voice_session_fact_ddl.py"
+  ],
   "attributes": [
     {
       "column": "api_key_id",
       "attribute": "bud.api_key_id",
       "roles": [
-        "turn"
+        "turn",
+        "session"
       ]
     },
     {
       "column": "api_key_project_id",
       "attribute": "bud.api_key_project_id",
       "roles": [
-        "turn"
+        "turn",
+        "session"
       ]
     },
     {
       "column": "endpoint_id",
       "attribute": "bud.endpoint_id",
       "roles": [
-        "turn"
+        "turn",
+        "session"
       ]
     },
     {
       "column": "model_id",
       "attribute": "bud.model_id",
       "roles": [
-        "turn"
+        "turn",
+        "session"
       ]
     },
     {
       "column": "project_id",
       "attribute": "bud.project_id",
       "roles": [
-        "turn"
+        "turn",
+        "session"
       ]
     },
     {
@@ -48,7 +56,8 @@
       "column": "user_id",
       "attribute": "bud.user_id",
       "roles": [
-        "turn"
+        "turn",
+        "session"
       ]
     },
     {
@@ -73,10 +82,19 @@
       ]
     },
     {
+      "column": "billed_seconds",
+      "attribute": "bud.voice.billed_seconds",
+      "roles": [
+        "turn",
+        "session"
+      ]
+    },
+    {
       "column": "capability",
       "attribute": "bud.voice.capability",
       "roles": [
-        "turn"
+        "turn",
+        "session"
       ]
     },
     {
@@ -90,7 +108,8 @@
       "column": "cost",
       "attribute": "bud.voice.cost",
       "roles": [
-        "turn"
+        "turn",
+        "session"
       ]
     },
     {
@@ -104,7 +123,8 @@
       "column": "endpoint_name",
       "attribute": "bud.voice.endpoint_name",
       "roles": [
-        "turn"
+        "turn",
+        "session"
       ]
     },
     {
@@ -153,7 +173,8 @@
       "column": "pricing_unit",
       "attribute": "bud.voice.pricing_unit",
       "roles": [
-        "turn"
+        "turn",
+        "session"
       ]
     },
     {
@@ -171,6 +192,126 @@
       ]
     },
     {
+      "column": "cached_audio_tokens",
+      "attribute": "bud.voice.rt.cached_audio_tokens",
+      "roles": [
+        "turn",
+        "session"
+      ]
+    },
+    {
+      "column": "cached_image_tokens",
+      "attribute": "bud.voice.rt.cached_image_tokens",
+      "roles": [
+        "turn",
+        "session"
+      ]
+    },
+    {
+      "column": "cached_text_tokens",
+      "attribute": "bud.voice.rt.cached_text_tokens",
+      "roles": [
+        "turn",
+        "session"
+      ]
+    },
+    {
+      "column": "rt_component",
+      "attribute": "bud.voice.rt.component",
+      "roles": [
+        "turn"
+      ]
+    },
+    {
+      "column": "input_audio_tokens",
+      "attribute": "bud.voice.rt.input_audio_tokens",
+      "roles": [
+        "turn",
+        "session"
+      ]
+    },
+    {
+      "column": "input_image_tokens",
+      "attribute": "bud.voice.rt.input_image_tokens",
+      "roles": [
+        "turn",
+        "session"
+      ]
+    },
+    {
+      "column": "input_text_tokens",
+      "attribute": "bud.voice.rt.input_text_tokens",
+      "roles": [
+        "turn",
+        "session"
+      ]
+    },
+    {
+      "column": "model",
+      "attribute": "bud.voice.rt.model",
+      "roles": [
+        "session"
+      ]
+    },
+    {
+      "column": "rt_model",
+      "attribute": "bud.voice.rt.model",
+      "roles": [
+        "turn"
+      ]
+    },
+    {
+      "column": "output_audio_tokens",
+      "attribute": "bud.voice.rt.output_audio_tokens",
+      "roles": [
+        "turn",
+        "session"
+      ]
+    },
+    {
+      "column": "output_text_tokens",
+      "attribute": "bud.voice.rt.output_text_tokens",
+      "roles": [
+        "turn",
+        "session"
+      ]
+    },
+    {
+      "column": "response_id",
+      "attribute": "bud.voice.rt.response_id",
+      "roles": [
+        "turn"
+      ]
+    },
+    {
+      "column": "response_status",
+      "attribute": "bud.voice.rt.response_status",
+      "roles": [
+        "turn"
+      ]
+    },
+    {
+      "column": "session_type",
+      "attribute": "bud.voice.rt.session_type",
+      "roles": [
+        "session"
+      ]
+    },
+    {
+      "column": "rt_vendor",
+      "attribute": "bud.voice.rt.vendor",
+      "roles": [
+        "turn"
+      ]
+    },
+    {
+      "column": "vendor",
+      "attribute": "bud.voice.rt.vendor",
+      "roles": [
+        "session"
+      ]
+    },
+    {
       "column": "sample_rate",
       "attribute": "bud.voice.sample_rate",
       "roles": [
@@ -185,10 +326,39 @@
       ]
     },
     {
+      "column": "close_code",
+      "attribute": "bud.voice.session.close_code",
+      "roles": [
+        "session"
+      ]
+    },
+    {
+      "column": "duration_ms",
+      "attribute": "bud.voice.session.duration_ms",
+      "roles": [
+        "session"
+      ]
+    },
+    {
+      "column": "end_reason",
+      "attribute": "bud.voice.session.end_reason",
+      "roles": [
+        "session"
+      ]
+    },
+    {
+      "column": "turns",
+      "attribute": "bud.voice.session.turns",
+      "roles": [
+        "session"
+      ]
+    },
+    {
       "column": "session_id",
       "attribute": "bud.voice.session_id",
       "roles": [
-        "turn"
+        "turn",
+        "session"
       ]
     },
     {
@@ -251,7 +421,8 @@
       "column": "transport",
       "attribute": "bud.voice.transport",
       "roles": [
-        "turn"
+        "turn",
+        "session"
       ]
     },
     {
@@ -304,10 +475,25 @@
       ]
     },
     {
+      "column": "unpriced_components",
+      "attribute": "bud.voice.unpriced_components",
+      "roles": [
+        "turn"
+      ]
+    },
+    {
       "column": "vendor_request_id",
       "attribute": "bud.voice.vendor_request_id",
       "roles": [
         "turn"
+      ]
+    },
+    {
+      "column": "vendor_session_id",
+      "attribute": "bud.voice.vendor_session_id",
+      "roles": [
+        "turn",
+        "session"
       ]
     },
     {
