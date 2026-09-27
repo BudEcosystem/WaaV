@@ -213,7 +213,7 @@ pub fn resample_pcm16(
     in_rate: u32,
     out_rate: u32,
 ) -> Option<Vec<u8>> {
-    if pcm.len() % 2 != 0 {
+    if !pcm.len().is_multiple_of(2) {
         warn!(
             bytes = pcm.len(),
             "malformed PCM16 egress chunk length; dropping chunk instead of truncating a partial sample"
@@ -225,8 +225,10 @@ pub fn resample_pcm16(
         return None;
     }
     let samples: Vec<f32> = pcm
-        .chunks_exact(2)
-        .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|b| i16::from_le_bytes(*b) as f32 / 32768.0)
         .collect();
     let out = r.resample(&samples, in_rate, out_rate)?;
     let mut bytes = Vec::with_capacity(out.len() * 2);

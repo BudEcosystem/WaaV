@@ -13,11 +13,17 @@ extend-exclude = [
   "**/node_modules/**",
   "**/target/**",
   "**/*.min.js",
+  "inferv2/REVIEW/*.json",       # agent-run transcripts (truncated tool output), not prose
 ]
 
 [default]
-# Don't try to correct inside base64/hex blobs and long identifiers.
-locale = "en-us"
+locale = "en"   # the codebase writes British English; accept both
+# Don't try to correct inside base64/hex blobs: PEM bodies and keys in tests, commit shas and
+# agent/workflow ids in notes.
+extend-ignore-re = [
+  "[A-Za-z0-9+/]{40,}={0,2}",
+  "\\b[0-9a-f]*[0-9][0-9a-f]*[a-f][0-9a-f]*\\b",
+]
 
 [default.extend-words]
 # Domain terms that look like typos but are intentional.
@@ -28,6 +34,61 @@ mut = "mut"
 crate = "crate"
 WaaV = "WaaV"
 waav = "waav"
+# Acronyms and domain abbreviations.
+fpt = "fpt"          # FPT.AI, a Vietnamese speech provider
+ane = "ane"          # Apple Neural Engine
+cann = "cann"        # Huawei CANN (Ascend NPU runtime)
+dbe = "dbe"          # GPU double-bit ECC error
+rto = "rto"          # retransmission timeout
+nin = "nin"          # network-in-network
+iit = "iit"          # IIT Madras (AI4Bharat)
+ist = "ist"          # iFlytek real-time (IST) mode
+onn = "onn"          # ONNX split by a line break in tables
+ake = "ake"          # redis notify-keyspace-events flags
+arange = "arange"    # numpy / torch
+strat = "strat"      # local variable for a strategy
+thr = "thr"          # threshold in formulas
+mis = "mis"          # mis- prefix (mis-routed, mis-detected)
+formant = "formant"  # acoustic resonance
+lasr = "lasr"        # Google lasr_ctc architecture
+criticals = "criticals"
+datas = "datas"
+# Language codes (ISO 639), phonemes and non-English voice names.
+ba = "ba"
+fo = "fo"
+tha = "tha"
+fre = "fre"
+iy = "iy"
+nam = "nam"
+giong = "giong"
+tung = "tung"
+# Correct spellings typos does not know.
+unparseable = "unparseable"
+uncatalogued = "uncatalogued"
+empted = "empted"    # pre-empted
+ded = "ded"          # ANDed
+alls = "alls"        # "fail-alls"
+correc = "correc"    # CORREC**T**ness
+# Deliberate misspellings the tests feed to the code (a typo'd key or value must be rejected),
+# and partial words a streaming test sends one delta at a time ("Hel" + "lo", "<thi" + "nk>").
+stabilty = "stabilty"
+minimial = "minimial"
+provder = "provder"
+helo = "helo"
+tru = "tru"
+abd = "abd"
+hel = "hel"
+thi = "thi"
+# Short variable names, ids and UI labels.
+pn = "pn"            # promptName
+ue = "ue"            # inside an ElevenLabs voice id
+whth = "whth"        # a workflow id
+rovider = "rovider"  # the "[P]rovider" hotkey label
+propert = "propert"  # propert{y,ies} pluralised in an f-string
+symbl = "symbl"      # Symbl.ai, in prose
+# Table cells cut off in the source notes.
+ful = "ful"
+transfor = "transfor"
 
 [default.extend-identifiers]
 # Provider / vendor / library identifiers that are not English words.
@@ -54,3 +115,7 @@ realfft = "realfft"
 rubato = "rubato"
 silero = "silero"
 Silero = "Silero"
+Speaches = "Speaches"   # speaches-ai/speaches, an OpenAI-compatible speech server
+symbl = "symbl"         # Symbl.ai
+signall = "signall"     # signall.us
+cristal = "cristal"     # a gradient-string preset

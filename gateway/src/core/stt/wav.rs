@@ -48,7 +48,7 @@ pub(crate) fn create_pcm_wav_header(
     if bits_per_sample == 0 {
         return Err(WavBuildError::ZeroBitsPerSample);
     }
-    if bits_per_sample % 8 != 0 {
+    if !bits_per_sample.is_multiple_of(8) {
         return Err(WavBuildError::InvalidBitsPerSample(bits_per_sample));
     }
 

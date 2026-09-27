@@ -1418,8 +1418,10 @@ async fn apply_noise_suppression(
                 // An odd length would mean a truncated final sample, so the chunk size is
                 // asserted by construction rather than assumed.
                 let samples: Vec<i16> = processed
-                    .chunks_exact(2)
-                    .map(|c| i16::from_le_bytes([c[0], c[1]]))
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|c| i16::from_le_bytes(*c))
                     .collect();
                 turn_span.record(NOISE_SUPPRESSION_ATTR, true);
                 info!(

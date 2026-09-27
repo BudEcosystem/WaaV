@@ -34,7 +34,7 @@ pub const DEFAULT_ASYNC_OBSERVER_QUEUE: usize = 256;
 
 /// One observable event, owned (queueable).
 enum ObserverEvent {
-    SttResult(STTResult, u64),
+    SttResult(Box<STTResult>, u64),
     TtsChunk(AudioData, Option<u64>),
     TtsComplete(u64),
     ConnectionStateChange {
@@ -150,7 +150,10 @@ fn dispatch(observer: &dyn VoiceObserver, event: ObserverEvent) {
 
 impl VoiceObserver for AsyncObserver {
     fn on_stt_result(&self, result: &STTResult, latency_ns: u64) {
-        self.enqueue(ObserverEvent::SttResult(result.clone(), latency_ns));
+        self.enqueue(ObserverEvent::SttResult(
+            Box::new(result.clone()),
+            latency_ns,
+        ));
     }
     fn on_tts_chunk(&self, chunk: &AudioData, ttfb_ns: Option<u64>) {
         self.enqueue(ObserverEvent::TtsChunk(chunk.clone(), ttfb_ns));

@@ -1,0 +1,17 @@
+# cargo audit's ignore list. It must match [advisories].ignore in ../../deny.toml, where
+# every entry carries its justification.
+[advisories]
+ignore = [
+  "RUSTSEC-2023-0071",
+  "RUSTSEC-2026-0258",
+  "RUSTSEC-2026-0049",
+  "RUSTSEC-2026-0098",
+  "RUSTSEC-2026-0099",
+  "RUSTSEC-2026-0104",
+  "RUSTSEC-2026-0217",
+  "RUSTSEC-2026-0150",
+  "RUSTSEC-2024-0014",
+  "RUSTSEC-2024-0436",
+  "RUSTSEC-2025-0134",
+  "RUSTSEC-2026-0249",
+]

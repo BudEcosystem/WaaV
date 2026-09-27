@@ -1,3 +1,16 @@
+// Tests that mutate process env vars serialise on `core::net::test_env_lock`, a process-wide
+// std Mutex, and hold it across the whole test body, awaits included: releasing it at an await
+// would let another test observe a half-set env. Each #[tokio::test] runs its own runtime on its
+// own thread, so a blocked lock() stalls only that thread and cannot deadlock the task holding
+// the guard, which is the hazard this lint guards against. Test builds only.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::await_holding_lock,
+        reason = "test env lock is deliberately held across awaits; see comment"
+    )
+)]
+
 pub mod auth;
 pub mod config;
 pub mod core;

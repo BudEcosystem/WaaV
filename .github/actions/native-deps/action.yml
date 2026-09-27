@@ -1,0 +1,24 @@
+name: native build deps
+description: >-
+  The system libraries and compiler the builder stage of gateway/Dockerfile installs. livekit's
+  webrtc-sys panics in its build script without the libva headers, so every job that compiles
+  the gateway needs this. Keep the package list and env in step with gateway/Dockerfile.
+runs:
+  using: composite
+  steps:
+    - name: install native build deps
+      shell: bash
+      run: |
+        sudo apt-get update -o Acquire::Retries=5
+        sudo apt-get install -y --no-install-recommends -o Acquire::Retries=5 \
+          clang cmake pkg-config libssl-dev libzstd-dev \
+          libva-dev libdrm-dev libglib2.0-dev libgbm-dev \
+          libx11-dev libxext-dev libxrandr-dev libxcomposite-dev libxdamage-dev libxfixes-dev
+        # webrtc-sys enables the NVIDIA codec when <CUDA_HOME>/include/cuda.h exists; the
+        # workflow points CUDA_HOME here, at a directory with no cuda.h.
+        mkdir -p /tmp/nocuda
+        {
+          echo "CC=clang"
+          echo "CXX=clang++"
+          echo "ZSTD_SYS_USE_PKG_CONFIG=1"
+        } >> "$GITHUB_ENV"

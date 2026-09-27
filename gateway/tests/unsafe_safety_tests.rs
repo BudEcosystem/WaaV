@@ -96,8 +96,10 @@ fn convert_bytes_to_i16_safe(audio_data: &[u8]) -> Vec<i16> {
 
     // Unaligned, or big-endian host: endian-explicit decode.
     audio_data
-        .chunks_exact(2)
-        .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|chunk| i16::from_le_bytes(*chunk))
         .collect()
 }
 
@@ -105,8 +107,10 @@ fn convert_bytes_to_i16_safe(audio_data: &[u8]) -> Vec<i16> {
 /// Used as the oracle the production fast path must match bit-for-bit.
 fn convert_bytes_to_i16_le_reference(audio_data: &[u8]) -> Vec<i16> {
     audio_data
-        .chunks_exact(2)
-        .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|chunk| i16::from_le_bytes(*chunk))
         .collect()
 }
 

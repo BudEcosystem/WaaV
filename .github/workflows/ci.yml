@@ -64,8 +64,7 @@ jobs:
         with: { components: clippy }
       - uses: Swatinem/rust-cache@v2
         with: { workspaces: gateway }
-      - name: prepare nocuda dir
-        run: mkdir -p /tmp/nocuda
+      - uses: ./.github/actions/native-deps
       - run: cargo clippy --all-targets --features ${{ env.PROD_FEATURES }} -- -D warnings
 
   build-and-unit:
@@ -84,9 +83,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-        with: { workspaces: gateway, key: "${{ matrix.features }}" }
-      - name: prepare nocuda dir
-        run: mkdir -p /tmp/nocuda
+        # rust-cache keys may not contain commas, and one matrix entry has three.
+        with: { workspaces: gateway, key: "features-${{ strategy.job-index }}" }
+      - uses: ./.github/actions/native-deps
+      # core::onnx's unit tests load the runtime whatever the feature set.
+      - uses: ./.github/actions/onnxruntime
       - name: check
         run: cargo check ${{ matrix.features && format('--features {0}', matrix.features) || '' }}
       - name: unit tests
@@ -184,15 +185,10 @@ jobs:
         with: { components: llvm-tools-preview }
       - uses: Swatinem/rust-cache@v2
         with: { workspaces: gateway, key: coverage }
+      - uses: ./.github/actions/native-deps
       - name: install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
-      - name: provision ONNX Runtime (load-dynamic; BUILD.md Gotcha 6)
-        run: |
-          mkdir -p /tmp/nocuda
-          curl -fsSL -o /tmp/ort.tgz \
-            "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-${ORT_VERSION}.tgz"
-          tar -xzf /tmp/ort.tgz -C /tmp
-          echo "ORT_DYLIB_PATH=/tmp/onnxruntime-linux-x64-${ORT_VERSION}/lib/libonnxruntime.so" >> "$GITHUB_ENV"
+      - uses: ./.github/actions/onnxruntime
       - name: cargo llvm-cov (lib, production features)
         # Excludes #[ignore]/live_* by construction (no --ignored, lib targets only).
         run: |
@@ -231,8 +227,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with: { workspaces: gateway, key: openapi }
-      - name: prepare nocuda dir
-        run: mkdir -p /tmp/nocuda
+      - uses: ./.github/actions/native-deps
       - name: drift test (in-memory regen == committed docs/openapi.yaml)
         run: cargo test --features openapi --test openapi_drift -- --nocapture
       - name: re-export via CLI and assert the committed artifact is unchanged
@@ -258,18 +253,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with: { workspaces: gateway, key: accuracy }
+      - uses: ./.github/actions/native-deps
       - name: cache ONNX models
         uses: actions/cache@v4
         with:
           path: ~/.cache/waav
           key: waav-models-v1
-      - name: provision ONNX Runtime (load-dynamic; BUILD.md Gotcha 6)
-        run: |
-          mkdir -p /tmp/nocuda
-          curl -fsSL -o /tmp/ort.tgz \
-            "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-${ORT_VERSION}.tgz"
-          tar -xzf /tmp/ort.tgz -C /tmp
-          echo "ORT_DYLIB_PATH=/tmp/onnxruntime-linux-x64-${ORT_VERSION}/lib/libonnxruntime.so" >> "$GITHUB_ENV"
+      - uses: ./.github/actions/onnxruntime
       - name: provision turn-detect model
         run: CACHE_PATH="$HOME/.cache/waav" cargo run --features turn-detect -- init || true
       # The accuracy tests now assert precision/recall/F1 + latency thresholds internally
@@ -286,8 +276,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with: { workspaces: gateway }
-      - name: prepare nocuda dir
-        run: mkdir -p /tmp/nocuda
+      - uses: ./.github/actions/native-deps
       # These exercise the gateway end-to-end against the in-repo mock providers
       # (tests/mock_providers) — protocol-level coverage for all providers without paid keys.
       - run: cargo test --features dag-routing --test e2e_mock_tests --test load_test_with_mocks --test server_startup --test ws_tests --test keystone_wire --test provider_keystone_completeness
@@ -300,8 +289,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with: { workspaces: gateway }
-      - name: prepare nocuda dir
-        run: mkdir -p /tmp/nocuda
+      - uses: ./.github/actions/native-deps
       - run: cargo build --release
       - name: boot and probe liveness/readiness/metrics
         run: |
@@ -321,21 +309,32 @@ jobs:
           curl -fsS http://localhost:3001/metrics | grep -q 'waav_provider' || { echo "metrics missing waav_provider series"; kill $PID 2>/dev/null; exit 1; }
           echo "healthy"; kill $PID 2>/dev/null; exit 0
 
-  cross-compile-musl:
-    name: cross-compile (musl, rustls)
+  # ---------------------------------------------------------------------------------------
+  # no-openssl: the README's "rustls, no OpenSSL dependency". This was a musl cross-compile
+  # check, but the gateway links livekit's libwebrtc (a glibc C++ prebuilt), so it has never
+  # built for musl. Asserts on the RUNTIME graph (-e normal), for every feature: ort-sys pulls
+  # native-tls in as a BUILD dependency to download ONNX Runtime, which ships in no binary.
+  # ---------------------------------------------------------------------------------------
+  no-openssl:
+    name: no OpenSSL at runtime (rustls only)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with: { targets: x86_64-unknown-linux-musl }
-      - run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - uses: Swatinem/rust-cache@v2
-        with: { workspaces: gateway }
-      - name: prepare nocuda dir
-        run: mkdir -p /tmp/nocuda
-      # Validates the rustls/no-OpenSSL cross-compilation claim (README). turn/noise features
-      # are excluded here because their native ONNX/tract deps complicate musl static linking.
-      - run: cargo check --target x86_64-unknown-linux-musl --features dag-routing
+      - name: no openssl / native-tls crate in the runtime dependency graph
+        run: |
+          set -euo pipefail
+          for features in "--all-features" "--no-default-features"; do
+            found=$(cargo tree --locked $features -e normal --prefix none --format '{p}' \
+              | grep -E '^(openssl|openssl-sys|native-tls) ' | sort -u || true)
+            if [ -n "$found" ]; then
+              echo "::error::OpenSSL reached the runtime graph ($features):"
+              echo "$found"
+              cargo tree --locked $features -e normal -i openssl-sys || true
+              exit 1
+            fi
+          done
+          echo "runtime graph is rustls-only"
 
   real-provider-e2e:
     name: real-provider e2e (SECRET-GATED)
@@ -354,8 +353,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with: { workspaces: gateway }
-      - name: prepare nocuda dir
-        run: mkdir -p /tmp/nocuda
+      - uses: ./.github/actions/native-deps
       - name: run #[ignore]d real-provider tests for providers whose secret is present
         run: cargo test --release --test real_provider_tests -- --ignored --test-threads=1
 
@@ -363,13 +361,17 @@ jobs:
   # required: single aggregate context for branch protection. It fails if ANY gating job
   # failed or was skipped (e.g. a cancelled supply-chain), so requiring this one context in
   # branch protection makes fmt/clippy/build-matrix/supply-chain/coverage/openapi-drift/
-  # accuracy-enforced/integration/server-smoke/cross-compile all effectively required.
+  # accuracy-enforced/integration/server-smoke/no-openssl all effectively required.
   # real-provider-e2e is intentionally NOT required (secret-gated, skipped on PRs).
   # ---------------------------------------------------------------------------------------
   required:
     name: required (merge gate)
     runs-on: ubuntu-latest
     if: always()
+    # No checkout here, so the workflow-wide `working-directory: gateway` does not exist.
+    defaults:
+      run:
+        working-directory: .
     needs:
       - fmt
       - clippy
@@ -380,11 +382,13 @@ jobs:
       - accuracy-enforced
       - integration-mock
       - server-smoke
-      - cross-compile-musl
+      - no-openssl
     steps:
       - name: assert all required jobs succeeded
+        env:
+          RESULTS: ${{ join(needs.*.result, ',') }}
         run: |
-          results='${{ join(needs.*.result, ",") }}'
+          results="$RESULTS"
           echo "required job results: $results"
           IFS=',' read -ra arr <<< "$results"
           for r in "${arr[@]}"; do

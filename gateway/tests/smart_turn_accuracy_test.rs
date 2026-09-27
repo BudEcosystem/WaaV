@@ -110,9 +110,11 @@ fn read_wav_16k_mono(path: &Path) -> Result<Vec<f32>> {
             // Convert to f32 samples
             let samples: Vec<f32> = if bits_per_sample == 16 {
                 audio_data
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|chunk| {
-                        let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
+                        let sample = i16::from_le_bytes(*chunk);
                         sample as f32 / 32768.0
                     })
                     .collect()
@@ -128,8 +130,10 @@ fn read_wav_16k_mono(path: &Path) -> Result<Vec<f32>> {
             // Convert to mono if stereo
             let mono_samples: Vec<f32> = if num_channels == 2 {
                 samples
-                    .chunks_exact(2)
-                    .map(|c| (c[0] + c[1]) / 2.0)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|[l, r]| (l + r) / 2.0)
                     .collect()
             } else {
                 samples

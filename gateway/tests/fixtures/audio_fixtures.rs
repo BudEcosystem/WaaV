@@ -232,8 +232,10 @@ pub fn samples_to_bytes(samples: &[i16]) -> Vec<u8> {
 /// Convert bytes to i16 samples
 pub fn bytes_to_samples(bytes: &[u8]) -> Vec<i16> {
     bytes
-        .chunks_exact(2)
-        .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|chunk| i16::from_le_bytes(*chunk))
         .collect()
 }
 

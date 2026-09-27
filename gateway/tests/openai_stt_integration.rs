@@ -9,6 +9,14 @@
 //! Note: Tests requiring actual API calls are marked with #[ignore]
 //! and require OPENAI_API_KEY environment variable.
 
+// `openai_base_url_env_lock` serialises every test that sets OPENAI_BASE_URL and is held across
+// the test's awaits on purpose: each #[tokio::test] owns its runtime and thread, so a blocked
+// lock() stalls only that thread. The same reasoning as the lib's test env lock.
+#![allow(
+    clippy::await_holding_lock,
+    reason = "env lock deliberately held across awaits; see comment"
+)]
+
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;

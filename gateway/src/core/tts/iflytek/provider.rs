@@ -51,8 +51,6 @@ use crate::core::tts::base::{
 /// Provider information string.
 const PROVIDER_INFO: &str = "iFlytek TTS WebSocket v2.0 (科大讯飞)";
 
-/// WebSocket connection timeout.
-
 /// WebSocket message timeout.
 const WS_MESSAGE_TIMEOUT: Duration = Duration::from_secs(60);
 
