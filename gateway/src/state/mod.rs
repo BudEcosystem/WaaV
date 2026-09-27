@@ -534,6 +534,7 @@ impl AppState {
         if max_per_ip != 0 && current_ip >= max_per_ip as usize {
             // Rollback both counters
             ip_entry.fetch_sub(1, Ordering::Relaxed);
+            drop(ip_entry);
             self.active_ws_connections.fetch_sub(1, Ordering::Relaxed);
             tracing::warn!(
                 ip = %ip,
@@ -544,10 +545,15 @@ impl AppState {
             return Err(ConnectionLimitError::PerIpLimitReached);
         }
 
+        // The entry holds its DashMap shard's WRITE lock. It must be dropped before anything reads
+        // the map again: `ip_connection_count` takes the same shard's read lock, and the `debug!`
+        // below evaluates it only when DEBUG is enabled — so with debug logging on, the first
+        // WebSocket connection deadlocked its worker thread (found by FRD-023's relay tests).
+        drop(ip_entry);
         tracing::debug!(
             ip = %ip,
             total_connections = self.active_ws_connections.load(Ordering::Relaxed),
-            ip_connections = self.ip_connection_count(&ip),
+            ip_connections = current_ip + 1,
             "Connection acquired"
         );
         self.export_active_sessions();
@@ -916,5 +922,62 @@ mod tests {
         );
 
         cleanup_core_runtime_env();
+    }
+}
+
+#[cfg(test)]
+mod connection_slot_debug_tests {
+    //! A connection slot must be acquirable with DEBUG logging enabled (see `try_acquire_connection`).
+    use super::*;
+
+    struct DebugOn;
+    impl tracing::Subscriber for DebugOn {
+        fn register_callsite(
+            &self,
+            _m: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::always()
+        }
+        fn enabled(&self, _m: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _a: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _s: &tracing::span::Id, _v: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _s: &tracing::span::Id, _f: &tracing::span::Id) {}
+        fn event(&self, e: &tracing::Event<'_>) {
+            // Evaluate every field, as a real formatter does.
+            struct V;
+            impl tracing::field::Visit for V {
+                fn record_debug(&mut self, _f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                    let _ = format!("{v:?}");
+                }
+            }
+            e.record(&mut V);
+        }
+        fn enter(&self, _s: &tracing::span::Id) {}
+        fn exit(&self, _s: &tracing::span::Id) {}
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_slot_is_acquired_and_released_with_debug_logging_on() {
+        let state = AppState::new(crate::test_support::minimal_config()).await;
+        let ip: IpAddr = "10.1.2.3".parse().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = Arc::clone(&state);
+        std::thread::spawn(move || {
+            tracing::subscriber::with_default(DebugOn, || {
+                let acquired = worker.try_acquire_connection(ip).is_ok();
+                worker.release_connection(ip);
+                let _ = tx.send(acquired);
+            });
+        });
+        let acquired = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("try_acquire_connection deadlocked with DEBUG logging enabled");
+        assert!(acquired);
+        assert_eq!(state.ip_connection_count(&ip), 0);
     }
 }
