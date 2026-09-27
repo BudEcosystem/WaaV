@@ -383,8 +383,10 @@ jobs:
       - cross-compile-musl
     steps:
       - name: assert all required jobs succeeded
+        env:
+          RESULTS: ${{ join(needs.*.result, ',') }}
         run: |
-          results='${{ join(needs.*.result, ",") }}'
+          results="$RESULTS"
           echo "required job results: $results"
           IFS=',' read -ra arr <<< "$results"
           for r in "${arr[@]}"; do
