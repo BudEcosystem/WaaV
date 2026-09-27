@@ -71,6 +71,7 @@ pub async fn ws_voice_handler(
     Extension(auth): Extension<Auth>,
     client_ip: Option<Extension<ClientIp>>,
     slot: Option<Extension<ConnectionSlot>>,
+    credential: Option<Extension<crate::auth::SessionCredential>>,
 ) -> Response {
     info!(
         auth_id = ?auth.id,
@@ -83,6 +84,7 @@ pub async fn ws_voice_handler(
     // The connection slot rides into the session and is released when it ends; if the upgrade
     // never happens, the closure (and the slot) is dropped with it.
     let slot = slot.map(|Extension(s)| s);
+    let credential = credential.map(|Extension(c)| c);
 
     // Apply message size limits to prevent memory exhaustion attacks
     let response = ws
@@ -90,7 +92,7 @@ pub async fn ws_voice_handler(
         .max_message_size(MAX_WS_MESSAGE_SIZE)
         .on_upgrade(move |socket| {
             debug!("WebSocket upgrade callback triggered");
-            handle_voice_socket(socket, state, auth, ip, slot)
+            handle_voice_socket(socket, state, auth, ip, slot, credential)
         });
 
     debug!("WebSocket upgrade response created");
@@ -125,6 +127,7 @@ async fn handle_voice_socket(
     auth: Auth,
     client_ip: Option<IpAddr>,
     slot: Option<ConnectionSlot>,
+    credential: Option<crate::auth::SessionCredential>,
 ) {
     // Multi-tenant panic isolation (W-E1 / E6).
     //
@@ -140,8 +143,9 @@ async fn handle_voice_socket(
     // exposing a logically-torn invariant to another session.
     let _connection_slot = slot;
 
-    let session =
-        std::panic::AssertUnwindSafe(run_voice_socket_session(socket, app_state, auth, client_ip));
+    let session = std::panic::AssertUnwindSafe(run_voice_socket_session(
+        socket, app_state, auth, client_ip, credential,
+    ));
     if futures::FutureExt::catch_unwind(session).await.is_err() {
         // A panic was caught and contained to this session. The process and all
         // other sessions remain alive. The connection guard above still releases
@@ -160,6 +164,7 @@ async fn run_voice_socket_session(
     app_state: Arc<AppState>,
     auth: Auth,
     client_ip: Option<IpAddr>,
+    credential: Option<crate::auth::SessionCredential>,
 ) {
     debug!("handle_voice_socket started");
     info!(
@@ -177,6 +182,21 @@ async fn run_voice_socket_session(
     // Connection state with RwLock for rare writes, frequent reads
     // Initialize with auth context for room name normalization
     let state = Arc::new(RwLock::new(ConnectionState::with_auth(auth.clone())));
+    // FRD-023 RT6: fix the identity the upgrade authenticated, for `auth` refreshes to match.
+    if app_state.bud_mode.is_some()
+        && let Some(credential) = credential.as_ref()
+    {
+        let bearer = crate::handlers::openai_realtime::handshake::Credential::new(
+            credential.current(),
+            crate::handlers::openai_realtime::handshake::CredentialSource::Bearer,
+        );
+        state.write().await.caller_check =
+            crate::handlers::openai_realtime::session::authenticate(&app_state, &bearer)
+                .await
+                .ok()
+                .map(|caller| caller.check);
+    }
+    state.write().await.credential = credential;
 
     let (message_tx, mut message_rx) = mpsc::channel::<MessageRoute>(CHANNEL_BUFFER_SIZE);
 
@@ -204,7 +224,8 @@ async fn run_voice_socket_session(
                         // Channel closed, exit gracefully
                         break;
                     };
-                    let should_close = matches!(route, MessageRoute::Close);
+                    let should_close =
+                        matches!(route, MessageRoute::Close | MessageRoute::CloseWith { .. });
 
                     let result = match route {
                         MessageRoute::Outgoing(message) => {
@@ -221,6 +242,10 @@ async fn run_voice_socket_session(
                         MessageRoute::Close => {
                             info!("Closing WebSocket connection");
                             sender.send(Message::Close(None)).await
+                        }
+                        MessageRoute::CloseWith { code, reason } => {
+                            info!(code, reason = %reason, "Closing WebSocket connection");
+                            sender.send(coded_close(code, &reason)).await
                         }
                     };
 
@@ -246,6 +271,9 @@ async fn run_voice_socket_session(
                             }
                             MessageRoute::Binary(data) => sender.send(Message::Binary(data)).await,
                             MessageRoute::Close => sender.send(Message::Close(None)).await,
+                            MessageRoute::CloseWith { code, reason } => {
+                                sender.send(coded_close(code, &reason)).await
+                            }
                         };
                         if result.is_err() {
                             break;
@@ -306,6 +334,12 @@ async fn run_voice_socket_session(
     // Clean up resources - graceful shutdown with timeout fallback
     // Signal shutdown to sender task
     shutdown_voice_sender_task(shutdown_tx, &mut sender_task).await;
+
+    // FRD-023 RT6: bill audio streamed after the last final transcript; the legs' admissions are
+    // released with the state.
+    if let Some(meter) = state.read().await.leg_meter.clone() {
+        meter.finish();
+    }
 
     // Snapshot state before cleanup so we can drop the read lock before awaiting
     let (voice_manager, livekit_client, recording_egress_id, room_name) = {
@@ -550,6 +584,18 @@ where
             }
         }
     }
+}
+
+/// A close frame with a code, its reason cut to the 123 bytes a control frame allows.
+fn coded_close(code: u16, reason: &str) -> Message {
+    let mut end = reason.len().min(123);
+    while !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    Message::Close(Some(axum::extract::ws::CloseFrame {
+        code,
+        reason: reason[..end].to_string().into(),
+    }))
 }
 
 async fn shutdown_voice_sender_task(

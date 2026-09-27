@@ -246,10 +246,6 @@ pub async fn handle_config_message(
     // wins; on no catalog match the resolver returns the provider default + a
     // non-fatal `config_warning` (never a 400). The resolved id is set on the config
     // and thus echoed in the `ready` ack.
-    if let Some(tts) = tts_ws_config.as_mut() {
-        resolve_voice_descriptor(tts, app_state, message_tx).await;
-    }
-
     // Generate stream_id if not provided by client
     let stream_id = resolve_stream_id(stream_id);
     info!("Session stream_id: {}", stream_id);
@@ -262,6 +258,59 @@ pub async fn handle_config_message(
         audio_enabled,
         livekit_ws_config.is_some()
     );
+
+    // FRD-023 RT6: under the Bud control plane each leg addresses a DEPLOYMENT, resolved through
+    // the caller's allowlist and admitted once for the session; its vendor credential, model,
+    // api_base and voice come from voice_table (the voice read with the deployment's own key, so
+    // P4 below has nothing left to do for it).
+    let mut bud_legs = if app_state.bud_mode.is_some() && audio_enabled {
+        match prepare_bud_legs(
+            app_state,
+            state,
+            &mut stt_ws_config,
+            &mut tts_ws_config,
+            &stream_id,
+        )
+        .await
+        {
+            Ok(legs) => legs,
+            Err(refusal) => {
+                warn!(code = refusal.code, "Refusing a Bud-mode /ws leg");
+                send_error(message_tx, format!("{}: {}", refusal.code, refusal.message)).await;
+                if let Some(code) = refusal.close {
+                    send_critical(
+                        message_tx,
+                        MessageRoute::CloseWith {
+                            code,
+                            reason: refusal.code.to_string(),
+                        },
+                    )
+                    .await;
+                    return false;
+                }
+                return true;
+            }
+        }
+    } else {
+        None
+    };
+    if let Some(legs) = bud_legs.as_mut() {
+        for advisory in std::mem::take(&mut legs.advisories).as_slice() {
+            send_config_warning(
+                message_tx,
+                "deployment_setting_not_applied",
+                advisory.clone(),
+                None,
+            )
+            .await;
+        }
+    }
+
+    if bud_legs.is_none()
+        && let Some(tts) = tts_ws_config.as_mut()
+    {
+        resolve_voice_descriptor(tts, app_state, message_tx).await;
+    }
 
     // Validate required configurations when audio is enabled
     if audio_enabled && !validate_audio_configs(&stt_ws_config, &tts_ws_config, message_tx).await {
@@ -316,8 +365,32 @@ pub async fn handle_config_message(
             return true;
         };
 
-        match initialize_voice_manager(stt_config, tts_config, app_state, message_tx).await {
+        match initialize_voice_manager(
+            stt_config,
+            tts_config,
+            app_state,
+            message_tx,
+            bud_legs.as_ref(),
+        )
+        .await
+        {
             Some(vm) => {
+                // FRD-023 RT6: the session now holds its legs' admissions; meter each leg (STT
+                // per final transcript, TTS per synthesis) and revalidate the caller.
+                if let Some(legs) = bud_legs.take() {
+                    let meter = Arc::clone(&legs.meter);
+                    meter.set_stt_format(stt_config.sample_rate, stt_config.channels);
+                    {
+                        let mut guard = state.write().await;
+                        guard.leg_meter = Some(Arc::clone(&meter));
+                        guard.leg_admissions = legs.admissions;
+                    }
+                    let m = Arc::clone(&meter);
+                    vm.set_speak_observer(Arc::new(move |text: &str| m.tts_spoken(text)));
+                    let m = Arc::clone(&meter);
+                    vm.set_stt_final_observer(Arc::new(move |text: &str| m.stt_final(text)));
+                    spawn_bud_revalidation(app_state, state, message_tx, meter).await;
+                }
                 let heartbeat_period = match heartbeat_period_from_env() {
                     Ok(period) => period,
                     Err(e) => {
@@ -525,6 +598,7 @@ pub async fn handle_config_message(
             app_state.core_state.profiler.clone(),
             egress_audio.clone(),
             Some(app_state.core_state.resilience().clone()),
+            app_state,
         )
         .await
         {
@@ -575,7 +649,31 @@ pub async fn handle_config_message(
     } else if let (Some(conv_config), Some(vm)) =
         (conversation_ws_config.as_ref(), voice_manager.as_ref())
     {
-        match initialize_conversation_loop(conv_config, &stream_id, vm, message_tx).await {
+        let (credential, attribution) = {
+            let guard = state.read().await;
+            let attribution = guard.leg_meter.as_ref().map(|m| {
+                let p = &m.caller().principal;
+                crate::core::conversation::TurnAttribution {
+                    project_id: p.project_id.clone(),
+                    api_key_id: p.api_key_id.clone(),
+                    api_key_project_id: p.project_id.clone(),
+                    user_id: p.user_id.clone(),
+                    endpoint_name: Some(conv_config.model.clone()),
+                }
+            });
+            (guard.credential.clone(), attribution)
+        };
+        match initialize_conversation_loop(
+            conv_config,
+            &stream_id,
+            vm,
+            message_tx,
+            app_state,
+            credential,
+            attribution,
+        )
+        .await
+        {
             Ok(true) => {
                 info!("Conversation loop initialized for stream {}", stream_id);
                 emit_reasoning_config_warnings(conv_config, message_tx).await;
@@ -676,6 +774,163 @@ pub(crate) fn bud_mode_config_refusal(
         );
     }
     None
+}
+
+/// Resolve a Bud-mode session's STT and TTS legs as deployments (FRD-023 RT6, FR-WS-1).
+///
+/// `Ok(None)` when a leg config is missing: `validate_audio_configs` refuses that, by name.
+async fn prepare_bud_legs(
+    app_state: &Arc<AppState>,
+    state: &Arc<RwLock<ConnectionState>>,
+    stt: &mut Option<STTWebSocketConfig>,
+    tts: &mut Option<TTSWebSocketConfig>,
+    stream_id: &str,
+) -> Result<Option<super::bud_legs::PreparedLegs>, super::bud_legs::LegRefusal> {
+    let (Some(stt), Some(tts)) = (stt.as_mut(), tts.as_mut()) else {
+        return Ok(None);
+    };
+    let credential = state.read().await.credential.clone();
+    super::bud_legs::prepare(app_state, credential.as_ref(), stt, tts, stream_id)
+        .await
+        .map(Some)
+}
+
+/// Re-check a Bud-mode session's caller against its legs' deployments every
+/// `WAAV_REALTIME_REVALIDATE_SECS` (D-17, TC-WS-13): a revoked key, a user removed from the
+/// project, or an unpublished deployment ends the session with 1008.
+async fn spawn_bud_revalidation(
+    app_state: &Arc<AppState>,
+    state: &Arc<RwLock<ConnectionState>>,
+    message_tx: &mpsc::Sender<MessageRoute>,
+    meter: Arc<super::bud_legs::LegMeter>,
+) {
+    let every = app_state.realtime.timings.revalidate;
+    let app_state = Arc::clone(app_state);
+    let session = Arc::downgrade(state);
+    let tx = message_tx.clone();
+    let tracker = state.read().await.task_tracker.clone();
+    let handle = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(every);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tick.tick().await;
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {}
+                _ = tx.closed() => return,
+            }
+            // The session ended (or, defensively, holds other legs now).
+            let Some(session) = session.upgrade() else {
+                return;
+            };
+            let current = session
+                .read()
+                .await
+                .leg_meter
+                .as_ref()
+                .is_some_and(|m| Arc::ptr_eq(m, &meter));
+            drop(session);
+            if !current {
+                return;
+            }
+            if !super::bud_legs::session_still_allowed(&app_state, &meter).await {
+                warn!("Bud-mode /ws session no longer authorized; closing");
+                send_error(
+                    &tx,
+                    "session_revoked: this session's credential or deployment is no longer \
+                     authorized (key revoked, access removed, or deployment unpublished)",
+                )
+                .await;
+                send_critical(
+                    &tx,
+                    MessageRoute::CloseWith {
+                        code: super::bud_legs::CLOSE_REVOKED,
+                        reason: "session_revoked".to_string(),
+                    },
+                )
+                .await;
+                return;
+            }
+        }
+    });
+    tracker.track("bud-revalidation", handle);
+}
+
+/// Bind a Bud-mode session's DAG template to the caller's deployments (FRD-023 WP-RT6.3).
+#[cfg(feature = "dag-routing")]
+async fn bind_bud_dag(
+    app_state: &Arc<AppState>,
+    state: &Arc<RwLock<ConnectionState>>,
+    message_tx: &mpsc::Sender<MessageRoute>,
+    definition: &mut DAGDefinition,
+    stream_id: &str,
+) -> Result<(), String> {
+    let (credential, meter) = {
+        let guard = state.read().await;
+        (guard.credential.clone(), guard.leg_meter.clone())
+    };
+    let credential = credential.ok_or_else(|| {
+        "this gateway serves Bud deployments, which need your Bud API key or token".to_string()
+    })?;
+    let meter = match meter {
+        Some(meter) => meter,
+        None => {
+            // No audio legs: the session meter anchors the caller, the held deployments and
+            // their revalidation.
+            let bearer = crate::handlers::openai_realtime::handshake::Credential::new(
+                credential.current(),
+                crate::handlers::openai_realtime::handshake::CredentialSource::Bearer,
+            );
+            let caller =
+                crate::handlers::openai_realtime::session::authenticate(app_state, &bearer)
+                    .await
+                    .map_err(|e| format!("{}: {}", e.code, e.message))?;
+            let meter = Arc::new(super::bud_legs::LegMeter::new(
+                stream_id.to_string(),
+                caller,
+                None,
+                None,
+            ));
+            state.write().await.leg_meter = Some(Arc::clone(&meter));
+            spawn_bud_revalidation(app_state, state, message_tx, Arc::clone(&meter)).await;
+            meter
+        }
+    };
+    let admissions =
+        super::bud_legs::bind_dag(app_state, definition, &credential, &meter, stream_id)
+            .await
+            .map_err(|r| format!("{}: {}", r.code, r.message))?;
+    state.write().await.leg_admissions.extend(admissions);
+    Ok(())
+}
+
+/// Point a Bud-mode voice agent's LLM leg at the Bud gateway (FRD-023 RT6, FR-WS-2, TC-WS-06).
+///
+/// `model` (and `reasoning_model`) name Bud chat deployments; the address is the operator's
+/// `WAAV_LLM_BASE_URL` and the credential is the caller's own, read per call so an `auth` refresh
+/// reaches the next one. The client's endpoint and key were refused earlier (RT0).
+fn bud_llm_leg(
+    config: &mut crate::core::conversation::ConversationConfig,
+    credential: Option<crate::auth::SessionCredential>,
+) -> Result<(), String> {
+    let base_url = super::bud_legs::llm_base_url().ok_or_else(|| {
+        "the voice agent's LLM leg is not available on this gateway: WAAV_LLM_BASE_URL (the Bud \
+         gateway) is not configured"
+            .to_string()
+    })?;
+    let credential = credential.ok_or_else(|| {
+        "the voice agent's LLM leg needs your Bud API key or token, and this session has none"
+            .to_string()
+    })?;
+    config.base_url = base_url;
+    config.server_llm_endpoint = true;
+    config.api_key = None;
+    config.credential = Some(credential);
+    // budgateway speaks the OpenAI wire format whatever the deployment's vendor.
+    config.provider_kind = Some(crate::core::llm::AdapterKind::OpenAi);
+    config.reasoning_base_url = None;
+    config.reasoning_api_key = None;
+    config.reasoning_provider_kind = Some(crate::core::llm::AdapterKind::OpenAi);
+    Ok(())
 }
 
 /// Initialize the built-in conversation loop for a session (plan W-O2).
@@ -1056,13 +1311,18 @@ async fn initialize_conversation_loop(
     stream_id: &str,
     voice_manager: &Arc<VoiceManager>,
     message_tx: &mpsc::Sender<MessageRoute>,
+    app_state: &Arc<AppState>,
+    credential: Option<crate::auth::SessionCredential>,
+    attribution: Option<crate::core::conversation::TurnAttribution>,
 ) -> Result<bool, String> {
-    let orchestrator = ConversationOrchestrator::new(
-        stream_id.to_string(),
-        conv_config.to_conversation_config(),
-        voice_manager.clone(),
-    )
-    .map_err(|e| e.to_string())?;
+    let mut config = conv_config.to_conversation_config();
+    if app_state.bud_mode.is_some() {
+        bud_llm_leg(&mut config, credential)?;
+        config.attribution = attribution;
+    }
+    let orchestrator =
+        ConversationOrchestrator::new(stream_id.to_string(), config, voice_manager.clone())
+            .map_err(|e| e.to_string())?;
 
     let orchestrator = Arc::new(orchestrator);
 
@@ -1091,11 +1351,16 @@ async fn initialize_conversation_loop(
             crate::core::observability::spawn_observed_detached(
                 "conversation.fatal-handler",
                 async move {
-                    send_error(
-                        &message_tx,
-                        format!("fatal provider error (session cannot recover): {error}"),
-                    )
-                    .await;
+                    let message = if error.starts_with("auth_expired") {
+                        // FRD-023 RT6: the session stays; the next turn uses a refreshed token.
+                        format!(
+                            "{error}. The Bud gateway refused this session's credential; send \
+                             {{\"type\":\"auth\",\"token\":\"<fresh token>\"}} to continue."
+                        )
+                    } else {
+                        format!("fatal provider error (session cannot recover): {error}")
+                    };
+                    send_error(&message_tx, message).await;
                 },
             );
         }));
@@ -1374,6 +1639,14 @@ fn validate_audio_config_values(
     stt_config: &STTWebSocketConfig,
     tts_config: &TTSWebSocketConfig,
 ) -> Result<(), String> {
+    // Optional on the wire since FRD-023 RT6 (a Bud leg takes its vendor from the deployment, and
+    // by this point has it); a standalone gateway still needs to be told.
+    if stt_config.provider.trim().is_empty() {
+        return Err("STT provider is required when audio=true".to_string());
+    }
+    if tts_config.provider.trim().is_empty() {
+        return Err("TTS provider is required when audio=true".to_string());
+    }
     if stt_config.sample_rate == 0 {
         return Err("STT sample_rate must be greater than 0 when audio=true".to_string());
     }
@@ -1394,6 +1667,7 @@ async fn initialize_voice_manager(
     tts_ws_config: &TTSWebSocketConfig,
     app_state: &Arc<AppState>,
     message_tx: &mpsc::Sender<MessageRoute>,
+    bud_legs: Option<&super::bud_legs::PreparedLegs>,
 ) -> Option<Arc<VoiceManager>> {
     info!(
         "Initializing voice manager with STT provider: {} and TTS provider: {}",
@@ -1403,25 +1677,31 @@ async fn initialize_voice_manager(
     // Get API keys - prefer client-provided keys where the deployment allows them, fall back to
     // server config
     let allow_client_keys = app_state.allows_client_supplied_keys();
-    let stt_api_key = resolve_provider_api_key(
-        stt_ws_config.api_key.as_deref(),
-        &stt_ws_config.provider,
-        "stt",
-        allow_client_keys,
-        &app_state.config,
-        message_tx,
-    )
-    .await?;
-
-    let tts_api_key = resolve_provider_api_key(
-        tts_ws_config.api_key.as_deref(),
-        &tts_ws_config.provider,
-        "tts",
-        allow_client_keys,
-        &app_state.config,
-        message_tx,
-    )
-    .await?;
+    // FRD-023 RT6: a Bud deployment's legs bring their own credentials (from voice_table).
+    let (stt_api_key, tts_api_key) = match bud_legs {
+        Some(legs) => (legs.stt_key.clone(), legs.tts_key.clone()),
+        None => {
+            let stt_api_key = resolve_provider_api_key(
+                stt_ws_config.api_key.as_deref(),
+                &stt_ws_config.provider,
+                "stt",
+                allow_client_keys,
+                &app_state.config,
+                message_tx,
+            )
+            .await?;
+            let tts_api_key = resolve_provider_api_key(
+                tts_ws_config.api_key.as_deref(),
+                &tts_ws_config.provider,
+                "tts",
+                allow_client_keys,
+                &app_state.config,
+                message_tx,
+            )
+            .await?;
+            (stt_api_key, tts_api_key)
+        }
+    };
 
     // P4 VOICE-DESCRIPTOR resolution: when the client supplied a canonical
     // `voice_descriptor` but NO raw `voice_id`, resolve it SERVER-SIDE to a concrete
@@ -1500,7 +1780,11 @@ async fn initialize_voice_manager(
     // on the flat factory path. The flat `stt_config`/`tts_config` are still derived (== the
     // standardized bases) for cache hashing and other flat consumers below.
     let standard_stt = stt_ws_config.to_standard_stt(stt_api_key);
-    let standard_tts = tts_ws_config.to_standard_tts(tts_api_key);
+    let mut standard_tts = tts_ws_config.to_standard_tts(tts_api_key);
+    if let Some(legs) = bud_legs {
+        // The deployment's address, published by budapp — never the client's (§5.9).
+        standard_tts.base.api_base = legs.tts_api_base.clone();
+    }
 
     // P2 language standardization: the client's canonical `language` was just mapped to each
     // provider's native notation inside `to_standard_stt`/`to_standard_tts` (so no provider sees a
@@ -2787,9 +3071,10 @@ async fn initialize_dag_routing(
     profiler: Arc<crate::core::observability::LatencyProfiler>,
     egress_audio: Option<Arc<EgressAudio>>,
     resilience: Option<Arc<crate::core::resilience::ResilienceRegistry>>,
+    app_state: &Arc<AppState>,
 ) -> Result<bool, String> {
     // Get DAG definition from template or inline
-    let dag_definition: DAGDefinition = if let Some(ref def) = dag_config.definition {
+    let mut dag_definition: DAGDefinition = if let Some(ref def) = dag_config.definition {
         // Parse inline definition
         serde_json::from_value(def.clone()).map_err(|e| format!("Invalid DAG definition: {}", e))?
     } else if let Some(ref template_name) = dag_config.template {
@@ -2802,6 +3087,12 @@ async fn initialize_dag_routing(
         // No DAG specified
         return Ok(false);
     };
+
+    // FRD-023 WP-RT6.3: under the Bud control plane the template's provider and LLM nodes address
+    // Bud deployments as the caller (inline definitions were refused before this, RT0).
+    if app_state.bud_mode.is_some() {
+        bind_bud_dag(app_state, state, message_tx, &mut dag_definition, stream_id).await?;
+    }
 
     info!(
         dag_id = %dag_definition.id,
@@ -3873,5 +4164,205 @@ mod frd023_bud_mode_tests {
             guard.stream_id.is_none() && guard.voice_manager.is_none(),
             "nothing was built"
         );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // FRD-023 RT6
+    // -----------------------------------------------------------------------------------------
+
+    const KEY: &str = "bud_ws_config_test_key";
+
+    async fn leg_plane(stt_extra: serde_json::Value) -> Arc<AppState> {
+        let mut stt = serde_json::json!({
+            "vendor": "deepgram", "credential": crate::test_support::TEST_CREDENTIAL.trim(),
+            "endpoints": ["audio_transcription"], "model": "nova-3"
+        });
+        for (k, v) in stt_extra.as_object().unwrap() {
+            stt[k] = v.clone();
+        }
+        let tts = serde_json::json!({
+            "vendor": "elevenlabs", "credential": crate::test_support::TEST_CREDENTIAL.trim(),
+            "endpoints": ["text_to_speech"], "model": "eleven_flash_v2_5", "voice": "v1"
+        });
+        let blob = serde_json::json!({
+            "stt-dg": {"endpoint_id": "ep-stt", "project_id": "p1", "kind": "model"},
+            "tts-el": {"endpoint_id": "ep-tts", "project_id": "p1", "kind": "model"},
+            "__metadata__": {"api_key_id": "k1", "user_id": "u1", "api_key_project_id": "p1"}
+        })
+        .to_string();
+        let keys = [
+            (format!("api_key:{}", bud_auth::hash_api_key(KEY)), blob),
+            (
+                "voice_table:ep-stt".to_string(),
+                serde_json::json!({"ep-stt": stt}).to_string(),
+            ),
+            (
+                "voice_table:ep-tts".to_string(),
+                serde_json::json!({"ep-tts": tts}).to_string(),
+            ),
+        ];
+        let refs: Vec<(&str, &str)> = keys.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        crate::test_support::bud_state_with_credentials(&refs)
+            .await
+            .0
+    }
+
+    fn keyed_state() -> Arc<RwLock<ConnectionState>> {
+        let mut state = ConnectionState::with_auth(crate::auth::Auth::new("p1"));
+        state.credential = Some(crate::auth::SessionCredential::new(KEY));
+        Arc::new(RwLock::new(state))
+    }
+
+    fn leg(v: serde_json::Value) -> (STTWebSocketConfig, TTSWebSocketConfig) {
+        let mut stt = serde_json::json!({"language": "en-US", "sample_rate": 16000, "channels": 1,
+            "punctuation": true});
+        for (k, val) in v["stt"].as_object().unwrap() {
+            stt[k] = val.clone();
+        }
+        let mut tts = serde_json::json!({"voice_id": null, "speaking_rate": null,
+            "audio_format": "linear16", "sample_rate": 24000, "connection_timeout": null,
+            "request_timeout": null});
+        for (k, val) in v["tts"].as_object().unwrap() {
+            tts[k] = val.clone();
+        }
+        (
+            serde_json::from_value(stt).unwrap(),
+            serde_json::from_value(tts).unwrap(),
+        )
+    }
+
+    fn drain(rx: &mut mpsc::Receiver<MessageRoute>) -> Vec<MessageRoute> {
+        let mut out = Vec::new();
+        while let Ok(route) = rx.try_recv() {
+            out.push(route);
+        }
+        out
+    }
+
+    /// TC-WS-04 🔒 — a provider-only leg is refused before anything is built; the socket stays
+    /// open for a corrected config.
+    #[tokio::test]
+    async fn tc_ws_04_a_provider_only_leg_is_refused_with_the_addressing_hint() {
+        let app_state = leg_plane(serde_json::json!({})).await;
+        let state = keyed_state();
+        let (tx, mut rx) = mpsc::channel(16);
+        let (stt, tts) =
+            leg(serde_json::json!({"stt": {"provider": "deepgram"}, "tts": {"model": "tts-el"}}));
+        let keep = handle_config_message(
+            None,
+            Some(true),
+            Some(stt),
+            Some(tts),
+            None,
+            None,
+            None,
+            None,
+            &state,
+            &tx,
+            &app_state,
+        )
+        .await;
+        assert!(keep);
+        let routes = drain(&mut rx);
+        assert!(
+            matches!(routes.first(), Some(MessageRoute::Outgoing(OutgoingMessage::Error { message }))
+                if message.starts_with("deployment_required")),
+            "{routes:?}"
+        );
+        assert!(
+            !routes
+                .iter()
+                .any(|r| matches!(r, MessageRoute::CloseWith { .. }))
+        );
+        let guard = state.read().await;
+        assert!(
+            guard.stream_id.is_none() && guard.voice_manager.is_none() && guard.leg_meter.is_none()
+        );
+    }
+
+    /// TC-WS-05 🔒 — a leg deployment at its cap refuses the session with close code 1013.
+    #[tokio::test]
+    async fn tc_ws_05_a_capped_leg_closes_the_session_with_1013() {
+        let app_state = leg_plane(serde_json::json!({"max_concurrent": 1})).await;
+        let _held = app_state.admit_deployment("ep-stt").await.expect("free");
+        let state = keyed_state();
+        let (tx, mut rx) = mpsc::channel(16);
+        let (stt, tts) =
+            leg(serde_json::json!({"stt": {"model": "stt-dg"}, "tts": {"model": "tts-el"}}));
+        let keep = handle_config_message(
+            None,
+            Some(true),
+            Some(stt),
+            Some(tts),
+            None,
+            None,
+            None,
+            None,
+            &state,
+            &tx,
+            &app_state,
+        )
+        .await;
+        assert!(!keep, "the session ends");
+        let routes = drain(&mut rx);
+        assert!(
+            routes
+                .iter()
+                .any(|r| matches!(r, MessageRoute::CloseWith { code: 1013, .. })),
+            "{routes:?}"
+        );
+        assert!(
+            app_state.admit_deployment("ep-tts").await.is_ok(),
+            "nothing held"
+        );
+    }
+
+    /// TC-WS-06 🔒 — the LLM leg is the Bud gateway with the caller's credential, OpenAI wire.
+    #[test]
+    #[serial_test::serial]
+    fn tc_ws_06_the_llm_leg_targets_the_bud_gateway_as_the_caller() {
+        let mut config = crate::core::conversation::ConversationConfig {
+            base_url: "https://api.openai.com/v1".into(),
+            api_key: Some("sk-client".into()),
+            provider_kind: Some(crate::core::llm::AdapterKind::Anthropic),
+            ..Default::default()
+        };
+        let credential = crate::auth::SessionCredential::new(KEY);
+
+        unsafe { std::env::remove_var("WAAV_LLM_BASE_URL") };
+        let err = bud_llm_leg(&mut config.clone(), Some(credential.clone())).unwrap_err();
+        assert!(err.contains("WAAV_LLM_BASE_URL"), "{err}");
+
+        unsafe { std::env::set_var("WAAV_LLM_BASE_URL", "http://ditto-budgateway:3000/v1") };
+        let err = bud_llm_leg(&mut config.clone(), None).unwrap_err();
+        assert!(err.contains("credential") || err.contains("key"), "{err}");
+
+        bud_llm_leg(&mut config, Some(credential)).expect("configured");
+        unsafe { std::env::remove_var("WAAV_LLM_BASE_URL") };
+        assert_eq!(config.base_url, "http://ditto-budgateway:3000/v1");
+        assert!(config.server_llm_endpoint);
+        assert!(config.api_key.is_none());
+        assert_eq!(
+            config.credential.as_ref().map(|c| c.current()).as_deref(),
+            Some(KEY)
+        );
+        assert_eq!(
+            config.provider_kind,
+            Some(crate::core::llm::AdapterKind::OpenAi)
+        );
+        assert_eq!(
+            config.reasoning_provider_kind,
+            Some(crate::core::llm::AdapterKind::OpenAi)
+        );
+    }
+
+    /// `provider` became optional on the wire for Bud clients; a standalone gateway still refuses
+    /// a leg without one, by name.
+    #[test]
+    fn a_standalone_leg_still_needs_a_provider() {
+        let (stt, tts) =
+            leg(serde_json::json!({"stt": {"model": "nova-3"}, "tts": {"provider": "deepgram"}}));
+        let err = validate_audio_config_values(&stt, &tts).unwrap_err();
+        assert!(err.contains("STT provider"), "{err}");
     }
 }

@@ -421,6 +421,12 @@ pub enum MessageRoute {
     Outgoing(OutgoingMessage),
     Binary(Bytes),
     Close,
+    /// Close with a code and reason (FRD-023 RT6: 1013 when a leg's deployment is at capacity,
+    /// 1008 when the session's caller lost access).
+    CloseWith {
+        code: u16,
+        reason: String,
+    },
 }
 
 /// Prometheus counter: outbound WS messages dropped by the per-class send

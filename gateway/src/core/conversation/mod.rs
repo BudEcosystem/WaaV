@@ -67,6 +67,14 @@ pub struct ConversationConfig {
     pub system_prompt: Option<String>,
     /// API key (literal or `${ENV_VAR}`); falls back to `OPENAI_API_KEY`.
     pub api_key: Option<String>,
+    /// FRD-023 RT6: `base_url` is the OPERATOR's (budgateway, `WAAV_LLM_BASE_URL`), not a client's,
+    /// so it is not SSRF-validated — it is an in-cluster address by design. Set only by the server.
+    pub server_llm_endpoint: bool,
+    /// FRD-023 RT6: the caller's live credential, sent on every LLM call in place of `api_key`, so
+    /// an `auth` refresh reaches the next call and a JWT caller's leg outlives one token.
+    pub credential: Option<crate::auth::SessionCredential>,
+    /// FRD-023 RT6: who each turn is attributed to, recorded on its `voice.turn` span.
+    pub attribution: Option<TurnAttribution>,
     /// Sampling temperature.
     pub temperature: Option<f32>,
     /// Max tokens per completion.
@@ -188,6 +196,9 @@ impl Default for ConversationConfig {
             model: "gpt-4o-mini".to_string(),
             system_prompt: None,
             api_key: None,
+            server_llm_endpoint: false,
+            credential: None,
+            attribution: None,
             temperature: None,
             max_tokens: None,
             streaming: true,
@@ -697,7 +708,31 @@ impl std::fmt::Debug for ConversationOrchestrator {
     }
 }
 
+/// A Bud-mode session's caller, for its conversation turns' `voice.turn` records (FRD-023 RT6).
+///
+/// Attribution only: the legs' costs are their own records (the transcription and speech
+/// deployments', and budgateway's for the chat deployment), so a turn carrying them would count
+/// them twice.
+#[derive(Debug, Clone, Default)]
+pub struct TurnAttribution {
+    pub project_id: Option<String>,
+    pub api_key_id: Option<String>,
+    pub api_key_project_id: Option<String>,
+    pub user_id: Option<String>,
+    /// The chat deployment the agent answers with.
+    pub endpoint_name: Option<String>,
+}
+
 impl ConversationOrchestrator {
+    /// The key for the next LLM call: the session's live credential when it has one (FRD-023 RT6,
+    /// a Bud caller reaching budgateway), else the configured `api_key`.
+    fn llm_key(&self) -> Option<String> {
+        match &self.config.credential {
+            Some(credential) => Some(credential.current()),
+            None => self.config.api_key.clone(),
+        }
+    }
+
     /// Create a new orchestrator for `session_id`.
     ///
     /// Validates the LLM `base_url` for SSRF (resolve-then-validate, with the
@@ -708,7 +743,10 @@ impl ConversationOrchestrator {
         config: ConversationConfig,
         voice_manager: Arc<VoiceManager>,
     ) -> Result<Self, ConversationOrchestratorError> {
-        validate_llm_url(&config.base_url).map_err(ConversationOrchestratorError::InvalidLlmUrl)?;
+        if !config.server_llm_endpoint {
+            validate_llm_url(&config.base_url)
+                .map_err(ConversationOrchestratorError::InvalidLlmUrl)?;
+        }
         // S1/S2: the reasoning tier's base_url is ALSO client-supplied — validate
         // it for SSRF before it is ever used for a request.
         if let Some(rb) = &config.reasoning_base_url {
@@ -865,9 +903,17 @@ impl ConversationOrchestrator {
             } else {
                 DEFAULT_REASONING_BUDGET_MS
             };
+            // FRD-023 RT6: both tiers are Bud chat deployments behind one budgateway, reached
+            // with the session's own credential; otherwise the tier resolves its own key.
+            let fb_key = self.config.credential.as_ref().map(|c| c.current());
             let fb_result = tokio::time::timeout(
                 Duration::from_millis(bound_ms),
-                fallback.continue_from_history(&self.session_id, None, &fb_token, None),
+                fallback.continue_from_history(
+                    &self.session_id,
+                    fb_key.as_deref(),
+                    &fb_token,
+                    None,
+                ),
             )
             .await;
             match fb_result {
@@ -1042,12 +1088,7 @@ impl ConversationOrchestrator {
         let epoch = self.voice_manager.clear_epoch();
         let result = self
             .llm
-            .continue_from_history(
-                &self.session_id,
-                self.config.api_key.as_deref(),
-                &token,
-                None,
-            )
+            .continue_from_history(&self.session_id, self.llm_key().as_deref(), &token, None)
             .await;
         match result {
             Ok(resp) if !resp.content.trim().is_empty() => {
@@ -1200,6 +1241,20 @@ impl ConversationOrchestrator {
             crate::observability::voice_attrs::turn::TRANSCRIPT,
             transcript,
         );
+        if let Some(a) = &self.config.attribution {
+            use crate::observability::voice_attrs::turn;
+            for (key, value) in [
+                (turn::PROJECT_ID, &a.project_id),
+                (turn::API_KEY_ID, &a.api_key_id),
+                (turn::API_KEY_PROJECT_ID, &a.api_key_project_id),
+                (turn::USER_ID, &a.user_id),
+                (turn::ENDPOINT_NAME, &a.endpoint_name),
+            ] {
+                if let Some(v) = value.as_deref().filter(|v| !v.is_empty()) {
+                    span.record(key, v);
+                }
+            }
+        }
         tracing::Instrument::instrument(self.run_turn_inner(transcript), span).await
     }
 
@@ -1470,10 +1525,11 @@ impl ConversationOrchestrator {
             let reasoner_token = token.child_token();
             let req_start = crate::core::observability::now_monotonic_ns();
             let budget_ns = budget_ms.saturating_mul(1_000_000);
+            let llm_key = self.llm_key();
             let complete_fut = llm.complete(
                 &self.session_id,
                 transcript,
-                self.config.api_key.as_deref(),
+                llm_key.as_deref(),
                 &reasoner_token,
                 on_token,
             );
@@ -1505,7 +1561,7 @@ impl ConversationOrchestrator {
             llm.complete(
                 &self.session_id,
                 transcript,
-                self.config.api_key.as_deref(),
+                self.llm_key().as_deref(),
                 &token,
                 on_token,
             )
@@ -1565,7 +1621,7 @@ impl ConversationOrchestrator {
                             &registry,
                             &self.session_id,
                             response,
-                            self.config.api_key.as_deref(),
+                            self.llm_key().as_deref(),
                             &token,
                             tool_opts,
                         )
@@ -1764,7 +1820,7 @@ impl ConversationOrchestrator {
             let llm = Arc::clone(&self.llm);
             let session_id = self.session_id.clone();
             let target_tokens = self.config.summarize_target_tokens;
-            let api_key = self.config.api_key.clone();
+            let api_key = self.llm_key();
             tokio::spawn(async move {
                 let cfg = crate::core::llm::SummaryConfig {
                     target_tokens,
@@ -1842,7 +1898,7 @@ impl ConversationOrchestrator {
         let response: Arc<SyncMutex<Option<Result<String, ()>>>> = Arc::new(SyncMutex::new(None));
         let llm = self.llm.clone();
         let session_id = self.session_id.clone();
-        let api_key = self.config.api_key.clone();
+        let api_key = self.llm_key();
         let text_owned = text.to_string();
         let response_store = response.clone();
         let task_token = token.clone();
@@ -2085,6 +2141,20 @@ impl ConversationOrchestrator {
                 StageErrorClass::Recoverable => {
                     warn!(session = %self.session_id, error = %e, "conversation turn failed (recoverable; call continues)");
                 }
+                StageErrorClass::Fatal
+                    if self.config.credential.is_some() && is_auth_failure(&e.to_string()) =>
+                {
+                    // FRD-023 RT6: the session's credential is refreshable (an `auth` message
+                    // replaces it), so a refused credential — typically an expired Keycloak token —
+                    // is not the end of the call. Tell the client, keep listening; the next turn
+                    // sends whatever credential is current.
+                    warn!(session = %self.session_id, error = %e,
+                        "LLM leg refused the session credential; waiting for an auth refresh");
+                    let handler = self.fatal_handler.lock().clone();
+                    if let Some(handler) = handler {
+                        handler(format!("auth_expired: {e}"));
+                    }
+                }
                 StageErrorClass::Fatal => {
                     tracing::error!(session = %self.session_id, error = %e,
                         "FATAL turn error (auth/config) — stopping the session");
@@ -2250,6 +2320,17 @@ fn eager_transcript_matches(speculation: &str, final_transcript: &str) -> bool {
             .to_lowercase()
     }
     norm(speculation) == norm(final_transcript)
+}
+
+/// Whether an LLM error is the provider refusing the credential (401/403 or an auth message).
+fn is_auth_failure(message: &str) -> bool {
+    let e = message.to_ascii_lowercase();
+    e.contains("http 401")
+        || e.contains("http 403")
+        || e.contains("invalid api key")
+        || e.contains("invalid_api_key")
+        || e.contains("unauthorized")
+        || e.contains("authentication")
 }
 
 /// Validate a client-supplied LLM base URL for SSRF.

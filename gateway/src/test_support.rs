@@ -92,3 +92,39 @@ pub(crate) async fn bud_state(keys: &[(&str, &str)]) -> Arc<AppState> {
         .bud_mode = Some(crate::auth::bud_mode::BudMode::for_plane(plane).expect("bud mode"));
     state
 }
+
+/// [`bud_state`] whose plane opens `voice_table` credentials with bud-auth's fixture key (the
+/// plaintext of `test_cred_encrypted.hex` is `dg_vendor_key_abc123`) and enforces deployment
+/// policies (FRD-023 RT6 tests). Returns the store, to mutate the control plane mid-test.
+pub(crate) async fn bud_state_with_credentials(
+    keys: &[(&str, &str)],
+) -> (Arc<AppState>, Arc<bud_auth::MemoryStore>) {
+    let store = Arc::new(bud_auth::MemoryStore::new());
+    for (k, v) in keys {
+        store.set(k, v);
+    }
+    let pem = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../bud-auth/tests/fixtures/test_cred_private.pem"
+    ))
+    .expect("bud-auth's fixture key (git-ignored *.pem) must be present locally");
+    let plane = Arc::new(bud_auth::BudPlane::with_decryptor(
+        store.clone() as Arc<dyn bud_auth::ControlPlaneStore>,
+        None,
+        bud_auth::CredentialDecryptor::from_pem(&pem).expect("fixture key parses"),
+    ));
+    plane.boot().await.expect("plane boots");
+    let mut state = AppState::new(minimal_config()).await;
+    {
+        let s = Arc::get_mut(&mut state).expect("the state is not shared yet");
+        s.bud_mode = Some(crate::auth::bud_mode::BudMode::for_plane(plane).expect("bud mode"));
+        s.policies = Some(crate::core::deployment_policy::DeploymentPolicies::local());
+    }
+    (state, store)
+}
+
+/// bud-auth's fixture ciphertext, for `voice_table` entries in tests.
+pub(crate) const TEST_CREDENTIAL: &str =
+    include_str!("../../bud-auth/tests/fixtures/test_cred_encrypted.hex");
+/// Its plaintext.
+pub(crate) const TEST_CREDENTIAL_PLAIN: &str = "dg_vendor_key_abc123";

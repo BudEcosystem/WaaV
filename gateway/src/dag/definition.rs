@@ -460,6 +460,12 @@ pub struct NodeDefinition {
     /// Maximum retry attempts
     #[serde(default = "default_max_retries")]
     pub max_retries: u32,
+
+    /// FRD-023 RT6 (WP-RT6.3): the Bud deployment this node was bound to by the SERVER — its
+    /// vendor credential, address and metering, or the caller's credential for an LLM node.
+    /// Never deserialized, so neither a template nor a client can supply one.
+    #[serde(skip)]
+    pub bud: Option<std::sync::Arc<super::nodes::BudNodeBinding>>,
 }
 
 fn default_max_retries() -> u32 {
@@ -476,6 +482,7 @@ impl NodeDefinition {
             timeout_ms: None,
             retry_on_failure: false,
             max_retries: default_max_retries(),
+            bud: None,
         }
     }
 

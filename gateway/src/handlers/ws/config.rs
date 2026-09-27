@@ -62,8 +62,11 @@ pub struct DAGWebSocketConfig {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct ConversationWebSocketConfig {
-    /// OpenAI-compatible base URL for the LLM (e.g. `https://api.openai.com/v1`).
+    /// OpenAI-compatible base URL for the LLM (e.g. `https://api.openai.com/v1`). Omitted — and
+    /// refused if present — under the Bud control plane, where the LLM leg is a Bud chat
+    /// deployment reached through the Bud gateway (FRD-023 RT6).
     #[cfg_attr(feature = "openapi", schema(example = "https://api.openai.com/v1"))]
+    #[serde(default)]
     pub base_url: String,
 
     /// Model identifier.
@@ -251,6 +254,9 @@ impl ConversationWebSocketConfig {
             model: self.model.clone(),
             system_prompt: self.system_prompt.clone(),
             api_key: self.api_key.clone(),
+            server_llm_endpoint: false,
+            credential: None,
+            attribution: None,
             temperature: self.temperature,
             max_tokens: self.max_tokens,
             streaming: self.streaming,
@@ -307,7 +313,9 @@ pub fn default_stt_encoding() -> String {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct STTWebSocketConfig {
-    /// Provider name (e.g., "deepgram")
+    /// Provider name (e.g., "deepgram"). Under the Bud control plane it is taken from the
+    /// deployment `model` names, and may be omitted (FRD-023 RT6).
+    #[serde(default)]
     #[cfg_attr(feature = "openapi", schema(example = "deepgram"))]
     pub provider: String,
     /// Language code for transcription (e.g., "en-US", "es-ES")
@@ -533,7 +541,9 @@ impl LiveKitWebSocketConfig {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct TTSWebSocketConfig {
-    /// Provider name (e.g., "deepgram", "hume", "elevenlabs")
+    /// Provider name (e.g., "deepgram", "hume", "elevenlabs"). Under the Bud control plane it is
+    /// taken from the deployment `model` names, and may be omitted (FRD-023 RT6).
+    #[serde(default)]
     #[cfg_attr(feature = "openapi", schema(example = "deepgram"))]
     pub provider: String,
     /// Voice ID or name to use for synthesis.
@@ -591,7 +601,8 @@ pub struct TTSWebSocketConfig {
     /// Request timeout in seconds
     #[cfg_attr(feature = "openapi", schema(example = 60))]
     pub request_timeout: Option<u64>,
-    /// Model to use for TTS
+    /// Model to use for TTS. Under the Bud control plane: the text-to-speech DEPLOYMENT.
+    #[serde(default)]
     #[cfg_attr(feature = "openapi", schema(example = "aura-asteria-en"))]
     pub model: String,
     /// Pronunciation replacements to apply before TTS

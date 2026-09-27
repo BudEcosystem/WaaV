@@ -117,9 +117,9 @@ pub struct TtsSettings {
 
 /// Transcription defaults for a deployment.
 ///
-/// The five streaming-only canonical features are absent by construction: they need a continuous
-/// stream, budapp refuses them at publish naming the transport, and a field here would suggest
-/// otherwise to the next person reading this struct.
+/// The five streaming-only canonical features are not fields of their own: they need a continuous
+/// stream, so budapp refuses them at the top of `stt` and publishes them under `stt.streaming`
+/// ([`SttStreaming`]), which only the `/ws` transport applies (FRD-023 WP-RT6.4, FR-WS-4).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 pub struct SttSettings {
     // --- the four the handler used to hardcode, plus model and prompt ---
@@ -170,6 +170,26 @@ pub struct SttSettings {
     /// request and changes the audio the vendor bills against, so it defaults off.
     #[serde(default)]
     pub noise_suppression: Option<bool>,
+
+    /// The streaming-only features, applied on `/ws` and ignored by the prerecorded upload.
+    #[serde(default)]
+    pub streaming: Option<SttStreaming>,
+}
+
+/// `stt.streaming`: the five canonical features that need a continuous audio stream
+/// (FRD-023 WP-RT6.4). budapp validates the closed key set and the millisecond ranges.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct SttStreaming {
+    #[serde(default)]
+    pub interim_results: Option<bool>,
+    #[serde(default)]
+    pub vad_events: Option<bool>,
+    #[serde(default)]
+    pub endpointing_ms: Option<u32>,
+    #[serde(default)]
+    pub utterance_end_ms: Option<u32>,
+    #[serde(default)]
+    pub speech_begin_event: Option<bool>,
 }
 
 /// Translation defaults.
@@ -386,6 +406,7 @@ const KNOWN_STT: &[&str] = &[
     "alternatives",
     "sentiment",
     "noise_suppression",
+    "streaming",
 ];
 
 const KNOWN_TRANSLATION: &[&str] = &["target_languages", "translate_to_english", "partials"];
@@ -536,6 +557,28 @@ mod tests {
         assert_eq!(
             settings.translation.unwrap().target_languages.unwrap(),
             vec!["es-ES".to_string(), "de-DE".to_string()]
+        );
+    }
+
+    #[test]
+    fn streaming_features_are_modelled_under_stt_streaming() {
+        // TC-WS-11: budapp publishes the five streaming-only features here (WP-RT6.4).
+        let settings = parse(
+            r#"{"stt": {"diarization": true, "streaming": {"interim_results": true,
+                "vad_events": false, "endpointing_ms": 300, "utterance_end_ms": 1000,
+                "speech_begin_event": true}}}"#,
+        );
+        let stt = settings.stt.expect("stt parses");
+        assert_eq!(stt.diarization, Some(true));
+        let streaming = stt.streaming.expect("stt.streaming is modelled");
+        assert_eq!(streaming.interim_results, Some(true));
+        assert_eq!(streaming.vad_events, Some(false));
+        assert_eq!(streaming.endpointing_ms, Some(300));
+        assert_eq!(streaming.utterance_end_ms, Some(1000));
+        assert_eq!(streaming.speech_begin_event, Some(true));
+        assert!(
+            KNOWN_STT.contains(&"streaming"),
+            "no unmodelled-key warning for it"
         );
     }
 

@@ -47,6 +47,15 @@ pub struct ConnectionState {
     pub recording_egress_id: Option<String>,
     /// Auth context for this connection (used for room name normalization)
     pub auth: Auth,
+    /// FRD-023 RT6: the caller's credential (Bud mode), refreshed by `auth` messages.
+    pub credential: Option<crate::auth::SessionCredential>,
+    /// FRD-023 RT6: who the session's credential identifies, fixed when the session authenticates
+    /// so an `auth` refresh can renew the credential but never change the principal.
+    pub caller_check: Option<crate::handlers::openai_realtime::session::CallerCheck>,
+    /// FRD-023 RT6: per-leg metering for a session whose legs address Bud deployments.
+    pub leg_meter: Option<Arc<super::bud_legs::LegMeter>>,
+    /// FRD-023 RT6: each leg deployment's admission, held for the session (FRD-022 §6.2).
+    pub leg_admissions: Vec<crate::core::deployment_policy::Admission>,
 
     /// D8 uplink opus decoder (feature `opus-codec`): `Some` only when the session negotiated
     /// `stt_config.audio_in_codec = opus`. Each client WS binary frame is one opus packet decoded
@@ -90,6 +99,10 @@ impl ConnectionState {
             livekit_local_identity: None,
             recording_egress_id: None,
             auth: Auth::empty(),
+            credential: None,
+            caller_check: None,
+            leg_meter: None,
+            leg_admissions: Vec::new(),
             #[cfg(feature = "opus-codec")]
             opus_decoder: None,
             #[cfg(feature = "dag-routing")]
@@ -117,6 +130,10 @@ impl ConnectionState {
             livekit_local_identity: None,
             recording_egress_id: None,
             auth,
+            credential: None,
+            caller_check: None,
+            leg_meter: None,
+            leg_admissions: Vec::new(),
             #[cfg(feature = "opus-codec")]
             opus_decoder: None,
             #[cfg(feature = "dag-routing")]

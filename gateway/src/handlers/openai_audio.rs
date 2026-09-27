@@ -1462,7 +1462,7 @@ fn is_aws_vendor(vendor: &str) -> bool {
 /// GATEWAY's identity in us-east-1), a Google project and location, the Azure Speech host, the
 /// Azure OpenAI api-version. Only the keys named here are copied — never `endpoint_override`,
 /// which is a destination for the vendor's credential.
-fn deployment_extras(
+pub(crate) fn deployment_extras(
     endpoint: &bud_auth::credentials::VoiceEndpoint,
 ) -> serde_json::Map<String, serde_json::Value> {
     let mut extras = serde_json::Map::new();
@@ -1524,17 +1524,25 @@ fn endpoint_misconfiguration(
     name: &str,
     advisories: &mut Advisories,
 ) -> Option<Response> {
-    let refuse = |why: String| {
-        Some(openai_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "api_error",
-            format!(
-                "Endpoint '{name}' is misconfigured for vendor '{}': {why}",
-                endpoint.vendor
-            ),
-            None,
-        ))
-    };
+    let why = endpoint_misconfiguration_reason(endpoint, advisories)?;
+    Some(openai_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "api_error",
+        format!(
+            "Endpoint '{name}' is misconfigured for vendor '{}': {why}",
+            endpoint.vendor
+        ),
+        None,
+    ))
+}
+
+/// Why [`endpoint_misconfiguration`] refuses a deployment, shared with the `/ws` legs (FRD-023
+/// RT6), which reach the same vendors with the same credentials.
+pub(crate) fn endpoint_misconfiguration_reason(
+    endpoint: &bud_auth::credentials::VoiceEndpoint,
+    advisories: &mut Advisories,
+) -> Option<String> {
+    let refuse = |why: String| Some(why);
     if is_azure_speech(&endpoint.vendor)
         && let Some(api_base) = endpoint
             .api_base
@@ -1982,7 +1990,7 @@ fn describing_voice(
 /// the resolver's `style`, because that is what the control above it promises — "words matched
 /// against the vendor's own voice metadata: warm, gravelly, bright". The blob key keeps its
 /// original spelling so an entry written before this still parses.
-async fn resolve_described_voice(
+pub(crate) async fn resolve_described_voice(
     state: &Arc<AppState>,
     endpoint: &bud_auth::credentials::VoiceEndpoint,
     advisories: &mut Advisories,

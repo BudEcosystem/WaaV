@@ -218,6 +218,10 @@ struct LlmMockState {
     reply: Arc<Mutex<String>>,
     /// P1: when set, the endpoint returns HTTP 500 (a failing LLM tier).
     fail: Arc<AtomicBool>,
+    /// FRD-023 RT6: every request's `Authorization` header, in order.
+    authorizations: Arc<Mutex<Vec<String>>>,
+    /// FRD-023 RT6: when set, the endpoint refuses the credential with HTTP 401.
+    unauthorized: Arc<AtomicBool>,
 }
 
 struct TestServer {
@@ -264,9 +268,23 @@ where
 async fn start_llm_mock(state: LlmMockState) -> (String, TestServer) {
     async fn chat(
         State(state): State<LlmMockState>,
+        headers: axum::http::HeaderMap,
         Json(req): Json<Value>,
     ) -> (axum::http::StatusCode, Json<Value>) {
         state.requests.lock().push(req.clone());
+        state.authorizations.lock().push(
+            headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string(),
+        );
+        if state.unauthorized.load(Ordering::SeqCst) {
+            return (
+                axum::http::StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": { "message": "token expired", "code": "invalid_api_key" } })),
+            );
+        }
         let delay = state.delay_ms.load(Ordering::SeqCst);
         if delay > 0 {
             tokio::time::sleep(Duration::from_millis(delay as u64)).await;
@@ -2564,5 +2582,313 @@ async fn a_conversation_turn_emits_the_llm_leg_on_its_voice_turn_span() {
     assert!(
         f.contains_key("bud.voice.turn_index"),
         "turn index missing: two turns in one session would be indistinguishable"
+    );
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// FRD-023 RT6: the voice agent's LLM leg on a Bud deployment.
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// The config `/ws` builds for a Bud-mode session: the operator's gateway address (not
+/// SSRF-checked), no configured key, the caller's live credential.
+fn bud_conv_config(
+    base_url: String,
+    credential: waav_gateway::auth::SessionCredential,
+) -> ConversationConfig {
+    ConversationConfig {
+        base_url,
+        model: "chat-deployment".to_string(),
+        api_key: None,
+        server_llm_endpoint: true,
+        credential: Some(credential),
+        provider_kind: Some(waav_gateway::core::llm::AdapterKind::OpenAi),
+        streaming: false,
+        allow_interruption: true,
+        ..Default::default()
+    }
+}
+
+/// TC-WS-06 🔒 / TC-WS-08 🔒 — every LLM call carries the caller's credential, and an `auth`
+/// refresh reaches the next one.
+#[tokio::test]
+#[serial_test::serial]
+async fn tc_ws_06_08_the_llm_leg_sends_the_live_session_credential() {
+    register_mock_tts();
+    reset_tts_stats();
+    let llm_state = LlmMockState::default();
+    *llm_state.reply.lock() = "Sure.".to_string();
+    let (base_url, _server) = start_llm_mock(llm_state.clone()).await;
+    let vm = build_voice_manager();
+    vm.start().await.expect("vm start");
+
+    let credential = waav_gateway::auth::SessionCredential::new("bud_first_token");
+    let orchestrator = ConversationOrchestrator::new(
+        "session-bud-llm",
+        bud_conv_config(base_url, credential.clone()),
+        vm.clone(),
+    )
+    .expect("a server endpoint is not SSRF-checked (it is in-cluster by design)");
+
+    orchestrator.on_stt_result(&final_result("first")).await;
+    credential.replace("bud_refreshed_token");
+    orchestrator.on_stt_result(&final_result("second")).await;
+
+    assert_eq!(
+        *llm_state.authorizations.lock(),
+        vec![
+            "Bearer bud_first_token".to_string(),
+            "Bearer bud_refreshed_token".to_string()
+        ]
+    );
+}
+
+/// TC-WS-09 🔒 — an expired credential fails the call with `auth_expired`, not the session: once
+/// refreshed, the next turn is answered.
+#[tokio::test]
+#[serial_test::serial]
+async fn tc_ws_09_an_expired_credential_is_auth_expired_and_the_session_continues() {
+    register_mock_tts();
+    reset_tts_stats();
+    let llm_state = LlmMockState::default();
+    *llm_state.reply.lock() = "Back again.".to_string();
+    llm_state.unauthorized.store(true, Ordering::SeqCst);
+    let (base_url, _server) = start_llm_mock(llm_state.clone()).await;
+    let vm = build_voice_manager();
+    vm.start().await.expect("vm start");
+
+    let credential = waav_gateway::auth::SessionCredential::new("bud_expired_token");
+    let orchestrator = ConversationOrchestrator::new(
+        "session-bud-expired",
+        bud_conv_config(base_url, credential.clone()),
+        vm.clone(),
+    )
+    .expect("orchestrator");
+    let fatals: Arc<Mutex<Vec<String>>> = Arc::default();
+    let seen = fatals.clone();
+    orchestrator.set_fatal_handler(Arc::new(move |e: String| seen.lock().push(e)));
+
+    orchestrator.on_stt_result(&final_result("hello?")).await;
+    {
+        let fatals = fatals.lock();
+        assert_eq!(fatals.len(), 1, "{fatals:?}");
+        assert!(fatals[0].starts_with("auth_expired"), "{}", fatals[0]);
+    }
+
+    credential.replace("bud_fresh_token");
+    llm_state.unauthorized.store(false, Ordering::SeqCst);
+    orchestrator
+        .on_stt_result(&final_result("hello again"))
+        .await;
+    assert_eq!(
+        llm_state.requests.lock().len(),
+        2,
+        "the session kept listening"
+    );
+    assert!(
+        TTS_STATS
+            .spoken
+            .lock()
+            .iter()
+            .any(|s| s.contains("Back again")),
+        "the refreshed turn was answered"
+    );
+    assert_eq!(fatals.lock().len(), 1);
+}
+
+/// TC-WS-09 — without a refreshable credential, an auth failure still stops the session (the
+/// standalone gateway's behaviour is unchanged).
+#[tokio::test]
+#[serial_test::serial]
+async fn a_configured_key_refused_still_stops_the_session() {
+    unsafe {
+        std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1");
+    }
+    register_mock_tts();
+    reset_tts_stats();
+    let llm_state = LlmMockState::default();
+    llm_state.unauthorized.store(true, Ordering::SeqCst);
+    let (base_url, _server) = start_llm_mock(llm_state.clone()).await;
+    let vm = build_voice_manager();
+    vm.start().await.expect("vm start");
+    let orchestrator =
+        ConversationOrchestrator::new("session-byok", conv_config(base_url, false), vm.clone())
+            .expect("orchestrator");
+    let fatals: Arc<Mutex<Vec<String>>> = Arc::default();
+    let seen = fatals.clone();
+    orchestrator.set_fatal_handler(Arc::new(move |e: String| seen.lock().push(e)));
+
+    orchestrator.on_stt_result(&final_result("one")).await;
+    orchestrator.on_stt_result(&final_result("two")).await;
+    assert_eq!(
+        llm_state.requests.lock().len(),
+        1,
+        "stopped after the fatal"
+    );
+    assert!(!fatals.lock()[0].starts_with("auth_expired"));
+}
+
+/// A mock STT whose result callback the test drives (FRD-023 RT6 STT-leg metering).
+static STT_CALLBACK: once_cell::sync::Lazy<
+    Mutex<Option<waav_gateway::core::stt::STTResultCallback>>,
+> = once_cell::sync::Lazy::new(|| Mutex::new(None));
+
+struct CallbackStt {
+    ready: bool,
+}
+
+#[async_trait::async_trait]
+impl waav_gateway::core::stt::BaseSTT for CallbackStt {
+    fn new(_config: STTConfig) -> Result<Self, waav_gateway::core::stt::STTError> {
+        Ok(Self { ready: false })
+    }
+    async fn connect(&mut self) -> Result<(), waav_gateway::core::stt::STTError> {
+        self.ready = true;
+        Ok(())
+    }
+    async fn disconnect(&mut self) -> Result<(), waav_gateway::core::stt::STTError> {
+        self.ready = false;
+        Ok(())
+    }
+    fn is_ready(&self) -> bool {
+        self.ready
+    }
+    async fn send_audio(
+        &mut self,
+        _audio: bytes::Bytes,
+    ) -> Result<(), waav_gateway::core::stt::STTError> {
+        Ok(())
+    }
+    async fn on_result(
+        &mut self,
+        cb: waav_gateway::core::stt::STTResultCallback,
+    ) -> Result<(), waav_gateway::core::stt::STTError> {
+        *STT_CALLBACK.lock() = Some(cb);
+        Ok(())
+    }
+    async fn on_error(
+        &mut self,
+        _cb: waav_gateway::core::stt::STTErrorCallback,
+    ) -> Result<(), waav_gateway::core::stt::STTError> {
+        Ok(())
+    }
+    fn get_config(&self) -> Option<&STTConfig> {
+        None
+    }
+    async fn update_config(
+        &mut self,
+        _config: STTConfig,
+    ) -> Result<(), waav_gateway::core::stt::STTError> {
+        Ok(())
+    }
+    fn get_provider_info(&self) -> &'static str {
+        "mock-stt-cb"
+    }
+}
+
+/// TC-WS-12 🔒 — the STT-final observer sees every vendor final, and survives the voice agent
+/// replacing the result callback; interim results are not billed records.
+#[tokio::test]
+#[serial_test::serial]
+async fn tc_ws_12_the_stt_final_observer_sees_every_final() {
+    register_mock_tts();
+    global_registry().register_stt(
+        "mock-stt-cb",
+        Arc::new(|config: STTConfig| {
+            CallbackStt::new(config)
+                .map(|s| Box::new(s) as Box<dyn waav_gateway::core::stt::BaseSTT>)
+        }),
+        ProviderMetadata::stt("mock-stt-cb", "Callback STT (RT6)"),
+    );
+    let stt_config = STTConfig {
+        provider: "mock-stt-cb".to_string(),
+        api_key: "test".to_string(),
+        ..Default::default()
+    };
+    let tts_config = TTSConfig {
+        provider: "mock-tts-conv".to_string(),
+        api_key: "test".to_string(),
+        ..Default::default()
+    };
+    let vm = Arc::new(
+        VoiceManager::new(VoiceManagerConfig::new(stt_config, tts_config), None)
+            .expect("voice manager"),
+    );
+    vm.start().await.expect("vm start");
+
+    let finals: Arc<Mutex<Vec<String>>> = Arc::default();
+    let seen = finals.clone();
+    vm.set_stt_final_observer(Arc::new(move |t: &str| seen.lock().push(t.to_string())));
+    // The session's own forwarder, then the voice agent's replacement.
+    vm.on_stt_result(|_r| Box::pin(async {})).await.unwrap();
+    vm.on_stt_result(|_r| Box::pin(async {})).await.unwrap();
+
+    let cb = STT_CALLBACK
+        .lock()
+        .clone()
+        .expect("the STT callback was registered");
+    cb(STTResult::new("hel".to_string(), false, false, 0.5)).await;
+    cb(STTResult::new("hello there".to_string(), true, false, 0.9)).await;
+    cb(STTResult::new("and more".to_string(), true, true, 0.9)).await;
+
+    assert_eq!(
+        *finals.lock(),
+        vec!["hello there".to_string(), "and more".to_string()]
+    );
+}
+
+/// FRD-023 RT6 (§5.9) — a Bud-mode agent's turn is attributed to its caller and the chat
+/// deployment, and carries no cost of its own (the legs bill themselves).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial]
+async fn a_bud_conversation_turn_is_attributed_to_its_caller() {
+    register_mock_tts();
+    reset_tts_stats();
+    let llm_state = LlmMockState::default();
+    *llm_state.reply.lock() = "Paris.".to_string();
+    let (base_url, _server) = start_llm_mock(llm_state.clone()).await;
+    let vm = build_voice_manager();
+    vm.start().await.expect("vm start");
+
+    let mut config = bud_conv_config(
+        base_url,
+        waav_gateway::auth::SessionCredential::new("bud_k"),
+    );
+    config.attribution = Some(waav_gateway::core::conversation::TurnAttribution {
+        project_id: Some("proj-1".into()),
+        api_key_id: Some("key-1".into()),
+        api_key_project_id: Some("proj-1".into()),
+        user_id: Some("user-1".into()),
+        endpoint_name: Some("chat-deployment".into()),
+    });
+    let orchestrator =
+        ConversationOrchestrator::new("session-attr", config, vm.clone()).expect("orchestrator");
+
+    let fields: span_capture::Fields = Default::default();
+    use tracing_subscriber::layer::SubscriberExt;
+    let dispatch = tracing::Dispatch::new(
+        tracing_subscriber::registry().with(span_capture::CaptureLayer(fields.clone())),
+    );
+    use tracing::instrument::WithSubscriber;
+    orchestrator
+        .run_turn("capital of France?")
+        .with_subscriber(dispatch)
+        .await
+        .expect("turn");
+
+    let f = fields.lock().unwrap();
+    assert_eq!(
+        f.get("bud.project_id").map(String::as_str),
+        Some("proj-1"),
+        "{f:?}"
+    );
+    assert_eq!(f.get("bud.api_key_id").map(String::as_str), Some("key-1"));
+    assert_eq!(f.get("bud.user_id").map(String::as_str), Some("user-1"));
+    assert_eq!(
+        f.get("bud.voice.endpoint_name").map(String::as_str),
+        Some("chat-deployment")
+    );
+    assert!(
+        !f.contains_key("bud.voice.cost"),
+        "the legs bill themselves: {f:?}"
     );
 }

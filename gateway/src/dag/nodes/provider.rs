@@ -121,6 +121,32 @@ pub(crate) fn bud_mode_node_credential_error(
     ))
 }
 
+/// A provider or LLM node bound by the server to a Bud deployment (FRD-023 WP-RT6.3).
+///
+/// Built only by the `/ws` session from the caller's own allowlist; never deserialized.
+pub struct BudNodeBinding {
+    /// The deployment, for logs.
+    pub endpoint_id: String,
+    /// A provider node's vendor credential, from the deployment's `voice_table` entry.
+    pub vendor_credential: Option<String>,
+    /// The deployment's own address (self-hosted, Azure OpenAI).
+    pub api_base: Option<String>,
+    /// The deployment's own vendor parameters (AWS region and keys, Google project, …).
+    pub extras: serde_json::Map<String, serde_json::Value>,
+    /// An LLM node's credential: the CALLER's, read per call so a refresh reaches it.
+    pub session_credential: Option<crate::auth::SessionCredential>,
+    /// Told the text of every synthesis, to meter it against the deployment.
+    pub on_synthesis: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+}
+
+impl std::fmt::Debug for BudNodeBinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BudNodeBinding")
+            .field("endpoint_id", &self.endpoint_id)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Callback bridge for TTS provider to DAG node
 ///
 /// This struct implements the `AudioCallback` trait and bridges
@@ -553,6 +579,8 @@ pub struct TTSProviderNode {
     config: serde_json::Value,
     /// Maximum total audio bytes to collect (prevents memory exhaustion)
     max_audio_bytes: usize,
+    /// FRD-023 WP-RT6.3: bound to a Bud deployment by the server.
+    bud: Option<Arc<BudNodeBinding>>,
 }
 
 impl TTSProviderNode {
@@ -565,6 +593,7 @@ impl TTSProviderNode {
             model: None,
             config: serde_json::Value::Null,
             max_audio_bytes: DEFAULT_MAX_TTS_AUDIO_BYTES,
+            bud: None,
         }
     }
 
@@ -589,6 +618,12 @@ impl TTSProviderNode {
     /// Set maximum audio bytes limit (default: 100MB)
     ///
     /// This prevents memory exhaustion from abnormally long TTS audio.
+    /// Bind the node to a Bud deployment (FRD-023 WP-RT6.3).
+    pub fn with_bud(mut self, binding: Arc<BudNodeBinding>) -> Self {
+        self.bud = Some(binding);
+        self
+    }
+
     pub fn with_max_audio_bytes(mut self, max_bytes: usize) -> Self {
         self.max_audio_bytes = max_bytes;
         self
@@ -673,26 +708,44 @@ impl DAGNode for TTSProviderNode {
         // Get TTS provider from registry
         let registry = crate::plugin::global_registry();
 
-        // Build TTS configuration. A configured credential must resolve; when no
-        // DAG credential is supplied, provider-specific fallback may still apply.
-        let api_key = resolve_configured_node_credential(
-            &self.config,
-            "api_key",
-            &self.id,
-            &self.provider,
-            "TTS",
-        )?
-        .unwrap_or_default();
+        // Build TTS configuration. A node bound to a Bud deployment uses the deployment's
+        // credential, address and parameters (FRD-023 WP-RT6.3). Otherwise a configured
+        // credential must resolve; when no DAG credential is supplied, provider-specific fallback
+        // may still apply.
+        let api_key = match &self.bud {
+            Some(bud) => bud.vendor_credential.clone().unwrap_or_default(),
+            None => resolve_configured_node_credential(
+                &self.config,
+                "api_key",
+                &self.id,
+                &self.provider,
+                "TTS",
+            )?
+            .unwrap_or_default(),
+        };
         let tts_config = crate::core::tts::TTSConfig {
             provider: self.provider.clone(),
             voice_id: self.voice_id.clone(),
             model: self.model.clone().unwrap_or_default(),
             api_key,
+            api_base: self.bud.as_ref().and_then(|b| b.api_base.clone()),
             ..Default::default()
         };
 
         // Create TTS provider
-        let mut tts = match registry.create_tts(&self.provider, tts_config) {
+        let created = match &self.bud {
+            Some(bud) => {
+                if let Some(meter) = &bud.on_synthesis {
+                    meter(&text);
+                }
+                let mut standard =
+                    crate::core::tts::standard::StandardTTSConfig::from_base(tts_config);
+                standard.extras.0 = bud.extras.clone();
+                crate::core::tts::standard::create_tts_standard(&self.provider, standard)
+            }
+            None => registry.create_tts(&self.provider, tts_config),
+        };
+        let mut tts = match created {
             Ok(tts) => tts,
             Err(e) => {
                 return Err(DAGError::TTSProviderError {
