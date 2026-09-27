@@ -474,6 +474,11 @@ impl TTSProvider {
         // Acquire a client from the pool
         let client_guard = match req_manager.acquire().await {
             Ok(guard) => guard,
+            Err(e) if crate::utils::req_manager::is_saturated(e.as_ref()) => {
+                warn!("TTS connection pool saturated: {}", e);
+                let _ = sender.send(Err(TTSError::Saturated(e.to_string()))).await;
+                return;
+            }
             Err(e) => {
                 error!("Failed to acquire HTTP client: {}", e);
                 let _ = sender

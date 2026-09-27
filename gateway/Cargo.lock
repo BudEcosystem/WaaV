@@ -1051,6 +1051,7 @@ dependencies = [
  "pkcs8",
  "redis",
  "reqwest 0.12.28",
+ "resil",
  "rsa",
  "serde",
  "serde_json",
@@ -4460,6 +4461,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "papaya"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da2442474a9404698c42509b8967f437249dbc7b50493e83020333d3943ec0ae"
+dependencies = [
+ "equivalent",
+ "seize",
+]
+
+[[package]]
 name = "parking"
 version = "2.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5305,6 +5316,7 @@ dependencies = [
  "percent-encoding",
  "pin-project-lite",
  "ryu",
+ "sha1_smol",
  "tokio",
  "tokio-util",
  "url",
@@ -5475,6 +5487,26 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
+]
+
+[[package]]
+name = "resil"
+version = "0.1.0"
+source = "git+https://github.com/BudEcosystem/resil?rev=c3bba58ae2cad4636c9593d831f56524a81a7060#c3bba58ae2cad4636c9593d831f56524a81a7060"
+dependencies = [
+ "arc-swap",
+ "dashmap",
+ "fastrand",
+ "foldhash 0.1.5",
+ "http 1.4.1",
+ "metrics",
+ "papaya",
+ "quanta",
+ "redis",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -5935,6 +5967,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "seize"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5b55fb86dfd3a2f5f76ea78310a88f96c4ea21a3031f8d212443d56123fd0521"
+dependencies = [
+ "libc",
+ "windows-sys 0.52.0",
+]
+
+[[package]]
 name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6090,6 +6132,12 @@ dependencies = [
  "cpufeatures 0.2.17",
  "digest 0.10.7",
 ]
+
+[[package]]
+name = "sha1_smol"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbfa15b3dddfee50a0fff136974b3e1bde555604ba463834a7eb7deb6417705d"
 
 [[package]]
 name = "sha2"
@@ -7709,8 +7757,10 @@ dependencies = [
  "prost-types",
  "pulp",
  "realfft",
+ "redis",
  "regex",
  "reqwest 0.12.28",
+ "resil",
  "rhai",
  "rtrb",
  "rubato 0.16.2",

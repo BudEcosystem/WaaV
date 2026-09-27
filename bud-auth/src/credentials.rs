@@ -326,6 +326,11 @@ pub struct VoiceEndpoint {
     /// vendor and validated. A key a vendor does not allow never reaches this map, so nothing
     /// downstream can forward it into a provider's extras.
     pub provider_params: BTreeMap<String, String>,
+    /// The deployment's Rate limiting and Resilience settings (FRD-022 §6.1): `rate_limits`,
+    /// `max_concurrent`, `retry_config`, `fallback_models`. Each block is parsed on its own, so a
+    /// malformed one is dropped (and logged) without taking the endpoint or the others with it.
+    /// Empty for an entry published before FRD-022.
+    pub policy: resil::DeploymentPolicy,
 }
 
 impl VoiceEndpoint {
@@ -516,6 +521,11 @@ pub fn parse_voice_blob(
                 // Voice contract §3. The keys inside are allowlisted per vendor in
                 // `parse_provider_params`, which warns about the rest.
                 "provider_params",
+                // FRD-022 §6.1, parsed leniently by `resil::DeploymentPolicy`.
+                "rate_limits",
+                "max_concurrent",
+                "retry_config",
+                "fallback_models",
             ];
             for k in fields.keys() {
                 if !KNOWN.contains(&k.as_str()) {
@@ -527,6 +537,13 @@ pub fn parse_voice_blob(
                     );
                 }
             }
+        }
+
+        // Before `raw` is consumed below. Each policy block stands alone: a malformed one is
+        // logged and dropped, the endpoint and its other blocks are kept (TC-CT-02).
+        let (policy, policy_warnings) = resil::DeploymentPolicy::from_json_lenient(&raw);
+        for w in &policy_warnings {
+            tracing::warn!(endpoint_id = %endpoint_id, "voice_table policy: {w}");
         }
 
         let blob: VoiceEndpointBlob = match serde_json::from_value(raw) {
@@ -584,6 +601,7 @@ pub fn parse_voice_blob(
                 config,
                 pricing,
                 provider_params,
+                policy,
             },
         );
     }
@@ -593,6 +611,27 @@ pub fn parse_voice_blob(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// TC-CT-02: a malformed policy block drops that block, never the endpoint.
+    #[test]
+    fn malformed_policy_block_keeps_the_endpoint() {
+        let blob = serde_json::json!({ "ep-1": {
+            "vendor": "self_hosted",
+            "api_base": "http://tts:8000",
+            "endpoints": ["text_to_speech"],
+            "rate_limits": {"algorithm": "leaky_bucket"},
+            "max_concurrent": 4,
+            "fallback_models": "not-a-list"
+        }})
+        .to_string();
+        let map = parse_voice_blob(&blob, &CredentialDecryptor::disabled()).unwrap();
+        let ep = map
+            .get("ep-1")
+            .expect("endpoint kept despite a bad policy block");
+        assert!(ep.policy.rate_limits.is_none());
+        assert!(ep.policy.fallback_models.is_empty());
+        assert_eq!(ep.policy.max_concurrent, Some(4));
+    }
 
     const PRIV: &str = include_str!("../tests/fixtures/test_cred_private.pem");
     const ENC_HEX: &str = include_str!("../tests/fixtures/test_cred_encrypted.hex");
@@ -805,6 +844,7 @@ mod tests {
             config: Default::default(),
             pricing: None,
             provider_params: Default::default(),
+            policy: Default::default(),
         };
         let rendered = format!("{ep:?}");
         assert!(

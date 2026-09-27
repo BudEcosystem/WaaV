@@ -181,6 +181,12 @@ pub enum TTSError {
     #[error("Authentication failed: {0}")]
     AuthenticationFailed(String),
 
+    /// WaaV's own per-vendor connection pool stayed full past its bounded wait
+    /// (`WAAV_TTS_MAX_CONCURRENT_PER_VENDOR`, FRD-022 §6.6). Local back-pressure, not a vendor
+    /// failure: it never counts against the vendor's breaker.
+    #[error("{0}")]
+    Saturated(String),
+
     /// The vendor refused the request as built: a voice, model or setting it does not have.
     ///
     /// Distinct from [`TTSError::ProviderError`] because the two call for opposite responses. A

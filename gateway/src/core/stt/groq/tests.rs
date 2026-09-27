@@ -1774,10 +1774,10 @@ mod resilience_tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn breaker_records_failure_on_upstream_4xx() {
-        // Uniformity gate: a failed upstream round-trip must be recorded on the SAME shared
-        // per-provider breaker the registry hands the WS fleet. A 400 is non-retryable for
-        // Groq, so exactly ONE attempt (and one recorded failure) happens.
+    async fn breaker_ignores_a_callers_upstream_4xx() {
+        // Uniformity gate: the provider feeds the SAME shared per-provider breaker the registry
+        // hands the WS fleet. A 400 is non-retryable for Groq, so exactly ONE attempt happens —
+        // and, being the caller's error, it is not recorded as a provider failure.
         let mut server = mockito::Server::new_async().await;
         let mock = server
             .mock("POST", "/openai/v1/audio/transcriptions")
@@ -1809,8 +1809,13 @@ mod resilience_tests {
         let err = stt.flush().await.expect_err("400 must surface an error");
         assert!(matches!(err, STTError::ConfigurationError(_)), "{err:?}");
 
+        // FRD-022 §6.5: a 400 describes the caller's request, not Groq. Counting it let one
+        // tenant's malformed payloads open the breaker every other tenant shares.
         let snap = stt.resilience_breaker().unwrap().snapshot();
-        assert_eq!(snap.failures, 1, "the 400 must be recorded as ONE failure");
+        assert_eq!(
+            snap.failures, 0,
+            "a caller's 400 must not count against the provider"
+        );
         assert_eq!(snap.successes, 0);
         mock.assert_async().await;
     }

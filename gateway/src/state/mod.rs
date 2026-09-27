@@ -53,6 +53,9 @@ pub struct AppState {
     /// Bud control plane (FRD-018). `None` leaves WaaV in standalone mode, where credentials
     /// come from configuration and voice endpoints are not registrable.
     pub bud_mode: Option<Arc<crate::auth::bud_mode::BudMode>>,
+    /// FRD-022: the Bud deployments' rate limits, concurrency caps, retry, fallback and breakers.
+    /// Present exactly when `bud_mode` is; standalone WaaV has no deployments to govern.
+    pub policies: Option<Arc<crate::core::deployment_policy::DeploymentPolicies>>,
 
     /// App-wide shutdown signal (RC6 SIGTERM session drain).
     ///
@@ -156,6 +159,36 @@ impl AppState {
 }
 
 impl AppState {
+    /// A fallback deployment by endpoint id (FRD-022 §6.4). `fallback_models` holds endpoint
+    /// ids, not aliases, and budapp validated them at save, so no alias map is consulted; a
+    /// fallback that no longer exists or does not serve `capability` is skipped by the caller.
+    pub fn fallback_voice_endpoint(
+        &self,
+        endpoint_id: &str,
+        capability: &str,
+    ) -> Option<bud_auth::credentials::VoiceEndpoint> {
+        let endpoint = self
+            .bud_mode
+            .as_ref()?
+            .plane()
+            .voice_endpoint(endpoint_id)?;
+        endpoint.serves(capability).then_some(endpoint)
+    }
+
+    /// Admit a request to a Bud deployment against its own limits (FRD-022 §6.2). Always admitted
+    /// when WaaV is standalone or the deployment has no policy.
+    pub async fn admit_deployment(
+        &self,
+        endpoint_id: &str,
+    ) -> Result<crate::core::deployment_policy::Admission, crate::core::deployment_policy::Rejection>
+    {
+        let (Some(policies), Some(bud)) = (self.policies.as_ref(), self.bud_mode.as_ref()) else {
+            return Ok(crate::core::deployment_policy::Admission::none());
+        };
+        policies.sync(&bud.plane().auth);
+        policies.admit(endpoint_id).await
+    }
+
     pub async fn new(config: ServerConfig) -> Arc<Self> {
         Self::try_new(config)
             .await
@@ -412,6 +445,7 @@ impl AppState {
             // Installed after construction by main(), once the control-plane connection is up:
             // AppState::try_new runs before the Redis URL is known.
             bud_mode: None,
+            policies: None,
             config,
             core_state,
             livekit_room_handler,
@@ -496,7 +530,8 @@ impl AppState {
             .or_insert_with(|| AtomicUsize::new(0));
 
         let current_ip = ip_entry.fetch_add(1, Ordering::Relaxed);
-        if current_ip >= max_per_ip as usize {
+        // 0 = no per-IP cap (behind an edge guard that limits per client IP, FRD-022 §10).
+        if max_per_ip != 0 && current_ip >= max_per_ip as usize {
             // Rollback both counters
             ip_entry.fetch_sub(1, Ordering::Relaxed);
             self.active_ws_connections.fetch_sub(1, Ordering::Relaxed);
@@ -515,6 +550,7 @@ impl AppState {
             ip_connections = self.ip_connection_count(&ip),
             "Connection acquired"
         );
+        self.export_active_sessions();
 
         Ok(())
     }
@@ -543,6 +579,15 @@ impl AppState {
             total_connections = self.active_ws_connections.load(Ordering::Relaxed),
             "Connection released"
         );
+        self.export_active_sessions();
+    }
+
+    /// `waav_active_sessions`: live WebSocket sessions on this replica — the signal an HPA
+    /// should scale a WebSocket service on, since CPU says little about held sessions
+    /// (FRD-022 §10).
+    fn export_active_sessions(&self) {
+        metrics::gauge!("waav_active_sessions")
+            .set(self.active_ws_connections.load(Ordering::Relaxed) as f64);
     }
 }
 

@@ -585,13 +585,26 @@ pub enum SynthesisError {
     /// Anything else: provider construction, the connection, a timeout, or the vendor failing a
     /// well-formed request.
     Failed(VoiceFailure),
+    /// The vendor answered with a status that decides retry, failover and the circuit breaker
+    /// (FRD-022 §6.3–6.5): 401/403 (the deployment's credential), 408, 429 (its quota or rate),
+    /// 5xx (the vendor). Kept apart from `Failed` because a 429 must reach the caller as a 429
+    /// with its `Retry-After`, not as a 502.
+    Vendor {
+        failure: VoiceFailure,
+        status: u16,
+        retry_after: Option<Duration>,
+    },
+    /// WaaV's own connection pool for the vendor stayed full past its bounded wait
+    /// ([`TTSError::Saturated`]): 503 with `Retry-After: 1`, never an unbounded queue.
+    Saturated(VoiceFailure),
 }
 
 impl SynthesisError {
-    /// The classified failure, whichever side of the 400/502 split it is on.
+    /// The classified failure, whichever variant carries it.
     pub fn failure(&self) -> &VoiceFailure {
         match self {
-            Self::Rejected(f) | Self::Failed(f) => f,
+            Self::Rejected(f) | Self::Failed(f) | Self::Saturated(f) => f,
+            Self::Vendor { failure, .. } => failure,
         }
     }
 
@@ -604,6 +617,54 @@ impl SynthesisError {
             message: format!("{context}: {e}"),
         })
     }
+
+    /// What this failure means for retry, failover and the breakers (FRD-022 §6.3–6.5).
+    pub fn verdict(&self) -> resil::classify::Verdict {
+        use resil::classify::{Failure, classify};
+        let status_verdict = |code: u16, message: &str| {
+            classify(&Failure::Status {
+                code,
+                headers: None,
+                body: Some(message.as_bytes()),
+            })
+        };
+        match self {
+            Self::Rejected(f) => {
+                let code = f
+                    .vendor_status
+                    .or_else(|| crate::core::deployment_policy::status_in(&f.message))
+                    .unwrap_or(400);
+                status_verdict(code, &f.message)
+            }
+            Self::Vendor {
+                failure,
+                status,
+                retry_after,
+            } => {
+                let mut v = status_verdict(*status, &failure.message);
+                if let Some(d) = retry_after {
+                    v.retry_after = Some(*d);
+                    if *status == 429 && !v.vendor_concurrency {
+                        v.breaker = resil::classify::BreakerSignal::OpenFor(*d);
+                    }
+                }
+                v
+            }
+            // Our own pool, not the vendor: worth a short retry, never the vendor's breaker.
+            Self::Saturated(_) => resil::classify::Verdict {
+                retryable: true,
+                failover: true,
+                breaker: resil::classify::BreakerSignal::Ignore,
+                caller_error: false,
+                retry_after: Some(Duration::from_millis(250)),
+                vendor_concurrency: false,
+            },
+            Self::Failed(f) => match f.vendor_status {
+                Some(code) => status_verdict(code, &f.message),
+                None => crate::core::deployment_policy::classify_message(&f.message, None),
+            },
+        }
+    }
 }
 
 impl std::fmt::Display for SynthesisError {
@@ -614,18 +675,55 @@ impl std::fmt::Display for SynthesisError {
 
 impl From<TTSError> for SynthesisError {
     fn from(e: TTSError) -> Self {
+        use crate::core::deployment_policy::status_in;
         let (class, vendor_status) = crate::core::voice_error::classify_tts_error(&e);
+        let vendor = |failure: VoiceFailure, status: u16, retry_after: Option<Duration>| {
+            Self::Vendor {
+                failure: VoiceFailure {
+                    // A status read from the message is still the vendor's status.
+                    class: if failure.vendor_status.is_some() {
+                        failure.class
+                    } else {
+                        VoiceErrorType::from_vendor_status(status)
+                    },
+                    vendor_status: Some(status),
+                    ..failure
+                },
+                status,
+                retry_after,
+            }
+        };
+        let failure = |message: String| VoiceFailure {
+            class,
+            vendor_status,
+            message,
+        };
         match e.inner() {
-            TTSError::RequestRejected(m) => Self::Rejected(VoiceFailure {
-                class,
-                vendor_status,
-                message: m.clone(),
-            }),
-            other => Self::Failed(VoiceFailure {
-                class,
-                vendor_status,
-                message: format!("synthesis error: {other}"),
-            }),
+            TTSError::RequestRejected(m) => Self::Rejected(failure(m.clone())),
+            TTSError::Saturated(m) => Self::Saturated(VoiceFailure::new(
+                VoiceErrorType::Internal,
+                format!("the vendor connection pool is saturated: {m}"),
+            )),
+            TTSError::RateLimited {
+                retry_after_secs,
+                message,
+            } => vendor(
+                failure(format!("the vendor rate-limited the request: {message}")),
+                vendor_status.unwrap_or(429),
+                retry_after_secs.map(Duration::from_secs),
+            ),
+            TTSError::AuthenticationFailed(m) => vendor(
+                failure(m.clone()),
+                vendor_status.or_else(|| status_in(m)).unwrap_or(401),
+                None,
+            ),
+            other => {
+                let message = format!("synthesis error: {other}");
+                match vendor_status.or_else(|| status_in(&message)) {
+                    Some(status) => vendor(failure(message), status, None),
+                    None => Self::Failed(failure(message)),
+                }
+            }
         }
     }
 }
@@ -765,13 +863,68 @@ mod tests {
             TTSError::InvalidConfiguration("cfg".into()),
         ] {
             assert!(
-                matches!(
+                !matches!(
                     SynthesisError::from(other.clone()),
-                    SynthesisError::Failed(_)
+                    SynthesisError::Rejected(_)
                 ),
-                "{other:?} must stay a failure"
+                "{other:?} must not read as the caller's fault"
             );
         }
+        assert!(matches!(
+            SynthesisError::from(TTSError::ProviderError("down".into())),
+            SynthesisError::Failed(_)
+        ));
+    }
+
+    /// FRD-022 §6.3: the status that decides retry, failover and the breaker survives the
+    /// conversion — a vendor 429 keeps its Retry-After, a bad key its 401, a 5xx its code.
+    #[test]
+    fn vendor_statuses_survive_the_conversion() {
+        match SynthesisError::from(TTSError::RateLimited {
+            retry_after_secs: Some(20),
+            message: "slow down".into(),
+        }) {
+            SynthesisError::Vendor {
+                failure,
+                status,
+                retry_after,
+            } => {
+                assert_eq!((status, retry_after), (429, Some(Duration::from_secs(20))));
+                assert_eq!(failure.class, VoiceErrorType::RateLimited);
+                assert_eq!(failure.vendor_status, Some(429));
+                assert_eq!(
+                    failure.message,
+                    "the vendor rate-limited the request: slow down"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            SynthesisError::from(TTSError::AuthenticationFailed(
+                "elevenlabs API error (401 Unauthorized): invalid key".into()
+            )),
+            SynthesisError::Vendor { status: 401, .. }
+        ));
+        assert!(matches!(
+            SynthesisError::from(TTSError::AuthenticationFailed("key".into())),
+            SynthesisError::Vendor { status: 401, .. }
+        ));
+        assert!(matches!(
+            SynthesisError::from(TTSError::ProviderError(
+                "API error (503 Service Unavailable): overloaded".into()
+            )),
+            SynthesisError::Vendor { status: 503, .. }
+        ));
+        assert!(matches!(
+            SynthesisError::from(TTSError::Saturated("elevenlabs".into())),
+            SynthesisError::Saturated(_)
+        ));
+        // A status read from a message the provider did not wrap still classifies as the vendor's.
+        let e = SynthesisError::from(TTSError::ProviderError(
+            "API error (503 Service Unavailable): overloaded".into(),
+        ));
+        assert_eq!(e.failure().class, VoiceErrorType::Vendor5xx);
+        assert_eq!(e.failure().vendor_status, Some(503));
     }
 
     /// FRD-021 GT-10: the vendor's status used to be lost here — every failure but a refusal

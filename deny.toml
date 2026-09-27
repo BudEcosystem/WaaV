@@ -5,7 +5,7 @@
 #   - advisories: fail on RUSTSEC vulnerabilities (cargo-audit overlaps; deny is the gate).
 #   - bans:       no wildcard versions; allow the known git/source for deep_filter.
 #   - licenses:   allow the permissive set the tree actually uses (Apache-2.0 crate).
-#   - sources:    only crates.io + the pinned DeepFilterNet git rev are permitted.
+#   - sources:    only crates.io + the pinned DeepFilterNet and resil git revs are permitted.
 #
 # Targets restrict graph evaluation to the platforms we actually ship/CI (Linux glibc +
 # the musl cross-compile target), so platform-specific advisories elsewhere don't add noise.
@@ -78,6 +78,7 @@ unknown-registry = "deny"
 unknown-git = "deny"
 # Only crates.io is allowed as a registry.
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-# The only permitted git source: DeepFilterNet, pinned to an exact rev in Cargo.toml
-# (noise-filter feature). cargo-deny verifies the rev matches the lockfile.
-allow-git = ["https://github.com/Rikorose/DeepFilterNet"]
+# Permitted git sources, each pinned to an exact rev in Cargo.toml (cargo-deny verifies the rev
+# matches the lockfile): DeepFilterNet (noise-filter feature), and resil — Bud's rate-limit and
+# resilience crate shared with budgateway (FRD-022).
+allow-git = ["https://github.com/Rikorose/DeepFilterNet", "https://github.com/BudEcosystem/resil"]

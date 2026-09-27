@@ -81,6 +81,7 @@ pub async fn realtime_handler(
     State(state): State<Arc<AppState>>,
     Extension(auth): Extension<Auth>,
     request_id: Option<Extension<crate::middleware::request_id::RequestId>>,
+    slot: Option<Extension<crate::middleware::ConnectionSlot>>,
 ) -> Response {
     info!(
         auth_id = ?auth.id,
@@ -96,7 +97,15 @@ pub async fn realtime_handler(
 
     ws.max_frame_size(MAX_WS_FRAME_SIZE)
         .max_message_size(MAX_WS_MESSAGE_SIZE)
-        .on_upgrade(move |socket| handle_realtime_socket(socket, state, auth, trace_parent))
+        .on_upgrade(move |socket| {
+            // Held for the session: released when it ends (FRD-022 Phase 0.1 — realtime
+            // sessions used to leak their slot).
+            let slot = slot.map(|Extension(s)| s);
+            async move {
+                let _connection_slot = slot;
+                handle_realtime_socket(socket, state, auth, trace_parent).await
+            }
+        })
 }
 
 /// Handle the realtime WebSocket connection. `trace_parent` is the connection's W3C `traceparent`
@@ -223,6 +232,20 @@ async fn handle_realtime_socket(
                         break;
                     }
                 }
+            }
+            _ = app_state.shutdown.cancelled() => {
+                // SIGTERM: tell the client before the drain window closes, so it reconnects to
+                // another replica instead of seeing the socket vanish (FRD-022 Phase 0.2).
+                info!("Realtime session closing: server shutting down");
+                send_realtime_with_policy(
+                    &message_tx,
+                    RealtimeMessageRoute::Outgoing(RealtimeOutgoingMessage::Error {
+                        code: Some("server_shutdown".to_string()),
+                        message: "Server is shutting down; reconnect to continue".to_string(),
+                    }),
+                )
+                .await;
+                break;
             }
             _ = tokio::time::sleep(processing_timeout) => {
                 // Check if connection has been idle too long

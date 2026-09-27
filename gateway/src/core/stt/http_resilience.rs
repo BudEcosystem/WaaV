@@ -29,10 +29,9 @@
 //!    - **429** → plain failure only — sustained rate-limiting may rate-trip the breaker (so
 //!      failover reroutes), but it must NEVER look like bad credentials, so it does not feed
 //!      the FATAL streak.
-//!    - any other non-success (5xx, validation 4xx, unexpected 3xx) → plain failure. A
-//!      per-request malformed payload (400/422) feeds the rate window — five consecutive ones
-//!      trip the breaker Open — but never the credentials-FATAL state, so one bad request
-//!      cannot take a healthy provider offline gateway-wide.
+//!    - **400/404/413/422** → ignored: a malformed request describes the caller, not the
+//!      provider, and must not open a breaker every other caller shares (FRD-022 §6.5).
+//!    - any other non-success (5xx, unexpected 3xx) → plain failure.
 //!
 //! Deliberately NOT here: retry loops (gateway-level failover handles rerouting; providers
 //! that already retry, e.g. Groq/Bhashini, simply consult the breaker per attempt) and the
@@ -130,10 +129,14 @@ impl HttpBreaker {
             // The credentials/config signature: rate failure + D-G2 quick-failure signal.
             b.record_failure();
             b.record_connection_closed(Duration::ZERO, false);
+        } else if matches!(status.as_u16(), 400 | 404 | 413 | 422) {
+            // The CALLER's malformed request (FRD-022 §6.5): it describes the request, not the
+            // provider. Counting it let one tenant's bad payloads open a breaker every other
+            // tenant of the vendor shares.
         } else {
-            // 5xx, 429, validation 4xx, unexpected 3xx: a plain breaker failure. 429 lands here
-            // deliberately — rate-limiting may rate-trip the breaker but must never arm the
-            // credentials-FATAL state.
+            // 5xx, 429, unexpected 3xx: a plain breaker failure. 429 lands here deliberately —
+            // rate-limiting may rate-trip the breaker but must never arm the credentials-FATAL
+            // state.
             b.record_failure();
         }
     }
@@ -244,15 +247,20 @@ mod tests {
     }
 
     #[test]
-    fn validation_4xx_is_a_plain_failure_not_fatal() {
-        let hb = injected("http-400-not-fatal");
+    fn caller_errors_never_count_against_the_provider() {
+        // FRD-022 §6.5: 400/404/413/422 describe the request; a storm of them must leave the
+        // provider's breaker closed for every other caller.
+        let hb = injected("http-400-ignored");
         for _ in 0..10 {
             hb.record_status(StatusCode::BAD_REQUEST);
+            hb.record_status(StatusCode::UNPROCESSABLE_ENTITY);
         }
-        assert!(
-            !hb.breaker().unwrap().is_permanently_failed(),
-            "malformed-request storms rate-trip but must not arm FATAL"
-        );
+        assert!(!hb.breaker().unwrap().is_permanently_failed());
+        assert_eq!(hb.breaker().unwrap().state(), CircuitState::Closed);
+        // a genuine provider failure still counts
+        for _ in 0..10 {
+            hb.record_status(StatusCode::SERVICE_UNAVAILABLE);
+        }
         assert_eq!(hb.breaker().unwrap().state(), CircuitState::Open);
     }
 }

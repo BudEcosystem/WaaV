@@ -348,7 +348,8 @@ fn validate_hook_secret(
 /// * `max_connections_per_ip` - Maximum concurrent connections per IP address
 ///
 /// # Errors
-/// Returns an error if any parameter is zero
+/// Returns an error if the rate limit or burst is zero. `max_connections_per_ip = 0` turns the
+/// per-IP cap off (see below).
 pub fn validate_security_config(
     rate_limit_rps: u32,
     rate_limit_burst: u32,
@@ -361,8 +362,13 @@ pub fn validate_security_config(
         return Err("burst_size must be positive (0 would disable bursting)".into());
     }
     if max_connections_per_ip == 0 {
-        return Err(
-            "max_connections_per_ip must be positive (0 would disable connection limiting)".into(),
+        // Allowed on purpose (FRD-022 §10): behind an ingress every connection shares the
+        // ingress's peer address, so a per-IP cap here is one shared bucket for all tenants.
+        // With Traefik's per-client-IP edge guard in front, 0 turns it off; the global cap
+        // (`max_websocket_connections`) still applies.
+        tracing::warn!(
+            "max_connections_per_ip = 0: the per-IP WebSocket cap is OFF; run this only behind an \
+             ingress that limits connections per client IP"
         );
     }
     Ok(())

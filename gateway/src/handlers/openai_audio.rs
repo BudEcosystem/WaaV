@@ -29,7 +29,7 @@ use waav_openai_audio::{
 use tracing::Instrument;
 
 use crate::core::voice_cost::voice_cost;
-use crate::core::voice_error::VoiceErrorType;
+use crate::core::voice_error::{VoiceErrorType, VoiceFailure};
 use crate::observability::vendor_span;
 use crate::observability::voice_attrs;
 use crate::observability::voice_span::{FormCapture, Root, RootSpan, VoiceSpans};
@@ -176,7 +176,7 @@ async fn speech_inner(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    use voice_attrs::{leg, turn};
+    use voice_attrs::{leg, resilience, turn};
 
     // The bearer resolves the caller's alias map, which is both the alias -> endpoint id
     // mapping and the authorization boundary. Auth has already passed by the time we get here;
@@ -211,6 +211,21 @@ async fn speech_inner(
         return model_not_found(&settings.endpoint, "text_to_speech");
     };
 
+    // FRD-022 §6.2: the deployment's own rate limits and concurrency cap, before any vendor
+    // work. A refusal here is not a call either — nothing was attempted — so it opens no turn.
+    // The admission (and with it the concurrency slot) lives until the response is built.
+    let admission = match state.admit_deployment(&resolved.endpoint_id).await {
+        Ok(a) => a,
+        Err(rejection) => {
+            info!(
+                endpoint = %settings.endpoint,
+                retry_after_s = rejection.retry_after().as_secs(),
+                "speech request refused by the deployment's own limits"
+            );
+            return rejection.into_response();
+        }
+    };
+
     // FRD-021: the turn opens HERE, as soon as there is an endpoint to attribute it to, so every
     // failure after this point — a bad override, a voice the vendor lacks, a missing credential —
     // is a failed call with a class, not a request that never happened. It used to open after
@@ -229,10 +244,228 @@ async fn speech_inner(
         (leg::TTS_VENDOR, leg::TTS_MODEL),
     )
     .await;
-    let ResolvedVoiceEndpoint { endpoint, .. } = resolved;
+    spans.record_text(
+        resilience::RATE_LIMIT_OUTCOME,
+        Some(if admission.headers.is_some() {
+            "allow"
+        } else {
+            "unlimited"
+        }),
+    );
+    let ResolvedVoiceEndpoint {
+        endpoint_id,
+        endpoint,
+        ..
+    } = resolved;
 
     let mut advisories = Advisories::new();
     warn_unrecognised(&settings.unrecognised, &mut advisories);
+
+    let plan = match plan_speech(
+        &state,
+        &settings.endpoint,
+        &endpoint,
+        &settings,
+        VoicePick::Primary,
+        &mut advisories,
+    )
+    .await
+    {
+        Ok(plan) => plan,
+        Err(refusal) => return refusal.fail_on(&spans),
+    };
+    // The voice the synthesis runs with, whoever chose it (FRD-021 §6.1, Phase 5).
+    spans.record_text(leg::TTS_VOICE, plan.voice.as_deref());
+    // Recorded only when there is one: `""` is not NULL (FRD-021 GT-12).
+    spans.record_text(turn::LANGUAGE, plan.language.as_deref());
+
+    // `characters` is the billing dimension for synthesis and is recorded on SUCCESS only: set
+    // at creation it counted every refused request — a voice the account lacks, text the vendor
+    // would not speak — as characters synthesised. It is the text the caller sent, BEFORE
+    // pronunciation replacement: what the customer is billed for (FRD-021 §6.4).
+    let chars = settings.text.chars().count();
+    info!(
+        endpoint = %settings.endpoint,
+        vendor = %endpoint.vendor,
+        format = settings.format.as_str(),
+        chars,
+        "openai audio/speech"
+    );
+
+    let started = std::time::Instant::now();
+
+    // FRD-022 §6.3–6.5: retries on the deployment, the circuit breakers, and the fallback chain,
+    // all inside one deadline.
+    let mut served = match synthesize_resiliently(
+        &state,
+        &settings,
+        &endpoint_id,
+        &endpoint,
+        plan,
+        &mut advisories,
+        &spans,
+    )
+    .await
+    {
+        Ok(served) => served,
+        Err(failure) => return failure,
+    };
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    let sample_rate = served.sample_rate;
+
+    // Packaged BEFORE anything billable is recorded: a clip that cannot be served is a failed
+    // call, and units or cost on a failure would bill it (FRD-021 TC-EMIT-04).
+    let audio = std::mem::take(&mut served.audio);
+    let packaged = match serve_as_requested(settings.format, audio, sample_rate) {
+        Ok(packaged) => packaged,
+        Err(e) => {
+            warn!(endpoint = %settings.endpoint, error = %e, "could not package audio");
+            return fail_call(
+                &spans,
+                VoiceErrorType::Internal,
+                None,
+                StatusCode::BAD_GATEWAY,
+                "api_error",
+                e,
+                None,
+            );
+        }
+    };
+    if let Some(actual) = packaged.substituted {
+        advisories.warn(format!(
+            "requested {} audio, but {} returned {actual}; served as {actual}",
+            settings.format.as_str(),
+            served.vendor
+        ));
+    }
+
+    // The success-only record: duration, units, and what they cost (FRD-021 §6.1, §6.4) — at
+    // the SERVED deployment's price, so a turn a fallback served is billed as the fallback's
+    // (FRD-022 §6.4).
+    let served_format = packaged.format_label.unwrap_or(settings.format.as_str());
+    let (output_secs, output_rate) =
+        output_audio_meta(&packaged.bytes, settings.format, sample_rate);
+    spans.record(leg::TTS_DURATION_MS, elapsed_ms);
+    if let Some(ttfb) = served.ttfb {
+        spans.record(leg::TTS_TTFB_MS, ttfb.as_secs_f64() * 1000.0);
+    }
+    spans.record(turn::CHARACTERS, chars as u64);
+    if let Some(secs) = output_secs {
+        spans.record(turn::OUTPUT_AUDIO_SECONDS, secs);
+    }
+    spans.record_text(turn::AUDIO_FORMAT, Some(served_format));
+    if let Some(rate) = output_rate {
+        spans.record(turn::SAMPLE_RATE, i64::from(rate));
+    }
+    spans.record_cost(voice_cost(
+        served.pricing.as_ref(),
+        "text_to_speech",
+        Some(chars as u64),
+        None,
+        output_secs,
+    ));
+
+    let audio = packaged.bytes;
+    let mut headers = HeaderMap::new();
+    if let Ok(ct) = packaged.content_type.parse() {
+        headers.insert(header::CONTENT_TYPE, ct);
+    }
+    if let Ok(v) = packaged
+        .format_label
+        .unwrap_or(served.format.as_str())
+        .parse()
+    {
+        headers.insert("x-audio-format", v);
+    }
+    // Raw samples carry no container, so the rate has to travel out of band or the
+    // caller cannot play what they were sent.
+    if matches!(settings.format, AudioFormat::Pcm)
+        && let Ok(v) = sample_rate.to_string().parse()
+    {
+        headers.insert("x-sample-rate", v);
+    }
+    served.apply_headers(&mut headers);
+    admission.apply(&mut headers);
+    // W1. This response is audio bytes, so a header is the ONLY channel there is; a
+    // body-carried advisory would be unreachable on this route by construction.
+    advisories.apply(&mut headers);
+    (StatusCode::OK, headers, audio).into_response()
+}
+
+/// Why a deployment cannot take the request as sent, and what the caller is told when that
+/// deployment is the one they named. A fallback that cannot take it is skipped instead.
+struct PlanRefusal {
+    /// The failed call's class and message; `None` for the refusals that record none.
+    failure: Option<VoiceFailure>,
+    response: Response,
+}
+
+impl PlanRefusal {
+    fn classified(class: VoiceErrorType, message: impl Into<String>, response: Response) -> Self {
+        Self {
+            failure: Some(VoiceFailure::new(class, message)),
+            response,
+        }
+    }
+
+    fn unclassified(response: Response) -> Self {
+        Self {
+            failure: None,
+            response,
+        }
+    }
+
+    /// Mark the call failed (when the refusal is classified) and answer with the refusal.
+    fn fail_on(self, spans: &VoiceSpans) -> Response {
+        if let Some(f) = &self.failure {
+            spans.fail(f.class, f.vendor_status, &f.message);
+        }
+        self.response
+    }
+}
+
+/// Everything decided about ONE deployment before its vendor is called.
+struct SpeechPlan {
+    std_config: crate::core::tts::standard::StandardTTSConfig,
+    /// The deployment's `request_timeout`, the deadline of the whole chain when it is the
+    /// primary's.
+    deadline: Option<std::time::Duration>,
+    voice: Option<String>,
+    voice_for_errors: String,
+    voice_origin: VoiceOrigin,
+    /// The canonical language the request resolved to (for the span).
+    language: Option<String>,
+}
+
+/// Where a hop's voice comes from.
+#[derive(Clone, Copy)]
+enum VoicePick<'a> {
+    /// The deployment the caller named: request, then deployment, then description, then default.
+    Primary,
+    /// A fallback deployment (FRD-022 §6.4). A voice id is vendor-specific, so the caller's voice
+    /// is used only on the same vendor; otherwise the primary's voice DESCRIPTION is matched in
+    /// the fallback vendor's catalog; otherwise the fallback's own configured voice.
+    Fallback {
+        caller_voice: Option<&'a str>,
+        primary: &'a bud_auth::credentials::VoiceEndpoint,
+    },
+}
+
+fn same_vendor(a: &str, b: &str) -> bool {
+    a.trim().eq_ignore_ascii_case(b.trim())
+}
+
+/// Build the synthesis request for one deployment. `Err` is the refusal the CALLER should see
+/// for the primary; a fallback that cannot take the request is skipped instead.
+async fn plan_speech(
+    state: &Arc<AppState>,
+    label: &str,
+    endpoint: &bud_auth::credentials::VoiceEndpoint,
+    settings: &speech::SpeechSettings,
+    pick: VoicePick<'_>,
+    advisories: &mut Advisories,
+) -> Result<SpeechPlan, PlanRefusal> {
+    let primary = matches!(pick, VoicePick::Primary);
 
     // The request's own speech settings, laid over the deployment's. Merged here, before any
     // vendor work, so a value outside the canonical vocabulary is a 400 and not a wasted call;
@@ -241,17 +474,20 @@ async fn speech_inner(
     if let Err((field, reason)) =
         settings_map::apply_speech_overrides(&mut tts_overridden, &settings.overrides)
     {
-        return fail_call(
-            &spans,
+        let message = format!("`{field}`: {reason}");
+        return Err(PlanRefusal::classified(
             VoiceErrorType::InvalidRequest,
-            None,
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            format!("`{field}`: {reason}"),
-            Some(field),
-        );
+            message.clone(),
+            openai_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                message,
+                Some(field),
+            ),
+        ));
     }
-    if settings.overrides.sample_rate.is_some() && !settings.format.accepts_sample_rate() {
+    if primary && settings.overrides.sample_rate.is_some() && !settings.format.accepts_sample_rate()
+    {
         advisories.warn(format!(
             "`sample_rate` applies only to response_format=pcm and was ignored for {}",
             settings.format.as_str()
@@ -280,38 +516,63 @@ async fn speech_inner(
     // A default is picked only for a vendor whose API REQUIRES a voice. Where the voice is
     // optional (Deepgram, Google) nothing is sent and the vendor applies its own default: a voice
     // WaaV chose would be one neither the caller nor the operator asked for.
-    let (voice, voice_origin) =
-        match settings_map::resolve_voice(settings.voice.as_deref(), endpoint.voice.as_deref()) {
-            Some(v) if settings.voice.is_some() => (Some(v), VoiceOrigin::Request),
+    let (requested, cross_vendor_description) = match pick {
+        VoicePick::Primary => (settings.voice.as_deref(), None),
+        VoicePick::Fallback {
+            caller_voice,
+            primary: p,
+        } => {
+            let same = same_vendor(&p.vendor, &endpoint.vendor);
+            let described = p
+                .config
+                .tts()
+                .voice_descriptor
+                .clone()
+                .filter(|d| !d.is_empty());
+            (
+                caller_voice.filter(|_| same),
+                if same { None } else { described },
+            )
+        }
+    };
+    let chosen = match cross_vendor_description.as_ref() {
+        // FRD-022 §6.4 step 2: the primary's DESCRIPTION, matched in this vendor's catalog.
+        Some(d) if requested.is_none() => {
+            resolve_described_voice_with(state, endpoint, Some(d), advisories)
+                .await
+                .map(|v| (Some(v), VoiceOrigin::Described))
+        }
+        _ => None,
+    };
+    let (voice, voice_origin) = match chosen {
+        Some(chosen) => chosen,
+        None => match settings_map::resolve_voice(requested, endpoint.voice.as_deref()) {
+            Some(v) if requested.is_some() => (Some(v), VoiceOrigin::Request),
             Some(v) => (Some(v), VoiceOrigin::Deployment),
-            None => match resolve_described_voice(&state, &endpoint, &mut advisories).await {
+            None => match resolve_described_voice(state, endpoint, advisories).await {
                 Some(v) => (Some(v), VoiceOrigin::Described),
                 None if !crate::handlers::voices::voice_required(&endpoint.vendor) => {
                     advisories.warn(format!(
-                        "deployment '{}' has no voice configured, so {}'s own default voice was \
-                         used. Set a voice in the deployment's audio settings, or pass one in \
+                        "deployment '{label}' has no voice configured, so {}'s own default voice \
+                         was used. Set a voice in the deployment's audio settings, or pass one in \
                          `voice`, to choose it.",
-                        settings.endpoint, endpoint.vendor
+                        endpoint.vendor
                     ));
                     (None, VoiceOrigin::Vendor)
                 }
-                None => match default_voice(&state, &endpoint, &settings.endpoint, &mut advisories)
-                    .await
-                {
+                None => match default_voice(state, endpoint, label, advisories).await {
                     Some(v) => (Some(v), VoiceOrigin::Default),
                     None => {
-                        spans.fail(
+                        return Err(PlanRefusal::classified(
                             VoiceErrorType::InvalidRequest,
-                            None,
                             "`voice` is required: no voice was named, configured or defaulted",
-                        );
-                        return no_voice_error(&settings.endpoint, &endpoint.vendor);
+                            no_voice_error(label, &endpoint.vendor),
+                        ));
                     }
                 },
             },
-        };
-    // The voice the synthesis runs with, whoever chose it (FRD-021 §6.1, Phase 5).
-    spans.record_text(leg::TTS_VOICE, voice.as_deref());
+        },
+    };
 
     // FRD-018 M7 exit criterion 3: a bad voice name must say which voices exist.
     //
@@ -329,7 +590,11 @@ async fn speech_inner(
     if let Some(voice) = voice.as_deref()
         && let Err(e) = speech::validate_voice(voice, known_voices_for(&endpoint.vendor))
     {
-        return fail_translation(&spans, VoiceErrorType::InvalidRequest, &e);
+        return Err(PlanRefusal::classified(
+            VoiceErrorType::InvalidRequest,
+            e.to_string(),
+            translation_error(&e),
+        ));
     }
 
     // A Google deployment names a voice FAMILY (`chirp-3-hd`, `wavenet`…), but Google's API has
@@ -342,44 +607,49 @@ async fn speech_inner(
         endpoint.model.as_deref().unwrap_or_default(),
         voice.as_deref(),
         voice_origin,
-        &settings.endpoint,
+        label,
     ) {
-        return refusal;
+        return Err(PlanRefusal::unclassified(refusal));
     }
 
     // Refuse a format the vendor cannot produce BEFORE spending a vendor call on it. The
     // alternative was raw samples served under the codec's content type, which nothing can play.
+    // (On a fallback hop this skips the hop: FRD-022 §6.4 "Format".)
     if let Some(supported) = vendor_output_formats(&endpoint.vendor)
         && !supported.contains(&settings.format)
     {
         let names: Vec<&str> = supported.iter().map(|f| f.as_str()).collect();
-        return fail_call(
-            &spans,
-            VoiceErrorType::InvalidRequest,
-            None,
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            format!(
-                "{} cannot produce {} audio; `response_format` must be one of {}",
-                endpoint.vendor,
-                settings.format.as_str(),
-                names.join(", ")
-            ),
-            Some("response_format"),
+        let message = format!(
+            "{} cannot produce {} audio; `response_format` must be one of {}",
+            endpoint.vendor,
+            settings.format.as_str(),
+            names.join(", ")
         );
+        return Err(PlanRefusal::classified(
+            VoiceErrorType::InvalidRequest,
+            message.clone(),
+            openai_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                message,
+                Some("response_format"),
+            ),
+        ));
     }
 
     // Accepted fields this route does not apply, said out loud. Each returned 200 audio that
     // silently ignored what the caller asked for.
-    if settings
-        .instructions
-        .as_deref()
-        .is_some_and(|i| !i.trim().is_empty())
+    if primary
+        && settings
+            .instructions
+            .as_deref()
+            .is_some_and(|i| !i.trim().is_empty())
     {
         advisories
             .warn("`instructions` is not applied on /v1/audio/speech and was ignored".to_string());
     }
-    if settings.speaking_rate.is_some()
+    if primary
+        && settings.speaking_rate.is_some()
         && speed_is_ignored(
             &endpoint.vendor,
             endpoint.model.as_deref().unwrap_or_default(),
@@ -396,46 +666,32 @@ async fn speech_inner(
     // 401 from the vendor several seconds later that mentions neither Bud nor the endpoint.
     let api_key = endpoint.credential.clone().unwrap_or_default();
     if api_key.is_empty() && !crate::core::tts::self_hosted::is_self_hosted(&endpoint.vendor) {
-        return fail_call(
-            &spans,
-            VoiceErrorType::Config,
-            None,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "api_error",
-            format!(
-                "Endpoint '{}' has no credential configured for vendor '{}'",
-                settings.endpoint, endpoint.vendor
-            ),
-            None,
+        let message = format!(
+            "Endpoint '{label}' has no credential configured for vendor '{}'",
+            endpoint.vendor
         );
+        return Err(PlanRefusal::classified(
+            VoiceErrorType::Config,
+            message.clone(),
+            openai_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "api_error",
+                message,
+                None,
+            ),
+        ));
     }
-    if let Some(refusal) = endpoint_misconfiguration(&endpoint, &settings.endpoint, &mut advisories)
-    {
-        return refusal;
+    if let Some(refusal) = endpoint_misconfiguration(endpoint, label, advisories) {
+        return Err(PlanRefusal::unclassified(refusal));
     }
 
-    // `characters` is the billing dimension for synthesis and is recorded on SUCCESS only: set
-    // at creation it counted every refused request — a voice the account lacks, text the vendor
-    // would not speak — as characters synthesised. It is the text the caller sent, BEFORE
-    // pronunciation replacement: what the customer is billed for (FRD-021 §6.4).
-    let chars = settings.text.chars().count();
     // The request's own `language` (a Bud per-request override), then the tts block's, then the
-    // endpoint default. Recorded only when there is one: `""` is not NULL (FRD-021 GT-12).
+    // endpoint default.
     let language = settings_map::resolve_language(
         settings.overrides.language.as_deref(),
         endpoint.language.as_deref(),
         endpoint.config.tts().language.as_deref(),
     );
-    spans.record_text(turn::LANGUAGE, language.as_deref());
-    info!(
-        endpoint = %settings.endpoint,
-        vendor = %endpoint.vendor,
-        format = settings.format.as_str(),
-        chars,
-        "openai audio/speech"
-    );
-
-    let started = std::time::Instant::now();
 
     let mut tts_settings = tts_overridden;
 
@@ -455,7 +711,7 @@ async fn speech_inner(
     // Connections to a vendor are pooled and shared across deployments, so a per-deployment
     // connect timeout cannot be applied on this route. `request_timeout` is: it bounds the whole
     // synthesis below.
-    if tts_settings.connection_timeout.is_some() {
+    if primary && tts_settings.connection_timeout.is_some() {
         advisories.warn(
             "connection_timeout is not applied: connections to the vendor are pooled and shared"
                 .to_string(),
@@ -465,12 +721,12 @@ async fn speech_inner(
         .request_timeout
         .map(std::time::Duration::from_secs);
     let voice_for_errors = voice.clone().unwrap_or_default();
-    let model = vendor_model(&state, &endpoint, voice.as_deref()).await;
+    let model = vendor_model(state, endpoint, voice.as_deref()).await;
 
     let mut tts_config = crate::core::tts::TTSConfig {
         provider: endpoint.vendor.clone(),
         api_key,
-        voice_id: voice,
+        voice_id: voice.clone(),
         model,
         speaking_rate: settings.speaking_rate,
         audio_format: Some(settings.format.as_waav_format().to_string()),
@@ -491,7 +747,7 @@ async fn speech_inner(
         &tts_settings,
         &mut tts_config,
         settings.format.accepts_sample_rate(),
-        &mut advisories,
+        advisories,
     );
 
     // C1/C3: the synthesis language, mapped into the vendor's own notation. OpenAI's schema has
@@ -505,7 +761,7 @@ async fn speech_inner(
             canonical,
             &super::ws::config::tts_provider_alias(&endpoint.vendor),
             &tts_config.model,
-            &mut advisories,
+            advisories,
         )
     });
 
@@ -523,145 +779,385 @@ async fn speech_inner(
         tts_config,
         &tts_settings,
         mapped_language.as_deref(),
-        &mut advisories,
+        advisories,
     );
-    std_config.extras.0.extend(deployment_extras(&endpoint));
+    std_config.extras.0.extend(deployment_extras(endpoint));
 
-    // The vendor request runs in the call's scope, so its CLIENT span is a child of `voice.turn`
-    // carrying the call's ids (CONTRACTS §1.2a).
-    let synthesis = spans
-        .vendor_scope(vendor_span::operation::TEXT_TO_SPEECH)
-        .run(crate::handlers::speak::synthesize_once_standard(
-            &state,
-            std_config,
-            &settings.text,
-        ))
-        .instrument(spans.turn().clone());
-    // The deployment's `request_timeout`, as a bound on the whole synthesis. It used to reach
-    // only an HTTP client this path never builds (the shared per-vendor pool is used instead),
-    // so `request_timeout: 1` let a 2.2 s request through.
-    let outcome = match deadline {
-        Some(limit) => match tokio::time::timeout(limit, synthesis).await {
-            Ok(outcome) => outcome,
-            Err(_) => {
-                let message = format!(
-                    "synthesis exceeded deployment '{}''s request_timeout of {}s",
-                    settings.endpoint,
-                    limit.as_secs()
-                );
-                warn!(endpoint = %settings.endpoint, "{message}");
-                return fail_call(
-                    &spans,
-                    VoiceErrorType::Deadline,
-                    None,
-                    StatusCode::GATEWAY_TIMEOUT,
-                    "api_error",
-                    message,
-                    None,
-                );
+    Ok(SpeechPlan {
+        std_config,
+        deadline,
+        voice,
+        voice_for_errors,
+        voice_origin,
+        language,
+    })
+}
+
+/// Audio a deployment produced, and which deployment it was.
+struct SpeechServed {
+    audio: Vec<u8>,
+    format: String,
+    sample_rate: u32,
+    ttfb: Option<std::time::Duration>,
+    served_id: String,
+    vendor: String,
+    /// The SERVED deployment's pricing: a fallback's turn costs what the fallback costs.
+    pricing: Option<bud_auth::credentials::VoicePricing>,
+    fell_back: bool,
+    voice_substituted: bool,
+    bud_mode: bool,
+    /// The fallback's own admission (its concurrency slot) — held until the response is built.
+    _fallback_admission: Option<crate::core::deployment_policy::Admission>,
+}
+
+impl SpeechServed {
+    /// `x-bud-endpoint-id` (the SERVED deployment), and on a fallback `x-bud-fallback` and
+    /// `x-bud-voice-substituted` (FRD-022 §6.4).
+    fn apply_headers(&self, headers: &mut HeaderMap) {
+        use crate::core::deployment_policy::{
+            FALLBACK_HEADER, SERVED_ENDPOINT_HEADER, VOICE_SUBSTITUTED_HEADER,
+        };
+        if self.bud_mode
+            && let Ok(v) = header::HeaderValue::from_str(&self.served_id)
+        {
+            headers.insert(SERVED_ENDPOINT_HEADER, v);
+        }
+        if self.fell_back {
+            headers.insert(FALLBACK_HEADER, header::HeaderValue::from_static("true"));
+            headers.insert(
+                VOICE_SUBSTITUTED_HEADER,
+                header::HeaderValue::from_static(if self.voice_substituted {
+                    "true"
+                } else {
+                    "false"
+                }),
+            );
+        }
+    }
+}
+
+/// The message of a hop that ran out of the chain's deadline — WaaV's own bound, told apart from
+/// a vendor or provider timeout by exactly this text.
+const CHAIN_DEADLINE_ELAPSED: &str = "the request deadline elapsed";
+
+/// The class a refusal records when no attempt produced a failure of its own: only a failing
+/// vendor opens a breaker.
+const BREAKER_OPEN_CLASS: VoiceErrorType = VoiceErrorType::Vendor5xx;
+
+/// Synthesise on the primary with its retry policy, behind the circuit breakers, falling back
+/// through its fallback chain on a failover-eligible failure — all within one deadline
+/// (FRD-022 §6.3–6.5). `Err` is the response to send; the turn is marked failed with it.
+async fn synthesize_resiliently(
+    state: &Arc<AppState>,
+    settings: &speech::SpeechSettings,
+    primary_id: &str,
+    primary: &bud_auth::credentials::VoiceEndpoint,
+    primary_plan: SpeechPlan,
+    advisories: &mut Advisories,
+    spans: &VoiceSpans,
+) -> Result<SpeechServed, Response> {
+    use crate::core::deployment_policy::{
+        DEFAULT_SPEECH_DEADLINE, breaker_open_response, vendor_key,
+    };
+    use crate::handlers::speak::SynthesisError;
+    use resil::retry::{RetryPolicy, retry};
+    use voice_attrs::{leg, resilience};
+
+    const CAPABILITY: &str = "text_to_speech";
+    let policies = state.policies.clone();
+    let chain_limit = primary_plan.deadline.unwrap_or(DEFAULT_SPEECH_DEADLINE);
+    let deadline = tokio::time::Instant::now() + chain_limit;
+    let candidates: Vec<Arc<str>> = resil::fallback::expand(
+        primary_id,
+        |id| {
+            if id == primary_id {
+                primary.policy.fallback_models.clone()
+            } else {
+                state
+                    .fallback_voice_endpoint(id, CAPABILITY)
+                    .map(|e| e.policy.fallback_models)
+                    .unwrap_or_default()
             }
         },
-        None => synthesis.await,
-    };
-    let elapsed_ms = started.elapsed().as_millis() as u64;
-    match outcome {
-        Ok(synth) => {
-            let sample_rate = synth.sample_rate;
-            let format = synth.format;
-            // Packaged BEFORE anything billable is recorded: a clip that cannot be served is a
-            // failed call, and units or cost on a failure would bill it (FRD-021 TC-EMIT-04).
-            let served = match serve_as_requested(settings.format, synth.audio, sample_rate) {
-                Ok(served) => served,
-                Err(e) => {
-                    warn!(endpoint = %settings.endpoint, error = %e, "could not package audio");
-                    return fail_call(
-                        &spans,
-                        VoiceErrorType::Internal,
-                        None,
-                        StatusCode::BAD_GATEWAY,
-                        "api_error",
-                        e,
-                        None,
-                    );
+        1 + resil::policy::MAX_FALLBACKS * 2,
+    );
+
+    let primary_voice = primary_plan.voice.clone();
+    let primary_voice_for_errors = primary_plan.voice_for_errors.clone();
+    let primary_origin = primary_plan.voice_origin;
+    let mut primary_plan = Some(primary_plan);
+    let mut retries_total = 0u32;
+    let mut primary_error: Option<SynthesisError> = None;
+    let mut primary_breaker: Option<resil::breaker::Open> = None;
+    let mut fallback_limited: Option<std::time::Duration> = None;
+    let mut fallback_attempted = false;
+    let mut timed_out = false;
+
+    for (hop, id) in candidates.iter().enumerate() {
+        if tokio::time::Instant::now() >= deadline {
+            timed_out = true;
+            break;
+        }
+        // The hop's deployment, its own admission and its plan.
+        let (endpoint, plan, hop_admission) = if hop == 0 {
+            let Some(plan) = primary_plan.take() else {
+                break;
+            };
+            (primary.clone(), plan, None)
+        } else {
+            let Some(endpoint) = state.fallback_voice_endpoint(id, CAPABILITY) else {
+                warn!(fallback = %id, "fallback deployment unknown or not a TTS deployment; skipped");
+                continue;
+            };
+            let admission = match state.admit_deployment(id).await {
+                Ok(a) => a,
+                Err(rejection) => {
+                    let wait = rejection.retry_after();
+                    fallback_limited = Some(fallback_limited.map_or(wait, |w| w.min(wait)));
+                    info!(fallback = %id, "fallback skipped: its own limit said no");
+                    continue;
                 }
             };
-            if let Some(actual) = served.substituted {
-                advisories.warn(format!(
-                    "requested {} audio, but {} returned {actual}; served as {actual}",
-                    settings.format.as_str(),
-                    endpoint.vendor
-                ));
-            }
-
-            // The success-only record: duration, units, and what they cost (FRD-021 §6.1, §6.4).
-            let served_format = served.format_label.unwrap_or(settings.format.as_str());
-            let (output_secs, output_rate) =
-                output_audio_meta(&served.bytes, settings.format, sample_rate);
-            spans.record(leg::TTS_DURATION_MS, elapsed_ms);
-            if let Some(ttfb) = synth.ttfb {
-                spans.record(leg::TTS_TTFB_MS, ttfb.as_secs_f64() * 1000.0);
-            }
-            spans.record(turn::CHARACTERS, chars as u64);
-            if let Some(secs) = output_secs {
-                spans.record(turn::OUTPUT_AUDIO_SECONDS, secs);
-            }
-            spans.record_text(turn::AUDIO_FORMAT, Some(served_format));
-            if let Some(rate) = output_rate {
-                spans.record(turn::SAMPLE_RATE, i64::from(rate));
-            }
-            spans.record_cost(voice_cost(
-                endpoint.pricing.as_ref(),
-                "text_to_speech",
-                Some(chars as u64),
-                None,
-                output_secs,
-            ));
-
-            let audio = served.bytes;
-            let mut headers = HeaderMap::new();
-            if let Ok(ct) = served.content_type.parse() {
-                headers.insert(header::CONTENT_TYPE, ct);
-            }
-            if let Ok(v) = served.format_label.unwrap_or(format.as_str()).parse() {
-                headers.insert("x-audio-format", v);
-            }
-            // Raw samples carry no container, so the rate has to travel out of band or the
-            // caller cannot play what they were sent.
-            if matches!(settings.format, AudioFormat::Pcm)
-                && let Ok(v) = sample_rate.to_string().parse()
+            let mut hop_advisories = Advisories::new();
+            let plan = match plan_speech(
+                state,
+                id,
+                &endpoint,
+                settings,
+                VoicePick::Fallback {
+                    caller_voice: settings.voice.as_deref(),
+                    primary,
+                },
+                &mut hop_advisories,
+            )
+            .await
             {
-                headers.insert("x-sample-rate", v);
+                Ok(p) => p,
+                Err(_) => {
+                    info!(fallback = %id, "fallback skipped: it cannot serve this request");
+                    continue;
+                }
+            };
+            fallback_attempted = true;
+            (endpoint, plan, Some(admission))
+        };
+
+        let vkey = vendor_key(&endpoint.vendor, endpoint.api_base.as_deref());
+        if let Some(p) = &policies
+            && let Err(open) = p.breakers().check(id, &vkey)
+        {
+            info!(deployment = %id, retry_in_ms = open.retry_in.as_millis() as u64, "circuit open; hop skipped");
+            if hop == 0 {
+                primary_breaker = Some(open);
             }
-            // W1. This response is audio bytes, so a header is the ONLY channel there is; a
-            // body-carried advisory would be unreachable on this route by construction.
-            advisories.apply(&mut headers);
-            (StatusCode::OK, headers, audio).into_response()
+            continue;
         }
-        Err(crate::handlers::speak::SynthesisError::Rejected(failure)) => {
-            warn!(endpoint = %settings.endpoint, error = %failure, "vendor rejected synthesis");
-            spans.fail(failure.class, failure.vendor_status, &failure.message);
-            rejection_error(
+
+        let retry_policy = endpoint
+            .policy
+            .retry_config
+            .as_ref()
+            .map(RetryPolicy::waav)
+            .unwrap_or_else(RetryPolicy::none);
+        let std_config = plan.std_config;
+        let text = settings.text.as_str();
+        let outcome = retry(
+            &retry_policy,
+            Some(deadline),
+            |_| {
+                let cfg = std_config.clone();
+                async move {
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    // Each attempt runs in the call's scope, so its CLIENT span is a child of
+                    // `voice.turn` carrying the call's ids (CONTRACTS §1.2a): a retry is a second
+                    // vendor span, not a longer first one.
+                    let synthesis = spans
+                        .vendor_scope(vendor_span::operation::TEXT_TO_SPEECH)
+                        .run(crate::handlers::speak::synthesize_once_standard(
+                            state, cfg, text,
+                        ))
+                        .instrument(spans.turn().clone());
+                    match tokio::time::timeout(remaining, synthesis).await {
+                        Ok(result) => result,
+                        Err(_) => Err(SynthesisError::Failed(VoiceFailure::new(
+                            VoiceErrorType::Deadline,
+                            format!("synthesis timed out: {CHAIN_DEADLINE_ELAPSED}"),
+                        ))),
+                    }
+                }
+            },
+            |e: &SynthesisError| e.verdict(),
+        )
+        .await;
+        retries_total += outcome.retries;
+
+        match outcome.result {
+            Ok(synth) => {
+                if let Some(p) = &policies {
+                    p.breakers().record_success(id, &vkey);
+                }
+                spans.record(resilience::RETRY_COUNT, u64::from(retries_total));
+                spans.record_text(resilience::SERVED_ENDPOINT_ID, Some(&**id));
+                if hop > 0 {
+                    spans.record_text(resilience::FALLBACK_FROM, Some(primary_id));
+                    // The leg is the fallback's: its vendor, model and voice.
+                    spans.record_vendor(
+                        leg::TTS_VENDOR,
+                        leg::TTS_MODEL,
+                        &endpoint.vendor,
+                        endpoint.model.as_deref(),
+                    );
+                    spans.record_text(leg::TTS_VOICE, plan.voice.as_deref());
+                    advisories.warn(format!(
+                        "served by fallback deployment '{id}' ({}) because '{}' failed",
+                        endpoint.vendor, settings.endpoint
+                    ));
+                }
+                return Ok(SpeechServed {
+                    audio: synth.audio,
+                    format: synth.format,
+                    sample_rate: synth.sample_rate,
+                    ttfb: synth.ttfb,
+                    served_id: id.to_string(),
+                    vendor: endpoint.vendor.clone(),
+                    pricing: endpoint.pricing.clone(),
+                    fell_back: hop > 0,
+                    voice_substituted: hop > 0 && plan.voice != primary_voice,
+                    bud_mode: state.bud_mode.is_some(),
+                    _fallback_admission: hop_admission,
+                });
+            }
+            Err(e) => {
+                let verdict = e.verdict();
+                if let Some(p) = &policies {
+                    p.breakers().record_failure(id, &vkey, &verdict);
+                }
+                if verdict.vendor_concurrency {
+                    warn!(
+                        deployment = %id,
+                        "the vendor refused for concurrency: this deployment's max_concurrent is \
+                         above the vendor plan; lower it"
+                    );
+                }
+                warn!(deployment = %id, hop, error = %e, "synthesis failed");
+                if hop == 0 {
+                    let surface = !verdict.failover;
+                    primary_error = Some(e);
+                    // A caller error would fail on every fallback too, and a config error such
+                    // as an invalid voice must surface rather than be masked (FRD-022 §6.4).
+                    if surface {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    spans.record(resilience::RETRY_COUNT, u64::from(retries_total));
+    let fail = |failure: &VoiceFailure| {
+        spans.fail(failure.class, failure.vendor_status, &failure.message);
+    };
+    let deadline_exceeded = || {
+        let m = format!(
+            "synthesis exceeded deployment '{}''s request_timeout of {}s",
+            settings.endpoint,
+            chain_limit.as_secs()
+        );
+        warn!(endpoint = %settings.endpoint, "{m}");
+        spans.fail(VoiceErrorType::Deadline, None, &m);
+        openai_error(StatusCode::GATEWAY_TIMEOUT, "api_error", m, None)
+    };
+    match primary_error {
+        Some(SynthesisError::Rejected(failure)) => {
+            fail(&failure);
+            Err(rejection_error(
                 failure.message,
-                &voice_for_errors,
-                voice_origin,
-                &endpoint.vendor,
+                &primary_voice_for_errors,
+                primary_origin,
+                &primary.vendor,
                 &settings.endpoint,
+            ))
+        }
+        // The primary could not serve (it failed over, or its breaker is open) and every
+        // fallback was held back by its own limit: say when a fallback can take it (TC-WR-12).
+        _ if fallback_limited.is_some()
+            && !fallback_attempted
+            && (primary_breaker.is_some()
+                || primary_error.as_ref().is_some_and(|e| e.verdict().failover)) =>
+        {
+            match primary_error.as_ref() {
+                Some(e) => fail(e.failure()),
+                None => spans.fail(
+                    BREAKER_OPEN_CLASS,
+                    None,
+                    "circuit breaker open, and every fallback was held back by its own limit",
+                ),
+            }
+            Err(
+                crate::core::deployment_policy::Rejection::Rate(resil::RateHeaders {
+                    limit: 0,
+                    remaining: 0,
+                    reset: 0,
+                    retry_after: fallback_limited.map(|d| d.as_secs().max(1)),
+                })
+                .into_response(),
             )
         }
-        Err(crate::handlers::speak::SynthesisError::Failed(failure)) => {
-            warn!(endpoint = %settings.endpoint, error = %failure, "synthesis failed");
-            // 502, not 500: the failure is upstream of WaaV, and the distinction is what tells
-            // an operator whether to look at the vendor or at us.
-            fail_call(
-                &spans,
-                failure.class,
-                failure.vendor_status,
-                StatusCode::BAD_GATEWAY,
+        Some(SynthesisError::Vendor {
+            failure,
+            status: 429,
+            retry_after,
+        }) => {
+            // A vendor 429 that survived retries and fallback is a 429 with Retry-After, not a
+            // 502 (FRD-022 §6.6, TC-WR-07).
+            fail(&failure);
+            let mut resp = openai_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limit_error",
+                failure.message,
+                None,
+            );
+            let secs = retry_after
+                .or(fallback_limited)
+                .map(|d| d.as_secs().max(1))
+                .unwrap_or(1);
+            resp.headers_mut()
+                .insert(header::RETRY_AFTER, header::HeaderValue::from(secs));
+            Err(resp)
+        }
+        Some(SynthesisError::Saturated(failure)) => {
+            fail(&failure);
+            let mut resp = openai_error(
+                StatusCode::SERVICE_UNAVAILABLE,
                 "api_error",
                 failure.message,
                 None,
-            )
+            );
+            resp.headers_mut()
+                .insert(header::RETRY_AFTER, header::HeaderValue::from(1u64));
+            Err(resp)
         }
+        Some(e) if timed_out || e.failure().message.contains(CHAIN_DEADLINE_ELAPSED) => {
+            Err(deadline_exceeded())
+        }
+        Some(e) => {
+            fail(e.failure());
+            // 502, not 500: the failure is upstream of WaaV, and the distinction is what tells
+            // an operator whether to look at the vendor or at us.
+            Err(openai_error(
+                StatusCode::BAD_GATEWAY,
+                "api_error",
+                e.failure().message.clone(),
+                None,
+            ))
+        }
+        None => match primary_breaker {
+            Some(open) => {
+                spans.fail(BREAKER_OPEN_CLASS, None, "circuit breaker open");
+                Err(breaker_open_response(open))
+            }
+            None => Err(deadline_exceeded()),
+        },
     }
 }
 
@@ -1490,7 +1986,18 @@ async fn resolve_described_voice(
     advisories: &mut Advisories,
 ) -> Option<String> {
     let tts = endpoint.config.tts();
-    let descriptor = describing_voice(tts.voice_descriptor.as_ref())?;
+    resolve_described_voice_with(state, endpoint, tts.voice_descriptor.as_ref(), advisories).await
+}
+
+/// Resolve a voice DESCRIPTOR — the deployment's own, or on a cross-vendor fallback hop the
+/// PRIMARY's (FRD-022 §6.4 step 2) — against `endpoint`'s vendor catalog.
+async fn resolve_described_voice_with(
+    state: &Arc<AppState>,
+    endpoint: &bud_auth::credentials::VoiceEndpoint,
+    described: Option<&bud_auth::endpoint_config::VoiceDescriptor>,
+    advisories: &mut Advisories,
+) -> Option<String> {
+    let descriptor = describing_voice(described)?;
 
     let catalog = crate::handlers::voices::fetch_provider_catalog_with_key(
         state,
@@ -1727,6 +2234,21 @@ async fn transcription_inner(
         return model_not_found(&settings.endpoint, capability);
     };
 
+    // FRD-022 §6.2: the deployment's own rate limits and concurrency cap, before any vendor
+    // work. A refusal here is not a call either, so it opens no turn. The slot is held until the
+    // response is built.
+    let admission = match state.admit_deployment(&resolved.endpoint_id).await {
+        Ok(a) => a,
+        Err(rejection) => {
+            info!(
+                endpoint = %settings.endpoint,
+                retry_after_s = rejection.retry_after().as_secs(),
+                "transcription refused by the deployment's own limits"
+            );
+            return rejection.into_response();
+        }
+    };
+
     // The STT leg's span, mirroring the TTS one: opened as soon as the endpoint resolves, so
     // every failure after this is a failed call with a class (FRD-021 FR-4). `audio_seconds` is
     // the billing dimension for transcription exactly as `characters` is for synthesis, and is
@@ -1741,17 +2263,25 @@ async fn transcription_inner(
         (leg::STT_VENDOR, leg::STT_MODEL),
     )
     .await;
-    let ResolvedVoiceEndpoint { endpoint, .. } = resolved;
+    spans.record_text(
+        voice_attrs::resilience::RATE_LIMIT_OUTCOME,
+        Some(if admission.headers.is_some() {
+            "allow"
+        } else {
+            "unlimited"
+        }),
+    );
+    let ResolvedVoiceEndpoint {
+        endpoint_id,
+        endpoint,
+        ..
+    } = resolved;
 
     // The language that will actually be used, not just the one the request named: the request,
     // then the stt block's `language`, then the endpoint default (C1 — the precedence is
     // `settings_map::resolve_language`'s; the section outranks the endpoint default). Recorded
     // only when there is one: `""` is not NULL (FRD-021 GT-12).
-    let canonical_language = settings_map::resolve_language(
-        settings.language.as_deref(),
-        endpoint.language.as_deref(),
-        endpoint.config.stt().language.as_deref(),
-    );
+    let canonical_language = stt_language(&settings, &endpoint);
     spans.record_text(turn::LANGUAGE, canonical_language.as_deref());
     // What was uploaded, read from the bytes in hand — no decoding (FRD-021 §6.1, Phase 5).
     spans.record(turn::INPUT_AUDIO_BYTES, file_bytes.len() as i64);
@@ -1762,14 +2292,403 @@ async fn transcription_inner(
     if let Some(rate) = wav_sample_rate(&file_bytes) {
         spans.record(turn::SAMPLE_RATE, i64::from(rate));
     }
-    let stt_started = std::time::Instant::now();
-    // What the vendor request does, as its CLIENT span names it (CONTRACTS §1.2a).
-    let vendor_operation = if translate {
-        vendor_span::operation::TRANSLATION
-    } else {
-        vendor_span::operation::TRANSCRIPTION
-    };
 
+    let upload = SttUpload {
+        file: Bytes::from(file_bytes),
+        filename,
+        decoded: tokio::sync::OnceCell::new(),
+    };
+    let request = SttRequest {
+        settings: &settings,
+        capability,
+        translate,
+        // What the vendor request does, as its CLIENT span names it (CONTRACTS §1.2a).
+        vendor_operation: if translate {
+            vendor_span::operation::TRANSLATION
+        } else {
+            vendor_span::operation::TRANSCRIPTION
+        },
+        upload: &upload,
+        spans: &spans,
+        started: std::time::Instant::now(),
+    };
+    let mut response =
+        transcribe_resiliently(&state, &request, &endpoint_id, &endpoint, &advisories).await;
+    admission.apply(response.headers_mut());
+    response
+}
+
+/// The language a transcription on `endpoint` runs in: the request, then the deployment's stt
+/// block, then its default.
+fn stt_language(
+    settings: &transcription::TranscriptionSettings,
+    endpoint: &bud_auth::credentials::VoiceEndpoint,
+) -> Option<String> {
+    settings_map::resolve_language(
+        settings.language.as_deref(),
+        endpoint.language.as_deref(),
+        endpoint.config.stt().language.as_deref(),
+    )
+}
+
+/// The upload, shared by every hop: forwarded whole to an OpenAI-compatible deployment, decoded
+/// (once, on first need) for every other vendor.
+struct SttUpload {
+    file: Bytes,
+    filename: String,
+    decoded: tokio::sync::OnceCell<Result<waav_openai_audio::pcm::PcmAudio, DecodeFailure>>,
+}
+
+/// Why the upload could not be decoded.
+enum DecodeFailure {
+    /// A container WaaV cannot read, a truncated file, an Opus upload: the caller's audio.
+    Unreadable(AudioError),
+    /// The decode task itself failed: ours.
+    Task,
+}
+
+impl SttUpload {
+    /// Decode BEFORE touching a provider: a container we cannot read is the caller's problem and
+    /// must not cost a vendor connection to discover.
+    ///
+    /// On a blocking thread: an MP3 is decoded and resampled in full here — seconds of CPU for a
+    /// long recording — and on the async runtime that would stall every other request scheduled
+    /// on the same worker for as long as it took.
+    async fn decoded(&self) -> Result<&waav_openai_audio::pcm::PcmAudio, SttFailure> {
+        let decoded = self
+            .decoded
+            .get_or_init(|| async {
+                let (file, name) = (self.file.clone(), self.filename.clone());
+                match tokio::task::spawn_blocking(move || {
+                    waav_openai_audio::pcm::decode(&file, &name)
+                })
+                .await
+                {
+                    Ok(result) => result.map_err(DecodeFailure::Unreadable),
+                    Err(e) => {
+                        warn!(error = %e, "audio decode task failed");
+                        Err(DecodeFailure::Task)
+                    }
+                }
+            })
+            .await;
+        decoded.as_ref().map_err(|failure| match failure {
+            DecodeFailure::Unreadable(e) => SttFailure::Refused(PlanRefusal::classified(
+                VoiceErrorType::InputDecode,
+                e.to_string(),
+                translation_error(e),
+            )),
+            DecodeFailure::Task => SttFailure::Refused(PlanRefusal::classified(
+                VoiceErrorType::Internal,
+                "audio decode task failed",
+                openai_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "api_error",
+                    "the uploaded audio could not be decoded".to_string(),
+                    None,
+                ),
+            )),
+        })
+    }
+}
+
+/// What does not change between hops.
+struct SttRequest<'a> {
+    settings: &'a transcription::TranscriptionSettings,
+    capability: &'static str,
+    translate: bool,
+    vendor_operation: &'static str,
+    upload: &'a SttUpload,
+    spans: &'a VoiceSpans,
+    started: std::time::Instant,
+}
+
+/// One transcription attempt's failure.
+enum SttFailure {
+    /// The request as sent cannot be served by this deployment (bad upload, a setting it cannot
+    /// take): the caller's to fix on the primary, a reason to skip on a fallback.
+    Refused(PlanRefusal),
+    /// The vendor or the connection failed.
+    Vendor(VoiceFailure),
+}
+
+impl SttFailure {
+    fn verdict(&self) -> resil::classify::Verdict {
+        match self {
+            // Never retried, never failed over from: it would fail anywhere (FRD-022 §6.4).
+            SttFailure::Refused(_) => resil::classify::Verdict {
+                retryable: false,
+                failover: false,
+                breaker: resil::classify::BreakerSignal::Ignore,
+                caller_error: true,
+                retry_after: None,
+                vendor_concurrency: false,
+            },
+            SttFailure::Vendor(f) => {
+                match f
+                    .vendor_status
+                    .or_else(|| crate::core::deployment_policy::status_in(&f.message))
+                {
+                    Some(code) => resil::classify::classify(&resil::classify::Failure::Status {
+                        code,
+                        headers: None,
+                        body: Some(f.message.as_bytes()),
+                    }),
+                    None => crate::core::deployment_policy::classify_message(&f.message, None),
+                }
+            }
+        }
+    }
+}
+
+/// Transcribe on the primary with its retry policy, behind the circuit breakers, falling back
+/// through its fallback chain on a failover-eligible failure — all within one deadline
+/// (FRD-022 §6.3–6.5). The upload is already buffered, so a resend is free. A failure marks the
+/// turn failed with the response it returns.
+async fn transcribe_resiliently(
+    state: &Arc<AppState>,
+    req: &SttRequest<'_>,
+    primary_id: &str,
+    primary: &bud_auth::credentials::VoiceEndpoint,
+    advisories: &Advisories,
+) -> Response {
+    use crate::core::deployment_policy::{
+        DEFAULT_TRANSCRIPTION_DEADLINE, breaker_open_response, vendor_key,
+    };
+    use resil::retry::{RetryPolicy, retry};
+    use voice_attrs::{leg, resilience};
+
+    let policies = state.policies.clone();
+    // STT settings carry no request_timeout of their own; uploads can be long, so the route
+    // default bounds the chain.
+    let chain_limit = DEFAULT_TRANSCRIPTION_DEADLINE;
+    let deadline = tokio::time::Instant::now() + chain_limit;
+    let candidates: Vec<Arc<str>> = resil::fallback::expand(
+        primary_id,
+        |id| {
+            if id == primary_id {
+                primary.policy.fallback_models.clone()
+            } else {
+                state
+                    .fallback_voice_endpoint(id, req.capability)
+                    .map(|e| e.policy.fallback_models)
+                    .unwrap_or_default()
+            }
+        },
+        1 + resil::policy::MAX_FALLBACKS * 2,
+    );
+
+    let mut retries_total = 0u32;
+    let mut primary_failure: Option<SttFailure> = None;
+    let mut primary_breaker: Option<resil::breaker::Open> = None;
+    let mut fallback_limited: Option<std::time::Duration> = None;
+    let mut fallback_attempted = false;
+
+    for (hop, id) in candidates.iter().enumerate() {
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        let (endpoint, _hop_admission) = if hop == 0 {
+            (primary.clone(), None)
+        } else {
+            let Some(endpoint) = state.fallback_voice_endpoint(id, req.capability) else {
+                warn!(fallback = %id, "fallback deployment unknown or not serving {}; skipped", req.capability);
+                continue;
+            };
+            match state.admit_deployment(id).await {
+                Ok(a) => {
+                    fallback_attempted = true;
+                    (endpoint, Some(a))
+                }
+                Err(rejection) => {
+                    let wait = rejection.retry_after();
+                    fallback_limited = Some(fallback_limited.map_or(wait, |w| w.min(wait)));
+                    info!(fallback = %id, "fallback skipped: its own limit said no");
+                    continue;
+                }
+            }
+        };
+
+        let vkey = vendor_key(&endpoint.vendor, endpoint.api_base.as_deref());
+        if let Some(p) = &policies
+            && let Err(open) = p.breakers().check(id, &vkey)
+        {
+            info!(deployment = %id, retry_in_ms = open.retry_in.as_millis() as u64, "circuit open; hop skipped");
+            if hop == 0 {
+                primary_breaker = Some(open);
+            }
+            continue;
+        }
+
+        let retry_policy = endpoint
+            .policy
+            .retry_config
+            .as_ref()
+            .map(RetryPolicy::waav)
+            .unwrap_or_else(RetryPolicy::none);
+        let label: &str = if hop == 0 { &req.settings.endpoint } else { id };
+        let endpoint_ref = &endpoint;
+        let outcome = retry(
+            &retry_policy,
+            Some(deadline),
+            |_| async move {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                match tokio::time::timeout(
+                    remaining,
+                    transcribe_on(state, req, label, endpoint_ref, advisories),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err(SttFailure::Vendor(VoiceFailure::new(
+                        VoiceErrorType::Deadline,
+                        format!("transcription timed out: {CHAIN_DEADLINE_ELAPSED}"),
+                    ))),
+                }
+            },
+            |f: &SttFailure| f.verdict(),
+        )
+        .await;
+        retries_total += outcome.retries;
+
+        match outcome.result {
+            Ok(mut response) => {
+                if let Some(p) = &policies {
+                    p.breakers().record_success(id, &vkey);
+                }
+                req.spans
+                    .record(resilience::RETRY_COUNT, u64::from(retries_total));
+                req.spans
+                    .record_text(resilience::SERVED_ENDPOINT_ID, Some(&**id));
+                use crate::core::deployment_policy::{FALLBACK_HEADER, SERVED_ENDPOINT_HEADER};
+                if state.bud_mode.is_some()
+                    && let Ok(v) = header::HeaderValue::from_str(id)
+                {
+                    response.headers_mut().insert(SERVED_ENDPOINT_HEADER, v);
+                }
+                if hop > 0 {
+                    req.spans
+                        .record_text(resilience::FALLBACK_FROM, Some(primary_id));
+                    // The leg is the fallback's: its vendor and model.
+                    req.spans.record_vendor(
+                        leg::STT_VENDOR,
+                        leg::STT_MODEL,
+                        &endpoint.vendor,
+                        endpoint.model.as_deref(),
+                    );
+                    response
+                        .headers_mut()
+                        .insert(FALLBACK_HEADER, header::HeaderValue::from_static("true"));
+                }
+                return response;
+            }
+            Err(failure) => {
+                let verdict = failure.verdict();
+                if let Some(p) = &policies {
+                    p.breakers().record_failure(id, &vkey, &verdict);
+                }
+                if let SttFailure::Vendor(f) = &failure {
+                    warn!(deployment = %id, hop, error = %f, "transcription failed");
+                }
+                if hop == 0 {
+                    let surface = !verdict.failover;
+                    primary_failure = Some(failure);
+                    if surface {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    let spans = req.spans;
+    spans.record(resilience::RETRY_COUNT, u64::from(retries_total));
+    let deadline_exceeded = || {
+        let m = format!(
+            "transcription exceeded deployment '{}''s request_timeout of {}s",
+            req.settings.endpoint,
+            chain_limit.as_secs()
+        );
+        spans.fail(VoiceErrorType::Deadline, None, &m);
+        openai_error(StatusCode::GATEWAY_TIMEOUT, "api_error", m, None)
+    };
+    match primary_failure {
+        Some(SttFailure::Refused(refusal)) => refusal.fail_on(spans),
+        _ if fallback_limited.is_some()
+            && !fallback_attempted
+            && (primary_breaker.is_some()
+                || primary_failure
+                    .as_ref()
+                    .is_some_and(|f| f.verdict().failover)) =>
+        {
+            match primary_failure.as_ref() {
+                Some(SttFailure::Vendor(f)) => spans.fail(f.class, f.vendor_status, &f.message),
+                _ => spans.fail(
+                    BREAKER_OPEN_CLASS,
+                    None,
+                    "circuit breaker open, and every fallback was held back by its own limit",
+                ),
+            }
+            crate::core::deployment_policy::Rejection::Rate(resil::RateHeaders {
+                limit: 0,
+                remaining: 0,
+                reset: 0,
+                retry_after: fallback_limited.map(|d| d.as_secs().max(1)),
+            })
+            .into_response()
+        }
+        Some(SttFailure::Vendor(f)) if f.message.contains(CHAIN_DEADLINE_ELAPSED) => {
+            deadline_exceeded()
+        }
+        Some(SttFailure::Vendor(f)) => {
+            spans.fail(f.class, f.vendor_status, &f.message);
+            // A vendor 429 that survived retries and fallback is a 429, not a 502 (FRD-022 §6.6).
+            let status = f
+                .vendor_status
+                .or_else(|| crate::core::deployment_policy::status_in(&f.message));
+            if status == Some(429) {
+                let mut resp = openai_error(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "rate_limit_error",
+                    f.message,
+                    None,
+                );
+                let secs = fallback_limited.map(|d| d.as_secs().max(1)).unwrap_or(1);
+                resp.headers_mut()
+                    .insert(header::RETRY_AFTER, header::HeaderValue::from(secs));
+                return resp;
+            }
+            // 502, not 500: the failure is upstream of WaaV, and the distinction is what tells
+            // an operator whether to look at the vendor or at us. The class says which upstream
+            // failure.
+            openai_error(StatusCode::BAD_GATEWAY, "api_error", f.message, None)
+        }
+        None => match primary_breaker {
+            Some(open) => {
+                spans.fail(BREAKER_OPEN_CLASS, None, "circuit breaker open");
+                breaker_open_response(open)
+            }
+            None => deadline_exceeded(),
+        },
+    }
+}
+
+/// One transcription on one deployment. `Ok` is the finished response; its billing and signal
+/// attributes are recorded on the turn only then.
+async fn transcribe_on(
+    state: &Arc<AppState>,
+    req: &SttRequest<'_>,
+    label: &str,
+    endpoint: &bud_auth::credentials::VoiceEndpoint,
+    base_advisories: &Advisories,
+) -> Result<Response, SttFailure> {
+    use voice_attrs::{leg, turn};
+
+    let _ = state;
+    let settings = req.settings;
+    let spans = req.spans;
+    let capability = req.capability;
+    let mut advisories = base_advisories.clone();
     let api_key = endpoint.credential.clone().unwrap_or_default();
 
     // A self-hosted deployment already speaks this exact API, so the file is FORWARDED whole
@@ -1783,28 +2702,28 @@ async fn transcription_inner(
     let azure_openai = crate::core::tts::self_hosted::is_azure_openai(&endpoint.vendor);
     if azure_openai || crate::core::tts::self_hosted::is_self_hosted(&endpoint.vendor) {
         let Some(api_base) = endpoint.api_base.clone() else {
-            // Returned without marking the turn before FRD-021 (GT-9): a failure counted as a
-            // success.
-            return fail_call(
-                &spans,
-                VoiceErrorType::Config,
-                None,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "api_error",
-                format!(
-                    "Endpoint '{}' is {} but has no deployment URL configured",
-                    settings.endpoint,
-                    if azure_openai {
-                        "an Azure OpenAI deployment"
-                    } else {
-                        "self-hosted"
-                    }
-                ),
-                None,
+            let message = format!(
+                "Endpoint '{label}' is {} but has no deployment URL configured",
+                if azure_openai {
+                    "an Azure OpenAI deployment"
+                } else {
+                    "self-hosted"
+                }
             );
+            return Err(SttFailure::Refused(PlanRefusal::classified(
+                VoiceErrorType::Config,
+                message.clone(),
+                openai_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "api_error",
+                    message,
+                    None,
+                ),
+            )));
         };
+        let file_bytes = req.upload.file.to_vec();
         info!(
-            endpoint = %settings.endpoint,
+            endpoint = %label,
             capability,
             bytes = file_bytes.len(),
             "openai audio/transcriptions -> self-hosted passthrough"
@@ -1822,7 +2741,7 @@ async fn transcription_inner(
         let deployment = endpoint.model.clone().unwrap_or_default();
         let forwarded = if azure_openai {
             spans
-                .vendor_scope(vendor_operation)
+                .vendor_scope(req.vendor_operation)
                 .run(crate::handlers::transcribe::transcribe_azure_openai(
                     &endpoint.vendor,
                     &api_base,
@@ -1830,22 +2749,22 @@ async fn transcription_inner(
                     endpoint.provider_param("api_version"),
                     &api_key,
                     file_bytes,
-                    &filename,
-                    &settings,
+                    &req.upload.filename,
+                    settings,
                 ))
                 .instrument(spans.turn().clone())
                 .await
         } else {
             spans
-                .vendor_scope(vendor_operation)
+                .vendor_scope(req.vendor_operation)
                 .run(crate::handlers::transcribe::transcribe_self_hosted(
                     &endpoint.vendor,
                     &api_base,
                     &api_key,
                     &deployment,
                     file_bytes,
-                    &filename,
-                    &settings,
+                    &req.upload.filename,
+                    settings,
                 ))
                 .instrument(spans.turn().clone())
                 .await
@@ -1854,7 +2773,7 @@ async fn transcription_inner(
             Ok(answer) => {
                 spans.record(
                     leg::STT_DURATION_MS,
-                    stt_started.elapsed().as_millis() as u64,
+                    req.started.elapsed().as_millis() as u64,
                 );
                 // `audio_seconds` is the billing dimension for transcription. This branch
                 // forwards the upload verbatim and never decodes it, so the field the span
@@ -1865,6 +2784,7 @@ async fn transcription_inner(
                 if let Some(secs) = measured_secs {
                     spans.record(turn::AUDIO_SECONDS, secs);
                 }
+                // At the SERVED deployment's price (FRD-022 §6.4).
                 spans.record_cost(voice_cost(
                     endpoint.pricing.as_ref(),
                     capability,
@@ -1879,74 +2799,43 @@ async fn transcription_inner(
                     passthrough_language(&answer.body).as_deref(),
                 );
                 spans.record_text(turn::VENDOR_REQUEST_ID, answer.vendor_request_id.as_deref());
-                passthrough_response(&settings.response_format, answer.body, &advisories)
+                Ok(passthrough_response(
+                    &settings.response_format,
+                    answer.body,
+                    &advisories,
+                ))
             }
             Err(failure) => {
-                warn!(endpoint = %settings.endpoint, error = %failure, "self-hosted transcription failed");
-                fail_call(
-                    &spans,
-                    failure.class,
-                    failure.vendor_status,
-                    StatusCode::BAD_GATEWAY,
-                    "api_error",
-                    failure.message,
-                    None,
-                )
+                warn!(endpoint = %label, error = %failure, "self-hosted transcription failed");
+                Err(SttFailure::Vendor(failure))
             }
         };
     }
 
-    // Decode BEFORE touching the provider: a container we cannot read is the caller's problem
-    // and must not cost a vendor connection to discover.
-    //
-    // On a blocking thread: an MP3 is decoded and resampled in full here — seconds of CPU for a
-    // long recording — and on the async runtime that would stall every other request scheduled
-    // on the same worker for as long as it took.
-    let decode_name = filename.clone();
-    let decoded = tokio::task::spawn_blocking(move || {
-        waav_openai_audio::pcm::decode(&file_bytes, &decode_name)
-    })
-    .await;
-    let audio = match decoded {
-        Ok(Ok(a)) => a,
-        // A container WaaV cannot read, a truncated file, an Opus upload: the caller's audio.
-        Ok(Err(e)) => return fail_translation(&spans, VoiceErrorType::InputDecode, &e),
-        Err(e) => {
-            warn!(endpoint = %settings.endpoint, error = %e, "audio decode task failed");
-            return fail_call(
-                &spans,
-                VoiceErrorType::Internal,
-                None,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "api_error",
-                "the uploaded audio could not be decoded".to_string(),
-                None,
-            );
-        }
-    };
+    let audio = req.upload.decoded().await?.clone();
 
     if api_key.is_empty() && !crate::core::tts::self_hosted::is_self_hosted(&endpoint.vendor) {
-        // Returned without marking the turn before FRD-021 (GT-9).
-        return fail_call(
-            &spans,
-            VoiceErrorType::Config,
-            None,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "api_error",
-            format!(
-                "Endpoint '{}' has no credential configured for vendor '{}'",
-                settings.endpoint, endpoint.vendor
-            ),
-            None,
+        let message = format!(
+            "Endpoint '{label}' has no credential configured for vendor '{}'",
+            endpoint.vendor
         );
+        return Err(SttFailure::Refused(PlanRefusal::classified(
+            VoiceErrorType::Config,
+            message.clone(),
+            openai_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "api_error",
+                message,
+                None,
+            ),
+        )));
     }
-    if let Some(refusal) = endpoint_misconfiguration(&endpoint, &settings.endpoint, &mut advisories)
-    {
-        return refusal;
+    if let Some(refusal) = endpoint_misconfiguration(endpoint, label, &mut advisories) {
+        return Err(SttFailure::Refused(PlanRefusal::unclassified(refusal)));
     }
 
     info!(
-        endpoint = %settings.endpoint,
+        endpoint = %label,
         vendor = %endpoint.vendor,
         capability,
         secs = audio.duration_secs(),
@@ -1962,7 +2851,9 @@ async fn transcription_inner(
     );
 
     // FRD-018 Part III C1/C3 step 3, and language detection reconciled with it: see
-    // `settings_map::upload_language` for the rules.
+    // `settings_map::upload_language` for the rules. The language is this deployment's: a
+    // fallback's own defaults apply on a fallback hop.
+    let canonical_language = stt_language(settings, endpoint);
     let mapped_language = match settings_map::upload_language(
         &mut stt_settings,
         canonical_language.as_deref(),
@@ -1977,16 +2868,16 @@ async fn transcription_inner(
     ) {
         Ok(language) => language,
         Err(message) => {
-            // Returned without marking the turn before FRD-021 (GT-9).
-            return fail_call(
-                &spans,
+            return Err(SttFailure::Refused(PlanRefusal::classified(
                 VoiceErrorType::InvalidRequest,
-                None,
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                message,
-                Some("language_detection"),
-            );
+                message.clone(),
+                openai_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    message,
+                    Some("language_detection"),
+                ),
+            )));
         }
     };
 
@@ -2022,21 +2913,16 @@ async fn transcription_inner(
         &stt_settings,
         settings_map::translation_for(
             endpoint.config.translation.as_ref(),
-            translate,
+            req.translate,
             &mut advisories,
         ),
         &mut advisories,
     );
-    apply_request_stt_fields(
-        &mut std_config,
-        &settings,
-        &endpoint.vendor,
-        &mut advisories,
-    );
-    std_config.extras.0.extend(deployment_extras(&endpoint));
+    apply_request_stt_fields(&mut std_config, settings, &endpoint.vendor, &mut advisories);
+    std_config.extras.0.extend(deployment_extras(endpoint));
 
     match spans
-        .vendor_scope(vendor_operation)
+        .vendor_scope(req.vendor_operation)
         .run(crate::handlers::transcribe::transcribe_once_standard(
             &endpoint.vendor,
             std_config,
@@ -2048,11 +2934,12 @@ async fn transcription_inner(
         Ok(t) => {
             spans.record(
                 leg::STT_DURATION_MS,
-                stt_started.elapsed().as_millis() as u64,
+                req.started.elapsed().as_millis() as u64,
             );
             // The billing dimension, recorded on success only: set before the call, it counted
             // every refused transcription's audio as transcribed.
             spans.record(turn::AUDIO_SECONDS, audio.duration_secs());
+            // At the SERVED deployment's price (FRD-022 §6.4).
             spans.record_cost(voice_cost(
                 endpoint.pricing.as_ref(),
                 capability,
@@ -2073,7 +2960,7 @@ async fn transcription_inner(
             // byte-identical to one where the setting had worked.
             advisories.extend(t.config_warnings.clone());
             if t.truncated {
-                warn!(endpoint = %settings.endpoint, "returning a partial transcript");
+                warn!(endpoint = %label, "returning a partial transcript");
             }
             // The vendor's own measurement where it reports one; the decoder's otherwise.
             let duration = t.audio_duration.or_else(|| Some(audio.duration_secs()));
@@ -2081,7 +2968,7 @@ async fn transcription_inner(
                 &t.text,
                 &t.words,
                 duration,
-                &settings,
+                settings,
                 &endpoint.vendor,
                 &mut advisories,
             );
@@ -2102,7 +2989,7 @@ async fn transcription_inner(
             } else {
                 &[]
             };
-            render_transcription(
+            Ok(render_transcription(
                 &settings.response_format,
                 settings.translate,
                 &result,
@@ -2110,38 +2997,29 @@ async fn transcription_inner(
                 words,
                 &t.speakers,
                 &t.alternatives,
-            )
+            ))
         }
         Err(e) => {
-            warn!(endpoint = %settings.endpoint, error = %e, "transcription failed");
+            warn!(endpoint = %label, error = %e, "transcription failed");
             match e {
                 // The deployment cannot be served as configured: the caller's problem and
                 // fixable, so it is a 400 carrying the reason. Returning 502 here — as this
                 // path used to for everything — sends an operator to look at the vendor's
                 // status page for a model id they typed themselves.
                 crate::handlers::transcribe::TranscribeFailure::Configuration(failure) => {
-                    fail_call(
-                        &spans,
-                        failure.class,
-                        failure.vendor_status,
-                        StatusCode::BAD_REQUEST,
-                        "invalid_request_error",
-                        failure.message,
-                        Some("model"),
-                    )
+                    Err(SttFailure::Refused(PlanRefusal {
+                        failure: Some(failure.clone()),
+                        response: openai_error(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_request_error",
+                            failure.message,
+                            Some("model"),
+                        ),
+                    }))
                 }
-                // 502, not 500: the failure is upstream of WaaV, and the distinction is what
-                // tells an operator whether to look at the vendor or at us. The class says
-                // which upstream failure: a 429 and a 408 used to be one variant here.
-                crate::handlers::transcribe::TranscribeFailure::Upstream(failure) => fail_call(
-                    &spans,
-                    failure.class,
-                    failure.vendor_status,
-                    StatusCode::BAD_GATEWAY,
-                    "api_error",
-                    failure.message,
-                    None,
-                ),
+                crate::handlers::transcribe::TranscribeFailure::Upstream(failure) => {
+                    Err(SttFailure::Vendor(failure))
+                }
             }
         }
     }

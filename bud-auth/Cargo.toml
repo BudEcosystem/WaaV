@@ -37,6 +37,10 @@ pkcs1 = "0.7"
 pkcs8 = { version = "0.10", features = ["encryption", "pem"] }
 base64 = "0.22.0"
 
+# FRD-022: the deployment-settings contract (rate limits, concurrency, retry, fallback), parsed
+# exactly as budgateway parses model_table. Policy types only; no Redis adapter here.
+resil = { git = "https://github.com/BudEcosystem/resil", rev = "c3bba58ae2cad4636c9593d831f56524a81a7060" }
+
 async-trait = "0.1.88"
 thiserror = "2.0.12"
 tracing = "0.1"

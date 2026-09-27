@@ -38,6 +38,13 @@
       ]
     },
     {
+      "column": "rate_limit_outcome",
+      "attribute": "bud.rate_limit.outcome",
+      "roles": [
+        "turn"
+      ]
+    },
+    {
       "column": "user_id",
       "attribute": "bud.user_id",
       "roles": [
@@ -108,6 +115,13 @@
       ]
     },
     {
+      "column": "fallback_from_endpoint_id",
+      "attribute": "bud.voice.fallback_from",
+      "roles": [
+        "turn"
+      ]
+    },
+    {
       "column": "input_audio_bytes",
       "attribute": "bud.voice.input_audio_bytes",
       "roles": [
@@ -150,8 +164,22 @@
       ]
     },
     {
+      "column": "retry_count",
+      "attribute": "bud.voice.retry_count",
+      "roles": [
+        "turn"
+      ]
+    },
+    {
       "column": "sample_rate",
       "attribute": "bud.voice.sample_rate",
+      "roles": [
+        "turn"
+      ]
+    },
+    {
+      "column": "served_endpoint_id",
+      "attribute": "bud.voice.served_endpoint_id",
       "roles": [
         "turn"
       ]
