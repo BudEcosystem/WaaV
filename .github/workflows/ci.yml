@@ -86,6 +86,8 @@ jobs:
         # rust-cache keys may not contain commas, and one matrix entry has three.
         with: { workspaces: gateway, key: "features-${{ strategy.job-index }}" }
       - uses: ./.github/actions/native-deps
+      # core::onnx's unit tests load the runtime whatever the feature set.
+      - uses: ./.github/actions/onnxruntime
       - name: check
         run: cargo check ${{ matrix.features && format('--features {0}', matrix.features) || '' }}
       - name: unit tests
@@ -186,13 +188,7 @@ jobs:
       - uses: ./.github/actions/native-deps
       - name: install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
-      - name: provision ONNX Runtime (load-dynamic; BUILD.md Gotcha 6)
-        run: |
-          mkdir -p /tmp/nocuda
-          curl -fsSL -o /tmp/ort.tgz \
-            "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-${ORT_VERSION}.tgz"
-          tar -xzf /tmp/ort.tgz -C /tmp
-          echo "ORT_DYLIB_PATH=/tmp/onnxruntime-linux-x64-${ORT_VERSION}/lib/libonnxruntime.so" >> "$GITHUB_ENV"
+      - uses: ./.github/actions/onnxruntime
       - name: cargo llvm-cov (lib, production features)
         # Excludes #[ignore]/live_* by construction (no --ignored, lib targets only).
         run: |
@@ -263,13 +259,7 @@ jobs:
         with:
           path: ~/.cache/waav
           key: waav-models-v1
-      - name: provision ONNX Runtime (load-dynamic; BUILD.md Gotcha 6)
-        run: |
-          mkdir -p /tmp/nocuda
-          curl -fsSL -o /tmp/ort.tgz \
-            "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-${ORT_VERSION}.tgz"
-          tar -xzf /tmp/ort.tgz -C /tmp
-          echo "ORT_DYLIB_PATH=/tmp/onnxruntime-linux-x64-${ORT_VERSION}/lib/libonnxruntime.so" >> "$GITHUB_ENV"
+      - uses: ./.github/actions/onnxruntime
       - name: provision turn-detect model
         run: CACHE_PATH="$HOME/.cache/waav" cargo run --features turn-detect -- init || true
       # The accuracy tests now assert precision/recall/F1 + latency thresholds internally

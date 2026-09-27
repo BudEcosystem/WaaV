@@ -1,0 +1,16 @@
+name: ONNX Runtime
+description: >-
+  Downloads ONNX Runtime and points ORT_DYLIB_PATH at it. `ort` is built with load-dynamic
+  (BUILD.md Gotcha 6), so anything that LOADS a model, core::onnx's unit tests included,
+  panics without the shared library at run time. The version comes from the workflow's
+  ORT_VERSION.
+runs:
+  using: composite
+  steps:
+    - name: provision ONNX Runtime
+      shell: bash
+      run: |
+        curl -fsSL --retry 5 -o /tmp/ort.tgz \
+          "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-${ORT_VERSION}.tgz"
+        tar -xzf /tmp/ort.tgz -C /tmp
+        echo "ORT_DYLIB_PATH=/tmp/onnxruntime-linux-x64-${ORT_VERSION}/lib/libonnxruntime.so" >> "$GITHUB_ENV"
