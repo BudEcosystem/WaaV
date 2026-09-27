@@ -39,7 +39,7 @@ base64 = "0.22.0"
 
 # FRD-022: the deployment-settings contract (rate limits, concurrency, retry, fallback), parsed
 # exactly as budgateway parses model_table. Policy types only; no Redis adapter here.
-resil = { git = "https://github.com/BudEcosystem/resil", rev = "c3bba58ae2cad4636c9593d831f56524a81a7060" }
+resil = { git = "https://github.com/BudEcosystem/resil", rev = "9be62f18ac968cb98e4ccc621c42cd73e960f9ba" }
 
 async-trait = "0.1.88"
 thiserror = "2.0.12"

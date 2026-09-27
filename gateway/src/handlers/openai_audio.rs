@@ -957,7 +957,7 @@ async fn synthesize_resiliently(
             .policy
             .retry_config
             .as_ref()
-            .map(RetryPolicy::waav)
+            .map(RetryPolicy::interactive)
             .unwrap_or_else(RetryPolicy::none);
         let std_config = plan.std_config;
         let text = settings.text.as_str();
@@ -2524,7 +2524,7 @@ async fn transcribe_resiliently(
             .policy
             .retry_config
             .as_ref()
-            .map(RetryPolicy::waav)
+            .map(RetryPolicy::interactive)
             .unwrap_or_else(RetryPolicy::none);
         let label: &str = if hop == 0 { &req.settings.endpoint } else { id };
         let endpoint_ref = &endpoint;

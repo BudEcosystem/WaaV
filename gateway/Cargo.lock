@@ -5492,7 +5492,7 @@ dependencies = [
 [[package]]
 name = "resil"
 version = "0.1.0"
-source = "git+https://github.com/BudEcosystem/resil?rev=c3bba58ae2cad4636c9593d831f56524a81a7060#c3bba58ae2cad4636c9593d831f56524a81a7060"
+source = "git+https://github.com/BudEcosystem/resil?rev=9be62f18ac968cb98e4ccc621c42cd73e960f9ba#9be62f18ac968cb98e4ccc621c42cd73e960f9ba"
 dependencies = [
  "arc-swap",
  "dashmap",
