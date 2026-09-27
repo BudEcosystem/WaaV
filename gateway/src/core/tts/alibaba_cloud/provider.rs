@@ -63,8 +63,6 @@ use crate::core::tts::base::{
 #[allow(dead_code)]
 const PROVIDER_INFO: &str = "Alibaba Cloud DashScope TTS (阿里云)";
 
-/// WebSocket connection timeout.
-
 /// Channel buffer size for text messages.
 const TEXT_CHANNEL_BUFFER: usize = 32;
 

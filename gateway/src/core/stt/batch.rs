@@ -40,7 +40,7 @@ const BATCH_CALLBACK_URL_SCHEMES: &[&str] = &["http", "https"];
 pub const MAX_BATCH_INLINE_AUDIO_BYTES: usize = 25 * 1024 * 1024;
 /// JSON body budget for base64 inline audio plus envelope overhead.
 pub const BATCH_JSON_BODY_LIMIT_BYTES: usize =
-    ((MAX_BATCH_INLINE_AUDIO_BYTES + 2) / 3) * 4 + (1024 * 1024);
+    MAX_BATCH_INLINE_AUDIO_BYTES.div_ceil(3) * 4 + (1024 * 1024);
 
 // =============================================================================
 // Envelope
@@ -911,7 +911,7 @@ pub(crate) fn decode_inline_batch_audio_with_limit(
         .take_while(|&&b| b == b'=')
         .count()
         .min(2);
-    let decoded_upper_bound = ((payload.len() + 3) / 4) * 3 - padding;
+    let decoded_upper_bound = payload.len().div_ceil(4) * 3 - padding;
     if decoded_upper_bound > max_decoded_bytes {
         return Err(format!(
             "inline batch audio exceeds decoded size limit of {max_decoded_bytes} bytes"

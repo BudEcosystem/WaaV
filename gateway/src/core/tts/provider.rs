@@ -259,6 +259,12 @@ pub struct TTSProvider {
     previous_text: Arc<RwLock<Option<String>>>,
 }
 
+impl Default for TTSProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TTSProvider {
     /// Create a new HTTP-based TTS provider instance
     pub fn new() -> Self {

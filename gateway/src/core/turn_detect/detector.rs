@@ -271,8 +271,8 @@ mod tests {
 
     #[test]
     fn test_normalization_regexes_compile_without_unwrap() {
-        assert!(matches!(&*PUNCT_REGEX, Ok(_)));
-        assert!(matches!(&*WHITESPACE_REGEX, Ok(_)));
+        assert!(PUNCT_REGEX.is_ok());
+        assert!(WHITESPACE_REGEX.is_ok());
     }
 
     #[test]

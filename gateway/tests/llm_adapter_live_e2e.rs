@@ -11,6 +11,14 @@
 //! second turn proving history threading — the full B-G1 live gate from
 //! PIPECAT_FIX_PLAN §2.
 
+// `ollama_serial_lock` is held across each test's awaits on purpose: each
+// #[tokio::test] owns its runtime and thread, so a blocked lock() stalls only that
+// thread, never the task holding the guard.
+#![allow(
+    clippy::await_holding_lock,
+    reason = "test serialisation lock deliberately held across awaits; see comment"
+)]
+
 use std::sync::{Arc, Mutex};
 
 use tokio_util::sync::CancellationToken;
@@ -42,11 +50,6 @@ fn openai_key() -> Option<String> {
     }
 }
 
-/// LIVE (OpenAI, key-gated): a REASONING model (gpt-5-mini) must round-trip
-/// through WaaV's OpenAI adapter — this is the regression for the
-/// `max_tokens`→`max_completion_tokens` shape (reasoning models 400 on
-/// `max_tokens`; live-caught). Validates the fast tier + the two-tier shape too.
-
 /// Serializes the live-ollama tests: two reasoning-LLM generations racing each other (and the
 /// build load on this box) starve the shared local ollama past the adapter timeout — a pure
 /// resource-contention flake, not a product bug. One at a time is deterministic. Poison-tolerant.
@@ -56,6 +59,10 @@ fn ollama_serial_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// LIVE (OpenAI, key-gated): a REASONING model (gpt-5-mini) must round-trip
+/// through WaaV's OpenAI adapter — this is the regression for the
+/// `max_tokens`→`max_completion_tokens` shape (reasoning models 400 on
+/// `max_tokens`; live-caught). Validates the fast tier + the two-tier shape too.
 #[tokio::test]
 async fn openai_reasoning_model_live_round_trip() {
     let _serial = ollama_serial_lock();

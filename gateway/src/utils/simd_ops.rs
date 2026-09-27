@@ -504,8 +504,8 @@ pub fn pcm_to_float_simd(pcm: &[u8]) -> Vec<f32> {
 
     // First convert bytes to i16 then to f32 (scalar - SIMD int conversion is complex)
     let mut samples: Vec<f32> = Vec::with_capacity(sample_count);
-    for chunk in pcm.chunks_exact(2) {
-        let sample = i16::from_le_bytes([chunk[0], chunk[1]]) as f32;
+    for chunk in pcm.as_chunks::<2>().0 {
+        let sample = i16::from_le_bytes(*chunk) as f32;
         samples.push(sample);
     }
 
@@ -1076,8 +1076,8 @@ pub fn copy_to_tensor_simd(src: &[f32], dst: &mut [f32]) -> Result<(), TensorCop
 #[allow(dead_code)]
 pub fn pcm_to_float_scalar(pcm: &[u8]) -> Vec<f32> {
     let mut output = Vec::with_capacity(pcm.len() / 2);
-    for chunk in pcm.chunks_exact(2) {
-        let sample = i16::from_le_bytes([chunk[0], chunk[1]]) as f32;
+    for chunk in pcm.as_chunks::<2>().0 {
+        let sample = i16::from_le_bytes(*chunk) as f32;
         output.push((sample * PCM_TO_FLOAT_SCALE).clamp(-1.0, 1.0));
     }
     output

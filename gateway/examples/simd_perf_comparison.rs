@@ -624,8 +624,8 @@ fn compare_accuracy(a: &[f32], b: &[f32]) -> (bool, f32, f64) {
 fn pcm_to_float_scalar(pcm: &[u8]) -> Vec<f32> {
     let sample_count = pcm.len() / 2;
     let mut output = Vec::with_capacity(sample_count);
-    for chunk in pcm.chunks_exact(2) {
-        let sample = i16::from_le_bytes([chunk[0], chunk[1]]) as f32;
+    for chunk in pcm.as_chunks::<2>().0 {
+        let sample = i16::from_le_bytes(*chunk) as f32;
         output.push((sample * PCM_TO_FLOAT_SCALE).clamp(-1.0, 1.0));
     }
     output

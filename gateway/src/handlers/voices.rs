@@ -15,7 +15,7 @@ const MAX_VOICE_CLONE_SAMPLE_BYTES: usize = 25 * 1024 * 1024;
 const MAX_VOICE_CLONE_TOTAL_AUDIO_BYTES: usize = 250 * 1024 * 1024;
 /// JSON body budget for base64 clone samples plus request metadata.
 pub const VOICE_CLONE_JSON_BODY_LIMIT_BYTES: usize =
-    ((MAX_VOICE_CLONE_TOTAL_AUDIO_BYTES + 2) / 3) * 4 + (1024 * 1024);
+    MAX_VOICE_CLONE_TOTAL_AUDIO_BYTES.div_ceil(3) * 4 + (1024 * 1024);
 
 fn voice_handler_http_client() -> Result<reqwest::Client, reqwest::Error> {
     crate::core::net::ssrf_protected_client_builder(crate::core::net::HTTP_URL_SCHEMES).build()

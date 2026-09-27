@@ -400,8 +400,8 @@ impl GroqSTT {
         let sample_count = audio_data.len() / 2;
 
         // Process PCM 16-bit little-endian samples
-        for chunk in audio_data.chunks_exact(2) {
-            let sample = i16::from_le_bytes([chunk[0], chunk[1]]) as f32 * PCM_TO_FLOAT_SCALE;
+        for chunk in audio_data.as_chunks::<2>().0 {
+            let sample = i16::from_le_bytes(*chunk) as f32 * PCM_TO_FLOAT_SCALE;
             sum_squares += sample * sample;
         }
 

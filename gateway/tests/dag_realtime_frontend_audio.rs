@@ -659,8 +659,10 @@ async fn real_audio_drives_frontend_into_realtime_dag_node() {
     // Count how many 16-bit samples the model changed — full DeepFilterNet processing
     // rewrites essentially the whole buffer; a stub / pass-through changes nothing.
     let changed_samples = raw_utterance
-        .chunks_exact(2)
-        .zip(denoised_utterance.chunks_exact(2))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .zip(denoised_utterance.as_chunks::<2>().0)
         .filter(|(a, b)| a != b)
         .count();
     let total_samples = raw_utterance.len() / 2;

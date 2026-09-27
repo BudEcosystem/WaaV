@@ -414,10 +414,10 @@ fn parse_args_object(arguments: &str) -> Value {
     })
 }
 
-fn request_body_object_mut<'a>(
-    body: &'a mut Value,
+fn request_body_object_mut(
+    body: &mut Value,
     adapter: AdapterKind,
-) -> Option<&'a mut serde_json::Map<String, Value>> {
+) -> Option<&mut serde_json::Map<String, Value>> {
     let obj = body.as_object_mut();
     if obj.is_none() {
         tracing::error!(

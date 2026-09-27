@@ -102,8 +102,7 @@ async fn silero_vad_inference_latency() -> Result<()> {
     // Silero processes 512-sample (32 ms) frames at 16 kHz.
     let audio = synth(SR); // 1 s → ~31 frames
     let mut per_frame = Vec::new();
-    let mut i = 0usize;
-    for frame in audio.chunks(512) {
+    for (i, frame) in audio.chunks(512).enumerate() {
         if frame.len() < 512 {
             break;
         }
@@ -113,7 +112,6 @@ async fn silero_vad_inference_latency() -> Result<()> {
         if i >= 5 {
             per_frame.push(us);
         }
-        i += 1;
     }
     let n = per_frame.len();
     println!("\n=== SILERO-VAD per-frame (512-sample / 32ms) inference latency (n={n}) ===");
