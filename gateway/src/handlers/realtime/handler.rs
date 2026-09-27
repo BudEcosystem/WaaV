@@ -589,6 +589,43 @@ async fn handle_config(
     app_state: &Arc<AppState>,
     trace_parent: &str,
 ) -> bool {
+    // F-2 (FRD-023 WP-RT0.5): one config per session, as on `/ws`. A second config used to replace
+    // the provider without `disconnect()`, leaking the first upstream socket and its tasks.
+    if realtime_provider.is_some() {
+        warn!("Rejecting a second config on an already-configured realtime session");
+        send_realtime_with_policy(
+            message_tx,
+            RealtimeMessageRoute::Outgoing(RealtimeOutgoingMessage::Error {
+                code: Some("session_already_configured".to_string()),
+                message: "Session already configured — open a new connection to reconfigure \
+                          (one config message per session)"
+                    .to_string(),
+            }),
+        )
+        .await;
+        return true;
+    }
+
+    // FRD-023 RT0 (X-3): under the Bud control plane this native path would otherwise spend the
+    // PROCESS's vendor key for whichever tenant connected. Bud deployments are served by the
+    // OpenAI-compatible `/v1/realtime?model=<deployment>`, which takes the deployment's own
+    // credential from `voice_table`.
+    if app_state.bud_mode.is_some() {
+        warn!("Refusing a native realtime config in Bud mode");
+        send_realtime_with_policy(
+            message_tx,
+            RealtimeMessageRoute::Outgoing(RealtimeOutgoingMessage::Error {
+                code: Some("deployment_required".to_string()),
+                message: "This gateway serves Bud deployments: connect to \
+                          /v1/realtime?model=<your realtime deployment> (OpenAI Realtime \
+                          protocol) instead of sending a native config (FRD-023)."
+                    .to_string(),
+            }),
+        )
+        .await;
+        return true;
+    }
+
     // P3: resolve a server-side ALIAS into the session config BEFORE the provider /
     // credential is selected. Definitions are server-config-only (SSRF-safe); explicit
     // client fields win. Unknown alias is non-fatal (proceed + advisory). This mirrors
@@ -1387,5 +1424,154 @@ mod tests {
                 result.err()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod frd023_native_tests {
+    //! TC-SEC-05 / TC-SEC-08 on the native `/realtime` path.
+    use super::*;
+    use crate::core::realtime::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct ConnectedRt(Arc<AtomicBool>);
+
+    #[async_trait::async_trait]
+    impl BaseRealtime for ConnectedRt {
+        fn new(_c: RealtimeConfig) -> RealtimeResult<Self> {
+            unreachable!()
+        }
+        async fn connect(&mut self) -> RealtimeResult<()> {
+            Ok(())
+        }
+        async fn disconnect(&mut self) -> RealtimeResult<()> {
+            self.0.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        fn is_ready(&self) -> bool {
+            true
+        }
+        fn get_connection_state(&self) -> ConnectionState {
+            ConnectionState::Connected
+        }
+        async fn send_audio(&mut self, _a: bytes::Bytes) -> RealtimeResult<()> {
+            Ok(())
+        }
+        async fn send_text(&mut self, _t: &str) -> RealtimeResult<()> {
+            Ok(())
+        }
+        async fn create_response(&mut self) -> RealtimeResult<()> {
+            Ok(())
+        }
+        async fn cancel_response(&mut self) -> RealtimeResult<()> {
+            Ok(())
+        }
+        async fn commit_audio_buffer(&mut self) -> RealtimeResult<()> {
+            Ok(())
+        }
+        async fn clear_audio_buffer(&mut self) -> RealtimeResult<()> {
+            Ok(())
+        }
+        fn on_transcript(&mut self, _c: TranscriptCallback) -> RealtimeResult<()> {
+            Ok(())
+        }
+        fn on_audio(&mut self, _c: AudioOutputCallback) -> RealtimeResult<()> {
+            Ok(())
+        }
+        fn on_error(&mut self, _c: RealtimeErrorCallback) -> RealtimeResult<()> {
+            Ok(())
+        }
+        fn on_function_call(&mut self, _c: FunctionCallCallback) -> RealtimeResult<()> {
+            Ok(())
+        }
+        fn on_speech_event(&mut self, _c: SpeechEventCallback) -> RealtimeResult<()> {
+            Ok(())
+        }
+        fn on_response_done(&mut self, _c: ResponseDoneCallback) -> RealtimeResult<()> {
+            Ok(())
+        }
+        fn on_reconnection(&mut self, _c: ReconnectionCallback) -> RealtimeResult<()> {
+            Ok(())
+        }
+        async fn update_session(&mut self, _c: RealtimeConfig) -> RealtimeResult<()> {
+            Ok(())
+        }
+        async fn submit_function_result(&mut self, _id: &str, _r: &str) -> RealtimeResult<()> {
+            Ok(())
+        }
+        fn get_provider_info(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+    }
+
+    fn config(provider: &str) -> RealtimeSessionConfig {
+        serde_json::from_value(serde_json::json!({"provider": provider})).expect("config")
+    }
+
+    fn error_code(rx: &mut mpsc::Receiver<RealtimeMessageRoute>) -> Option<String> {
+        match rx.try_recv() {
+            Ok(RealtimeMessageRoute::Outgoing(RealtimeOutgoingMessage::Error { code, .. })) => code,
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn tc_sec_05_native_config_in_bud_mode_never_reads_process_keys() {
+        let mut cfg = crate::test_support::minimal_config();
+        cfg.openai_api_key = Some("sk-canary".to_string());
+        let mut app_state = AppState::new(cfg).await;
+        let bud = crate::test_support::bud_state(&[]).await;
+        Arc::get_mut(&mut app_state).unwrap().bud_mode = bud.bud_mode.clone();
+
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut provider: Option<Box<dyn BaseRealtime>> = None;
+        let mut session_id = None;
+
+        handle_config(
+            config("openai"),
+            &mut provider,
+            &mut session_id,
+            &tx,
+            &app_state,
+            "",
+        )
+        .await;
+
+        assert_eq!(error_code(&mut rx).as_deref(), Some("deployment_required"));
+        assert!(
+            provider.is_none(),
+            "no upstream provider may be built in Bud mode"
+        );
+        assert!(session_id.is_none());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn tc_sec_08_a_second_config_is_refused_and_the_first_provider_kept() {
+        let app_state = AppState::new(crate::test_support::minimal_config()).await;
+        let disconnected = Arc::new(AtomicBool::new(false));
+        let mut provider: Option<Box<dyn BaseRealtime>> =
+            Some(Box::new(ConnectedRt(Arc::clone(&disconnected))));
+        let mut session_id = Some("sess-1".to_string());
+        let (tx, mut rx) = mpsc::channel(8);
+
+        handle_config(
+            config("openai"),
+            &mut provider,
+            &mut session_id,
+            &tx,
+            &app_state,
+            "",
+        )
+        .await;
+
+        assert_eq!(
+            error_code(&mut rx).as_deref(),
+            Some("session_already_configured")
+        );
+        assert!(provider.is_some(), "the first provider is still in place");
+        assert!(!disconnected.load(Ordering::SeqCst), "and still connected");
+        assert_eq!(session_id.as_deref(), Some("sess-1"));
     }
 }

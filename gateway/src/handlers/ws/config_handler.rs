@@ -188,6 +188,17 @@ pub async fn handle_config_message(
         }
     }
 
+    // FRD-023 RT0 (X-1, X-2): in Bud mode a client never chooses where a platform-side call goes
+    // or which credential it carries. Refused before anything is built, so nothing is dialled.
+    if app_state.bud_mode.is_some()
+        && let Some(refusal) =
+            bud_mode_config_refusal(conversation_ws_config.as_ref(), dag_ws_config.as_ref())
+    {
+        warn!(reason = %refusal, "Refusing a Bud-mode /ws config");
+        send_error(message_tx, refusal).await;
+        return true;
+    }
+
     // P3: resolve a server-side ALIAS into the session config BEFORE any provider
     // construction. The alias supplies DEFAULTS; explicit client fields above always
     // win (handled inside `splice_alias`). Definitions are server-config-only, so the
@@ -616,6 +627,55 @@ pub async fn handle_config_message(
     );
 
     true
+}
+
+/// What a Bud-mode `/ws` config may not carry (FRD-023 RT0, FR-WS-2, FR-WS-3), or `None`.
+///
+/// * `conversation_config.base_url` / `api_key` / `reasoning_base_url` / `reasoning_api_key` — the
+///   voice agent's LLM leg is a Bud chat deployment reached through budgateway with the caller's
+///   own credential (RT6). A client-chosen host with the key omitted used to receive the
+///   platform's `OPENAI_API_KEY` (X-1).
+/// * an inline `dag_config.definition` — its nodes could carry literal keys or `${VAR}`
+///   references (X-2). Server templates are the Bud-mode DAG.
+pub(crate) fn bud_mode_config_refusal(
+    conversation: Option<&ConversationWebSocketConfig>,
+    dag: Option<&DAGWebSocketConfig>,
+) -> Option<String> {
+    if let Some(conv) = conversation {
+        let mut fields: Vec<&str> = Vec::new();
+        if !conv.base_url.trim().is_empty() {
+            fields.push("base_url");
+        }
+        if conv
+            .api_key
+            .as_deref()
+            .is_some_and(|k| !k.trim().is_empty())
+        {
+            fields.push("api_key");
+        }
+        if conv.reasoning_base_url.is_some() {
+            fields.push("reasoning_base_url");
+        }
+        if conv.reasoning_api_key.is_some() {
+            fields.push("reasoning_api_key");
+        }
+        if !fields.is_empty() {
+            return Some(format!(
+                "conversation_config.{} is not accepted by this gateway. The voice agent's LLM leg \
+                 is a Bud chat deployment reached through the Bud gateway with your own \
+                 credential: remove the field and name the deployment in `model` (FRD-023 RT6).",
+                fields.join(", conversation_config.")
+            ));
+        }
+    }
+    if dag.is_some_and(|d| d.definition.is_some()) {
+        return Some(
+            "dag_config.definition is not accepted by this gateway: an inline DAG can carry vendor \
+             credentials of its own. Use a server template (dag_config.template) (FRD-023 RT0)."
+                .to_string(),
+        );
+    }
+    None
 }
 
 /// Initialize the built-in conversation loop for a session (plan W-O2).
@@ -1273,6 +1333,26 @@ async fn resolve_provider_api_key(
                  Vendor credentials are owned by the control plane and resolved here; remove \
                  the field. To address a specific deployment's credential, call POST \
                  /v1/audio/speech with `model` set to your Bud endpoint name."
+            )
+        }
+        // FRD-023 RT0 (X-4): under the Bud control plane a socket leg NEVER uses a key from the
+        // process configuration — that key is the platform's, and every tenant would spend it
+        // unattributed. The leg's credential comes from the deployment it addresses (RT6).
+        None if !allow_client_keys => {
+            warn!(
+                provider = %provider,
+                role = %role,
+                "Refused a provider-only socket leg: no process vendor keys in Bud mode"
+            );
+            format!(
+                "{role}_config names provider '{provider}' but no Bud deployment. This gateway \
+                 serves Bud deployments only: set {role}_config.model to the name of your {kind} \
+                 deployment and its credential is used (FRD-023 RT6).",
+                kind = if role == "stt" {
+                    "transcription"
+                } else {
+                    "text-to-speech"
+                },
             )
         }
         None => match config.get_api_key(provider) {
@@ -3452,8 +3532,11 @@ mod tests {
         assert!(next_error(&mut rx).is_none(), "BYOK is not an error");
     }
 
+    /// TC-SEC-06 (FRD-023 X-4). This test used to assert the opposite — that an empty client key
+    /// under Bud mode fell back to the SERVER's vendor key. That fallback is the exposure: every
+    /// tenant spent the platform key, unattributed.
     #[tokio::test]
-    async fn test_empty_client_api_key_falls_back_under_bud_mode() {
+    async fn tc_sec_06_empty_client_key_under_bud_mode_never_reaches_the_process_key() {
         let (tx, mut rx) = mpsc::channel(4);
         let empty = String::new();
 
@@ -3467,22 +3550,49 @@ mod tests {
         )
         .await;
 
-        assert_eq!(key.as_deref(), Some("dg-server-key"));
+        assert_eq!(key, None, "the process's deepgram key was used in Bud mode");
+        let message = next_error(&mut rx).expect("the refusal must reach the client");
         assert!(
-            next_error(&mut rx).is_none(),
-            "an empty key bypasses nothing and must not fail the session"
+            message.contains("stt_config.model"),
+            "must say how to address a deployment: {message}"
         );
+        assert!(!message.contains("dg-server-key"));
     }
 
     #[tokio::test]
-    async fn test_absent_client_api_key_falls_back_under_bud_mode() {
+    async fn tc_sec_06_absent_client_key_under_bud_mode_never_reaches_the_process_key() {
+        for role in ["stt", "tts"] {
+            let (tx, mut rx) = mpsc::channel(4);
+
+            let key = resolve_provider_api_key(
+                None,
+                "deepgram",
+                role,
+                false,
+                &config_with_deepgram_key(),
+                &tx,
+            )
+            .await;
+
+            assert_eq!(
+                key, None,
+                "the process's vendor key was used for a Bud-mode {role} leg"
+            );
+            let message = next_error(&mut rx).expect("the refusal must reach the client");
+            assert!(message.contains("FRD-023"), "{message}");
+            assert!(!message.contains("dg-server-key"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_absent_client_key_falls_back_to_server_config_in_standalone_mode() {
         let (tx, mut rx) = mpsc::channel(4);
 
         let key = resolve_provider_api_key(
             None,
             "deepgram",
             "stt",
-            false,
+            true,
             &config_with_deepgram_key(),
             &tx,
         )
@@ -3500,7 +3610,7 @@ mod tests {
             None,
             "elevenlabs",
             "tts",
-            false,
+            true,
             &config_with_deepgram_key(),
             &tx,
         )
@@ -3669,5 +3779,99 @@ mod tests {
         assert_eq!(stt.sample_rate, 48_000, "44100 → 48000");
         assert_eq!(tts.client_playback_rate, Some(48_000), "44100 → 48000");
         assert_eq!(tts.audio_out_chunk_ms, Some(20), "15ms → 20ms opus frame");
+    }
+}
+
+#[cfg(test)]
+mod frd023_bud_mode_tests {
+    //! TC-SEC-01 / TC-SEC-03: a Bud-mode `/ws` config never chooses a platform-side host or key.
+    use super::*;
+    use crate::handlers::ws::state::ConnectionState;
+
+    fn conversation(extra: serde_json::Value) -> ConversationWebSocketConfig {
+        let mut base = serde_json::json!({"base_url": "", "model": "chat-deployment"});
+        for (k, v) in extra.as_object().unwrap() {
+            base[k] = v.clone();
+        }
+        serde_json::from_value(base).expect("conversation config")
+    }
+
+    #[test]
+    fn tc_sec_01_client_llm_endpoint_and_keys_are_refused() {
+        for (field, value) in [
+            ("base_url", serde_json::json!("https://attacker.example/v1")),
+            ("api_key", serde_json::json!("sk-caller")),
+            (
+                "reasoning_base_url",
+                serde_json::json!("https://attacker.example/v1"),
+            ),
+            ("reasoning_api_key", serde_json::json!("sk-caller")),
+        ] {
+            let conv = conversation(serde_json::json!({ field: value }));
+            let refusal = bud_mode_config_refusal(Some(&conv), None)
+                .unwrap_or_else(|| panic!("{field} was accepted in Bud mode"));
+            assert!(refusal.contains(field), "must name {field}: {refusal}");
+            assert!(refusal.contains("FRD-023 RT6"), "{refusal}");
+            assert!(!refusal.contains("sk-caller"), "a key must not be echoed");
+        }
+    }
+
+    #[test]
+    fn a_conversation_naming_only_a_deployment_is_not_refused() {
+        assert!(
+            bud_mode_config_refusal(Some(&conversation(serde_json::json!({}))), None).is_none()
+        );
+    }
+
+    #[test]
+    fn tc_sec_03_inline_dag_definitions_are_refused() {
+        let dag: DAGWebSocketConfig =
+            serde_json::from_value(serde_json::json!({"definition": {"nodes": []}})).unwrap();
+        let refusal = bud_mode_config_refusal(None, Some(&dag)).expect("refused");
+        assert!(refusal.contains("dag_config.definition"), "{refusal}");
+
+        let template: DAGWebSocketConfig =
+            serde_json::from_value(serde_json::json!({"template": "support-agent"})).unwrap();
+        assert!(bud_mode_config_refusal(None, Some(&template)).is_none());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn tc_sec_01_handle_config_refuses_before_building_anything() {
+        let app_state = crate::test_support::bud_state(&[]).await;
+        let state = Arc::new(RwLock::new(ConnectionState::new()));
+        let (tx, mut rx) = mpsc::channel(8);
+        let conv = conversation(serde_json::json!({"base_url": "https://attacker.example/v1"}));
+
+        let keep_open = handle_config_message(
+            None,
+            Some(false),
+            None,
+            None,
+            None,
+            None,
+            Some(conv),
+            None,
+            &state,
+            &tx,
+            &app_state,
+        )
+        .await;
+
+        assert!(
+            keep_open,
+            "a refused config is an error frame, not a dropped socket"
+        );
+        match rx.try_recv() {
+            Ok(MessageRoute::Outgoing(OutgoingMessage::Error { message })) => {
+                assert!(message.contains("FRD-023 RT6"), "{message}")
+            }
+            other => panic!("expected an error frame, got {other:?}"),
+        }
+        let guard = state.read().await;
+        assert!(
+            guard.stream_id.is_none() && guard.voice_manager.is_none(),
+            "nothing was built"
+        );
     }
 }

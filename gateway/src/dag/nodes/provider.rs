@@ -34,7 +34,30 @@ use crate::dag::error::{DAGError, DAGResult};
 /// Without this, STT/TTS provider nodes built `STTConfig`/`TTSConfig` with an EMPTY `api_key`, so a
 /// DAG could never authenticate to a real vendor — the node failed with "API key is required".
 pub(crate) fn resolve_node_credential(config: &serde_json::Value, field: &str) -> Option<String> {
+    resolve_node_credential_with(config, field, crate::auth::bud_mode::process_in_bud_mode())
+}
+
+/// [`resolve_node_credential`] with Bud mode explicit, so the rule is testable without a
+/// process-wide flag.
+///
+/// FRD-023 RT0 (X-2): in Bud mode a DAG node carries NO credential of its own — neither a literal
+/// key (a tenant's BYOK that bypasses attribution, quota and billing) nor a `${VAR}` reference
+/// (the platform's key, spent on behalf of whoever wrote the node). Vendor credentials come from
+/// the Bud deployment the node addresses.
+pub(crate) fn resolve_node_credential_with(
+    config: &serde_json::Value,
+    field: &str,
+    bud_mode: bool,
+) -> Option<String> {
     let raw = config.get(field)?.as_str()?;
+    if bud_mode {
+        warn!(
+            field = %field,
+            "DAG node config: refused a node-level credential; in Bud mode vendor credentials \
+             come from the addressed deployment (FRD-023 RT0)"
+        );
+        return None;
+    }
     if let Some(var) = raw.strip_prefix("${").and_then(|s| s.strip_suffix('}')) {
         let looks_like_credential = !var.is_empty()
             && var
@@ -70,6 +93,11 @@ fn resolve_configured_node_credential(
         return Ok(None);
     }
 
+    if crate::auth::bud_mode::process_in_bud_mode() {
+        return Err(bud_mode_node_credential_error(
+            node_id, provider, kind, field,
+        ));
+    }
     match resolve_node_credential(config, field) {
         Some(value) if !value.trim().is_empty() => Ok(Some(value)),
         _ => Err(DAGError::MissingConfiguration(format!(
@@ -77,6 +105,20 @@ fn resolve_configured_node_credential(
              non-string, blocked, or references an unset env var"
         ))),
     }
+}
+
+/// The refusal a Bud-mode DAG node with its own credential gets (FRD-023 RT0, TC-SEC-04).
+pub(crate) fn bud_mode_node_credential_error(
+    node_id: &str,
+    provider: &str,
+    kind: &str,
+    field: &str,
+) -> DAGError {
+    DAGError::MissingConfiguration(format!(
+        "{kind} provider node '{node_id}' ({provider}) sets config.{field}, which this gateway \
+         does not accept: in Bud mode vendor credentials come from a Bud deployment, never from a \
+         DAG node or the process environment (FRD-023 RT0)"
+    ))
 }
 
 /// Callback bridge for TTS provider to DAG node
@@ -2430,6 +2472,44 @@ mod session_realtime_tests {
             LEGACY_CONNECTS.load(Ordering::SeqCst),
             2,
             "legacy fallback connects PER turn (no session-map resource → no persistence)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod frd023_node_credential_tests {
+    //! TC-SEC-04: in Bud mode a DAG node's own credential — literal or `${VAR}` — is refused.
+    use super::*;
+
+    #[test]
+    fn tc_sec_04_bud_mode_refuses_literal_and_env_credentials() {
+        let literal = serde_json::json!({"api_key": "sk-literal"});
+        let env_ref = serde_json::json!({"api_key": "${OPENAI_API_KEY}"});
+        assert_eq!(
+            resolve_node_credential_with(&literal, "api_key", true),
+            None
+        );
+        assert_eq!(
+            resolve_node_credential_with(&env_ref, "api_key", true),
+            None
+        );
+    }
+
+    #[test]
+    fn standalone_keeps_literal_credentials() {
+        let literal = serde_json::json!({"api_key": "sk-literal"});
+        assert_eq!(
+            resolve_node_credential_with(&literal, "api_key", false).as_deref(),
+            Some("sk-literal")
+        );
+    }
+
+    #[test]
+    fn tc_sec_04_the_refusal_names_bud_mode_not_a_missing_key() {
+        let err = bud_mode_node_credential_error("n1", "deepgram", "STT", "api_key").to_string();
+        assert!(
+            err.contains("Bud deployment") && err.contains("FRD-023"),
+            "{err}"
         );
     }
 }

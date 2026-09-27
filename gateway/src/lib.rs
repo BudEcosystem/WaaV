@@ -28,6 +28,9 @@ pub mod routes;
 pub mod state;
 pub mod utils;
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
 // Re-export commonly used items for convenience
 pub use config::ServerConfig;
 pub use core::*;

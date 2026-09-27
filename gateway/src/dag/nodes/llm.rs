@@ -204,6 +204,9 @@ impl From<LlmEndpointConfig> for LlmClientConfig {
             extra: c.extra,
             provider_kind: c.provider_kind,
             reasoning_effort: c.reasoning_effort,
+            // Env fallback stays the client default; Bud mode refuses it process-wide
+            // (`resolve_api_key`, FRD-023 RT0).
+            allow_env_fallback: true,
         }
     }
 }
