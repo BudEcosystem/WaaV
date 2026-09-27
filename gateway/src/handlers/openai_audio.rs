@@ -101,9 +101,10 @@ fn fail_translation(spans: &VoiceSpans, class: VoiceErrorType, err: &AudioError)
 ///
 /// * `bud.endpoint_id` — the endpoint UUID, never the alias; `bud.voice.endpoint_name` — the
 ///   alias the caller sent.
-/// * `bud.model_id` and `bud.project_id` — from the alias entry, i.e. the ENDPOINT's model and
-///   project. `bud.project_id` falls back to the principal's when the caller named the endpoint id
-///   itself and there is no entry (DEG-3).
+/// * `bud.model_id` and `bud.project_id` — from the allowlist entry that reached the endpoint
+///   (the key's own, or the published overlay's for a customer key), i.e. the ENDPOINT's model and
+///   project, whether it was named by alias or by id. `bud.project_id` falls back to the
+///   principal's only for an entry that carries no project.
 /// * `bud.api_key_project_id` — the project of the key that made the call: what this span called
 ///   `bud.project_id` before FRD-021, and what customer scoping keys on.
 ///

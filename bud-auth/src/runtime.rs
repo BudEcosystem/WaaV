@@ -18,6 +18,10 @@ use crate::snapshot::BudAuth;
 use crate::store::ControlPlaneStore;
 use crate::types::{AliasMap, AliasMetadata};
 
+/// The prefix budapp gives a customer (`client_app`) API key: `bud_client_<random>`
+/// (`credential_ops/helpers.py`). budgateway gates the published overlay on exactly this.
+const CLIENT_KEY_PREFIX: &str = "bud_client";
+
 /// Who is calling, once resolved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Principal {
@@ -63,7 +67,8 @@ pub struct BudPlane {
     /// Opens RSA-encrypted vendor credentials at hydration. Absent means encrypted credentials
     /// cannot be used — plaintext and keyless endpoints still work.
     decryptor: crate::credentials::CredentialDecryptor,
-    /// The published overlay: what any authenticated caller may reach.
+    /// The published overlay (`published_model_info`): what a customer (`bud_client_*`) key and a
+    /// published-only JWT caller may reach beyond their own project — see `client_overlay`.
     published: arc_swap::ArcSwap<AliasMap>,
     /// Readiness. A pod that answers before its first sweep answers 401 to valid keys.
     hydrated: AtomicBool,
@@ -113,6 +118,7 @@ impl BudPlane {
             voice_skipped = voice.skipped,
             "voice table hydrated"
         );
+        self.load_published_overlay().await;
         self.hydrated.store(true, Ordering::SeqCst);
         Ok(stats)
     }
@@ -126,8 +132,33 @@ impl BudPlane {
         let stats = hydrate::hydrate_all(self.store.as_ref(), &self.auth).await?;
         let _ =
             hydrate::hydrate_voice_table(self.store.as_ref(), &self.auth, &self.decryptor).await?;
+        // Publications made while the connection was down arrived as events nobody heard.
+        self.load_published_overlay().await;
         self.hydrated.store(true, Ordering::SeqCst);
         Ok(stats)
+    }
+
+    /// (Re)load the published overlay from the store.
+    ///
+    /// Absent is authoritative (nothing is published) and clears it. An unreadable store or an
+    /// unparseable document keeps the last good overlay: a Redis wobble or one bad write must not
+    /// unpublish every deployment for every customer.
+    async fn load_published_overlay(&self) {
+        match self.store.get(hydrate::PUBLISHED_MODEL_INFO_KEY).await {
+            Ok(Some(raw)) => match hydrate::parse_published_overlay(&raw) {
+                Ok(overlay) => {
+                    tracing::info!(entries = overlay.len(), "published overlay loaded");
+                    self.set_published_overlay(overlay);
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "unparseable published_model_info; keeping the last good overlay");
+                }
+            },
+            Ok(None) => self.set_published_overlay(AliasMap::new()),
+            Err(e) => {
+                tracing::warn!(error = %e, "published_model_info unreadable; keeping the last good overlay");
+            }
+        }
     }
 
     /// True once the first sweep has completed. Wire this to the readiness probe.
@@ -154,6 +185,14 @@ impl BudPlane {
             self.origin.elapsed().as_millis() as u64 + 1,
             Ordering::Relaxed,
         );
+        // The overlay is one key, written whole: re-read it on a set, drop it on a delete.
+        if key == hydrate::PUBLISHED_MODEL_INFO_KEY {
+            match event {
+                KeyEvent::Set => self.load_published_overlay().await,
+                KeyEvent::Del | KeyEvent::Expired => self.set_published_overlay(AliasMap::new()),
+            }
+            return Ok(());
+        }
         hydrate::apply_key_event(
             self.store.as_ref(),
             &self.auth,
@@ -303,7 +342,20 @@ impl BudPlane {
         {
             return entry.aliases.contains_key(alias);
         }
-        self.published.load().contains_key(alias)
+        self.client_overlay(raw, &hashed)
+            .is_some_and(|overlay| overlay.contains_key(alias))
+    }
+
+    /// The published overlay, when this caller is a customer key WaaV has issued.
+    ///
+    /// budgateway's rule (auth.rs): only a `bud_client_*` key's map is extended with the overlay
+    /// — an admin key reaches its own project's deployments, not every project's published ones —
+    /// and only a key that authenticates: a forged `bud_client_…` string reaches nothing.
+    fn client_overlay(&self, raw: &str, hashed: &str) -> Option<Arc<AliasMap>> {
+        if !raw.starts_with(CLIENT_KEY_PREFIX) || self.auth.resolve(hashed).is_none() {
+            return None;
+        }
+        Some(self.published.load_full())
     }
 }
 
@@ -491,15 +543,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_published_overlay_is_reachable_by_any_caller() {
-        let hashed = hash_api_key("bud_live");
-        let (_s, plane) = plane_with(&[(&format!("api_key:{hashed}"), blob())]).await;
+    async fn the_published_overlay_is_reachable_by_client_keys_only() {
+        // budgateway's rule (auth.rs): only a `bud_client_*` key is extended with the published
+        // overlay. An admin key reaches its own project's deployments, not other projects'
+        // published ones.
+        let (_s, plane) = plane_with(&[
+            (&format!("api_key:{}", hash_api_key("bud_live")), blob()),
+            (
+                &format!("api_key:{}", hash_api_key("bud_client_live")),
+                blob(),
+            ),
+        ])
+        .await;
 
         let mut overlay = AliasMap::new();
         overlay.insert("public-tts".into(), Default::default());
         plane.set_published_overlay(overlay);
 
-        assert!(plane.is_authorized("bud_live", "public-tts"));
+        assert!(plane.is_authorized("bud_client_live", "public-tts"));
+        assert!(!plane.is_authorized("bud_live", "public-tts"));
+        assert!(!plane.is_authorized("bud_client_never_issued", "public-tts"));
     }
 
     #[tokio::test]
@@ -610,17 +673,7 @@ impl BudPlane {
     /// caller can only resolve aliases their key lists, so an endpoint id they merely guessed
     /// never resolves. Returns `None` when the key is unknown or does not carry the alias.
     pub fn alias_endpoint_id(&self, raw_token: &str, alias: &str) -> Option<String> {
-        let hashed = hash_api_key(raw_token);
-        if let Some(meta) = self.auth.lookup_alias(&hashed, alias)
-            && let Some(id) = meta.endpoint_id
-        {
-            return Some(id);
-        }
-        // A JWT caller's allowlist lives in the identity-keyed cache, not the snapshot.
-        let jwt = self.jwt.as_ref()?;
-        let identity = jwt.cached_identity(&hashed)?;
-        let entry = jwt.cached_authz(&identity.sub)?;
-        entry.aliases.get(alias).and_then(|m| m.endpoint_id.clone())
+        self.alias_metadata(raw_token, alias)?.endpoint_id
     }
 
     /// The whole alias entry a caller's allowlist carries for `alias`, from the same two places
@@ -629,15 +682,56 @@ impl BudPlane {
     /// budapp stamps every entry with the endpoint's `model_id` and `project_id` (FRD-021 GT-5);
     /// `alias_endpoint_id` keeps only the id, so a voice call could not be attributed to the
     /// model it served or to the project that owns the endpoint.
+    ///
+    /// Three places, in budgateway's order: for a customer key the published overlay first (it
+    /// extends the key's map and wins a name collision), then the key's own map, then a JWT
+    /// caller's identity-keyed allowlist.
     pub fn alias_metadata(&self, raw_token: &str, alias: &str) -> Option<AliasMetadata> {
         let hashed = hash_api_key(raw_token);
+        if let Some(meta) = self
+            .client_overlay(raw_token, &hashed)
+            .and_then(|overlay| overlay.get(alias).cloned())
+        {
+            return Some(meta);
+        }
         if let Some(meta) = self.auth.lookup_alias(&hashed, alias) {
             return Some(meta);
         }
+        // A JWT caller's allowlist lives in the identity-keyed cache, not the snapshot.
         let jwt = self.jwt.as_ref()?;
         let identity = jwt.cached_identity(&hashed)?;
         let entry = jwt.cached_authz(&identity.sub)?;
         entry.aliases.get(alias).cloned()
+    }
+
+    /// The allowlist entry through which this caller reaches `endpoint_id`, when one does.
+    ///
+    /// A caller may name an endpoint by its id instead of an alias (spec 021 DEG-3), but only an
+    /// id its OWN allowlist — or, for a customer key, the published overlay — reaches. Without
+    /// this, any authenticated key could call any voice deployment whose id it knew, published or
+    /// not, in any project. The entry also carries the endpoint's model and project, so a call made
+    /// by id is attributed exactly like one made by name.
+    pub fn endpoint_entry(&self, raw_token: &str, endpoint_id: &str) -> Option<AliasMetadata> {
+        let hashed = hash_api_key(raw_token);
+        let matching = |aliases: &AliasMap| {
+            aliases
+                .values()
+                .find(|m| m.endpoint_id.as_deref() == Some(endpoint_id))
+                .cloned()
+        };
+        if let Some(meta) = self
+            .client_overlay(raw_token, &hashed)
+            .and_then(|overlay| matching(&overlay))
+        {
+            return Some(meta);
+        }
+        if let Some(own) = self.auth.resolve(&hashed) {
+            return matching(&own);
+        }
+        let jwt = self.jwt.as_ref()?;
+        let identity = jwt.cached_identity(&hashed)?;
+        let entry = jwt.cached_authz(&identity.sub)?;
+        matching(&entry.aliases)
     }
 }
 
@@ -716,6 +810,193 @@ mod alias_tests {
         assert!(
             plane
                 .alias_metadata("bud_not_a_key", "tts-deepgram")
+                .is_none()
+        );
+    }
+}
+
+/// Published voice deployments reach customer keys (the published overlay), with budgateway's
+/// rules: `bud_client_*` keys only, the published entry wins an alias collision, and an endpoint
+/// id is reachable only through the caller's own allowlist.
+#[cfg(test)]
+mod published_overlay_tests {
+    use super::*;
+    use crate::store::MemoryStore;
+
+    const CLIENT: &str = "bud_client_customer_test";
+    const ADMIN: &str = "bud_admin_owner_test";
+
+    /// What budapp's `rebuild_published_model_info` writes: every published entity, keyed by name.
+    fn overlay() -> String {
+        r#"{"pub-tts":{"endpoint_id":"ep-pub","model_id":"m-pub","project_id":"p-owner","kind":"model","created_at":1},
+            "a-router":{"router_id":"r-1","project_id":"p-owner","kind":"router","created_at":2}}"#
+            .to_string()
+    }
+
+    fn client_blob() -> String {
+        r#"{"__metadata__":{"api_key_id":"ak-c","user_id":"u-c","api_key_project_id":"p-customer"}}"#.to_string()
+    }
+
+    fn admin_blob() -> String {
+        r#"{"own-tts":{"endpoint_id":"ep-own","model_id":"m-own","project_id":"p-owner"},
+            "__metadata__":{"api_key_id":"ak-a","user_id":"u-a","api_key_project_id":"p-owner"}}"#
+            .to_string()
+    }
+
+    async fn plane(extra: &[(&str, String)]) -> (Arc<MemoryStore>, BudPlane) {
+        let store = Arc::new(MemoryStore::new());
+        store.set(&format!("api_key:{}", hash_api_key(CLIENT)), &client_blob());
+        store.set(&format!("api_key:{}", hash_api_key(ADMIN)), &admin_blob());
+        for (k, v) in extra {
+            store.set(k, v);
+        }
+        let plane = BudPlane::new(Arc::clone(&store) as Arc<dyn ControlPlaneStore>, None);
+        plane.boot().await.unwrap();
+        (store, plane)
+    }
+
+    /// The reported defect: a customer key names a published deployment and gets a 404, because
+    /// the key's own map (its project's endpoints) is all WaaV ever read.
+    #[tokio::test]
+    async fn a_client_key_reaches_a_published_deployment_by_name() {
+        let (_s, plane) = plane(&[("published_model_info", overlay())]).await;
+
+        assert_eq!(
+            plane.alias_endpoint_id(CLIENT, "pub-tts").as_deref(),
+            Some("ep-pub")
+        );
+        // Attribution (spec 021 CONTRACTS §1): the entry carries the ENDPOINT's project and model;
+        // the key's own project comes from its metadata, unchanged.
+        let meta = plane
+            .alias_metadata(CLIENT, "pub-tts")
+            .expect("published entry");
+        assert_eq!(meta.project_id.as_deref(), Some("p-owner"));
+        assert_eq!(meta.model_id.as_deref(), Some("m-pub"));
+        let who = plane
+            .authenticate(CLIENT)
+            .await
+            .expect("client authenticates");
+        assert_eq!(who.project_id.as_deref(), Some("p-customer"));
+    }
+
+    #[tokio::test]
+    async fn an_admin_key_does_not_reach_the_overlay() {
+        let (_s, plane) = plane(&[("published_model_info", overlay())]).await;
+
+        assert_eq!(plane.alias_endpoint_id(ADMIN, "pub-tts"), None);
+        assert_eq!(plane.alias_metadata(ADMIN, "pub-tts"), None);
+        assert!(!plane.is_authorized(ADMIN, "pub-tts"));
+        // Its own deployments still resolve.
+        assert_eq!(
+            plane.alias_endpoint_id(ADMIN, "own-tts").as_deref(),
+            Some("ep-own")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_key_that_was_never_issued_reaches_nothing() {
+        let (_s, plane) = plane(&[("published_model_info", overlay())]).await;
+        assert_eq!(
+            plane.alias_endpoint_id("bud_client_forged", "pub-tts"),
+            None
+        );
+        assert_eq!(plane.alias_metadata("bud_client_forged", "pub-tts"), None);
+    }
+
+    #[tokio::test]
+    async fn the_published_entry_wins_an_alias_collision() {
+        // budgateway extends the key's map WITH the overlay, so the published entry wins.
+        let colliding = r#"{"pub-tts":{"endpoint_id":"ep-customer-own","project_id":"p-customer"},
+            "__metadata__":{"api_key_project_id":"p-customer"}}"#;
+        let (_s, plane) = plane(&[
+            ("published_model_info", overlay()),
+            (
+                &format!("api_key:{}", hash_api_key("bud_client_colliding")),
+                colliding.to_string(),
+            ),
+        ])
+        .await;
+        assert_eq!(
+            plane
+                .alias_endpoint_id("bud_client_colliding", "pub-tts")
+                .as_deref(),
+            Some("ep-pub")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_overlay_follows_keyspace_events() {
+        let (store, plane) = plane(&[]).await;
+        assert_eq!(plane.alias_endpoint_id(CLIENT, "pub-tts"), None);
+
+        // Published: budapp rewrites the key whole.
+        store.set("published_model_info", &overlay());
+        plane
+            .on_key_event("published_model_info", KeyEvent::Set)
+            .await
+            .unwrap();
+        assert_eq!(
+            plane.alias_endpoint_id(CLIENT, "pub-tts").as_deref(),
+            Some("ep-pub")
+        );
+
+        // Unpublished everything: the key is deleted.
+        store.remove("published_model_info");
+        plane
+            .on_key_event("published_model_info", KeyEvent::Del)
+            .await
+            .unwrap();
+        assert_eq!(plane.alias_endpoint_id(CLIENT, "pub-tts"), None);
+    }
+
+    #[tokio::test]
+    async fn an_unparseable_overlay_keeps_the_last_good_one() {
+        let (store, plane) = plane(&[("published_model_info", overlay())]).await;
+        store.set("published_model_info", "{not json");
+        plane
+            .on_key_event("published_model_info", KeyEvent::Set)
+            .await
+            .unwrap();
+        assert_eq!(
+            plane.alias_endpoint_id(CLIENT, "pub-tts").as_deref(),
+            Some("ep-pub"),
+            "a bad write must not unpublish every deployment"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reconnect_rehydrates_the_overlay() {
+        let (store, plane) = plane(&[]).await;
+        store.set("published_model_info", &overlay());
+        plane.rehydrate_after_reconnect().await.unwrap();
+        assert_eq!(
+            plane.alias_endpoint_id(CLIENT, "pub-tts").as_deref(),
+            Some("ep-pub")
+        );
+    }
+
+    /// The other half of the authorization boundary: a caller may name an endpoint by its id only
+    /// when its own allowlist (and, for a customer key, the published overlay) reaches that id —
+    /// never an id it merely knows.
+    #[tokio::test]
+    async fn an_endpoint_id_is_reachable_only_through_the_callers_allowlist() {
+        let (_s, plane) = plane(&[("published_model_info", overlay())]).await;
+
+        let own = plane.endpoint_entry(ADMIN, "ep-own").expect("own endpoint");
+        assert_eq!(own.project_id.as_deref(), Some("p-owner"));
+        assert!(plane.endpoint_entry(ADMIN, "ep-pub").is_none());
+
+        let published = plane
+            .endpoint_entry(CLIENT, "ep-pub")
+            .expect("published endpoint");
+        assert_eq!(published.project_id.as_deref(), Some("p-owner"));
+        assert!(
+            plane.endpoint_entry(CLIENT, "ep-own").is_none(),
+            "an UNPUBLISHED deployment of another project reached a customer key by id"
+        );
+        assert!(
+            plane
+                .endpoint_entry("bud_client_forged", "ep-pub")
                 .is_none()
         );
     }

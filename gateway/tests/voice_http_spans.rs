@@ -198,6 +198,14 @@ const DG_EP: &str = "7d3c9a10-3333-4a2b-8c3d-000000000003";
 const DG_BARE_EP: &str = "7d3c9a10-4444-4a2b-8c3d-000000000004";
 const DG_TTS_EP: &str = "7d3c9a10-5555-4a2b-8c3d-000000000005";
 const NO_BASE_EP: &str = "7d3c9a10-6666-4a2b-8c3d-000000000006";
+/// A voice endpoint in the table that NO key's allowlist names and nothing publishes.
+const UNLISTED_EP: &str = "7d3c9a10-7777-4a2b-8c3d-000000000007";
+
+/// A customer (`client_app`) key: its own project holds no voice deployment, so its map is empty.
+const CLIENT_KEY: &str = "bud_client_voice_http_spans_customer";
+const CLIENT_PROJECT: &str = "0e1f7c2a-4b1d-4c0e-9a55-5a1f00000003";
+const CLIENT_USER: &str = "0e1f7c2a-4b1d-4c0e-9a55-5a1f000000a3";
+const CLIENT_API_KEY: &str = "0e1f7c2a-4b1d-4c0e-9a55-5a1f000000b3";
 
 /// The vendor model each `voice_table` entry names.
 const TTS_VENDOR_MODEL: &str = "kokoro-v1";
@@ -599,7 +607,15 @@ fn pricing(unit: &str, cost_per_unit: f64, per_units: u64) -> Json {
 /// A gateway over a plane hydrated with `table` (`endpoint id -> voice_table entry`) and the
 /// test key.
 async fn gateway(table: Vec<(&str, Json)>) -> axum::Router {
+    gateway_with(table, &[]).await
+}
+
+/// [`gateway`] plus raw control-plane keys (another key's blob, the published overlay).
+async fn gateway_with(table: Vec<(&str, Json)>, extra: &[(String, String)]) -> axum::Router {
     let store = Arc::new(bud_auth::MemoryStore::new());
+    for (key, value) in extra {
+        store.set(key, value);
+    }
     let mut blob = aliases().as_object().cloned().unwrap();
     blob.insert(
         "__metadata__".into(),
@@ -681,10 +697,14 @@ async fn send(app: &axum::Router, req: Request<Body>) -> Reply {
 }
 
 async fn speech(app: &axum::Router, body: Json) -> Reply {
+    speech_as(app, KEY, body).await
+}
+
+async fn speech_as(app: &axum::Router, bearer: &str, body: Json) -> Reply {
     send(
         app,
         Request::post("/v1/audio/speech")
-            .header("authorization", format!("Bearer {KEY}"))
+            .header("authorization", format!("Bearer {bearer}"))
             .header("content-type", "application/json")
             .header("user-agent", "voice-http-spans/1.0")
             .header("host", "waav.test:3001")
@@ -1029,6 +1049,137 @@ async fn tts_success_records_identity_units_cost_and_the_server_root() {
     f.assert_none();
 }
 
+// =============================================================================================
+// Published deployments and the endpoint-id boundary
+// =============================================================================================
+
+/// The customer key and budapp's published overlay (`published_model_info`), which lists TTS_EP
+/// under the name customers call it by.
+fn published_extra() -> Vec<(String, String)> {
+    vec![
+        (
+            format!("api_key:{}", bud_auth::hash_api_key(CLIENT_KEY)),
+            json!({"__metadata__": {"api_key_id": CLIENT_API_KEY, "user_id": CLIENT_USER,
+                                    "api_key_project_id": CLIENT_PROJECT}})
+            .to_string(),
+        ),
+        (
+            "published_model_info".to_string(),
+            json!({"pub-tts": {"endpoint_id": TTS_EP, "model_id": TTS_MODEL_ID,
+                               "project_id": EP_PROJECT, "kind": "model", "created_at": 1}})
+            .to_string(),
+        ),
+    ]
+}
+
+/// The reported defect: a customer key named a PUBLISHED voice deployment and got
+/// `404 Model 'pub-tts' not found`, because WaaV only ever read the key's own map. budgateway
+/// extends a `bud_client_*` key's map with the published overlay; WaaV now does the same, and the
+/// call is attributed to BOTH projects (CONTRACTS §1): the endpoint's and the key's.
+#[tokio::test]
+async fn a_published_deployment_serves_a_customer_key_attributed_to_both_projects() {
+    let cap = Capture::install();
+    let vendor = tts_vendor(vec![0u8; 48_000], "audio/pcm").await;
+    let app = gateway_with(
+        vec![(
+            TTS_EP,
+            tts_entry(
+                &base(&vendor),
+                Some(pricing("character", 30.0, 1_000_000)),
+                None,
+            ),
+        )],
+        &published_extra(),
+    )
+    .await;
+
+    let reply = speech_as(
+        &app,
+        CLIENT_KEY,
+        json!({"model": "pub-tts", "input": sentence(120), "voice": "George", "response_format": "pcm"}),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+
+    let spans = cap.take().await;
+    let turn = only(&spans, "voice.turn");
+    let root = root_of(&spans);
+    let mut f = Findings::default();
+    for (ctx, span) in [("published turn", turn), ("published root", root)] {
+        f.eq_text(ctx, span, ENDPOINT_ID, Some(TTS_EP));
+        f.eq_text(ctx, span, MODEL_ID, Some(TTS_MODEL_ID));
+        f.eq_text(ctx, span, PROJECT_ID, Some(EP_PROJECT));
+        f.eq_text(ctx, span, API_KEY_PROJECT_ID, Some(CLIENT_PROJECT));
+        f.eq_text(ctx, span, USER_ID, Some(CLIENT_USER));
+        f.eq_text(ctx, span, API_KEY_ID, Some(CLIENT_API_KEY));
+    }
+    f.eq_text("published turn", turn, ENDPOINT_NAME, Some("pub-tts"));
+    f.eq_number("published turn", turn, COST, Some(0.0036));
+    f.assert_none();
+}
+
+/// The other half of the boundary. A caller could name an endpoint by its id instead of an alias
+/// (DEG-3), and WaaV resolved ANY id in the voice table: an authenticated key reached every voice
+/// deployment whose id it knew, published or not, in any project. Now an id resolves only through
+/// the caller's own allowlist (and, for a customer key, the published overlay) — and is then
+/// attributed like the alias that reaches it.
+#[tokio::test]
+async fn an_endpoint_id_outside_the_callers_allowlist_is_not_found() {
+    let cap = Capture::install();
+    let vendor = tts_vendor(vec![0u8; 48_000], "audio/pcm").await;
+    let app = gateway_with(
+        vec![
+            (TTS_EP, tts_entry(&base(&vendor), None, None)),
+            (UNLISTED_EP, tts_entry(&base(&vendor), None, None)),
+        ],
+        &published_extra(),
+    )
+    .await;
+    let body = |model: &str| json!({"model": model, "input": "hello", "voice": "George", "response_format": "pcm"});
+
+    for bearer in [KEY, CLIENT_KEY] {
+        let reply = speech_as(&app, bearer, body(UNLISTED_EP)).await;
+        assert_eq!(
+            reply.status,
+            StatusCode::NOT_FOUND,
+            "{bearer} reached an endpoint no allowlist names: {}",
+            reply.text()
+        );
+    }
+
+    // The key's own endpoint by id, and a published one by id for the customer key, still work.
+    for bearer in [KEY, CLIENT_KEY] {
+        let _ = cap.take().await;
+        let reply = speech_as(&app, bearer, body(TTS_EP)).await;
+        assert_eq!(reply.status, StatusCode::OK, "{bearer}: {}", reply.text());
+        let spans = cap.take().await;
+        let turn = only(&spans, "voice.turn");
+        let mut f = Findings::default();
+        // Named by id, attributed through the entry that reaches it (no longer DEG-3's gap).
+        f.eq_text(bearer, turn, MODEL_ID, Some(TTS_MODEL_ID));
+        f.eq_text(bearer, turn, PROJECT_ID, Some(EP_PROJECT));
+        f.assert_none();
+    }
+}
+
+/// budgateway extends only a `bud_client_*` key with the overlay: an admin or project key reaches
+/// its own project's deployments, not every project's published ones.
+#[tokio::test]
+async fn the_published_overlay_does_not_extend_a_non_customer_key() {
+    let vendor = tts_vendor(vec![0u8; 48_000], "audio/pcm").await;
+    let app = gateway_with(
+        vec![(TTS_EP, tts_entry(&base(&vendor), None, None))],
+        &published_extra(),
+    )
+    .await;
+    let reply = speech(
+        &app,
+        json!({"model": "pub-tts", "input": "hello", "voice": "George", "response_format": "pcm"}),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::NOT_FOUND, "{}", reply.text());
+}
+
 /// TC-EMIT-01 (STT + translation success), TC-EMIT-02 (STT), TC-EMIT-05 (`second`),
 /// TC-EMIT-10 (self-hosted: detected language, no confidence), TC-EMIT-11 (STT),
 /// TC-TRACE-01 (success rows).
@@ -1259,9 +1410,11 @@ async fn unpriced_calls_record_no_cost() {
     f.assert_none();
 }
 
-/// TC-EMIT-02 variant (DEG-3): a caller that names the endpoint id itself has no alias metadata.
+/// TC-EMIT-02 variant (DEG-3): a caller that names the endpoint id itself — an id its allowlist
+/// reaches — is attributed through the entry that reaches it, exactly as if it had used the alias.
+/// (It used to get no model and the KEY's project, because an id resolved without any entry.)
 #[tokio::test]
-async fn a_raw_endpoint_id_falls_back_to_the_principals_project() {
+async fn a_raw_endpoint_id_is_attributed_through_the_entry_that_reaches_it() {
     let cap = Capture::install();
     let vendor = tts_vendor(vec![0u8; 4_800], "audio/pcm").await;
     let app = gateway(vec![(TTS_EP, tts_entry(&base(&vendor), None, None))]).await;
@@ -1276,9 +1429,9 @@ async fn a_raw_endpoint_id_falls_back_to_the_principals_project() {
     let mut f = Findings::default();
     f.eq_text("raw id", turn, ENDPOINT_ID, Some(TTS_EP));
     f.eq_text("raw id", turn, ENDPOINT_NAME, Some(TTS_EP));
-    f.eq_text("raw id", turn, PROJECT_ID, Some(KEY_PROJECT));
+    f.eq_text("raw id", turn, PROJECT_ID, Some(EP_PROJECT));
     f.eq_text("raw id", turn, API_KEY_PROJECT_ID, Some(KEY_PROJECT));
-    f.absent("raw id", turn, &[MODEL_ID]);
+    f.eq_text("raw id", turn, MODEL_ID, Some(TTS_MODEL_ID));
     f.assert_none();
 }
 
