@@ -185,6 +185,121 @@ pub struct TranslationSettings {
     pub partials: Option<bool>,
 }
 
+/// Input-transcription defaults for a realtime session (OpenAI GA `audio.input.transcription`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct RealtimeTranscription {
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub language: Option<String>,
+    #[serde(default)]
+    pub prompt: Option<String>,
+}
+
+/// What WaaV sends the vendor in its first `session.update`, unless the client overrides it
+/// (FRD-023 §5.6: request > deployment > vendor default).
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct RealtimeDefaults {
+    #[serde(default)]
+    pub voice: Option<String>,
+    #[serde(default)]
+    pub instructions: Option<String>,
+    #[serde(default)]
+    pub output_modalities: Option<Vec<String>>,
+    /// Passed to the vendor as written: `{"type": "server_vad" | "semantic_vad", …}` or `null`.
+    /// budapp validated its shape; the vendor owns its semantics.
+    #[serde(default)]
+    pub turn_detection: Option<serde_json::Value>,
+    #[serde(default)]
+    pub input_transcription: Option<RealtimeTranscription>,
+    #[serde(default)]
+    pub noise_reduction: Option<String>,
+    #[serde(default)]
+    pub max_output_tokens: Option<u32>,
+    #[serde(default)]
+    pub speed: Option<f64>,
+}
+
+/// Per-deployment session limits. Absent means the gateway's ceiling applies.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct RealtimeLimits {
+    #[serde(default)]
+    pub max_session_seconds: Option<u64>,
+    #[serde(default)]
+    pub idle_timeout_seconds: Option<u64>,
+}
+
+/// What a client may change on a realtime session (FRD-023 D-11, S-5).
+///
+/// Every field is `Option` like the rest of this module, but the ACCESSORS apply the secure
+/// default: a stored prompt, an MCP connector and a trace belong to the VENDOR ORG, which every
+/// project sharing the credential shares, so they are off unless the deployment turns them on.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct RealtimePolicy {
+    #[serde(default)]
+    pub allow_client_instructions: Option<bool>,
+    #[serde(default)]
+    pub allow_mcp_tools: Option<bool>,
+    #[serde(default)]
+    pub allow_prompt_references: Option<bool>,
+    #[serde(default)]
+    pub allow_image_input: Option<bool>,
+    /// Transcription models a client may select. Absent = any; present = exactly these.
+    #[serde(default)]
+    pub input_transcription_models: Option<Vec<String>>,
+}
+
+impl RealtimePolicy {
+    pub fn allows_client_instructions(&self) -> bool {
+        self.allow_client_instructions.unwrap_or(true)
+    }
+
+    pub fn allows_mcp_tools(&self) -> bool {
+        self.allow_mcp_tools.unwrap_or(false)
+    }
+
+    pub fn allows_prompt_references(&self) -> bool {
+        self.allow_prompt_references.unwrap_or(false)
+    }
+
+    pub fn allows_image_input(&self) -> bool {
+        self.allow_image_input.unwrap_or(true)
+    }
+
+    pub fn allows_transcription_model(&self, model: &str) -> bool {
+        match &self.input_transcription_models {
+            None => true,
+            Some(list) => list.iter().any(|m| m == model),
+        }
+    }
+}
+
+/// A realtime (speech-to-speech) deployment's session settings (FRD-023 §5.3).
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct RealtimeSettings {
+    /// `realtime` or `transcription`, derived by budapp from the model's modality.
+    #[serde(default)]
+    pub session_type: Option<String>,
+    #[serde(default)]
+    pub defaults: Option<RealtimeDefaults>,
+    #[serde(default)]
+    pub limits: Option<RealtimeLimits>,
+    #[serde(default)]
+    pub policy: Option<RealtimePolicy>,
+}
+
+impl RealtimeSettings {
+    /// The policy block, or an all-default one (every accessor at its secure default).
+    pub fn policy(&self) -> RealtimePolicy {
+        self.policy.clone().unwrap_or_default()
+    }
+
+    /// Whether this deployment serves transcription-only sessions.
+    pub fn is_transcription(&self) -> bool {
+        self.session_type.as_deref() == Some("transcription")
+    }
+}
+
 /// The whole `config` object on a voice entry.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct VoiceEndpointSettings {
@@ -194,11 +309,17 @@ pub struct VoiceEndpointSettings {
     pub stt: Option<SttSettings>,
     #[serde(default)]
     pub translation: Option<TranslationSettings>,
+    /// FRD-023: the realtime session block, on `realtime_session` deployments only.
+    #[serde(default)]
+    pub realtime: Option<RealtimeSettings>,
 }
 
 impl VoiceEndpointSettings {
     pub fn is_empty(&self) -> bool {
-        self.tts.is_none() && self.stt.is_none() && self.translation.is_none()
+        self.tts.is_none()
+            && self.stt.is_none()
+            && self.translation.is_none()
+            && self.realtime.is_none()
     }
 
     /// The tts block, or an all-`None` one. Saves every call site an `unwrap_or_default` clone.
@@ -269,7 +390,9 @@ const KNOWN_STT: &[&str] = &[
 
 const KNOWN_TRANSLATION: &[&str] = &["target_languages", "translate_to_english", "partials"];
 
-const KNOWN_SECTIONS: &[&str] = &["tts", "stt", "translation"];
+const KNOWN_REALTIME: &[&str] = &["session_type", "defaults", "limits", "policy"];
+
+const KNOWN_SECTIONS: &[&str] = &["tts", "stt", "translation", "realtime"];
 
 /// Parse a `config` object, warning about anything this build does not model.
 ///
@@ -286,6 +409,7 @@ pub fn parse_endpoint_settings(
             ("tts", KNOWN_TTS),
             ("stt", KNOWN_STT),
             ("translation", KNOWN_TRANSLATION),
+            ("realtime", KNOWN_REALTIME),
         ] {
             if let Some(serde_json::Value::Object(fields)) = sections.get(section) {
                 warn_unmodelled(
@@ -318,6 +442,8 @@ pub fn parse_endpoint_settings(
                 stt: section("stt").and_then(|v| parse_section(endpoint_id, "stt", v)),
                 translation: section("translation")
                     .and_then(|v| parse_section(endpoint_id, "translation", v)),
+                realtime: section("realtime")
+                    .and_then(|v| parse_section(endpoint_id, "realtime", v)),
             }
         }
     }

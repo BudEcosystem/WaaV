@@ -504,6 +504,19 @@ impl JwtVerifier {
         );
     }
 
+    /// Drop one subject's cached authorization (FRD-023 Q-7): `user_projects:{sub}` changed, so
+    /// the next check re-reads it instead of serving the old grants for up to `authz_ttl`.
+    pub fn evict_authz(&self, sub: &str) {
+        self.authz_cache.remove(sub);
+    }
+
+    /// Drop every cached authorization: a `project_models:*` blob changed, and which subjects it
+    /// feeds is not known without reading every `user_projects:*`. Membership changes are rare
+    /// and a miss costs one store read, so a full clear is the cheap correct answer.
+    pub fn clear_authz(&self) {
+        self.authz_cache.clear();
+    }
+
     pub fn config(&self) -> &JwtConfig {
         &self.cfg
     }
