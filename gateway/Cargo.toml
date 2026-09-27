@@ -212,7 +212,8 @@ regex = "1.10"
 once_cell = "1.19"
 uuid = { version = "1.10", features = ["v4"] }
 
-object_store = { version = "0.12", features = ["aws"] }
+# 0.14.1+: earlier releases pull quick-xml < 0.41 (RUSTSEC-2026-0194, RUSTSEC-2026-0195).
+object_store = { version = "0.14.2", features = ["aws"] }
 
 # OpenAPI documentation (feature-gated)
 utoipa = { version = "5.3", optional = true, features = ["axum_extras"] }
@@ -276,11 +277,14 @@ async-stream = "0.3"
 
 # AWS SDKs for Amazon Transcribe and Polly
 aws-config = { version = "1.5", features = ["behavior-version-latest"] }
-aws-sdk-transcribestreaming = "1.62"
-aws-sdk-polly = "1.61"
+# No `rustls` feature: it only adds the legacy hyper-0.14 connector (rustls 0.21, h2 0.3,
+# rustls-webpki 0.101, all under RUSTSEC advisories). With BehaviorVersion::latest(), which
+# every call site passes, the SDK uses `default-https-client` anyway.
+aws-sdk-transcribestreaming = { version = "1.62", default-features = false, features = ["default-https-client", "rt-tokio"] }
+aws-sdk-polly = { version = "1.61", default-features = false, features = ["http-1x", "default-https-client", "rt-tokio"] }
 # AWS Bedrock Runtime — drives Nova Sonic's `InvokeModelWithBidirectionalStream`
 # (HTTP/2 bidi event stream; the same SDK family as transcribestreaming above).
-aws-sdk-bedrockruntime = "1.62"
+aws-sdk-bedrockruntime = { version = "1.62", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-credential-types = "1.2"
 aws-types = "1.3"
 aws-smithy-types = "1.3"

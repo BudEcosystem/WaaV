@@ -35,12 +35,29 @@ ignore = [
   # perform RSA private-key decryption on attacker-controlled ciphertext on the hot path).
   # Remove once `rsa` ships a patched release.
   { id = "RUSTSEC-2023-0071", reason = "rsa Marvin timing sidechannel; no patched release; not on an exploitable path" },
+  # tonic 0.11 is pinned by google-api-proto (Google Speech v2 gRPC). WaaV is the CLIENT on that
+  # channel and its only peer is Google's endpoint. Leaves with the move to googleapis-tonic-*.
+  { id = "RUSTSEC-2026-0258", reason = "h2 0.3 only via tonic 0.11 (google-api-proto); client to Google Speech only" },
+  { id = "RUSTSEC-2026-0049", reason = "rustls-webpki 0.102 only via tonic 0.11; CRLs are not configured" },
+  { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.102 only via tonic 0.11; validates Google's public chain" },
+  { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.102 only via tonic 0.11; validates Google's public chain" },
+  { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.102 only via tonic 0.11; CRLs are not configured" },
+  # tract_nnef::tensors::read_tensor reads NNEF archives. WaaV never loads one: noise-filter runs the
+  # DeepFilterNet ONNX model compiled into the binary. The fixed 0.21.16+ caps `time` < 0.3.42,
+  # which would reintroduce RUSTSEC-2026-0009 (fixed in time 0.3.47).
+  { id = "RUSTSEC-2026-0217", reason = "tract NNEF tensor parser; WaaV loads only the compiled-in DeepFilterNet ONNX model" },
+  # Unmaintained, no safe upgrade exists. Not vulnerabilities.
+  { id = "RUSTSEC-2026-0150", reason = "unmaintained audiopus_sys (opus-codec feature); no maintained replacement yet" },
+  { id = "RUSTSEC-2024-0014", reason = "unmaintained generational-arena via abi_stable (plugin ABI); no upgrade" },
+  { id = "RUSTSEC-2024-0436", reason = "unmaintained paste (proc-macro) via abi_stable/tokenizers; no upgrade" },
+  { id = "RUSTSEC-2025-0134", reason = "unmaintained rustls-pemfile via axum-server 0.7 and tonic 0.11" },
+  { id = "RUSTSEC-2026-0249", reason = "unmaintained smartstring via rhai (dag-routing); no upgrade" },
 ]
 
 # ---------------------------------------------------------------------------------------
 [bans]
 multiple-versions = "warn"     # duplicate-version churn is noise, not a merge blocker
-wildcard-dependencies = "deny" # forbid `*` version requirements (reproducibility, W11)
+wildcards = "deny"             # forbid `*` version requirements (reproducibility, W11)
 allow-wildcard-paths = true    # ...except path deps (waav-plugin-api), which are intra-repo
 
 # ---------------------------------------------------------------------------------------
@@ -62,6 +79,7 @@ allow = [
   "0BSD",
   "BSL-1.0",
   "OpenSSL",
+  "CDLA-Permissive-2.0",  # webpki-roots / webpki-root-certs: the Mozilla CA bundle as data
 ]
 confidence-threshold = 0.9
 
