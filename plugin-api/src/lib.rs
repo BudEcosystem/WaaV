@@ -123,7 +123,11 @@ pub struct PluginManifest {
 
 impl PluginManifest {
     /// Create a new plugin manifest with required fields.
-    pub fn new(id: impl Into<RString>, name: impl Into<RString>, version: impl Into<RString>) -> Self {
+    pub fn new(
+        id: impl Into<RString>,
+        name: impl Into<RString>,
+        version: impl Into<RString>,
+    ) -> Self {
         Self {
             id: id.into(),
             name: name.into(),
@@ -460,7 +464,11 @@ pub struct STTVTable {
 
     /// Send audio data for transcription.
     /// `audio_data` points to audio bytes, `audio_len` is the byte count.
-    pub send_audio: extern "C" fn(handle: *mut ProviderHandle, audio_data: *const u8, audio_len: usize) -> FFIResult,
+    pub send_audio: extern "C" fn(
+        handle: *mut ProviderHandle,
+        audio_data: *const u8,
+        audio_len: usize,
+    ) -> FFIResult,
 
     /// Set the result callback.
     /// `callback` is called with STT results; `user_data` is passed through.
@@ -472,11 +480,8 @@ pub struct STTVTable {
 
     /// Set the error callback.
     /// `callback` is called with error code and message.
-    pub set_error_callback: extern "C" fn(
-        handle: *mut ProviderHandle,
-        callback: ErrorCallbackFn,
-        user_data: *mut (),
-    ),
+    pub set_error_callback:
+        extern "C" fn(handle: *mut ProviderHandle, callback: ErrorCallbackFn, user_data: *mut ()),
 
     /// Get provider info as JSON string.
     pub get_provider_info: extern "C" fn(handle: *const ProviderHandle) -> RString,
@@ -538,7 +543,8 @@ pub struct TTSVTable {
 
     /// Send text for synthesis.
     /// `text` points to the text string; `flush` indicates whether to flush immediately.
-    pub speak: extern "C" fn(handle: *mut ProviderHandle, text: *const RString, flush: bool) -> FFIResult,
+    pub speak:
+        extern "C" fn(handle: *mut ProviderHandle, text: *const RString, flush: bool) -> FFIResult,
 
     /// Clear queued text.
     pub clear: extern "C" fn(handle: *mut ProviderHandle) -> FFIResult,
@@ -554,11 +560,8 @@ pub struct TTSVTable {
     ),
 
     /// Set the error callback.
-    pub set_error_callback: extern "C" fn(
-        handle: *mut ProviderHandle,
-        callback: ErrorCallbackFn,
-        user_data: *mut (),
-    ),
+    pub set_error_callback:
+        extern "C" fn(handle: *mut ProviderHandle, callback: ErrorCallbackFn, user_data: *mut ()),
 
     /// Set the completion callback.
     pub set_complete_callback: extern "C" fn(
@@ -636,7 +639,11 @@ pub struct RealtimeVTable {
     pub is_ready: extern "C" fn(handle: *const ProviderHandle) -> bool,
 
     /// Send audio data.
-    pub send_audio: extern "C" fn(handle: *mut ProviderHandle, audio_data: *const u8, audio_len: usize) -> FFIResult,
+    pub send_audio: extern "C" fn(
+        handle: *mut ProviderHandle,
+        audio_data: *const u8,
+        audio_len: usize,
+    ) -> FFIResult,
 
     /// Send text message.
     pub send_text: extern "C" fn(handle: *mut ProviderHandle, text: *const RString) -> FFIResult,
@@ -662,11 +669,8 @@ pub struct RealtimeVTable {
     ),
 
     /// Set the error callback.
-    pub set_error_callback: extern "C" fn(
-        handle: *mut ProviderHandle,
-        callback: ErrorCallbackFn,
-        user_data: *mut (),
-    ),
+    pub set_error_callback:
+        extern "C" fn(handle: *mut ProviderHandle, callback: ErrorCallbackFn, user_data: *mut ()),
 
     /// Get provider info as JSON string.
     pub get_provider_info: extern "C" fn(handle: *const ProviderHandle) -> RString,
@@ -764,7 +768,8 @@ pub struct PluginModule {
     /// Factory function for creating Realtime providers.
     ///
     /// Set to `ROption::RNone` if this plugin doesn't provide Realtime.
-    pub create_realtime: ROption<extern "C" fn(*const FFIConfig) -> RResult<RealtimeProvider, RString>>,
+    pub create_realtime:
+        ROption<extern "C" fn(*const FFIConfig) -> RResult<RealtimeProvider, RString>>,
 }
 
 impl RootModule for PluginModule_Ref {
