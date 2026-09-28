@@ -42,8 +42,14 @@ use crate::core::realtime::base::{
     TranscriptRole,
 };
 use crate::core::realtime::scaffold::{
-    ConnectSpec, Inbound, OutFrame, ProtocolCaps, RealtimeProtocol, S2sEvent,
+    ConnectSpec, Inbound, OutFrame, ProtocolCaps, RealtimeProtocol, S2sEvent, UsageReport,
 };
+
+/// A protobuf `Duration` in its JSON form (`"12.5s"`).
+fn parse_proto_duration(s: &str) -> Option<std::time::Duration> {
+    let secs: f64 = s.trim().strip_suffix('s')?.trim().parse().ok()?;
+    (secs.is_finite() && secs >= 0.0).then(|| std::time::Duration::from_secs_f64(secs))
+}
 
 /// Gemini Live BidiGenerateContent WebSocket endpoint. The `?key=<API_KEY>`
 /// query is appended in `connect_spec` (Gemini auths by QUERY param, not header).
@@ -240,6 +246,121 @@ impl GeminiProtocol {
         out
     }
 
+    /// `usageMetadata` → one cumulative [`UsageReport`]. Per modality from the `*TokensDetails`
+    /// lists (`TEXT`, `AUDIO`, `IMAGE`; `VIDEO` frames bill as image); a vendor that sends only
+    /// the totals has them attributed to text rather than dropped. `cachedContentTokenCount` is a
+    /// SUBSET of `promptTokenCount` (Google's contract), which is what the cost formula expects;
+    /// thinking tokens bill at the output-text rate.
+    fn map_usage(u: &Value) -> S2sEvent {
+        fn n(v: Option<&Value>) -> u64 {
+            v.and_then(Value::as_u64).unwrap_or(0)
+        }
+        /// `(text, audio, image)` from a `[{modality, tokenCount}]` list, or `None` if absent.
+        fn split(list: Option<&Value>) -> Option<(u64, u64, u64)> {
+            let list = list?.as_array()?;
+            let mut out = (0, 0, 0);
+            for d in list {
+                let count = n(d.get("tokenCount"));
+                match d.get("modality").and_then(Value::as_str) {
+                    Some("AUDIO") => out.1 += count,
+                    Some("IMAGE") | Some("VIDEO") => out.2 += count,
+                    _ => out.0 += count,
+                }
+            }
+            Some(out)
+        }
+        let prompt =
+            split(u.get("promptTokensDetails")).unwrap_or((n(u.get("promptTokenCount")), 0, 0));
+        let tool = split(u.get("toolUsePromptTokensDetails")).unwrap_or((
+            n(u.get("toolUsePromptTokenCount")),
+            0,
+            0,
+        ));
+        let cached = split(u.get("cacheTokensDetails")).unwrap_or((
+            n(u.get("cachedContentTokenCount")),
+            0,
+            0,
+        ));
+        let response =
+            split(u.get("responseTokensDetails")).unwrap_or((n(u.get("responseTokenCount")), 0, 0));
+        let mut tokens = crate::core::realtime_cost::RealtimeUsage {
+            input_text: prompt.0 + tool.0,
+            input_audio: prompt.1 + tool.1,
+            input_image: prompt.2 + tool.2,
+            cached_text: cached.0,
+            cached_audio: cached.1,
+            cached_image: cached.2,
+            output_text: response.0 + n(u.get("thoughtsTokenCount")),
+            output_audio: response.1,
+        };
+        // A cached count above its class is a vendor inconsistency; it must never make the
+        // uncached remainder negative (that would REDUCE the bill).
+        tokens.cached_text = tokens.cached_text.min(tokens.input_text);
+        tokens.cached_audio = tokens.cached_audio.min(tokens.input_audio);
+        tokens.cached_image = tokens.cached_image.min(tokens.input_image);
+        S2sEvent::Usage(UsageReport {
+            tokens,
+            seconds: None,
+            cumulative: true,
+        })
+    }
+
+    /// Everything but `usageMetadata`, which rides on any message.
+    fn map_message(value: &Value) -> Vec<S2sEvent> {
+        // goAway: the connection closes after `timeLeft`; the driver reconnects with the
+        // resumption handle at the next turn boundary (FRD-023 RT7.1, TC-XL-04).
+        if let Some(ga) = value.get("goAway") {
+            let time_left = ga
+                .get("timeLeft")
+                .and_then(Value::as_str)
+                .and_then(parse_proto_duration);
+            return vec![S2sEvent::GoAway { time_left }];
+        }
+
+        // serverContent — the MULTI-FRAME case (audio + text parts + turn flags).
+        if let Some(sc) = value.get("serverContent") {
+            return Self::map_server_content(sc);
+        }
+
+        // toolCall ⇒ one FunctionCall per functionCalls[] entry.
+        if let Some(tc) = value.get("toolCall") {
+            return Self::map_tool_call(tc);
+        }
+
+        // sessionResumptionUpdate ⇒ ResumptionHandle (driver stores it, feeds it
+        // back into build_session_config on reconnect). Only emit when the server
+        // marks it resumable AND provides a non-empty handle.
+        if let Some(update) = value.get("sessionResumptionUpdate") {
+            let resumable = update
+                .get("resumable")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if let Some(handle) = update.get("newHandle").and_then(Value::as_str)
+                && resumable
+                && !handle.is_empty()
+            {
+                return vec![S2sEvent::ResumptionHandle(handle.to_string())];
+            }
+            return vec![S2sEvent::Ignore];
+        }
+
+        // toolCallCancellation: the server cancelled pending tool calls; nothing
+        // for the gateway to forward (the call ids would already be in flight) ⇒ Ignore.
+        vec![S2sEvent::Ignore]
+    }
+
+    fn encode_user_audio_chunk(&self, pcm: &[u8]) -> Value {
+        // base64-in-JSON: realtimeInput.mediaChunks[0] with the 16 kHz input mime.
+        json!({
+            "realtimeInput": {
+                "mediaChunks": [{
+                    "mimeType": format!("audio/pcm;rate={INPUT_SAMPLE_RATE}"),
+                    "data": BASE64_STANDARD.encode(pcm),
+                }]
+            }
+        })
+    }
+
     /// Lower a `toolCall` object into one `FunctionCall` per `functionCalls[]`
     /// entry. Each call carries `id` (may be absent on Vertex), `name`, and
     /// `args` (a JSON object stringified into `arguments`).
@@ -300,6 +421,10 @@ impl RealtimeProtocol for GeminiProtocol {
 
     fn provider_id(&self) -> &'static str {
         "gemini"
+    }
+
+    fn input_sample_rate(&self) -> u32 {
+        INPUT_SAMPLE_RATE
     }
 
     fn caps(&self) -> ProtocolCaps {
@@ -416,50 +541,18 @@ impl RealtimeProtocol for GeminiProtocol {
             return vec![S2sEvent::SessionReady { session_id: None }];
         }
 
-        // serverContent — the MULTI-FRAME case (audio + text parts + turn flags).
-        if let Some(sc) = value.get("serverContent") {
-            return Self::map_server_content(sc);
+        // usageMetadata rides on any server message (usually the turn's last). It goes FIRST,
+        // so it lands on the response the same message completes (FRD-023 §5.7, TC-XL-03).
+        let mut events = Self::map_message(&value);
+        if let Some(u) = value.get("usageMetadata").map(Self::map_usage) {
+            events.retain(|e| !matches!(e, S2sEvent::Ignore));
+            events.insert(0, u);
         }
-
-        // toolCall ⇒ one FunctionCall per functionCalls[] entry.
-        if let Some(tc) = value.get("toolCall") {
-            return Self::map_tool_call(tc);
-        }
-
-        // sessionResumptionUpdate ⇒ ResumptionHandle (driver stores it, feeds it
-        // back into build_session_config on reconnect). Only emit when the server
-        // marks it resumable AND provides a non-empty handle.
-        if let Some(update) = value.get("sessionResumptionUpdate") {
-            let resumable = update
-                .get("resumable")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            if let Some(handle) = update.get("newHandle").and_then(Value::as_str)
-                && resumable
-                && !handle.is_empty()
-            {
-                return vec![S2sEvent::ResumptionHandle(handle.to_string())];
-            }
-            return vec![S2sEvent::Ignore];
-        }
-
-        // toolCallCancellation: the server cancelled pending tool calls; nothing
-        // for the gateway to forward (the call ids would already be in flight).
-        // goAway: the server warns of an imminent disconnect — the scaffold's
-        // reconnect (with the stored resumption handle) handles it. Both ⇒ Ignore.
-        vec![S2sEvent::Ignore]
+        events
     }
 
     fn encode_user_audio(&self, pcm: &[u8]) -> Self::Wire {
-        // base64-in-JSON: realtimeInput.mediaChunks[0] with the 16 kHz input mime.
-        json!({
-            "realtimeInput": {
-                "mediaChunks": [{
-                    "mimeType": format!("audio/pcm;rate={INPUT_SAMPLE_RATE}"),
-                    "data": BASE64_STANDARD.encode(pcm),
-                }]
-            }
-        })
+        self.encode_user_audio_chunk(pcm)
     }
 
     fn send_text(&self, text: &str) -> Vec<Self::Wire> {
@@ -821,6 +914,67 @@ mod tests {
         }
     }
 
+    /// TC-XL-03 (protocol half) — `usageMetadata` becomes ONE cumulative `Usage`, FIRST in the
+    /// message's events (so it lands on the response the same message completes), split by
+    /// modality; cached tokens stay a subset of their class; thinking bills as output text.
+    #[test]
+    fn tc_xl_03_usage_metadata_becomes_one_cumulative_usage_first() {
+        let p = proto(&base_cfg());
+        let raw = json!({
+            "serverContent": {"turnComplete": true},
+            "usageMetadata": {
+                "promptTokenCount": 120, "cachedContentTokenCount": 20,
+                "responseTokenCount": 80, "thoughtsTokenCount": 5, "totalTokenCount": 205,
+                "promptTokensDetails": [{"modality": "TEXT", "tokenCount": 30},
+                                        {"modality": "AUDIO", "tokenCount": 90}],
+                "cacheTokensDetails": [{"modality": "TEXT", "tokenCount": 20}],
+                "responseTokensDetails": [{"modality": "AUDIO", "tokenCount": 70},
+                                          {"modality": "TEXT", "tokenCount": 10}]
+            }
+        })
+        .to_string();
+        let evs = p.map_server_event(Inbound::Text(&raw));
+        let S2sEvent::Usage(u) = &evs[0] else {
+            panic!("usage first, got {evs:?}");
+        };
+        assert!(
+            u.cumulative,
+            "a Gemini report is the response's running total"
+        );
+        let t = u.tokens;
+        assert_eq!(
+            (t.input_text, t.input_audio, t.cached_text, t.cached_audio),
+            (30, 90, 20, 0)
+        );
+        assert_eq!((t.output_text, t.output_audio), (15, 70));
+        assert!(matches!(evs.last(), Some(S2sEvent::ResponseDone { .. })));
+
+        // Totals only: attributed to text, never dropped.
+        let raw = json!({"usageMetadata": {"promptTokenCount": 50, "responseTokenCount": 25}})
+            .to_string();
+        let evs = p.map_server_event(Inbound::Text(&raw));
+        let [S2sEvent::Usage(u)] = evs.as_slice() else {
+            panic!("{evs:?}");
+        };
+        assert_eq!((u.tokens.input_text, u.tokens.output_text), (50, 25));
+    }
+
+    /// TC-XL-04 (protocol half) — `goAway` carries its deadline to the driver.
+    #[test]
+    fn tc_xl_04_go_away_carries_time_left() {
+        let p = proto(&base_cfg());
+        let evs = p.map_server_event(Inbound::Text(r#"{"goAway":{"timeLeft":"12.5s"}}"#));
+        assert!(
+            matches!(evs.as_slice(), [S2sEvent::GoAway { time_left: Some(d) }] if *d == std::time::Duration::from_millis(12_500)),
+            "{evs:?}"
+        );
+        let evs = p.map_server_event(Inbound::Text(r#"{"goAway":{}}"#));
+        assert!(
+            matches!(evs.as_slice(), [S2sEvent::GoAway { time_left: None }]),
+            "{evs:?}"
+        );
+    }
+
     /// setupComplete ⇒ SessionReady.
     #[test]
     fn setup_complete_maps_to_session_ready() {
@@ -878,12 +1032,12 @@ mod tests {
         }
     }
 
-    /// goAway / toolCallCancellation / unknown / non-JSON / binary ⇒ Ignore.
+    /// toolCallCancellation / unknown / non-JSON / binary ⇒ Ignore. (`goAway` is acted on:
+    /// `tc_xl_04_go_away_carries_time_left`.)
     #[test]
     fn go_away_cancellation_unknown_and_binary_ignore() {
         let p = proto(&base_cfg());
         for raw in [
-            r#"{"goAway":{"timeLeft":"5s"}}"#,
             r#"{"toolCallCancellation":{"ids":["call_1"]}}"#,
             r#"{"somethingNew":{}}"#,
             "not json",

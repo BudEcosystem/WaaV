@@ -42,6 +42,19 @@ pub trait RealtimeProtocol: Send + Sync + Sized + 'static {
     /// support). Drives the driver's mode-aware barge-in + audio stamping.
     fn caps(&self) -> ProtocolCaps;
 
+    /// The PCM16 sample rate the vendor expects on INPUT (FRD-023 §5.7: a GA client sends
+    /// 24 kHz; the translate engine resamples to this). Default: the GA rate.
+    fn input_sample_rate(&self) -> u32 {
+        24_000
+    }
+
+    /// The longest a single vendor connection may live (Nova Sonic: 8 minutes). The driver
+    /// reconnects proactively before it — at a turn boundary where it can — so the session
+    /// outlives the connection. `None`: no cap.
+    fn max_connection(&self) -> Option<std::time::Duration> {
+        None
+    }
+
     /// Build the connect target (URL + headers) from config. Sync: any async
     /// handshake (Ultravox REST-create, AWS SigV4) is the transport factory's job.
     fn connect_spec(&self, cfg: &RealtimeConfig) -> RealtimeResult<ConnectSpec>;

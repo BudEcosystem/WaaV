@@ -427,7 +427,8 @@ pub fn allowed_provider_params(vendor: &str) -> &'static [&'static str] {
         .replace('-', "_")
         .as_str()
     {
-        "aws_polly" | "aws_transcribe" => &["region"],
+        // Nova 2 Sonic (realtime, FRD-023 RT7.2) signs Bedrock requests in this region.
+        "aws_polly" | "aws_transcribe" | "nova_sonic" => &["region"],
         "google" => &["project_id", "location"],
         "azure_openai" => &["api_version"],
         _ => &[],
@@ -1245,6 +1246,33 @@ mod tests {
             "Azure AI Speech takes no provider_params"
         );
         assert!(allowed_provider_params("deepgram").is_empty());
+    }
+
+    /// FRD-023 RT7.2 (CONTRACTS C7) — a Nova 2 Sonic realtime entry carries its REQUIRED region
+    /// in `provider_params`; dropping it at parse would leave the session unable to sign.
+    #[test]
+    fn nova_sonic_keeps_its_region_and_its_key_pair() {
+        assert_eq!(allowed_provider_params("nova_sonic"), &["region"]);
+        assert_eq!(allowed_provider_params("nova-sonic"), &["region"]);
+        let json = serde_json::json!({ "ep-nova": {
+            "vendor": "nova_sonic",
+            "credential": encrypt_like_budapp(
+                r#"{"access_key_id":"AKIDNOVA","secret_access_key":"s3cr3t"}"#
+            ),
+            "endpoints": ["realtime_session"],
+            "model": "amazon.nova-2-sonic-v1:0",
+            "provider_params": { "region": "us-east-1", "endpoint_override": "https://evil" },
+        }})
+        .to_string();
+        let map = parse_voice_blob(&json, &decryptor()).unwrap();
+        let ep = map.get("ep-nova").unwrap();
+        assert_eq!(ep.provider_param("region"), Some("us-east-1"));
+        assert_eq!(ep.provider_param("endpoint_override"), None);
+        let parts = ep.credential_parts.as_ref().expect("the AWS pair splits");
+        assert_eq!(
+            parts.get("access_key_id").map(String::as_str),
+            Some("AKIDNOVA")
+        );
     }
 
     #[test]

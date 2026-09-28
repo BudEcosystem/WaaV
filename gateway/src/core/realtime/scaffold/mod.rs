@@ -18,7 +18,9 @@ mod protocol;
 mod session;
 mod transport;
 
-pub use event::{ConnectSpec, Inbound, OutFrame, ProtocolCaps, S2sEvent, apply_endpoint_override};
+pub use event::{
+    ConnectSpec, Inbound, OutFrame, ProtocolCaps, S2sEvent, UsageReport, apply_endpoint_override,
+};
 pub use protocol::RealtimeProtocol;
 pub use session::RealtimeSession;
 pub use transport::{

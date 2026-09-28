@@ -90,6 +90,11 @@ impl RealtimeProtocol for ElevenLabsProtocol {
         "elevenlabs"
     }
 
+    fn input_sample_rate(&self) -> u32 {
+        // `pcm_16000` both directions.
+        OUTPUT_SAMPLE_RATE
+    }
+
     fn caps(&self) -> ProtocolCaps {
         ProtocolCaps {
             // ConvAI runs server-side VAD + turn-taking, so it owns turns and

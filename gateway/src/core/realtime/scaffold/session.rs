@@ -20,8 +20,8 @@ use super::super::base::{
     AudioOutputCallback, BaseRealtime, ConnectionState, FunctionCallCallback, RealtimeAudioData,
     RealtimeConfig, RealtimeError, RealtimeErrorCallback, RealtimeResponseOverride, RealtimeResult,
     ReconnectionCallback, ReconnectionConfig, ReconnectionEvent, ReplayConversationItem,
-    ResponseDoneCallback, SpeechEventCallback, TranscriptCallback, TranscriptResult,
-    TranscriptRole, clamp_truncate_ms,
+    ResponseDoneCallback, S2sEventCallback, SpeechEventCallback, TranscriptCallback,
+    TranscriptResult, TranscriptRole, clamp_truncate_ms,
 };
 use super::event::{OutFrame, ProtocolCaps, S2sEvent};
 use super::protocol::RealtimeProtocol;
@@ -41,6 +41,20 @@ const PREROLL_CAP_BYTES: usize = 32_000;
 /// stops the storm instead of hammering.
 const MIN_STABLE_CONNECTION: Duration = Duration::from_secs(5);
 const MAX_CONSECUTIVE_QUICK_FAILURES: u32 = 3;
+/// A planned reconnect (a vendor's `goAway`, a connection cap) waits for the response in
+/// flight to finish — but only until this much before the vendor's own deadline.
+const GO_AWAY_MARGIN: Duration = Duration::from_millis(500);
+
+/// Why a live connection is being replaced on purpose (not a failure, no backoff).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Planned {
+    /// Not planned: keep the connection.
+    No,
+    /// Replace it at the next turn boundary, or at `deadline` at the latest.
+    WhenIdle,
+    /// Replace it now.
+    Now,
+}
 
 /// Playback position of the currently-streaming assistant item (for truncate).
 /// `first_delta` anchors WALL-CLOCK elapsed so a barge-in truncates to what the
@@ -92,6 +106,8 @@ struct DispatchCtx {
     playback: Arc<StdMutex<Option<ItemPlayback>>>,
     conversation_log: Arc<RwLock<Vec<ReplayConversationItem>>>,
     resumption: Arc<RwLock<Option<String>>>,
+    /// The raw event tap (`BaseRealtime::on_event`).
+    event_cb: Arc<Mutex<Option<S2sEventCallback>>>,
     caps: ProtocolCaps,
 }
 
@@ -221,6 +237,12 @@ impl DispatchCtx {
             S2sEvent::ResumptionHandle(h) => {
                 *self.resumption.write().await = Some(h);
             }
+            // Carried by the event tap only: no callback of the native surface takes them. A
+            // `GoAway` is acted on by the supervisor before dispatch.
+            S2sEvent::Usage(_)
+            | S2sEvent::ItemAdded { .. }
+            | S2sEvent::ItemDone { .. }
+            | S2sEvent::GoAway { .. } => {}
             // Routed to the outbound path by the supervisor BEFORE dispatch (it
             // owns the out channel); it is not a user-facing callback event, so
             // reaching the dispatcher is a no-op (defensive — the supervisor's
@@ -260,8 +282,18 @@ impl<P: RealtimeProtocol> RealtimeSession<P> {
     /// Build a session from a protocol + config (the provider newtype calls this
     /// from `BaseRealtime::new`).
     pub fn from_parts(protocol: P, config: RealtimeConfig) -> RealtimeResult<Self> {
-        let caps = protocol.caps();
         let factory = protocol.transport_factory();
+        Self::with_transport(protocol, config, factory)
+    }
+
+    /// Build a session that dials through `factory` instead of the protocol's own — e.g. a
+    /// Bedrock factory holding a deployment's static AWS keys (FRD-023 RT7.2).
+    pub fn with_transport(
+        protocol: P,
+        config: RealtimeConfig,
+        factory: Arc<dyn RealtimeTransportFactory>,
+    ) -> RealtimeResult<Self> {
+        let caps = protocol.caps();
         let reconnect_cfg = config.reconnection.clone().unwrap_or_default();
         Ok(Self {
             protocol: Arc::new(protocol),
@@ -289,6 +321,7 @@ impl<P: RealtimeProtocol> RealtimeSession<P> {
                 playback: Arc::new(StdMutex::new(None)),
                 conversation_log: Arc::new(RwLock::new(Vec::new())),
                 resumption: Arc::new(RwLock::new(None)),
+                event_cb: Arc::new(Mutex::new(None)),
                 caps,
             },
             reconnection_cb: Arc::new(Mutex::new(None)),
@@ -493,18 +526,49 @@ impl<P: RealtimeProtocol> RealtimeSession<P> {
                 if let Some(r) = &resilience {
                     r.breaker.record_success();
                 }
-                Self::notify_reconnect(&reconnection_cb, attempt, true, None).await;
             }
             crate::core::metrics::bridge::record_reconnect(provider_id, "connected");
+            // Connected BEFORE the reconnect is announced: a listener that resumes sending on
+            // the announcement must find the session ready.
             connected.store(true, Ordering::SeqCst);
             write_connection_state(&state, ConnectionState::Connected);
+            if is_reconnect {
+                Self::notify_reconnect(&reconnection_cb, attempt, true, None).await;
+            }
             // First connect succeeded → unblock connect().
             Self::signal_ready(&mut ready_tx, Ok(()));
             attempt = 0;
 
+            // A connection cap (Nova Sonic: 8 min) or a vendor `goAway` replaces the connection
+            // on purpose, at a turn boundary when there is one (FRD-023 RT7.1, RT7.2).
+            let cap = config.max_connection.or_else(|| protocol.max_connection());
+            let cap_at = cap.map(|d| tokio::time::Instant::now() + d);
+            // After the cap, a response in flight gets this long to finish.
+            let cap_grace = cap.map(|d| (d / 16).max(Duration::from_millis(1)));
+            let mut planned = Planned::No;
+            let mut deadline: Option<tokio::time::Instant> = None;
+            let mut in_response = false;
+
             // ── inner loop: pump outbound + dispatch inbound ──
             loop {
+                if planned == Planned::WhenIdle && !in_response {
+                    planned = Planned::Now;
+                }
+                if planned == Planned::Now {
+                    break;
+                }
                 tokio::select! {
+                    _ = tokio::time::sleep_until(cap_at.unwrap_or_else(tokio::time::Instant::now)),
+                        if cap_at.is_some() && planned == Planned::No => {
+                        planned = Planned::WhenIdle;
+                        let grace_end = cap_at.unwrap_or_else(tokio::time::Instant::now)
+                            + cap_grace.unwrap_or_default();
+                        deadline = Some(deadline.map_or(grace_end, |d| d.min(grace_end)));
+                    }
+                    _ = tokio::time::sleep_until(deadline.unwrap_or_else(tokio::time::Instant::now)),
+                        if deadline.is_some() => {
+                        planned = Planned::Now;
+                    }
                     out = out_rx.recv() => match out {
                         Some(frame) => {
                             if transport.send(frame).await.is_err() {
@@ -519,7 +583,33 @@ impl<P: RealtimeProtocol> RealtimeSession<P> {
                     },
                     inbound = transport.recv() => match inbound {
                         Some(Ok(frame)) => {
+                            let tap = ctx.event_cb.lock().await.clone();
                             for ev in protocol.map_server_event(frame.as_inbound()) {
+                                if let Some(tap) = &tap
+                                    && !matches!(ev, S2sEvent::SendFrame(_) | S2sEvent::Ignore)
+                                {
+                                    tap(ev.clone()).await;
+                                }
+                                match &ev {
+                                    S2sEvent::Audio { .. }
+                                    | S2sEvent::FunctionCall(_)
+                                    | S2sEvent::Transcript {
+                                        role: TranscriptRole::Assistant,
+                                        ..
+                                    } => in_response = true,
+                                    S2sEvent::ResponseDone { .. }
+                                    | S2sEvent::InterruptedByServer => in_response = false,
+                                    S2sEvent::GoAway { time_left } => {
+                                        let by = tokio::time::Instant::now()
+                                            + time_left
+                                                .unwrap_or_default()
+                                                .saturating_sub(GO_AWAY_MARGIN);
+                                        deadline = Some(deadline.map_or(by, |d| d.min(by)));
+                                        planned = Planned::WhenIdle;
+                                        continue;
+                                    }
+                                    _ => {}
+                                }
                                 // An inbound-triggered outbound frame (e.g. ConvAI
                                 // ping→pong): send it on the transport DIRECTLY, exactly
                                 // like the InterruptedByServer cancel/truncate sends just
@@ -580,6 +670,16 @@ impl<P: RealtimeProtocol> RealtimeSession<P> {
             // ── connection ended ──
             connected.store(false, Ordering::SeqCst);
             transport.close().await;
+
+            if planned == Planned::Now && !intentional_disconnect.load(Ordering::SeqCst) {
+                // Replaced on purpose: no failure signal, no backoff, the resumption handle
+                // (if any) is carried by the next dial.
+                tracing::info!(provider = provider_id, "planned reconnect");
+                crate::core::metrics::bridge::record_reconnect(provider_id, "planned");
+                write_connection_state(&state, ConnectionState::Reconnecting);
+                is_reconnect = true;
+                continue 'outer;
+            }
 
             // D-G2: feed the SHARED, per-provider circuit breaker this
             // connection's measured lifetime, so a bad-credential
@@ -879,6 +979,20 @@ impl<P: RealtimeProtocol> BaseRealtime for RealtimeSession<P> {
 
     fn set_resilience(&mut self, resilience: ResilienceHandles) {
         self.resilience = Some(resilience);
+    }
+
+    fn on_event(&mut self, callback: S2sEventCallback) -> RealtimeResult<()> {
+        if let Ok(mut g) = self.cb.event_cb.try_lock() {
+            *g = Some(callback);
+        }
+        Ok(())
+    }
+
+    fn audio_rates(&self) -> Option<(u32, u32)> {
+        Some((
+            self.protocol.input_sample_rate(),
+            self.caps.output_sample_rate,
+        ))
     }
 
     fn emits_user_turn_frames(&self) -> bool {

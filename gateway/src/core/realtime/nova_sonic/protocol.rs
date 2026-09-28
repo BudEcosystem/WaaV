@@ -45,13 +45,14 @@ use bytes::Bytes;
 use serde_json::{Value, json};
 use std::sync::Mutex;
 
+use crate::core::realtime::base::ReplayConversationItem;
 use crate::core::realtime::base::{
     FunctionCallRequest, RealtimeConfig, RealtimeError, RealtimeResponseOverride, RealtimeResult,
     TranscriptRole,
 };
 use crate::core::realtime::scaffold::{
     BedrockBidiTransportFactory, ConnectSpec, Inbound, OutFrame, ProtocolCaps, RealtimeProtocol,
-    RealtimeTransportFactory, S2sEvent,
+    RealtimeTransportFactory, S2sEvent, UsageReport,
 };
 use std::sync::Arc;
 
@@ -75,6 +76,9 @@ const OUTPUT_BYTES_PER_MS: u64 = 48;
 /// (PCM 16-bit mono @ 16 kHz — the gateway's standard mic rate; Nova Sonic accepts
 /// 8/16/24 kHz).
 const INPUT_SAMPLE_RATE: u32 = 16_000;
+
+/// A Bedrock bidirectional stream lives at most 8 minutes; replace it 30 s before that.
+const MAX_CONNECTION: std::time::Duration = std::time::Duration::from_secs(8 * 60 - 30);
 
 /// The current text-content role/stage tracked across a `contentStart`→`textOutput`
 /// pair. Nova Sonic puts the role (USER ASR vs ASSISTANT) + `generationStage`
@@ -114,6 +118,11 @@ pub struct NovaSonicProtocol {
     /// on the following `textOutput`. Single-writer (the driver's recv loop);
     /// `Mutex` only to satisfy `Send + Sync` on the `&self` trait.
     current_text: Mutex<Option<TextContentState>>,
+    /// The assistant AUDIO content block in flight (its `contentId`), for `ItemAdded`/`ItemDone`.
+    current_audio: Mutex<Option<String>>,
+    /// The running `usageEvent` totals on THIS connection, for a report that carries totals
+    /// but no delta. Reset at every (re)connect: a new stream counts from zero.
+    usage_totals: Mutex<crate::core::realtime_cost::RealtimeUsage>,
 }
 
 impl NovaSonicProtocol {
@@ -197,6 +206,58 @@ impl NovaSonicProtocol {
         Some(json!({ "tools": specs }))
     }
 
+    /// One `usageEvent` → one delta [`UsageReport`] (see the `usageEvent` arm).
+    fn map_usage(&self, body: &Value) -> Vec<S2sEvent> {
+        fn n(v: Option<&Value>) -> u64 {
+            v.and_then(Value::as_u64).unwrap_or(0)
+        }
+        fn read(block: &Value) -> crate::core::realtime_cost::RealtimeUsage {
+            let input = block.get("input");
+            let output = block.get("output");
+            crate::core::realtime_cost::RealtimeUsage {
+                input_audio: n(input.and_then(|i| i.get("speechTokens"))),
+                input_text: n(input.and_then(|i| i.get("textTokens"))),
+                output_audio: n(output.and_then(|o| o.get("speechTokens"))),
+                output_text: n(output.and_then(|o| o.get("textTokens"))),
+                ..Default::default()
+            }
+        }
+        let details = body.get("details");
+        let tokens = if let Some(delta) = details.and_then(|d| d.get("delta")) {
+            let delta = read(delta);
+            if let Some(total) = details.and_then(|d| d.get("total"))
+                && let Ok(mut t) = self.usage_totals.lock()
+            {
+                *t = read(total);
+            }
+            delta
+        } else if let Some(total) = details.and_then(|d| d.get("total")) {
+            let total = read(total);
+            let Ok(mut last) = self.usage_totals.lock() else {
+                return vec![S2sEvent::Ignore];
+            };
+            let delta = crate::core::realtime_cost::RealtimeUsage {
+                input_audio: total.input_audio.saturating_sub(last.input_audio),
+                input_text: total.input_text.saturating_sub(last.input_text),
+                output_audio: total.output_audio.saturating_sub(last.output_audio),
+                output_text: total.output_text.saturating_sub(last.output_text),
+                ..Default::default()
+            };
+            *last = total;
+            delta
+        } else {
+            return vec![S2sEvent::Ignore];
+        };
+        if tokens.is_empty() {
+            return vec![S2sEvent::Ignore];
+        }
+        vec![S2sEvent::Usage(UsageReport {
+            tokens,
+            seconds: None,
+            cumulative: false,
+        })]
+    }
+
     /// `{"event": {"audioInput": {promptName, contentName, content}}}` — one
     /// base64-PCM user-audio chunk into the single audio content container.
     fn audio_input_event(&self, pcm: &[u8]) -> Value {
@@ -240,6 +301,8 @@ impl RealtimeProtocol for NovaSonicProtocol {
             prompt_name: uuid::Uuid::new_v4().to_string(),
             audio_content_name: uuid::Uuid::new_v4().to_string(),
             current_text: Mutex::new(None),
+            current_audio: Mutex::new(None),
+            usage_totals: Mutex::new(Default::default()),
         })
     }
 
@@ -247,11 +310,21 @@ impl RealtimeProtocol for NovaSonicProtocol {
     /// stream, so it opts into the Bedrock-bidi transport factory instead of the
     /// default plain WebSocket.
     fn transport_factory(&self) -> Arc<dyn RealtimeTransportFactory> {
-        Arc::new(BedrockBidiTransportFactory)
+        Arc::new(BedrockBidiTransportFactory::default_chain())
     }
 
     fn provider_id(&self) -> &'static str {
         "nova_sonic"
+    }
+
+    fn input_sample_rate(&self) -> u32 {
+        INPUT_SAMPLE_RATE
+    }
+
+    /// Nova Sonic ends a bidirectional stream at 8 minutes; the driver replaces it 30 s before,
+    /// at a turn boundary when there is one (FRD-023 RT7.2).
+    fn max_connection(&self) -> Option<std::time::Duration> {
+        Some(MAX_CONNECTION)
     }
 
     fn caps(&self) -> ProtocolCaps {
@@ -284,6 +357,13 @@ impl RealtimeProtocol for NovaSonicProtocol {
         cfg: &RealtimeConfig,
         _resumption: Option<&str>,
     ) -> Vec<Self::Wire> {
+        // A (re)connect is a new stream: its usage totals count from zero.
+        if let Ok(mut t) = self.usage_totals.lock() {
+            *t = Default::default();
+        }
+        if let Ok(mut a) = self.current_audio.lock() {
+            *a = None;
+        }
         // The Nova Sonic bootstrap sequence (each a `{"event": {…}}` JSON), in the
         // documented order, leaving the session ready for `audioInput`:
         //   sessionStart → promptStart → (SYSTEM contentStart/textInput/contentEnd)
@@ -403,6 +483,19 @@ impl RealtimeProtocol for NovaSonicProtocol {
             // textOutput (and the type for audio). We stash the TEXT role/stage so
             // the subsequent textOutput maps to the right transcript role/finality.
             "contentStart" => {
+                // The assistant's spoken output is a conversation item of its own.
+                if body.get("type").and_then(Value::as_str) == Some("AUDIO")
+                    && body.get("role").and_then(Value::as_str) == Some("ASSISTANT")
+                    && let Some(id) = body.get("contentId").and_then(Value::as_str)
+                {
+                    if let Ok(mut g) = self.current_audio.lock() {
+                        *g = Some(id.to_string());
+                    }
+                    return vec![S2sEvent::ItemAdded {
+                        item_id: id.to_string(),
+                        role: TranscriptRole::Assistant,
+                    }];
+                }
                 if body.get("type").and_then(Value::as_str) == Some("TEXT") {
                     let role = match body.get("role").and_then(Value::as_str) {
                         Some("USER") => TranscriptRole::User,
@@ -506,11 +599,24 @@ impl RealtimeProtocol for NovaSonicProtocol {
             // (the driver clears local playback). Other stopReasons are not turn-
             // complete (completionEnd is the response-done signal), so Ignore.
             "contentEnd" => {
-                if body.get("stopReason").and_then(Value::as_str) == Some("INTERRUPTED") {
-                    vec![S2sEvent::InterruptedByServer]
-                } else {
-                    vec![S2sEvent::Ignore]
+                let mut out = Vec::new();
+                let id = body.get("contentId").and_then(Value::as_str);
+                if let Ok(mut g) = self.current_audio.lock()
+                    && id.is_some()
+                    && g.as_deref() == id
+                {
+                    *g = None;
+                    out.push(S2sEvent::ItemDone {
+                        item_id: id.unwrap_or_default().to_string(),
+                    });
                 }
+                if body.get("stopReason").and_then(Value::as_str) == Some("INTERRUPTED") {
+                    out.push(S2sEvent::InterruptedByServer);
+                }
+                if out.is_empty() {
+                    out.push(S2sEvent::Ignore);
+                }
+                out
             }
             // completionEnd: the model finished this response generation. Drives
             // on_response_done (the response/completion id is not separately needed).
@@ -521,7 +627,12 @@ impl RealtimeProtocol for NovaSonicProtocol {
                     .unwrap_or("")
                     .to_string(),
             }],
-            // completionStart / usageEvent / unknown ⇒ nothing actionable.
+            // usageEvent: the tokens since the last report (`details.delta`), metered once each
+            // (FRD-023 §5.10, TC-XL-05). Speech bills at the audio rates, text at the text
+            // rates. The running `details.total` is used only when a report has no delta — and
+            // then as a difference, so it is never billed twice.
+            "usageEvent" => self.map_usage(body),
+            // completionStart / unknown ⇒ nothing actionable.
             _ => vec![S2sEvent::Ignore],
         }
     }
@@ -584,6 +695,48 @@ impl RealtimeProtocol for NovaSonicProtocol {
         // Barge-in is server-side (the INTERRUPTED contentEnd); there is no
         // client-driven response-cancel event. Safest to send nothing.
         Vec::new()
+    }
+
+    /// Conversation history after a reconnect (the 8-minute cap, FRD-023 RT7.2): a new stream
+    /// starts a new Nova session, so each logged turn is sent back as a non-interactive TEXT
+    /// block with its role — the context survives the connection.
+    fn replay_item(&self, item: &ReplayConversationItem) -> Vec<Self::Wire> {
+        let content_name = uuid::Uuid::new_v4().to_string();
+        let role = match item.role {
+            TranscriptRole::User => "USER",
+            TranscriptRole::Assistant => "ASSISTANT",
+        };
+        vec![
+            json!({
+                "event": {
+                    "contentStart": {
+                        "promptName": self.prompt_name,
+                        "contentName": content_name,
+                        "type": "TEXT",
+                        "interactive": false,
+                        "role": role,
+                        "textInputConfiguration": { "mediaType": "text/plain" },
+                    }
+                }
+            }),
+            json!({
+                "event": {
+                    "textInput": {
+                        "promptName": self.prompt_name,
+                        "contentName": content_name,
+                        "content": item.text,
+                    }
+                }
+            }),
+            json!({
+                "event": {
+                    "contentEnd": {
+                        "promptName": self.prompt_name,
+                        "contentName": content_name,
+                    }
+                }
+            }),
+        ]
     }
 
     fn format_tool_result(&self, call_id: &str, result: &str) -> Vec<Self::Wire> {
@@ -673,6 +826,90 @@ mod tests {
     }
 
     /// from_config defaults the model + voice when omitted.
+    /// TC-XL-05 (protocol half) — a `usageEvent` is ONE delta report: speech → audio, text →
+    /// text, from `details.delta` (never the running total, which would bill twice).
+    #[test]
+    fn tc_xl_05_usage_event_is_one_delta_report() {
+        let p = NovaSonicProtocol::from_config(&base_cfg()).unwrap();
+        let raw = json!({"event": {"usageEvent": {
+            "completionId": "c1", "totalTokens": 999,
+            "details": {
+                "delta": {"input": {"speechTokens": 40, "textTokens": 3},
+                          "output": {"speechTokens": 50, "textTokens": 7}},
+                "total": {"input": {"speechTokens": 400, "textTokens": 30},
+                          "output": {"speechTokens": 500, "textTokens": 70}}
+            }
+        }}})
+        .to_string();
+        let evs = p.map_server_event(Inbound::Text(&raw));
+        let [S2sEvent::Usage(u)] = evs.as_slice() else {
+            panic!("{evs:?}");
+        };
+        assert!(!u.cumulative);
+        let t = u.tokens;
+        assert_eq!(
+            (t.input_audio, t.input_text, t.output_audio, t.output_text),
+            (40, 3, 50, 7)
+        );
+    }
+
+    /// A report with totals and no delta is billed as the DIFFERENCE from the last total on
+    /// the same connection; a reconnect starts the count again.
+    #[test]
+    fn usage_totals_without_a_delta_bill_the_difference_per_connection() {
+        let p = NovaSonicProtocol::from_config(&base_cfg()).unwrap();
+        let total = |speech_in: u64| {
+            json!({"event": {"usageEvent": {"details": {"total": {
+                "input": {"speechTokens": speech_in, "textTokens": 0},
+                "output": {"speechTokens": 0, "textTokens": 0}}}}}})
+            .to_string()
+        };
+        let billed = |raw: String| match p.map_server_event(Inbound::Text(&raw)).as_slice() {
+            [S2sEvent::Usage(u)] => u.tokens.input_audio,
+            _ => 0,
+        };
+        assert_eq!(billed(total(100)), 100);
+        assert_eq!(billed(total(150)), 50);
+        let _ = p.build_session_config(&base_cfg(), None); // a reconnect
+        assert_eq!(billed(total(30)), 30);
+    }
+
+    /// The assistant's audio block is an item: `ItemAdded` at its start, `ItemDone` at its end.
+    #[test]
+    fn assistant_audio_blocks_are_items() {
+        let p = NovaSonicProtocol::from_config(&base_cfg()).unwrap();
+        let start = json!({"event": {"contentStart": {"type": "AUDIO", "role": "ASSISTANT",
+            "contentId": "ct-1"}}})
+        .to_string();
+        assert!(matches!(
+            p.map_server_event(Inbound::Text(&start)).as_slice(),
+            [S2sEvent::ItemAdded { item_id, role: TranscriptRole::Assistant }] if item_id == "ct-1"
+        ));
+        let end = json!({"event": {"contentEnd": {"contentId": "ct-1", "stopReason": "END_TURN"}}})
+            .to_string();
+        assert!(matches!(
+            p.map_server_event(Inbound::Text(&end)).as_slice(),
+            [S2sEvent::ItemDone { item_id }] if item_id == "ct-1"
+        ));
+    }
+
+    /// History survives a reconnect: each logged turn goes back as a non-interactive TEXT
+    /// block with its role.
+    #[test]
+    fn replay_sends_history_as_text_blocks() {
+        let p = NovaSonicProtocol::from_config(&base_cfg()).unwrap();
+        let wires = p.replay_item(&ReplayConversationItem {
+            role: TranscriptRole::Assistant,
+            text: "hi there".into(),
+        });
+        assert_eq!(wires.len(), 3);
+        let cs = &wires[0]["event"]["contentStart"];
+        assert_eq!(cs["role"], "ASSISTANT");
+        assert_eq!(cs["type"], "TEXT");
+        assert_eq!(cs["interactive"], false);
+        assert_eq!(wires[1]["event"]["textInput"]["content"], "hi there");
+    }
+
     /// F-4 — Nova Sonic v1 reached end of life on 2026-09-14; the default is Nova 2 Sonic.
     #[test]
     fn f4_the_default_model_is_nova_2_sonic() {
@@ -1095,7 +1332,8 @@ mod tests {
     }
 
     /// Turn/response controls are empty (server VAD owns them); defaults (truncate,
-    /// input-buffer clear, replay) are empty too.
+    /// input-buffer clear) are empty too. (Replay is not: the 8-minute reconnect needs the
+    /// history — `replay_sends_history_as_text_blocks`.)
     #[test]
     fn turn_and_default_controls_are_empty() {
         let p = proto(&base_cfg());
@@ -1104,12 +1342,5 @@ mod tests {
         assert!(p.cancel_response().is_empty());
         assert!(p.truncate("x", 1).is_empty());
         assert!(p.clear_input_buffer().is_empty());
-        assert!(
-            p.replay_item(&ReplayConversationItem {
-                role: TranscriptRole::User,
-                text: "x".into(),
-            })
-            .is_empty()
-        );
     }
 }

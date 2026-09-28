@@ -295,6 +295,35 @@ pub struct RealtimeConfig {
     /// engine opens a fresh root span). Server-set only; other providers ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trace: Option<String>,
+
+    /// SERVER-SET: reconnect proactively after a connection has lived this long (a vendor's
+    /// connection cap — Nova Sonic's 8 minutes). `None` ⇒ the protocol's own cap
+    /// ([`RealtimeProtocol::max_connection`](crate::core::realtime::scaffold::RealtimeProtocol::max_connection)).
+    /// Never read from a client message (`serde(skip)`).
+    #[serde(skip)]
+    pub max_connection: Option<std::time::Duration>,
+}
+
+/// A static AWS key pair from a Bud deployment's credential (FRD-023 RT7.2: Nova Sonic signs with
+/// the DEPLOYMENT's keys, never the gateway's own AWS identity). `Debug` is redacted.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AwsStaticCredentials {
+    pub access_key_id: String,
+    pub secret_access_key: String,
+    pub session_token: Option<String>,
+}
+
+impl fmt::Debug for AwsStaticCredentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AwsStaticCredentials")
+            .field("access_key_id", &"[redacted]")
+            .field("secret_access_key", &"[redacted]")
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| "[redacted]"),
+            )
+            .finish()
+    }
 }
 
 /// Configuration for input audio transcription.
@@ -580,6 +609,13 @@ pub struct ReconnectionEvent {
 pub type ReconnectionCallback =
     Arc<dyn Fn(ReconnectionEvent) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
+/// Receives every normalized provider event, in order (FRD-023 RT7, the translate engine).
+pub type S2sEventCallback = Arc<
+    dyn Fn(crate::core::realtime::scaffold::S2sEvent) -> Pin<Box<dyn Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
+
 // =============================================================================
 // Base Trait
 // =============================================================================
@@ -754,6 +790,24 @@ pub trait BaseRealtime: Send + Sync {
     /// provider breaker tripping and publish `waav_circuit_breaker_state{provider}` on transition.
     /// Default is a no-op so providers that don't (yet) consume the handles compile unchanged.
     fn set_resilience(&mut self, _resilience: crate::core::resilience::ResilienceHandles) {}
+
+    /// Every normalized event the provider produces, in wire order, BEFORE the callbacks above
+    /// see it — including those no callback carries (`Usage`, `ItemAdded`, `InterruptedByServer`,
+    /// …). The translate engine (FRD-023 §5.7) builds the OpenAI GA event stream from it. The
+    /// callback must not block: the provider's receive loop awaits it.
+    ///
+    /// Default: refused, so a provider that is not on the S2S scaffold cannot be translated by
+    /// accident with half its events missing.
+    fn on_event(&mut self, _callback: S2sEventCallback) -> RealtimeResult<()> {
+        Err(RealtimeError::InvalidConfiguration(
+            "this realtime provider does not expose its event stream".to_string(),
+        ))
+    }
+
+    /// The PCM16 sample rates the provider speaks: `(input, output)`, when known.
+    fn audio_rates(&self) -> Option<(u32, u32)> {
+        None
+    }
 
     // ── B-G2: S2S-as-a-service surface (defaults are no-ops so every
     //    provider compiles; OpenAI Realtime implements them fully) ──

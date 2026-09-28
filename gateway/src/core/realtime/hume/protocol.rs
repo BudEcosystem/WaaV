@@ -110,6 +110,10 @@ impl RealtimeProtocol for HumeProtocol {
         "hume"
     }
 
+    fn input_sample_rate(&self) -> u32 {
+        self.config.sample_rate
+    }
+
     fn caps(&self) -> ProtocolCaps {
         ProtocolCaps {
             // Hume EVI runs SERVER-side VAD + turn-taking (it auto-generates
