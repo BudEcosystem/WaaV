@@ -649,3 +649,29 @@ fn the_translate_vendors_are_c7s() {
     assert!(vendor_info("deepgram_voice_agent").unwrap().per_minute);
     assert!(!vendor_info("gemini").unwrap().per_minute);
 }
+
+/// Every translate vendor detects turns itself unless told otherwise, so a session that set no
+/// `turn_detection` reports server VAD — `null` would tell a GA client (the playground) the session
+/// is push-to-talk and put a manual "Send" in front of a user who only has to speak. An explicit
+/// `turn_detection: null` is still reported as off.
+#[test]
+fn an_unset_turn_detection_is_reported_as_the_vendors_own_vad() {
+    for vendor in ["gemini", "nova_sonic", "deepgram_voice_agent", "elevenlabs_convai", "hume_evi"] {
+        let tr = translator(vendor);
+        let created: Value = serde_json::from_str(&tr.session_created()).unwrap();
+        assert_eq!(
+            created["session"]["audio"]["input"]["turn_detection"],
+            json!({"type": "server_vad"}),
+            "{vendor}"
+        );
+    }
+    let mut tr = translator("deepgram_voice_agent");
+    let acts = tr.client(
+        &json!({"type": "session.update",
+                "session": {"audio": {"input": {"turn_detection": null}}}})
+        .to_string(),
+    );
+    let _ = acts;
+    let created: Value = serde_json::from_str(&tr.session_created()).unwrap();
+    assert!(created["session"]["audio"]["input"]["turn_detection"].is_null());
+}

@@ -557,10 +557,13 @@ impl Translator {
             "audio": {
                 "input": {
                     "format": format,
-                    "turn_detection": c.turn_detection.as_ref().map(|t| match t {
-                        TurnDetectionConfig::None => Value::Null,
-                        other => serde_json::to_value(other).unwrap_or(Value::Null),
-                    }),
+                    // Unset = the vendor's own turn detection, which every translate vendor
+                    // runs by default; `null` only when the client turned it off.
+                    "turn_detection": match c.turn_detection.as_ref() {
+                        None => json!({"type": "server_vad"}),
+                        Some(TurnDetectionConfig::None) => Value::Null,
+                        Some(other) => serde_json::to_value(other).unwrap_or(Value::Null),
+                    },
                     "transcription": c.input_audio_transcription.as_ref().map(|t| json!({"model": t.model})),
                 },
                 "output": {"format": format, "voice": c.voice},
