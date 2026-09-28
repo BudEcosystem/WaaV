@@ -25,6 +25,7 @@ pub mod middleware;
 pub mod observability;
 pub mod plugin;
 pub mod routes;
+pub mod server;
 pub mod state;
 pub mod utils;
 

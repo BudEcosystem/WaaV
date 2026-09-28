@@ -539,7 +539,8 @@ async fn main() -> anyhow::Result<()> {
         });
 
         // Create and run the server
-        axum_server::bind_rustls(socket_addr, rustls_config)
+        // TCP_NODELAY on accept: see `server` (FRD-023 TC-PERF-01).
+        waav_gateway::server::tls_server(socket_addr, rustls_config)
             .handle(handle)
             .serve(app.into_make_service_with_connect_info::<SocketAddr>())
             .await
@@ -549,9 +550,9 @@ async fn main() -> anyhow::Result<()> {
 
         let listener = TcpListener::bind(&socket_addr).await?;
 
-        // Use axum::serve with graceful shutdown
+        // Use axum::serve with graceful shutdown; TCP_NODELAY on accept (FRD-023 TC-PERF-01).
         axum::serve(
-            listener,
+            waav_gateway::server::nodelay_listener(listener),
             app.into_make_service_with_connect_info::<SocketAddr>(),
         )
         .with_graceful_shutdown(async move {
