@@ -434,7 +434,13 @@ pub fn defaults_update(
         input.insert("transcription".into(), Value::Object(transcription_cfg));
     }
     if let Some(td) = &defaults.turn_detection {
-        input.insert("turn_detection".into(), td.clone());
+        // Bud stores "off" as `{"type":"none"}`; GA turns detection off with `null` and refuses the
+        // type, which would drop the whole update.
+        let off = td.get("type").and_then(Value::as_str) == Some("none");
+        input.insert(
+            "turn_detection".into(),
+            if off { Value::Null } else { td.clone() },
+        );
     }
     if let Some(nr) = &defaults.noise_reduction {
         input.insert("noise_reduction".into(), serde_json::json!({ "type": nr }));
@@ -794,6 +800,29 @@ mod tests {
         );
         assert_eq!(s["audio"]["input"]["noise_reduction"]["type"], "near_field");
         assert!(s.get("model").is_none());
+    }
+
+    /// Bud stores "turn detection off" as `{"type":"none"}`; OpenAI GA turns it off with `null` and
+    /// refuses the type (`invalid_value: Supported values are: 'server_vad' and 'semantic_vad'`, seen live
+    /// on gpt-realtime-2.1-mini) -- which also drops every other default in the same update.
+    #[test]
+    fn turn_detection_none_is_sent_as_null() {
+        let settings: RealtimeSettings = serde_json::from_value(serde_json::json!({
+            "session_type": "realtime",
+            "defaults": {"voice": "cedar", "turn_detection": {"type": "none"}}
+        }))
+        .unwrap();
+        let update: Value = serde_json::from_str(
+            &defaults_update(Some(&settings), Some("gpt-realtime-2.1"), "e").unwrap(),
+        )
+        .unwrap();
+        let input = &update["session"]["audio"]["input"];
+        assert!(
+            input.as_object().unwrap().contains_key("turn_detection"),
+            "off must be sent, not omitted: omitting keeps the vendor's server VAD"
+        );
+        assert!(input["turn_detection"].is_null(), "{input}");
+        assert_eq!(update["session"]["audio"]["output"]["voice"], "cedar");
     }
 
     #[test]
