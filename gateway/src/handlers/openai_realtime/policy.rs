@@ -297,8 +297,16 @@ pub fn client_event<'a>(raw: &'a str, rules: &ClientRules) -> ClientOutcome<'a> 
 #[derive(Debug, PartialEq)]
 pub enum Tap {
     None,
-    SessionCreated { vendor_session_id: Option<String> },
-    SessionUpdated { event_id: Option<String> },
+    SessionCreated {
+        vendor_session_id: Option<String>,
+    },
+    /// xAI opens a session with `conversation.created` and no `session.created` (WP-RT7.3).
+    ConversationCreated {
+        vendor_session_id: Option<String>,
+    },
+    SessionUpdated {
+        event_id: Option<String>,
+    },
     ResponseDone(Value),
     TranscriptionCompleted(Value),
     Error(Value),
@@ -349,6 +357,18 @@ pub fn vendor_event<'a>(raw: &'a str, deployment: &str) -> VendorOutcome<'a> {
                 Tap::SessionUpdated { event_id }
             };
             VendorOutcome::Forward(Cow::Owned(event.to_string()), tap)
+        }
+        "conversation.created" => {
+            let vendor_session_id = serde_json::from_str::<Value>(raw).ok().and_then(|v| {
+                v.get("conversation")
+                    .and_then(|c| c.get("id"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            });
+            VendorOutcome::Forward(
+                Cow::Borrowed(raw),
+                Tap::ConversationCreated { vendor_session_id },
+            )
         }
         "response.done" => match serde_json::from_str::<Value>(raw) {
             Ok(v) => VendorOutcome::Forward(Cow::Borrowed(raw), Tap::ResponseDone(v)),
@@ -458,6 +478,28 @@ pub fn defaults_update(
         })
         .to_string(),
     )
+}
+
+/// A GA `session.created` for a vendor that bootstraps without one (xAI's
+/// `conversation.created`). Only what the gateway knows: the deployment name as the model (as
+/// every relayed `session.created` carries it) and the vendor's session id.
+pub fn synthesized_session_created(
+    event_id: &str,
+    deployment: &str,
+    session_type: &str,
+    vendor_session_id: Option<&str>,
+) -> String {
+    serde_json::json!({
+        "type": "session.created",
+        "event_id": event_id,
+        "session": {
+            "object": "realtime.session",
+            "type": session_type,
+            "id": vendor_session_id,
+            "model": deployment,
+        }
+    })
+    .to_string()
 }
 
 /// An OpenAI `error` event from the gateway.

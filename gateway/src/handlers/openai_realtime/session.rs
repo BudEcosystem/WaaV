@@ -561,6 +561,8 @@ struct Relay<'a> {
     /// Client frames wait here until the vendor has applied the deployment defaults (§5.6).
     held: VecDeque<(String, bool)>,
     ready: bool,
+    /// The vendor's session exists (`session.created`, or xAI's `conversation.created`).
+    started: bool,
     /// The `event_id` of the defaults update in flight, and its deadline.
     awaiting_defaults: Option<String>,
     hold_deadline: Option<Instant>,
@@ -712,6 +714,29 @@ impl Relay<'_> {
         }
     }
 
+    /// The vendor's session exists: apply the deployment defaults (§5.6), once.
+    async fn session_started(&mut self, vendor_session_id: Option<String>) -> Result<(), End> {
+        if self.started {
+            return Ok(());
+        }
+        self.started = true;
+        self.meter.set_vendor_session_id(vendor_session_id);
+        let event_id = format!("evt_bud_defaults_{}", uuid::Uuid::new_v4().simple());
+        match policy::defaults_update(
+            self.p.settings.as_ref(),
+            self.p.endpoint.model.as_deref(),
+            &event_id,
+        ) {
+            Some(update) => {
+                self.send_to_vendor(update).await?;
+                self.awaiting_defaults = Some(event_id);
+                self.hold_deadline = Some(Instant::now() + self.timings.hold);
+                Ok(())
+            }
+            None => self.release_held().await,
+        }
+    }
+
     async fn on_vendor_text(&mut self, raw: &str) -> Result<(), End> {
         self.last_activity = Instant::now();
         match policy::vendor_event(raw, &self.p.endpoint_name) {
@@ -721,23 +746,23 @@ impl Relay<'_> {
                 let text = text.into_owned();
                 match tap {
                     Tap::SessionCreated { vendor_session_id } => {
-                        self.meter.set_vendor_session_id(vendor_session_id);
                         self.to_client(text).await?;
-                        let event_id =
-                            format!("evt_bud_defaults_{}", uuid::Uuid::new_v4().simple());
-                        match policy::defaults_update(
-                            self.p.settings.as_ref(),
-                            self.p.endpoint.model.as_deref(),
-                            &event_id,
-                        ) {
-                            Some(update) => {
-                                self.send_to_vendor(update).await?;
-                                self.awaiting_defaults = Some(event_id);
-                                self.hold_deadline = Some(Instant::now() + self.timings.hold);
-                                Ok(())
-                            }
-                            None => self.release_held().await,
+                        self.session_started(vendor_session_id).await
+                    }
+                    Tap::ConversationCreated { vendor_session_id } => {
+                        self.to_client(text).await?;
+                        if self.started {
+                            return Ok(());
                         }
+                        // A GA client waits for `session.created`; xAI never sends one.
+                        self.to_client(policy::synthesized_session_created(
+                            &next_event_id(),
+                            &self.p.endpoint_name,
+                            &self.p.rules.session_type,
+                            vendor_session_id.as_deref(),
+                        ))
+                        .await?;
+                        self.session_started(vendor_session_id).await
                     }
                     Tap::SessionUpdated { .. } => {
                         self.to_client(text).await?;
@@ -863,6 +888,7 @@ async fn run(state: Arc<AppState>, p: Prepared, socket: WebSocket, slot: Option<
         timings: timings.clone(),
         held: VecDeque::new(),
         ready: false,
+        started: false,
         awaiting_defaults: None,
         // The vendor must say `session.created` within the hold window as well.
         hold_deadline: Some(now + timings.connect),

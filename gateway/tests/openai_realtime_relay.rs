@@ -218,6 +218,10 @@ struct Behaviour {
     /// Answer `input_audio_buffer.commit` with a completed transcription carrying this usage.
     transcription_usage: Option<Json>,
     usage: Json,
+    /// Speak like xAI (TC-XL-06): bootstrap with `conversation.created` instead of
+    /// `session.created`, answer a commit with CUMULATIVE
+    /// `conversation.item.input_audio_transcription.updated` events, never `rate_limits.updated`.
+    xai: bool,
 }
 
 impl Default for Behaviour {
@@ -231,6 +235,7 @@ impl Default for Behaviour {
             go_silent_after: None,
             transcription_usage: None,
             usage: documented_usage(),
+            xai: false,
         }
     }
 }
@@ -303,8 +308,13 @@ impl MockVendor {
                         .last()
                         .and_then(|(pq, _)| pq.split("model=").nth(1).map(str::to_string))
                         .unwrap_or_default();
-                    let created = json!({"type": "session.created", "event_id": "evt_v0",
-                        "session": {"id": "sess_vendor_1", "object": "realtime.session", "type": "realtime", "model": model}});
+                    let created = if b.xai {
+                        json!({"type": "conversation.created", "event_id": "evt_x0",
+                            "conversation": {"id": "conv_xai_1", "object": "realtime.conversation"}})
+                    } else {
+                        json!({"type": "session.created", "event_id": "evt_v0",
+                            "session": {"id": "sess_vendor_1", "object": "realtime.session", "type": "realtime", "model": model}})
+                    };
                     if ws
                         .send(Message::Text(created.to_string().into()))
                         .await
@@ -347,6 +357,14 @@ impl MockVendor {
                                 out.push(json!({"type": "response.done", "event_id": format!("evt_done_{response_n}"),
                                     "response": {"id": rid, "status": "completed", "usage": b.usage,
                                         "output": [{"type": "message", "content": [{"type": "output_audio", "transcript": "hello there"}]}]}}));
+                            }
+                            "input_audio_buffer.commit" if b.xai => {
+                                for partial in ["hel", "hello", "hello world"] {
+                                    out.push(json!({"type": "conversation.item.input_audio_transcription.updated",
+                                        "item_id": "item_x", "content_index": 0, "transcript": partial}));
+                                }
+                                out.push(json!({"type": "conversation.item.input_audio_transcription.completed",
+                                    "item_id": "item_x", "content_index": 0, "transcript": "hello world"}));
                             }
                             "input_audio_buffer.commit" => {
                                 if let Some(u) = &b.transcription_usage {
@@ -1748,6 +1766,93 @@ async fn duration_priced_sessions_bill_segments() {
     assert!(billed > 2.4 && billed < 3.5, "{billed}");
     for s in &segments {
         assert_eq!(text(s, "bud.voice.pricing_unit").as_deref(), Some("minute"));
+    }
+}
+
+// =============================================================================================
+// xAI — TC-XL-06 (relayed, not translated)
+// =============================================================================================
+
+/// TC-XL-06 — an xAI deployment is RELAYED: its upstream is the xAI GA URL with the vendor model
+/// and Bearer; xAI's `conversation.created` bootstrap starts the session (the client gets a
+/// GA `session.created`, the deployment defaults are applied); cumulative
+/// `…input_audio_transcription.updated` events reach the client verbatim and in order; and no
+/// `rate_limits.updated` is needed for anything.
+#[tokio::test]
+async fn tc_xl_06_xai_relay_quirks() {
+    let cap = Capture::install();
+    let vendor = MockVendor::start(Behaviour {
+        xai: true,
+        ..Default::default()
+    })
+    .await;
+    let gw = gateway(Setup {
+        endpoints: vec![ep(
+            "grok-rt",
+            "a1a1a1a1-0000-4000-8000-0000000000a6",
+            rt_entry(
+                &vendor,
+                json!({"vendor": "grok", "model": "grok-voice-2",
+                       "config": {"realtime": {"defaults": {"voice": "ara"}}}}),
+            ),
+        )],
+        ..Default::default()
+    })
+    .await;
+    let mut c = connect(&gw, "grok-rt").await;
+    let created = until_type(&mut c, "session.created").await;
+    assert_eq!(created["session"]["model"], "grok-rt");
+    // The defaults went to xAI once its session existed.
+    for _ in 0..50 {
+        if !vendor.frames_of("session.update").is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let defaults = &vendor.frames_of("session.update")[0];
+    assert_eq!(defaults["session"]["audio"]["output"]["voice"], "ara");
+
+    send(&mut c, json!({"type": "input_audio_buffer.commit"})).await;
+    let mut partials = Vec::new();
+    loop {
+        let v = next_json(&mut c).await;
+        match v["type"].as_str() {
+            Some("conversation.item.input_audio_transcription.updated") => {
+                partials.push(v["transcript"].as_str().unwrap().to_string())
+            }
+            Some("conversation.item.input_audio_transcription.completed") => break,
+            _ => {}
+        }
+    }
+    assert_eq!(partials, vec!["hel", "hello", "hello world"]);
+
+    send(&mut c, json!({"type": "response.create"})).await;
+    until_type(&mut c, "response.done").await;
+    // No `rate_limits.updated` ever arrives, and the session is fine without it.
+    keep_alive(&mut c, Duration::from_millis(700)).await;
+    send(&mut c, json!({"type": "response.create"})).await;
+    until_type(&mut c, "response.done").await;
+
+    let (pq, headers) = vendor.upgrades()[0].clone();
+    assert_eq!(pq, "/v1/realtime?model=grok-voice-2");
+    assert_eq!(
+        headers.get("authorization").map(String::as_str),
+        Some(&*format!("Bearer {VENDOR_KEY}"))
+    );
+    // Two responses (and the unpriced transcription turn xAI reported without usage).
+    let turns = cap.wait_for("voice.turn", 3).await;
+    let responses: Vec<&SpanData> = turns
+        .iter()
+        .filter(|t| text(t, "bud.voice.rt.component").as_deref() == Some("response"))
+        .collect();
+    assert_eq!(responses.len(), 2);
+    for t in responses {
+        assert_eq!(text(t, "bud.voice.rt.vendor").as_deref(), Some("grok"));
+        assert_eq!(
+            text(t, "bud.voice.vendor_session_id").as_deref(),
+            Some("conv_xai_1")
+        );
+        assert!(number(t, "bud.voice.cost").is_some());
     }
 }
 

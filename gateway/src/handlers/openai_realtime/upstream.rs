@@ -12,10 +12,14 @@ use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-/// The relay-capable vendors (D-2). Everything else needs the translate engine (RT7).
-pub const RELAY_VENDORS: &[&str] = &["openai", "azure_openai"];
+/// The relay-capable vendors (D-2): they speak OpenAI Realtime GA themselves. xAI joined in RT7
+/// (WP-RT7.3); the vendors without a GA surface are served by the translate engine
+/// ([`super::facade`]).
+pub const RELAY_VENDORS: &[&str] = &["openai", "azure_openai", "grok"];
 
 const OPENAI_DEFAULT_BASE: &str = "https://api.openai.com/v1";
+/// xAI's GA-compatible realtime surface (CONTRACTS C7): `wss://api.x.ai/v1/realtime?model=…`.
+const XAI_DEFAULT_BASE: &str = "https://api.x.ai/v1";
 
 pub type UpstreamSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -41,10 +45,9 @@ pub enum UpstreamError {
 impl std::fmt::Display for UpstreamError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::UnsupportedVendor(v) => write!(
-                f,
-                "realtime sessions are not yet served for vendor '{v}' (relay vendors: openai, azure_openai)"
-            ),
+            Self::UnsupportedVendor(v) => {
+                write!(f, "realtime sessions are not served for vendor '{v}'")
+            }
             Self::MissingCredential => write!(f, "the deployment has no usable vendor credential"),
             Self::MissingModel => write!(f, "the deployment names no vendor model"),
             Self::MissingApiBase => write!(
@@ -134,12 +137,19 @@ pub fn build(
     };
 
     match vendor.as_str() {
-        "openai" => {
+        // xAI speaks GA on its own host (WP-RT7.3): Bearer, the vendor model in the query. Its
+        // quirks are on the event stream, not the handshake (`policy::vendor_event`).
+        "openai" | "grok" => {
+            let default_base = if vendor == "grok" {
+                XAI_DEFAULT_BASE
+            } else {
+                OPENAI_DEFAULT_BASE
+            };
             let api_base = endpoint
                 .api_base
                 .as_deref()
                 .filter(|b| !b.trim().is_empty());
-            let base = to_ws_base(api_base.unwrap_or(OPENAI_DEFAULT_BASE))?;
+            let base = to_ws_base(api_base.unwrap_or(default_base))?;
             Ok(UpstreamRequest {
                 url: format!("{base}/realtime?{}", query(model)?),
                 headers: vec![("authorization", format!("Bearer {credential}"))],
@@ -293,6 +303,26 @@ mod tests {
         );
         assert!(!req.url.contains("api-version"));
         assert_eq!(req.headers, vec![("api-key", "sk-vendor".to_string())]);
+        assert!(req.needs_ssrf_check);
+    }
+
+    /// TC-XL-06 (unit half) — xAI is relayed: its GA endpoint, the vendor model verbatim, Bearer,
+    /// and no SSRF check for the vendor constant; an `api_base` is validated like OpenAI's.
+    #[test]
+    fn tc_xl_06_xai_url_and_bearer() {
+        let req = build(&endpoint("grok", None, Some("grok-voice-2")), false).unwrap();
+        assert_eq!(req.url, "wss://api.x.ai/v1/realtime?model=grok-voice-2");
+        assert_eq!(
+            req.headers,
+            vec![("authorization", "Bearer sk-vendor".to_string())]
+        );
+        assert!(!req.needs_ssrf_check);
+        let req = build(
+            &endpoint("grok", Some("https://xai-proxy.example/v1"), Some("m")),
+            false,
+        )
+        .unwrap();
+        assert_eq!(req.url, "wss://xai-proxy.example/v1/realtime?model=m");
         assert!(req.needs_ssrf_check);
     }
 
