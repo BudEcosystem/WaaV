@@ -331,6 +331,11 @@ pulp = "0.18"
 
 [dev-dependencies]
 aws-smithy-eventstream = "0.60"
+# FRD-023 RT7: the in-process Bedrock event-stream mock (Nova Sonic) and test credentials
+# encrypted the way budapp encrypts them. All three are already in the lock (bud-auth, hyper).
+http-body = "1"
+http-body-util = "0.1"
+rsa = { version = "0.9", features = ["sha2"] }
 tower = { version = "0.5.2", features = ["util"] }
 tempfile = "3.8"
 serial_test = "3.2"

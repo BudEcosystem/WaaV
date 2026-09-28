@@ -115,6 +115,74 @@ fn response_transcript(event: &Value) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join(" "))
 }
 
+/// OpenAI GA `response.usage` for a usage the gateway computed itself (the translate engine's
+/// `response.done`, FRD-023 §5.7). Cached counts are reported as the subset they are.
+pub fn ga_usage(u: &RealtimeUsage) -> Value {
+    let input = u.input_text + u.input_audio + u.input_image;
+    let output = u.output_text + u.output_audio;
+    serde_json::json!({
+        "total_tokens": input + output,
+        "input_tokens": input,
+        "output_tokens": output,
+        "input_token_details": {
+            "text_tokens": u.input_text,
+            "audio_tokens": u.input_audio,
+            "image_tokens": u.input_image,
+            "cached_tokens": u.cached_text + u.cached_audio + u.cached_image,
+            "cached_tokens_details": {
+                "text_tokens": u.cached_text,
+                "audio_tokens": u.cached_audio,
+                "image_tokens": u.cached_image,
+            },
+        },
+        "output_token_details": {
+            "text_tokens": u.output_text,
+            "audio_tokens": u.output_audio,
+        },
+    })
+}
+
+/// Duration segments under a minute/second price (D-9): a billed record every `len`, and the
+/// partial remainder at close — a 150 s session bills 60 + 60 + 30 (TC-XL-07). Shared by the
+/// relay and the translate engine. Pure over the instants it is given.
+#[derive(Debug, Clone)]
+pub struct SegmentClock {
+    len: std::time::Duration,
+    /// Where the unbilled stretch begins.
+    last: tokio::time::Instant,
+}
+
+impl SegmentClock {
+    pub fn start(now: tokio::time::Instant, len: std::time::Duration) -> Self {
+        Self { len, last: now }
+    }
+
+    /// When the next full segment falls due.
+    pub fn next_due(&self) -> tokio::time::Instant {
+        self.last + self.len
+    }
+
+    /// The full segments that fell due by `now`, in seconds each.
+    pub fn due(&mut self, now: tokio::time::Instant) -> Vec<f64> {
+        let mut out = Vec::new();
+        while self.len > std::time::Duration::ZERO && now >= self.last + self.len {
+            self.last += self.len;
+            out.push(self.len.as_secs_f64());
+        }
+        out
+    }
+
+    /// The partial segment at close: every full one first, then the remainder.
+    pub fn close(mut self, now: tokio::time::Instant) -> Vec<f64> {
+        let mut out = self.due(now);
+        let rest = now.saturating_duration_since(self.last).as_secs_f64();
+        if rest > 0.0 {
+            out.push(rest);
+        }
+        out
+    }
+}
+
 /// The meter for one session.
 pub struct SessionMeter {
     session_span: Span,
@@ -216,32 +284,44 @@ impl SessionMeter {
             .and_then(|r| r.get("usage"))
             .and_then(RealtimeUsage::from_openai)
             .unwrap_or_default();
-        let cost = realtime_response_cost(self.pricing.as_ref(), &usage);
-        let span = self.open_turn("response");
-        record_text(
-            &span,
-            rt::RESPONSE_ID,
+        self.usage_turn(
             response.and_then(|r| r.get("id")).and_then(Value::as_str),
+            response
+                .and_then(|r| r.get("status"))
+                .and_then(Value::as_str),
+            &usage,
+            response_transcript(event).as_deref(),
         );
-        let status = response
-            .and_then(|r| r.get("status"))
-            .and_then(Value::as_str);
+    }
+
+    /// One billed response: a relayed `response.done`, or a translated vendor's usage report
+    /// (FRD-023 §5.7 — Gemini `usageMetadata`, Nova Sonic `usageEvent`), metered once.
+    pub fn usage_turn(
+        &mut self,
+        response_id: Option<&str>,
+        status: Option<&str>,
+        usage: &RealtimeUsage,
+        transcript: Option<&str>,
+    ) {
+        let cost = realtime_response_cost(self.pricing.as_ref(), usage);
+        let span = self.open_turn("response");
+        record_text(&span, rt::RESPONSE_ID, response_id);
         record_text(&span, rt::RESPONSE_STATUS, status);
         if status == Some("failed") {
             span.record("otel.status_code", "ERROR");
             span.record(turn::ERROR_TYPE, "vendor_error");
         }
-        record_usage(&span, &usage);
+        record_usage(&span, usage);
         record_cost(&span, &cost);
         if self.capture
-            && let Some(t) = response_transcript(event)
+            && let Some(t) = transcript.filter(|t| !t.is_empty())
         {
             span.record(
                 turn::TRANSCRIPT,
-                crate::observability::trace_redact::sanitize_body(&t).as_str(),
+                crate::observability::trace_redact::sanitize_body(t).as_str(),
             );
         }
-        self.totals.add(&usage);
+        self.totals.add(usage);
         self.account(&cost);
     }
 
@@ -332,5 +412,61 @@ impl SessionMeter {
             span.record("otel.status_code", "ERROR");
         }
         // Dropping `self` ends the span.
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// TC-XL-07 🔒 — a 150 s per-minute session bills 60 + 60 + 30, never a rounded-up minute
+    /// and never one lump at close.
+    #[test]
+    fn tc_xl_07_a_150_s_session_bills_60_60_30() {
+        let t0 = tokio::time::Instant::now();
+        let mut clock = SegmentClock::start(t0, Duration::from_secs(60));
+        assert!(clock.due(t0 + Duration::from_secs(59)).is_empty());
+        assert_eq!(clock.due(t0 + Duration::from_secs(60)), vec![60.0]);
+        assert_eq!(clock.next_due(), t0 + Duration::from_secs(120));
+        assert_eq!(clock.due(t0 + Duration::from_secs(121)), vec![60.0]);
+        assert_eq!(clock.close(t0 + Duration::from_secs(150)), vec![30.0]);
+    }
+
+    /// A timer that fires late still bills every elapsed segment, once.
+    #[test]
+    fn late_ticks_bill_each_elapsed_segment_once() {
+        let t0 = tokio::time::Instant::now();
+        let mut clock = SegmentClock::start(t0, Duration::from_secs(60));
+        assert_eq!(
+            clock.due(t0 + Duration::from_secs(185)),
+            vec![60.0, 60.0, 60.0]
+        );
+        assert_eq!(clock.close(t0 + Duration::from_secs(185)), vec![5.0]);
+        let clock = SegmentClock::start(t0, Duration::from_secs(60));
+        assert_eq!(
+            clock.close(t0 + Duration::from_secs(150)),
+            vec![60.0, 60.0, 30.0],
+            "a session that closes before any tick is still billed in segments"
+        );
+    }
+
+    #[test]
+    fn ga_usage_reports_cached_as_the_subset_it_is() {
+        let u = RealtimeUsage {
+            input_text: 119,
+            cached_text: 64,
+            input_audio: 13,
+            output_text: 30,
+            output_audio: 91,
+            ..Default::default()
+        };
+        let v = ga_usage(&u);
+        assert_eq!(v["input_tokens"], 132);
+        assert_eq!(v["output_tokens"], 121);
+        assert_eq!(v["total_tokens"], 253);
+        assert_eq!(v["input_token_details"]["cached_tokens"], 64);
+        // Round-trips through the relay's reader: the same record either way.
+        assert_eq!(RealtimeUsage::from_openai(&v), Some(u));
     }
 }

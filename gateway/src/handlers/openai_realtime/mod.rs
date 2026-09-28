@@ -11,9 +11,12 @@
 //! * [`policy`] — what crosses the relay, per event (§5.5, §5.6).
 //! * [`metering`] — a `voice.turn` per billed record, a `voice.session` per session (§5.10).
 //! * [`session`] — the session engine: admission, relay, timers, revalidation, teardown (§5.4).
+//! * [`facade`] — the translate engine: GA over WaaV's native providers for vendors without a
+//!   GA surface (Gemini Live, Nova 2 Sonic, the per-minute voice agents; §5.7, RT7).
 //! * [`client_secrets`] — `POST /v1/realtime/client_secrets`, the `ek_bud_` mint (§5.8).
 
 pub mod client_secrets;
+pub mod facade;
 pub mod handshake;
 pub mod metering;
 pub mod policy;

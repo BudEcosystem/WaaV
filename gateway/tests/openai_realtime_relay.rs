@@ -493,6 +493,7 @@ fn fast_timings() -> Timings {
         warn_before: Duration::from_secs(1),
         segment: Duration::from_secs(1),
         upstream_send: Duration::from_secs(2),
+        connection_cap: None,
     }
 }
 
@@ -633,6 +634,7 @@ async fn gateway(setup: Setup) -> Gateway {
             client_secret_keys: setup
                 .client_secret_keys
                 .map(|k| waav_gateway::auth::ephemeral::ClientSecretKeys::parse(k).unwrap()),
+            bedrock_http_client: None,
         });
     }
     let app = waav_gateway::routes::openai_realtime::create_openai_realtime_router()
@@ -1854,6 +1856,63 @@ async fn tc_xl_06_xai_relay_quirks() {
         );
         assert!(number(t, "bud.voice.cost").is_some());
     }
+}
+
+/// CONTRACTS C7 — an xAI deployment priced PER MINUTE (xAI bills its Voice Agent API by the
+/// minute) is billed by duration segments; its responses carry tokens and no cost.
+#[tokio::test]
+async fn xai_priced_per_minute_bills_duration_segments() {
+    let cap = Capture::install();
+    let vendor = MockVendor::start(Behaviour {
+        xai: true,
+        ..Default::default()
+    })
+    .await;
+    let gw = gateway(Setup {
+        endpoints: vec![ep(
+            "grok-min",
+            "a1a1a1a1-0000-4000-8000-0000000000a7",
+            rt_entry(
+                &vendor,
+                json!({"vendor": "grok", "model": "grok-voice-2",
+                       "pricing": {"unit": "minute", "cost_per_unit": 0.08, "per_units": 1}}),
+            ),
+        )],
+        ..Default::default()
+    })
+    .await;
+    let mut c = connect(&gw, "grok-min").await;
+    until_type(&mut c, "session.created").await;
+    send(&mut c, json!({"type": "response.create"})).await;
+    until_type(&mut c, "response.done").await;
+    keep_alive(&mut c, Duration::from_millis(1500)).await;
+    c.close(None).await.unwrap();
+    let _ = until_close(&mut c).await;
+    let session = cap.wait_for("voice.session", 1).await.remove(0);
+    let turns: Vec<SpanData> = cap
+        .spans()
+        .into_iter()
+        .filter(|s| s.name == "voice.turn")
+        .collect();
+    let segments: Vec<&SpanData> = turns
+        .iter()
+        .filter(|t| text(t, "bud.voice.rt.component").as_deref() == Some("duration_segment"))
+        .collect();
+    assert!(segments.len() >= 2, "a full segment and the remainder");
+    for s in &segments {
+        let secs = number(s, "bud.voice.billed_seconds").unwrap();
+        assert!((number(s, "bud.voice.cost").unwrap() - secs / 60.0 * 0.08).abs() < 1e-12);
+    }
+    let response = turns
+        .iter()
+        .find(|t| text(t, "bud.voice.rt.component").as_deref() == Some("response"))
+        .expect("the response is still recorded");
+    assert_eq!(
+        number(response, "bud.voice.cost"),
+        None,
+        "a minute price bills no tokens"
+    );
+    assert!(number(&session, "bud.voice.billed_seconds").unwrap() > 1.5);
 }
 
 // =============================================================================================

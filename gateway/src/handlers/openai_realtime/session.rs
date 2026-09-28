@@ -30,7 +30,7 @@ use crate::state::AppState;
 use super::handshake::{
     self, Credential, HandshakeError, MAX_MESSAGE_BYTES, REALTIME_CAPABILITY, SUBPROTOCOL,
 };
-use super::metering::{Attribution, SessionMeter};
+use super::metering::{Attribution, SegmentClock, SessionMeter};
 use super::policy::{self, ClientOutcome, ClientRules, Tap, VendorOutcome};
 use super::upstream::{self, UpstreamRequest};
 
@@ -51,6 +51,9 @@ pub struct Timings {
     pub warn_before: Duration,
     pub segment: Duration,
     pub upstream_send: Duration,
+    /// Replaces every translated vendor's connection cap (Nova Sonic: 8 min). `None`: each
+    /// vendor's own. Tests shorten it; production leaves it unset.
+    pub connection_cap: Option<Duration>,
 }
 
 impl Default for Timings {
@@ -67,6 +70,7 @@ impl Default for Timings {
             warn_before: Duration::from_secs(60),
             segment: Duration::from_secs(60),
             upstream_send: Duration::from_secs(10),
+            connection_cap: None,
         }
     }
 }
@@ -101,6 +105,9 @@ pub struct RealtimeRuntime {
     pub timings: Timings,
     /// `None`: client secrets are not configured (the mint route answers 501, `ek_bud_` refused).
     pub client_secret_keys: Option<ephemeral::ClientSecretKeys>,
+    /// The HTTP client Nova Sonic's Bedrock streams dial with. `None` (production): the AWS
+    /// SDK's own. In-process tests set a connector that speaks the Bedrock event stream.
+    pub bedrock_http_client: Option<aws_smithy_runtime_api::client::http::SharedHttpClient>,
 }
 
 impl RealtimeRuntime {
@@ -110,6 +117,7 @@ impl RealtimeRuntime {
         Ok(Self {
             timings: Timings::from_env(),
             client_secret_keys: ephemeral::ClientSecretKeys::from_env()?,
+            bedrock_http_client: None,
         })
     }
 }
@@ -296,6 +304,14 @@ async fn authenticate_client_secret(
     Ok((caller, claims.ep, alias))
 }
 
+/// The two engines behind `/v1/realtime` (FRD-023 D-2, §5.7).
+pub enum Engine {
+    /// The vendor speaks OpenAI Realtime GA: frames are relayed after policy.
+    Relay(UpstreamRequest),
+    /// The vendor has its own protocol: WaaV's native provider, behind the GA facade.
+    Translate(Box<super::facade::TranslatePlan>),
+}
+
 /// Everything a session needs, decided before the upgrade.
 pub struct Prepared {
     pub caller: Caller,
@@ -305,7 +321,8 @@ pub struct Prepared {
     pub alias: Option<AliasMetadata>,
     pub settings: Option<RealtimeSettings>,
     pub rules: ClientRules,
-    pub upstream: UpstreamRequest,
+    /// How the vendor is reached: relayed (it speaks GA) or translated (FRD-023 §5.7).
+    pub engine: Engine,
     pub vkey: String,
     /// Held for the session: the deployment's concurrency slot (D-8).
     pub admission: Admission,
@@ -375,18 +392,32 @@ pub async fn prepare(
         .as_ref()
         .is_some_and(RealtimeSettings::is_transcription);
 
-    // Build before admitting: a deployment the relay cannot serve must not take a slot.
-    let upstream_req = upstream::build(&endpoint, transcription).map_err(|e| match e {
+    // Build before admitting: a deployment the gateway cannot serve must not take a slot.
+    let refused = |e: upstream::UpstreamError| match e {
         upstream::UpstreamError::UnsupportedVendor(_) => HandshakeError::new(
             StatusCode::NOT_IMPLEMENTED,
             "unsupported_vendor",
             e.to_string(),
         ),
+        upstream::UpstreamError::Misconfigured(_) => HandshakeError::new(
+            StatusCode::BAD_GATEWAY,
+            "deployment_misconfigured",
+            e.to_string(),
+        ),
         other => HandshakeError::new(StatusCode::BAD_GATEWAY, "upstream_error", other.to_string()),
-    })?;
-    upstream::validate(&upstream_req).await.map_err(|e| {
-        HandshakeError::new(StatusCode::BAD_GATEWAY, "upstream_error", e.to_string())
-    })?;
+    };
+    let engine = if super::facade::is_translate_vendor(&endpoint.vendor) {
+        let plan =
+            super::facade::TranslatePlan::build(&endpoint, settings.as_ref()).map_err(refused)?;
+        plan.validate().await.map_err(refused)?;
+        Engine::Translate(Box::new(plan))
+    } else {
+        let req = upstream::build(&endpoint, transcription).map_err(refused)?;
+        upstream::validate(&req).await.map_err(|e| {
+            HandshakeError::new(StatusCode::BAD_GATEWAY, "upstream_error", e.to_string())
+        })?;
+        Engine::Relay(req)
+    };
 
     debug!(endpoint_id = %endpoint_id, "realtime upstream request validated");
     let vkey = vendor_key(&endpoint.vendor, endpoint.api_base.as_deref());
@@ -415,7 +446,7 @@ pub async fn prepare(
         endpoint,
         alias,
         settings,
-        upstream: upstream_req,
+        engine,
         vkey,
         admission,
     })
@@ -448,7 +479,12 @@ pub async fn realtime_ws_handler(
     ws.protocols([SUBPROTOCOL])
         .max_message_size(MAX_MESSAGE_BYTES)
         .max_frame_size(MAX_MESSAGE_BYTES)
-        .on_upgrade(move |socket| run(state, prepared, socket, slot))
+        .on_upgrade(move |socket| async move {
+            match prepared.engine {
+                Engine::Relay(_) => run(state, prepared, socket, slot).await,
+                Engine::Translate(_) => super::facade::run(state, prepared, socket, slot).await,
+            }
+        })
 }
 
 /// How a session ended.
@@ -461,7 +497,7 @@ pub struct End {
 }
 
 impl End {
-    fn new(reason: &'static str, close_code: u16) -> Self {
+    pub(super) fn new(reason: &'static str, close_code: u16) -> Self {
         Self {
             reason,
             close_code,
@@ -469,13 +505,13 @@ impl End {
         }
     }
 
-    fn with_error(mut self, code: &'static str, message: impl Into<String>) -> Self {
+    pub(super) fn with_error(mut self, code: &'static str, message: impl Into<String>) -> Self {
         self.error = Some((code, message.into()));
         self
     }
 }
 
-enum Outbound {
+pub(super) enum Outbound {
     Frame(Message),
     Close {
         error: Option<String>,
@@ -484,11 +520,11 @@ enum Outbound {
     },
 }
 
-fn next_event_id() -> String {
+pub(super) fn next_event_id() -> String {
     format!("evt_bud_{}", uuid::Uuid::new_v4().simple())
 }
 
-fn gateway_error(
+pub(super) fn gateway_error(
     code: &str,
     message: &str,
     param: Option<&str>,
@@ -510,7 +546,7 @@ fn gateway_error(
 
 /// The client-bound writer: a bounded queue drained by its own task, so a slow client applies
 /// backpressure without the relay dropping a frame (FR-EVT-4).
-fn spawn_writer(
+pub(super) fn spawn_writer(
     mut sink: futures_util::stream::SplitSink<WebSocket, Message>,
     capacity: usize,
 ) -> (mpsc::Sender<Outbound>, tokio::task::JoinHandle<()>) {
@@ -547,7 +583,7 @@ fn spawn_writer(
 }
 
 /// The client-bound queue: 2 s of 24 kHz audio at 20 ms frames, plus headroom for events.
-const CLIENT_QUEUE: usize = 256;
+pub(super) const CLIENT_QUEUE: usize = 256;
 /// Client frames held while the vendor applies the defaults.
 const MAX_HELD: usize = 4096;
 
@@ -805,12 +841,9 @@ impl Relay<'_> {
     }
 }
 
-async fn run(state: Arc<AppState>, p: Prepared, socket: WebSocket, slot: Option<ConnectionSlot>) {
-    let _slot = slot;
-    let timings = state.realtime.timings.clone();
-    let session_id = format!("sess_bud_{}", uuid::Uuid::new_v4().simple());
-    let vendor = p.endpoint.vendor.clone();
-    let attribution = Attribution {
+/// Who a session bills (CONTRACTS C2), shared by both engines.
+pub(super) fn attribution(p: &Prepared) -> Attribution {
+    Attribution {
         project_id: p
             .alias
             .as_ref()
@@ -822,15 +855,58 @@ async fn run(state: Arc<AppState>, p: Prepared, socket: WebSocket, slot: Option<
         user_id: p.caller.principal.user_id.clone(),
         api_key_project_id: p.caller.principal.project_id.clone(),
         endpoint_name: p.endpoint_name.clone(),
-        vendor: vendor.clone(),
+        vendor: p.endpoint.vendor.clone(),
         model: p.endpoint.model.clone(),
         session_type: p
             .settings
             .as_ref()
             .and_then(|s| s.session_type.clone())
             .unwrap_or_else(|| "realtime".into()),
-    };
-    let meter = SessionMeter::start(session_id.clone(), attribution, p.endpoint.pricing.clone());
+    }
+}
+
+/// A session's length limits (D-13): the deployment's, capped by the gateway's.
+pub(super) struct SessionLimits {
+    pub max_len: Duration,
+    pub idle: Duration,
+    pub max_at: Instant,
+    pub warn_at: Option<Instant>,
+}
+
+impl SessionLimits {
+    pub(super) fn new(p: &Prepared, timings: &Timings, now: Instant) -> Self {
+        let limits = p
+            .settings
+            .as_ref()
+            .and_then(|s| s.limits.clone())
+            .unwrap_or_default();
+        let max_len = limits
+            .max_session_seconds
+            .map(Duration::from_secs)
+            .map_or(timings.max_session, |d| d.min(timings.max_session));
+        let idle = limits
+            .idle_timeout_seconds
+            .map(Duration::from_secs)
+            .unwrap_or(timings.default_idle);
+        Self {
+            max_len,
+            idle,
+            max_at: now + max_len,
+            warn_at: max_len.checked_sub(timings.warn_before).map(|d| now + d),
+        }
+    }
+}
+
+async fn run(state: Arc<AppState>, p: Prepared, socket: WebSocket, slot: Option<ConnectionSlot>) {
+    let _slot = slot;
+    let timings = state.realtime.timings.clone();
+    let session_id = format!("sess_bud_{}", uuid::Uuid::new_v4().simple());
+    let vendor = p.endpoint.vendor.clone();
+    let meter = SessionMeter::start(
+        session_id.clone(),
+        attribution(&p),
+        p.endpoint.pricing.clone(),
+    );
     metrics::gauge!("waav_realtime_sessions_active", "vendor" => vendor.clone()).increment(1.0);
     info!(session_id = %session_id, endpoint_id = %p.endpoint_id, vendor = %vendor, "realtime session opened");
 
@@ -838,7 +914,10 @@ async fn run(state: Arc<AppState>, p: Prepared, socket: WebSocket, slot: Option<
     let (client_sink, mut client_rx) = socket.split();
     let (client_tx, writer) = spawn_writer(client_sink, CLIENT_QUEUE);
 
-    let upstream_socket = match upstream::connect(&p.upstream, timings.connect).await {
+    let Engine::Relay(upstream_req) = &p.engine else {
+        unreachable!("the relay runs relayed deployments only");
+    };
+    let upstream_socket = match upstream::connect(upstream_req, timings.connect).await {
         Ok(s) => {
             if let Some(pol) = &state.policies {
                 pol.breakers().record_success(&p.endpoint_id, &p.vkey);
@@ -862,21 +941,12 @@ async fn run(state: Arc<AppState>, p: Prepared, socket: WebSocket, slot: Option<
     let (up_tx, mut up_rx) = upstream_socket.split();
 
     let now = Instant::now();
-    let limits = p
-        .settings
-        .as_ref()
-        .and_then(|s| s.limits.clone())
-        .unwrap_or_default();
-    let max_len = limits
-        .max_session_seconds
-        .map(Duration::from_secs)
-        .map_or(timings.max_session, |d| d.min(timings.max_session));
-    let idle = limits
-        .idle_timeout_seconds
-        .map(Duration::from_secs)
-        .unwrap_or(timings.default_idle);
-    let max_at = now + max_len;
-    let warn_at = max_len.checked_sub(timings.warn_before).map(|d| now + d);
+    let SessionLimits {
+        max_len,
+        idle,
+        max_at,
+        warn_at,
+    } = SessionLimits::new(&p, &timings, now);
     let bills_duration = crate::core::realtime_cost::bills_duration(p.endpoint.pricing.as_ref());
 
     let mut relay = Relay {
@@ -898,8 +968,7 @@ async fn run(state: Arc<AppState>, p: Prepared, socket: WebSocket, slot: Option<
     };
     let mut ping = tokio::time::interval_at(now + timings.ping, timings.ping);
     let mut revalidate = tokio::time::interval_at(now + timings.revalidate, timings.revalidate);
-    let mut segment = tokio::time::interval_at(now + timings.segment, timings.segment);
-    let mut last_segment = now;
+    let mut segments = bills_duration.then(|| SegmentClock::start(now, timings.segment));
     let mut warned = warn_at.is_none();
 
     let end: End = loop {
@@ -962,9 +1031,13 @@ async fn run(state: Arc<AppState>, p: Prepared, socket: WebSocket, slot: Option<
                 .with_error("session_expired", format!("The session reached its maximum length of {} s.", max_len.as_secs()))),
             _ = tokio::time::sleep_until(hold_at.unwrap_or(max_at)), if hold_at.is_some() => Err(End::new("upstream_error", 1011)
                 .with_error("upstream_error", "The vendor did not start or configure the session in time.")),
-            _ = segment.tick(), if bills_duration => {
-                relay.meter.duration_segment(timings.segment.as_secs_f64());
-                last_segment = Instant::now();
+            _ = tokio::time::sleep_until(segments.as_ref().map_or(max_at, SegmentClock::next_due)),
+                if segments.is_some() => {
+                if let Some(clock) = segments.as_mut() {
+                    for secs in clock.due(Instant::now()) {
+                        relay.meter.duration_segment(secs);
+                    }
+                }
                 Ok(())
             }
         };
@@ -973,11 +1046,11 @@ async fn run(state: Arc<AppState>, p: Prepared, socket: WebSocket, slot: Option<
         }
     };
 
-    if bills_duration {
+    if let Some(clock) = segments {
         // The final partial segment: a 150 s session bills 60 + 60 + 30 (TC-XL-07).
-        relay
-            .meter
-            .duration_segment(last_segment.elapsed().as_secs_f64());
+        for secs in clock.close(Instant::now()) {
+            relay.meter.duration_segment(secs);
+        }
     }
     let Relay {
         meter, mut up_tx, ..
@@ -997,7 +1070,7 @@ async fn run(state: Arc<AppState>, p: Prepared, socket: WebSocket, slot: Option<
 }
 
 /// The common teardown: the error event and close, the session record, the metrics.
-async fn finish(
+pub(super) async fn finish(
     meter: SessionMeter,
     end: End,
     client_tx: &mpsc::Sender<Outbound>,

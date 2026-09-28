@@ -40,6 +40,9 @@ pub enum UpstreamError {
     Connect(String),
     /// No answer within the connect deadline.
     Timeout,
+    /// The deployment's entry cannot be served as published (a missing region, a key of the
+    /// wrong shape, a session type the vendor does not have).
+    Misconfigured(String),
 }
 
 impl std::fmt::Display for UpstreamError {
@@ -57,6 +60,7 @@ impl std::fmt::Display for UpstreamError {
             Self::InvalidApiBase(why) => write!(f, "the deployment's api_base was refused: {why}"),
             Self::Connect(why) => write!(f, "could not connect to the vendor: {why}"),
             Self::Timeout => write!(f, "the vendor did not answer within the connect deadline"),
+            Self::Misconfigured(why) => write!(f, "the deployment is misconfigured: {why}"),
         }
     }
 }
@@ -83,7 +87,7 @@ impl std::fmt::Debug for UpstreamRequest {
 }
 
 /// `https://…` → `wss://…`, `http://…` → `ws://…`; `ws(s)` kept. Trailing slashes trimmed.
-fn to_ws_base(base: &str) -> Result<String, UpstreamError> {
+pub(super) fn to_ws_base(base: &str) -> Result<String, UpstreamError> {
     let base = base.trim().trim_end_matches('/');
     let converted = if let Some(rest) = base.strip_prefix("https://") {
         format!("wss://{rest}")
