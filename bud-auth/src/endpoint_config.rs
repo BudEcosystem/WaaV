@@ -117,9 +117,9 @@ pub struct TtsSettings {
 
 /// Transcription defaults for a deployment.
 ///
-/// The five streaming-only canonical features are absent by construction: they need a continuous
-/// stream, budapp refuses them at publish naming the transport, and a field here would suggest
-/// otherwise to the next person reading this struct.
+/// The five streaming-only canonical features are not fields of their own: they need a continuous
+/// stream, so budapp refuses them at the top of `stt` and publishes them under `stt.streaming`
+/// ([`SttStreaming`]), which only the `/ws` transport applies (FRD-023 WP-RT6.4, FR-WS-4).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 pub struct SttSettings {
     // --- the four the handler used to hardcode, plus model and prompt ---
@@ -170,6 +170,26 @@ pub struct SttSettings {
     /// request and changes the audio the vendor bills against, so it defaults off.
     #[serde(default)]
     pub noise_suppression: Option<bool>,
+
+    /// The streaming-only features, applied on `/ws` and ignored by the prerecorded upload.
+    #[serde(default)]
+    pub streaming: Option<SttStreaming>,
+}
+
+/// `stt.streaming`: the five canonical features that need a continuous audio stream
+/// (FRD-023 WP-RT6.4). budapp validates the closed key set and the millisecond ranges.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct SttStreaming {
+    #[serde(default)]
+    pub interim_results: Option<bool>,
+    #[serde(default)]
+    pub vad_events: Option<bool>,
+    #[serde(default)]
+    pub endpointing_ms: Option<u32>,
+    #[serde(default)]
+    pub utterance_end_ms: Option<u32>,
+    #[serde(default)]
+    pub speech_begin_event: Option<bool>,
 }
 
 /// Translation defaults.
@@ -185,6 +205,121 @@ pub struct TranslationSettings {
     pub partials: Option<bool>,
 }
 
+/// Input-transcription defaults for a realtime session (OpenAI GA `audio.input.transcription`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct RealtimeTranscription {
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub language: Option<String>,
+    #[serde(default)]
+    pub prompt: Option<String>,
+}
+
+/// What WaaV sends the vendor in its first `session.update`, unless the client overrides it
+/// (FRD-023 §5.6: request > deployment > vendor default).
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct RealtimeDefaults {
+    #[serde(default)]
+    pub voice: Option<String>,
+    #[serde(default)]
+    pub instructions: Option<String>,
+    #[serde(default)]
+    pub output_modalities: Option<Vec<String>>,
+    /// Passed to the vendor as written: `{"type": "server_vad" | "semantic_vad", …}` or `null`.
+    /// budapp validated its shape; the vendor owns its semantics.
+    #[serde(default)]
+    pub turn_detection: Option<serde_json::Value>,
+    #[serde(default)]
+    pub input_transcription: Option<RealtimeTranscription>,
+    #[serde(default)]
+    pub noise_reduction: Option<String>,
+    #[serde(default)]
+    pub max_output_tokens: Option<u32>,
+    #[serde(default)]
+    pub speed: Option<f64>,
+}
+
+/// Per-deployment session limits. Absent means the gateway's ceiling applies.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct RealtimeLimits {
+    #[serde(default)]
+    pub max_session_seconds: Option<u64>,
+    #[serde(default)]
+    pub idle_timeout_seconds: Option<u64>,
+}
+
+/// What a client may change on a realtime session (FRD-023 D-11, S-5).
+///
+/// Every field is `Option` like the rest of this module, but the ACCESSORS apply the secure
+/// default: a stored prompt, an MCP connector and a trace belong to the VENDOR ORG, which every
+/// project sharing the credential shares, so they are off unless the deployment turns them on.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct RealtimePolicy {
+    #[serde(default)]
+    pub allow_client_instructions: Option<bool>,
+    #[serde(default)]
+    pub allow_mcp_tools: Option<bool>,
+    #[serde(default)]
+    pub allow_prompt_references: Option<bool>,
+    #[serde(default)]
+    pub allow_image_input: Option<bool>,
+    /// Transcription models a client may select. Absent = any; present = exactly these.
+    #[serde(default)]
+    pub input_transcription_models: Option<Vec<String>>,
+}
+
+impl RealtimePolicy {
+    pub fn allows_client_instructions(&self) -> bool {
+        self.allow_client_instructions.unwrap_or(true)
+    }
+
+    pub fn allows_mcp_tools(&self) -> bool {
+        self.allow_mcp_tools.unwrap_or(false)
+    }
+
+    pub fn allows_prompt_references(&self) -> bool {
+        self.allow_prompt_references.unwrap_or(false)
+    }
+
+    pub fn allows_image_input(&self) -> bool {
+        self.allow_image_input.unwrap_or(true)
+    }
+
+    pub fn allows_transcription_model(&self, model: &str) -> bool {
+        match &self.input_transcription_models {
+            None => true,
+            Some(list) => list.iter().any(|m| m == model),
+        }
+    }
+}
+
+/// A realtime (speech-to-speech) deployment's session settings (FRD-023 §5.3).
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct RealtimeSettings {
+    /// `realtime` or `transcription`, derived by budapp from the model's modality.
+    #[serde(default)]
+    pub session_type: Option<String>,
+    #[serde(default)]
+    pub defaults: Option<RealtimeDefaults>,
+    #[serde(default)]
+    pub limits: Option<RealtimeLimits>,
+    #[serde(default)]
+    pub policy: Option<RealtimePolicy>,
+}
+
+impl RealtimeSettings {
+    /// The policy block, or an all-default one (every accessor at its secure default).
+    pub fn policy(&self) -> RealtimePolicy {
+        self.policy.clone().unwrap_or_default()
+    }
+
+    /// Whether this deployment serves transcription-only sessions.
+    pub fn is_transcription(&self) -> bool {
+        self.session_type.as_deref() == Some("transcription")
+    }
+}
+
 /// The whole `config` object on a voice entry.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct VoiceEndpointSettings {
@@ -194,11 +329,17 @@ pub struct VoiceEndpointSettings {
     pub stt: Option<SttSettings>,
     #[serde(default)]
     pub translation: Option<TranslationSettings>,
+    /// FRD-023: the realtime session block, on `realtime_session` deployments only.
+    #[serde(default)]
+    pub realtime: Option<RealtimeSettings>,
 }
 
 impl VoiceEndpointSettings {
     pub fn is_empty(&self) -> bool {
-        self.tts.is_none() && self.stt.is_none() && self.translation.is_none()
+        self.tts.is_none()
+            && self.stt.is_none()
+            && self.translation.is_none()
+            && self.realtime.is_none()
     }
 
     /// The tts block, or an all-`None` one. Saves every call site an `unwrap_or_default` clone.
@@ -265,11 +406,14 @@ const KNOWN_STT: &[&str] = &[
     "alternatives",
     "sentiment",
     "noise_suppression",
+    "streaming",
 ];
 
 const KNOWN_TRANSLATION: &[&str] = &["target_languages", "translate_to_english", "partials"];
 
-const KNOWN_SECTIONS: &[&str] = &["tts", "stt", "translation"];
+const KNOWN_REALTIME: &[&str] = &["session_type", "defaults", "limits", "policy"];
+
+const KNOWN_SECTIONS: &[&str] = &["tts", "stt", "translation", "realtime"];
 
 /// Parse a `config` object, warning about anything this build does not model.
 ///
@@ -286,6 +430,7 @@ pub fn parse_endpoint_settings(
             ("tts", KNOWN_TTS),
             ("stt", KNOWN_STT),
             ("translation", KNOWN_TRANSLATION),
+            ("realtime", KNOWN_REALTIME),
         ] {
             if let Some(serde_json::Value::Object(fields)) = sections.get(section) {
                 warn_unmodelled(
@@ -318,6 +463,8 @@ pub fn parse_endpoint_settings(
                 stt: section("stt").and_then(|v| parse_section(endpoint_id, "stt", v)),
                 translation: section("translation")
                     .and_then(|v| parse_section(endpoint_id, "translation", v)),
+                realtime: section("realtime")
+                    .and_then(|v| parse_section(endpoint_id, "realtime", v)),
             }
         }
     }
@@ -410,6 +557,28 @@ mod tests {
         assert_eq!(
             settings.translation.unwrap().target_languages.unwrap(),
             vec!["es-ES".to_string(), "de-DE".to_string()]
+        );
+    }
+
+    #[test]
+    fn streaming_features_are_modelled_under_stt_streaming() {
+        // TC-WS-11: budapp publishes the five streaming-only features here (WP-RT6.4).
+        let settings = parse(
+            r#"{"stt": {"diarization": true, "streaming": {"interim_results": true,
+                "vad_events": false, "endpointing_ms": 300, "utterance_end_ms": 1000,
+                "speech_begin_event": true}}}"#,
+        );
+        let stt = settings.stt.expect("stt parses");
+        assert_eq!(stt.diarization, Some(true));
+        let streaming = stt.streaming.expect("stt.streaming is modelled");
+        assert_eq!(streaming.interim_results, Some(true));
+        assert_eq!(streaming.vad_events, Some(false));
+        assert_eq!(streaming.endpointing_ms, Some(300));
+        assert_eq!(streaming.utterance_end_ms, Some(1000));
+        assert_eq!(streaming.speech_begin_event, Some(true));
+        assert!(
+            KNOWN_STT.contains(&"streaming"),
+            "no unmodelled-key warning for it"
         );
     }
 

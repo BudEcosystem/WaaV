@@ -44,21 +44,16 @@ use std::sync::Arc;
 /// // Client sends audio as binary frames
 /// // Server sends back transcripts and audio
 /// ```
-/// Every path the realtime handler is served at.
+/// Every path the NATIVE realtime handler is served at.
 ///
 /// A CONSTANT the router iterates, rather than a list of `.route()` calls, so the test below
-/// asserts on the same data the router uses. A test that greps this file for `.route(...)`
-/// would be checking its own transcription of the truth; this one cannot drift from it.
+/// asserts on the same data the router uses.
 ///
-/// * `/realtime` — WaaV's native path, kept for standalone deployments already using it.
-/// * `/v1/realtime` — the OpenAI-compatible path, and the one Bud's ingress routes here.
-///
-/// Both are needed because a Kubernetes Ingress does NOT rewrite paths: a rule sending
-/// `/v1/realtime` to this service delivers it verbatim, so serving only `/realtime` left the
-/// ingress pointing at a route that did not exist. The failure is invisible from outside —
-/// the auth middleware answers 401 before routing, so a missing route and a missing
-/// credential are indistinguishable.
-pub const REALTIME_PATHS: &[&str] = &["/realtime", "/v1/realtime"];
+/// Only `/realtime`: FRD-023 D-1 made `/v1/realtime` the OpenAI Realtime GA endpoint for Bud
+/// deployments (`routes::openai_realtime`). WaaV's own SDKs connect to `/realtime`, and the
+/// native protocol could never have served a Bud deployment on `/v1/realtime` (it had no way to
+/// name one, nor a credential to use).
+pub const REALTIME_PATHS: &[&str] = &["/realtime"];
 
 pub fn create_realtime_router() -> Router<Arc<AppState>> {
     let mut router = Router::new();
@@ -73,11 +68,13 @@ mod route_tests {
     use super::REALTIME_PATHS;
 
     #[test]
-    fn the_openai_compatible_path_is_served() {
-        assert!(
-            REALTIME_PATHS.contains(&"/v1/realtime"),
-            "Bud's ingress routes /v1/realtime here and does not rewrite the path; \
-             dropping it makes the ingress point at nothing, which reads as a 401"
+    fn the_openai_compatible_path_is_not_the_native_handler() {
+        // FRD-023 D-1: `/v1/realtime` speaks OpenAI GA (routes::openai_realtime). Serving it with
+        // the native handler too would register the path twice — axum panics at construction.
+        assert!(!REALTIME_PATHS.contains(&"/v1/realtime"));
+        assert_eq!(
+            crate::handlers::openai_realtime::OPENAI_REALTIME_PATH,
+            "/v1/realtime"
         );
     }
 

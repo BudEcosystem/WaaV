@@ -31,6 +31,9 @@ pub struct Principal {
     pub user_id: Option<String>,
     /// How the caller proved identity.
     pub via: PrincipalKind,
+    /// A JWT caller's verified `exp` (unix seconds). `None` for an API key, whose snapshot entry
+    /// carries no expiry: an expired or deleted key leaves the snapshot instead (FRD-023 §5.8).
+    pub expires_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -185,6 +188,19 @@ impl BudPlane {
             self.origin.elapsed().as_millis() as u64 + 1,
             Ordering::Relaxed,
         );
+        // FRD-023 Q-7: a JWT caller's grants are cached per `sub` for `OIDC_AUTHZ_TTL_SECS`. Without
+        // eviction, removing a user from a project reached WaaV only when that entry aged out, so
+        // a live realtime session outlived the revocation by up to the TTL.
+        if let Some(jwt) = &self.jwt {
+            if let Some(sub) = key.strip_prefix(crate::authz::USER_PROJECTS_PREFIX) {
+                jwt.evict_authz(sub);
+                return Ok(());
+            }
+            if key.starts_with(crate::authz::PROJECT_MODELS_PREFIX) {
+                jwt.clear_authz();
+                return Ok(());
+            }
+        }
         // The overlay is one key, written whole: re-read it on a set, drop it on a delete.
         if key == hydrate::PUBLISHED_MODEL_INFO_KEY {
             match event {
@@ -236,6 +252,7 @@ impl BudPlane {
                 api_key_id: md.as_ref().and_then(|m| m.api_key_id.clone()),
                 user_id: md.as_ref().and_then(|m| m.user_id.clone()),
                 via: PrincipalKind::ApiKey,
+                expires_at: None,
             });
         }
 
@@ -273,6 +290,7 @@ impl BudPlane {
                             api_key_id: None,
                             user_id: Some(identity.sub),
                             via: PrincipalKind::Jwt,
+                            expires_at: (identity.exp > 0).then_some(identity.exp),
                         })
                     }
                     Err(_) => Err(AuthFailure::JwtRejected),
@@ -307,6 +325,7 @@ impl BudPlane {
                                     api_key_id: md.as_ref().and_then(|m| m.api_key_id.clone()),
                                     user_id: md.as_ref().and_then(|m| m.user_id.clone()),
                                     via: PrincipalKind::ApiKey,
+                                    expires_at: None,
                                 })
                             }
                             Err(_) => Err(AuthFailure::Unauthorized),
@@ -732,6 +751,210 @@ impl BudPlane {
         let identity = jwt.cached_identity(&hashed)?;
         let entry = jwt.cached_authz(&identity.sub)?;
         matching(&entry.aliases)
+    }
+
+    /// Whether an API key, known only by its snapshot hash, still reaches `endpoint_id`.
+    ///
+    /// FRD-023 revalidation and `ek_bud_` parents: a live session and a client secret hold the
+    /// HASH, never the raw key, so the lookup is the same `HashMap::get` a direct connect makes.
+    /// `client_key` is whether the raw key was a `bud_client_*` key, recorded when the raw key was
+    /// last in hand — such a key also reaches the published overlay.
+    pub fn hash_reaches(
+        &self,
+        hashed: &str,
+        endpoint_id: &str,
+        client_key: bool,
+    ) -> Option<AliasMetadata> {
+        let own = self.auth.resolve(hashed)?;
+        let matching = |aliases: &AliasMap| {
+            aliases
+                .values()
+                .find(|m| m.endpoint_id.as_deref() == Some(endpoint_id))
+                .cloned()
+        };
+        if client_key && let Some(meta) = matching(&self.published.load_full()) {
+            return Some(meta);
+        }
+        matching(&own)
+    }
+
+    /// The `__metadata__` of an API key known by its hash.
+    pub fn hash_metadata(&self, hashed: &str) -> Option<crate::types::AuthMetadata> {
+        self.auth.metadata(hashed).map(|m| (*m).clone())
+    }
+
+    /// What a JWT subject may reach, through the per-`sub` authz cache; a miss is one store read
+    /// of `user_projects:{sub}` (FRD-023 D-17). `None` when JWT acceptance is not configured.
+    pub async fn subject_aliases(&self, sub: &str) -> Option<Arc<AliasMap>> {
+        let jwt = self.jwt.as_ref()?;
+        if let Some(entry) = jwt.cached_authz(sub) {
+            return Some(entry.aliases);
+        }
+        let r = authz::resolve(self.store.as_ref(), sub, self.published.load_full()).await;
+        if r.tier.is_cacheable() {
+            jwt.store_authz(sub, Arc::clone(&r.aliases));
+        }
+        Some(r.aliases)
+    }
+
+    /// Whether a JWT subject still reaches `endpoint_id`.
+    pub async fn subject_reaches(&self, sub: &str, endpoint_id: &str) -> Option<AliasMetadata> {
+        let aliases = self.subject_aliases(sub).await?;
+        aliases
+            .values()
+            .find(|m| m.endpoint_id.as_deref() == Some(endpoint_id))
+            .cloned()
+    }
+
+    /// The JWT verifier, when JWT acceptance is configured.
+    pub fn jwt(&self) -> Option<&Arc<JwtVerifier>> {
+        self.jwt.as_ref()
+    }
+}
+
+#[cfg(test)]
+mod realtime_reach_tests {
+    //! FRD-023 D-17 / §5.8: what a live session and an `ek_bud_` parent re-check, by hash or sub.
+    use super::*;
+    use crate::store::MemoryStore;
+
+    fn key_blob() -> String {
+        r#"{"rt":{"endpoint_id":"ep-rt","project_id":"p1","model_id":"m1"},"__metadata__":{"api_key_id":"ak1","user_id":"u1","api_key_project_id":"p1"}}"#.to_string()
+    }
+
+    async fn plane_with(
+        keys: &[(&str, String)],
+        jwt: Option<Arc<JwtVerifier>>,
+    ) -> (Arc<MemoryStore>, BudPlane) {
+        let store = Arc::new(MemoryStore::new());
+        for (k, v) in keys {
+            store.set(k, v);
+        }
+        let plane = BudPlane::new(Arc::clone(&store) as Arc<dyn ControlPlaneStore>, jwt);
+        plane.boot().await.unwrap();
+        (store, plane)
+    }
+
+    struct NoKeys;
+    #[async_trait::async_trait]
+    impl crate::jwt::JwksSource for NoKeys {
+        async fn fetch(&self) -> Result<String, String> {
+            Ok(r#"{"keys":[]}"#.to_string())
+        }
+    }
+
+    fn verifier() -> Arc<JwtVerifier> {
+        let cfg = crate::jwt::JwtConfig::from_lookup(|k| match k {
+            "OIDC_ISSUER" => Some("https://kc.example/realms/bud".into()),
+            "OIDC_ALLOWED_CLIENTS" => Some("bud-playground".into()),
+            _ => None,
+        })
+        .unwrap();
+        Arc::new(JwtVerifier::new(cfg, Arc::new(NoKeys)))
+    }
+
+    #[tokio::test]
+    async fn a_hash_reaches_its_endpoint_until_the_key_is_revoked() {
+        let hashed = hash_api_key("bud_rt");
+        let key = format!("api_key:{hashed}");
+        let (store, plane) = plane_with(&[(&key, key_blob())], None).await;
+
+        let entry = plane
+            .hash_reaches(&hashed, "ep-rt", false)
+            .expect("reaches");
+        assert_eq!(entry.project_id.as_deref(), Some("p1"));
+        assert!(plane.hash_reaches(&hashed, "ep-other", false).is_none());
+
+        store.remove(&key);
+        plane.on_key_event(&key, KeyEvent::Del).await.unwrap();
+        assert!(
+            plane.hash_reaches(&hashed, "ep-rt", false).is_none(),
+            "a revoked key still reached its endpoint; a live session would never close"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_a_client_key_reaches_the_published_overlay_by_hash() {
+        let hashed = hash_api_key("bud_client_x");
+        let (_s, plane) = plane_with(
+            &[
+                (
+                    &format!("api_key:{hashed}"),
+                    r#"{"__metadata__":{"api_key_id":"ak"}}"#.to_string(),
+                ),
+                (
+                    crate::hydrate::PUBLISHED_MODEL_INFO_KEY,
+                    r#"{"pub-rt":{"endpoint_id":"ep-pub","project_id":"p9"}}"#.to_string(),
+                ),
+            ],
+            None,
+        )
+        .await;
+        assert!(plane.hash_reaches(&hashed, "ep-pub", true).is_some());
+        assert!(plane.hash_reaches(&hashed, "ep-pub", false).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_user_projects_event_evicts_the_subjects_cached_grants() {
+        let jwt = verifier();
+        let (store, plane) = plane_with(
+            &[
+                (
+                    "user_projects:sub-1",
+                    r#"{"user_id":"u1","projects":["p1"]}"#.to_string(),
+                ),
+                (
+                    "project_models:p1",
+                    r#"{"rt":{"endpoint_id":"ep-rt","project_id":"p1"}}"#.to_string(),
+                ),
+            ],
+            Some(Arc::clone(&jwt)),
+        )
+        .await;
+        assert!(plane.subject_reaches("sub-1", "ep-rt").await.is_some());
+        assert!(
+            jwt.cached_authz("sub-1").is_some(),
+            "the resolution is cached"
+        );
+
+        // The user is removed from the project.
+        store.set("user_projects:sub-1", r#"{"user_id":"u1","projects":[]}"#);
+        plane
+            .on_key_event("user_projects:sub-1", KeyEvent::Set)
+            .await
+            .unwrap();
+        assert!(
+            jwt.cached_authz("sub-1").is_none(),
+            "Q-7: the cached grants survived the change"
+        );
+        assert!(plane.subject_reaches("sub-1", "ep-rt").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_project_models_event_clears_every_cached_grant() {
+        let jwt = verifier();
+        let (store, plane) = plane_with(
+            &[
+                (
+                    "user_projects:sub-1",
+                    r#"{"user_id":"u1","projects":["p1"]}"#.to_string(),
+                ),
+                (
+                    "project_models:p1",
+                    r#"{"rt":{"endpoint_id":"ep-rt","project_id":"p1"}}"#.to_string(),
+                ),
+            ],
+            Some(Arc::clone(&jwt)),
+        )
+        .await;
+        assert!(plane.subject_reaches("sub-1", "ep-rt").await.is_some());
+
+        store.set("project_models:p1", "{}");
+        plane
+            .on_key_event("project_models:p1", KeyEvent::Set)
+            .await
+            .unwrap();
+        assert!(plane.subject_reaches("sub-1", "ep-rt").await.is_none());
     }
 }
 

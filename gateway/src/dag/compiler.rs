@@ -269,6 +269,9 @@ impl DAGCompiler {
                 if let Some(m) = model {
                     node = node.with_model(m);
                 }
+                if let Some(bud) = &def.bud {
+                    node = node.with_bud(bud.clone());
+                }
                 Arc::new(node)
             }
             NodeType::RealtimeProvider { provider, model } => {
@@ -381,8 +384,7 @@ impl DAGCompiler {
                     llm_config.tools = Some(parsed_tools);
                 }
 
-                // Use try_new() for SSRF protection on the client-supplied base_url.
-                Arc::new(LlmEndpointNode::try_new(&def.id, llm_config)?)
+                bud_or_checked_llm_node(def, llm_config)?
             }
             NodeType::Translate {
                 target_language,
@@ -433,7 +435,7 @@ impl DAGCompiler {
                     headers: headers.clone(),
                     ..Default::default()
                 };
-                Arc::new(LlmEndpointNode::try_new(&def.id, llm_config)?)
+                bud_or_checked_llm_node(def, llm_config)?
             }
             NodeType::WebhookOutput { url, headers } => {
                 // Use try_new() for SSRF protection (S6): webhook URLs are client-supplied.
@@ -547,6 +549,21 @@ impl Default for DAGCompiler {
 /// excludes reconvergence/join nodes, which have at least one predecessor from a
 /// different branch and therefore execute once in the main sweep rather than per
 /// branch. This is the data needed for single-execution split handling.
+/// An LLM node: SSRF-checked when its `base_url` came with the template, or pointed at the Bud
+/// gateway with the caller's credential when the server bound it (FRD-023 WP-RT6.3).
+fn bud_or_checked_llm_node(
+    def: &NodeDefinition,
+    llm_config: LlmEndpointConfig,
+) -> DAGResult<Arc<dyn DAGNode>> {
+    match def.bud.as_ref().and_then(|b| b.session_credential.clone()) {
+        Some(credential) => Ok(Arc::new(LlmEndpointNode::for_bud_gateway(
+            &def.id, llm_config, credential,
+        ))),
+        // Use try_new() for SSRF protection on the client-supplied base_url.
+        None => Ok(Arc::new(LlmEndpointNode::try_new(&def.id, llm_config)?)),
+    }
+}
+
 fn compute_split_plans(
     graph: &DiGraph<CompiledNode, CompiledEdge>,
     topo_order: &[NodeIndex],

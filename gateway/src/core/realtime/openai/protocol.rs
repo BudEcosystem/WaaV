@@ -54,7 +54,7 @@ pub struct OpenAiProtocol {
 impl OpenAiProtocol {
     /// The configured model (for the newtype's inherent `model()` accessor).
     pub fn model(&self) -> OpenAIRealtimeModel {
-        self.model
+        self.model.clone()
     }
 
     /// The configured voice (for the newtype's inherent `voice()` accessor).
@@ -562,6 +562,35 @@ mod tests {
             voice: Some("alloy".into()),
             ..Default::default()
         }
+    }
+
+    /// TC-XL-08 (F-1) — a model the gateway has never heard of reaches the vendor VERBATIM. A
+    /// closed enum turned `gpt-realtime-1.5`, `-2.1` and `-2.1-mini` into `gpt-realtime` (shut
+    /// down 2027-01-20) without a word.
+    #[test]
+    fn tc_xl_08_an_unlisted_model_reaches_upstream_verbatim() {
+        for model in [
+            "gpt-realtime-2.1",
+            "gpt-realtime-2.1-mini",
+            "gpt-realtime-1.5",
+        ] {
+            let cfg = RealtimeConfig {
+                model: model.into(),
+                ..base_cfg()
+            };
+            let p = proto(&cfg);
+            assert_eq!(p.model().as_str(), model);
+            let ConnectSpec::WebSocket { url, .. } = p.connect_spec(&cfg).unwrap() else {
+                panic!("expected a WebSocket connect spec");
+            };
+            assert_eq!(url, format!("{OPENAI_REALTIME_URL}?model={model}"));
+        }
+        // Only an EMPTY model takes the default.
+        let cfg = RealtimeConfig {
+            model: String::new(),
+            ..base_cfg()
+        };
+        assert_eq!(proto(&cfg).model().as_str(), "gpt-realtime");
     }
 
     /// THE GOLDEN WIRE ORACLE: every outbound message the protocol serializes

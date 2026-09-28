@@ -37,6 +37,40 @@ pub struct Auth {
     // pub metadata: Option<serde_json::Value>,
 }
 
+/// A socket session's raw credential, kept so the session can act AS its caller (FRD-023 RT6):
+/// resolve its legs' deployments, reach budgateway for the voice agent's LLM leg, and be
+/// revalidated while it lives.
+///
+/// Shared (`Clone` shares the value), because an `auth` message REFRESHES it mid-session — a
+/// Keycloak token lives about five minutes, a voice call longer — and the LLM leg must send the
+/// current token on its next call. `Debug` never prints it.
+#[derive(Clone)]
+pub struct SessionCredential(std::sync::Arc<std::sync::RwLock<String>>);
+
+impl SessionCredential {
+    pub fn new(raw: impl Into<String>) -> Self {
+        Self(std::sync::Arc::new(std::sync::RwLock::new(raw.into())))
+    }
+
+    /// The credential as it is now.
+    pub fn current(&self) -> String {
+        self.0.read().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    /// Replace it (an `auth` refresh); every holder sees the new value.
+    pub fn replace(&self, raw: impl Into<String>) {
+        if let Ok(mut g) = self.0.write() {
+            *g = raw.into();
+        }
+    }
+}
+
+impl std::fmt::Debug for SessionCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SessionCredential([redacted])")
+    }
+}
+
 impl Auth {
     /// Create a new Auth with the given id
     pub fn new(id: impl Into<String>) -> Self {
@@ -119,6 +153,22 @@ impl Auth {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_session_credential_is_shared_refreshable_and_never_printed() {
+        let a = SessionCredential::new("bud_secret_one");
+        let b = a.clone();
+        b.replace("bud_secret_two");
+        assert_eq!(
+            a.current(),
+            "bud_secret_two",
+            "a refresh reaches every holder"
+        );
+        assert!(
+            !format!("{a:?}").contains("bud_secret"),
+            "Debug must redact"
+        );
+    }
 
     #[test]
     fn test_normalize_room_name_basic_prefix() {

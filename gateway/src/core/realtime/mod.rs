@@ -66,13 +66,13 @@ pub mod yandex;
 
 pub use azure::{AzureProtocol, AzureRealtime};
 pub use base::{
-    AudioOutputCallback, BaseRealtime, BoxedRealtime, ConnectionState, FunctionCallCallback,
-    FunctionCallRequest, FunctionDefinition, InputTranscriptionConfig, RealtimeAudioData,
-    RealtimeConfig, RealtimeError, RealtimeErrorCallback, RealtimeFactory,
-    RealtimeResponseOverride, RealtimeResult, ReconnectionCallback, ReconnectionEvent,
-    ReplayConversationItem, ResponseDoneCallback, SpeechEvent, SpeechEventCallback, ToolDefinition,
-    TranscriptCallback, TranscriptResult, TranscriptRole, TurnDetectionConfig, clamp_truncate_ms,
-    run_barge_in_sequence,
+    AudioOutputCallback, AwsStaticCredentials, BaseRealtime, BoxedRealtime, ConnectionState,
+    FunctionCallCallback, FunctionCallRequest, FunctionDefinition, InputTranscriptionConfig,
+    RealtimeAudioData, RealtimeConfig, RealtimeError, RealtimeErrorCallback, RealtimeFactory,
+    RealtimeResponseOverride, RealtimeResult, ReconnectionCallback, ReconnectionConfig,
+    ReconnectionEvent, ReplayConversationItem, ResponseDoneCallback, S2sEventCallback, SpeechEvent,
+    SpeechEventCallback, ToolDefinition, TranscriptCallback, TranscriptResult, TranscriptRole,
+    TurnDetectionConfig, clamp_truncate_ms, run_barge_in_sequence,
 };
 pub use deepgram::{DeepgramProtocol, DeepgramRealtime};
 pub use elevenlabs::{ElevenLabsProtocol, ElevenLabsRealtime};

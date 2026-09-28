@@ -21,6 +21,29 @@ use bud_auth::{AuthFailure, BudPlane, ControlPlaneStore, JwtConfig, JwtVerifier,
 
 use crate::auth::context::Auth;
 
+/// Whether THIS PROCESS serves Bud deployments (FRD-023 RT0, S-1).
+///
+/// Set once, when [`BudMode::start`] succeeds, and never cleared: a WaaV process is in Bud mode
+/// for its whole life or not at all. It exists for the code paths that fetch a vendor key from the
+/// process environment and have no `AppState` in reach — the LLM client's `${VAR}` / default-env
+/// fallback and DAG node credentials. In Bud mode every one of those would spend (or, through a
+/// client-chosen `base_url`, exfiltrate) a platform key on behalf of an arbitrary tenant, so they
+/// consult this flag rather than trusting each call site to pass one down.
+static PROCESS_IN_BUD_MODE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// See [`PROCESS_IN_BUD_MODE`].
+pub fn process_in_bud_mode() -> bool {
+    PROCESS_IN_BUD_MODE.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Mark the process as serving Bud deployments. Called by [`BudMode::start`]; public so an
+/// integration test can put a test binary into the same state.
+#[doc(hidden)]
+pub fn mark_process_in_bud_mode() {
+    PROCESS_IN_BUD_MODE.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// Everything needed to stand the plane up, read from the environment.
 pub struct BudModeConfig {
     pub redis_url: String,
@@ -143,6 +166,7 @@ impl BudMode {
         let stats = plane.boot().await.map_err(|e| {
             format!("initial control-plane hydration failed ({e}); refusing to start with an empty auth map")
         })?;
+        mark_process_in_bud_mode();
         tracing::info!(
             api_keys = stats.api_keys,
             skipped = stats.skipped,

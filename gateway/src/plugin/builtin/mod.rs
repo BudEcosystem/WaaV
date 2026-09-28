@@ -1276,7 +1276,7 @@ fn gemini_realtime_metadata() -> ProviderMetadata {
         .with_description(
             "Google Gemini Live (BidiGenerateContent) — speech-to-speech (base64+JSON, 16k in / 24k out; MULTI-FRAME serverContent; session resumption; server VAD)",
         )
-        .with_models(["gemini-2.0-flash-live-001"])
+        .with_models(["gemini-3.8-live"])
         .with_aliases(["gemini-live", "google"])
         .with_features([
             "full-duplex",
@@ -1302,7 +1302,7 @@ fn nova_sonic_realtime_metadata() -> ProviderMetadata {
         .with_description(
             "AWS Nova Sonic — Amazon's speech-to-speech model (base64-PCM + JSON events, 16k in / 24k out; BedrockBidi: an Amazon Bedrock InvokeModelWithBidirectionalStream HTTP/2 event stream; AWS SigV4 via aws-config, NO api-key; server VAD)",
         )
-        .with_models(["amazon.nova-sonic-v1:0"])
+        .with_models(["amazon.nova-2-sonic-v1:0"])
         .with_aliases(["nova-sonic", "aws"])
         .with_features(["full-duplex", "function-calling", "turn-detection", "barge-in"])
 }

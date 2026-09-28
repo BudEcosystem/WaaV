@@ -34,7 +34,30 @@ use crate::dag::error::{DAGError, DAGResult};
 /// Without this, STT/TTS provider nodes built `STTConfig`/`TTSConfig` with an EMPTY `api_key`, so a
 /// DAG could never authenticate to a real vendor — the node failed with "API key is required".
 pub(crate) fn resolve_node_credential(config: &serde_json::Value, field: &str) -> Option<String> {
+    resolve_node_credential_with(config, field, crate::auth::bud_mode::process_in_bud_mode())
+}
+
+/// [`resolve_node_credential`] with Bud mode explicit, so the rule is testable without a
+/// process-wide flag.
+///
+/// FRD-023 RT0 (X-2): in Bud mode a DAG node carries NO credential of its own — neither a literal
+/// key (a tenant's BYOK that bypasses attribution, quota and billing) nor a `${VAR}` reference
+/// (the platform's key, spent on behalf of whoever wrote the node). Vendor credentials come from
+/// the Bud deployment the node addresses.
+pub(crate) fn resolve_node_credential_with(
+    config: &serde_json::Value,
+    field: &str,
+    bud_mode: bool,
+) -> Option<String> {
     let raw = config.get(field)?.as_str()?;
+    if bud_mode {
+        warn!(
+            field = %field,
+            "DAG node config: refused a node-level credential; in Bud mode vendor credentials \
+             come from the addressed deployment (FRD-023 RT0)"
+        );
+        return None;
+    }
     if let Some(var) = raw.strip_prefix("${").and_then(|s| s.strip_suffix('}')) {
         let looks_like_credential = !var.is_empty()
             && var
@@ -70,12 +93,57 @@ fn resolve_configured_node_credential(
         return Ok(None);
     }
 
+    if crate::auth::bud_mode::process_in_bud_mode() {
+        return Err(bud_mode_node_credential_error(
+            node_id, provider, kind, field,
+        ));
+    }
     match resolve_node_credential(config, field) {
         Some(value) if !value.trim().is_empty() => Ok(Some(value)),
         _ => Err(DAGError::MissingConfiguration(format!(
             "{kind} provider node '{node_id}' ({provider}) has config.{field}, but it is empty, \
              non-string, blocked, or references an unset env var"
         ))),
+    }
+}
+
+/// The refusal a Bud-mode DAG node with its own credential gets (FRD-023 RT0, TC-SEC-04).
+pub(crate) fn bud_mode_node_credential_error(
+    node_id: &str,
+    provider: &str,
+    kind: &str,
+    field: &str,
+) -> DAGError {
+    DAGError::MissingConfiguration(format!(
+        "{kind} provider node '{node_id}' ({provider}) sets config.{field}, which this gateway \
+         does not accept: in Bud mode vendor credentials come from a Bud deployment, never from a \
+         DAG node or the process environment (FRD-023 RT0)"
+    ))
+}
+
+/// A provider or LLM node bound by the server to a Bud deployment (FRD-023 WP-RT6.3).
+///
+/// Built only by the `/ws` session from the caller's own allowlist; never deserialized.
+pub struct BudNodeBinding {
+    /// The deployment, for logs.
+    pub endpoint_id: String,
+    /// A provider node's vendor credential, from the deployment's `voice_table` entry.
+    pub vendor_credential: Option<String>,
+    /// The deployment's own address (self-hosted, Azure OpenAI).
+    pub api_base: Option<String>,
+    /// The deployment's own vendor parameters (AWS region and keys, Google project, …).
+    pub extras: serde_json::Map<String, serde_json::Value>,
+    /// An LLM node's credential: the CALLER's, read per call so a refresh reaches it.
+    pub session_credential: Option<crate::auth::SessionCredential>,
+    /// Told the text of every synthesis, to meter it against the deployment.
+    pub on_synthesis: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+}
+
+impl std::fmt::Debug for BudNodeBinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BudNodeBinding")
+            .field("endpoint_id", &self.endpoint_id)
+            .finish_non_exhaustive()
     }
 }
 
@@ -511,6 +579,8 @@ pub struct TTSProviderNode {
     config: serde_json::Value,
     /// Maximum total audio bytes to collect (prevents memory exhaustion)
     max_audio_bytes: usize,
+    /// FRD-023 WP-RT6.3: bound to a Bud deployment by the server.
+    bud: Option<Arc<BudNodeBinding>>,
 }
 
 impl TTSProviderNode {
@@ -523,6 +593,7 @@ impl TTSProviderNode {
             model: None,
             config: serde_json::Value::Null,
             max_audio_bytes: DEFAULT_MAX_TTS_AUDIO_BYTES,
+            bud: None,
         }
     }
 
@@ -547,6 +618,12 @@ impl TTSProviderNode {
     /// Set maximum audio bytes limit (default: 100MB)
     ///
     /// This prevents memory exhaustion from abnormally long TTS audio.
+    /// Bind the node to a Bud deployment (FRD-023 WP-RT6.3).
+    pub fn with_bud(mut self, binding: Arc<BudNodeBinding>) -> Self {
+        self.bud = Some(binding);
+        self
+    }
+
     pub fn with_max_audio_bytes(mut self, max_bytes: usize) -> Self {
         self.max_audio_bytes = max_bytes;
         self
@@ -631,26 +708,44 @@ impl DAGNode for TTSProviderNode {
         // Get TTS provider from registry
         let registry = crate::plugin::global_registry();
 
-        // Build TTS configuration. A configured credential must resolve; when no
-        // DAG credential is supplied, provider-specific fallback may still apply.
-        let api_key = resolve_configured_node_credential(
-            &self.config,
-            "api_key",
-            &self.id,
-            &self.provider,
-            "TTS",
-        )?
-        .unwrap_or_default();
+        // Build TTS configuration. A node bound to a Bud deployment uses the deployment's
+        // credential, address and parameters (FRD-023 WP-RT6.3). Otherwise a configured
+        // credential must resolve; when no DAG credential is supplied, provider-specific fallback
+        // may still apply.
+        let api_key = match &self.bud {
+            Some(bud) => bud.vendor_credential.clone().unwrap_or_default(),
+            None => resolve_configured_node_credential(
+                &self.config,
+                "api_key",
+                &self.id,
+                &self.provider,
+                "TTS",
+            )?
+            .unwrap_or_default(),
+        };
         let tts_config = crate::core::tts::TTSConfig {
             provider: self.provider.clone(),
             voice_id: self.voice_id.clone(),
             model: self.model.clone().unwrap_or_default(),
             api_key,
+            api_base: self.bud.as_ref().and_then(|b| b.api_base.clone()),
             ..Default::default()
         };
 
         // Create TTS provider
-        let mut tts = match registry.create_tts(&self.provider, tts_config) {
+        let created = match &self.bud {
+            Some(bud) => {
+                if let Some(meter) = &bud.on_synthesis {
+                    meter(&text);
+                }
+                let mut standard =
+                    crate::core::tts::standard::StandardTTSConfig::from_base(tts_config);
+                standard.extras.0 = bud.extras.clone();
+                crate::core::tts::standard::create_tts_standard(&self.provider, standard)
+            }
+            None => registry.create_tts(&self.provider, tts_config),
+        };
+        let mut tts = match created {
             Ok(tts) => tts,
             Err(e) => {
                 return Err(DAGError::TTSProviderError {
@@ -2430,6 +2525,44 @@ mod session_realtime_tests {
             LEGACY_CONNECTS.load(Ordering::SeqCst),
             2,
             "legacy fallback connects PER turn (no session-map resource → no persistence)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod frd023_node_credential_tests {
+    //! TC-SEC-04: in Bud mode a DAG node's own credential — literal or `${VAR}` — is refused.
+    use super::*;
+
+    #[test]
+    fn tc_sec_04_bud_mode_refuses_literal_and_env_credentials() {
+        let literal = serde_json::json!({"api_key": "sk-literal"});
+        let env_ref = serde_json::json!({"api_key": "${OPENAI_API_KEY}"});
+        assert_eq!(
+            resolve_node_credential_with(&literal, "api_key", true),
+            None
+        );
+        assert_eq!(
+            resolve_node_credential_with(&env_ref, "api_key", true),
+            None
+        );
+    }
+
+    #[test]
+    fn standalone_keeps_literal_credentials() {
+        let literal = serde_json::json!({"api_key": "sk-literal"});
+        assert_eq!(
+            resolve_node_credential_with(&literal, "api_key", false).as_deref(),
+            Some("sk-literal")
+        );
+    }
+
+    #[test]
+    fn tc_sec_04_the_refusal_names_bud_mode_not_a_missing_key() {
+        let err = bud_mode_node_credential_error("n1", "deepgram", "STT", "api_key").to_string();
+        assert!(
+            err.contains("Bud deployment") && err.contains("FRD-023"),
+            "{err}"
         );
     }
 }

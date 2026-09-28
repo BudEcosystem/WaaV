@@ -80,7 +80,7 @@ pub async fn handle_audio_message(
     }
 
     // Fast path: read lock to check state, get the voice manager, and (D8) opus-decode the frame.
-    let (voice_manager, audio_data) = {
+    let (voice_manager, audio_data, leg_meter) = {
         let state_guard = state.read().await;
 
         // Check if audio processing is enabled (atomic read, no lock overhead)
@@ -120,10 +120,13 @@ pub async fn handle_audio_message(
             None => audio_data,
         };
 
-        (voice_manager, audio_data)
+        (voice_manager, audio_data, state_guard.leg_meter.clone())
     };
 
     // Send the (decoded) PCM audio to the STT provider. Bytes gives O(1) clones.
+    if let Some(meter) = &leg_meter {
+        meter.add_stt_audio(audio_data.len());
+    }
     if let Err(e) = voice_manager.receive_audio(audio_data).await {
         error!("Failed to process audio: {}", e);
         send_error(message_tx, format!("Failed to process audio: {e}")).await;

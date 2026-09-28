@@ -60,6 +60,24 @@ impl NovaSonicRealtime {
         self.0.resilience_breaker()
     }
 
+    /// A session signed with a Bud deployment's own AWS keys (FRD-023 RT7.2): it dials through
+    /// `factory` (built with [`BedrockBidiTransportFactory::with_credentials`]) instead of the
+    /// `aws-config` default chain.
+    ///
+    /// [`BedrockBidiTransportFactory::with_credentials`]: crate::core::realtime::scaffold::BedrockBidiTransportFactory::with_credentials
+    pub fn with_transport(
+        config: RealtimeConfig,
+        factory: crate::core::realtime::scaffold::BedrockBidiTransportFactory,
+    ) -> RealtimeResult<Self> {
+        use crate::core::realtime::scaffold::RealtimeProtocol;
+        let protocol = NovaSonicProtocol::from_config(&config)?;
+        Ok(Self(RealtimeSession::with_transport(
+            protocol,
+            config,
+            std::sync::Arc::new(factory),
+        )?))
+    }
+
     /// Get the session ID if connected (Nova Sonic surfaces it on `completionStart`
     /// / `completionEnd`; the driver tracks none over this seam ⇒ `None`).
     pub async fn session_id(&self) -> Option<String> {
@@ -179,6 +197,17 @@ impl BaseRealtime for NovaSonicRealtime {
 
     fn set_resilience(&mut self, resilience: crate::core::resilience::ResilienceHandles) {
         self.0.set_resilience(resilience)
+    }
+
+    fn on_event(
+        &mut self,
+        callback: crate::core::realtime::base::S2sEventCallback,
+    ) -> RealtimeResult<()> {
+        self.0.on_event(callback)
+    }
+
+    fn audio_rates(&self) -> Option<(u32, u32)> {
+        self.0.audio_rates()
     }
 
     fn emits_user_turn_frames(&self) -> bool {

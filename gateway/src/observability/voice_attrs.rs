@@ -97,6 +97,49 @@ pub mod resilience {
     pub const RATE_LIMIT_OUTCOME: &str = "bud.rate_limit.outcome";
 }
 
+/// A realtime (speech-to-speech) billed record (FRD-023 §5.10, CONTRACTS C2).
+///
+/// Realtime is the one place on the audio plane billed in TOKENS — at up to eight per-modality
+/// rates — so these are the only token attributes in the vocabulary.
+pub mod realtime {
+    /// `response` | `input_transcription` | `duration_segment`.
+    pub const COMPONENT: &str = "bud.voice.rt.component";
+    /// The vendor serving the session (`voice_table.vendor`).
+    pub const VENDOR: &str = "bud.voice.rt.vendor";
+    /// The vendor's model (`voice_table.model`; the Azure deployment name for Azure).
+    pub const MODEL: &str = "bud.voice.rt.model";
+    pub const RESPONSE_ID: &str = "bud.voice.rt.response_id";
+    /// `completed` | `cancelled` | `incomplete` | `failed`.
+    pub const RESPONSE_STATUS: &str = "bud.voice.rt.response_status";
+    pub const INPUT_TEXT_TOKENS: &str = "bud.voice.rt.input_text_tokens";
+    pub const INPUT_AUDIO_TOKENS: &str = "bud.voice.rt.input_audio_tokens";
+    pub const INPUT_IMAGE_TOKENS: &str = "bud.voice.rt.input_image_tokens";
+    /// Cached tokens are a SUBSET of their input class, not additional to it.
+    pub const CACHED_TEXT_TOKENS: &str = "bud.voice.rt.cached_text_tokens";
+    pub const CACHED_AUDIO_TOKENS: &str = "bud.voice.rt.cached_audio_tokens";
+    pub const CACHED_IMAGE_TOKENS: &str = "bud.voice.rt.cached_image_tokens";
+    pub const OUTPUT_TEXT_TOKENS: &str = "bud.voice.rt.output_text_tokens";
+    pub const OUTPUT_AUDIO_TOKENS: &str = "bud.voice.rt.output_audio_tokens";
+    /// Seconds billed: an input transcription's audio, or a duration segment.
+    pub const BILLED_SECONDS: &str = "bud.voice.billed_seconds";
+    /// Components present with no rate — named, never priced at zero.
+    pub const UNPRICED_COMPONENTS: &str = "bud.voice.unpriced_components";
+    /// The vendor's own session id (`session.created.session.id`).
+    pub const VENDOR_SESSION_ID: &str = "bud.voice.vendor_session_id";
+    /// `realtime` | `transcription` (the session span).
+    pub const SESSION_TYPE: &str = "bud.voice.rt.session_type";
+}
+
+/// Attributes of the `voice.session` span, one per realtime session (FRD-023 §5.10).
+pub mod session {
+    pub const DURATION_MS: &str = "bud.voice.session.duration_ms";
+    pub const TURNS: &str = "bud.voice.session.turns";
+    /// `client_close` | `idle` | `max_duration` | `revoked` | `drain` | `upstream_error` |
+    /// `rate_limited` | `client_too_slow` | `client_timeout`.
+    pub const END_REASON: &str = "bud.voice.session.end_reason";
+    pub const CLOSE_CODE: &str = "bud.voice.session.close_code";
+}
+
 /// Attributes carried by a CLIENT span covering one leg of a turn.
 ///
 /// Per-leg rather than a single `provider`/`duration` pair, because a turn routinely spans two
@@ -176,6 +219,72 @@ pub const ALL: &[&str] = &[
     resilience::FALLBACK_FROM,
     resilience::RETRY_COUNT,
     resilience::RATE_LIMIT_OUTCOME,
+    realtime::COMPONENT,
+    realtime::VENDOR,
+    realtime::MODEL,
+    realtime::RESPONSE_ID,
+    realtime::RESPONSE_STATUS,
+    realtime::INPUT_TEXT_TOKENS,
+    realtime::INPUT_AUDIO_TOKENS,
+    realtime::INPUT_IMAGE_TOKENS,
+    realtime::CACHED_TEXT_TOKENS,
+    realtime::CACHED_AUDIO_TOKENS,
+    realtime::CACHED_IMAGE_TOKENS,
+    realtime::OUTPUT_TEXT_TOKENS,
+    realtime::OUTPUT_AUDIO_TOKENS,
+    realtime::BILLED_SECONDS,
+    realtime::UNPRICED_COMPONENTS,
+    realtime::VENDOR_SESSION_ID,
+    realtime::SESSION_TYPE,
+    session::DURATION_MS,
+    session::TURNS,
+    session::END_REASON,
+    session::CLOSE_CODE,
+];
+
+/// Attributes only the `voice.session` span carries; every other attribute in [`ALL`] is a
+/// `voice.turn` attribute and declared by [`voice_turn_span!`].
+pub const SESSION_ONLY: &[&str] = &[
+    realtime::SESSION_TYPE,
+    session::DURATION_MS,
+    session::TURNS,
+    session::END_REASON,
+    session::CLOSE_CODE,
+];
+
+/// The attributes a `voice.session` span declares (FRD-023): attribution, the realtime shape, the
+/// session's own fields and the totals. Kept beside [`ALL`] so the session macro and its test
+/// read one list.
+pub const SESSION: &[&str] = &[
+    turn::PROJECT_ID,
+    turn::ENDPOINT_ID,
+    turn::MODEL_ID,
+    turn::API_KEY_ID,
+    turn::USER_ID,
+    turn::API_KEY_PROJECT_ID,
+    turn::ENDPOINT_NAME,
+    turn::CAPABILITY,
+    turn::TRANSPORT,
+    turn::SESSION_ID,
+    turn::COST,
+    turn::PRICING_UNIT,
+    realtime::VENDOR,
+    realtime::MODEL,
+    realtime::SESSION_TYPE,
+    realtime::VENDOR_SESSION_ID,
+    realtime::INPUT_TEXT_TOKENS,
+    realtime::INPUT_AUDIO_TOKENS,
+    realtime::INPUT_IMAGE_TOKENS,
+    realtime::CACHED_TEXT_TOKENS,
+    realtime::CACHED_AUDIO_TOKENS,
+    realtime::CACHED_IMAGE_TOKENS,
+    realtime::OUTPUT_TEXT_TOKENS,
+    realtime::OUTPUT_AUDIO_TOKENS,
+    realtime::BILLED_SECONDS,
+    session::DURATION_MS,
+    session::TURNS,
+    session::END_REASON,
+    session::CLOSE_CODE,
 ];
 
 /// Open a `voice.turn` span that declares EVERY attribute in [`ALL`] up front.
@@ -198,9 +307,100 @@ pub const ALL: &[&str] = &[
 /// extra field can be written in any form tracing accepts, `{ CONST } = value` included.
 #[macro_export]
 macro_rules! voice_turn_span {
+    // FRD-023 D-19: a realtime billed record is the ROOT of its own trace.
+    (parent: $parent:expr, capability = $capability:expr, transport = $transport:expr $(, $($extra:tt)*)?) => {
+        $crate::__voice_turn_span_fields!((parent: $parent,) $capability, $transport $(, $($extra)*)?)
+    };
     (capability = $capability:expr, transport = $transport:expr $(, $($extra:tt)*)?) => {
+        $crate::__voice_turn_span_fields!(() $capability, $transport $(, $($extra)*)?)
+    };
+}
+
+/// The field list behind [`voice_turn_span!`], in one place for both of its forms.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __voice_turn_span_fields {
+    (($($parent:tt)*) $capability:expr, $transport:expr $(, $($extra:tt)*)?) => {
         ::tracing::info_span!(
+            $($parent)*
             "voice.turn",
+                { $crate::observability::voice_attrs::turn::CAPABILITY } = $capability,
+                { $crate::observability::voice_attrs::turn::TRANSPORT } = $transport,
+                { $crate::observability::voice_attrs::turn::PROJECT_ID } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::turn::ENDPOINT_ID } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::turn::MODEL_ID } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::turn::API_KEY_ID } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::turn::USER_ID } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::turn::SESSION_ID } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::turn::TURN_INDEX } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::turn::CHARACTERS } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::turn::AUDIO_SECONDS } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::turn::COST } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::turn::RESPONSE_LATENCY_MS } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::turn::BARGE_IN } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::turn::TURN_DETECTOR } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::turn::LANGUAGE } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::turn::TRANSCRIPT } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::turn::SYNTHESIS_INPUT } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::leg::STT_VENDOR } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::leg::STT_DURATION_MS } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::leg::STT_TTFB_MS } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::leg::TTS_VENDOR } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::leg::TTS_DURATION_MS } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::leg::TTS_TTFB_MS } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::leg::LLM_MODEL } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::leg::LLM_DURATION_MS } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::turn::ENDPOINT_NAME } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::turn::API_KEY_PROJECT_ID } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::turn::PRICING_UNIT } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::turn::ERROR_TYPE } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::turn::VENDOR_STATUS_CODE } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::turn::OUTPUT_AUDIO_SECONDS } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::turn::DETECTED_LANGUAGE } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::turn::AUDIO_FORMAT } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::turn::SAMPLE_RATE } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::turn::INPUT_AUDIO_BYTES } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::turn::VENDOR_REQUEST_ID } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::leg::STT_MODEL } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::leg::TTS_MODEL } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::leg::STT_CONFIDENCE } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::leg::TTS_VOICE } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::leg::STT_NOISE_SUPPRESSION } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::resilience::SERVED_ENDPOINT_ID } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::resilience::FALLBACK_FROM } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::resilience::RETRY_COUNT } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::resilience::RATE_LIMIT_OUTCOME } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::realtime::COMPONENT } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::realtime::VENDOR } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::realtime::MODEL } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::realtime::RESPONSE_ID } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::realtime::RESPONSE_STATUS } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::realtime::INPUT_TEXT_TOKENS } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::realtime::INPUT_AUDIO_TOKENS } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::realtime::INPUT_IMAGE_TOKENS } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::realtime::CACHED_TEXT_TOKENS } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::realtime::CACHED_AUDIO_TOKENS } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::realtime::CACHED_IMAGE_TOKENS } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::realtime::OUTPUT_TEXT_TOKENS } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::realtime::OUTPUT_AUDIO_TOKENS } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::realtime::BILLED_SECONDS } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::realtime::UNPRICED_COMPONENTS } = ::tracing::field::Empty,
+                { $crate::observability::voice_attrs::realtime::VENDOR_SESSION_ID } = ::tracing::field::Empty,
+                otel.status_code = ::tracing::field::Empty,
+                otel.status_message = ::tracing::field::Empty
+                $(, $($extra)*)?
+        )
+    };
+}
+
+/// Open a `voice.session` span (FRD-023 §5.10): the ROOT of its own trace, declaring every
+/// attribute in [`SESSION`] up front (the declare-before-record rule of [`voice_turn_span!`]).
+#[macro_export]
+macro_rules! voice_session_span {
+    (capability = $capability:expr, transport = $transport:expr) => {
+        ::tracing::info_span!(
+            parent: None,
+            "voice.session",
             { $crate::observability::voice_attrs::turn::CAPABILITY } = $capability,
             { $crate::observability::voice_attrs::turn::TRANSPORT } = $transport,
             { $crate::observability::voice_attrs::turn::PROJECT_ID } = ::tracing::field::Empty,
@@ -208,48 +408,30 @@ macro_rules! voice_turn_span {
             { $crate::observability::voice_attrs::turn::MODEL_ID } = ::tracing::field::Empty,
             { $crate::observability::voice_attrs::turn::API_KEY_ID } = ::tracing::field::Empty,
             { $crate::observability::voice_attrs::turn::USER_ID } = ::tracing::field::Empty,
-            { $crate::observability::voice_attrs::turn::SESSION_ID } = ::tracing::field::Empty,
-            { $crate::observability::voice_attrs::turn::TURN_INDEX } = ::tracing::field::Empty,
-            { $crate::observability::voice_attrs::turn::CHARACTERS } = ::tracing::field::Empty,
-            { $crate::observability::voice_attrs::turn::AUDIO_SECONDS } = ::tracing::field::Empty,
-            { $crate::observability::voice_attrs::turn::COST } = ::tracing::field::Empty,
-            { $crate::observability::voice_attrs::turn::RESPONSE_LATENCY_MS } = ::tracing::field::Empty,
-            { $crate::observability::voice_attrs::turn::BARGE_IN } = ::tracing::field::Empty,
-            { $crate::observability::voice_attrs::turn::TURN_DETECTOR } = ::tracing::field::Empty,
-            { $crate::observability::voice_attrs::turn::LANGUAGE } = ::tracing::field::Empty,
-            { $crate::observability::voice_attrs::turn::TRANSCRIPT } = ::tracing::field::Empty,
-            { $crate::observability::voice_attrs::turn::SYNTHESIS_INPUT } = ::tracing::field::Empty,
-            { $crate::observability::voice_attrs::leg::STT_VENDOR } = ::tracing::field::Empty,
-            { $crate::observability::voice_attrs::leg::STT_DURATION_MS } = ::tracing::field::Empty,
-            { $crate::observability::voice_attrs::leg::STT_TTFB_MS } = ::tracing::field::Empty,
-            { $crate::observability::voice_attrs::leg::TTS_VENDOR } = ::tracing::field::Empty,
-            { $crate::observability::voice_attrs::leg::TTS_DURATION_MS } = ::tracing::field::Empty,
-            { $crate::observability::voice_attrs::leg::TTS_TTFB_MS } = ::tracing::field::Empty,
-            { $crate::observability::voice_attrs::leg::LLM_MODEL } = ::tracing::field::Empty,
-            { $crate::observability::voice_attrs::leg::LLM_DURATION_MS } = ::tracing::field::Empty,
-            { $crate::observability::voice_attrs::turn::ENDPOINT_NAME } = ::tracing::field::Empty,
             { $crate::observability::voice_attrs::turn::API_KEY_PROJECT_ID } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::turn::ENDPOINT_NAME } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::turn::SESSION_ID } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::turn::COST } = ::tracing::field::Empty,
             { $crate::observability::voice_attrs::turn::PRICING_UNIT } = ::tracing::field::Empty,
-            { $crate::observability::voice_attrs::turn::ERROR_TYPE } = ::tracing::field::Empty,
-            { $crate::observability::voice_attrs::turn::VENDOR_STATUS_CODE } = ::tracing::field::Empty,
-            { $crate::observability::voice_attrs::turn::OUTPUT_AUDIO_SECONDS } = ::tracing::field::Empty,
-            { $crate::observability::voice_attrs::turn::DETECTED_LANGUAGE } = ::tracing::field::Empty,
-            { $crate::observability::voice_attrs::turn::AUDIO_FORMAT } = ::tracing::field::Empty,
-            { $crate::observability::voice_attrs::turn::SAMPLE_RATE } = ::tracing::field::Empty,
-            { $crate::observability::voice_attrs::turn::INPUT_AUDIO_BYTES } = ::tracing::field::Empty,
-            { $crate::observability::voice_attrs::turn::VENDOR_REQUEST_ID } = ::tracing::field::Empty,
-            { $crate::observability::voice_attrs::leg::STT_MODEL } = ::tracing::field::Empty,
-            { $crate::observability::voice_attrs::leg::TTS_MODEL } = ::tracing::field::Empty,
-            { $crate::observability::voice_attrs::leg::STT_CONFIDENCE } = ::tracing::field::Empty,
-            { $crate::observability::voice_attrs::leg::TTS_VOICE } = ::tracing::field::Empty,
-            { $crate::observability::voice_attrs::leg::STT_NOISE_SUPPRESSION } = ::tracing::field::Empty,
-            { $crate::observability::voice_attrs::resilience::SERVED_ENDPOINT_ID } = ::tracing::field::Empty,
-            { $crate::observability::voice_attrs::resilience::FALLBACK_FROM } = ::tracing::field::Empty,
-            { $crate::observability::voice_attrs::resilience::RETRY_COUNT } = ::tracing::field::Empty,
-            { $crate::observability::voice_attrs::resilience::RATE_LIMIT_OUTCOME } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::realtime::VENDOR } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::realtime::MODEL } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::realtime::SESSION_TYPE } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::realtime::VENDOR_SESSION_ID } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::realtime::INPUT_TEXT_TOKENS } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::realtime::INPUT_AUDIO_TOKENS } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::realtime::INPUT_IMAGE_TOKENS } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::realtime::CACHED_TEXT_TOKENS } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::realtime::CACHED_AUDIO_TOKENS } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::realtime::CACHED_IMAGE_TOKENS } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::realtime::OUTPUT_TEXT_TOKENS } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::realtime::OUTPUT_AUDIO_TOKENS } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::realtime::BILLED_SECONDS } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::session::DURATION_MS } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::session::TURNS } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::session::END_REASON } = ::tracing::field::Empty,
+            { $crate::observability::voice_attrs::session::CLOSE_CODE } = ::tracing::field::Empty,
             otel.status_code = ::tracing::field::Empty,
             otel.status_message = ::tracing::field::Empty
-            $(, $($extra)*)?
         )
     };
 }
@@ -358,12 +540,15 @@ mod tests {
         tracing::subscriber::with_default(capture::Sub(seen.clone()), || {
             let span =
                 crate::voice_turn_span!(capability = "conversation", transport = "websocket");
-            for name in ALL {
+            for name in ALL.iter().filter(|a| !SESSION_ONLY.contains(a)) {
                 span.record(*name, "x");
             }
         });
         let seen = seen.lock().unwrap();
-        let missing: Vec<_> = ALL.iter().filter(|a| !seen.contains(**a)).collect();
+        let missing: Vec<_> = ALL
+            .iter()
+            .filter(|a| !SESSION_ONLY.contains(a) && !seen.contains(**a))
+            .collect();
         assert!(
             missing.is_empty(),
             "voice_turn_span! does not declare {missing:?}; recording them is a silent no-op, \
@@ -429,13 +614,66 @@ mod tests {
 
     #[test]
     fn the_billing_dimensions_are_the_vendors_own_units() {
-        // A token count on a voice turn would be all zeroes: TTS bills per character, STT per
-        // second of audio.
+        // A token count on an HTTP voice turn would be all zeroes: TTS bills per character, STT
+        // per second of audio. Realtime (FRD-023) is the one capability billed in tokens, so its
+        // `bud.voice.rt.*_tokens` are the only token attributes.
         assert!(ALL.contains(&turn::CHARACTERS));
         assert!(ALL.contains(&turn::AUDIO_SECONDS));
+        let tokens: Vec<_> = ALL.iter().filter(|a| a.contains("token")).collect();
+        assert_eq!(tokens.len(), 8, "{tokens:?}");
         assert!(
-            !ALL.iter().any(|a| a.contains("token")),
-            "token counts are meaningless for a voice turn"
+            tokens.iter().all(|a| a.starts_with("bud.voice.rt.")),
+            "token counts belong to realtime only: {tokens:?}"
+        );
+    }
+
+    /// TC-MET-10 🔒: every realtime attribute is declared by BOTH span macros that carry it, so a
+    /// record on it is never a silent no-op.
+    #[test]
+    fn tc_met_10_the_realtime_turn_root_declares_every_attribute_in_all() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        tracing::subscriber::with_default(capture::Sub(seen.clone()), || {
+            let span = crate::voice_turn_span!(
+                parent: None,
+                capability = "realtime_session",
+                transport = "websocket"
+            );
+            for name in ALL.iter().filter(|a| !SESSION_ONLY.contains(a)) {
+                span.record(*name, "x");
+            }
+        });
+        let seen = seen.lock().unwrap();
+        let missing: Vec<_> = ALL
+            .iter()
+            .filter(|a| !SESSION_ONLY.contains(a) && !seen.contains(**a))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "the root form does not declare {missing:?}"
+        );
+    }
+
+    #[test]
+    fn tc_met_10_the_session_span_declares_every_session_attribute() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        tracing::subscriber::with_default(capture::Sub(seen.clone()), || {
+            let span = crate::voice_session_span!(
+                capability = "realtime_session",
+                transport = "websocket"
+            );
+            for name in SESSION {
+                span.record(*name, "x");
+            }
+        });
+        let seen = seen.lock().unwrap();
+        let missing: Vec<_> = SESSION.iter().filter(|a| !seen.contains(**a)).collect();
+        assert!(
+            missing.is_empty(),
+            "voice_session_span! does not declare {missing:?}"
+        );
+        assert!(
+            SESSION.iter().all(|a| ALL.contains(a)),
+            "a session attribute is missing from ALL"
         );
     }
 }

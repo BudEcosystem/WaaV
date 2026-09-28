@@ -106,6 +106,7 @@ pub struct MockProtocol {
     caps: ProtocolCaps,
     scripts: Arc<Mutex<VecDeque<Vec<Step>>>>,
     obs: MockObserver,
+    max_connection: Option<std::time::Duration>,
 }
 
 impl MockProtocol {
@@ -116,9 +117,16 @@ impl MockProtocol {
                 caps,
                 scripts: Arc::new(Mutex::new(scripts.into())),
                 obs: obs.clone(),
+                max_connection: None,
             },
             obs,
         )
+    }
+
+    /// A connection cap, as Nova Sonic has.
+    pub fn with_max_connection(mut self, d: std::time::Duration) -> Self {
+        self.max_connection = Some(d);
+        self
     }
 
     fn map_one(cmd: &str) -> S2sEvent {
@@ -169,6 +177,17 @@ impl MockProtocol {
             // `inbound_command_triggers_outbound_send_frame` test below.
             ["send", text] => S2sEvent::SendFrame(OutFrame::Text(text.to_string())),
             ["resume", h] => S2sEvent::ResumptionHandle(h.to_string()),
+            ["goaway", ms] => S2sEvent::GoAway {
+                time_left: ms.parse().ok().map(std::time::Duration::from_millis),
+            },
+            ["usage", n] => S2sEvent::Usage(super::event::UsageReport {
+                tokens: crate::core::realtime_cost::RealtimeUsage {
+                    input_audio: n.parse().unwrap_or(0),
+                    ..Default::default()
+                },
+                seconds: None,
+                cumulative: false,
+            }),
             ["err", msg] => S2sEvent::Error(RealtimeError::ProviderError(msg.to_string())),
             _ => S2sEvent::Ignore,
         }
@@ -194,6 +213,9 @@ impl RealtimeProtocol for MockProtocol {
     }
     fn caps(&self) -> ProtocolCaps {
         self.caps
+    }
+    fn max_connection(&self) -> Option<std::time::Duration> {
+        self.max_connection
     }
     fn connect_spec(&self, _cfg: &RealtimeConfig) -> RealtimeResult<ConnectSpec> {
         Ok(ConnectSpec::WebSocket {
@@ -440,6 +462,114 @@ mod tests {
         .unwrap();
         s.connect().await.unwrap();
         until(|| n.load(Ordering::SeqCst) == 1 && dn.load(Ordering::SeqCst) == 1).await;
+        s.disconnect().await.unwrap();
+    }
+
+    /// FRD-023 RT7.0 — the event tap sees every normalized event in wire order, including the
+    /// ones no native callback carries (`Usage`).
+    #[tokio::test]
+    async fn the_event_tap_sees_every_event_in_order() {
+        let script = vec![Step::Text("multi:usage:7;;audio:10;;done:r1".into())];
+        let (proto, _o) = MockProtocol::new(ProtocolCaps::default(), vec![script]);
+        let mut s = RealtimeSession::from_parts(proto, cfg()).unwrap();
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let c = seen.clone();
+        s.on_event(Arc::new(move |ev| {
+            let label = match ev {
+                S2sEvent::Usage(u) => format!("usage:{}", u.tokens.input_audio),
+                S2sEvent::Audio { data, .. } => format!("audio:{}", data.len()),
+                S2sEvent::ResponseDone { response_id } => format!("done:{response_id}"),
+                other => format!("{other:?}"),
+            };
+            c.lock().unwrap().push(label);
+            Box::pin(async {})
+        }))
+        .unwrap();
+        s.connect().await.unwrap();
+        until(|| seen.lock().unwrap().len() >= 3).await;
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            &["usage:7", "audio:10", "done:r1"]
+        );
+        s.disconnect().await.unwrap();
+    }
+
+    /// TC-XL-04 (driver half) — a `goAway` replaces the connection AT ONCE (no backoff: the
+    /// default first delay is ~1 s) carrying the resumption handle, and is not a failure.
+    #[tokio::test]
+    async fn go_away_reconnects_at_once_with_the_resumption_handle() {
+        let scripts = vec![
+            vec![
+                Step::Text("resume:h1".into()),
+                Step::Text("goaway:0".into()),
+            ],
+            vec![],
+        ];
+        let (proto, obs) = MockProtocol::new(ProtocolCaps::default(), scripts);
+        let mut s = RealtimeSession::from_parts(proto, cfg()).unwrap();
+        let reconnects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let r = reconnects.clone();
+        s.on_reconnection(Arc::new(move |ev| {
+            assert!(ev.success);
+            r.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {})
+        }))
+        .unwrap();
+        s.connect().await.unwrap();
+        until(|| obs.connect_count() == 2).await;
+        until(|| {
+            obs.sent_text()
+                .contains(&"session_update:resume=h1".to_string())
+        })
+        .await;
+        until(|| reconnects.load(Ordering::SeqCst) == 1).await;
+        assert!(s.is_ready());
+        s.disconnect().await.unwrap();
+    }
+
+    /// A `goAway` during a response waits for the response to finish (its deadline is far).
+    #[tokio::test]
+    async fn go_away_waits_for_the_response_in_flight() {
+        let scripts = vec![
+            vec![
+                Step::Text("audio:10".into()),
+                Step::Text("goaway:60000".into()),
+            ],
+            vec![],
+        ];
+        let (proto, obs) = MockProtocol::new(ProtocolCaps::default(), scripts);
+        let mut s = RealtimeSession::from_parts(proto, cfg()).unwrap();
+        s.connect().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(obs.connect_count(), 1, "cut the response off");
+        s.disconnect().await.unwrap();
+
+        let scripts = vec![
+            vec![
+                Step::Text("audio:10".into()),
+                Step::Text("goaway:60000".into()),
+                Step::Text("done:r1".into()),
+            ],
+            vec![],
+        ];
+        let (proto, obs) = MockProtocol::new(ProtocolCaps::default(), scripts);
+        let mut s = RealtimeSession::from_parts(proto, cfg()).unwrap();
+        s.connect().await.unwrap();
+        until(|| obs.connect_count() == 2).await;
+        s.disconnect().await.unwrap();
+    }
+
+    /// TC-XL-05 (driver half) — a connection cap replaces the connection before the vendor
+    /// does, over and over, without ever counting as a quick failure (3 of which stop the
+    /// session).
+    #[tokio::test]
+    async fn a_connection_cap_reconnects_proactively_and_is_not_a_failure() {
+        let (proto, obs) = MockProtocol::new(ProtocolCaps::default(), vec![]);
+        let proto = proto.with_max_connection(Duration::from_millis(30));
+        let mut s = RealtimeSession::from_parts(proto, cfg()).unwrap();
+        s.connect().await.unwrap();
+        until(|| obs.connect_count() >= 5).await;
+        assert_ne!(s.get_connection_state(), ConnectionState::Failed);
         s.disconnect().await.unwrap();
     }
 

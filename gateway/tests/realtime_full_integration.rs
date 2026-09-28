@@ -147,6 +147,8 @@ fn rich_config_for(name: &str) -> RealtimeConfig {
         realtime_endpoint_override: None,
         reconnection: None,
         trace: None,
+        // SERVER-SET connection cap (FRD-023 RT7); the protocol's own when unset.
+        max_connection: None,
     };
 
     match name {

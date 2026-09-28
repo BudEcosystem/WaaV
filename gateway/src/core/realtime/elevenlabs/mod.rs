@@ -171,6 +171,17 @@ impl BaseRealtime for ElevenLabsRealtime {
         self.0.set_resilience(resilience)
     }
 
+    fn on_event(
+        &mut self,
+        callback: crate::core::realtime::base::S2sEventCallback,
+    ) -> RealtimeResult<()> {
+        self.0.on_event(callback)
+    }
+
+    fn audio_rates(&self) -> Option<(u32, u32)> {
+        self.0.audio_rates()
+    }
+
     fn emits_user_turn_frames(&self) -> bool {
         self.0.emits_user_turn_frames()
     }

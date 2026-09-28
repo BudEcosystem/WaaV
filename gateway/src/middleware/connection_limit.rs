@@ -95,6 +95,7 @@ pub async fn connection_limit_middleware(
     }
 
     let client_ip = addr.ip();
+    let openai_path = crate::middleware::auth::is_openai_compatible_path(request.uri().path());
 
     // Try to acquire a connection slot
     match state.try_acquire_connection(client_ip) {
@@ -115,24 +116,46 @@ pub async fn connection_limit_middleware(
                 ip = %client_ip,
                 "Rejecting connection: global limit reached"
             );
-            (
+            refusal(
+                openai_path,
                 StatusCode::SERVICE_UNAVAILABLE,
+                "server_at_capacity",
                 "Server at capacity. Please try again later.",
             )
-                .into_response()
         }
         Err(ConnectionLimitError::PerIpLimitReached) => {
             tracing::warn!(
                 ip = %client_ip,
                 "Rejecting connection: per-IP limit reached"
             );
-            (
+            refusal(
+                openai_path,
                 StatusCode::TOO_MANY_REQUESTS,
+                "rate_limit_exceeded",
                 "Too many connections from your IP address.",
             )
-                .into_response()
         }
     }
+}
+
+/// A refused upgrade, with `Retry-After: 1` either way. On the OpenAI-compatible routes
+/// (`/v1/realtime`) the client is an OpenAI SDK, which reads `error.code` and backs off on the
+/// header, so it gets the relay's own error envelope (FRD-023 §5.2); the native routes keep their
+/// text body.
+fn refusal(openai_path: bool, status: StatusCode, code: &'static str, message: &str) -> Response {
+    if openai_path {
+        return crate::handlers::openai_realtime::handshake::HandshakeError::new(
+            status, code, message,
+        )
+        .retry_after(1)
+        .into_response();
+    }
+    let mut response = (status, message.to_string()).into_response();
+    response.headers_mut().insert(
+        axum::http::header::RETRY_AFTER,
+        axum::http::HeaderValue::from_static("1"),
+    );
+    response
 }
 
 #[cfg(test)]
@@ -298,6 +321,82 @@ mod tests {
             StatusCode::SERVICE_UNAVAILABLE,
             "the global cap still applies"
         );
+    }
+
+    /// FRD-023 §5.2: a refusal on `/v1/realtime` reaches an OpenAI SDK, which reads `error.code`
+    /// and backs off on `Retry-After` — a plain-text 429 gives it neither. `/ws` keeps its native
+    /// body (its clients read text) and gains the hint too.
+    #[tokio::test]
+    async fn a_refusal_on_the_openai_path_uses_the_openai_envelope_and_retry_after() {
+        use axum::extract::connect_info::MockConnectInfo;
+        use tower::ServiceExt;
+        for (max_ws, per_ip, want, code) in [
+            (
+                Some(1000),
+                1,
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limit_exceeded",
+            ),
+            (
+                Some(1),
+                100,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "server_at_capacity",
+            ),
+        ] {
+            let state = AppState::new(limit_test_config(max_ws, per_ip)).await;
+            let held: Arc<std::sync::Mutex<Vec<ConnectionSlot>>> = Default::default();
+            let h = held.clone();
+            let handler = axum::routing::get(
+                move |axum::Extension(slot): axum::Extension<ConnectionSlot>| {
+                    h.lock().unwrap().push(slot);
+                    async { StatusCode::SWITCHING_PROTOCOLS }
+                },
+            );
+            let app = axum::Router::new()
+                .route("/v1/realtime", handler.clone())
+                .route("/ws", handler)
+                .layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    connection_limit_middleware,
+                ))
+                .layer(MockConnectInfo(SocketAddr::from(([10, 0, 0, 9], 4242))));
+            let upgrade = |path: &str| {
+                Request::builder()
+                    .uri(path)
+                    .header("upgrade", "websocket")
+                    .body(Body::empty())
+                    .unwrap()
+            };
+            let first = app.clone().oneshot(upgrade("/v1/realtime")).await.unwrap();
+            assert_eq!(first.status(), StatusCode::SWITCHING_PROTOCOLS);
+
+            let refused = app.clone().oneshot(upgrade("/v1/realtime")).await.unwrap();
+            assert_eq!(refused.status(), want);
+            assert_eq!(refused.headers()["retry-after"], "1");
+            let body = axum::body::to_bytes(refused.into_body(), 4096)
+                .await
+                .unwrap();
+            let json: serde_json::Value =
+                serde_json::from_slice(&body).expect("an OpenAI error envelope");
+            assert_eq!(json["error"]["code"], code, "{json}");
+            assert!(
+                json["error"]["message"]
+                    .as_str()
+                    .is_some_and(|m| !m.is_empty())
+            );
+
+            let native = app.clone().oneshot(upgrade("/ws")).await.unwrap();
+            assert_eq!(native.status(), want);
+            assert_eq!(native.headers()["retry-after"], "1");
+            let body = axum::body::to_bytes(native.into_body(), 4096)
+                .await
+                .unwrap();
+            assert!(
+                serde_json::from_slice::<serde_json::Value>(&body).is_err(),
+                "native text body"
+            );
+        }
     }
 
     /// A live session keeps its slot until it ends.

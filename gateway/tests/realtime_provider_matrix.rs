@@ -60,10 +60,9 @@ const KEYLESS_PROVIDERS: [&str; 1] = ["nova_sonic"];
 /// - **azure** (`azure/protocol.rs`): `from_config` REQUIRES both `endpoint`
 ///   (the Azure resource) AND a non-empty `model` (the deployment name) — either
 ///   missing ⇒ `InvalidConfiguration`. Both are set here;
-/// - **openai** (`openai/protocol.rs`): `from_config` parses `model` into the
-///   `OpenAIRealtimeModel` enum via `from_str_or_default`, which DEFAULTS an
-///   unknown string to `gpt-realtime` rather than erroring — so any model
-///   string constructs. We pass the real GA default `"gpt-realtime"` explicitly;
+/// - **openai** (`openai/protocol.rs`): `from_config` carries `model` VERBATIM
+///   (`OpenAIRealtimeModel`, FRD-023 F-1) — any non-empty id constructs and reaches
+///   the vendor as given. We pass the real GA default `"gpt-realtime"` explicitly;
 /// - **grok / inworld / deepgram**: take a raw/lenient model string (inworld and
 ///   deepgram don't even require it at construction — only `connect_spec`/the
 ///   Settings wire consult it). A descriptive model is supplied anyway;

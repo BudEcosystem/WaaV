@@ -62,6 +62,12 @@ fn uninterruptible_playback_from_env() -> VoiceManagerResult<bool> {
     }
 }
 
+/// See [`VoiceManager::set_speak_observer`].
+pub type SpeakObserver = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// See [`VoiceManager::set_stt_final_observer`].
+pub type SttFinalObserver = Arc<dyn Fn(&str) + Send + Sync>;
+
 /// VoiceManager provides a unified interface for managing STT and TTS providers
 /// Optimized for extreme low-latency with lock-free atomics and pre-allocated buffers
 pub struct VoiceManager {
@@ -118,6 +124,13 @@ pub struct VoiceManager {
     // None ⇒ a single relaxed read per call site, zero work. Set once at
     // session setup via `set_observers`; read-mostly thereafter.
     observers: Arc<SyncRwLock<Option<Arc<ObserverRegistry>>>>,
+    /// FRD-023 RT6: told the text of every synthesis request, so a Bud deployment's TTS leg is
+    /// metered per `speak` — the client's and the voice agent's alike.
+    speak_observer: Arc<SyncRwLock<Option<SpeakObserver>>>,
+    /// FRD-023 RT6: told every FINAL transcript the vendor returns, so a Bud deployment's STT leg
+    /// is metered per utterance. Separate from the result callback, which the voice agent
+    /// replaces; read per result, so it holds across every `on_stt_result` registration.
+    stt_final_observer: Arc<SyncRwLock<Option<SttFinalObserver>>>,
 
     /// A-G6: when uninterruptible playback is enabled, TTS chunks are metered to
     /// the transport through this pump's queue so a barge-in can selectively
@@ -244,6 +257,8 @@ impl VoiceManager {
             clear_notify: Arc::new(Notify::new()),
             clear_epoch: Arc::new(AtomicUsize::new(0)),
             observers: Arc::new(SyncRwLock::new(None)),
+            speak_observer: Arc::new(SyncRwLock::new(None)),
+            stt_final_observer: Arc::new(SyncRwLock::new(None)),
             playback_pump: Arc::new(SyncRwLock::new(None)),
             uninterruptible_playback: AtomicBool::new(uninterruptible_playback),
         })
@@ -705,14 +720,32 @@ impl VoiceManager {
         // D-G9 (review wf_d43814c3): count chars on THIS path too — the
         // orchestrator speaks via speak_if_epoch, not speak(), so the
         // counter was never incremented on the production conversation path.
-        crate::core::metrics::bridge::count_tts_chars(
-            &self.config.tts_config.provider,
-            text.chars().count(),
-        );
+        self.note_speak(text);
         tts.speak(text, flush)
             .await
             .map_err(VoiceManagerError::TTSError)?;
         Ok(true)
+    }
+
+    /// Every synthesis request passes here: the D-G9 cost proxy and the RT6 speak observer.
+    fn note_speak(&self, text: &str) {
+        crate::core::metrics::bridge::count_tts_chars(
+            &self.config.tts_config.provider,
+            text.chars().count(),
+        );
+        if let Some(observer) = self.speak_observer.read().clone() {
+            observer(text);
+        }
+    }
+
+    /// Observe the text of every synthesis request (FRD-023 RT6 TTS-leg metering).
+    pub fn set_speak_observer(&self, observer: SpeakObserver) {
+        *self.speak_observer.write() = Some(observer);
+    }
+
+    /// Observe every final transcript the STT vendor returns (FRD-023 RT6 STT-leg metering).
+    pub fn set_stt_final_observer(&self, observer: SttFinalObserver) {
+        *self.stt_final_observer.write() = Some(observer);
     }
 
     pub async fn speak(&self, text: &str, flush: bool) -> VoiceManagerResult<()> {
@@ -722,10 +755,7 @@ impl VoiceManager {
             obs.notify_tts_request(crate::core::observability::now_monotonic_ns());
         }
         // D-G9: synthesis cost proxy.
-        crate::core::metrics::bridge::count_tts_chars(
-            &self.config.tts_config.provider,
-            text.chars().count(),
-        );
+        self.note_speak(text);
         // Send text to TTS provider
         {
             let mut tts = self.tts.write().await;
@@ -786,10 +816,7 @@ impl VoiceManager {
 
         // D-G9: synthesis cost proxy (covers the non-interruptible /
         // speak_if_epoch-delegated path).
-        crate::core::metrics::bridge::count_tts_chars(
-            &self.config.tts_config.provider,
-            text.chars().count(),
-        );
+        self.note_speak(text);
         // Send text to TTS provider
         {
             let mut tts = self.tts.write().await;
@@ -986,6 +1013,7 @@ impl VoiceManager {
         let interruption_state_clone = self.interruption_state.clone();
         let turn_detector_clone = self.turn_detector.clone();
         let observers_clone = self.observers.clone();
+        let stt_final_observer_clone = self.stt_final_observer.clone();
 
         // Create STT processor with configured timeouts from VoiceManagerConfig,
         // plus the provider's measured TTFS p99 (A-G2/D-G8: a slow provider's
@@ -1010,6 +1038,13 @@ impl VoiceManager {
             let turn_detector = turn_detector_clone.clone();
             let stt_processor = stt_processor.clone();
             let observers = observers_clone.read().clone();
+            // Before any suppression: the vendor transcribed (and billed) this audio whether or
+            // not the session acts on the result.
+            if result.is_final
+                && let Some(observer) = stt_final_observer_clone.read().clone()
+            {
+                observer(&result.transcript);
+            }
 
             Box::pin(async move {
                 // Fast synchronous check for interruption - execute before any async ops

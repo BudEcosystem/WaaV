@@ -162,6 +162,14 @@ async fn authenticate_request(
                     auth_id = ?auth.id,
                     "bud authentication successful"
                 );
+                // FRD-023 RT6: a /ws session acts as its caller for the session's life (its legs'
+                // deployments, the LLM leg through budgateway, revalidation), so it keeps the
+                // credential — redacted, in memory only.
+                if request_path == "/ws" {
+                    request
+                        .extensions_mut()
+                        .insert(crate::auth::SessionCredential::new(token.clone()));
+                }
                 request.extensions_mut().insert(auth);
                 Ok(next.run(request).await)
             }

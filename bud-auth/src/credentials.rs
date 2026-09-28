@@ -235,7 +235,29 @@ pub struct VoicePricing {
     /// How many units `cost_per_unit` covers. `0` is carried as published and prices nothing,
     /// rather than dividing by it.
     pub per_units: u64,
+    /// FRD-023 §5.10: a realtime deployment's per-modality rates, each per `per_units` tokens
+    /// (`transcription_per_minute` per minute). Keys are restricted to [`REALTIME_RATE_KEYS`].
+    /// Empty for every other unit and every non-realtime deployment.
+    pub rates: BTreeMap<String, f64>,
 }
+
+/// The rate keys a realtime price may carry (CONTRACTS C1). A closed set: a key outside it is
+/// ignored with a warning rather than guessed at, and a component whose rate is absent is
+/// recorded as UNPRICED, never as free.
+pub const REALTIME_RATE_KEYS: &[&str] = &[
+    "input_text",
+    "input_audio",
+    "input_image",
+    "cached_input_text",
+    "cached_input_audio",
+    "cached_input_image",
+    "output_text",
+    "output_audio",
+    "transcription_per_minute",
+    "transcription_input_audio",
+    "transcription_input_text",
+    "transcription_output_text",
+];
 
 /// Read a published `pricing` block, or `None` with a warning when it cannot be used.
 ///
@@ -269,8 +291,15 @@ pub fn parse_pricing(endpoint_id: &str, raw: &serde_json::Value) -> Option<Voice
         Some(u) if !u.is_empty() => u.to_ascii_lowercase(),
         _ => return refuse("no unit"),
     };
+    let rates = parse_rates(endpoint_id, fields.get("rates"));
+    // FRD-023: a TOKEN price on the audio plane is a realtime price, and is ONLY its rates. With
+    // none it would price every response at zero, so it is refused like any unusable price.
+    if unit == "token" && rates.is_empty() {
+        return refuse("a token price on a voice endpoint needs per-modality rates");
+    }
     let cost_per_unit = match fields.get("cost_per_unit").and_then(number) {
         Some(c) if c.is_finite() && c >= 0.0 => c,
+        None if unit == "token" => 0.0,
         _ => return refuse("cost_per_unit is not a non-negative number"),
     };
     let per_units = match fields.get("per_units") {
@@ -293,7 +322,48 @@ pub fn parse_pricing(endpoint_id: &str, raw: &serde_json::Value) -> Option<Voice
         cost_per_unit,
         currency,
         per_units,
+        rates,
     })
+}
+
+/// Read a `rates` object: numbers or numeric strings, finite and non-negative, keys restricted to
+/// [`REALTIME_RATE_KEYS`]. Anything else is dropped by KEY with a warning; the rest is kept.
+fn parse_rates(endpoint_id: &str, raw: Option<&serde_json::Value>) -> BTreeMap<String, f64> {
+    let mut out = BTreeMap::new();
+    let fields = match raw {
+        None | Some(serde_json::Value::Null) => return out,
+        Some(serde_json::Value::Object(fields)) => fields,
+        Some(_) => {
+            tracing::warn!(endpoint_id = %endpoint_id, "voice_table pricing.rates is not an object; ignored");
+            return out;
+        }
+    };
+    for (key, value) in fields {
+        if !REALTIME_RATE_KEYS.contains(&key.as_str()) {
+            tracing::warn!(
+                endpoint_id = %endpoint_id,
+                field = %key,
+                "voice_table pricing.rates carries a key this build does not price; ignored"
+            );
+            continue;
+        }
+        let rate = match value {
+            serde_json::Value::Number(n) => n.as_f64(),
+            serde_json::Value::String(s) => s.trim().parse::<f64>().ok(),
+            _ => None,
+        };
+        match rate {
+            Some(r) if r.is_finite() && r >= 0.0 => {
+                out.insert(key.clone(), r);
+            }
+            _ => tracing::warn!(
+                endpoint_id = %endpoint_id,
+                field = %key,
+                "voice_table pricing rate is not a non-negative number; ignored"
+            ),
+        }
+    }
+    out
 }
 
 /// A voice endpoint after hydration: the credential is already plaintext.
@@ -357,7 +427,8 @@ pub fn allowed_provider_params(vendor: &str) -> &'static [&'static str] {
         .replace('-', "_")
         .as_str()
     {
-        "aws_polly" | "aws_transcribe" => &["region"],
+        // Nova 2 Sonic (realtime, FRD-023 RT7.2) signs Bedrock requests in this region.
+        "aws_polly" | "aws_transcribe" | "nova_sonic" => &["region"],
         "google" => &["project_id", "location"],
         "azure_openai" => &["api_version"],
         _ => &[],
@@ -741,6 +812,7 @@ mod tests {
                 cost_per_unit: 0.0001,
                 currency: Some("USD".into()),
                 per_units: 1,
+                rates: BTreeMap::new(),
             })
         );
     }
@@ -1174,6 +1246,33 @@ mod tests {
             "Azure AI Speech takes no provider_params"
         );
         assert!(allowed_provider_params("deepgram").is_empty());
+    }
+
+    /// FRD-023 RT7.2 (CONTRACTS C7) — a Nova 2 Sonic realtime entry carries its REQUIRED region
+    /// in `provider_params`; dropping it at parse would leave the session unable to sign.
+    #[test]
+    fn nova_sonic_keeps_its_region_and_its_key_pair() {
+        assert_eq!(allowed_provider_params("nova_sonic"), &["region"]);
+        assert_eq!(allowed_provider_params("nova-sonic"), &["region"]);
+        let json = serde_json::json!({ "ep-nova": {
+            "vendor": "nova_sonic",
+            "credential": encrypt_like_budapp(
+                r#"{"access_key_id":"AKIDNOVA","secret_access_key":"s3cr3t"}"#
+            ),
+            "endpoints": ["realtime_session"],
+            "model": "amazon.nova-2-sonic-v1:0",
+            "provider_params": { "region": "us-east-1", "endpoint_override": "https://evil" },
+        }})
+        .to_string();
+        let map = parse_voice_blob(&json, &decryptor()).unwrap();
+        let ep = map.get("ep-nova").unwrap();
+        assert_eq!(ep.provider_param("region"), Some("us-east-1"));
+        assert_eq!(ep.provider_param("endpoint_override"), None);
+        let parts = ep.credential_parts.as_ref().expect("the AWS pair splits");
+        assert_eq!(
+            parts.get("access_key_id").map(String::as_str),
+            Some("AKIDNOVA")
+        );
     }
 
     #[test]

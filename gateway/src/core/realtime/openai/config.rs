@@ -6,6 +6,8 @@
 //! - Audio format configuration
 //! - Turn detection settings
 
+use std::borrow::Cow;
+
 use serde::{Deserialize, Serialize};
 
 /// OpenAI Realtime API WebSocket endpoint.
@@ -18,71 +20,67 @@ pub const OPENAI_REALTIME_SAMPLE_RATE: u32 = 24000;
 // Models
 // =============================================================================
 
-/// Supported OpenAI Realtime models.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub enum OpenAIRealtimeModel {
-    /// gpt-realtime — the current GA realtime model (default).
-    #[default]
-    #[serde(rename = "gpt-realtime")]
-    GptRealtime,
-    /// gpt-realtime-2 — reasoning-capable realtime model (honors `reasoning.effort`).
-    #[serde(rename = "gpt-realtime-2")]
-    GptRealtime2,
-    /// gpt-realtime-mini — smaller / lower-latency realtime model.
-    #[serde(rename = "gpt-realtime-mini")]
-    GptRealtimeMini,
-    /// GPT-4o Realtime Preview (DEPRECATED — retained for backward compatibility)
-    #[serde(rename = "gpt-4o-realtime-preview")]
-    Gpt4oRealtimePreview,
-    /// GPT-4o Realtime Preview 2024-10-01
-    #[serde(rename = "gpt-4o-realtime-preview-2024-10-01")]
-    Gpt4oRealtimePreview20241001,
-    /// GPT-4o Realtime Preview 2024-12-17
-    #[serde(rename = "gpt-4o-realtime-preview-2024-12-17")]
-    Gpt4oRealtimePreview20241217,
-    /// GPT-4o Mini Realtime Preview
-    #[serde(rename = "gpt-4o-mini-realtime-preview")]
-    Gpt4oMiniRealtimePreview,
-    /// GPT-4o Mini Realtime Preview 2024-12-17
-    #[serde(rename = "gpt-4o-mini-realtime-preview-2024-12-17")]
-    Gpt4oMiniRealtimePreview20241217,
-}
+/// An OpenAI Realtime model id, carried VERBATIM (FRD-023 F-1).
+///
+/// This was a closed enum whose parser mapped every id it did not list to `gpt-realtime` — so
+/// `gpt-realtime-1.5`, `gpt-realtime-2.1` and `gpt-realtime-2.1-mini` silently became a model
+/// that shuts down on 2027-01-20. OpenAI ships realtime models faster than a gateway release,
+/// and the id is the vendor's to define: an unknown one must reach the vendor, which can refuse
+/// it by name. Only an EMPTY id takes the default.
+///
+/// The associated constants keep the names of the enum variants this type replaced.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct OpenAIRealtimeModel(Cow<'static, str>);
 
+#[allow(non_upper_case_globals)]
 impl OpenAIRealtimeModel {
-    /// Convert to the API parameter value.
+    /// gpt-realtime — the GA realtime model (default).
+    pub const GptRealtime: Self = Self(Cow::Borrowed("gpt-realtime"));
+    /// gpt-realtime-2 — reasoning-capable realtime model (honors `reasoning.effort`).
+    pub const GptRealtime2: Self = Self(Cow::Borrowed("gpt-realtime-2"));
+    /// gpt-realtime-mini — smaller / lower-latency realtime model.
+    pub const GptRealtimeMini: Self = Self(Cow::Borrowed("gpt-realtime-mini"));
+    /// GPT-4o Realtime Preview (DEPRECATED — retained for backward compatibility)
+    pub const Gpt4oRealtimePreview: Self = Self(Cow::Borrowed("gpt-4o-realtime-preview"));
+    /// GPT-4o Realtime Preview 2024-10-01
+    pub const Gpt4oRealtimePreview20241001: Self =
+        Self(Cow::Borrowed("gpt-4o-realtime-preview-2024-10-01"));
+    /// GPT-4o Realtime Preview 2024-12-17
+    pub const Gpt4oRealtimePreview20241217: Self =
+        Self(Cow::Borrowed("gpt-4o-realtime-preview-2024-12-17"));
+    /// GPT-4o Mini Realtime Preview
+    pub const Gpt4oMiniRealtimePreview: Self = Self(Cow::Borrowed("gpt-4o-mini-realtime-preview"));
+    /// GPT-4o Mini Realtime Preview 2024-12-17
+    pub const Gpt4oMiniRealtimePreview20241217: Self =
+        Self(Cow::Borrowed("gpt-4o-mini-realtime-preview-2024-12-17"));
+
+    /// The API parameter value — exactly the id the model was built from.
     #[inline]
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::GptRealtime => "gpt-realtime",
-            Self::GptRealtime2 => "gpt-realtime-2",
-            Self::GptRealtimeMini => "gpt-realtime-mini",
-            Self::Gpt4oRealtimePreview => "gpt-4o-realtime-preview",
-            Self::Gpt4oRealtimePreview20241001 => "gpt-4o-realtime-preview-2024-10-01",
-            Self::Gpt4oRealtimePreview20241217 => "gpt-4o-realtime-preview-2024-12-17",
-            Self::Gpt4oMiniRealtimePreview => "gpt-4o-mini-realtime-preview",
-            Self::Gpt4oMiniRealtimePreview20241217 => "gpt-4o-mini-realtime-preview-2024-12-17",
-        }
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 
-    /// Parse from string, with fallback to default.
+    /// The id as given (trimmed); the default only when it is empty. Never a substitution.
     pub fn from_str_or_default(s: &str) -> Self {
-        match s.to_lowercase().as_str() {
-            "gpt-realtime" => Self::GptRealtime,
-            "gpt-realtime-2" => Self::GptRealtime2,
-            "gpt-realtime-mini" => Self::GptRealtimeMini,
-            "gpt-4o-realtime-preview" => Self::Gpt4oRealtimePreview,
-            "gpt-4o-realtime-preview-2024-10-01" => Self::Gpt4oRealtimePreview20241001,
-            "gpt-4o-realtime-preview-2024-12-17" => Self::Gpt4oRealtimePreview20241217,
-            "gpt-4o-mini-realtime-preview" => Self::Gpt4oMiniRealtimePreview,
-            "gpt-4o-mini-realtime-preview-2024-12-17" => Self::Gpt4oMiniRealtimePreview20241217,
-            _ => Self::default(),
+        let id = s.trim();
+        if id.is_empty() {
+            Self::default()
+        } else {
+            Self(Cow::Owned(id.to_string()))
         }
+    }
+}
+
+impl Default for OpenAIRealtimeModel {
+    fn default() -> Self {
+        Self::GptRealtime
     }
 }
 
 impl std::fmt::Display for OpenAIRealtimeModel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.as_str())
+        f.write_str(self.as_str())
     }
 }
 
@@ -304,9 +302,13 @@ mod tests {
             OpenAIRealtimeModel::from_str_or_default("gpt-4o-realtime-preview"),
             OpenAIRealtimeModel::Gpt4oRealtimePreview
         );
-        // Default is now the GA gpt-realtime (the deprecated preview is retired).
+        // F-1: an id the gateway does not list is kept verbatim; only an empty one defaults.
         assert_eq!(
-            OpenAIRealtimeModel::from_str_or_default("unknown"),
+            OpenAIRealtimeModel::from_str_or_default("unknown").as_str(),
+            "unknown"
+        );
+        assert_eq!(
+            OpenAIRealtimeModel::from_str_or_default("  "),
             OpenAIRealtimeModel::GptRealtime
         );
     }

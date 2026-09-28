@@ -260,6 +260,19 @@ mod endpoint_override_tests {
     }
 }
 
+/// One vendor usage report ([`S2sEvent::Usage`]).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct UsageReport {
+    /// Per-modality token counts; cached counts are a SUBSET of their input class.
+    pub tokens: crate::core::realtime_cost::RealtimeUsage,
+    /// Billed seconds, for a vendor that reports duration instead of tokens.
+    pub seconds: Option<f64>,
+    /// `true`: a running total for the response in progress — a later report for the same
+    /// response REPLACES it (Gemini's `usageMetadata`). `false`: a delta — reports ADD (Nova
+    /// Sonic's `usageEvent.details.delta`).
+    pub cumulative: bool,
+}
+
 /// The normalized realtime server event. Every provider's `map_server_event`
 /// lowers raw wire payloads to a `Vec` of these (a Vec because some providers —
 /// e.g. Gemini — bundle several logical frames into one wire message). The
@@ -299,6 +312,23 @@ pub enum S2sEvent {
     InterruptedByServer,
     /// A resumption handle to carry across reconnects (Gemini session-resumption).
     ResumptionHandle(String),
+    /// The vendor's usage report (FRD-023 §5.7, §5.10): per-modality token counts, or billed
+    /// seconds. Gemini `usageMetadata`, Nova Sonic `usageEvent`. Each report is metered exactly
+    /// once by whoever consumes it; the driver itself only forwards it.
+    Usage(UsageReport),
+    /// A conversation item began (the vendor's own item id, where it has one).
+    ItemAdded {
+        item_id: String,
+        role: TranscriptRole,
+    },
+    /// A conversation item is complete.
+    ItemDone { item_id: String },
+    /// The vendor will close this connection soon (Gemini `goAway`). The driver reconnects at
+    /// the next turn boundary — or when `time_left` runs out — carrying the resumption handle,
+    /// with no backoff and without counting it as a failure.
+    GoAway {
+        time_left: Option<std::time::Duration>,
+    },
     /// An outbound frame the driver must send in response to an inbound event
     /// (e.g. ElevenLabs ConvAI ping→pong); the dispatcher routes it to the
     /// transport instead of a callback.

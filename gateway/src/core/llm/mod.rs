@@ -518,6 +518,53 @@ pub struct LlmClientConfig {
     /// applies the floor in `ConversationConfig::to_client_config`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Whether a missing key may fall back to the process environment. Never (de)serialised: a
+    /// client-supplied config must not be able to turn it on. Bud mode forces it off regardless
+    /// (FRD-023 RT0).
+    #[serde(skip, default = "default_allow_env_fallback")]
+    pub allow_env_fallback: bool,
+}
+
+/// The key-resolution rule, over an injected environment lookup so it can be tested without
+/// touching the process environment. `env_allowed == false` means the lookup is never called.
+pub(crate) fn resolve_llm_api_key(
+    per_call: Option<&str>,
+    config_key: Option<&str>,
+    env_allowed: bool,
+    default_env_key: &str,
+    env: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    if let Some(key) = per_call {
+        return Some(key.to_string());
+    }
+    if let Some(key) = config_key {
+        if key.starts_with("${") && key.ends_with('}') {
+            if !env_allowed {
+                warn!(
+                    "Refused a ${{VAR}} API-key reference: vendor keys never come from the environment in Bud mode"
+                );
+                return None;
+            }
+            let var_name = &key[2..key.len() - 1];
+            if !ALLOWED_ENV_VARS.contains(&var_name) {
+                warn!(
+                    var_name = %var_name,
+                    "Blocked access to non-whitelisted environment variable"
+                );
+                return None;
+            }
+            return env(var_name);
+        }
+        return Some(key.to_string());
+    }
+    if !env_allowed {
+        return None;
+    }
+    env(default_env_key)
+}
+
+fn default_allow_env_fallback() -> bool {
+    true
 }
 
 impl Default for LlmClientConfig {
@@ -550,6 +597,7 @@ impl Default for LlmClientConfig {
             extra: HashMap::new(),
             provider_kind: None,
             reasoning_effort: None,
+            allow_env_fallback: true,
         }
     }
 }
@@ -836,27 +884,20 @@ impl LlmClient {
     /// Priority: per-call key > config key (literal or `${ENV_VAR}`) > the
     /// active vendor's default env var (`OPENAI_API_KEY` /
     /// `ANTHROPIC_API_KEY` / `GOOGLE_AI_API_KEY`).
+    ///
+    /// FRD-023 RT0 (X-1): in Bud mode the process environment is NEVER read — neither a
+    /// `${VAR}` reference nor the default env var. A client-chosen `base_url` with the key
+    /// omitted used to send the platform's `OPENAI_API_KEY` to that host.
     pub fn resolve_api_key(&self, per_call: Option<&str>) -> Option<String> {
-        if let Some(key) = per_call {
-            return Some(key.to_string());
-        }
-
-        if let Some(key) = &self.config.api_key {
-            if key.starts_with("${") && key.ends_with('}') {
-                let var_name = &key[2..key.len() - 1];
-                if !ALLOWED_ENV_VARS.contains(&var_name) {
-                    warn!(
-                        var_name = %var_name,
-                        "Blocked access to non-whitelisted environment variable"
-                    );
-                    return None;
-                }
-                return std::env::var(var_name).ok();
-            }
-            return Some(key.clone());
-        }
-
-        std::env::var(self.adapter.default_env_key()).ok()
+        let env_allowed =
+            self.config.allow_env_fallback && !crate::auth::bud_mode::process_in_bud_mode();
+        resolve_llm_api_key(
+            per_call,
+            self.config.api_key.as_deref(),
+            env_allowed,
+            self.adapter.default_env_key(),
+            |name| std::env::var(name).ok(),
+        )
     }
 
     /// Render a vendor request via the adapter and apply the operator's extra
@@ -1889,5 +1930,95 @@ mod tests {
     fn test_utf8_boundary_empty() {
         let bytes: &[u8] = &[];
         assert_eq!(find_utf8_boundary(bytes), 0);
+    }
+}
+
+#[cfg(test)]
+mod frd023_key_tests {
+    //! TC-SEC-02: in Bud mode no path that builds an `LlmClient` reads a key from the environment.
+    use super::resolve_llm_api_key;
+    use std::cell::RefCell;
+
+    fn canary(reads: &RefCell<Vec<String>>) -> impl Fn(&str) -> Option<String> + '_ {
+        move |name| {
+            reads.borrow_mut().push(name.to_string());
+            Some("sk-canary".to_string())
+        }
+    }
+
+    #[test]
+    fn tc_sec_02_no_env_fallback_when_env_is_not_allowed() {
+        let reads = RefCell::new(Vec::new());
+        assert_eq!(
+            resolve_llm_api_key(None, None, false, "OPENAI_API_KEY", canary(&reads)),
+            None
+        );
+        assert_eq!(
+            resolve_llm_api_key(
+                None,
+                Some("${OPENAI_API_KEY}"),
+                false,
+                "OPENAI_API_KEY",
+                canary(&reads)
+            ),
+            None
+        );
+        assert!(
+            reads.borrow().is_empty(),
+            "the environment was read: {:?}",
+            reads.borrow()
+        );
+    }
+
+    #[test]
+    fn tc_sec_02_an_explicit_key_still_wins() {
+        let reads = RefCell::new(Vec::new());
+        assert_eq!(
+            resolve_llm_api_key(
+                Some("bud_caller"),
+                None,
+                false,
+                "OPENAI_API_KEY",
+                canary(&reads)
+            )
+            .as_deref(),
+            Some("bud_caller")
+        );
+        assert_eq!(
+            resolve_llm_api_key(
+                None,
+                Some("literal"),
+                false,
+                "OPENAI_API_KEY",
+                canary(&reads)
+            )
+            .as_deref(),
+            Some("literal")
+        );
+        assert!(reads.borrow().is_empty());
+    }
+
+    #[test]
+    fn standalone_mode_keeps_its_env_fallback() {
+        let reads = RefCell::new(Vec::new());
+        assert_eq!(
+            resolve_llm_api_key(None, None, true, "OPENAI_API_KEY", canary(&reads)).as_deref(),
+            Some("sk-canary")
+        );
+        assert_eq!(reads.borrow().as_slice(), ["OPENAI_API_KEY".to_string()]);
+    }
+
+    #[test]
+    fn allow_env_fallback_cannot_be_set_from_a_client_config() {
+        let cfg: super::LlmClientConfig = serde_json::from_value(serde_json::json!({
+            "base_url": "https://api.openai.com/v1", "model": "m", "allow_env_fallback": false
+        }))
+        .unwrap();
+        assert!(
+            cfg.allow_env_fallback,
+            "the field is not client-settable in either direction"
+        );
+        let out = serde_json::to_value(&cfg).unwrap();
+        assert!(out.get("allow_env_fallback").is_none());
     }
 }

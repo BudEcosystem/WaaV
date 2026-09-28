@@ -204,6 +204,9 @@ impl From<LlmEndpointConfig> for LlmClientConfig {
             extra: c.extra,
             provider_kind: c.provider_kind,
             reasoning_effort: c.reasoning_effort,
+            // Env fallback stays the client default; Bud mode refuses it process-wide
+            // (`resolve_api_key`, FRD-023 RT0).
+            allow_env_fallback: true,
         }
     }
 }
@@ -235,6 +238,9 @@ pub struct LlmEndpointNode {
     id: String,
     streaming: bool,
     client: LlmClient,
+    /// FRD-023 WP-RT6.3: a node bound to a Bud chat deployment sends the CALLER's credential,
+    /// read per call, instead of `ctx.api_key`.
+    session_credential: Option<crate::auth::SessionCredential>,
 }
 
 impl std::fmt::Debug for LlmEndpointNode {
@@ -258,6 +264,28 @@ impl LlmEndpointNode {
             id: id.into(),
             streaming,
             client,
+            session_credential: None,
+        }
+    }
+
+    /// A node the server pointed at the Bud gateway (FRD-023 WP-RT6.3): its `base_url` is the
+    /// operator's in-cluster address (so not SSRF-checked, as a client's would be) and every call
+    /// carries the session's credential.
+    pub fn for_bud_gateway(
+        id: impl Into<String>,
+        config: LlmEndpointConfig,
+        credential: crate::auth::SessionCredential,
+    ) -> Self {
+        let mut node = Self::new(id, config);
+        node.session_credential = Some(credential);
+        node
+    }
+
+    /// The key for this call.
+    fn call_key(&self, ctx: &DAGContext) -> Option<String> {
+        match &self.session_credential {
+            Some(credential) => Some(credential.current()),
+            None => ctx.api_key.clone(),
         }
     }
 
@@ -359,12 +387,13 @@ impl DAGNode for LlmEndpointNode {
 
         // Per-connection API key from the DAG context takes priority (matches the
         // old node behavior); otherwise the client falls back to config/env.
+        let key = self.call_key(ctx);
         let response = self
             .client
             .complete(
                 &ctx.stream_id,
                 &input_text,
-                ctx.api_key.as_deref(),
+                key.as_deref(),
                 &ctx.cancel_token,
                 None,
             )
@@ -435,10 +464,11 @@ impl DAGNode for LlmEndpointNode {
             // Drop reasoning chain-of-thought before it streams downstream.
             let mut think = crate::core::text::ThinkStripper::default();
             let mut emitted_any = false;
+            let key = self.call_key(ctx);
             let completion = self.client.complete(
                 &ctx.stream_id,
                 &input_text,
-                ctx.api_key.as_deref(),
+                key.as_deref(),
                 &ctx.cancel_token,
                 Some(on_token),
             );

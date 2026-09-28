@@ -1,0 +1,62 @@
+{
+  "ep-rt-contract": {
+    "vendor": "openai",
+    "endpoints": [
+      "realtime_session"
+    ],
+    "model": "gpt-realtime-2.1",
+    "config": {
+      "realtime": {
+        "session_type": "realtime",
+        "defaults": {
+          "voice": "marin",
+          "instructions": "You are a helpful assistant.",
+          "output_modalities": [
+            "audio"
+          ],
+          "turn_detection": {
+            "type": "semantic_vad",
+            "eagerness": "auto"
+          },
+          "input_transcription": {
+            "model": "gpt-4o-mini-transcribe",
+            "language": "en"
+          },
+          "noise_reduction": "near_field",
+          "max_output_tokens": 4096,
+          "speed": 1.0
+        },
+        "limits": {
+          "max_session_seconds": 3600,
+          "idle_timeout_seconds": 300
+        },
+        "policy": {
+          "allow_client_instructions": true,
+          "allow_mcp_tools": false,
+          "allow_prompt_references": false,
+          "allow_image_input": true,
+          "input_transcription_models": [
+            "gpt-4o-mini-transcribe"
+          ]
+        }
+      }
+    },
+    "pricing": {
+      "unit": "token",
+      "per_units": 1000000,
+      "currency": "USD",
+      "rates": {
+        "input_text": 4.0,
+        "input_audio": 32.0,
+        "input_image": 5.0,
+        "cached_input_text": 0.4,
+        "cached_input_audio": 0.4,
+        "cached_input_image": 0.5,
+        "output_text": 24.0,
+        "output_audio": 64.0,
+        "transcription_per_minute": 0.003
+      }
+    },
+    "max_concurrent": 20
+  }
+}

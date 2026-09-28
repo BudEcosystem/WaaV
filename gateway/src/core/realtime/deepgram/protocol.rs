@@ -145,6 +145,11 @@ impl RealtimeProtocol for DeepgramProtocol {
         "deepgram"
     }
 
+    fn input_sample_rate(&self) -> u32 {
+        // One rate both ways (the `Settings` audio block).
+        self.output_sample_rate
+    }
+
     fn caps(&self) -> ProtocolCaps {
         ProtocolCaps {
             // Deepgram runs server-side VAD + turn-taking, so it owns turns and

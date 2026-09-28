@@ -25,8 +25,12 @@ pub mod middleware;
 pub mod observability;
 pub mod plugin;
 pub mod routes;
+pub mod server;
 pub mod state;
 pub mod utils;
+
+#[cfg(test)]
+pub(crate) mod test_support;
 
 // Re-export commonly used items for convenience
 pub use config::ServerConfig;

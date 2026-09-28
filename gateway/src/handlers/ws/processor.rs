@@ -226,12 +226,31 @@ async fn handle_auth_message(
         app_state.config.has_jwt_auth(),
     );
 
+    if path == WsAuthPath::Bud && !state.read().await.auth.is_pending() {
+        return refresh_bud_credential(token, state, message_tx, app_state).await;
+    }
+
     let resolved: Option<String> = match path {
         WsAuthPath::Bud => {
             // Unwrap is safe: `ws_auth_path` returns Bud only when bud_mode is Some.
             let bud = app_state.bud_mode.as_ref().expect("bud mode present");
             match bud.authenticate(&token).await {
-                Ok(auth) => auth.id,
+                Ok(auth) => {
+                    // FRD-023 RT6: the session acts as this caller from here on.
+                    let bearer = crate::handlers::openai_realtime::handshake::Credential::new(
+                        token.clone(),
+                        crate::handlers::openai_realtime::handshake::CredentialSource::Bearer,
+                    );
+                    let check =
+                        crate::handlers::openai_realtime::session::authenticate(app_state, &bearer)
+                            .await
+                            .ok()
+                            .map(|caller| caller.check);
+                    let mut guard = state.write().await;
+                    guard.credential = Some(crate::auth::SessionCredential::new(token.clone()));
+                    guard.caller_check = check;
+                    auth.id
+                }
                 Err(e) => {
                     warn!(error = ?e, "first-message bud authentication failed");
                     None
@@ -300,6 +319,65 @@ async fn handle_auth_message(
         send_critical(message_tx, MessageRoute::Close).await;
         false
     }
+}
+
+/// An `auth` message on an authenticated Bud-mode session: a credential REFRESH (FRD-023 WP-RT6.2,
+/// TC-WS-08). A Keycloak token lives minutes and a call longer, so a JWT caller keeps its voice
+/// agent's LLM leg alive by sending a fresh token; the leg reads it on its next call.
+///
+/// The new credential must identify the SAME principal — the session's legs are admitted, billed
+/// and authorized against it. A refresh that fails leaves the session and its current credential
+/// as they were: the credential failing is what `auth_expired` reports, and revalidation is what
+/// ends a session whose caller lost access.
+async fn refresh_bud_credential(
+    token: String,
+    state: &Arc<RwLock<ConnectionState>>,
+    message_tx: &mpsc::Sender<MessageRoute>,
+    app_state: &Arc<AppState>,
+) -> bool {
+    let bearer = crate::handlers::openai_realtime::handshake::Credential::new(
+        token.clone(),
+        crate::handlers::openai_realtime::handshake::CredentialSource::Bearer,
+    );
+    let caller =
+        match crate::handlers::openai_realtime::session::authenticate(app_state, &bearer).await {
+            Ok(caller) => caller,
+            Err(e) => {
+                warn!(code = e.code, "Bud-mode /ws credential refresh refused");
+                send_error(
+                    message_tx,
+                    format!(
+                        "auth_refresh_failed: {}. The session keeps its current credential.",
+                        e.message
+                    ),
+                )
+                .await;
+                return true;
+            }
+        };
+    let guard = state.read().await;
+    let same = guard.caller_check.as_ref() == Some(&caller.check);
+    let Some(credential) = guard.credential.clone().filter(|_| same) else {
+        drop(guard);
+        warn!("Bud-mode /ws credential refresh carried a different identity; refused");
+        send_error(
+            message_tx,
+            "auth_refresh_refused: a refresh must renew this session's own credential (the same \
+             API key or the same user); open a new connection to act as someone else.",
+        )
+        .await;
+        return true;
+    };
+    credential.replace(token);
+    let id = guard.auth.id.clone();
+    drop(guard);
+    info!("Bud-mode /ws credential refreshed");
+    send_critical(
+        message_tx,
+        MessageRoute::Outgoing(OutgoingMessage::Authenticated { id }),
+    )
+    .await;
+    true
 }
 
 /// Handle custom plugin message
@@ -416,7 +494,7 @@ async fn handle_custom_message(
 
 #[cfg(test)]
 mod ws_auth_path_tests {
-    use super::{WsAuthPath, ws_auth_path};
+    use super::*;
 
     #[test]
     fn bud_mode_is_consulted_whenever_it_is_configured() {
@@ -463,5 +541,125 @@ mod ws_auth_path_tests {
         // Fail CLOSED. An unconfigured gateway must not treat "nothing to check against" as
         // "everything passes".
         assert_eq!(ws_auth_path(false, false, false), WsAuthPath::Unconfigured);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // FRD-023 WP-RT6.2: `auth` on an authenticated Bud-mode session is a credential refresh.
+    // -----------------------------------------------------------------------------------------
+
+    const KEY: &str = "bud_ws_refresh_key";
+    const OTHER_KEY: &str = "bud_ws_refresh_other_key";
+
+    async fn refresh_plane() -> Arc<AppState> {
+        let blob = |project: &str| {
+            serde_json::json!({"__metadata__": {"api_key_id": "k", "user_id": "u",
+                "api_key_project_id": project}})
+            .to_string()
+        };
+        let a = (
+            format!("api_key:{}", bud_auth::hash_api_key(KEY)),
+            blob("p1"),
+        );
+        let b = (
+            format!("api_key:{}", bud_auth::hash_api_key(OTHER_KEY)),
+            blob("p2"),
+        );
+        crate::test_support::bud_state_with_credentials(&[
+            (a.0.as_str(), a.1.as_str()),
+            (b.0.as_str(), b.1.as_str()),
+        ])
+        .await
+        .0
+    }
+
+    /// A session authenticated as KEY, as the upgrade leaves it.
+    async fn authenticated(app_state: &Arc<AppState>) -> Arc<RwLock<ConnectionState>> {
+        let state = Arc::new(RwLock::new(ConnectionState::with_auth(Auth::new("p1"))));
+        let bearer = crate::handlers::openai_realtime::handshake::Credential::new(
+            KEY,
+            crate::handlers::openai_realtime::handshake::CredentialSource::Bearer,
+        );
+        let check = crate::handlers::openai_realtime::session::authenticate(app_state, &bearer)
+            .await
+            .unwrap()
+            .check;
+        let mut guard = state.write().await;
+        guard.credential = Some(crate::auth::SessionCredential::new(KEY));
+        guard.caller_check = Some(check);
+        drop(guard);
+        state
+    }
+
+    fn first_error(rx: &mut mpsc::Receiver<MessageRoute>) -> Option<String> {
+        while let Ok(route) = rx.try_recv() {
+            if let MessageRoute::Outgoing(OutgoingMessage::Error { message }) = route {
+                return Some(message);
+            }
+        }
+        None
+    }
+
+    /// TC-WS-08 🔒 — a refresh with the same identity replaces the session's credential.
+    #[tokio::test]
+    async fn tc_ws_08_a_refresh_renews_the_credential() {
+        let app_state = refresh_plane().await;
+        let state = authenticated(&app_state).await;
+        let credential = state.read().await.credential.clone().unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+
+        // The same key, re-sent (a JWT caller sends a fresh token for the same subject).
+        assert!(handle_auth_message(KEY.to_string(), &state, &tx, &app_state).await);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(MessageRoute::Outgoing(
+                OutgoingMessage::Authenticated { .. }
+            ))
+        ));
+        assert_eq!(credential.current(), KEY);
+    }
+
+    /// TC-WS-08 🔒 — a refresh can never change who the session is.
+    #[tokio::test]
+    async fn tc_ws_08_a_refresh_to_another_identity_is_refused() {
+        let app_state = refresh_plane().await;
+        let state = authenticated(&app_state).await;
+        let credential = state.read().await.credential.clone().unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+
+        let keep = handle_auth_message(OTHER_KEY.to_string(), &state, &tx, &app_state).await;
+        assert!(keep, "the session continues on its own credential");
+        let error = first_error(&mut rx).expect("an error frame");
+        assert!(error.starts_with("auth_refresh_refused"), "{error}");
+        assert_eq!(credential.current(), KEY, "unchanged");
+    }
+
+    /// A refresh that fails leaves the session and its credential as they were.
+    #[tokio::test]
+    async fn a_failed_refresh_keeps_the_session() {
+        let app_state = refresh_plane().await;
+        let state = authenticated(&app_state).await;
+        let credential = state.read().await.credential.clone().unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+
+        let keep = handle_auth_message("bud_nope".to_string(), &state, &tx, &app_state).await;
+        assert!(keep);
+        let error = first_error(&mut rx).expect("an error frame");
+        assert!(error.starts_with("auth_refresh_failed"), "{error}");
+        assert_eq!(credential.current(), KEY);
+    }
+
+    /// First-message auth in Bud mode keeps the credential and fixes the identity.
+    #[tokio::test]
+    async fn first_message_auth_keeps_the_credential_for_the_session() {
+        let app_state = refresh_plane().await;
+        let state = Arc::new(RwLock::new(ConnectionState::with_auth(Auth::pending())));
+        let (tx, _rx) = mpsc::channel(8);
+        assert!(handle_auth_message(KEY.to_string(), &state, &tx, &app_state).await);
+        let guard = state.read().await;
+        assert_eq!(
+            guard.credential.as_ref().map(|c| c.current()).as_deref(),
+            Some(KEY)
+        );
+        assert!(guard.caller_check.is_some());
     }
 }

@@ -27,9 +27,12 @@ pub mod store;
 pub mod types;
 
 pub use authz::{AuthzTier, Resolution};
-pub use credentials::{CredentialDecryptor, CredentialError, VoiceEndpoint, VoicePricing};
+pub use credentials::{
+    CredentialDecryptor, CredentialError, REALTIME_RATE_KEYS, VoiceEndpoint, VoicePricing,
+};
 pub use endpoint_config::{
-    Pronunciation, SttSettings, TranslationSettings, TtsSettings, VoiceDescriptor,
+    Pronunciation, RealtimeDefaults, RealtimeLimits, RealtimePolicy, RealtimeSettings,
+    RealtimeTranscription, SttSettings, TranslationSettings, TtsSettings, VoiceDescriptor,
     VoiceEndpointSettings,
 };
 pub use guards::{Denied, EscalationPermit, KeyShape, MissGuardConfig, MissGuards};

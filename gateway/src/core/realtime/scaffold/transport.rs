@@ -552,18 +552,41 @@ fn unwrap_output_payload(event: &BidiOutputEvent) -> Option<String> {
 /// drained by [`recv`](RealtimeTransport::recv). Dropping the transport drops
 /// `input_tx` → the input stream ends → the HTTP/2 request finalizes (the same
 /// channel-close finalize `AwsTranscribeTransport` relies on).
+type BedrockOutput = aws_sdk_bedrockruntime::primitives::event_stream::EventReceiver<
+    BidiOutputEvent,
+    aws_sdk_bedrockruntime::types::error::InvokeModelWithBidirectionalStreamOutputError,
+>;
+
+/// The output half of a Bedrock stream: still opening, or open.
+///
+/// The SDK's `send()` for `InvokeModelWithBidirectionalStream` does not return at the response
+/// headers — it waits for the stream's FIRST output event (`try_recv_initial_response`). Nova
+/// Sonic sends nothing until it has input, and the input (the session configuration, then the
+/// caller's audio) is written only after the transport exists. Awaiting `send()` inside
+/// `connect` therefore deadlocks until the dial timeout (found by the in-process Bedrock mock,
+/// FRD-023 TC-XL-05). The open runs in its own task instead: `connect` returns at once, the
+/// input channel buffers what the driver writes, and the first `recv` waits for the open.
+enum BedrockOutputState {
+    Opening(tokio::task::JoinHandle<RealtimeResult<BedrockOutput>>),
+    Open(Box<BedrockOutput>),
+    Closed,
+}
+
 pub struct BedrockBidiTransport {
     /// Outbound input events → the SDK's input event-stream sender (via the
     /// channel-fed `async_stream` installed at connect). Cloned `send()` surface.
     input_tx: mpsc::Sender<BidiInputEvent>,
     /// This connection's OWN output event receiver (owned outright, dropped with
-    /// the transport) — the bidi stream's server→client half. (`event_receiver`
-    /// is a private module; the public re-export is via `primitives::event_stream`,
-    /// exactly as `AwsTranscribeTransport` references its result stream.)
-    output_rx: aws_sdk_bedrockruntime::primitives::event_stream::EventReceiver<
-        BidiOutputEvent,
-        aws_sdk_bedrockruntime::types::error::InvokeModelWithBidirectionalStreamOutputError,
-    >,
+    /// the transport) — the bidi stream's server→client half — once the open completes.
+    output: BedrockOutputState,
+}
+
+impl Drop for BedrockBidiTransport {
+    fn drop(&mut self) {
+        if let BedrockOutputState::Opening(handle) = &self.output {
+            handle.abort();
+        }
+    }
 }
 
 #[async_trait]
@@ -595,7 +618,29 @@ impl RealtimeTransport for BedrockBidiTransport {
         // decoded JSON event as a Text frame, map a stream error to Some(Err),
         // and a clean end (`Ok(None)`) to None (no reconnect).
         loop {
-            match self.output_rx.recv().await {
+            let output = match &mut self.output {
+                BedrockOutputState::Open(output) => output,
+                BedrockOutputState::Closed => return None,
+                BedrockOutputState::Opening(handle) => {
+                    let opened = match handle.await {
+                        Ok(result) => result,
+                        Err(e) => Err(RealtimeError::ConnectionFailed(format!(
+                            "Bedrock stream open task failed: {e}"
+                        ))),
+                    };
+                    match opened {
+                        Ok(output) => {
+                            self.output = BedrockOutputState::Open(Box::new(output));
+                            continue;
+                        }
+                        Err(e) => {
+                            self.output = BedrockOutputState::Closed;
+                            return Some(Err(e));
+                        }
+                    }
+                }
+            };
+            match output.recv().await {
                 Ok(Some(event)) => {
                     if let Some(json) = unwrap_output_payload(&event) {
                         return Some(Ok(OutFrame::Text(json)));
@@ -622,6 +667,65 @@ impl RealtimeTransport for BedrockBidiTransport {
     }
 }
 
+/// May this dial proceed? In Bud mode a Bedrock stream is signed with the DEPLOYMENT's static
+/// keys or not at all — the gateway's own AWS identity (env, shared config, instance role) is
+/// never lent to a tenant session (FRD-023 D-5, RT0). Pure, so the rule is testable without
+/// flipping the process-wide Bud-mode flag.
+pub(crate) fn bedrock_dial_allowed(
+    credentials: Option<&crate::core::realtime::base::AwsStaticCredentials>,
+    in_bud_mode: bool,
+) -> RealtimeResult<()> {
+    if credentials.is_none() && in_bud_mode {
+        return Err(RealtimeError::AuthenticationFailed(
+            "a Bud deployment's Nova Sonic session is signed with the deployment's own AWS keys; \
+             the gateway's AWS identity is never used"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// The Bedrock client for a dial. With static credentials the config is built from them and
+/// the spec ALONE — no environment, no shared config, no instance metadata: in Bud mode not even
+/// an `AWS_ENDPOINT_URL` may redirect a request signed with a tenant's keys. Without, the
+/// `aws-config` default chain (the native path, as before).
+async fn bedrock_client(
+    factory: &BedrockBidiTransportFactory,
+    region: Option<String>,
+) -> BedrockClient {
+    match &factory.credentials {
+        Some(c) => {
+            let mut b = aws_sdk_bedrockruntime::Config::builder()
+                .behavior_version(BehaviorVersion::latest())
+                .credentials_provider(aws_credential_types::Credentials::new(
+                    c.access_key_id.clone(),
+                    c.secret_access_key.clone(),
+                    c.session_token.clone(),
+                    None,
+                    "bud-voice-table",
+                ))
+                .region(region.map(aws_config::Region::new));
+            if let Some(url) = &factory.endpoint_url {
+                b = b.endpoint_url(url.clone());
+            }
+            if let Some(h) = &factory.http_client {
+                b = b.http_client(h.clone());
+            }
+            BedrockClient::from_conf(b.build())
+        }
+        None => {
+            let mut loader = aws_config::defaults(BehaviorVersion::latest());
+            if let Some(r) = region {
+                loader = loader.region(aws_config::Region::new(r));
+            }
+            if let Some(h) = &factory.http_client {
+                loader = loader.http_client(h.clone());
+            }
+            BedrockClient::new(&loader.load().await)
+        }
+    }
+}
+
 /// Factory for the AWS NOVA SONIC pattern: opens an Amazon Bedrock
 /// `InvokeModelWithBidirectionalStream` HTTP/2 bidi event stream and returns a
 /// [`BedrockBidiTransport`] over it.
@@ -636,8 +740,56 @@ impl RealtimeTransport for BedrockBidiTransport {
 /// chain (region from the spec, else the environment), install a channel-fed
 /// `async_stream` as the input half, `send()` the request, and hand back the
 /// output [`EventReceiver`](aws_sdk_bedrockruntime::primitives::event_stream::EventReceiver)
-/// half. Credentials are AWS SigV4 via the default chain — NO api-key.
-pub struct BedrockBidiTransportFactory;
+/// half. Credentials are AWS SigV4 — via the default chain, or (a Bud deployment, FRD-023
+/// RT7.2) the deployment's static key pair ([`Self::with_credentials`]). NO api-key.
+#[derive(Clone, Default)]
+pub struct BedrockBidiTransportFactory {
+    credentials: Option<crate::core::realtime::base::AwsStaticCredentials>,
+    endpoint_url: Option<String>,
+    http_client: Option<aws_smithy_runtime_api::client::http::SharedHttpClient>,
+}
+
+impl std::fmt::Debug for BedrockBidiTransportFactory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BedrockBidiTransportFactory")
+            .field("static_credentials", &self.credentials.is_some())
+            .field("endpoint_url", &self.endpoint_url)
+            .finish()
+    }
+}
+
+impl BedrockBidiTransportFactory {
+    /// The `aws-config` default credential chain (the native path).
+    pub fn default_chain() -> Self {
+        Self::default()
+    }
+
+    /// Sign with this key pair and nothing else.
+    pub fn with_credentials(
+        credentials: crate::core::realtime::base::AwsStaticCredentials,
+    ) -> Self {
+        Self {
+            credentials: Some(credentials),
+            ..Self::default()
+        }
+    }
+
+    /// A Bedrock endpoint other than the region's (already SSRF-validated by the caller).
+    pub fn endpoint_url(mut self, url: Option<String>) -> Self {
+        self.endpoint_url = url;
+        self
+    }
+
+    /// The HTTP client the SDK dials with. `None`: the SDK's own. Tests pass an in-process
+    /// connector that speaks the Bedrock event stream.
+    pub fn http_client(
+        mut self,
+        client: Option<aws_smithy_runtime_api::client::http::SharedHttpClient>,
+    ) -> Self {
+        self.http_client = client;
+        self
+    }
+}
 
 #[async_trait]
 impl RealtimeTransportFactory for BedrockBidiTransportFactory {
@@ -647,58 +799,53 @@ impl RealtimeTransportFactory for BedrockBidiTransportFactory {
                 "BedrockBidiTransportFactory only supports ConnectSpec::BedrockBidi".to_string(),
             ));
         };
+        bedrock_dial_allowed(
+            self.credentials.as_ref(),
+            crate::auth::bud_mode::process_in_bud_mode(),
+        )?;
 
-        // Bound the WHOLE dial (config load + stream open) so a misconfigured
-        // deployment fails fast with a clear error instead of stalling the client
-        // across slow IMDS-timeout backoff retries (see BEDROCK_CONNECT_TIMEOUT).
-        tokio::time::timeout(BEDROCK_CONNECT_TIMEOUT, async move {
-            // Build the AWS config + Bedrock client from the DEFAULT credential chain
-            // (env / shared config / IAM role), exactly like AwsTranscribeTransport.
-            // Region: the spec's, else resolved by the loader from the environment.
-            let mut loader = aws_config::defaults(BehaviorVersion::latest());
-            if let Some(r) = region {
-                loader = loader.region(aws_config::Region::new(r));
+        // Bound the client build (a default-chain config load can stall on IMDS) so a
+        // misconfigured deployment fails fast instead of stalling the client.
+        let client = tokio::time::timeout(BEDROCK_CONNECT_TIMEOUT, bedrock_client(self, region))
+            .await
+            .map_err(|_| {
+                RealtimeError::ConnectionFailed(
+                    "Bedrock connect timed out (check AWS credentials/region)".to_string(),
+                )
+            })?;
+
+        // The input half: a bounded channel whose receiver drives an async stream
+        // of union events; the sender is the transport's `send()` surface. (Same
+        // channel-fed `async_stream` Transcribe attaches as its audio input — here
+        // it is the outbound-frame path.)
+        let (input_tx, mut input_rx) = mpsc::channel::<BidiInputEvent>(BEDROCK_INPUT_CHANNEL_DEPTH);
+        let input_stream = async_stream::stream! {
+            while let Some(event) = input_rx.recv().await {
+                yield Ok::<BidiInputEvent, BidiInputError>(event);
             }
-            let aws_config = loader.load().await;
-            let client = BedrockClient::new(&aws_config);
+        };
 
-            // The input half: a bounded channel whose receiver drives an async stream
-            // of union events; the sender is the transport's `send()` surface. (Same
-            // channel-fed `async_stream` Transcribe attaches as its audio input — here
-            // it is the outbound-frame path.)
-            let (input_tx, mut input_rx) =
-                mpsc::channel::<BidiInputEvent>(BEDROCK_INPUT_CHANNEL_DEPTH);
-            let input_stream = async_stream::stream! {
-                while let Some(event) = input_rx.recv().await {
-                    yield Ok::<BidiInputEvent, BidiInputError>(event);
-                }
-            };
-
-            // Open the bidi stream. `.body(stream.into())` + `.send()` mirrors
-            // Transcribe's `.audio_stream(stream.into()).send_with(&client)`.
-            let output = client
+        // Open the bidi stream in its own task (see `BedrockOutputState`): the SDK returns
+        // from `send()` only at the first output event, which Nova sends only after input.
+        let open = tokio::spawn(async move {
+            client
                 .invoke_model_with_bidirectional_stream()
                 .model_id(model_id)
                 .body(input_stream.into())
                 .send()
                 .await
+                .map(|output| output.body)
                 .map_err(|e| {
                     RealtimeError::ConnectionFailed(format!(
                         "failed to open Bedrock bidirectional stream: {e}"
                     ))
-                })?;
+                })
+        });
 
-            Ok(Box::new(BedrockBidiTransport {
-                input_tx,
-                output_rx: output.body,
-            }) as Box<dyn RealtimeTransport>)
-        })
-        .await
-        .map_err(|_| {
-            RealtimeError::ConnectionFailed(
-                "Bedrock connect timed out (check AWS credentials/region)".to_string(),
-            )
-        })?
+        Ok(Box::new(BedrockBidiTransport {
+            input_tx,
+            output: BedrockOutputState::Opening(open),
+        }) as Box<dyn RealtimeTransport>)
     }
 }
 
@@ -710,6 +857,108 @@ impl RealtimeTransportFactory for BedrockBidiTransportFactory {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn aws_keys() -> crate::core::realtime::base::AwsStaticCredentials {
+        crate::core::realtime::base::AwsStaticCredentials {
+            access_key_id: "AKIDBUDDEPLOYMENT1".into(),
+            secret_access_key: "deployment-secret".into(),
+            session_token: None,
+        }
+    }
+
+    /// FRD-023 RT7.2 🔒 — in Bud mode a Bedrock dial without the deployment's keys is refused;
+    /// the default chain (the gateway's own AWS identity) is for the native path only.
+    #[test]
+    fn rt7_2_bud_mode_never_dials_bedrock_with_the_gateway_identity() {
+        assert!(matches!(
+            bedrock_dial_allowed(None, true),
+            Err(RealtimeError::AuthenticationFailed(_))
+        ));
+        assert!(bedrock_dial_allowed(Some(&aws_keys()), true).is_ok());
+        assert!(bedrock_dial_allowed(None, false).is_ok());
+    }
+
+    /// The key pair never reaches a log line through `Debug`.
+    #[test]
+    fn aws_static_credentials_debug_is_redacted() {
+        let printed = format!("{:?}", aws_keys());
+        assert!(!printed.contains("AKIDBUDDEPLOYMENT1"), "{printed}");
+        assert!(!printed.contains("deployment-secret"), "{printed}");
+        let printed = format!(
+            "{:?}",
+            BedrockBidiTransportFactory::with_credentials(aws_keys())
+        );
+        assert!(!printed.contains("deployment-secret"), "{printed}");
+    }
+
+    /// FRD-023 RT7.2 🔒 — a factory holding a deployment's keys SIGNS WITH THEM (SigV4, the
+    /// `bedrock` service, the deployment's region), whatever the process environment holds.
+    #[tokio::test]
+    async fn rt7_2_static_credentials_sign_the_bedrock_request() {
+        use aws_smithy_runtime_api::client::http::{
+            HttpClient, HttpConnector, HttpConnectorFuture, HttpConnectorSettings,
+            SharedHttpClient, SharedHttpConnector,
+        };
+        use aws_smithy_runtime_api::client::orchestrator::HttpRequest;
+        use aws_smithy_runtime_api::client::runtime_components::RuntimeComponents;
+        use aws_smithy_runtime_api::http::{Response, StatusCode};
+        use aws_smithy_types::body::SdkBody;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Debug, Clone, Default)]
+        struct Capture(Arc<Mutex<Vec<(String, String)>>>);
+        impl HttpConnector for Capture {
+            fn call(&self, req: HttpRequest) -> HttpConnectorFuture {
+                let auth = req
+                    .headers()
+                    .get("authorization")
+                    .unwrap_or_default()
+                    .to_string();
+                self.0.lock().unwrap().push((req.uri().to_string(), auth));
+                HttpConnectorFuture::new(async move {
+                    let mut resp =
+                        Response::new(StatusCode::try_from(200u16).unwrap(), SdkBody::empty());
+                    resp.headers_mut()
+                        .insert("content-type", "application/vnd.amazon.eventstream");
+                    Ok(resp)
+                })
+            }
+        }
+        impl HttpClient for Capture {
+            fn http_connector(
+                &self,
+                _s: &HttpConnectorSettings,
+                _c: &RuntimeComponents,
+            ) -> SharedHttpConnector {
+                SharedHttpConnector::new(self.clone())
+            }
+        }
+
+        let capture = Capture::default();
+        let factory = BedrockBidiTransportFactory::with_credentials(aws_keys())
+            .http_client(Some(SharedHttpClient::new(capture.clone())));
+        let mut transport = factory
+            .connect(ConnectSpec::BedrockBidi {
+                model_id: "amazon.nova-2-sonic-v1:0".into(),
+                region: Some("eu-north-1".into()),
+            })
+            .await
+            .expect("connect returns at once; the stream opens in the background");
+        // The first read waits for the open (here: an empty stream, so it ends).
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), transport.recv()).await;
+        let seen = capture.0.lock().unwrap().clone();
+        let (uri, auth) = seen.first().expect("the SDK sent the request");
+        assert!(
+            uri.starts_with("https://bedrock-runtime.eu-north-1.amazonaws.com/"),
+            "{uri}"
+        );
+        assert!(auth.starts_with("AWS4-HMAC-SHA256 "), "{auth}");
+        assert!(
+            auth.contains("Credential=AKIDBUDDEPLOYMENT1/")
+                && auth.contains("/eu-north-1/bedrock/aws4_request"),
+            "signed with the deployment's key in its region: {auth}"
+        );
+    }
 
     /// The join-url extraction the REST-handshake factory does: present string
     /// field at the pointer ⇒ that url.
@@ -871,7 +1120,9 @@ mod tests {
             headers: vec![],
         };
         assert!(matches!(
-            BedrockBidiTransportFactory.connect(spec).await,
+            BedrockBidiTransportFactory::default_chain()
+                .connect(spec)
+                .await,
             Err(RealtimeError::ConnectionFailed(_))
         ));
     }
@@ -1041,7 +1292,9 @@ mod tests {
             path: "/tmp/x.sock".to_string(),
         };
         assert!(matches!(
-            BedrockBidiTransportFactory.connect(spec).await,
+            BedrockBidiTransportFactory::default_chain()
+                .connect(spec)
+                .await,
             Err(RealtimeError::ConnectionFailed(_))
         ));
     }
