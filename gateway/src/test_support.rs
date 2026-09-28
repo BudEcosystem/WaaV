@@ -93,9 +93,9 @@ pub(crate) async fn bud_state(keys: &[(&str, &str)]) -> Arc<AppState> {
     state
 }
 
-/// [`bud_state`] whose plane opens `voice_table` credentials with bud-auth's fixture key (the
-/// plaintext of `test_cred_encrypted.hex` is `dg_vendor_key_abc123`) and enforces deployment
-/// policies (FRD-023 RT6 tests). Returns the store, to mutate the control plane mid-test.
+/// [`bud_state`] whose plane opens `voice_table` credentials with the test key pair
+/// ([`test_credential`] decrypts to [`TEST_CREDENTIAL_PLAIN`]) and enforces deployment policies
+/// (FRD-023 RT6 tests). Returns the store, to mutate the control plane mid-test.
 pub(crate) async fn bud_state_with_credentials(
     keys: &[(&str, &str)],
 ) -> (Arc<AppState>, Arc<bud_auth::MemoryStore>) {
@@ -103,15 +103,11 @@ pub(crate) async fn bud_state_with_credentials(
     for (k, v) in keys {
         store.set(k, v);
     }
-    let pem = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../bud-auth/tests/fixtures/test_cred_private.pem"
-    ))
-    .expect("bud-auth's fixture key (git-ignored *.pem) must be present locally");
     let plane = Arc::new(bud_auth::BudPlane::with_decryptor(
         store.clone() as Arc<dyn bud_auth::ControlPlaneStore>,
         None,
-        bud_auth::CredentialDecryptor::from_pem(&pem).expect("fixture key parses"),
+        bud_auth::CredentialDecryptor::from_pem(&credential_fixture().0)
+            .expect("fixture key parses"),
     ));
     plane.boot().await.expect("plane boots");
     let mut state = AppState::new(minimal_config()).await;
@@ -123,8 +119,36 @@ pub(crate) async fn bud_state_with_credentials(
     (state, store)
 }
 
-/// bud-auth's fixture ciphertext, for `voice_table` entries in tests.
-pub(crate) const TEST_CREDENTIAL: &str =
-    include_str!("../../bud-auth/tests/fixtures/test_cred_encrypted.hex");
-/// Its plaintext.
+/// The plaintext of [`test_credential`].
 pub(crate) const TEST_CREDENTIAL_PLAIN: &str = "dg_vendor_key_abc123";
+
+/// A test key pair (PKCS#8 PEM) and [`TEST_CREDENTIAL_PLAIN`] encrypted to it the way budapp encrypts
+/// credentials (RSA-OAEP-SHA-256, hex), made once per test binary. bud-auth's `*.pem` fixtures are
+/// git-ignored, so a clean checkout -- CI -- has no key to read and no way to open a committed
+/// ciphertext.
+fn credential_fixture() -> &'static (String, String) {
+    static FIXTURE: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+    FIXTURE.get_or_init(|| {
+        use rsa::pkcs8::{EncodePrivateKey, LineEnding};
+        let mut rng = rsa::rand_core::OsRng;
+        let key = rsa::RsaPrivateKey::new(&mut rng, 2048).expect("test key generates");
+        let pem = key
+            .to_pkcs8_pem(LineEnding::LF)
+            .expect("test key encodes")
+            .to_string();
+        let ciphertext = key
+            .to_public_key()
+            .encrypt(
+                &mut rng,
+                rsa::Oaep::new::<sha2::Sha256>(),
+                TEST_CREDENTIAL_PLAIN.as_bytes(),
+            )
+            .expect("test credential encrypts");
+        (pem, hex::encode(ciphertext))
+    })
+}
+
+/// The test credential's ciphertext, for `voice_table` entries in tests.
+pub(crate) fn test_credential() -> &'static str {
+    &credential_fixture().1
+}

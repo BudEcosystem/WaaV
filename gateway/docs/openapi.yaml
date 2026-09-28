@@ -965,7 +965,6 @@ components:
         history and barge-in. When absent, the gateway keeps its raw STT/TTS
         behavior (fully backward-compatible).
       required:
-      - base_url
       - model
       properties:
         allow_interruption:
@@ -988,7 +987,10 @@ components:
           minimum: 0
         base_url:
           type: string
-          description: OpenAI-compatible base URL for the LLM (e.g. `https://api.openai.com/v1`).
+          description: |-
+            OpenAI-compatible base URL for the LLM (e.g. `https://api.openai.com/v1`). Omitted — and
+            refused if present — under the Bud control plane, where the LLM leg is a Bud chat
+            deployment reached through the Bud gateway (FRD-023 RT6).
           example: https://api.openai.com/v1
         degradation_message:
           type:
@@ -2661,7 +2663,6 @@ components:
       type: object
       description: STT configuration for WebSocket messages (with optional API key)
       required:
-      - provider
       - language
       - sample_rate
       - channels
@@ -2716,7 +2717,9 @@ components:
           example: nova-2
         provider:
           type: string
-          description: Provider name (e.g., "deepgram")
+          description: |-
+            Provider name (e.g., "deepgram"). Under the Bud control plane it is taken from the
+            deployment `model` names, and may be omitted (FRD-023 RT6).
           example: deepgram
         punctuation:
           type: boolean
@@ -2930,9 +2933,6 @@ components:
     TTSWebSocketConfig:
       type: object
       description: TTS configuration for WebSocket messages (with optional API key)
-      required:
-      - provider
-      - model
       properties:
         api_key:
           type:
@@ -3049,7 +3049,7 @@ components:
             (Deepgram first) honor them END-TO-END (W1 keystone, closing BRUTAL_REVIEW.md S1/S5).
         model:
           type: string
-          description: Model to use for TTS
+          description: 'Model to use for TTS. Under the Bud control plane: the text-to-speech DEPLOYMENT.'
           example: aura-asteria-en
         pronunciations:
           type: array
@@ -3058,7 +3058,9 @@ components:
           description: Pronunciation replacements to apply before TTS
         provider:
           type: string
-          description: Provider name (e.g., "deepgram", "hume", "elevenlabs")
+          description: |-
+            Provider name (e.g., "deepgram", "hume", "elevenlabs"). Under the Bud control plane it is
+            taken from the deployment `model` names, and may be omitted (FRD-023 RT6).
           example: deepgram
         request_timeout:
           type:

@@ -4174,14 +4174,14 @@ mod frd023_bud_mode_tests {
 
     async fn leg_plane(stt_extra: serde_json::Value) -> Arc<AppState> {
         let mut stt = serde_json::json!({
-            "vendor": "deepgram", "credential": crate::test_support::TEST_CREDENTIAL.trim(),
+            "vendor": "deepgram", "credential": crate::test_support::test_credential(),
             "endpoints": ["audio_transcription"], "model": "nova-3"
         });
         for (k, v) in stt_extra.as_object().unwrap() {
             stt[k] = v.clone();
         }
         let tts = serde_json::json!({
-            "vendor": "elevenlabs", "credential": crate::test_support::TEST_CREDENTIAL.trim(),
+            "vendor": "elevenlabs", "credential": crate::test_support::test_credential(),
             "endpoints": ["text_to_speech"], "model": "eleven_flash_v2_5", "voice": "v1"
         });
         let blob = serde_json::json!({

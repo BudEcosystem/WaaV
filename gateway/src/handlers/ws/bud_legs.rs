@@ -702,6 +702,7 @@ pub async fn prepare(
 }
 
 /// Headers a template may not send to the Bud gateway: the caller's own credential is the one.
+#[cfg(feature = "dag-routing")]
 const LLM_CREDENTIAL_HEADERS: &[&str] = &[
     "authorization",
     "api-key",
@@ -722,6 +723,7 @@ const LLM_CREDENTIAL_HEADERS: &[&str] = &[
 ///   relay, and the native engines address deployments from RT7.
 ///
 /// Returns the admissions to hold for the session.
+#[cfg(feature = "dag-routing")]
 pub async fn bind_dag(
     state: &Arc<AppState>,
     definition: &mut crate::dag::definition::DAGDefinition,
@@ -859,7 +861,7 @@ mod tests {
     //! deployment, which is what these assert; the live streams are the pde-ditto E2E.
 
     use super::*;
-    use crate::test_support::{TEST_CREDENTIAL, TEST_CREDENTIAL_PLAIN, bud_state_with_credentials};
+    use crate::test_support::{TEST_CREDENTIAL_PLAIN, bud_state_with_credentials, test_credential};
     use serde_json::{Value as Json, json};
     use std::collections::HashMap;
     use std::sync::Mutex;
@@ -881,7 +883,7 @@ mod tests {
         merge(
             json!({
                 "vendor": "deepgram",
-                "credential": TEST_CREDENTIAL.trim(),
+                "credential": test_credential(),
                 "endpoints": ["audio_transcription"],
                 "model": "nova-3",
                 "language": "en-US",
@@ -897,7 +899,7 @@ mod tests {
         merge(
             json!({
                 "vendor": "elevenlabs",
-                "credential": TEST_CREDENTIAL.trim(),
+                "credential": test_credential(),
                 "endpoints": ["text_to_speech"],
                 "model": "eleven_flash_v2_5",
                 "voice": "JBFqnCBsd6RMkjVDRZzb",
@@ -1542,6 +1544,7 @@ mod tests {
     // TC-WS-10 — DAG templates
     // ---------------------------------------------------------------------------------------
 
+    #[cfg(feature = "dag-routing")]
     fn template(nodes: Json) -> crate::dag::definition::DAGDefinition {
         serde_json::from_value(json!({
             "id": "t", "name": "t", "nodes": nodes, "edges": [],
@@ -1553,6 +1556,7 @@ mod tests {
     /// TC-WS-10 🔒 — a template's TTS node resolves a deployment (vendor, model, voice,
     /// credential, admission, revalidation); its LLM node goes to the Bud gateway with the
     /// caller's credential and none of the template's own.
+    #[cfg(feature = "dag-routing")]
     #[tokio::test]
     #[serial_test::serial]
     async fn tc_ws_10_template_nodes_address_deployments() {
@@ -1643,6 +1647,7 @@ mod tests {
 
     /// TC-WS-10 — a template node naming a deployment the caller cannot reach, or a realtime
     /// provider node, is refused.
+    #[cfg(feature = "dag-routing")]
     #[tokio::test]
     #[serial_test::serial]
     async fn tc_ws_10_unreachable_and_realtime_nodes_are_refused() {
