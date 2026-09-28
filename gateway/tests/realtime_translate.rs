@@ -1336,6 +1336,72 @@ impl AgentMock {
     }
 }
 
+/// TC-XL-07 🔒 — a per-minute vendor with NO duration price still meters its time: the vendor
+/// bills by the minute whatever Bud charges, so the segments are recorded with their seconds and
+/// marked unpriced (`duration`) — never a session that used 72 s of vendor time and left no record.
+#[tokio::test]
+async fn tc_xl_07_an_unpriced_per_minute_vendor_still_meters_its_time() {
+    let cap = Capture::install();
+    let mock = AgentMock::start(json!({"type": "Welcome", "request_id": "dg-req-2"})).await;
+    let entry = json!({
+        "vendor": "deepgram_voice_agent",
+        "api_base": mock.base(),
+        "credential": TEST_CREDENTIAL.trim(),
+        "endpoints": ["realtime_session"],
+        "model": "gpt-4o-mini"
+    });
+    let id = "c7c7c7c7-0000-4000-8000-000000000180";
+    let gw = gateway(Setup {
+        endpoints: vec![ep("agent", id, entry)],
+        ..Default::default()
+    })
+    .await;
+    let mut c = connect(&gw, "agent").await;
+    until_type(&mut c, "session.created").await;
+    send(
+        &mut c,
+        json!({"type": "session.update", "session": {"instructions": "hello"}}),
+    )
+    .await;
+    until_type(&mut c, "session.updated").await;
+    keep_alive(&mut c, Duration::from_millis(2500)).await;
+    close_and_drain(&mut c).await;
+
+    let sessions = cap.wait_for("voice.session", 1).await;
+    let session = sessions
+        .iter()
+        .find(|s| text(s, "bud.endpoint_id").as_deref() == Some(id))
+        .unwrap();
+    let segments: Vec<SpanData> = cap
+        .spans()
+        .into_iter()
+        .filter(|s| s.name == "voice.turn" && text(s, "bud.endpoint_id").as_deref() == Some(id))
+        .collect();
+    assert!(
+        segments.len() >= 2,
+        "segments are recorded without a price: {}",
+        segments.len()
+    );
+    for s in &segments {
+        assert_eq!(
+            text(s, "bud.voice.rt.component").as_deref(),
+            Some("duration_segment")
+        );
+        assert!(number(s, "bud.voice.billed_seconds").unwrap() > 0.0);
+        assert!(number(s, "bud.voice.cost").is_none(), "unpriced, never $0");
+        assert_eq!(
+            text(s, "bud.voice.unpriced_components").as_deref(),
+            Some("duration")
+        );
+    }
+    let total: f64 = segments
+        .iter()
+        .map(|s| number(s, "bud.voice.billed_seconds").unwrap())
+        .sum();
+    assert!(total > 2.3 && total < 3.6, "{total}");
+    assert!((total - number(session, "bud.voice.billed_seconds").unwrap()).abs() < 1e-9);
+}
+
 /// TC-XL-07 🔒 — a per-minute vendor bills DURATION SEGMENTS from the moment its connection
 /// opens: full segments while the session lives and the partial remainder at close (segments
 /// shortened to 1 s here, so ~2.5 s bills 1 + 1 + ~0.5; the 60 + 60 + 30 arithmetic is the

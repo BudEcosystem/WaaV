@@ -1518,9 +1518,9 @@ impl Shell<'_> {
         let rates = provider.audio_rates();
         self.provider = Some(provider);
         let now = Instant::now();
-        if self.plan.info.per_minute
-            && crate::core::realtime_cost::bills_duration(self.p.endpoint.pricing.as_ref())
-        {
+        // A per-minute vendor bills by time whatever Bud charges, so its time is always metered —
+        // priced when the deployment has a minute/second price, marked unpriced otherwise.
+        if self.plan.info.per_minute {
             self.segments = Some(SegmentClock::start(now, self.timings.segment));
         }
         let acts = self.tr.connected(rates);

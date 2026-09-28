@@ -280,16 +280,26 @@ pub fn realtime_transcription_cost(
 /// A duration segment under a minute or second price (D-9: per 60 s, so a socket that drops at
 /// minute 40 was still billed for 39 minutes). `None` under any other unit.
 pub fn realtime_duration_cost(pricing: Option<&VoicePricing>, seconds: f64) -> RealtimeCost {
-    let Some(pricing) = pricing else {
-        return RealtimeCost::none();
+    // Billed time with no minute/second price is named unpriced, never zero-priced: a per-minute
+    // vendor billed it whatever Bud charges (RT7).
+    let unpriced = || RealtimeCost {
+        cost: None,
+        unit: None,
+        unpriced: vec!["duration"],
     };
-    if pricing.per_units == 0 || !seconds.is_finite() || seconds < 0.0 {
+    let Some(pricing) = pricing else {
+        return unpriced();
+    };
+    if !seconds.is_finite() || seconds < 0.0 {
         return RealtimeCost::none();
+    }
+    if pricing.per_units == 0 {
+        return unpriced();
     }
     let (units, unit) = match pricing.unit.as_str() {
         "minute" => (seconds / 60.0, "minute"),
         "second" => (seconds, "second"),
-        _ => return RealtimeCost::none(),
+        _ => return unpriced(),
     };
     let cost = units * pricing.cost_per_unit / pricing.per_units as f64;
     RealtimeCost {
@@ -308,6 +318,17 @@ pub fn bills_duration(pricing: Option<&VoicePricing>) -> bool {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    /// A duration segment without a minute/second price is unpriced (`duration`), never $0 and
+    /// never silently costless: the vendor billed that time (RT7 per-minute vendors).
+    #[test]
+    fn an_unpriced_duration_segment_names_what_is_unpriced() {
+        for pricing in [None, Some(token_price(&[("input_audio", 1.0)]))] {
+            let c = realtime_duration_cost(pricing.as_ref(), 30.0);
+            assert_eq!(c.cost, None);
+            assert_eq!(c.unpriced, vec!["duration"]);
+        }
+    }
 
     fn token_price(rates: &[(&str, f64)]) -> VoicePricing {
         VoicePricing {
