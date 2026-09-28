@@ -278,6 +278,7 @@ async fn start_gateway(vendor: SocketAddr) -> SocketAddr {
         s.realtime = Arc::new(RealtimeRuntime {
             timings: Timings::default(),
             client_secret_keys: None,
+            bedrock_http_client: None,
         });
     }
     let app = waav_gateway::routes::openai_realtime::create_openai_realtime_router()

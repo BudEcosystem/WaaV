@@ -1189,12 +1189,17 @@ impl Translator {
             return;
         };
         let delta = if !is_final {
+            let delta = if r.interim_since_final.is_empty() {
+                spaced(&r.transcript, text)
+            } else {
+                text.to_string()
+            };
             r.interim_since_final.push_str(text);
-            text.to_string()
+            delta
         } else {
             let seen = std::mem::take(&mut r.interim_since_final);
             if seen.is_empty() {
-                text.to_string()
+                spaced(&r.transcript, text)
             } else if let Some(rest) = text.strip_prefix(seen.as_str()) {
                 rest.to_string()
             } else if seen.starts_with(text) {
@@ -1818,6 +1823,22 @@ pub(super) async fn run(
     meter.set_vendor_session_id(tr.vendor_session_id());
     session::finish(meter, end, &client_tx, writer, Some(&session_id), &vendor).await;
     drop(p);
+}
+
+/// The text of a new transcript segment, spaced from what the response already said. Deepgram's
+/// Voice Agent and Hume's EVI send an answer as separate finished sentences, and Nova Sonic as
+/// separate blocks, none with whitespace between them; a GA client just appends deltas. Scripts
+/// that do not space sentences (Chinese, Japanese) are left as they are.
+fn spaced(transcript: &str, text: &str) -> String {
+    let unspaced_script = |c: char| matches!(c, '\u{3000}'..='\u{30FF}' | '\u{3400}'..='\u{9FFF}' | '\u{FF00}'..='\u{FFEF}');
+    match (transcript.chars().last(), text.chars().next()) {
+        (Some(last), Some(first))
+            if !last.is_whitespace() && !first.is_whitespace() && !unspaced_script(last) =>
+        {
+            format!(" {text}")
+        }
+        _ => text.to_string(),
+    }
 }
 
 #[cfg(test)]

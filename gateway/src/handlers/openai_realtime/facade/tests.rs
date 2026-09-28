@@ -381,12 +381,52 @@ fn assistant_transcripts_are_sent_once_each() {
     acts.extend(tr.vendor(S2sEvent::ResponseDone {
         response_id: String::new(),
     }));
-    assert_eq!(transcript_deltas(&acts), vec!["Hi there.", "Bye."]);
+    assert_eq!(transcript_deltas(&acts), vec!["Hi there.", " Bye."]);
     let done = client_events(&acts)
         .into_iter()
         .find(|e| e["type"] == "response.output_audio_transcript.done")
         .unwrap();
-    assert_eq!(done["transcript"], "Hi there.Bye.");
+    assert_eq!(done["transcript"], "Hi there. Bye.");
+}
+
+/// Deepgram's Voice Agent and Hume's EVI send an answer as one finished sentence per message, with
+/// no whitespace between them; the client appends deltas, so the facade supplies the separator.
+/// Text the vendor already spaced, and a streamed chunk inside one segment, stay verbatim.
+#[test]
+fn sentences_sent_as_separate_finals_are_joined_with_a_space() {
+    let mut tr = translator("deepgram_voice_agent");
+    ready(&mut tr);
+    let mut acts = tr.vendor(asst("Paris is the capital.", true));
+    acts.extend(tr.vendor(asst("It is on the Seine.", true)));
+    acts.extend(tr.vendor(asst(" Its river has bridges.", true)));
+    acts.extend(tr.vendor(S2sEvent::ResponseDone {
+        response_id: String::new(),
+    }));
+    assert_eq!(
+        transcript_deltas(&acts),
+        vec![
+            "Paris is the capital.",
+            " It is on the Seine.",
+            " Its river has bridges."
+        ]
+    );
+    let done = client_events(&acts)
+        .into_iter()
+        .find(|e| e["type"] == "response.output_audio_transcript.done")
+        .unwrap();
+    assert_eq!(
+        done["transcript"],
+        "Paris is the capital. It is on the Seine. Its river has bridges."
+    );
+
+    let mut tr = translator("hume_evi");
+    ready(&mut tr);
+    let mut acts = tr.vendor(asst("東京です。", true));
+    acts.extend(tr.vendor(asst("人口は多いです。", true)));
+    assert_eq!(
+        transcript_deltas(&acts),
+        vec!["東京です。", "人口は多いです。"]
+    );
 }
 
 /// A function call ends its response (the client runs the tool, then asks for the next).
@@ -656,7 +696,13 @@ fn the_translate_vendors_are_c7s() {
 /// `turn_detection: null` is still reported as off.
 #[test]
 fn an_unset_turn_detection_is_reported_as_the_vendors_own_vad() {
-    for vendor in ["gemini", "nova_sonic", "deepgram_voice_agent", "elevenlabs_convai", "hume_evi"] {
+    for vendor in [
+        "gemini",
+        "nova_sonic",
+        "deepgram_voice_agent",
+        "elevenlabs_convai",
+        "hume_evi",
+    ] {
         let tr = translator(vendor);
         let created: Value = serde_json::from_str(&tr.session_created()).unwrap();
         assert_eq!(
