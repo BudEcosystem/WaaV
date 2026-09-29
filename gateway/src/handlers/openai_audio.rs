@@ -30,9 +30,10 @@ use tracing::Instrument;
 
 use crate::core::voice_cost::voice_cost;
 use crate::core::voice_error::{VoiceErrorType, VoiceFailure};
+use crate::observability::language::normalize_language;
 use crate::observability::vendor_span;
 use crate::observability::voice_attrs;
-use crate::observability::voice_span::{FormCapture, Root, RootSpan, VoiceSpans};
+use crate::observability::voice_span::{FormCapture, Leg, LegKind, Root, RootSpan, VoiceSpans};
 use crate::state::{AppState, ResolvedVoiceEndpoint};
 
 use super::advisories::Advisories;
@@ -118,7 +119,7 @@ async fn open_turn(
     endpoint_name: &str,
     bearer: Option<&str>,
     root: &Root,
-    (vendor_key, model_key): (&'static str, &'static str),
+    kind: LegKind,
 ) -> VoiceSpans {
     use voice_attrs::turn;
     use waav_openai_audio::recordable;
@@ -144,13 +145,44 @@ async fn open_turn(
         turn::API_KEY_ID,
         principal.as_ref().and_then(|p| p.api_key_id.as_deref()),
     );
-    spans.record_vendor(
-        vendor_key,
-        model_key,
-        &resolved.endpoint.vendor,
-        resolved.endpoint.model.as_deref(),
-    );
+    // The deployment the caller named, until a plan or a served fallback says more. Written when
+    // the call ends, once (see `Leg`).
+    spans.set_leg(kind, deployment_leg(&resolved.endpoint));
     spans
+}
+
+/// A deployment's leg as saved: its vendor and model.
+fn deployment_leg(endpoint: &bud_auth::credentials::VoiceEndpoint) -> Leg {
+    Leg {
+        vendor: endpoint.vendor.clone(),
+        model: endpoint.model.clone(),
+        ..Leg::default()
+    }
+}
+
+/// The model a vendor is called with, when it is one: `called` when set, else the deployment's.
+///
+/// `called` is empty where the deployment's model is deliberately not sent (a Deepgram voice
+/// family with no voice, which the vendor resolves itself); the deployment's model then still
+/// names what ran better than nothing does.
+fn effective_model(
+    called: &str,
+    endpoint: &bud_auth::credentials::VoiceEndpoint,
+) -> Option<String> {
+    waav_openai_audio::recordable(Some(called))
+        .map(str::to_string)
+        .or_else(|| endpoint.model.clone())
+}
+
+/// A synthesis leg as planned for `endpoint`: the model, voice and language it runs with.
+fn speech_leg(endpoint: &bud_auth::credentials::VoiceEndpoint, plan: &SpeechPlan) -> Leg {
+    Leg {
+        vendor: endpoint.vendor.clone(),
+        model: effective_model(&plan.std_config.base.model, endpoint),
+        voice: plan.voice.clone(),
+        language: plan.language.clone(),
+        noise_suppression: None,
+    }
 }
 
 /// `POST /v1/audio/speech`
@@ -241,7 +273,7 @@ async fn speech_inner(
         &settings.endpoint,
         bearer.as_deref(),
         root,
-        (leg::TTS_VENDOR, leg::TTS_MODEL),
+        LegKind::Tts,
     )
     .await;
     spans.record_text(
@@ -274,10 +306,9 @@ async fn speech_inner(
         Ok(plan) => plan,
         Err(refusal) => return refusal.fail_on(&spans),
     };
-    // The voice the synthesis runs with, whoever chose it (FRD-021 §6.1, Phase 5).
-    spans.record_text(leg::TTS_VOICE, plan.voice.as_deref());
-    // Recorded only when there is one: `""` is not NULL (FRD-021 GT-12).
-    spans.record_text(turn::LANGUAGE, plan.language.as_deref());
+    // The voice the synthesis runs with, whoever chose it (FRD-021 §6.1, Phase 5), and the model
+    // and language — the primary's, until a fallback serves.
+    spans.set_leg(LegKind::Tts, speech_leg(&endpoint, &plan));
 
     // `characters` is the billing dimension for synthesis and is recorded on SUCCESS only: set
     // at creation it counted every refused request — a voice the account lacks, text the vendor
@@ -343,8 +374,12 @@ async fn speech_inner(
     // the SERVED deployment's price, so a turn a fallback served is billed as the fallback's
     // (FRD-022 §6.4).
     let served_format = packaged.format_label.unwrap_or(settings.format.as_str());
-    let (output_secs, output_rate) =
-        output_audio_meta(&packaged.bytes, settings.format, sample_rate);
+    let (output_secs, output_rate) = output_audio_meta(
+        &packaged.bytes,
+        settings.format,
+        sample_rate,
+        vendor_declared_rate(&served.vendor, settings.format),
+    );
     spans.record(leg::TTS_DURATION_MS, elapsed_ms);
     if let Some(ttfb) = served.ttfb {
         spans.record(leg::TTS_TTFB_MS, ttfb.as_secs_f64() * 1000.0);
@@ -840,9 +875,9 @@ impl SpeechServed {
 /// a vendor or provider timeout by exactly this text.
 const CHAIN_DEADLINE_ELAPSED: &str = "the request deadline elapsed";
 
-/// The class a refusal records when no attempt produced a failure of its own: only a failing
-/// vendor opens a breaker.
-const BREAKER_OPEN_CLASS: VoiceErrorType = VoiceErrorType::Vendor5xx;
+/// The class a call records when a circuit breaker refused it and no hop produced a real failure:
+/// no vendor was called, so there is no vendor status and no vendor to blame (FRD-022 §6.5).
+const BREAKER_OPEN_CLASS: VoiceErrorType = VoiceErrorType::CircuitOpen;
 
 /// Synthesise on the primary with its retry policy, behind the circuit breakers, falling back
 /// through its fallback chain on a failover-eligible failure — all within one deadline
@@ -861,7 +896,7 @@ async fn synthesize_resiliently(
     };
     use crate::handlers::speak::SynthesisError;
     use resil::retry::{RetryPolicy, retry};
-    use voice_attrs::{leg, resilience};
+    use voice_attrs::resilience;
 
     const CAPABILITY: &str = "text_to_speech";
     let policies = state.policies.clone();
@@ -889,6 +924,9 @@ async fn synthesize_resiliently(
     let mut retries_total = 0u32;
     let mut primary_error: Option<SynthesisError> = None;
     let mut primary_breaker: Option<resil::breaker::Open> = None;
+    // The last failure a fallback hop actually produced: what a call whose primary was behind an
+    // open breaker records, rather than "circuit open" over a vendor call that did happen.
+    let mut fallback_failure: Option<VoiceFailure> = None;
     let mut fallback_limited: Option<std::time::Duration> = None;
     let mut fallback_attempted = false;
     let mut timed_out = false;
@@ -959,6 +997,8 @@ async fn synthesize_resiliently(
             .as_ref()
             .map(RetryPolicy::interactive)
             .unwrap_or_else(RetryPolicy::none);
+        // Named as the leg only if this hop serves (a failed fallback leaves the primary's).
+        let hop_leg = speech_leg(&endpoint, &plan);
         let std_config = plan.std_config;
         let text = settings.text.as_str();
         let outcome = retry(
@@ -1000,14 +1040,8 @@ async fn synthesize_resiliently(
                 spans.record_text(resilience::SERVED_ENDPOINT_ID, Some(&**id));
                 if hop > 0 {
                     spans.record_text(resilience::FALLBACK_FROM, Some(primary_id));
-                    // The leg is the fallback's: its vendor, model and voice.
-                    spans.record_vendor(
-                        leg::TTS_VENDOR,
-                        leg::TTS_MODEL,
-                        &endpoint.vendor,
-                        endpoint.model.as_deref(),
-                    );
-                    spans.record_text(leg::TTS_VOICE, plan.voice.as_deref());
+                    // The leg is the fallback's: its vendor, model, voice and language.
+                    spans.set_leg(LegKind::Tts, hop_leg);
                     advisories.warn(format!(
                         "served by fallback deployment '{id}' ({}) because '{}' failed",
                         endpoint.vendor, settings.endpoint
@@ -1040,6 +1074,9 @@ async fn synthesize_resiliently(
                     );
                 }
                 warn!(deployment = %id, hop, error = %e, "synthesis failed");
+                if hop > 0 {
+                    fallback_failure = Some(e.failure().clone());
+                }
                 if hop == 0 {
                     let surface = !verdict.failover;
                     primary_error = Some(e);
@@ -1153,7 +1190,10 @@ async fn synthesize_resiliently(
         }
         None => match primary_breaker {
             Some(open) => {
-                spans.fail(BREAKER_OPEN_CLASS, None, "circuit breaker open");
+                match &fallback_failure {
+                    Some(failure) => fail(failure),
+                    None => spans.fail(BREAKER_OPEN_CLASS, None, "circuit breaker open"),
+                }
                 Err(breaker_open_response(open))
             }
             None => Err(deadline_exceeded()),
@@ -1167,12 +1207,17 @@ async fn synthesize_resiliently(
 /// * a WAV container → both from its header;
 /// * raw PCM (what `response_format=pcm` serves) → `bytes / (rate × 2)`: WaaV's canonical PCM is
 ///   16-bit little-endian mono (`linear16`), the shape `serve_as_requested` also assumes;
-/// * a compressed container → neither. Its duration needs a demuxer (Q-2 is undecided), and a
-///   guessed number in a billing input is worse than none (DEG-4).
+/// * a compressed container (MP3, AAC/ADTS, FLAC, Ogg Opus/Vorbis, MP4) → from the container,
+///   demuxed and never decoded ([`waav_openai_audio::pcm::container_timing`]); the rate from its
+///   own headers, else `declared_rate`, the rate the vendor's format string names. NEVER the
+///   synthesis' labelled `sample_rate` for these: for a compressed format that label is a default
+///   the vendor did not produce;
+/// * anything else → neither. A guessed number in a billing input is worse than none (DEG-4).
 fn output_audio_meta(
     bytes: &[u8],
     requested: AudioFormat,
     sample_rate: u32,
+    declared_rate: Option<u32>,
 ) -> (Option<f64>, Option<u32>) {
     use crate::core::tts::sniff::{SniffedContainer, sniff_container};
     match sniff_container(bytes) {
@@ -1184,8 +1229,26 @@ fn output_audio_meta(
             Some(bytes.len() as f64 / (f64::from(sample_rate) * 2.0)),
             Some(sample_rate),
         ),
-        _ => (None, None),
+        _ => match waav_openai_audio::pcm::container_timing(bytes) {
+            Some(timing) => (Some(timing.seconds), timing.sample_rate.or(declared_rate)),
+            None => (None, None),
+        },
     }
+}
+
+/// The rate a vendor's own output-format string names for a compressed `format`, where WaaV
+/// builds one: ElevenLabs asks for `mp3_44100_128` or `opus_48000_64`. Only for the codec the
+/// string names — its `aac` and `flac` requests fall back to PCM.
+fn vendor_declared_rate(vendor: &str, format: AudioFormat) -> Option<u32> {
+    if !vendor.trim().eq_ignore_ascii_case("elevenlabs") {
+        return None;
+    }
+    let requested =
+        crate::core::tts::elevenlabs::output_format_for(Some(format.as_waav_format()), None);
+    let mut parts = requested.split('_');
+    let codec = parts.next()?;
+    let rate = parts.next()?.parse().ok()?;
+    (codec == format.as_str()).then_some(rate)
 }
 
 /// A WAV file's sample rate, from its `fmt ` chunk — the header only, like
@@ -1872,14 +1935,11 @@ fn rejection_error(
     )
 }
 
-/// Whether this transcription ran through WaaV's own denoiser.
-///
-/// A member of `voice_attrs::ALL` since FRD-021 (WP-5.4), when `VoiceTurnFact` gained the
-/// `noise_suppression` column that reads it. Before, it was a trace-only attribute, deliberately
-/// kept out of the contract until a column existed for it.
-const NOISE_SUPPRESSION_ATTR: &str = voice_attrs::leg::STT_NOISE_SUPPRESSION;
-
 /// Run the decoded PCM through DeepFilterNet before it reaches the vendor (FRD-018 Part III N1).
+///
+/// Returns the audio to transcribe and whether the denoiser ran on it — the leg's
+/// `bud.voice.stt.noise_suppression` (FRD-021 WP-5.4), written once for the leg that served
+/// rather than on every attempt of every hop.
 ///
 /// Three properties, each of which is the difference between a useful feature and a confusing one:
 ///
@@ -1893,23 +1953,20 @@ const NOISE_SUPPRESSION_ATTR: &str = voice_attrs::leg::STT_NOISE_SUPPRESSION;
 async fn apply_noise_suppression(
     audio: waav_openai_audio::pcm::PcmAudio,
     requested: bool,
-    turn_span: &tracing::Span,
     advisories: &mut Advisories,
-) -> waav_openai_audio::pcm::PcmAudio {
+) -> (waav_openai_audio::pcm::PcmAudio, bool) {
     if !requested {
-        turn_span.record(NOISE_SUPPRESSION_ATTR, false);
-        return audio;
+        return (audio, false);
     }
 
     #[cfg(not(feature = "noise-filter"))]
     {
-        turn_span.record(NOISE_SUPPRESSION_ATTR, false);
         advisories.warn(
             "noise_suppression is configured on this deployment but this gateway build does not \
              include the noise-filter feature; the recording was transcribed unprocessed"
                 .to_string(),
         );
-        audio
+        (audio, false)
     }
 
     #[cfg(feature = "noise-filter")]
@@ -1927,22 +1984,23 @@ async fn apply_noise_suppression(
                     .iter()
                     .map(|c| i16::from_le_bytes(*c))
                     .collect();
-                turn_span.record(NOISE_SUPPRESSION_ATTR, true);
                 info!(
                     samples = samples.len(),
                     "noise suppression applied before transcription"
                 );
-                waav_openai_audio::pcm::PcmAudio {
-                    samples,
-                    sample_rate,
-                }
+                (
+                    waav_openai_audio::pcm::PcmAudio {
+                        samples,
+                        sample_rate,
+                    },
+                    true,
+                )
             }
             Err(e) => {
-                turn_span.record(NOISE_SUPPRESSION_ATTR, false);
                 advisories.warn(format!(
                     "noise suppression failed ({e}); the recording was transcribed unprocessed"
                 ));
-                audio
+                (audio, false)
             }
         }
     }
@@ -2089,7 +2147,7 @@ async fn transcription_inner(
     mut multipart: axum::extract::Multipart,
     translate: bool,
 ) -> Response {
-    use voice_attrs::{leg, turn};
+    use voice_attrs::turn;
 
     let bearer = headers
         .get(header::AUTHORIZATION)
@@ -2270,7 +2328,7 @@ async fn transcription_inner(
         &settings.endpoint,
         bearer.as_deref(),
         root,
-        (leg::STT_VENDOR, leg::STT_MODEL),
+        LegKind::Stt,
     )
     .await;
     spans.record_text(
@@ -2292,7 +2350,7 @@ async fn transcription_inner(
     // `settings_map::resolve_language`'s; the section outranks the endpoint default). Recorded
     // only when there is one: `""` is not NULL (FRD-021 GT-12).
     let canonical_language = stt_language(&settings, &endpoint);
-    spans.record_text(turn::LANGUAGE, canonical_language.as_deref());
+    spans.update_leg(|l| l.language = canonical_language);
     // What was uploaded, read from the bytes in hand — no decoding (FRD-021 §6.1, Phase 5).
     spans.record(turn::INPUT_AUDIO_BYTES, file_bytes.len() as i64);
     spans.record_text(
@@ -2466,7 +2524,7 @@ async fn transcribe_resiliently(
         DEFAULT_TRANSCRIPTION_DEADLINE, breaker_open_response, vendor_key,
     };
     use resil::retry::{RetryPolicy, retry};
-    use voice_attrs::{leg, resilience};
+    use voice_attrs::resilience;
 
     let policies = state.policies.clone();
     // STT settings carry no request_timeout of their own; uploads can be long, so the route
@@ -2491,6 +2549,8 @@ async fn transcribe_resiliently(
     let mut retries_total = 0u32;
     let mut primary_failure: Option<SttFailure> = None;
     let mut primary_breaker: Option<resil::breaker::Open> = None;
+    // The last failure a fallback's vendor call produced (see `synthesize_resiliently`).
+    let mut fallback_failure: Option<VoiceFailure> = None;
     let mut fallback_limited: Option<std::time::Duration> = None;
     let mut fallback_attempted = false;
 
@@ -2538,6 +2598,13 @@ async fn transcribe_resiliently(
             .unwrap_or_else(RetryPolicy::none);
         let label: &str = if hop == 0 { &req.settings.endpoint } else { id };
         let endpoint_ref = &endpoint;
+        // This hop's leg, as its attempts learn it (the model called, the denoiser). It becomes
+        // the call's leg if the hop is the primary, or if it serves (see `Leg`).
+        let hop_leg = std::sync::Mutex::new(Leg {
+            language: stt_language(req.settings, &endpoint),
+            ..deployment_leg(&endpoint)
+        });
+        let hop_leg_ref = &hop_leg;
         let outcome = retry(
             &retry_policy,
             Some(deadline),
@@ -2545,7 +2612,7 @@ async fn transcribe_resiliently(
                 let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                 match tokio::time::timeout(
                     remaining,
-                    transcribe_on(state, req, label, endpoint_ref, advisories),
+                    transcribe_on(state, req, label, endpoint_ref, advisories, hop_leg_ref),
                 )
                 .await
                 {
@@ -2560,6 +2627,10 @@ async fn transcribe_resiliently(
         )
         .await;
         retries_total += outcome.retries;
+        let hop_leg = hop_leg.into_inner().unwrap_or_else(|e| e.into_inner());
+        if hop == 0 || outcome.result.is_ok() {
+            req.spans.set_leg(LegKind::Stt, hop_leg);
+        }
 
         match outcome.result {
             Ok(mut response) => {
@@ -2577,15 +2648,9 @@ async fn transcribe_resiliently(
                     response.headers_mut().insert(SERVED_ENDPOINT_HEADER, v);
                 }
                 if hop > 0 {
+                    // The leg is the fallback's, named above.
                     req.spans
                         .record_text(resilience::FALLBACK_FROM, Some(primary_id));
-                    // The leg is the fallback's: its vendor and model.
-                    req.spans.record_vendor(
-                        leg::STT_VENDOR,
-                        leg::STT_MODEL,
-                        &endpoint.vendor,
-                        endpoint.model.as_deref(),
-                    );
                     response
                         .headers_mut()
                         .insert(FALLBACK_HEADER, header::HeaderValue::from_static("true"));
@@ -2599,6 +2664,9 @@ async fn transcribe_resiliently(
                 }
                 if let SttFailure::Vendor(f) = &failure {
                     warn!(deployment = %id, hop, error = %f, "transcription failed");
+                    if hop > 0 {
+                        fallback_failure = Some(f.clone());
+                    }
                 }
                 if hop == 0 {
                     let surface = !verdict.failover;
@@ -2675,7 +2743,10 @@ async fn transcribe_resiliently(
         }
         None => match primary_breaker {
             Some(open) => {
-                spans.fail(BREAKER_OPEN_CLASS, None, "circuit breaker open");
+                match &fallback_failure {
+                    Some(f) => spans.fail(f.class, f.vendor_status, &f.message),
+                    None => spans.fail(BREAKER_OPEN_CLASS, None, "circuit breaker open"),
+                }
                 breaker_open_response(open)
             }
             None => deadline_exceeded(),
@@ -2691,10 +2762,16 @@ async fn transcribe_on(
     label: &str,
     endpoint: &bud_auth::credentials::VoiceEndpoint,
     base_advisories: &Advisories,
+    hop_leg: &std::sync::Mutex<Leg>,
 ) -> Result<Response, SttFailure> {
     use voice_attrs::{leg, turn};
 
     let _ = state;
+    // What this attempt learns about the leg, from scratch: a retry that fails before the
+    // denoiser must not report the previous attempt's.
+    let note =
+        |update: &dyn Fn(&mut Leg)| update(&mut hop_leg.lock().unwrap_or_else(|e| e.into_inner()));
+    note(&|l| l.noise_suppression = None);
     let settings = req.settings;
     let spans = req.spans;
     let capability = req.capability;
@@ -2803,10 +2880,11 @@ async fn transcribe_on(
                     None,
                 ));
                 // The backend's own answer to "what language was this", where its body says —
-                // `verbose_json` does; the other formats carry none.
+                // `verbose_json` does, as a name (`english`); the other formats carry none. One
+                // spelling per language, whoever answered.
                 spans.record_text(
                     turn::DETECTED_LANGUAGE,
-                    passthrough_language(&answer.body).as_deref(),
+                    normalize_language(passthrough_language(&answer.body).as_deref()).as_deref(),
                 );
                 spans.record_text(turn::VENDOR_REQUEST_ID, answer.vendor_request_id.as_deref());
                 Ok(passthrough_response(
@@ -2902,18 +2980,21 @@ async fn transcribe_on(
         model: endpoint.model.clone().unwrap_or_default(),
     };
     settings_map::apply_stt_flat(&stt_settings, &mut stt_config, &mut advisories);
+    // The model the vendor is called with: `stt.model` replaces the deployment's.
+    let called_model = effective_model(&stt_config.model, endpoint);
+    note(&|l| l.model = called_model.clone());
 
     // N1: decode -> denoise -> transcribe. DeepFilterNet ships in the image and, before this,
     // had exactly one caller -- the LiveKit participant path, which this platform does not
     // deploy. Cleaning a noisy recording before transcription is the one thing it is
     // unambiguously good at, and it needs no vendor support at all.
-    let audio = apply_noise_suppression(
+    let (audio, denoised) = apply_noise_suppression(
         audio,
         stt_settings.noise_suppression == Some(true),
-        spans.turn(),
         &mut advisories,
     )
     .await;
+    note(&|l| l.noise_suppression = Some(denoised));
 
     // C3: the canonical vocabulary and the translation request reach the provider only through
     // the STANDARD config. `translate` is the ROUTE the caller chose, so it wins over a
@@ -2962,7 +3043,10 @@ async fn transcribe_on(
             if let Some(confidence) = t.confidence.filter(|c| c.is_finite()) {
                 spans.record(leg::STT_CONFIDENCE, f64::from(confidence));
             }
-            spans.record_text(turn::DETECTED_LANGUAGE, t.detected_language.as_deref());
+            spans.record_text(
+                turn::DETECTED_LANGUAGE,
+                normalize_language(t.detected_language.as_deref()).as_deref(),
+            );
             spans.record_text(turn::VENDOR_REQUEST_ID, t.vendor_request_id.as_deref());
             // What the provider could not honour — a translation target list on a vendor that
             // cannot translate, a batch knob with no equivalent. Produced since the prerecorded
@@ -4151,7 +4235,10 @@ mod request_field_tests {
 #[cfg(test)]
 mod voice_signal_tests {
     //! FRD-021 Phase 5: what the handlers can say about the audio without decoding it.
-    use super::{output_audio_meta, passthrough_language, upload_format, wav_sample_rate};
+    use super::{
+        output_audio_meta, passthrough_language, upload_format, vendor_declared_rate,
+        wav_sample_rate,
+    };
     use waav_openai_audio::speech::AudioFormat;
 
     fn wav(secs: f64, rate: u32) -> Vec<u8> {
@@ -4174,28 +4261,240 @@ mod voice_signal_tests {
         v
     }
 
-    /// TC-EMIT-09: PCM 24 kHz 48,000 bytes is 1.0 s; a 1.5 s WAV is 1.5 s; mp3 is unknown.
+    /// `frames` silent MPEG-1 Layer III frames at 128 kb/s, 44.1 kHz mono: 417 bytes and 1152
+    /// samples each. Silent because the side information is all zeros; the header is real.
+    fn mp3_frames(frames: usize) -> Vec<u8> {
+        let mut v = Vec::with_capacity(frames * 417);
+        for _ in 0..frames {
+            v.extend_from_slice(&[0xFF, 0xFB, 0x90, 0xC0]);
+            v.resize(v.len() + 413, 0);
+        }
+        v
+    }
+
+    /// `frames` ADTS frames, AAC-LC 44.1 kHz mono, 1024 samples each. The payload is filler: the
+    /// duration comes from the headers, and nothing is decoded.
+    fn adts_frames(frames: usize) -> Vec<u8> {
+        const PAYLOAD: usize = 100;
+        let len = 7 + PAYLOAD;
+        let mut v = Vec::new();
+        for _ in 0..frames {
+            v.extend_from_slice(&[
+                0xFF,
+                0xF1,
+                0x50,
+                0x40 | ((len >> 11) & 0x03) as u8,
+                ((len >> 3) & 0xFF) as u8,
+                (((len & 0x07) << 5) as u8) | 0x1F,
+                0xFC,
+            ]);
+            v.resize(v.len() + PAYLOAD, 0);
+        }
+        v
+    }
+
+    fn crc8(data: &[u8]) -> u8 {
+        data.iter().fold(0u8, |mut c, &b| {
+            c ^= b;
+            for _ in 0..8 {
+                c = if c & 0x80 != 0 {
+                    (c << 1) ^ 0x07
+                } else {
+                    c << 1
+                };
+            }
+            c
+        })
+    }
+
+    fn crc16(data: &[u8]) -> u16 {
+        data.iter().fold(0u16, |mut c, &b| {
+            c ^= u16::from(b) << 8;
+            for _ in 0..8 {
+                c = if c & 0x8000 != 0 {
+                    (c << 1) ^ 0x8005
+                } else {
+                    c << 1
+                };
+            }
+            c
+        })
+    }
+
+    /// A FLAC stream of `frames` CONSTANT (silent) frames of 4096 samples, 48 kHz mono 16-bit.
+    /// `declared` is STREAMINFO's total, 0 meaning unknown — as a streaming encoder writes it.
+    fn flac_frames(frames: u8, declared: u64) -> Vec<u8> {
+        let mut v = b"fLaC".to_vec();
+        v.extend_from_slice(&[0x80, 0, 0, 34]); // the last metadata block: STREAMINFO, 34 bytes
+        v.extend_from_slice(&4096u16.to_be_bytes());
+        v.extend_from_slice(&4096u16.to_be_bytes());
+        v.extend_from_slice(&[0; 6]);
+        v.extend_from_slice(&((48_000u64 << 44) | (15 << 36) | declared).to_be_bytes());
+        v.extend_from_slice(&[0; 16]);
+        for n in 0..frames {
+            let start = v.len();
+            // Sync + fixed blocking, 4096 samples at 48 kHz, mono 16-bit, frame number n.
+            v.extend_from_slice(&[0xFF, 0xF8, 0xCA, 0x08, n]);
+            v.push(crc8(&v[start..]));
+            // A CONSTANT subframe of value 0.
+            v.extend_from_slice(&[0x00, 0x00, 0x00]);
+            let crc = crc16(&v[start..]);
+            v.extend_from_slice(&crc.to_be_bytes());
+        }
+        v
+    }
+
+    /// "Hello from Bud." as Ogg Opus, from ElevenLabs `opus_48000_64`.
+    const HELLO_OPUS: &[u8] =
+        include_bytes!("../../../waav-openai-audio/tests/fixtures/hello.opus");
+
+    /// The Ogg Opus clip length computed by hand: the last page's granule position less the
+    /// pre-skip in `OpusHead`, at 48 kHz — independent of the demuxer under test.
+    fn opus_seconds_by_hand(ogg: &[u8]) -> f64 {
+        let last = ogg
+            .windows(4)
+            .rposition(|w| w == b"OggS")
+            .expect("an Ogg page");
+        let granule = u64::from_le_bytes(ogg[last + 6..last + 14].try_into().unwrap());
+        let head = ogg
+            .windows(8)
+            .position(|w| w == b"OpusHead")
+            .expect("an OpusHead");
+        let pre_skip = u16::from_le_bytes([ogg[head + 10], ogg[head + 11]]);
+        (granule - u64::from(pre_skip)) as f64 / 48_000.0
+    }
+
+    /// TC-EMIT-09: PCM 24 kHz 48,000 bytes is 1.0 s; a 1.5 s WAV is 1.5 s.
     #[test]
-    fn output_duration_is_exact_for_pcm_and_wav_and_absent_for_compressed() {
+    fn output_duration_is_exact_for_pcm_and_wav() {
         assert_eq!(
-            output_audio_meta(&vec![0u8; 48_000], AudioFormat::Pcm, 24_000),
+            output_audio_meta(&vec![0u8; 48_000], AudioFormat::Pcm, 24_000, None),
             (Some(1.0), Some(24_000))
         );
         assert_eq!(
-            output_audio_meta(&wav(1.5, 24_000), AudioFormat::Wav, 24_000),
+            output_audio_meta(&wav(1.5, 24_000), AudioFormat::Wav, 24_000, None),
             (Some(1.5), Some(24_000))
         );
-        let mut mp3 = b"ID3\x04\x00\x00\x00\x00\x00\x00".to_vec();
-        mp3.resize(4_000, 0x55);
+    }
+
+    /// Compressed output is timed from its container: frames × samples-per-frame, at the
+    /// container's own rate — not the 24 kHz the synthesis was labelled with.
+    #[test]
+    fn compressed_output_is_timed_from_its_container() {
+        let (secs, rate) = output_audio_meta(&mp3_frames(100), AudioFormat::Mp3, 24_000, None);
+        assert_eq!(rate, Some(44_100));
+        assert!(
+            (secs.unwrap() - 100.0 * 1152.0 / 44_100.0).abs() < 1e-9,
+            "{secs:?}"
+        );
+
+        // An ID3v2 tag in front changes nothing: ElevenLabs' own, a TSSE frame naming the muxer.
+        let mut tagged =
+            b"ID3\x04\x00\x00\x00\x00\x00\x23TSSE\x00\x00\x00\x0f\x00\x00\x03Lavf60.16.101\x00"
+                .to_vec();
+        tagged.resize(45, 0);
+        tagged.extend(mp3_frames(100));
         assert_eq!(
-            output_audio_meta(&mp3, AudioFormat::Mp3, 24_000),
+            output_audio_meta(&tagged, AudioFormat::Mp3, 24_000, None),
+            (secs, rate)
+        );
+
+        let (secs, rate) = output_audio_meta(&adts_frames(50), AudioFormat::Aac, 24_000, None);
+        assert_eq!(rate, Some(44_100));
+        assert!(
+            (secs.unwrap() - 50.0 * 1024.0 / 44_100.0).abs() < 1e-9,
+            "{secs:?}"
+        );
+
+        for declared in [0, 3 * 4096] {
+            let (secs, rate) =
+                output_audio_meta(&flac_frames(3, declared), AudioFormat::Flac, 24_000, None);
+            assert_eq!(rate, Some(48_000), "declared {declared}");
+            assert!(
+                (secs.unwrap() - 3.0 * 4096.0 / 48_000.0).abs() < 1e-9,
+                "declared {declared}: {secs:?}"
+            );
+        }
+
+        let (secs, rate) = output_audio_meta(HELLO_OPUS, AudioFormat::Opus, 24_000, None);
+        assert_eq!(rate, Some(48_000));
+        let want = opus_seconds_by_hand(HELLO_OPUS);
+        assert!((0.5..5.0).contains(&want), "fixture length {want}");
+        assert!((secs.unwrap() - want).abs() < 1e-9, "{secs:?} vs {want}");
+    }
+
+    /// No container, or one that cannot be read, is no duration — never a guess (DEG-4).
+    #[test]
+    fn unreadable_or_uncontained_output_has_no_duration() {
+        let mut junk = b"ID3\x04\x00\x00\x00\x00\x00\x00".to_vec();
+        junk.resize(4_000, 0x55);
+        assert_eq!(
+            output_audio_meta(&junk, AudioFormat::Mp3, 24_000, None),
             (None, None)
         );
-        // Raw bytes served for a compressed request are not assumed to be PCM.
+        // Raw bytes served for a compressed request are not assumed to be PCM...
         assert_eq!(
-            output_audio_meta(&vec![0u8; 4_800], AudioFormat::Opus, 24_000),
+            output_audio_meta(&vec![0u8; 4_800], AudioFormat::Opus, 24_000, None),
             (None, None)
         );
+        // ...nor read as a container because a sample happens to look like a sync word: a PCM
+        // run of -1 is 0xFFFF, and an invalid bitrate/rate nibble rules it out.
+        assert_eq!(
+            output_audio_meta(&vec![0xFFu8; 4_800], AudioFormat::Mp3, 24_000, None),
+            (None, None)
+        );
+        // A vendor's declared rate never stands in for a clip that could not be read.
+        assert_eq!(
+            output_audio_meta(&junk, AudioFormat::Mp3, 24_000, Some(44_100)),
+            (None, None)
+        );
+        // A truncated clip is timed by the frames that are whole, not by the header's promise.
+        let mp3 = mp3_frames(10);
+        let (secs, _) = output_audio_meta(&mp3[..mp3.len() - 200], AudioFormat::Mp3, 24_000, None);
+        assert!(
+            (secs.unwrap() - 9.0 * 1152.0 / 44_100.0).abs() < 1e-9,
+            "{secs:?}"
+        );
+    }
+
+    #[test]
+    fn elevenlabs_declares_its_compressed_rates() {
+        assert_eq!(
+            vendor_declared_rate("elevenlabs", AudioFormat::Mp3),
+            Some(44_100)
+        );
+        assert_eq!(
+            vendor_declared_rate("ElevenLabs", AudioFormat::Opus),
+            Some(48_000)
+        );
+        // `aac` and `flac` are PCM requests at ElevenLabs: no compressed rate is declared.
+        assert_eq!(vendor_declared_rate("elevenlabs", AudioFormat::Aac), None);
+        assert_eq!(vendor_declared_rate("elevenlabs", AudioFormat::Flac), None);
+        assert_eq!(vendor_declared_rate("deepgram", AudioFormat::Mp3), None);
+    }
+
+    /// The cost of timing a clip: a 30 s MP3 is walked frame by frame (1149 frames). Printed so it
+    /// can be read (`--nocapture`); bounded so a regression to decoding would fail.
+    #[test]
+    fn timing_a_30_second_mp3_is_cheap() {
+        let mp3 = mp3_frames(1149);
+        let started = std::time::Instant::now();
+        let runs = 20;
+        for _ in 0..runs {
+            let (secs, _) = output_audio_meta(&mp3, AudioFormat::Mp3, 24_000, None);
+            assert!((secs.unwrap() - 30.013).abs() < 0.01, "{secs:?}");
+        }
+        let each = started.elapsed() / runs;
+        println!(
+            "container_timing: {} bytes, 30 s MP3: {each:?} per call",
+            mp3.len()
+        );
+        let bound = if cfg!(debug_assertions) {
+            std::time::Duration::from_millis(500)
+        } else {
+            std::time::Duration::from_millis(20)
+        };
+        assert!(each < bound, "{each:?} per call");
     }
 
     #[test]

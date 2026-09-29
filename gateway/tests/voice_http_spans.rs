@@ -84,6 +84,11 @@ const AUDIO_FORMAT: &str = "bud.voice.audio_format";
 const SAMPLE_RATE: &str = "bud.voice.sample_rate";
 const INPUT_AUDIO_BYTES: &str = "bud.voice.input_audio_bytes";
 const VENDOR_REQUEST_ID: &str = "bud.voice.vendor_request_id";
+const SERVED_ENDPOINT_ID: &str = "bud.voice.served_endpoint_id";
+const FALLBACK_FROM: &str = "bud.voice.fallback_from";
+const RETRY_COUNT: &str = "bud.voice.retry_count";
+const GEN_AI_PROVIDER: &str = "gen_ai.provider.name";
+const GEN_AI_MODEL: &str = "gen_ai.request.model";
 
 const REQUEST_BODY: &str = "http.request.body";
 const RESPONSE_BODY: &str = "http.response.body";
@@ -200,6 +205,10 @@ const DG_TTS_EP: &str = "7d3c9a10-5555-4a2b-8c3d-000000000005";
 const NO_BASE_EP: &str = "7d3c9a10-6666-4a2b-8c3d-000000000006";
 /// A voice endpoint in the table that NO key's allowlist names and nothing publishes.
 const UNLISTED_EP: &str = "7d3c9a10-7777-4a2b-8c3d-000000000007";
+/// Fallback deployments (FRD-022 §6.4): reached by id from a primary's `fallback_models`, never by
+/// alias, so no allowlist names them.
+const FB_TTS_EP: &str = "7d3c9a10-8888-4a2b-8c3d-000000000008";
+const FB_STT_EP: &str = "7d3c9a10-9999-4a2b-8c3d-000000000009";
 
 /// A customer (`client_app`) key: its own project holds no voice deployment, so its map is empty.
 const CLIENT_KEY: &str = "bud_client_voice_http_spans_customer";
@@ -612,6 +621,22 @@ async fn gateway(table: Vec<(&str, Json)>) -> axum::Router {
 
 /// [`gateway`] plus raw control-plane keys (another key's blob, the published overlay).
 async fn gateway_with(table: Vec<(&str, Json)>, extra: &[(String, String)]) -> axum::Router {
+    gateway_full(table, extra, None).await
+}
+
+/// [`gateway`] with the deployment policies (rate limits, circuit breakers) switched on.
+async fn gateway_with_policies(
+    table: Vec<(&str, Json)>,
+    policies: Arc<waav_gateway::core::deployment_policy::DeploymentPolicies>,
+) -> axum::Router {
+    gateway_full(table, &[], Some(policies)).await
+}
+
+async fn gateway_full(
+    table: Vec<(&str, Json)>,
+    extra: &[(String, String)],
+    policies: Option<Arc<waav_gateway::core::deployment_policy::DeploymentPolicies>>,
+) -> axum::Router {
     let store = Arc::new(bud_auth::MemoryStore::new());
     for (key, value) in extra {
         store.set(key, value);
@@ -641,11 +666,11 @@ async fn gateway_with(table: Vec<(&str, Json)>, extra: &[(String, String)]) -> a
     plane.boot().await.expect("plane boots");
 
     let mut state = AppState::new(config()).await;
-    Arc::get_mut(&mut state)
-        .expect("the state is not shared yet")
-        .bud_mode = Some(
+    let owned = Arc::get_mut(&mut state).expect("the state is not shared yet");
+    owned.bud_mode = Some(
         waav_gateway::auth::bud_mode::BudMode::for_plane(plane).expect("bud mode over the plane"),
     );
+    owned.policies = policies;
     router(state)
 }
 
@@ -946,6 +971,13 @@ fn check_root(
         text(turn, TTS_VENDOR).or(text(turn, STT_VENDOR)).as_deref(),
     );
     f.eq_text(ctx, root, "gen_ai.request.model", vendor_model);
+    // One value per key: a re-recorded field is exported twice, and ClickHouse reads either.
+    for span in [root, turn] {
+        let twice = duplicated(span);
+        f.check(twice.is_empty(), || {
+            format!("{ctx}: `{}` exports {twice:?} more than once", span.name)
+        });
+    }
     // R-11: the InferenceFact stage MVs are ServiceName-agnostic.
     for s in spans {
         let leaked: Vec<String> = keys(s)
@@ -1343,7 +1375,7 @@ async fn unpriced_calls_record_no_cost() {
             true,
         ),
         (
-            "tts per second, mp3 (duration unknown)",
+            "tts per second, mp3 (duration unreadable)",
             tts_entry(&base(&tts_mp3), Some(pricing("second", 0.001, 1)), None),
             true,
         ),
@@ -1882,12 +1914,26 @@ async fn tts_ttfb_is_the_vendors_first_audio() {
     assert_eq!(number(turn, OUTPUT_AUDIO_SECONDS), Some(1.0));
 }
 
-/// TC-EMIT-09: WAV duration from its header; a compressed format stays unknown (DEG-4).
+/// `frames` silent MPEG-1 Layer III frames at 128 kb/s, 44.1 kHz mono: 417 bytes and 1152
+/// samples each.
+fn mp3_frames(frames: usize) -> Vec<u8> {
+    let mut v = Vec::with_capacity(frames * 417);
+    for _ in 0..frames {
+        v.extend_from_slice(&[0xFF, 0xFB, 0x90, 0xC0]);
+        v.resize(v.len() + 413, 0);
+    }
+    v
+}
+
+/// TC-EMIT-09: WAV duration from its header; a compressed format's from its container, demuxed
+/// but not decoded; an unreadable one stays unknown (DEG-4).
 #[tokio::test]
 async fn tts_output_duration_for_wav_and_compressed_formats() {
     let cap = Capture::install();
     let wav = tts_vendor(wav_secs(1.5, 24_000), "audio/wav").await;
-    let mp3 = tts_vendor(
+    let mp3 = tts_vendor(mp3_frames(100), "audio/mpeg").await;
+    let opus = tts_vendor(HELLO_OPUS.to_vec(), "audio/ogg").await;
+    let junk = tts_vendor(
         {
             let mut b = b"ID3\x04\x00\x00\x00\x00\x00\x00".to_vec();
             b.extend(std::iter::repeat_n(0x55u8, 4_000));
@@ -1899,7 +1945,16 @@ async fn tts_output_duration_for_wav_and_compressed_formats() {
     let mut f = Findings::default();
     for (ctx, vendor, format, want_secs, want_rate) in [
         ("wav", &wav, "wav", Some(1.5), Some(24_000.0)),
-        ("mp3", &mp3, "mp3", None, None),
+        (
+            "mp3",
+            &mp3,
+            "mp3",
+            Some(100.0 * 1152.0 / 44_100.0),
+            Some(44_100.0),
+        ),
+        // "Hello from Bud." from ElevenLabs: 88,320 samples at 48 kHz after the pre-skip.
+        ("opus", &opus, "opus", Some(1.84), Some(48_000.0)),
+        ("unreadable mp3", &junk, "mp3", None, None),
     ] {
         let app = gateway(vec![(TTS_EP, tts_entry(&base(vendor), None, None))]).await;
         let reply = speech(
@@ -3315,6 +3370,378 @@ async fn child_prerecorded_vendor_spans() {
                 format!("`{}`.{} carries the vendor key", s.name, kv.key)
             });
         }
+    }
+    f.assert_none();
+}
+
+// =============================================================================================
+// One value per key: fallbacks, breakers (FRD-022 §6.4-6.5 on the FRD-021 record)
+// =============================================================================================
+
+/// Every value `span` exports under `key`, in order. [`text`] reads only the FIRST — which is how a
+/// duplicated key hid: `tracing-opentelemetry` appends a second `KeyValue` for a re-recorded field,
+/// and ClickHouse's `SpanAttributes['key']` then reads either.
+fn values(span: &SpanData, key: &str) -> Vec<String> {
+    span.attributes
+        .iter()
+        .filter(|kv| kv.key.as_str() == key)
+        .map(|kv| kv.value.as_str().into_owned())
+        .collect()
+}
+
+/// Keys `span` exports more than once.
+fn duplicated(span: &SpanData) -> Vec<String> {
+    let mut all: Vec<String> = keys(span);
+    all.dedup();
+    all.into_iter()
+        .filter(|k| values(span, k).len() > 1)
+        .collect()
+}
+
+/// A self-hosted vendor that fails every speech and transcription request with `status`.
+async fn failing_vendor(status: u16) -> MockServer {
+    let vendor = MockServer::start().await;
+    for route in [
+        "/v1/audio/speech",
+        "/v1/audio/transcriptions",
+        "/v1/audio/translations",
+    ] {
+        Mock::given(method("POST"))
+            .and(path(route))
+            .respond_with(
+                ResponseTemplate::new(status).set_body_json(json!({"detail": "vendor is down"})),
+            )
+            .mount(&vendor)
+            .await;
+    }
+    vendor
+}
+
+/// A self-hosted STT vendor answering verbose JSON with `language` as given.
+async fn stt_vendor_saying(language: &str) -> MockServer {
+    let vendor = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/audio/transcriptions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(json!({
+                    "task": "transcribe",
+                    "language": language,
+                    "duration": 1.0,
+                    "text": "hola",
+                    "segments": [],
+                })),
+        )
+        .mount(&vendor)
+        .await;
+    vendor
+}
+
+/// The primary TTS deployment, failing, with a fallback of another vendor, model and voice.
+fn tts_fallback_table(down: &MockServer, up: &MockServer) -> Vec<(&'static str, Json)> {
+    let mut primary = tts_entry(&base(down), None, None);
+    primary["voice"] = json!("af_heart");
+    primary["fallback_models"] = json!([FB_TTS_EP]);
+    let fallback = json!({
+        "vendor": "openai_compatible",
+        "api_base": base(up),
+        "endpoints": ["text_to_speech"],
+        "model": "kokoro-v2",
+        "voice": "af_bella",
+        "pricing": pricing("character", 30.0, 1_000_000),
+    });
+    vec![(TTS_EP, primary), (FB_TTS_EP, fallback)]
+}
+
+fn stt_fallback_table(down: &MockServer, up: &MockServer) -> Vec<(&'static str, Json)> {
+    let mut primary = stt_entry(&base(down), None);
+    primary["fallback_models"] = json!([FB_STT_EP]);
+    let fallback = json!({
+        "vendor": "openai_compatible",
+        "api_base": base(up),
+        "endpoints": ["audio_transcription", "audio_translation"],
+        "model": "whisper-v3-turbo",
+    });
+    vec![(STT_EP, primary), (FB_STT_EP, fallback)]
+}
+
+/// A synthesis a fallback served exports ONE value per key — the served deployment's vendor, model
+/// and voice — and one GenAI name each on the root. Before, the primary's were recorded when the
+/// turn opened and the fallback's again when it served, and both were exported.
+#[tokio::test]
+async fn a_fallback_served_synthesis_records_each_key_once() {
+    let cap = Capture::install();
+    let down = failing_vendor(503).await;
+    let up = tts_vendor(wav_secs(1.0, 24_000), "audio/wav").await;
+    let app = gateway(tts_fallback_table(&down, &up)).await;
+    let reply = speech(
+        &app,
+        json!({"model": "tts-a", "input": "Hello there.", "response_format": "wav"}),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    assert_eq!(
+        reply
+            .headers
+            .get("x-bud-fallback")
+            .map(|v| v.to_str().unwrap()),
+        Some("true"),
+        "the fallback must have served"
+    );
+    let spans = cap.take().await;
+    let turn = only(&spans, "voice.turn");
+    let root = root_of(&spans);
+    for (key, want) in [
+        (TTS_VENDOR, "openai_compatible"),
+        (TTS_MODEL, "kokoro-v2"),
+        (TTS_VOICE, "af_bella"),
+        (SERVED_ENDPOINT_ID, FB_TTS_EP),
+        (FALLBACK_FROM, TTS_EP),
+        (RETRY_COUNT, "0"),
+        (ENDPOINT_ID, TTS_EP),
+    ] {
+        assert_eq!(values(turn, key), [want], "voice.turn {key}");
+    }
+    assert_eq!(values(root, GEN_AI_PROVIDER), ["openai_compatible"]);
+    assert_eq!(values(root, GEN_AI_MODEL), ["kokoro-v2"]);
+    assert_eq!(duplicated(turn), Vec::<String>::new(), "voice.turn");
+    assert_eq!(duplicated(root), Vec::<String>::new(), "the root");
+    // Billed at the fallback's price (FRD-022 §6.4), once.
+    assert_eq!(values(turn, PRICING_UNIT), ["character"]);
+}
+
+/// The same for a transcription: the served deployment's vendor and model, once each.
+#[tokio::test]
+async fn a_fallback_served_transcription_records_each_key_once() {
+    let cap = Capture::install();
+    let down = failing_vendor(503).await;
+    let up = stt_vendor().await;
+    let app = gateway(stt_fallback_table(&down, &up)).await;
+    let reply = upload(
+        &app,
+        "/v1/audio/transcriptions",
+        &[("model", "stt-a"), ("response_format", "verbose_json")],
+        ("a.wav", "audio/wav", &wav_secs(1.0, 16_000)),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    let spans = cap.take().await;
+    let turn = only(&spans, "voice.turn");
+    let root = root_of(&spans);
+    for (key, want) in [
+        (STT_VENDOR, "openai_compatible"),
+        (STT_MODEL, "whisper-v3-turbo"),
+        (SERVED_ENDPOINT_ID, FB_STT_EP),
+        (FALLBACK_FROM, STT_EP),
+        (DETECTED_LANGUAGE, "es"),
+    ] {
+        assert_eq!(values(turn, key), [want], "voice.turn {key}");
+    }
+    assert_eq!(values(root, GEN_AI_PROVIDER), ["openai_compatible"]);
+    assert_eq!(values(root, GEN_AI_MODEL), ["whisper-v3-turbo"]);
+    assert_eq!(duplicated(turn), Vec::<String>::new(), "voice.turn");
+    assert_eq!(duplicated(root), Vec::<String>::new(), "the root");
+}
+
+/// Every hop failed: the call is attributed to the primary, once, with the primary's failure.
+#[tokio::test]
+async fn a_chain_that_fails_everywhere_keeps_the_primary_leg_once() {
+    let cap = Capture::install();
+    let down = failing_vendor(503).await;
+    let also_down = failing_vendor(500).await;
+    let app = gateway(tts_fallback_table(&down, &also_down)).await;
+    let reply = speech(
+        &app,
+        json!({"model": "tts-a", "input": "Hello there.", "response_format": "wav"}),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::BAD_GATEWAY, "{}", reply.text());
+    let spans = cap.take().await;
+    let turn = only(&spans, "voice.turn");
+    for (key, want) in [
+        (TTS_VENDOR, "self_hosted"),
+        (TTS_MODEL, TTS_VENDOR_MODEL),
+        (TTS_VOICE, "af_heart"),
+        (ERROR_TYPE, "vendor_5xx"),
+        (VENDOR_STATUS, "503"),
+    ] {
+        assert_eq!(values(turn, key), [want], "voice.turn {key}");
+    }
+    assert!(values(turn, SERVED_ENDPOINT_ID).is_empty());
+    assert_eq!(duplicated(turn), Vec::<String>::new(), "voice.turn");
+    assert_eq!(
+        duplicated(root_of(&spans)),
+        Vec::<String>::new(),
+        "the root"
+    );
+}
+
+fn open_breaker(
+    policies: &waav_gateway::core::deployment_policy::DeploymentPolicies,
+    deployment: &str,
+) {
+    for _ in 0..5 {
+        policies
+            .breakers()
+            .deployment
+            .record_failure(deployment, deployment);
+    }
+}
+
+/// A call an open circuit breaker refused made no vendor call: `circuit_open`, with no vendor
+/// status — not `vendor_5xx`, which blamed the vendor for a request it never received.
+#[tokio::test]
+async fn an_open_breaker_is_circuit_open_not_a_vendor_failure() {
+    let cap = Capture::install();
+    let tts = tts_vendor(wav_secs(1.0, 24_000), "audio/wav").await;
+    let stt = stt_vendor().await;
+    let policies = waav_gateway::core::deployment_policy::DeploymentPolicies::local();
+    open_breaker(&policies, TTS_EP);
+    open_breaker(&policies, STT_EP);
+    let app = gateway_with_policies(
+        vec![
+            (TTS_EP, tts_entry(&base(&tts), None, None)),
+            (STT_EP, stt_entry(&base(&stt), None)),
+        ],
+        policies,
+    )
+    .await;
+
+    let mut f = Findings::default();
+    let reply = speech(
+        &app,
+        json!({"model": "tts-a", "input": "Hello there.", "voice": "George", "response_format": "wav"}),
+    )
+    .await;
+    f.check(reply.status == StatusCode::SERVICE_UNAVAILABLE, || {
+        format!("tts: HTTP {} {}", reply.status, reply.text())
+    });
+    let spans = cap.take().await;
+    check_failure(
+        &mut f,
+        "tts breaker open",
+        &spans,
+        "/v1/audio/speech",
+        &reply,
+        "circuit_open",
+        None,
+    );
+
+    let reply = upload(
+        &app,
+        "/v1/audio/transcriptions",
+        &[("model", "stt-a")],
+        ("a.wav", "audio/wav", &wav_secs(1.0, 16_000)),
+    )
+    .await;
+    f.check(reply.status == StatusCode::SERVICE_UNAVAILABLE, || {
+        format!("stt: HTTP {} {}", reply.status, reply.text())
+    });
+    let spans = cap.take().await;
+    check_failure(
+        &mut f,
+        "stt breaker open",
+        &spans,
+        "/v1/audio/transcriptions",
+        &reply,
+        "circuit_open",
+        None,
+    );
+    f.check(
+        tts.received_requests().await.unwrap_or_default().is_empty()
+            && stt.received_requests().await.unwrap_or_default().is_empty(),
+        || "a vendor was called through an open breaker".to_string(),
+    );
+    f.assert_none();
+}
+
+/// The primary's breaker is open and a fallback DID call its vendor, which failed: that real
+/// failure is what the call records — its class and the vendor's status — not "circuit open".
+#[tokio::test]
+async fn behind_an_open_breaker_a_fallbacks_real_failure_is_recorded() {
+    let cap = Capture::install();
+    let primary_tts = tts_vendor(wav_secs(1.0, 24_000), "audio/wav").await;
+    let primary_stt = stt_vendor().await;
+    let fallback = failing_vendor(500).await;
+    let policies = waav_gateway::core::deployment_policy::DeploymentPolicies::local();
+    open_breaker(&policies, TTS_EP);
+    open_breaker(&policies, STT_EP);
+    let mut table = tts_fallback_table(&primary_tts, &fallback);
+    table.extend(stt_fallback_table(&primary_stt, &fallback));
+    let app = gateway_with_policies(table, policies).await;
+
+    let mut f = Findings::default();
+    let reply = speech(
+        &app,
+        json!({"model": "tts-a", "input": "Hello there.", "response_format": "wav"}),
+    )
+    .await;
+    let spans = cap.take().await;
+    check_failure(
+        &mut f,
+        "tts fallback 500",
+        &spans,
+        "/v1/audio/speech",
+        &reply,
+        "vendor_5xx",
+        Some(500),
+    );
+    let reply = upload(
+        &app,
+        "/v1/audio/transcriptions",
+        &[("model", "stt-a")],
+        ("a.wav", "audio/wav", &wav_secs(1.0, 16_000)),
+    )
+    .await;
+    let spans = cap.take().await;
+    check_failure(
+        &mut f,
+        "stt fallback 500",
+        &spans,
+        "/v1/audio/transcriptions",
+        &reply,
+        "vendor_5xx",
+        Some(500),
+    );
+    f.check(
+        !fallback
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
+        || "the fallback was never called".to_string(),
+    );
+    f.assert_none();
+}
+
+/// `bud.voice.detected_language` is one spelling per language, whoever answered: a Whisper-style
+/// backend's `Spanish` and ElevenLabs' `spa` are both `es`.
+#[tokio::test]
+async fn the_detected_language_is_normalized() {
+    let cap = Capture::install();
+    let mut f = Findings::default();
+    for (said, want) in [
+        ("Spanish", "es"),
+        ("spa", "es"),
+        ("es-MX", "es"),
+        ("en", "en"),
+    ] {
+        let vendor = stt_vendor_saying(said).await;
+        let app = gateway(vec![(STT_EP, stt_entry(&base(&vendor), None))]).await;
+        let reply = upload(
+            &app,
+            "/v1/audio/transcriptions",
+            &[("model", "stt-a"), ("response_format", "verbose_json")],
+            ("a.wav", "audio/wav", &wav_secs(1.0, 16_000)),
+        )
+        .await;
+        f.check(reply.status == StatusCode::OK, || {
+            format!("{said}: HTTP {} {}", reply.status, reply.text())
+        });
+        let spans = cap.take().await;
+        let turn = only(&spans, "voice.turn");
+        f.eq_text(said, turn, DETECTED_LANGUAGE, Some(want));
     }
     f.assert_none();
 }

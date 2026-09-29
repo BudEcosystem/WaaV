@@ -15,7 +15,7 @@ use crate::core::stt::google::streaming::{
     KEEPALIVE_INTERVAL_SECS, KEEPALIVE_SILENCE_DURATION_MS, KeepaliveTracker, MAX_AUDIO_CHUNK_SIZE,
     build_audio_request, build_config_request, chunk_audio, chunk_audio_vec,
     determine_speech_final, generate_silence_audio, get_confidence, handle_grpc_error,
-    handle_streaming_response, map_encoding_to_proto, to_prost_duration,
+    handle_streaming_response, map_encoding_to_proto, reported_confidence, to_prost_duration,
 };
 
 #[test]
@@ -234,6 +234,18 @@ fn test_handle_streaming_response_with_results() {
     assert!(result.is_final);
     assert!(result.is_speech_final);
     assert_eq!(result.confidence, 0.95);
+    assert_eq!(result.vendor_confidence, Some(0.95));
+}
+
+#[test]
+fn test_reported_confidence_is_googles_own_on_final_results_only() {
+    assert_eq!(reported_confidence(0.95, true), Some(0.95));
+    assert_eq!(reported_confidence(1.0, true), Some(1.0));
+    // proto3's default: Google did not set one.
+    assert_eq!(reported_confidence(0.0, true), None);
+    assert_eq!(reported_confidence(0.95, false), None);
+    assert_eq!(reported_confidence(-0.5, true), None);
+    assert_eq!(reported_confidence(f32::NAN, true), None);
 }
 
 #[test]
@@ -526,6 +538,7 @@ fn test_handle_streaming_response_interim_result() {
     assert!(!result.is_final);
     assert!(!result.is_speech_final);
     assert_eq!(result.confidence, 0.0);
+    assert_eq!(result.vendor_confidence, None);
 }
 
 #[test]

@@ -281,6 +281,17 @@ impl SpeechPhrase {
         self.duration as f64 / 10_000_000.0
     }
 
+    /// The confidence Azure itself reported: the top NBest entry's, which only the detailed
+    /// output format carries. `None` for the simple format — [`confidence`](Self::confidence)'s
+    /// 1.0 there is an assumption, and analytics must not count it (FRD-021 DEG-5).
+    pub fn reported_confidence(&self) -> Option<f32> {
+        self.nbest
+            .as_ref()?
+            .first()
+            .map(|best| best.confidence as f32)
+            .filter(|c| c.is_finite() && (0.0..=1.0).contains(c))
+    }
+
     /// Convert to the standard STTResult format.
     ///
     /// Returns `None` if recognition was not successful (NoMatch, Error, etc.).
@@ -293,11 +304,15 @@ impl SpeechPhrase {
         let transcript = self.transcript()?.to_string();
         let confidence = self.confidence();
 
-        Some(STTResult::new(
+        let mut result = STTResult::new(
             transcript, true, // is_final
             true, // is_speech_final
             confidence,
-        ))
+        );
+        // The batch HTTP route replays a file through this client, so this is also where its
+        // `bud.voice.stt.confidence` comes from (STTResult::vendor_confidence).
+        result.vendor_confidence = self.reported_confidence();
+        Some(result)
     }
 }
 
@@ -927,6 +942,30 @@ mod tests {
         assert!(result.is_final);
         assert!(result.is_speech_final);
         assert!((result.confidence - 1.0).abs() < 0.001);
+        // The simple format carries no confidence: the 1.0 above is assumed, not reported.
+        assert_eq!(result.vendor_confidence, None);
+    }
+
+    #[test]
+    fn test_speech_phrase_detailed_reports_the_vendor_confidence() {
+        let phrase: SpeechPhrase = serde_json::from_str(
+            r#"{
+            "RecognitionStatus": "Success",
+            "Offset": 0,
+            "Duration": 0,
+            "NBest": [
+                {"Confidence": 0.87, "Lexical": "hello world", "ITN": "hello world",
+                 "MaskedITN": "hello world", "Display": "Hello world."},
+                {"Confidence": 0.42, "Lexical": "hollow world", "ITN": "hollow world",
+                 "MaskedITN": "hollow world", "Display": "Hollow world."}
+            ]
+        }"#,
+        )
+        .unwrap();
+        let result = phrase.to_stt_result().unwrap();
+        assert_eq!(result.transcript, "Hello world.");
+        let reported = result.vendor_confidence.expect("the top NBest confidence");
+        assert!((reported - 0.87).abs() < 1e-6, "{reported}");
     }
 
     #[test]
