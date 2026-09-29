@@ -220,10 +220,23 @@ pub(crate) fn azure_openai_url_schemes() -> &'static [&'static str] {
 /// legitimate here. (An Azure Private Link endpoint resolves to a private address and is
 /// refused; that deployment shape would need an explicit allowance.)
 ///
-/// Resolves DNS synchronously: call it at construction, as the crate's other SSRF checks are,
-/// or off the async workers.
+/// Resolves DNS synchronously, so run it off the async workers (`spawn_blocking`), as
+/// transcription and [`SelfHostedTTS`]'s `connect` do. On a worker it holds that worker for the
+/// whole lookup, and every other session on the replica waits with it.
 pub fn validate_azure_openai_url(url: &str) -> Result<(), String> {
     crate::core::net::validate_url_for_ssrf(url, azure_openai_url_schemes())
+}
+
+/// Everything [`validate_azure_openai_url`] checks that needs no DNS: https, blocked hostnames
+/// and IP literals. Safe in a synchronous constructor on the request path.
+pub fn validate_azure_openai_url_without_dns(url: &str) -> Result<(), String> {
+    crate::core::net::validate_url_for_ssrf_without_dns(url, azure_openai_url_schemes())
+}
+
+fn azure_openai_ssrf_rejection(msg: String) -> crate::core::tts::TTSError {
+    crate::core::tts::TTSError::InvalidConfiguration(format!(
+        "azure_openai api_base rejected (SSRF protection): {msg}"
+    ))
 }
 
 /// Attach an Azure OpenAI key as `api-key`, marked sensitive so it never renders in a `Debug`.
@@ -338,7 +351,9 @@ impl SelfHostedTTS {
     /// [`AZURE_OPENAI_DEFAULT_API_VERSION`]. Everything that can be wrong with the target --
     /// no base, no key, no deployment, not https, a private or loopback host -- is refused HERE,
     /// where the message can name the field, rather than surfacing later as a transport error
-    /// that reads like Azure is down.
+    /// that reads like Azure is down. The one exception is a DNS name that RESOLVES to a private
+    /// address: resolving blocks, and this runs on a tokio worker, so that check waits for
+    /// `connect`, which runs it off the workers before anything is dialled.
     pub fn new_azure_openai(config: TTSConfig, api_version: Option<&str>) -> TTSResult<Self> {
         use crate::core::tts::TTSError::InvalidConfiguration;
 
@@ -363,11 +378,7 @@ impl SelfHostedTTS {
         }
         let url = azure_openai_audio_url(base, &config.model, AzureAudioRoute::Speech, api_version)
             .map_err(InvalidConfiguration)?;
-        validate_azure_openai_url(&url).map_err(|msg| {
-            InvalidConfiguration(format!(
-                "azure_openai api_base rejected (SSRF protection): {msg}"
-            ))
-        })?;
+        validate_azure_openai_url_without_dns(&url).map_err(azure_openai_ssrf_rejection)?;
 
         Ok(Self::with_upstream(config, Upstream::AzureOpenAi { url }))
     }
@@ -419,6 +430,19 @@ impl BaseTTS for SelfHostedTTS {
 
     async fn connect(&mut self) -> TTSResult<()> {
         let url = self.request_builder.target_url();
+        if let Upstream::AzureOpenAi { url: target } = &self.request_builder.upstream {
+            // The resolve-then-validate half of the SSRF gate, off the async workers
+            // (the constructor ran the rest). Transcription does the same (`transcribe.rs`).
+            let target = target.clone();
+            tokio::task::spawn_blocking(move || validate_azure_openai_url(&target))
+                .await
+                .map_err(|e| {
+                    crate::core::tts::TTSError::InternalError(format!(
+                        "the Azure OpenAI endpoint check did not complete: {e}"
+                    ))
+                })?
+                .map_err(azure_openai_ssrf_rejection)?;
+        }
         self.provider
             .generic_connect_with_config(&url, &self.request_builder.config)
             .await
@@ -840,6 +864,39 @@ mod tests {
             );
         }
         assert!(SelfHostedTTS::new_azure_openai(azure_config(AZ), None).is_ok());
+    }
+
+    /// A DNS name that resolves to a private address is still refused -- by `connect`, off the
+    /// async workers -- not by the constructor, which runs on a tokio worker where a blocking
+    /// `getaddrinfo` stalls every session on the replica (~25 speech req/s per pod at ~70 ms a
+    /// lookup, measured). `ip6-localhost` is in every Debian/Docker `/etc/hosts`, so no network.
+    #[test]
+    fn a_name_resolving_to_a_private_address_is_refused_at_connect_not_construction() {
+        use std::net::ToSocketAddrs;
+        let _env = crate::core::net::ssrf_env_lock();
+        const HOST: &str = "ip6-localhost";
+        let resolves_to_loopback = (HOST, 0u16)
+            .to_socket_addrs()
+            .map(|mut a| a.any(|s| s.ip().is_loopback()))
+            .unwrap_or(false);
+        if !resolves_to_loopback {
+            eprintln!("skipped: {HOST} does not resolve to loopback on this host");
+            return;
+        }
+
+        let mut tts =
+            SelfHostedTTS::new_azure_openai(azure_config(&format!("https://{HOST}")), None)
+                .expect("the constructor makes no DNS lookup, so a DNS name passes it");
+        let err = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(tts.connect())
+            .expect_err("connect must refuse a host that resolves to loopback");
+        assert!(
+            err.to_string().contains("SSRF protection"),
+            "the refusal must name the SSRF guard, got: {err}"
+        );
     }
 
     #[test]

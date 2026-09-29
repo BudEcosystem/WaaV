@@ -172,12 +172,16 @@ type AsyncErrorCallback = Box<
         + Sync,
 >;
 
+/// Pooled and shared by every prerecorded upload (`core::net::shared_http_client`): a client per
+/// request threw its connections away, so each call paid DNS + TCP + TLS to the vendor.
 fn http_client() -> Result<Client, reqwest::Error> {
-    crate::core::net::ssrf_protected_client_builder(crate::core::net::HTTP_URL_SCHEMES)
-        .timeout(HTTP_TIMEOUT)
-        .pool_max_idle_per_host(4)
-        .pool_idle_timeout(Duration::from_secs(90))
-        .build()
+    crate::core::net::shared_http_client("stt-prerecorded", || {
+        crate::core::net::ssrf_protected_client_builder(crate::core::net::HTTP_URL_SCHEMES)
+            .timeout(HTTP_TIMEOUT)
+            .pool_idle_timeout(Duration::from_secs(90))
+            .http1_only()
+            .build()
+    })
 }
 
 /// Buffers PCM and transcribes it against a vendor's prerecorded API on close.

@@ -283,7 +283,17 @@ pub struct ReqManagerConfig {
     /// Longest a caller waits for a free slot before [`Saturated`] (FRD-022 §6.6). `None` waits
     /// forever — the unbounded queue this replaced.
     pub acquire_timeout: Option<Duration>,
+    /// Speak HTTP/1.1 only: every in-flight request gets its own keep-alive connection from the
+    /// pool. For a manager SHARED by many concurrent long requests (one per deployment), where
+    /// HTTP/2 would put them all on one connection and queue whatever exceeds the vendor's
+    /// `SETTINGS_MAX_CONCURRENT_STREAMS` -- a hidden ceiling at 5-10 s per request.
+    pub http1_only: bool,
 }
+
+/// Upper bound on [`ReqManagerConfig::max_concurrent_requests`]. A per-deployment manager is
+/// shared by every one-shot request to that deployment on the replica, so at 5-10 s of vendor
+/// time per request a four-digit bound is ordinary load, not a runaway.
+pub const MAX_CONCURRENT_REQUESTS: usize = 10_000;
 
 /// The pool stayed full for the whole bounded wait. Local back-pressure: the caller is told
 /// 503 + `Retry-After: 1` rather than joining an unbounded queue.
@@ -329,6 +339,7 @@ impl Default for ReqManagerConfig {
             retry_max_delay: Duration::from_millis(500),
             per_request_timeout: Duration::from_secs(30), // 30s per request for TTS
             acquire_timeout: Some(Duration::from_secs(2)),
+            http1_only: false,
         }
     }
 }
@@ -351,6 +362,7 @@ impl ReqManagerConfig {
             retry_max_delay: Duration::from_millis(300),
             per_request_timeout: Duration::from_secs(2),
             acquire_timeout: Some(Duration::from_secs(2)),
+            http1_only: false,
         }
     }
 
@@ -371,6 +383,7 @@ impl ReqManagerConfig {
             retry_max_delay: Duration::from_secs(1),
             per_request_timeout: Duration::from_secs(5),
             acquire_timeout: Some(Duration::from_secs(2)),
+            http1_only: false,
         }
     }
 }
@@ -379,7 +392,8 @@ impl ReqManager {
     /// Create a new request manager with the specified maximum concurrent requests
     ///
     /// # Arguments
-    /// * `max_concurrent_requests` - Maximum number of concurrent requests allowed (1-1000)
+    /// * `max_concurrent_requests` - Maximum number of concurrent requests allowed
+    ///   (1..=[`MAX_CONCURRENT_REQUESTS`])
     ///
     /// # Returns
     /// A new `ReqManager` instance with default configuration
@@ -418,8 +432,11 @@ impl ReqManager {
         if config.max_concurrent_requests == 0 {
             return Err("max_concurrent_requests must be greater than 0".into());
         }
-        if config.max_concurrent_requests > 1000 {
-            return Err("max_concurrent_requests must not exceed 1000".into());
+        if config.max_concurrent_requests > MAX_CONCURRENT_REQUESTS {
+            return Err(format!(
+                "max_concurrent_requests must not exceed {MAX_CONCURRENT_REQUESTS}"
+            )
+            .into());
         }
         if config.max_retries == u32::MAX {
             return Err("max_retries must be less than u32::MAX".into());
@@ -438,21 +455,26 @@ impl ReqManager {
 
     /// Create an optimized HTTP/2 client with advanced connection pooling
     fn create_optimized_client(config: &ReqManagerConfig) -> Result<Client, reqwest::Error> {
-        crate::core::net::ssrf_protected_client_builder(crate::core::net::HTTP_URL_SCHEMES)
-            .http2_initial_stream_window_size(config.http2_stream_window_size)
-            .http2_initial_connection_window_size(config.http2_connection_window_size)
-            .http2_keep_alive_interval(Some(config.http2_keep_alive_interval))
-            .http2_keep_alive_timeout(config.http2_keep_alive_timeout)
-            .http2_keep_alive_while_idle(true)
-            .http2_adaptive_window(true)
-            .pool_idle_timeout(None)
-            .pool_max_idle_per_host(config.pool_max_idle_per_host)
-            .tcp_keepalive(config.tcp_keepalive)
-            .tcp_nodelay(true)
-            .connect_timeout(config.connect_timeout)
-            .timeout(config.request_timeout)
-            .user_agent("waav-gateway-req-manager/2.0")
-            .build()
+        let builder =
+            crate::core::net::ssrf_protected_client_builder(crate::core::net::HTTP_URL_SCHEMES)
+                .http2_initial_stream_window_size(config.http2_stream_window_size)
+                .http2_initial_connection_window_size(config.http2_connection_window_size)
+                .http2_keep_alive_interval(Some(config.http2_keep_alive_interval))
+                .http2_keep_alive_timeout(config.http2_keep_alive_timeout)
+                .http2_keep_alive_while_idle(true)
+                .http2_adaptive_window(true)
+                .pool_idle_timeout(None)
+                .pool_max_idle_per_host(config.pool_max_idle_per_host)
+                .tcp_keepalive(config.tcp_keepalive)
+                .tcp_nodelay(true)
+                .connect_timeout(config.connect_timeout)
+                .timeout(config.request_timeout)
+                .user_agent("waav-gateway-req-manager/2.0");
+        if config.http1_only {
+            builder.http1_only().build()
+        } else {
+            builder.build()
+        }
     }
 
     /// Acquire a client from the pool with automatic metrics tracking
@@ -823,8 +845,113 @@ impl ReqManager {
     }
 }
 
+/// One [`ReqManager`] per deployment, shared by every one-shot request to it on this replica.
+///
+/// A one-shot synthesis builds its provider per request, and a provider with no manager builds
+/// its own: a new HTTP client (DNS, TCP and TLS to the vendor on every call) plus a warm-up that
+/// sends the vendor a burst of unauthenticated `HEAD`s before the real request -- measured at 4
+/// per speech call, and ~4 ms of CPU per request, which made CPU the per-pod ceiling. Handing the
+/// provider a cached manager skips both: connections are pooled and reused across requests, and
+/// `generic_connect_with_config` does not warm up a manager it was given.
+///
+/// Keyed by whatever makes two deployments need different transports (the caller's key: vendor,
+/// endpoint base, timeouts). Credentials are NOT part of the transport -- every request carries
+/// its own -- so two deployments on the same endpoint may share a pool.
+#[derive(Default)]
+pub struct DeploymentReqManagers {
+    managers: dashmap::DashMap<String, Arc<ReqManager>>,
+}
+
+impl DeploymentReqManagers {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The manager for `key`, built from `config` the first time. HTTP/1.1 only (see
+    /// [`ReqManagerConfig::http1_only`]), with an idle pool as deep as the permit count so a
+    /// steady load keeps its connections.
+    pub async fn get_or_create(
+        &self,
+        key: &str,
+        config: ReqManagerConfig,
+    ) -> Result<Arc<ReqManager>, Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(existing) = self.managers.get(key) {
+            return Ok(existing.clone());
+        }
+        let config = ReqManagerConfig {
+            http1_only: true,
+            pool_max_idle_per_host: config.max_concurrent_requests,
+            ..config
+        };
+        let built = Arc::new(ReqManager::with_config(config).await?);
+        // Two first requests may race to build; both get the one that landed in the map.
+        Ok(self
+            .managers
+            .entry(key.to_string())
+            .or_insert(built)
+            .clone())
+    }
+
+    /// Deployments with a live manager (for tests and diagnostics).
+    pub fn len(&self) -> usize {
+        self.managers.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.managers.is_empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn a_deployment_manager_is_built_once_and_shared() {
+        let cache = DeploymentReqManagers::new();
+        let cfg = || ReqManagerConfig {
+            max_concurrent_requests: 2048,
+            ..Default::default()
+        };
+        let a = cache
+            .get_or_create("azure_openai|https://a", cfg())
+            .await
+            .unwrap();
+        let again = cache
+            .get_or_create("azure_openai|https://a", cfg())
+            .await
+            .unwrap();
+        let b = cache
+            .get_or_create("azure_openai|https://b", cfg())
+            .await
+            .unwrap();
+        assert!(
+            Arc::ptr_eq(&a, &again),
+            "the same deployment reuses its manager"
+        );
+        assert!(!Arc::ptr_eq(&a, &b), "another endpoint gets its own");
+        assert_eq!(cache.len(), 2);
+        assert_eq!(a.max_concurrent_requests, 2048, "the permit count survives");
+        assert!(a.config.http1_only, "a shared manager is HTTP/1.1 only");
+        assert_eq!(a.config.pool_max_idle_per_host, 2048);
+    }
+
+    #[tokio::test]
+    async fn the_permit_ceiling_is_max_concurrent_requests() {
+        let at = |n| ReqManagerConfig {
+            max_concurrent_requests: n,
+            ..Default::default()
+        };
+        assert!(
+            ReqManager::with_config(at(MAX_CONCURRENT_REQUESTS))
+                .await
+                .is_ok()
+        );
+        assert!(
+            ReqManager::with_config(at(MAX_CONCURRENT_REQUESTS + 1))
+                .await
+                .is_err()
+        );
+    }
     use super::*;
     use std::io::ErrorKind;
     use std::sync::atomic::{AtomicUsize, Ordering};
