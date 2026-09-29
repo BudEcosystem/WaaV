@@ -111,6 +111,21 @@ pub fn validate_url_for_ssrf(url: &str, allowed_schemes: &[&str]) -> Result<(), 
     validate_url_for_ssrf_inner(url, allowed_schemes, loopback_endpoints_allowed())
 }
 
+/// [`validate_url_for_ssrf`] without the resolve-then-validate step: the scheme allowlist, the
+/// blocked hostnames and every IP-literal spelling, and nothing that does I/O.
+///
+/// For a synchronous constructor on the request path. `validate_url_for_ssrf` resolves a DNS
+/// name with a blocking `getaddrinfo`, and a constructor that runs on a tokio worker holds that
+/// worker for the whole lookup (~70 ms for an external name under Kubernetes' `ndots:5`), so
+/// every other session on the replica waits with it. Pair this with the full check off the
+/// workers (`tokio::task::spawn_blocking`) before the first dial.
+pub fn validate_url_for_ssrf_without_dns(
+    url: &str,
+    allowed_schemes: &[&str],
+) -> Result<(), String> {
+    ssrf_dns_host(url, allowed_schemes, loopback_endpoints_allowed()).map(|_| ())
+}
+
 /// Build a reqwest redirect policy that validates every redirect target before
 /// following it. Use this for requests whose original URL passed
 /// [`validate_url_for_ssrf`]; reqwest follows redirects by default, and an
@@ -158,6 +173,23 @@ fn validate_url_for_ssrf_inner(
     allowed_schemes: &[&str],
     loopback_allowed: bool,
 ) -> Result<(), String> {
+    match ssrf_dns_host(url, allowed_schemes, loopback_allowed)? {
+        // Resolve-then-validate: when the host is a DNS name (not an IP literal),
+        // resolve it and reject if ANY resolved address is private/internal. This
+        // closes DNS-rebinding / TOCTOU holes where a public-looking hostname
+        // resolves to a private/metadata address.
+        Some(host) => validate_resolved_host_for_ssrf(&host),
+        None => Ok(()),
+    }
+}
+
+/// Every check [`validate_url_for_ssrf_inner`] makes that needs no I/O. `Ok(Some(host))` when
+/// the host is a DNS name still to be resolved, `Ok(None)` when nothing is left to check.
+fn ssrf_dns_host(
+    url: &str,
+    allowed_schemes: &[&str],
+    loopback_allowed: bool,
+) -> Result<Option<String>, String> {
     let parsed = url::Url::parse(url).map_err(|e| format!("invalid URL '{}': {}", url, e))?;
 
     // Scheme allowlist — applies even when the loopback escape hatch is on.
@@ -172,7 +204,7 @@ fn validate_url_for_ssrf_inner(
 
     // Test/local-mock escape hatch (opt-in, OFF by default).
     if loopback_allowed {
-        return Ok(());
+        return Ok(None);
     }
 
     let host = parsed
@@ -194,7 +226,7 @@ fn validate_url_for_ssrf_inner(
                 ip
             ));
         }
-        return Ok(());
+        return Ok(None);
     }
 
     // Bracketed IPv6 literal.
@@ -208,7 +240,7 @@ fn validate_url_for_ssrf_inner(
             ));
         }
         // An IP literal — never DNS-resolved.
-        return Ok(());
+        return Ok(None);
     }
 
     // DECIMAL/integer IPv4 literal (e.g. `http://3232235777` == 192.168.1.1).
@@ -225,14 +257,10 @@ fn validate_url_for_ssrf_inner(
                 host, ip
             ));
         }
-        return Ok(());
+        return Ok(None);
     }
 
-    // Resolve-then-validate: when the host is a DNS name (not an IP literal),
-    // resolve it and reject if ANY resolved address is private/internal. This
-    // closes DNS-rebinding / TOCTOU holes where a public-looking hostname
-    // resolves to a private/metadata address.
-    validate_resolved_host_for_ssrf(host)
+    Ok(Some(host.to_string()))
 }
 
 /// Resolve a DNS hostname and reject if any resolved IP is private/internal.
@@ -542,6 +570,36 @@ mod tests {
         assert!(
             validate_url_for_ssrf("https://unresolvable-host.invalid/path", HTTP_SCHEMES).is_ok()
         );
+    }
+
+    /// The DNS-free variant makes every check but the resolution: a name that resolves to a
+    /// private address passes it (the full check refuses it), everything else is refused alike.
+    #[test]
+    fn without_dns_skips_only_the_resolution() {
+        let _guard = env_guard();
+        for bad in [
+            "ftp://example.com/x",
+            "https://127.0.0.1/x",
+            "https://10.0.0.5/x",
+            "https://[::1]/x",
+            "https://3232235777/x",
+            "https://localhost/x",
+            "https://169.254.169.254/x",
+        ] {
+            assert!(
+                validate_url_for_ssrf_without_dns(bad, HTTP_SCHEMES).is_err(),
+                "{bad}"
+            );
+            assert!(validate_url_for_ssrf(bad, HTTP_SCHEMES).is_err(), "{bad}");
+        }
+        assert!(validate_url_for_ssrf_without_dns("https://8.8.8.8/x", HTTP_SCHEMES).is_ok());
+        // `localhost.` (trailing dot) is not on the blocked list but resolves to loopback.
+        if validate_resolved_host_for_ssrf("localhost.").is_err() {
+            assert!(
+                validate_url_for_ssrf_without_dns("https://localhost./x", HTTP_SCHEMES).is_ok()
+            );
+            assert!(validate_url_for_ssrf("https://localhost./x", HTTP_SCHEMES).is_err());
+        }
     }
 
     /// Loopback gate OFF (default): private targets rejected via the public,
