@@ -221,10 +221,10 @@ impl CoreState {
             ..Default::default()
         };
         if let Some(secs) = config.connection_timeout {
-            req_config.connect_timeout = Duration::from_secs(secs);
+            req_config.connect_timeout = std::time::Duration::from_secs(secs);
         }
         if let Some(secs) = config.request_timeout {
-            req_config.request_timeout = Duration::from_secs(secs);
+            req_config.request_timeout = std::time::Duration::from_secs(secs);
         }
         match self
             .deployment_tts_req_managers
