@@ -22,7 +22,9 @@ use crate::core::turn_detect::TurnDetector;
 #[cfg(feature = "turn-detect")]
 use crate::core::turn_detect::{TurnDetector, TurnDetectorConfig};
 use crate::state::SipHooksState;
-use crate::utils::req_manager::ReqManager;
+use crate::utils::req_manager::{
+    DeploymentReqManagers, MAX_CONCURRENT_REQUESTS, ReqManager, ReqManagerConfig,
+};
 
 /// Core-specific shared state for the application.
 ///
@@ -32,6 +34,10 @@ use crate::utils::req_manager::ReqManager;
 pub struct CoreState {
     /// HTTP request managers for TTS providers - key is provider name (e.g., "deepgram")
     pub tts_req_managers: Arc<RwLock<HashMap<String, Arc<ReqManager>>>>,
+    /// One pooled request manager per deployment for one-shot synthesis (`/v1/audio/speech`)
+    /// with a vendor that has no shared per-vendor manager above -- see
+    /// [`CoreState::deployment_tts_req_manager`].
+    pub deployment_tts_req_managers: Arc<DeploymentReqManagers>,
     /// Unified cache store (in-memory by default)
     pub cache: Arc<CacheStore>,
     /// Turn detector for determining end of user speech turns
@@ -160,6 +166,7 @@ impl CoreState {
 
         Ok(Arc::new(Self {
             tts_req_managers: Arc::new(RwLock::new(tts_req_managers)),
+            deployment_tts_req_managers: Arc::new(DeploymentReqManagers::new()),
             cache,
             turn_detector,
             sip_hooks_state,
@@ -183,6 +190,53 @@ impl CoreState {
     /// Get a TTS request manager for a specific provider
     pub async fn get_tts_req_manager(&self, provider: &str) -> Option<Arc<ReqManager>> {
         self.tts_req_managers.read().await.get(provider).cloned()
+    }
+
+    /// The pooled manager for one-shot synthesis against this deployment's endpoint, built on
+    /// first use. `None` only if the manager cannot be built, in which case the provider falls
+    /// back to building its own as before.
+    ///
+    /// Keyed by vendor, endpoint base and the transport timeouts -- what makes two deployments
+    /// need different connections. The credential is not part of it: each request carries its
+    /// own. The permit count is [`tts_max_concurrent_per_deployment`], and like the per-vendor
+    /// knob it bounds transport concurrency on this replica only; vendor-ACCOUNT concurrency is
+    /// the deployment's `max_concurrent`.
+    pub async fn deployment_tts_req_manager(
+        &self,
+        config: &crate::core::tts::TTSConfig,
+    ) -> Option<Arc<ReqManager>> {
+        let key = format!(
+            "{}|{}|{:?}|{:?}",
+            config.provider.trim().to_ascii_lowercase(),
+            config
+                .api_base
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or_default(),
+            config.connection_timeout,
+            config.request_timeout,
+        );
+        let mut req_config = ReqManagerConfig {
+            max_concurrent_requests: tts_max_concurrent_per_deployment(),
+            ..Default::default()
+        };
+        if let Some(secs) = config.connection_timeout {
+            req_config.connect_timeout = Duration::from_secs(secs);
+        }
+        if let Some(secs) = config.request_timeout {
+            req_config.request_timeout = Duration::from_secs(secs);
+        }
+        match self
+            .deployment_tts_req_managers
+            .get_or_create(&key, req_config)
+            .await
+        {
+            Ok(manager) => Some(manager),
+            Err(e) => {
+                tracing::warn!(error = %e, "could not build the per-deployment TTS request manager");
+                None
+            }
+        }
     }
 
     #[cfg(feature = "turn-detect")]
@@ -348,6 +402,19 @@ fn parse_env_positive_usize(name: &str) -> Result<Option<usize>, String> {
 
 /// `WAAV_TTS_MAX_CONCURRENT_PER_VENDOR` (default 64, 1–1000): concurrent vendor requests per TTS
 /// vendor per replica. It was a hard-coded 4 with an unbounded queue behind it.
+/// Permits of each per-deployment one-shot TTS manager
+/// ([`CoreState::deployment_tts_req_manager`]): `WAAV_TTS_MAX_CONCURRENT_PER_DEPLOYMENT`,
+/// 1..=[`MAX_CONCURRENT_REQUESTS`], default 4096. It is shared by every speech request to the
+/// deployment on this replica, so it has to hold the replica's whole load for that deployment:
+/// at 5 s of vendor time per request, 4096 is ~800 requests a second before the bounded wait.
+pub fn tts_max_concurrent_per_deployment() -> usize {
+    std::env::var("WAAV_TTS_MAX_CONCURRENT_PER_DEPLOYMENT")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| (1..=MAX_CONCURRENT_REQUESTS).contains(n))
+        .unwrap_or(4096)
+}
+
 pub fn tts_max_concurrent_per_vendor() -> usize {
     std::env::var("WAAV_TTS_MAX_CONCURRENT_PER_VENDOR")
         .ok()

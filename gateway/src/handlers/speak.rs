@@ -774,7 +774,14 @@ pub async fn synthesize_once_standard(
 
     // Connection pooling and per-provider metrics come from the shared manager; without this
     // the OpenAI route would open a fresh connection per request while `/speak` reuses them.
-    if let Some(req_manager) = state.get_tts_req_manager(&tts_config.provider).await {
+    // A pooled manager for the provider to use instead of building its own per request: the
+    // shared per-vendor one when the vendor has it, otherwise this deployment's. Without either
+    // every call paid DNS + TCP + TLS to the vendor plus a warm-up burst of HEADs.
+    let req_manager = match state.get_tts_req_manager(&tts_config.provider).await {
+        Some(shared) => Some(shared),
+        None => state.deployment_tts_req_manager(&tts_config).await,
+    };
+    if let Some(req_manager) = req_manager {
         if let Some(p) = provider.get_provider() {
             p.set_req_manager(req_manager.clone()).await;
         }

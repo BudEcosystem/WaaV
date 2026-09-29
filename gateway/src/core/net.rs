@@ -102,6 +102,29 @@ fn loopback_flag_enabled(value: Option<&str>) -> Result<bool, String> {
     }
 }
 
+/// A process-wide pooled HTTP client for vendor calls, one per `key`, built by `build` on first
+/// use and reused after.
+///
+/// A `reqwest::Client` IS its connection pool, so building one per request -- which the audio
+/// paths did -- throws the pool away every time: each call paid DNS, TCP and TLS to the vendor.
+/// Reusing it keeps keep-alive connections to each vendor host (one pool per host inside the
+/// client), which is per-deployment reuse without keying on deployments. Key by whatever changes
+/// the client's configuration (schemes, timeout). Build these HTTP/1.1-only: many long requests
+/// on one shared HTTP/2 connection queue behind the vendor's concurrent-stream limit.
+pub fn shared_http_client(
+    key: &str,
+    build: impl FnOnce() -> Result<reqwest::Client, reqwest::Error>,
+) -> Result<reqwest::Client, reqwest::Error> {
+    static CLIENTS: std::sync::LazyLock<dashmap::DashMap<String, reqwest::Client>> =
+        std::sync::LazyLock::new(dashmap::DashMap::new);
+    if let Some(client) = CLIENTS.get(key) {
+        return Ok(client.clone());
+    }
+    let built = build()?;
+    // Two first calls may race to build; both get the one that landed in the map.
+    Ok(CLIENTS.entry(key.to_string()).or_insert(built).clone())
+}
+
 /// Validate a URL for SSRF (Server-Side Request Forgery) protection.
 ///
 /// `allowed_schemes` must be lowercase (the URL's scheme is lowercased before
@@ -411,6 +434,30 @@ pub(crate) fn ssrf_env_lock() -> std::sync::MutexGuard<'static, ()> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_shared_client_is_built_once_per_key() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let builds = AtomicUsize::new(0);
+        let build = || {
+            builds.fetch_add(1, Ordering::SeqCst);
+            reqwest::Client::builder().http1_only().build()
+        };
+        let key = "net-tests-shared-client-once";
+        shared_http_client(key, build).unwrap();
+        shared_http_client(key, build).unwrap();
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            1,
+            "the second call reuses the first client"
+        );
+        shared_http_client("net-tests-shared-client-other", build).unwrap();
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            2,
+            "another key builds its own"
+        );
+    }
     use super::*;
 
     const HTTP_SCHEMES: &[&str] = &["http", "https"];

@@ -783,15 +783,20 @@ pub async fn transcribe_self_hosted(
         transcription_url(api_base)
     };
 
-    let client = reqwest::Client::builder()
-        .timeout(OVERALL_DEADLINE)
-        .build()
-        .map_err(|e| {
-            VoiceFailure::new(
-                VoiceErrorType::Internal,
-                format!("could not build the http client: {e}"),
-            )
-        })?;
+    // One pooled client for every self-hosted backend: connections to each host are kept and
+    // reused instead of a new DNS + TCP + TLS per upload (`core::net::shared_http_client`).
+    let client = crate::core::net::shared_http_client("stt-self-hosted", || {
+        reqwest::Client::builder()
+            .timeout(OVERALL_DEADLINE)
+            .http1_only()
+            .build()
+    })
+    .map_err(|e| {
+        VoiceFailure::new(
+            VoiceErrorType::Internal,
+            format!("could not build the http client: {e}"),
+        )
+    })?;
 
     let fields = openai_transcription_fields(model, settings);
     let call = upload_call(
@@ -871,15 +876,24 @@ pub(crate) async fn transcribe_azure_openai(
             ))
         })?;
 
-    let client = crate::core::net::ssrf_protected_client_builder(azure_openai_url_schemes())
-        .timeout(OVERALL_DEADLINE)
-        .build()
-        .map_err(|e| {
-            VoiceFailure::new(
-                VoiceErrorType::Internal,
-                format!("could not build the http client: {e}"),
-            )
-        })?;
+    // Pooled and reused across uploads (`core::net::shared_http_client`); keyed by the scheme
+    // set because the redirect policy is built from it.
+    let schemes = azure_openai_url_schemes();
+    let client = crate::core::net::shared_http_client(
+        &format!("stt-azure-openai|{}", schemes.join(",")),
+        || {
+            crate::core::net::ssrf_protected_client_builder(schemes)
+                .timeout(OVERALL_DEADLINE)
+                .http1_only()
+                .build()
+        },
+    )
+    .map_err(|e| {
+        VoiceFailure::new(
+            VoiceErrorType::Internal,
+            format!("could not build the http client: {e}"),
+        )
+    })?;
 
     let model = deployment.trim();
     let fields = openai_transcription_fields(model, settings);

@@ -473,6 +473,14 @@ impl AppState {
         self.core_state.get_tts_req_manager(provider).await
     }
 
+    /// See [`crate::core::state::CoreState::deployment_tts_req_manager`].
+    pub async fn deployment_tts_req_manager(
+        &self,
+        config: &crate::core::tts::TTSConfig,
+    ) -> Option<Arc<ReqManager>> {
+        self.core_state.deployment_tts_req_manager(config).await
+    }
+
     /// Get a handle to the application's cache store
     pub fn cache(&self) -> Arc<CacheStore> {
         self.core_state.cache.clone()
