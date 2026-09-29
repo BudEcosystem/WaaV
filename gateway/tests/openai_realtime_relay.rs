@@ -222,6 +222,9 @@ struct Behaviour {
     /// `session.created`, answer a commit with CUMULATIVE
     /// `conversation.item.input_audio_transcription.updated` events, never `rate_limits.updated`.
     xai: bool,
+    /// Close the socket with this code after this many client frames (the vendor ending the
+    /// session itself).
+    close_after: Option<(usize, u16)>,
 }
 
 impl Default for Behaviour {
@@ -236,6 +239,7 @@ impl Default for Behaviour {
             transcription_usage: None,
             usage: documented_usage(),
             xai: false,
+            close_after: None,
         }
     }
 }
@@ -332,6 +336,20 @@ impl MockVendor {
                         if b.go_silent_after.is_some_and(|n| received >= n) {
                             // Stop reading: no more pongs, no more answers.
                             tokio::time::sleep(Duration::from_secs(120)).await;
+                            return;
+                        }
+                        if let Some((n, code)) = b.close_after
+                            && received >= n
+                        {
+                            use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+                            let _ = ws
+                                .close(Some(CloseFrame {
+                                    code: code.into(),
+                                    reason: "session over".into(),
+                                }))
+                                .await;
+                            // Drain until the peer's close answer, as a real server does.
+                            while let Some(Ok(_)) = ws.next().await {}
                             return;
                         }
                         let kind = v["type"].as_str().unwrap_or_default().to_string();
@@ -1354,6 +1372,72 @@ async fn tc_life_03_dead_vendor() {
     let (errors, code) = until_close(&mut c).await;
     assert_eq!(code, Some(1011));
     assert!(errors.contains(&"upstream_error".to_string()), "{errors:?}");
+}
+
+/// A vendor that closes its socket NORMALLY ends the session: `vendor_close` with the vendor's
+/// code relayed, no `error` event, and a session span that is not ERROR. An abnormal close is still
+/// `upstream_error` + 1011, ERROR.
+#[tokio::test]
+async fn a_vendors_normal_close_is_vendor_close_not_an_upstream_error() {
+    let cap = Capture::install();
+    for (n, (code, want_reason, want_client_code, want_errors, want_error_status)) in [
+        (
+            1000u16,
+            "vendor_close",
+            1000u16,
+            Vec::<String>::new(),
+            false,
+        ),
+        (1001, "vendor_close", 1001, vec![], false),
+        (
+            1011,
+            "upstream_error",
+            1011,
+            vec!["upstream_error".to_string()],
+            true,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let vendor = MockVendor::start(Behaviour {
+            close_after: Some((1, code)),
+            ..Default::default()
+        })
+        .await;
+        let gw = gateway(Setup {
+            endpoints: vec![ep(
+                "rt",
+                &format!("a1a1a1a1-0000-4000-8000-00000000015{n}"),
+                rt_entry(&vendor, json!({})),
+            )],
+            ..Default::default()
+        })
+        .await;
+        let mut c = connect(&gw, "rt").await;
+        until_type(&mut c, "session.created").await;
+        send(&mut c, json!({"type": "input_audio_buffer.clear"})).await;
+        let (errors, client_code) = until_close(&mut c).await;
+        assert_eq!(errors, want_errors, "vendor close {code}");
+        assert_eq!(client_code, Some(want_client_code), "vendor close {code}");
+        let session = cap.wait_for("voice.session", n + 1).await.remove(n);
+        assert_eq!(
+            text(&session, "bud.voice.session.end_reason").as_deref(),
+            Some(want_reason),
+            "vendor close {code}"
+        );
+        assert_eq!(
+            number(&session, "bud.voice.session.close_code"),
+            Some(f64::from(want_client_code)),
+            "vendor close {code}"
+        );
+        assert_eq!(
+            matches!(session.status, opentelemetry::trace::Status::Error { .. }),
+            want_error_status,
+            "vendor close {code}: {:?}",
+            session.status
+        );
+    }
 }
 
 /// TC-LIFE-05 — maximum length: a warning, then `session_expired` + 1000.

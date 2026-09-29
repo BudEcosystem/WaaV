@@ -36,10 +36,15 @@ pub enum VoiceErrorType {
     Config,
     /// Anything else. Bud.
     Internal,
+    /// Refused by an open circuit breaker: no vendor was called for this request, because the
+    /// deployment's vendor failed recently (FRD-022 §6.5). Operator. Never carries a vendor status —
+    /// there was no vendor response — and is not `vendor_5xx`, which would blame the vendor for a
+    /// call it never received.
+    CircuitOpen,
 }
 
 impl VoiceErrorType {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::InvalidRequest,
         Self::InputDecode,
         Self::VendorRejected,
@@ -51,6 +56,7 @@ impl VoiceErrorType {
         Self::Network,
         Self::Config,
         Self::Internal,
+        Self::CircuitOpen,
     ];
 
     /// The wire value, as budmetrics and both UIs read it.
@@ -67,6 +73,7 @@ impl VoiceErrorType {
             Self::Network => "network",
             Self::Config => "config",
             Self::Internal => "internal",
+            Self::CircuitOpen => "circuit_open",
         }
     }
 
@@ -182,6 +189,7 @@ mod tests {
                 "network",
                 "config",
                 "internal",
+                "circuit_open",
             ]
         );
     }

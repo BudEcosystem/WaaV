@@ -360,6 +360,14 @@ pub(super) fn determine_speech_final(event_type: SpeechEventType, is_final: bool
 /// Get confidence score, returning 0.0 for interim results.
 /// Called on every result - inlined for performance.
 #[inline]
+/// The confidence Google itself reported, for analytics (`STTResult::vendor_confidence`,
+/// FRD-021 M-B4): on FINAL results only — interim ones carry none — and never proto3's `0.0`,
+/// which means "not set", not "certainly wrong".
+pub(super) fn reported_confidence(confidence: f32, is_final: bool) -> Option<f32> {
+    (is_final && confidence.is_finite() && confidence > 0.0 && confidence <= 1.0)
+        .then_some(confidence)
+}
+
 pub(super) fn get_confidence(confidence: f32, is_final: bool) -> f32 {
     if is_final && confidence > 0.0 {
         confidence
@@ -507,12 +515,15 @@ pub(super) fn handle_streaming_response(
             continue;
         }
 
-        let stt_result = STTResult::new(
+        let mut stt_result = STTResult::new(
             top_alt.transcript.clone(),
             result.is_final,
             determine_speech_final(event_type, result.is_final),
             get_confidence(top_alt.confidence, result.is_final),
         );
+        // The batch HTTP route replays a file through this streaming client, so this is also
+        // where its `bud.voice.stt.confidence` comes from.
+        stt_result.vendor_confidence = reported_confidence(top_alt.confidence, result.is_final);
 
         debug!(
             transcript = %stt_result.transcript,

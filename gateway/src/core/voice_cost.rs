@@ -11,8 +11,8 @@
 //! | `minute`    | output audio seconds / 60     | audio seconds / 60   |
 //! | `request`   | 1                             | 1                    |
 //!
-//! No pricing, a unit that does not apply, a unit whose quantity is unknown (compressed TTS
-//! output, DEG-4), or `per_units == 0` → no cost at all, never `0.0`: the UI shows such a call as
+//! No pricing, a unit that does not apply, a unit whose quantity is unknown (TTS output whose
+//! container cannot be read, DEG-4), or `per_units == 0` → no cost at all, never `0.0`: the UI shows such a call as
 //! unpriced (M-A9), and a zero would read as "free".
 
 use bud_auth::VoicePricing;

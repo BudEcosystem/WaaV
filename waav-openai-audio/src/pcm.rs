@@ -419,6 +419,150 @@ pub fn wav_duration_secs(bytes: &[u8]) -> Option<f64> {
     Some((len / align) as f64 / rate as f64)
 }
 
+/// How long a compressed clip lasts, and its sample rate, as its CONTAINER declares them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ContainerTiming {
+    pub seconds: f64,
+    /// The stream's rate from the container's own headers, when it states one.
+    pub sample_rate: Option<u32>,
+}
+
+/// The container [`container_timing`] reads, from the first bytes alone — never from a label,
+/// which a vendor can get wrong in either direction.
+fn timed_container(b: &[u8]) -> Option<&'static str> {
+    if b.starts_with(b"ID3") {
+        return Some("mp3");
+    }
+    if b.starts_with(b"OggS") {
+        return Some("ogg");
+    }
+    if b.starts_with(b"fLaC") {
+        return Some("flac");
+    }
+    if b.get(4..8) == Some(b"ftyp") {
+        return Some("m4a");
+    }
+    if b.len() >= 4 && b[0] == 0xFF {
+        // ADTS: a 12-bit sync, layer 00, a sampling-frequency index that exists.
+        if b[1] & 0xF6 == 0xF0 && (b[2] >> 2) & 0x0F < 13 {
+            return Some("aac");
+        }
+        // An MPEG audio frame: 11-bit sync, and no reserved version, layer, bitrate or rate — the
+        // checks that keep a run of raw PCM starting 0xFFFF from reading as MP3.
+        if b[1] & 0xE0 == 0xE0
+            && b[1] & 0x18 != 0x08
+            && b[1] & 0x06 != 0
+            && b[2] & 0xF0 != 0xF0
+            && b[2] & 0xF0 != 0
+            && b[2] & 0x0C != 0x0C
+        {
+            return Some("mp3");
+        }
+    }
+    None
+}
+
+/// The duration of an MP3, AAC (ADTS), FLAC, Ogg (Opus/Vorbis/FLAC) or MP4/M4A clip, and its
+/// sample rate, from the container alone — no sample is decoded (FRD-021 WP-5.2).
+///
+/// * **Ogg** — the last page's granule position, which the reader seeks to: exact, and no packet
+///   is walked. Opus counts its pre-skip in the granule position; the clip is what follows it.
+/// * **everything else** — the packets are walked and their durations summed. Each is exact (an
+///   MPEG frame is 1152 or 576 samples, an ADTS frame 1024, a FLAC frame says its block size);
+///   the reader's own `n_frames` is NOT used, because for MP3 without a Xing header and for ADTS
+///   it is an estimate from the bitrate. Encoder delay and padding are subtracted where the
+///   container declares them (a LAME tag).
+///
+/// `None` whenever that cannot be done with certainty: bytes that do not open with one of those
+/// containers (raw PCM served for a compressed request is not guessed at), a stream that errors
+/// part-way (the packets summed so far are not the clip), no time base. A guessed number here
+/// would feed billing (`output_audio_seconds`, DEG-4); absent is the honest answer.
+pub fn container_timing(bytes: &[u8]) -> Option<ContainerTiming> {
+    let container = timed_container(bytes)?;
+    // The bytes are a vendor's. A demuxer panic must cost this attribute, not the request.
+    std::panic::catch_unwind(|| demux_timing(bytes, container))
+        .ok()
+        .flatten()
+}
+
+fn demux_timing(bytes: &[u8], container: &'static str) -> Option<ContainerTiming> {
+    use symphonia::core::codecs::{CODEC_TYPE_NULL, CODEC_TYPE_OPUS};
+    use symphonia::core::errors::Error as SymphoniaError;
+    use symphonia::core::formats::FormatOptions;
+    use symphonia::core::io::MediaSourceStream;
+    use symphonia::core::meta::MetadataOptions;
+    use symphonia::core::probe::Hint;
+    use symphonia::core::units::TimeBase;
+
+    let ogg = container == "ogg";
+    let mss = MediaSourceStream::new(
+        Box::new(std::io::Cursor::new(bytes.to_vec())),
+        Default::default(),
+    );
+    let mut hint = Hint::new();
+    hint.with_extension(container);
+    // Gapless for Ogg only: there it makes the end-of-stream length the last granule position,
+    // without the final packet's padding. Elsewhere it would trim packets against an `n_frames`
+    // that may be an estimate.
+    let options = FormatOptions {
+        enable_gapless: ogg,
+        ..Default::default()
+    };
+    let mut format = symphonia::default::get_probe()
+        .format(&hint, mss, &options, &MetadataOptions::default())
+        .ok()?
+        .format;
+    let track = format
+        .tracks()
+        .iter()
+        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)?;
+    let (track_id, params) = (track.id, track.codec_params.clone());
+    let sample_rate = params.sample_rate.filter(|r| *r > 0);
+    let time_base = params
+        .time_base
+        .or_else(|| sample_rate.map(|r| TimeBase::new(1, r)))?;
+    let delay = u64::from(params.delay.unwrap_or(0));
+
+    let frames = match params.n_frames {
+        Some(n) if ogg => n,
+        _ => {
+            let mut total = 0u64;
+            loop {
+                match format.next_packet() {
+                    Ok(p) if p.track_id() == track_id => total = total.checked_add(p.dur)?,
+                    Ok(_) => {}
+                    // The normal end of a stream in Symphonia is an unexpected-EOF I/O error.
+                    Err(SymphoniaError::IoError(e))
+                        if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+                    {
+                        break;
+                    }
+                    Err(_) => return None,
+                }
+            }
+            if ogg {
+                total
+            } else {
+                total.saturating_sub(delay + u64::from(params.padding.unwrap_or(0)))
+            }
+        }
+    };
+    let frames = if ogg && params.codec == CODEC_TYPE_OPUS {
+        frames.saturating_sub(delay)
+    } else {
+        frames
+    };
+    if frames == 0 {
+        return None;
+    }
+    let time = time_base.calc_time(frames);
+    let seconds = time.seconds as f64 + time.frac;
+    (seconds.is_finite() && seconds > 0.0).then_some(ContainerTiming {
+        seconds,
+        sample_rate,
+    })
+}
+
 fn decode_wav(bytes: &[u8]) -> Result<PcmAudio, AudioError> {
     if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
         return Err(invalid("not a RIFF/WAVE file"));

@@ -19,7 +19,7 @@ use tracing::Span;
 use crate::core::voice_error::VoiceErrorType;
 use crate::observability::trace_redact;
 use crate::observability::vendor_span::{self, VendorScope};
-use crate::observability::voice_attrs::turn;
+use crate::observability::voice_attrs::{leg, turn};
 
 /// OTel HTTP semantic-convention names the SERVER root carries.
 pub mod http {
@@ -269,6 +269,54 @@ impl Drop for FormCapture<'_> {
     }
 }
 
+/// Which vendor leg an HTTP call runs: the names its vendor, model and voice are recorded under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LegKind {
+    Tts,
+    Stt,
+}
+
+impl LegKind {
+    fn vendor_key(self) -> &'static str {
+        match self {
+            Self::Tts => leg::TTS_VENDOR,
+            Self::Stt => leg::STT_VENDOR,
+        }
+    }
+
+    fn model_key(self) -> &'static str {
+        match self {
+            Self::Tts => leg::TTS_MODEL,
+            Self::Stt => leg::STT_MODEL,
+        }
+    }
+}
+
+/// The deployment a call is attributed to, as its leg attributes describe it.
+///
+/// Held on [`VoiceSpans`] and written ONCE, when the call ends — never as the call goes. A fallback
+/// chain (FRD-022 §6.4) learns which deployment served only at its end, and recording the primary
+/// up front and the served hop again is not an overwrite: `tracing-opentelemetry` appends a second
+/// `KeyValue` for a re-recorded field, the exporter ships both, and ClickHouse's
+/// `SpanAttributes['<key>']` reads whichever map entry won — live rows paired one hop's vendor
+/// with the other's model. So the handler names the leg as it learns it ([`VoiceSpans::set_leg`],
+/// last write wins) and the span receives one value per key: the SERVED deployment on success, the
+/// primary when every hop failed.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Leg {
+    pub vendor: String,
+    /// The model the vendor was CALLED with — the deployment's own, or the one its settings
+    /// substitute (`stt.model`) — not merely the one the deployment was saved with.
+    pub model: Option<String>,
+    /// TTS: the voice the synthesis ran with. Ignored for STT.
+    pub voice: Option<String>,
+    /// The canonical language the leg ran in (`bud.voice.language`).
+    pub language: Option<String>,
+    /// STT: whether the upload went through WaaV's denoiser. `None` when the leg never reached
+    /// that step (a passthrough deployment, an open breaker). Ignored for TTS.
+    pub noise_suppression: Option<bool>,
+}
+
 /// The spans of one HTTP voice call: `voice.turn`, and the SERVER root when there is one.
 pub struct VoiceSpans {
     turn: Span,
@@ -276,6 +324,8 @@ pub struct VoiceSpans {
     /// The attribution ids as recorded, for the vendor spans beneath the turn (CONTRACTS §1.2a):
     /// a `tracing` span cannot be read back, so the values are kept as they are written.
     ids: std::sync::Mutex<Vec<(&'static str, String)>>,
+    /// The leg to record when the call ends; see [`Leg`].
+    leg: std::sync::Mutex<Option<(LegKind, Leg)>>,
 }
 
 impl VoiceSpans {
@@ -289,6 +339,7 @@ impl VoiceSpans {
             turn,
             root: root.span().cloned(),
             ids: std::sync::Mutex::new(Vec::new()),
+            leg: std::sync::Mutex::new(None),
         }
     }
 
@@ -331,26 +382,47 @@ impl VoiceSpans {
         }
     }
 
-    /// The vendor and its model: the leg's own names on `voice.turn`, the GenAI names on the
-    /// root, so the listing's model badge renders them (FRD-021 §6.7).
-    pub fn record_vendor(
-        &self,
-        vendor_key: &'static str,
-        model_key: &'static str,
-        vendor: &str,
-        model: Option<&str>,
-    ) {
-        if let Some(v) = waav_openai_audio::recordable(Some(vendor)) {
-            self.turn.record(vendor_key, v);
+    /// Name the leg the call is attributed to, replacing whatever was named before (see [`Leg`]).
+    /// Nothing is recorded until the call ends.
+    pub fn set_leg(&self, kind: LegKind, leg: Leg) {
+        *self.leg.lock().unwrap_or_else(|e| e.into_inner()) = Some((kind, leg));
+    }
+
+    /// Amend the leg named so far — the primary's plan has resolved its voice, say.
+    pub fn update_leg(&self, update: impl FnOnce(&mut Leg)) {
+        if let Some((_, leg)) = self.leg.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            update(leg);
+        }
+    }
+
+    /// Write the leg, once: the vendor and its model under the leg's own names on `voice.turn`,
+    /// the GenAI names on the root so the listing's model badge renders them (FRD-021 §6.7), and
+    /// the voice, language and denoiser flag beside them.
+    fn record_leg(&self) {
+        let Some((kind, l)) = self.leg.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+            return;
+        };
+        if let Some(v) = waav_openai_audio::recordable(Some(l.vendor.as_str())) {
+            self.turn.record(kind.vendor_key(), v);
             if let Some(root) = &self.root {
                 root.record(gen_ai::PROVIDER_NAME, v);
             }
         }
-        if let Some(m) = waav_openai_audio::recordable(model) {
-            self.turn.record(model_key, m);
+        if let Some(m) = waav_openai_audio::recordable(l.model.as_deref()) {
+            self.turn.record(kind.model_key(), m);
             if let Some(root) = &self.root {
                 root.record(gen_ai::REQUEST_MODEL, m);
             }
+        }
+        if kind == LegKind::Tts {
+            self.record_text(leg::TTS_VOICE, l.voice.as_deref());
+        }
+        // Recorded only when there is one: `""` is not NULL (FRD-021 GT-12).
+        self.record_text(turn::LANGUAGE, l.language.as_deref());
+        if kind == LegKind::Stt
+            && let Some(applied) = l.noise_suppression
+        {
+            self.turn.record(leg::STT_NOISE_SUPPRESSION, applied);
         }
     }
 
@@ -380,6 +452,15 @@ impl VoiceSpans {
             self.turn
                 .record(turn::VENDOR_STATUS_CODE, i64::from(status));
         }
+    }
+}
+
+/// The call has ended, whichever `return` ended it: its leg is written now, once. The span is still
+/// open here — `turn` is dropped only after this runs — and so is the root, which the middleware
+/// closes after the handler returns.
+impl Drop for VoiceSpans {
+    fn drop(&mut self) {
+        self.record_leg();
     }
 }
 
@@ -526,11 +607,13 @@ mod tests {
             spans.record_text(turn::ENDPOINT_NAME, Some(""));
             spans.record(turn::CHARACTERS, 120u64);
             spans.record_cost(Some((0.0036, "character")));
-            spans.record_vendor(
-                crate::observability::voice_attrs::leg::TTS_VENDOR,
-                crate::observability::voice_attrs::leg::TTS_MODEL,
-                "elevenlabs",
-                Some("eleven_v3"),
+            spans.set_leg(
+                LegKind::Tts,
+                Leg {
+                    vendor: "elevenlabs".into(),
+                    model: Some("eleven_v3".into()),
+                    ..Leg::default()
+                },
             );
             spans.fail(VoiceErrorType::RateLimited, Some(429), "slow down");
         });
@@ -563,6 +646,207 @@ mod tests {
         assert_eq!(turn_fields[turn::VENDOR_STATUS_CODE], "429");
         assert!(!root.contains_key("otel.status_code"));
         assert!(!root.contains_key(turn::VENDOR_STATUS_CODE));
+    }
+
+    /// The spans as EXPORTED — `tracing-opentelemetry` over the `Registry`, into a real SDK
+    /// provider — because the defect is in what that layer does with a re-recorded field.
+    mod exported {
+        use std::future::Future;
+        use std::sync::{Arc, Mutex};
+
+        use opentelemetry::trace::TracerProvider as _;
+        use opentelemetry_sdk::error::OTelSdkResult;
+        use opentelemetry_sdk::trace::{SdkTracerProvider, SpanData, SpanExporter};
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Debug, Clone, Default)]
+        struct Collect(Arc<Mutex<Vec<SpanData>>>);
+
+        impl SpanExporter for Collect {
+            fn export(&self, batch: Vec<SpanData>) -> impl Future<Output = OTelSdkResult> + Send {
+                self.0.lock().unwrap().extend(batch);
+                std::future::ready(Ok(()))
+            }
+        }
+
+        /// Run `f` under the production span pipeline and return every span it finished.
+        pub fn run(f: impl FnOnce()) -> Vec<SpanData> {
+            let collect = Collect::default();
+            let provider = SdkTracerProvider::builder()
+                .with_simple_exporter(collect.clone())
+                .build();
+            let subscriber = tracing_subscriber::registry()
+                .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("voice-span")));
+            tracing::subscriber::with_default(subscriber, f);
+            std::mem::take(&mut *collect.0.lock().unwrap())
+        }
+
+        pub fn named<'a>(spans: &'a [SpanData], name: &str) -> &'a SpanData {
+            spans
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("no `{name}` span exported"))
+        }
+
+        /// Every value the exported span carries under `key`, in order.
+        pub fn values(span: &SpanData, key: &str) -> Vec<String> {
+            span.attributes
+                .iter()
+                .filter(|kv| kv.key.as_str() == key)
+                .map(|kv| kv.value.as_str().into_owned())
+                .collect()
+        }
+    }
+
+    fn tts_leg(vendor: &str, model: Option<&str>, voice: &str) -> Leg {
+        Leg {
+            vendor: vendor.into(),
+            model: model.map(Into::into),
+            voice: Some(voice.into()),
+            language: Some("en".into()),
+            noise_suppression: None,
+        }
+    }
+
+    /// The premise of [`Leg`], pinned: a field recorded twice is exported twice. If the layer ever
+    /// starts overwriting, recording the leg as the call goes would be safe again and this says so.
+    #[test]
+    fn a_re_recorded_field_is_exported_twice() {
+        let spans = exported::run(|| {
+            let span = crate::voice_turn_span!(capability = "text_to_speech", transport = "http");
+            span.record(leg::TTS_VENDOR, "elevenlabs");
+            span.record(leg::TTS_VENDOR, "deepgram");
+        });
+        let turn = exported::named(&spans, "voice.turn");
+        assert_eq!(
+            exported::values(turn, leg::TTS_VENDOR),
+            ["elevenlabs", "deepgram"]
+        );
+    }
+
+    /// A turn a fallback served exports ONE value per leg key — the served deployment's — on the
+    /// turn, and one GenAI name each on the root.
+    #[test]
+    fn a_fallback_served_turn_exports_one_value_per_leg_key() {
+        let spans = exported::run(|| {
+            let root_span =
+                server_root_span("POST", "/v1/audio/speech", "/v1/audio/speech", "http", "r");
+            let _entered = root_span.enter();
+            let root = Root::new(Some(root_span.clone()));
+            let spans = VoiceSpans::open("text_to_speech", &root);
+            // The primary, as `open_turn` and the plan name it...
+            spans.set_leg(
+                LegKind::Tts,
+                tts_leg("elevenlabs", Some("eleven_v3"), "George"),
+            );
+            spans.update_leg(|l| l.language = Some("en-GB".into()));
+            // ...then the fallback that served.
+            spans.set_leg(
+                LegKind::Tts,
+                tts_leg("deepgram", Some("aura-2"), "aura-2-thalia-en"),
+            );
+            spans.record_text(
+                crate::observability::voice_attrs::resilience::FALLBACK_FROM,
+                Some("ep-primary"),
+            );
+            spans.record_text(
+                crate::observability::voice_attrs::resilience::SERVED_ENDPOINT_ID,
+                Some("ep-fallback"),
+            );
+        });
+        let turn = exported::named(&spans, "voice.turn");
+        for (key, want) in [
+            (leg::TTS_VENDOR, "deepgram"),
+            (leg::TTS_MODEL, "aura-2"),
+            (leg::TTS_VOICE, "aura-2-thalia-en"),
+            (turn::LANGUAGE, "en"),
+            (
+                crate::observability::voice_attrs::resilience::FALLBACK_FROM,
+                "ep-primary",
+            ),
+            (
+                crate::observability::voice_attrs::resilience::SERVED_ENDPOINT_ID,
+                "ep-fallback",
+            ),
+        ] {
+            assert_eq!(exported::values(turn, key), [want], "{key}");
+        }
+        // Exported under its `otel.name`.
+        let root = exported::named(&spans, "POST /v1/audio/speech");
+        assert_eq!(exported::values(root, gen_ai::PROVIDER_NAME), ["deepgram"]);
+        assert_eq!(exported::values(root, gen_ai::REQUEST_MODEL), ["aura-2"]);
+    }
+
+    /// A served hop with no model does not inherit the primary's; a TTS voice is not an STT
+    /// attribute; the denoiser flag is written once, for the leg that ran.
+    #[test]
+    fn the_leg_written_is_the_last_one_named_whole() {
+        let spans = exported::run(|| {
+            let root_span = server_root_span(
+                "POST",
+                "/v1/audio/transcriptions",
+                "/v1/audio/transcriptions",
+                "http",
+                "r",
+            );
+            let _entered = root_span.enter();
+            let root = Root::new(Some(root_span.clone()));
+            let spans = VoiceSpans::open("audio_transcription", &root);
+            spans.set_leg(
+                LegKind::Stt,
+                Leg {
+                    vendor: "deepgram".into(),
+                    model: Some("nova-3".into()),
+                    noise_suppression: Some(false),
+                    ..Leg::default()
+                },
+            );
+            spans.set_leg(
+                LegKind::Stt,
+                Leg {
+                    vendor: "elevenlabs".into(),
+                    model: None,
+                    voice: Some("not-an-stt-attribute".into()),
+                    language: None,
+                    noise_suppression: Some(true),
+                },
+            );
+        });
+        let turn = exported::named(&spans, "voice.turn");
+        assert_eq!(exported::values(turn, leg::STT_VENDOR), ["elevenlabs"]);
+        assert!(exported::values(turn, leg::STT_MODEL).is_empty());
+        assert!(exported::values(turn, leg::TTS_VOICE).is_empty());
+        assert!(exported::values(turn, turn::LANGUAGE).is_empty());
+        assert_eq!(exported::values(turn, leg::STT_NOISE_SUPPRESSION), ["true"]);
+        let root = exported::named(&spans, "POST /v1/audio/transcriptions");
+        assert_eq!(
+            exported::values(root, gen_ai::PROVIDER_NAME),
+            ["elevenlabs"]
+        );
+        assert!(exported::values(root, gen_ai::REQUEST_MODEL).is_empty());
+    }
+
+    /// Every hop failed: the call is attributed to the primary, as amended, once.
+    #[test]
+    fn a_failed_call_keeps_the_primary_leg() {
+        let spans = exported::run(|| {
+            let spans = VoiceSpans::open("text_to_speech", &Root::default());
+            spans.set_leg(
+                LegKind::Tts,
+                Leg {
+                    vendor: "elevenlabs".into(),
+                    model: Some("eleven_v3".into()),
+                    ..Leg::default()
+                },
+            );
+            spans.update_leg(|l| l.voice = Some("George".into()));
+            spans.fail(VoiceErrorType::Vendor5xx, Some(503), "down");
+        });
+        let turn = exported::named(&spans, "voice.turn");
+        assert_eq!(exported::values(turn, leg::TTS_VENDOR), ["elevenlabs"]);
+        assert_eq!(exported::values(turn, leg::TTS_MODEL), ["eleven_v3"]);
+        assert_eq!(exported::values(turn, leg::TTS_VOICE), ["George"]);
+        assert_eq!(exported::values(turn, turn::ERROR_TYPE), ["vendor_5xx"]);
     }
 
     #[test]

@@ -509,6 +509,28 @@ impl End {
         self.error = Some((code, message.into()));
         self
     }
+
+    /// The vendor closed its socket, with `frame`'s `(code, reason)`.
+    ///
+    /// A NORMAL close (1000, 1001) is the vendor ending the session — its own time limit, say —
+    /// and not a failure: `vendor_close`, relayed to the client with the vendor's code and no
+    /// `error` event, and not an ERROR on the session span. Recorded as `upstream_error` it read as
+    /// a failed session in every error rate. Any other code, or a close with none, is a vendor
+    /// failure: `upstream_error` + 1011, as before.
+    pub(super) fn vendor_closed(frame: Option<(u16, String)>) -> Self {
+        match frame {
+            Some((code @ (1000 | 1001), _)) => Self::new("vendor_close", code),
+            other => {
+                let detail = other
+                    .map(|(code, reason)| format!(" (code {code}: {reason})"))
+                    .unwrap_or_default();
+                Self::new("upstream_error", 1011).with_error(
+                    "upstream_error",
+                    format!("The vendor closed the session{detail}."),
+                )
+            }
+        }
+    }
 }
 
 pub(super) enum Outbound {
@@ -990,11 +1012,9 @@ async fn run(state: Arc<AppState>, p: Prepared, socket: WebSocket, slot: Option<
             msg = up_rx.next() => match msg {
                 None | Some(Err(_)) => Err(End::new("upstream_error", 1011)
                     .with_error("upstream_error", "The connection to the vendor was lost.")),
-                Some(Ok(UpMessage::Close(frame))) => {
-                    let detail = frame.map(|f| format!(" (code {}: {})", u16::from(f.code), f.reason)).unwrap_or_default();
-                    Err(End::new("upstream_error", 1011)
-                        .with_error("upstream_error", format!("The vendor closed the session{detail}.")))
-                }
+                Some(Ok(UpMessage::Close(frame))) => Err(End::vendor_closed(
+                    frame.map(|f| (u16::from(f.code), f.reason.to_string())),
+                )),
                 Some(Ok(UpMessage::Pong(_))) => { relay.vendor_missed = 0; Ok(()) }
                 Some(Ok(UpMessage::Ping(_))) => { let _ = relay.up_tx.flush().await; Ok(()) }
                 Some(Ok(UpMessage::Text(t))) => relay.on_vendor_text(t.as_str()).await,
@@ -1111,4 +1131,41 @@ pub(super) async fn finish(
     metrics::gauge!("waav_realtime_sessions_active", "vendor" => vendor.to_string()).decrement(1.0);
     meter.finish(end.reason, end.close_code);
     debug!("realtime session torn down");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::End;
+
+    #[test]
+    fn a_normal_vendor_close_ends_the_session_without_an_error() {
+        for code in [1000, 1001] {
+            let end = End::vendor_closed(Some((code, "done".into())));
+            assert_eq!(end.reason, "vendor_close");
+            assert_eq!(end.close_code, code, "the vendor's code is relayed");
+            assert!(
+                end.error.is_none(),
+                "{code}: no error event for a normal close"
+            );
+        }
+    }
+
+    #[test]
+    fn an_abnormal_vendor_close_is_an_upstream_error() {
+        for frame in [
+            Some((1011, "boom".to_string())),
+            Some((4000, String::new())),
+            None,
+        ] {
+            let end = End::vendor_closed(frame.clone());
+            assert_eq!(end.reason, "upstream_error", "{frame:?}");
+            assert_eq!(end.close_code, 1011);
+            let (code, message) = end.error.expect("an error event");
+            assert_eq!(code, "upstream_error");
+            assert!(
+                message.starts_with("The vendor closed the session"),
+                "{message}"
+            );
+        }
+    }
 }

@@ -1,5 +1,6 @@
 //! Observability surfaces (FRD-018 M6, FRD-021).
 
+pub mod language;
 pub mod trace_redact;
 pub mod tracing_init;
 pub mod vendor_span;

@@ -408,6 +408,8 @@ impl SessionMeter {
                 span.record(turn::PRICING_UNIT, unit);
             }
         }
+        // A failed session only. `vendor_close` — the vendor closing normally (1000/1001) — ended
+        // the session without failing it, like `idle` or `max_duration`.
         if matches!(end_reason, "upstream_error" | "error") {
             span.record("otel.status_code", "ERROR");
         }

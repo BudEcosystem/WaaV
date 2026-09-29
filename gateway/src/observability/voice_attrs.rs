@@ -67,14 +67,18 @@ pub mod turn {
 
     // ---- FRD-021 §6.1, Phase 5 -------------------------------------------------------------
 
-    /// Seconds of audio a synthesis produced. Exact for PCM and WAV; absent for compressed
-    /// formats, whose duration cannot be read without decoding (DEG-4).
+    /// Seconds of audio a synthesis produced. Exact for PCM and WAV; for MP3, AAC (ADTS), FLAC,
+    /// Ogg and MP4, read from the container without decoding (packet durations, the last Ogg
+    /// granule position); absent when the container cannot be read (DEG-4).
     pub const OUTPUT_AUDIO_SECONDS: &str = "bud.voice.output_audio_seconds";
-    /// The language the vendor says it heard, where it reports one.
+    /// The language the vendor says it heard, where it reports one — normalized to the lowercase
+    /// BCP-47 primary language subtag, ISO 639-1 where one exists (`en` for `eng`, `english`,
+    /// `en-US`; see `observability::language`).
     pub const DETECTED_LANGUAGE: &str = "bud.voice.detected_language";
     /// TTS: the format served. STT: the upload's container.
     pub const AUDIO_FORMAT: &str = "bud.voice.audio_format";
-    /// Samples per second, where known without decoding (PCM, WAV headers).
+    /// Samples per second, where known without decoding (PCM, WAV headers, a compressed
+    /// container's own headers).
     pub const SAMPLE_RATE: &str = "bud.voice.sample_rate";
     /// STT: the size of the uploaded file.
     pub const INPUT_AUDIO_BYTES: &str = "bud.voice.input_audio_bytes";
@@ -134,8 +138,12 @@ pub mod realtime {
 pub mod session {
     pub const DURATION_MS: &str = "bud.voice.session.duration_ms";
     pub const TURNS: &str = "bud.voice.session.turns";
-    /// `client_close` | `idle` | `max_duration` | `revoked` | `drain` | `upstream_error` |
-    /// `rate_limited` | `client_too_slow` | `client_timeout`.
+    /// `client_close` | `idle` | `max_duration` | `revoked` | `drain` | `vendor_close` |
+    /// `upstream_error` | `rate_limited` | `client_too_slow` | `client_timeout`.
+    ///
+    /// `vendor_close` is the vendor closing its socket normally (1000/1001) — the session ended, it
+    /// did not fail; `upstream_error` is an abnormal vendor close, a lost connection or a vendor
+    /// that stopped answering, and marks the session span ERROR.
     pub const END_REASON: &str = "bud.voice.session.end_reason";
     pub const CLOSE_CODE: &str = "bud.voice.session.close_code";
 }
