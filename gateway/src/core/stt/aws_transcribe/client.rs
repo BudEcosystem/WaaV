@@ -1491,7 +1491,7 @@ mod tests {
         features: SttFeatures,
         extras: serde_json::Map<String, serde_json::Value>,
     ) -> aws_sdk_transcribestreaming::operation::start_stream_transcription::builders::StartStreamTranscriptionInputBuilder
-    {
+{
         let std = StandardSTTConfig {
             base: STTConfig {
                 provider: "aws-transcribe".into(),

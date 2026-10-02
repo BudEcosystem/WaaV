@@ -52,6 +52,7 @@ ignore = [
   { id = "RUSTSEC-2024-0436", reason = "unmaintained paste (proc-macro) via abi_stable/tokenizers; no upgrade" },
   { id = "RUSTSEC-2025-0134", reason = "unmaintained rustls-pemfile via axum-server 0.7 and tonic 0.11" },
   { id = "RUSTSEC-2026-0249", reason = "unmaintained smartstring via rhai (dag-routing); no upgrade" },
+  { id = "RUSTSEC-2026-0319", reason = "unmaintained anymap2 via liquid (tract-linalg, noise-filter); no patched release" },
 ]
 
 # ---------------------------------------------------------------------------------------

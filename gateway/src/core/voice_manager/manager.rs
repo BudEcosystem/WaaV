@@ -1265,6 +1265,8 @@ impl VoiceManager {
                 // wf_5772cd64 #3 / wf_85659e16 follow-up): a plain
                 // load→store racing a reset could resurrect a stale window.
                 if !int_state.allow_interruption.load(Ordering::Acquire) {
+                    // `fetch_update` is `try_update` from Rust 1.99; the image still builds on 1.96.
+                    #[allow(deprecated)]
                     let _ = int_state.non_interruptible_until_ms.fetch_update(
                         Ordering::AcqRel,
                         Ordering::Acquire,

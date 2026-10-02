@@ -111,6 +111,8 @@ impl InterruptionState {
         // when racing reset() from a concurrent barge-in clear (review
         // wf_5772cd64 #3a).
         let now = now_monotonic_ms();
+        // `fetch_update` is `try_update` from Rust 1.99; the image still builds on 1.96.
+        #[allow(deprecated)]
         let _ = self
             .playout_end_ms
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |prev| {
