@@ -20,6 +20,7 @@ use crate::types::{AliasMap, AliasMetadata, AuthMetadata};
 
 pub const API_KEY_PREFIX: &str = "api_key:";
 pub const VOICE_TABLE_PREFIX: &str = "voice_table:";
+pub use crate::voice_agent::VOICE_AGENT_PREFIX;
 
 /// budapp's published overlay (`budapp/shared/publication_cache.py`): every published deployment,
 /// agent and router, keyed by the name a customer calls it by — `{endpoint_id, model_id,
@@ -175,6 +176,77 @@ async fn apply_voice_event(
     }
 }
 
+/// Apply one `voice_agent:` keyspace event (spec 025).
+///
+/// A `set` that does not parse REMOVES the entry rather than keeping the previous one: budapp has
+/// changed the agent's voice in a way this build cannot read, and serving the old legs (perhaps a
+/// deployment budapp just moved the agent off) is worse than refusing new sessions until it is fixed.
+async fn apply_voice_agent_event(
+    store: &dyn ControlPlaneStore,
+    auth: &BudAuth,
+    key: &str,
+    agent_key: &str,
+    event: KeyEvent,
+) -> Result<bool, StoreError> {
+    match event {
+        KeyEvent::Set => {
+            let parsed = match store.get(key).await? {
+                Some(raw) => crate::voice_agent::parse_voice_agent_blob(&raw)
+                    .map_err(|e| tracing::warn!(key = %key, error = %e, "unparseable voice_agent update; removing the agent"))
+                    .ok(),
+                None => None,
+            };
+            match parsed {
+                // The key names the entry; an entry naming another version is a writer bug.
+                Some(entry) if entry.key() == agent_key => {
+                    auth.mutate_voice_agent(agent_key, Some(Arc::new(entry)))
+                }
+                Some(entry) => {
+                    tracing::warn!(key = %key, names = %entry.key(), "voice_agent entry does not match its key; removing it");
+                    auth.mutate_voice_agent(agent_key, None);
+                }
+                None => auth.mutate_voice_agent(agent_key, None),
+            }
+            Ok(true)
+        }
+        KeyEvent::Del | KeyEvent::Expired => {
+            auth.mutate_voice_agent(agent_key, None);
+            Ok(true)
+        }
+    }
+}
+
+/// Full sweep of `voice_agent:*` as one generation (boot and reconnect, beside `voice_table`).
+pub async fn hydrate_voice_agents(
+    store: &dyn ControlPlaneStore,
+    auth: &BudAuth,
+) -> Result<VoiceHydrationStats, StoreError> {
+    let raw = store.scan(&format!("{VOICE_AGENT_PREFIX}*")).await?;
+    let mut agents: HashMap<Arc<str>, Arc<crate::voice_agent::VoiceAgentEntry>> = HashMap::new();
+    let mut stats = VoiceHydrationStats::default();
+    for (key, value) in raw {
+        let Some(agent_key) = key.strip_prefix(VOICE_AGENT_PREFIX) else {
+            continue;
+        };
+        match crate::voice_agent::parse_voice_agent_blob(&value) {
+            Ok(entry) if entry.key() == agent_key => {
+                agents.insert(Arc::from(agent_key), Arc::new(entry));
+                stats.endpoints += 1;
+            }
+            Ok(entry) => {
+                tracing::warn!(key = %key, names = %entry.key(), "skipping voice_agent entry that does not match its key");
+                stats.skipped += 1;
+            }
+            Err(e) => {
+                tracing::warn!(key = %key, error = %e, "skipping unparseable voice_agent entry");
+                stats.skipped += 1;
+            }
+        }
+    }
+    auth.replace_voice_agents(agents);
+    Ok(stats)
+}
+
 /// What a keyspace notification means for the snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyEvent {
@@ -213,6 +285,10 @@ pub async fn apply_key_event(
     // credential rotation silently fails to take effect until the next reconnect.
     if let Some(endpoint_id) = key.strip_prefix(VOICE_TABLE_PREFIX) {
         return apply_voice_event(store, auth, decryptor, key, endpoint_id, event).await;
+    }
+    // Spec 025: agent voice projections ride the same keyspace and the same events.
+    if let Some(agent_key) = key.strip_prefix(VOICE_AGENT_PREFIX) {
+        return apply_voice_agent_event(store, auth, key, agent_key, event).await;
     }
 
     let Some(hashed) = key.strip_prefix(API_KEY_PREFIX) else {
@@ -813,5 +889,111 @@ mod voice_event_tests {
             "a voice event revoked a credential"
         );
         assert_eq!(auth.voice_endpoint("ep-1").unwrap().vendor, "cartesia");
+    }
+}
+
+#[cfg(test)]
+mod voice_agent_tests {
+    //! Spec 025: `voice_agent:*` is hydrated like `voice_table:*` — swept at boot and reconnect as one
+    //! generation, and kept current by keyspace events, so turning an agent's voice on or off needs
+    //! no restart.
+    use super::*;
+    use crate::credentials::CredentialDecryptor;
+    use crate::guards::MissGuards;
+    use crate::store::MemoryStore;
+
+    fn agent(prompt_id: &str, version: i64, stt: &str) -> String {
+        format!(
+            r#"{{"v":1,"prompt_id":"{prompt_id}","version":{version},"stt":{{"endpoint_id":"{stt}"}},"tts":{{"endpoint_id":"tts-1","voice":"alloy"}}}}"#
+        )
+    }
+
+    async fn event(store: &MemoryStore, auth: &BudAuth, key: &str, ev: KeyEvent) {
+        apply_key_event(
+            store,
+            auth,
+            &MissGuards::default(),
+            &CredentialDecryptor::disabled(),
+            key,
+            ev,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn boot_sweeps_every_agent_as_one_generation() {
+        let store = MemoryStore::new();
+        for i in 1..=50 {
+            store.set(
+                &format!("voice_agent:p{i}:v1"),
+                &agent(&format!("p{i}"), 1, "stt-1"),
+            );
+        }
+        store.set("voice_agent:broken:v1", "not json");
+        store.set("voice_agent:mismatch:v1", &agent("other", 1, "stt-1"));
+        let auth = BudAuth::new();
+        let before = auth.generation();
+        let stats = hydrate_voice_agents(&store, &auth).await.unwrap();
+        assert_eq!(stats.endpoints, 50);
+        assert_eq!(stats.skipped, 2);
+        assert_eq!(auth.generation() - before, 1);
+        assert_eq!(auth.voice_agent("p7", 1).unwrap().stt.endpoint_id, "stt-1");
+        assert!(auth.voice_agent("mismatch", 1).is_none());
+        assert!(
+            auth.voice_agent("p7", 2).is_none(),
+            "versions are distinct agents"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_and_delete_events_apply_without_a_restart() {
+        let store = MemoryStore::new();
+        let auth = BudAuth::new();
+        store.set("voice_agent:p1:v3", &agent("p1", 3, "stt-a"));
+        event(&store, &auth, "voice_agent:p1:v3", KeyEvent::Set).await;
+        assert_eq!(auth.voice_agent("p1", 3).unwrap().stt.endpoint_id, "stt-a");
+
+        store.set("voice_agent:p1:v3", &agent("p1", 3, "stt-b"));
+        event(&store, &auth, "voice_agent:p1:v3", KeyEvent::Set).await;
+        assert_eq!(auth.voice_agent("p1", 3).unwrap().stt.endpoint_id, "stt-b");
+
+        store.remove("voice_agent:p1:v3");
+        event(&store, &auth, "voice_agent:p1:v3", KeyEvent::Del).await;
+        assert!(auth.voice_agent("p1", 3).is_none());
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_update_takes_the_agent_off_the_air() {
+        let store = MemoryStore::new();
+        let auth = BudAuth::new();
+        store.set("voice_agent:p1:v1", &agent("p1", 1, "stt-a"));
+        event(&store, &auth, "voice_agent:p1:v1", KeyEvent::Set).await;
+        store.set("voice_agent:p1:v1", r#"{"prompt_id":"p1","version":1}"#);
+        event(&store, &auth, "voice_agent:p1:v1", KeyEvent::Set).await;
+        assert!(auth.voice_agent("p1", 1).is_none());
+    }
+
+    #[tokio::test]
+    async fn an_expired_draft_disappears() {
+        let store = MemoryStore::new();
+        let auth = BudAuth::new();
+        store.set("voice_agent:draft-9:v1", &agent("draft-9", 1, "stt-a"));
+        event(&store, &auth, "voice_agent:draft-9:v1", KeyEvent::Set).await;
+        event(&store, &auth, "voice_agent:draft-9:v1", KeyEvent::Expired).await;
+        assert!(auth.voice_agent("draft-9", 1).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_key_rehydration_keeps_the_agents() {
+        let store = MemoryStore::new();
+        let auth = BudAuth::new();
+        store.set("voice_agent:p1:v1", &agent("p1", 1, "stt-a"));
+        hydrate_voice_agents(&store, &auth).await.unwrap();
+        hydrate_all(&store, &auth).await.unwrap();
+        assert!(
+            auth.voice_agent("p1", 1).is_some(),
+            "replace_all must carry the agent projections across"
+        );
     }
 }

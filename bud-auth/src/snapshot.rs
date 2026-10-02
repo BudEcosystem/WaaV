@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::credentials::VoiceEndpoint;
 use crate::types::{AliasMap, AuthMetadata};
+use crate::voice_agent::VoiceAgentEntry;
 
 /// One immutable generation of the auth map.
 #[derive(Debug, Default)]
@@ -35,6 +36,11 @@ pub struct BudSnapshot {
     /// Held in the same generation as the api-key map so a request never sees an endpoint
     /// whose credential has not been resolved yet.
     pub voice: HashMap<Arc<str>, Arc<VoiceEndpoint>>,
+    /// `"{prompt_id}:v{version}"` -> that agent version's voice projection (spec 025).
+    ///
+    /// The same generation as `voice`: a session resolves an agent to its two leg deployments in
+    /// one snapshot load, so it never sees an agent whose legs belong to a different generation.
+    pub voice_agents: HashMap<Arc<str>, Arc<VoiceAgentEntry>>,
 }
 
 impl BudSnapshot {
@@ -43,6 +49,7 @@ impl BudSnapshot {
             api_keys: self.api_keys.clone(),
             metadata: self.metadata.clone(),
             voice: self.voice.clone(),
+            voice_agents: self.voice_agents.clone(),
         }
     }
 }
@@ -171,6 +178,57 @@ impl BudAuth {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// An agent version's voice projection (spec 025). Hot path at session start; no I/O.
+    pub fn voice_agent(&self, prompt_id: &str, version: i64) -> Option<Arc<VoiceAgentEntry>> {
+        self.snapshot
+            .load()
+            .voice_agents
+            .get(crate::voice_agent::voice_agent_key(prompt_id, version).as_str())
+            .map(Arc::clone)
+    }
+
+    pub fn voice_agent_count(&self) -> usize {
+        self.snapshot.load().voice_agents.len()
+    }
+
+    /// Upsert or remove one agent version's projection, leaving everything else untouched.
+    ///
+    /// Driven by `voice_agent:` keyspace events, so turning voice off (budapp deletes the key) ends
+    /// new sessions at once and revalidation ends live ones.
+    pub fn mutate_voice_agent(&self, key: &str, entry: Option<Arc<VoiceAgentEntry>>) {
+        #[expect(
+            clippy::expect_used,
+            reason = "a poisoned auth writer is unrecoverable"
+        )]
+        let _guard = self.writer.lock().expect("bud auth writer mutex poisoned");
+        let mut next = self.snapshot.load().clone_contents();
+        match entry {
+            Some(e) => {
+                next.voice_agents.insert(Arc::from(key), e);
+            }
+            None => {
+                next.voice_agents.remove(key);
+            }
+        }
+        self.snapshot.store(Arc::new(next));
+        self.generations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Replace every agent projection as one generation (boot / reconnect sweep).
+    pub fn replace_voice_agents(&self, voice_agents: HashMap<Arc<str>, Arc<VoiceAgentEntry>>) {
+        #[expect(
+            clippy::expect_used,
+            reason = "a poisoned auth writer is unrecoverable"
+        )]
+        let _guard = self.writer.lock().expect("bud auth writer mutex poisoned");
+        let mut next = self.snapshot.load().clone_contents();
+        next.voice_agents = voice_agents;
+        self.snapshot.store(Arc::new(next));
+        self.generations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Replace the whole voice table as one generation, leaving the api-key map untouched.
     pub fn replace_voice(&self, voice: HashMap<Arc<str>, Arc<VoiceEndpoint>>) {
         #[expect(
@@ -254,11 +312,17 @@ impl BudAuth {
         let _guard = self.writer.lock().expect("bud auth writer mutex poisoned");
         // Carry the voice table across: `replace_all` re-publishes the api-key generation,
         // and dropping the voice map here would blank every endpoint on the next key event.
-        let voice = self.snapshot.load().voice.clone();
+        // The same for the agent projections (spec 025): a key sweep must not take every voice
+        // agent off the air until the next `voice_agent:` event.
+        let current = self.snapshot.load();
+        let voice = current.voice.clone();
+        let voice_agents = current.voice_agents.clone();
+        drop(current);
         self.snapshot.store(Arc::new(BudSnapshot {
             api_keys,
             metadata,
             voice,
+            voice_agents,
         }));
         self.generations
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

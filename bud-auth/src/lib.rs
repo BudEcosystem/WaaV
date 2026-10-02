@@ -25,6 +25,7 @@ pub mod runtime;
 pub mod snapshot;
 pub mod store;
 pub mod types;
+pub mod voice_agent;
 
 pub use authz::{AuthzTier, Resolution};
 pub use credentials::{
@@ -44,3 +45,4 @@ pub use runtime::{AuthFailure, BudPlane, Principal, PrincipalKind};
 pub use snapshot::{BudAuth, BudSnapshot, Mutation};
 pub use store::{ControlPlaneStore, MemoryStore, StoreError};
 pub use types::{AliasMap, AliasMetadata, AuthMetadata, UserProjects, VerifiedIdentity};
+pub use voice_agent::{VoiceAgentEntry, parse_voice_agent_blob, voice_agent_key};

@@ -15,6 +15,7 @@
 //!   GA surface (Gemini Live, Nova 2 Sonic, the per-minute voice agents; §5.7, RT7).
 //! * [`client_secrets`] — `POST /v1/realtime/client_secrets`, the `ek_bud_` mint (§5.8).
 
+pub mod cascade;
 pub mod client_secrets;
 pub mod facade;
 pub mod handshake;

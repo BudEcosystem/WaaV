@@ -416,6 +416,7 @@
 //!
 //! All errors are sent back to the client as JSON messages with `type: "error"`.
 
+pub mod agent;
 pub mod audio_handler;
 pub mod bud_legs;
 pub mod command_handler;

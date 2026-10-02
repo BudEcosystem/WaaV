@@ -52,6 +52,73 @@ pub struct DAGWebSocketConfig {
     pub timeout_ms: Option<u64>,
 }
 
+/// A Bud voice agent for this session (spec 025): `{"type":"config","agent":{"id":"support"}}`.
+///
+/// The agent decides both speech legs (its STT and TTS deployments), the voice and how turns are
+/// taken; budprompt runs its prompt, tools and governance one turn per utterance. `stt_config` and
+/// `tts_config` may still carry the client's AUDIO format (sample rate, encoding, codec, playback
+/// rate) and the overrides the agent allows (`session_overrides`); they never name a deployment.
+/// Mutually exclusive with `conversation_config` and `dag_config`.
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct AgentWebSocketConfig {
+    /// The agent's name — what `prompt:<name>` names on `/v1/responses` — optionally pinned to a
+    /// version as `name:v<n>` (or with `version`). The `prompt:` prefix is accepted and ignored.
+    #[cfg_attr(feature = "openapi", schema(example = "support"))]
+    pub id: String,
+    /// Pin a version; the agent's default version is used (and pinned for the session) otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<i64>,
+    /// The agent's structured input, once per session (D-14).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(value_type = Object))]
+    pub variables: Option<serde_json::Map<String, serde_json::Value>>,
+    /// Text replies only: the agent's answers arrive as `assistant_transcript`, nothing is spoken.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_only: Option<bool>,
+}
+
+/// The STT leg's audio format when a voice-agent client sends no `stt_config`: 16 kHz mono PCM16.
+pub fn default_agent_stt_config() -> STTWebSocketConfig {
+    STTWebSocketConfig {
+        provider: String::new(),
+        language: String::new(),
+        sample_rate: 16_000,
+        channels: 1,
+        punctuation: true,
+        encoding: default_stt_encoding(),
+        audio_in_codec: None,
+        model: String::new(),
+        api_key: None,
+        features: Default::default(),
+        extras: Default::default(),
+        translation: None,
+        turn_detection: None,
+    }
+}
+
+/// The TTS leg's format when a voice-agent client sends no `tts_config`: the deployment's own.
+pub fn default_agent_tts_config() -> Option<TTSWebSocketConfig> {
+    serde_json::from_value(serde_json::json!({})).ok()
+}
+
+impl AgentWebSocketConfig {
+    /// The `prompt:` model string this config names.
+    pub fn model(&self) -> String {
+        let id = self.id.trim();
+        let id = id.strip_prefix("prompt:").unwrap_or(id);
+        match self.version {
+            Some(v) => {
+                let base = crate::state::parse_agent_model(&format!("prompt:{id}"))
+                    .map(|(name, _)| name)
+                    .unwrap_or_else(|| id.to_string());
+                format!("prompt:{base}:v{v}")
+            }
+            None => format!("prompt:{id}"),
+        }
+    }
+}
+
 /// Conversation-loop configuration for WebSocket messages (plan W-O2).
 ///
 /// When present on a `config` message, the gateway wires up a built-in

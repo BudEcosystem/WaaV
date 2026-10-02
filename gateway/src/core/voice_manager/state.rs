@@ -63,6 +63,12 @@ pub struct InterruptionState {
     /// used by turn policy (MinWords barge-in gating). Over-estimating is the
     /// safe direction: it can only RAISE the barge-in word threshold briefly.
     pub playout_end_ms: AtomicUsize,
+    /// Total milliseconds of TTS audio delivered to the egress over the session (monotonic).
+    ///
+    /// Spec 025: with `playout_end_ms` it says how much of a reply the user has HEARD — audio
+    /// delivered minus audio still queued — which is what an interrupted voice agent's history is
+    /// cut to. Never reset by a clear: it is a counter, consumers take differences.
+    pub audio_out_ms_total: std::sync::atomic::AtomicU64,
 }
 
 impl InterruptionState {
@@ -110,6 +116,14 @@ impl InterruptionState {
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |prev| {
                 Some(prev.max(now) + chunk_duration_ms)
             });
+        self.audio_out_ms_total
+            .fetch_add(chunk_duration_ms as u64, Ordering::AcqRel);
+    }
+
+    /// Estimated milliseconds of delivered audio not yet played.
+    pub fn playout_remaining_ms(&self) -> u64 {
+        (self.playout_end_ms.load(Ordering::Acquire) as u64)
+            .saturating_sub(now_monotonic_ms() as u64)
     }
 
     /// Whether the bot is (estimated to be) audibly speaking right now.

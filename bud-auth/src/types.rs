@@ -23,6 +23,10 @@ pub struct AliasMetadata {
     pub project_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub router_id: Option<String>,
+    /// For an agent alias (`kind: "agent"`): the id the agent's `voice_agent:` projection is
+    /// keyed by — budapp's prompt UUID for a saved agent, the draft id for a draft (spec 025).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_id: Option<String>,
     /// `model`, `adapter`, `guardrail`, `router` or `agent`, stamped by budapp.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,

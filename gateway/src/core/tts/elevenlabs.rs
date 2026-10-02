@@ -74,6 +74,18 @@ impl VoiceSettings {
 
 pub const ELEVENLABS_TTS_URL: &str = "https://api.elevenlabs.io/v1/text-to-speech";
 
+/// Whether a model takes context continuity: `previous_text` / `next_text` and request stitching
+/// (`previous_request_ids` / `next_request_ids`).
+///
+/// The eleven_v3 models refuse all four: `previous_text` is a 400 "not yet supported with the
+/// 'eleven_v3' model" (live, 2026-10-02) and "request stitching is not available for the eleven_v3
+/// model" (elevenlabs.io/docs/eleven-api/guides/cookbooks/text-to-speech/request-stitching). A voice
+/// session sends `previous_text` from its second sentence on, so on v3 every sentence after the
+/// first failed. The variants (`eleven_v3_conversational`) behave the same.
+pub fn supports_context_continuity(model: &str) -> bool {
+    !model.starts_with("eleven_v3")
+}
+
 /// The voice used when nothing names one: George, the voice ElevenLabs' own quickstart uses.
 ///
 /// Must be a voice EVERY account may use, which rules out the long-standing choice, Rachel
@@ -242,8 +254,11 @@ impl TTSRequestBuilder for ElevenLabsRequestBuilder {
             body["voice_settings"] = json!(self.voice_settings);
         }
 
+        // Context continuity, where the model takes it (not the eleven_v3 models).
+        let continuity = supports_context_continuity(&self.config.model);
+
         // Add previous_text for context continuity if available
-        if let Some(prev) = previous_text {
+        if let Some(prev) = previous_text.filter(|_| continuity) {
             body["previous_text"] = json!(prev);
         }
 
@@ -262,16 +277,16 @@ impl TTSRequestBuilder for ElevenLabsRequestBuilder {
 
         // Forward context text → BODY `next_text` (lookahead text following `text`). Confirmed body
         // param (convert + stream). `previous_text` (the lookback) is already emitted above.
-        if let Some(next_text) = &self.next_text {
+        if let Some(next_text) = self.next_text.as_ref().filter(|_| continuity) {
             body["next_text"] = json!(next_text);
         }
 
         // Stitching: preceding/following generation request IDs → BODY `previous_request_ids` /
         // `next_request_ids` (each an array, max 3). Confirmed body params (convert + stream).
-        if let Some(ids) = &self.previous_request_ids {
+        if let Some(ids) = self.previous_request_ids.as_ref().filter(|_| continuity) {
             body["previous_request_ids"] = json!(ids);
         }
-        if let Some(ids) = &self.next_request_ids {
+        if let Some(ids) = self.next_request_ids.as_ref().filter(|_| continuity) {
             body["next_request_ids"] = json!(ids);
         }
 
@@ -857,6 +872,69 @@ mod tests {
             body["voice_settings"],
             serde_json::json!({ "stability": 0.5 })
         );
+    }
+
+    fn context_builder(model: &str) -> ElevenLabsRequestBuilder {
+        ElevenLabsRequestBuilder {
+            config: TTSConfig {
+                voice_id: Some("test_voice_id".to_string()),
+                api_key: "test_key".to_string(),
+                model: model.to_string(),
+                ..Default::default()
+            },
+            voice_settings: VoiceSettings::default(),
+            seed: None,
+            optimize_streaming_latency: None,
+            language_code: None,
+            next_text: Some("And the next sentence.".to_string()),
+            previous_request_ids: Some(vec!["req_1".to_string()]),
+            next_request_ids: Some(vec!["req_3".to_string()]),
+            apply_text_normalization: None,
+            apply_language_text_normalization: None,
+            use_pvc_as_ivc: None,
+            enable_logging: None,
+        }
+    }
+
+    fn context_body(model: &str) -> serde_json::Value {
+        let built = context_builder(model)
+            .build_http_request_with_context(
+                &reqwest::Client::new(),
+                "This one.",
+                Some("The one before."),
+            )
+            .build()
+            .unwrap();
+        serde_json::from_slice(built.body().and_then(|b| b.as_bytes()).unwrap()).unwrap()
+    }
+
+    /// eleven_v3 refuses context continuity: `previous_text`/`next_text` are a 400 ("not yet
+    /// supported with the 'eleven_v3' model", live 2026-10-02) and so is request stitching. A voice
+    /// agent sends `previous_text` from its second sentence on, so every sentence after the first
+    /// failed. The v3 models get none of the four; the others keep all of them.
+    #[test]
+    fn eleven_v3_models_are_sent_no_context_continuity() {
+        const CONTEXT: [&str; 4] = [
+            "previous_text",
+            "next_text",
+            "previous_request_ids",
+            "next_request_ids",
+        ];
+        for model in ["eleven_v3", "eleven_v3_conversational"] {
+            let body = context_body(model);
+            for field in CONTEXT {
+                assert!(
+                    body.get(field).is_none(),
+                    "{model} must not get {field}: {body}"
+                );
+            }
+            assert_eq!(body["text"], "This one.");
+        }
+        let body = context_body("eleven_flash_v2_5");
+        assert_eq!(body["previous_text"], "The one before.");
+        assert_eq!(body["next_text"], "And the next sentence.");
+        assert_eq!(body["previous_request_ids"], serde_json::json!(["req_1"]));
+        assert_eq!(body["next_request_ids"], serde_json::json!(["req_3"]));
     }
 
     #[test]

@@ -460,6 +460,32 @@ pub async fn realtime_ws_handler(
     slot: Option<Extension<ConnectionSlot>>,
     ws: Result<WebSocketUpgrade, axum::extract::ws::rejection::WebSocketUpgradeRejection>,
 ) -> Response {
+    // Spec 025: `?model=prompt:<agent>` is a voice agent — the Cascade engine.
+    if handshake::parse(uri.query(), &headers)
+        .is_ok_and(|hs| super::cascade::is_agent_model(&hs.model))
+    {
+        let prepared = match super::cascade::prepare(&state, uri.query(), &headers).await {
+            Ok(p) => p,
+            Err(e) => {
+                metrics::counter!("waav_realtime_refusals_total", "code" => e.code).increment(1);
+                return e.into_response();
+            }
+        };
+        let Ok(ws) = ws else {
+            return HandshakeError::new(
+                StatusCode::BAD_REQUEST,
+                "websocket_required",
+                "/v1/realtime is a WebSocket endpoint; send an Upgrade request.",
+            )
+            .into_response();
+        };
+        let slot = slot.map(|Extension(s)| s);
+        return ws
+            .protocols([SUBPROTOCOL])
+            .max_message_size(MAX_MESSAGE_BYTES)
+            .max_frame_size(MAX_MESSAGE_BYTES)
+            .on_upgrade(move |socket| super::cascade::run(state, prepared, socket, slot));
+    }
     let prepared = match prepare(&state, uri.query(), &headers).await {
         Ok(p) => p,
         Err(e) => {

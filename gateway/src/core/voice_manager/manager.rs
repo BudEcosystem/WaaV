@@ -252,6 +252,7 @@ impl VoiceManager {
                 current_sample_rate: AtomicU32::new(24000),
                 is_completed: AtomicBool::new(true), // Start as completed
                 playout_end_ms: AtomicUsize::new(0), // Silent at start
+                audio_out_ms_total: std::sync::atomic::AtomicU64::new(0),
             }),
             config,
             clear_notify: Arc::new(Notify::new()),
@@ -1463,6 +1464,18 @@ impl VoiceManager {
     /// the bot-speaking truth for turn policy (MinWords barge-in gating,
     /// A-G3). Derived from the per-chunk playout estimate; cleared audio
     /// (barge-in) snaps it to silent.
+    /// Total milliseconds of TTS audio delivered to the egress this session (spec 025).
+    pub fn audio_out_ms(&self) -> u64 {
+        self.interruption_state
+            .audio_out_ms_total
+            .load(Ordering::Acquire)
+    }
+
+    /// Estimated milliseconds of delivered audio the client has not played yet (spec 025).
+    pub fn playout_remaining_ms(&self) -> u64 {
+        self.interruption_state.playout_remaining_ms()
+    }
+
     pub fn is_bot_speaking(&self) -> bool {
         self.interruption_state.is_audibly_speaking()
     }

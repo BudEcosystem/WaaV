@@ -335,10 +335,28 @@ async fn run_voice_socket_session(
     // Signal shutdown to sender task
     shutdown_voice_sender_task(shutdown_tx, &mut sender_task).await;
 
+    teardown_session(&state, &app_state).await;
+
+    info!("WebSocket voice connection terminated");
+}
+
+/// Release everything a `/ws` session holds, in order: leg metering and the voice agent, LiveKit,
+/// the providers, persistent realtime sessions, tracked tasks, recording and room.
+///
+/// Shared with the `/v1/realtime` voice-agent adapter, which runs a `/ws` session in-process and
+/// must release it exactly as `/ws` does (spec 025).
+pub(crate) async fn teardown_session(
+    state: &Arc<RwLock<ConnectionState>>,
+    app_state: &Arc<AppState>,
+) {
     // FRD-023 RT6: bill audio streamed after the last final transcript; the legs' admissions are
     // released with the state.
     if let Some(meter) = state.read().await.leg_meter.clone() {
         meter.finish();
+    }
+    // Spec 025: end the voice agent's live turn, which cancels its run at budprompt.
+    if let Some(engine) = state.read().await.agent.clone() {
+        engine.shutdown().await;
     }
 
     // Snapshot state before cleanup so we can drop the read lock before awaiting
@@ -470,8 +488,6 @@ async fn run_voice_socket_session(
             info!("Room deleted successfully");
         }
     }
-
-    info!("WebSocket voice connection terminated");
 }
 
 /// Why [`run_session_loop`] returned. Drives only logging today, but gives the

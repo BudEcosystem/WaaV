@@ -92,6 +92,7 @@ pub async fn handle_incoming_message(
             livekit,
             dag_config,
             conversation_config,
+            agent,
             alias,
         } => {
             // Handle backward compatibility for audio_disabled field
@@ -126,6 +127,7 @@ pub async fn handle_incoming_message(
                 livekit,
                 dag_config,
                 conversation_config,
+                agent,
                 alias,
                 state,
                 message_tx,
@@ -138,7 +140,37 @@ pub async fn handle_incoming_message(
             flush,
             allow_interruption,
         } => handle_speak_message(text, flush, allow_interruption, state, message_tx).await,
-        IncomingMessage::Clear => handle_clear_message(state, message_tx).await,
+        IncomingMessage::Clear => {
+            // Spec 025: on a voice-agent session `clear` stops the agent too — the live turn ends
+            // and its history keeps what was heard (a barge-in without speech).
+            if let Some(engine) = state.read().await.agent.clone() {
+                engine.cancel_response().await;
+                return true;
+            }
+            handle_clear_message(state, message_tx).await
+        }
+        IncomingMessage::Truncate { audio_end_ms } => {
+            match state.read().await.agent.clone() {
+                Some(engine) => engine.truncate_at(audio_end_ms),
+                None => {
+                    send_error(message_tx, "truncate applies to voice-agent sessions only").await
+                }
+            }
+            true
+        }
+        IncomingMessage::AgentInput { text } => {
+            match state.read().await.agent.clone() {
+                Some(engine) => engine.start_turn(text).await,
+                None => {
+                    send_error(
+                        message_tx,
+                        "agent_input applies to voice-agent sessions only",
+                    )
+                    .await
+                }
+            }
+            true
+        }
         IncomingMessage::SendMessage {
             message,
             role,
@@ -152,7 +184,20 @@ pub async fn handle_incoming_message(
             message_type,
             payload,
         } => handle_custom_message(message_type, payload, state, message_tx, app_state).await,
-        IncomingMessage::AudioEnd => handle_audio_end(state, message_tx).await,
+        IncomingMessage::AudioEnd => {
+            let keep = handle_audio_end(state, message_tx).await;
+            // Spec 025 manual turn detection: the end of the client's audio commits its turn. The
+            // provider's last final lands within the finalize; give it a moment before committing.
+            if let Some(engine) = state.read().await.agent.clone()
+                && engine.is_manual()
+            {
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    engine.commit_input().await;
+                });
+            }
+            keep
+        }
     }
 }
 
