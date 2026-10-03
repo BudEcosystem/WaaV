@@ -161,7 +161,9 @@ impl Default for AgentFillers {
             tool_call_after_ms: 1200,
             slow_response_after_ms: 2500,
             follow_up_after_ms: 3000,
-            messages: vec!["One moment.".into()],
+            messages: ["Hmm...", "One moment.", "Still checking..."]
+                .map(String::from)
+                .to_vec(),
             use_tool_status_messages: true,
         }
     }
@@ -487,6 +489,12 @@ mod tests {
         assert!(e.allows_override("tts.voice"));
         assert!(!e.allows_override("stt.language"));
         assert_eq!(e.fillers.follow_up_after_ms, 3000);
+        assert_eq!(
+            e.fillers.messages,
+            ["Hmm...", "One moment.", "Still checking..."],
+            "budapp's default filler script"
+        );
+        assert_eq!(e.fillers.messages, AgentFillers::default().messages);
         assert_eq!(e.key(), "c0de0000-0000-4000-8000-000000000003:v3");
     }
 

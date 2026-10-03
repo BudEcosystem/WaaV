@@ -1025,9 +1025,8 @@ mod tests {
     #[serial]
     async fn app_state_try_new_rejects_malformed_core_runtime_env_without_panic() {
         cleanup_core_runtime_env();
-        unsafe {
-            std::env::set_var("WAAV_EAGER_WARMUP", "sometimes");
-        }
+        // This thread only: in the shared environment, a parallel test's AppState read it.
+        crate::core::state::set_test_env_override("WAAV_EAGER_WARMUP", Some("sometimes"));
 
         let err = match AppState::try_new(minimal_test_config()).await {
             Ok(_) => panic!("malformed runtime env must fail AppState::try_new"),
@@ -1038,6 +1037,7 @@ mod tests {
             "error should name bad env var: {err}"
         );
 
+        crate::core::state::set_test_env_override("WAAV_EAGER_WARMUP", None);
         cleanup_core_runtime_env();
     }
 }
