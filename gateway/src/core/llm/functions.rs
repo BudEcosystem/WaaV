@@ -571,6 +571,8 @@ mod tests {
         };
         async fn chat(State(st): State<MockLlm>, Json(req): Json<Value>) -> Json<Value> {
             st.requests.lock().push(req);
+            // `fetch_update` is `try_update` from Rust 1.99; the image still builds on 1.96.
+            #[allow(deprecated)]
             let remaining = st
                 .tool_rounds
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {

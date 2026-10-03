@@ -36,6 +36,11 @@ fn partial_tag_tail_len(s: &str, tag: &str) -> usize {
     // Try the longest possible partial first (tag.len()-1 down to 1).
     let max = (tag.len() - 1).min(s.len());
     for n in (1..=max).rev() {
+        // The tags are ASCII, so a suffix starting inside a multi-byte character cannot match —
+        // and slicing there would panic.
+        if !s.is_char_boundary(s.len() - n) {
+            continue;
+        }
         let suffix = &s[s.len() - n..];
         if tag.as_bytes().starts_with(suffix.as_bytes()) {
             return n;
@@ -174,5 +179,35 @@ mod tests {
         assert_eq!(partial_tag_tail_len("abc<", OPEN), 1); // "<"
         assert_eq!(partial_tag_tail_len("abcdef", OPEN), 0);
         assert_eq!(partial_tag_tail_len("done</thin", CLOSE), 6); // "</thin"
+    }
+
+    /// A delta ending in a multi-byte character (a curly apostrophe, any non-Latin script) must not
+    /// be sliced inside that character. Live: gpt-5.4-nano's "Hi, I’m" panicked the turn task.
+    #[test]
+    fn multibyte_tail_is_never_sliced_inside_a_char() {
+        assert_eq!(partial_tag_tail_len("Hi, I’", OPEN), 0);
+        assert_eq!(partial_tag_tail_len("’", OPEN), 0);
+        assert_eq!(partial_tag_tail_len("日本語<", OPEN), 1);
+        assert_eq!(partial_tag_tail_len("é</th", CLOSE), 4);
+
+        let mut s = ThinkStripper::default();
+        let mut out = String::new();
+        for delta in [
+            "Hi",
+            ",",
+            " I",
+            "’",
+            "m",
+            " Bud",
+            " 😀",
+            "<thi",
+            "nk>私は</th",
+            "ink>",
+            " ok।",
+        ] {
+            out.push_str(&s.push(delta));
+        }
+        out.push_str(&s.flush());
+        assert_eq!(out, "Hi, I’m Bud 😀 ok।");
     }
 }

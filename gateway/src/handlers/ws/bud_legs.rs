@@ -400,6 +400,17 @@ pub struct LegMeter {
     turn_index: AtomicU64,
     /// Further deployments the session holds (a DAG template's bound nodes), revalidated with it.
     held: parking_lot::Mutex<Vec<(String, &'static str)>>,
+    /// Spec 025: a voice-agent session is authorized by the AGENT, not by its legs (D-6).
+    agent: parking_lot::Mutex<Option<AgentGrant>>,
+}
+
+/// What authorizes a voice-agent session, re-checked every revalidation (spec 025 S-8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentGrant {
+    /// The alias the caller reached: `prompt:<name>` or `prompt:<name>:v<n>`.
+    pub alias: String,
+    pub prompt_id: String,
+    pub version: i64,
 }
 
 impl std::fmt::Debug for LegMeter {
@@ -426,6 +437,7 @@ impl LegMeter {
             stt_bytes_per_second: AtomicU64::new(0),
             turn_index: AtomicU64::new(0),
             held: parking_lot::Mutex::new(Vec::new()),
+            agent: parking_lot::Mutex::new(None),
         };
         if let Some((_, rate, channels)) = stt {
             meter.set_stt_format(rate, channels);
@@ -551,6 +563,16 @@ impl LegMeter {
         self.held.lock().push((endpoint_id, capability));
     }
 
+    /// Mark this as a voice-agent session: revalidation re-checks the agent, not the legs.
+    pub fn set_agent(&self, grant: AgentGrant) {
+        *self.agent.lock() = Some(grant);
+    }
+
+    /// The agent this session speaks for, if it is a voice-agent session.
+    pub fn agent(&self) -> Option<AgentGrant> {
+        self.agent.lock().clone()
+    }
+
     /// The caller the session acts as.
     pub fn caller(&self) -> &Caller {
         &self.caller
@@ -570,6 +592,9 @@ pub async fn session_still_allowed(state: &AppState, meter: &LegMeter) -> bool {
         return false;
     };
     let plane = bud.plane();
+    if let Some(agent) = meter.agent() {
+        return agent_still_allowed(plane, meter, &agent).await;
+    }
     for (ep, capability) in meter.endpoints() {
         let serving = plane
             .voice_endpoint(&ep)
@@ -585,6 +610,44 @@ pub async fn session_still_allowed(state: &AppState, meter: &LegMeter) -> bool {
         }
     }
     true
+}
+
+/// A voice-agent session stays authorized while (spec 025 S-8): the caller still reaches the agent's
+/// alias, the agent version is still a voice agent, and both legs are still served.
+async fn agent_still_allowed(
+    plane: &bud_auth::BudPlane,
+    meter: &LegMeter,
+    agent: &AgentGrant,
+) -> bool {
+    let reachable = match meter.check() {
+        CallerCheck::ApiKey { hashed, client_key } => plane
+            .hash_reaches_alias(hashed, &agent.alias, *client_key)
+            .is_some(),
+        CallerCheck::Jwt { sub } => plane
+            .subject_reaches_alias(sub, &agent.alias)
+            .await
+            .is_some(),
+    };
+    if !reachable {
+        return false;
+    }
+    let Some(entry) = plane.voice_agent(&agent.prompt_id, agent.version) else {
+        return false;
+    };
+    // The legs the session was started on: a projection that moved the agent to other deployments
+    // ends this session too — it was admitted to the old ones.
+    let held = meter.endpoints();
+    held.iter().all(|(ep, capability)| {
+        let current = if *capability == STT_CAPABILITY {
+            &entry.stt.endpoint_id
+        } else {
+            &entry.tts.endpoint_id
+        };
+        current == ep
+            && plane
+                .voice_endpoint(ep)
+                .is_some_and(|e| e.serves(capability))
+    })
 }
 
 /// A Bud-mode `/ws` session's legs, resolved and admitted.
@@ -698,6 +761,318 @@ pub async fn prepare(
         meter,
         admissions: vec![stt_leg.admission, tts_leg.admission],
         advisories,
+    })
+}
+
+/// A voice-agent session's legs and the agent they speak for (spec 025 §5.4).
+pub struct PreparedAgent {
+    pub legs: PreparedLegs,
+    pub agent: crate::state::ResolvedVoiceAgent,
+}
+
+impl std::fmt::Debug for PreparedAgent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedAgent")
+            .field("agent", &self.agent.alias)
+            .field("version", &self.agent.version)
+            .field("legs", &self.legs)
+            .finish()
+    }
+}
+
+/// Resolve one of an agent's legs by its deployment id and admit the session to it.
+///
+/// NOT through the caller's allowlist: the agent authorizes its own legs (D-6), and budapp held
+/// them to the agent's project when the voice block was saved (S-3).
+async fn resolve_agent_leg(
+    state: &AppState,
+    agent: &crate::state::ResolvedVoiceAgent,
+    endpoint_id: &str,
+    capability: &'static str,
+) -> Result<BudLeg, LegRefusal> {
+    let plane = state.bud_mode.as_ref().map(|b| b.plane()).ok_or_else(|| {
+        LegRefusal::new(
+            "bud_mode_required",
+            "voice agents need the Bud control plane",
+        )
+    })?;
+    let unavailable = || {
+        LegRefusal::new(
+            "voice_leg_unavailable",
+            format!(
+                "Voice agent '{}': its {} deployment is not available on this gateway (deleted, not                  yet published, or no longer serving {}).",
+                agent.prompt_name,
+                kind(capability),
+                capability
+            ),
+        )
+    };
+    let endpoint = plane
+        .voice_endpoint(endpoint_id)
+        .filter(|e| e.serves(capability))
+        .ok_or_else(unavailable)?;
+    let vendor = endpoint.vendor.as_str();
+    if capability == STT_CAPABILITY
+        && (crate::core::tts::self_hosted::is_self_hosted(vendor)
+            || crate::core::tts::self_hosted::is_azure_openai(vendor))
+    {
+        return Err(LegRefusal::new(
+            "stt_not_streaming",
+            format!(
+                "Voice agent '{}': its transcription deployment ({vendor}) transcribes uploaded                  files and cannot stream. Choose a streaming transcription deployment for the agent.",
+                agent.prompt_name
+            ),
+        ));
+    }
+    let mut ignored = Advisories::new();
+    if let Some(why) =
+        crate::handlers::openai_audio::endpoint_misconfiguration_reason(&endpoint, &mut ignored)
+    {
+        return Err(LegRefusal::new(
+            "deployment_misconfigured",
+            format!(
+                "Voice agent '{}': its {} deployment is misconfigured for vendor '{vendor}': {why}",
+                agent.prompt_name,
+                kind(capability)
+            ),
+        ));
+    }
+    let admission = state.admit_deployment(endpoint_id).await.map_err(|rej| {
+        let (code, what) = match rej {
+            Rejection::Rate(_) => ("rate_limit_exceeded", "rate limit"),
+            Rejection::Concurrency(_) => ("concurrency_limit_exceeded", "concurrent-session limit"),
+        };
+        LegRefusal::new(
+            code,
+            format!(
+                "Voice agent '{}': its {} deployment reached its {what}; retry in {} s.",
+                agent.prompt_name,
+                kind(capability),
+                rej.retry_after().as_secs().max(1)
+            ),
+        )
+        .closing(CLOSE_TRY_LATER)
+    })?;
+    Ok(BudLeg {
+        endpoint_id: endpoint_id.to_string(),
+        endpoint_name: format!(
+            "{}/{}",
+            agent.prompt_name,
+            if capability == STT_CAPABILITY {
+                "stt"
+            } else {
+                "tts"
+            }
+        ),
+        endpoint,
+        // Attribution: the leg is the AGENT's deployment, in the agent's project.
+        alias: Some(AliasMetadata {
+            endpoint_id: Some(endpoint_id.to_string()),
+            project_id: agent.entry.project_id.clone(),
+            kind: Some("model".into()),
+            ..Default::default()
+        }),
+        admission,
+    })
+}
+
+/// An override the agent does not allow: the caller hears why their value was not used.
+fn refused_override(advisories: &mut Advisories, setting: &str, field: &str) {
+    advisories.warn(format!(
+        "This agent does not let callers change {setting}: {field} is ignored and the agent's own setting applies."
+    ));
+}
+
+/// The agent's turn-detection eagerness as a SmartTurn threshold (higher = waits longer).
+pub(crate) fn eagerness_threshold(eagerness: &str) -> Option<f32> {
+    match eagerness {
+        "low" => Some(0.7),
+        "medium" => Some(0.5),
+        "high" => Some(0.3),
+        _ => None,
+    }
+}
+
+/// Authenticate the caller, resolve `prompt:<name>` to a voice agent it may reach, resolve and admit
+/// the agent's two legs, and point the configs at them (spec 025 §5.4).
+///
+/// The client's `stt_config` / `tts_config` keep their AUDIO format; the deployment, model and
+/// credential are the agent's. A voice, speed or language the client sends is kept only when the
+/// agent lets callers override it (`session_overrides`, S-4).
+pub async fn prepare_agent(
+    state: &Arc<AppState>,
+    credential: Option<&crate::auth::SessionCredential>,
+    model: &str,
+    stt: &mut STTWebSocketConfig,
+    tts: &mut TTSWebSocketConfig,
+    session_id: &str,
+) -> Result<PreparedAgent, LegRefusal> {
+    let Some(credential) = credential.map(|c| c.current()) else {
+        return Err(LegRefusal::new(
+            "authentication_required",
+            "A voice agent needs your Bud API key or token.",
+        )
+        .closing(CLOSE_REVOKED));
+    };
+    let bearer = crate::handlers::openai_realtime::handshake::Credential::new(
+        credential.clone(),
+        crate::handlers::openai_realtime::handshake::CredentialSource::Bearer,
+    );
+    let caller = crate::handlers::openai_realtime::session::authenticate(state, &bearer)
+        .await
+        .map_err(|e| {
+            let close = if e.status == axum::http::StatusCode::SERVICE_UNAVAILABLE
+                || e.status == axum::http::StatusCode::TOO_MANY_REQUESTS
+            {
+                CLOSE_TRY_LATER
+            } else {
+                CLOSE_REVOKED
+            };
+            LegRefusal::new(e.code, e.message).closing(close)
+        })?;
+    for (field, key) in [
+        ("stt_config.api_key", &stt.api_key),
+        ("tts_config.api_key", &tts.api_key),
+    ] {
+        if key.as_deref().is_some_and(|k| !k.trim().is_empty()) {
+            return Err(LegRefusal::new(
+                "client_key_not_accepted",
+                format!(
+                    "{field} is not accepted: a voice agent's legs use its deployments' own credentials."
+                ),
+            ));
+        }
+    }
+    for (field, value) in [
+        ("stt_config.model", &stt.model),
+        ("tts_config.model", &tts.model),
+    ] {
+        if !value.trim().is_empty() {
+            return Err(LegRefusal::new(
+                "agent_owns_legs",
+                format!(
+                    "{field} cannot be set on a voice-agent session: the agent decides its speech deployments. Remove the field."
+                ),
+            ));
+        }
+    }
+
+    let agent = state
+        .resolve_voice_agent(model, &credential)
+        .await
+        .map_err(|why| match why {
+            crate::state::VoiceAgentRefusal::NotFound => LegRefusal::new(
+                "model_not_found",
+                format!("'{model}' is not an agent this credential can reach."),
+            ),
+            crate::state::VoiceAgentRefusal::NotVoiceEnabled => LegRefusal::new(
+                "agent_not_voice_enabled",
+                format!(
+                    "'{model}' is an agent without voice: give its version an STT and a TTS deployment in the agent's voice settings."
+                ),
+            ),
+        })?;
+    let entry = Arc::clone(&agent.entry);
+
+    let stt_leg = resolve_agent_leg(state, &agent, &entry.stt.endpoint_id, STT_CAPABILITY).await?;
+    let tts_leg = resolve_agent_leg(state, &agent, &entry.tts.endpoint_id, TTS_CAPABILITY).await?;
+
+    // Caller overrides the agent allows (S-4); everything else is the agent's. A refused one is
+    // reported to the caller, never dropped silently; sending the agent's own value is no override.
+    let mut advisories = Advisories::new();
+    let client_language = Some(stt.language.trim().to_string()).filter(|l| !l.is_empty());
+    let client_voice = tts.voice_id.clone().filter(|v| !v.trim().is_empty());
+    let client_speed = tts.speaking_rate;
+    let client_turn = stt.turn_detection.take();
+
+    let agent_language = entry.stt.language.clone();
+    stt.language = match client_language {
+        Some(l) if entry.allows_override("stt.language") => l,
+        other => {
+            if other.is_some_and(|l| Some(l.as_str()) != agent_language.as_deref()) {
+                refused_override(&mut advisories, "stt.language", "stt_config.language");
+            }
+            agent_language.unwrap_or_default()
+        }
+    };
+    let agent_voice = entry.tts.voice.clone();
+    tts.voice_id = match client_voice {
+        Some(v) if entry.allows_override("tts.voice") => Some(v),
+        other => {
+            if other.is_some_and(|v| Some(v.as_str()) != agent_voice.as_deref()) {
+                refused_override(&mut advisories, "tts.voice", "tts_config.voice_id");
+            }
+            agent_voice
+        }
+    };
+    tts.voice_descriptor = None;
+    let agent_speed = entry.tts.speed.map(|s| s as f32);
+    tts.speaking_rate = match client_speed {
+        Some(s) if entry.allows_override("tts.speed") => Some(s),
+        other => {
+            if other.is_some_and(|s| Some(s) != agent_speed) {
+                refused_override(&mut advisories, "tts.speed", "tts_config.speaking_rate");
+            }
+            agent_speed
+        }
+    };
+
+    // Semantic turn detection: the SmartTurn ensemble at the agent's eagerness. A caller's
+    // `turn_detection` is an eagerness override and nothing more, kept only where the agent allows
+    // one: an agent never speculates, and a manual or silence agent keeps its own turn taking.
+    let semantic = entry.turn_detection.kind == "semantic";
+    let eagerness_allowed = semantic && entry.allows_override("turn_detection.eagerness");
+    stt.turn_detection = semantic.then(|| super::config::TurnDetectionWsConfig {
+        enabled: true,
+        threshold: match &client_turn {
+            Some(td) if eagerness_allowed => td.threshold,
+            _ => eagerness_threshold(&entry.turn_detection.eagerness),
+        },
+        eager: false,
+    });
+    if client_turn.is_some() && !eagerness_allowed {
+        if semantic {
+            refused_override(
+                &mut advisories,
+                "turn_detection.eagerness",
+                "stt_config.turn_detection",
+            );
+        } else {
+            advisories.warn(format!(
+                "This agent's turn taking is {}: stt_config.turn_detection is ignored.",
+                entry.turn_detection.kind
+            ));
+        }
+    }
+
+    let stt_key = apply_stt(stt, &stt_leg, &mut advisories);
+    let tts_key = apply_tts(tts, &tts_leg, &mut advisories);
+    if !entry.stt.keyterms.is_empty() && stt.features.keyterms.is_none() {
+        stt.features.keyterms = Some(entry.stt.keyterms.clone());
+    }
+
+    let meter = Arc::new(LegMeter::new(
+        session_id.to_string(),
+        caller,
+        Some((&stt_leg, stt.sample_rate, stt.channels)),
+        Some(&tts_leg),
+    ));
+    meter.set_agent(AgentGrant {
+        alias: agent.alias.clone(),
+        prompt_id: agent.prompt_id.clone(),
+        version: agent.version,
+    });
+    let tts_api_base = tts_leg.endpoint.api_base.clone();
+    Ok(PreparedAgent {
+        legs: PreparedLegs {
+            stt_key,
+            tts_key,
+            tts_api_base,
+            meter,
+            admissions: vec![stt_leg.admission, tts_leg.admission],
+            advisories,
+        },
+        agent,
     })
 }
 
@@ -1697,3 +2072,7 @@ mod tests {
         assert!(!legs.meter.same_caller(&other));
     }
 }
+
+#[cfg(test)]
+#[path = "bud_legs_agent_tests.rs"]
+mod agent_tests;

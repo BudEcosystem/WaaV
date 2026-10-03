@@ -56,6 +56,8 @@ pub struct ConnectionState {
     pub leg_meter: Option<Arc<super::bud_legs::LegMeter>>,
     /// FRD-023 RT6: each leg deployment's admission, held for the session (FRD-022 §6.2).
     pub leg_admissions: Vec<crate::core::deployment_policy::Admission>,
+    /// Spec 025: the session's voice agent, when `config.agent` named one.
+    pub agent: Option<Arc<crate::core::agent::AgentEngine>>,
 
     /// D8 uplink opus decoder (feature `opus-codec`): `Some` only when the session negotiated
     /// `stt_config.audio_in_codec = opus`. Each client WS binary frame is one opus packet decoded
@@ -103,6 +105,7 @@ impl ConnectionState {
             caller_check: None,
             leg_meter: None,
             leg_admissions: Vec::new(),
+            agent: None,
             #[cfg(feature = "opus-codec")]
             opus_decoder: None,
             #[cfg(feature = "dag-routing")]
@@ -134,6 +137,7 @@ impl ConnectionState {
             caller_check: None,
             leg_meter: None,
             leg_admissions: Vec::new(),
+            agent: None,
             #[cfg(feature = "opus-codec")]
             opus_decoder: None,
             #[cfg(feature = "dag-routing")]

@@ -115,6 +115,8 @@ impl PlaybackQueue {
     /// a blanket `clear_all` may have already zeroed it).
     pub fn mark_played(&self, interruptible: bool) {
         if !interruptible {
+            // `fetch_update` is `try_update` from Rust 1.99; the image still builds on 1.96.
+            #[allow(deprecated)]
             let _ = self.uninterruptible_in_flight.fetch_update(
                 Ordering::AcqRel,
                 Ordering::Acquire,

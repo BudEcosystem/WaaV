@@ -30,6 +30,46 @@ pub struct ResolvedVoiceEndpoint {
     pub endpoint: bud_auth::credentials::VoiceEndpoint,
 }
 
+/// A voice agent as a caller reached it (spec 025 §5.4).
+#[derive(Debug, Clone)]
+pub struct ResolvedVoiceAgent {
+    /// The alias the caller's map holds it under: `prompt:<name>` or `prompt:<name>:v<n>`.
+    pub alias: String,
+    /// The agent's name as budgateway looks it up (`prompt:{this}`), without a version.
+    pub prompt_name: String,
+    /// What the projection is keyed by: budapp's prompt UUID, or a draft id.
+    pub prompt_id: String,
+    /// Pinned for the session (D-12).
+    pub version: i64,
+    pub meta: bud_auth::AliasMetadata,
+    pub entry: std::sync::Arc<bud_auth::VoiceAgentEntry>,
+}
+
+/// Why a `prompt:` model could not be served as a voice agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VoiceAgentRefusal {
+    /// The caller's allowlist has no such agent (or it is not an agent).
+    NotFound,
+    /// The agent exists but its version has no voice block.
+    NotVoiceEnabled,
+}
+
+/// Split `prompt:<name>[:v<n>]` into the name and the version the caller pinned, if any.
+pub fn parse_agent_model(model: &str) -> Option<(String, Option<i64>)> {
+    let rest = model.trim().strip_prefix("prompt:")?;
+    if rest.is_empty() {
+        return None;
+    }
+    if let Some((name, v)) = rest.rsplit_once(":v")
+        && !name.is_empty()
+        && let Ok(n) = v.parse::<i64>()
+        && n >= 1
+    {
+        return Some((name.to_string(), Some(n)));
+    }
+    Some((rest.to_string(), None))
+}
+
 /// Application state that can be shared across handlers
 #[derive(Clone)]
 pub struct AppState {
@@ -162,6 +202,67 @@ impl AppState {
 }
 
 impl AppState {
+    /// Resolve `prompt:<name>[:v<n>]` to a voice agent this caller may reach (spec 025 §5.4).
+    ///
+    /// The alias is looked up in the caller's own allowlist — its key map, the published overlay
+    /// for a customer key, `project_models` for a JWT — exactly where budgateway's auth looks, so a
+    /// caller reaches a voice agent exactly when it reaches the agent by text. The agent's two
+    /// speech deployments are NOT checked against that allowlist: the agent authorizes its own legs
+    /// (D-6), and budapp restricted them to the agent's project when the voice block was saved.
+    pub async fn resolve_voice_agent(
+        &self,
+        model: &str,
+        bearer: &str,
+    ) -> Result<ResolvedVoiceAgent, VoiceAgentRefusal> {
+        let plane = self
+            .bud_mode
+            .as_ref()
+            .ok_or(VoiceAgentRefusal::NotFound)?
+            .plane();
+        let (name, pinned) = parse_agent_model(model).ok_or(VoiceAgentRefusal::NotFound)?;
+        let alias = match pinned {
+            Some(v) => format!("prompt:{name}:v{v}"),
+            None => format!("prompt:{name}"),
+        };
+        // A JWT (the playground's credential) reaches the alias through its projects' grants.
+        // Every refusal is logged with what was looked up: the client sees only a handshake status.
+        let refuse = |why: VoiceAgentRefusal, detail: &str| {
+            tracing::info!(model, alias = %alias, detail, "voice agent refused");
+            why
+        };
+        let meta = plane.caller_alias(bearer, &alias).await.ok_or_else(|| {
+            refuse(
+                VoiceAgentRefusal::NotFound,
+                "alias not reachable by this caller",
+            )
+        })?;
+        if meta.kind.as_deref().is_some_and(|k| k != "agent") {
+            return Err(refuse(VoiceAgentRefusal::NotFound, "alias is not an agent"));
+        }
+        let prompt_id = meta
+            .prompt_id
+            .clone()
+            .ok_or_else(|| refuse(VoiceAgentRefusal::NotFound, "alias carries no prompt_id"))?;
+        let version = pinned.or(meta.version).ok_or_else(|| {
+            refuse(
+                VoiceAgentRefusal::NotVoiceEnabled,
+                "alias carries no version",
+            )
+        })?;
+        let entry = plane.voice_agent(&prompt_id, version).ok_or_else(|| {
+            tracing::info!(prompt_id = %prompt_id, version, "voice agent refused: no projection for this version");
+            VoiceAgentRefusal::NotVoiceEnabled
+        })?;
+        Ok(ResolvedVoiceAgent {
+            alias,
+            prompt_name: name,
+            prompt_id,
+            version,
+            meta,
+            entry,
+        })
+    }
+
     /// A fallback deployment by endpoint id (FRD-022 §6.4). `fallback_models` holds endpoint
     /// ids, not aliases, and budapp validated them at save, so no alias map is consulted; a
     /// fallback that no longer exists or does not serve `capability` is skipped by the caller.

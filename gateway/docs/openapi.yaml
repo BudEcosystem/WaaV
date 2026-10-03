@@ -619,6 +619,39 @@ components:
       - young
       - middle_aged
       - old
+    AgentWebSocketConfig:
+      type: object
+      description: |-
+        A Bud voice agent for this session (spec 025): `{"type":"config","agent":{"id":"support"}}`.
+
+        The agent decides both speech legs (its STT and TTS deployments), the voice and how turns are
+        taken; budprompt runs its prompt, tools and governance one turn per utterance. `stt_config` and
+        `tts_config` may still carry the client's AUDIO format (sample rate, encoding, codec, playback
+        rate) and the overrides the agent allows (`session_overrides`); they never name a deployment.
+        Mutually exclusive with `conversation_config` and `dag_config`.
+      required:
+      - id
+      properties:
+        id:
+          type: string
+          description: |-
+            The agent's name — what `prompt:<name>` names on `/v1/responses` — optionally pinned to a
+            version as `name:v<n>` (or with `version`). The `prompt:` prefix is accepted and ignored.
+          example: support
+        text_only:
+          type:
+          - boolean
+          - 'null'
+          description: 'Text replies only: the agent''s answers arrive as `assistant_transcript`, nothing is spoken.'
+        variables:
+          type: object
+          description: The agent's structured input, once per session (D-14).
+        version:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: Pin a version; the agent's default version is used (and pinned for the session) otherwise.
     AliasKind:
       type: string
       description: |-
@@ -1468,6 +1501,14 @@ components:
         required:
         - type
         properties:
+          agent:
+            oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/AgentWebSocketConfig'
+              description: |-
+                A Bud voice agent for the session (spec 025): its STT and TTS deployments, voice and
+                turn-taking come from the agent; budprompt answers one turn per utterance. Mutually
+                exclusive with `conversation_config` and `dag_config`.
           alias:
             type:
             - string
@@ -1712,6 +1753,36 @@ components:
             type: string
             enum:
             - audio_end
+      - type: object
+        description: |-
+          Voice-agent sessions (spec 025): the client played only `audio_end_ms` of the agent's
+          current (or last) reply — the agent's history keeps what was heard.
+        required:
+        - audio_end_ms
+        - type
+        properties:
+          audio_end_ms:
+            type: integer
+            format: int64
+            description: Milliseconds of the reply's audio the client actually played.
+            minimum: 0
+          type:
+            type: string
+            enum:
+            - truncate
+      - type: object
+        description: 'Voice-agent sessions (spec 025): a typed user turn — no speech, the same agent turn.'
+        required:
+        - text
+        - type
+        properties:
+          text:
+            type: string
+            description: What the user typed.
+          type:
+            type: string
+            enum:
+            - agent_input
       description: WebSocket message types for incoming messages
     IntensityLevel:
       type: string
@@ -2131,6 +2202,179 @@ components:
             type: string
             enum:
             - auth_required
+      - type: object
+        description: 'Voice agent (spec 025): an agent turn began (`kind`: `agent` or `greeting`).'
+        required:
+        - turn_index
+        - kind
+        - type
+        properties:
+          input:
+            type:
+            - string
+            - 'null'
+            description: The user's words that started it; absent for the greeting.
+          kind:
+            type: string
+          turn_index:
+            type: integer
+            format: int64
+            minimum: 0
+          type:
+            type: string
+            enum:
+            - agent_response_started
+      - type: object
+        description: 'Voice agent: budprompt''s id for this turn''s run (`GET /v1/responses/{id}`).'
+        required:
+        - turn_index
+        - response_id
+        - type
+        properties:
+          response_id:
+            type: string
+          turn_index:
+            type: integer
+            format: int64
+            minimum: 0
+          type:
+            type: string
+            enum:
+            - agent_response_created
+      - type: object
+        description: 'Voice agent: the agent''s words, as they are spoken (or shown, in text mode).'
+        required:
+        - turn_index
+        - delta
+        - type
+        properties:
+          delta:
+            type: string
+          turn_index:
+            type: integer
+            format: int64
+            minimum: 0
+          type:
+            type: string
+            enum:
+            - assistant_transcript
+      - type: object
+        description: 'Voice agent: a server-side tool''s progress (`in_progress`, `completed`, `failed`).'
+        required:
+        - turn_index
+        - item_id
+        - name
+        - status
+        - type
+        properties:
+          item_id:
+            type: string
+          name:
+            type: string
+          status:
+            type: string
+          turn_index:
+            type: integer
+            format: int64
+            minimum: 0
+          type:
+            type: string
+            enum:
+            - agent_tool
+      - type: object
+        description: 'Voice agent: a structured-output agent''s JSON.'
+        required:
+        - turn_index
+        - output
+        - type
+        properties:
+          output:
+            type: object
+          response_id:
+            type:
+            - string
+            - 'null'
+          turn_index:
+            type: integer
+            format: int64
+            minimum: 0
+          type:
+            type: string
+            enum:
+            - agent_output
+      - type: object
+        description: 'Voice agent: the turn ended (`completed`, `cancelled`, `failed`, `incomplete`).'
+        required:
+        - turn_index
+        - kind
+        - status
+        - transcript
+        - type
+        properties:
+          kind:
+            type: string
+          response_id:
+            type:
+            - string
+            - 'null'
+          status:
+            type: string
+          transcript:
+            type: string
+            description: What the caller heard (or was shown).
+          turn_index:
+            type: integer
+            format: int64
+            minimum: 0
+          type:
+            type: string
+            enum:
+            - agent_response_done
+          usage:
+            type: object
+      - type: object
+        description: 'Voice agent: the reply was cut off; the agent''s history keeps `spoken`.'
+        required:
+        - turn_index
+        - spoken
+        - audio_end_ms
+        - type
+        properties:
+          audio_end_ms:
+            type: integer
+            format: int64
+            minimum: 0
+          response_id:
+            type:
+            - string
+            - 'null'
+          spoken:
+            type: string
+          turn_index:
+            type: integer
+            format: int64
+            minimum: 0
+          type:
+            type: string
+            enum:
+            - agent_truncated
+      - type: object
+        description: |-
+          Voice agent: a non-fatal error with a stable code (`missing_variables`, `rate_limit_exceeded`,
+          `auth_expired`, `approval_required`, …).
+        required:
+        - code
+        - message
+        - type
+        properties:
+          code:
+            type: string
+          message:
+            type: string
+          type:
+            type: string
+            enum:
+            - agent_error
       - type: object
         description: |-
           Plugin response message

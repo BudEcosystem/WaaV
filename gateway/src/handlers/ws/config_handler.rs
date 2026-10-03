@@ -33,6 +33,7 @@ use crate::dag::{
     nodes::STTResultData,
 };
 
+use super::agent::initialize_agent_loop;
 use super::{
     config::{
         ConversationWebSocketConfig, DAGWebSocketConfig, LiveKitWebSocketConfig,
@@ -165,6 +166,7 @@ pub async fn handle_config_message(
     livekit_ws_config: Option<LiveKitWebSocketConfig>,
     mut dag_ws_config: Option<DAGWebSocketConfig>,
     mut conversation_ws_config: Option<ConversationWebSocketConfig>,
+    agent_ws_config: Option<super::config::AgentWebSocketConfig>,
     alias: Option<String>,
     state: &Arc<RwLock<ConnectionState>>,
     message_tx: &mpsc::Sender<MessageRoute>,
@@ -197,6 +199,29 @@ pub async fn handle_config_message(
         warn!(reason = %refusal, "Refusing a Bud-mode /ws config");
         send_error(message_tx, refusal).await;
         return true;
+    }
+
+    // Spec 025: a voice agent decides its own legs and runs its own turns.
+    if let Some(agent) = agent_ws_config.as_ref() {
+        if let Some(refusal) = agent_config_refusal(
+            agent,
+            app_state.bud_mode.is_some(),
+            audio,
+            conversation_ws_config.is_some(),
+            dag_ws_config.is_some(),
+            alias.is_some(),
+        ) {
+            warn!(reason = %refusal, "Refusing a voice-agent /ws config");
+            send_error(message_tx, refusal).await;
+            return true;
+        }
+        // The agent supplies the legs; the client's configs carry only its audio format.
+        if stt_ws_config.is_none() {
+            stt_ws_config = Some(super::config::default_agent_stt_config());
+        }
+        if tts_ws_config.is_none() {
+            tts_ws_config = super::config::default_agent_tts_config();
+        }
     }
 
     // P3: resolve a server-side ALIAS into the session config BEFORE any provider
@@ -263,16 +288,36 @@ pub async fn handle_config_message(
     // the caller's allowlist and admitted once for the session; its vendor credential, model,
     // api_base and voice come from voice_table (the voice read with the deployment's own key, so
     // P4 below has nothing left to do for it).
+    let mut resolved_agent: Option<crate::state::ResolvedVoiceAgent> = None;
     let mut bud_legs = if app_state.bud_mode.is_some() && audio_enabled {
-        match prepare_bud_legs(
-            app_state,
-            state,
-            &mut stt_ws_config,
-            &mut tts_ws_config,
-            &stream_id,
-        )
-        .await
-        {
+        let prepared = match agent_ws_config.as_ref() {
+            Some(agent) => prepare_agent_legs(
+                app_state,
+                state,
+                &agent.model(),
+                &mut stt_ws_config,
+                &mut tts_ws_config,
+                &stream_id,
+            )
+            .await
+            .map(|p| {
+                p.map(|p| {
+                    resolved_agent = Some(p.agent);
+                    p.legs
+                })
+            }),
+            None => {
+                prepare_bud_legs(
+                    app_state,
+                    state,
+                    &mut stt_ws_config,
+                    &mut tts_ws_config,
+                    &stream_id,
+                )
+                .await
+            }
+        };
+        match prepared {
             Ok(legs) => legs,
             Err(refusal) => {
                 warn!(code = refusal.code, "Refusing a Bud-mode /ws leg");
@@ -638,7 +683,36 @@ pub async fn handle_config_message(
     // Mutually exclusive with the DAG: the DAG owns the post-STT pipeline when
     // enabled, so we only wire the conversation orchestrator when DAG routing is
     // not active. When neither is set, the gateway keeps raw STT/TTS behavior.
-    let conversation_enabled = if dag_enabled {
+    // Spec 025: a voice agent's turns are budprompt runs, driven by the agent engine.
+    let agent_enabled = match (
+        resolved_agent.take(),
+        voice_manager.as_ref(),
+        agent_ws_config.as_ref(),
+    ) {
+        (Some(agent), Some(vm), Some(agent_cfg)) => {
+            match initialize_agent_loop(
+                agent, agent_cfg, &stream_id, vm, state, message_tx, app_state,
+            )
+            .await
+            {
+                Ok(()) => true,
+                Err(e) => {
+                    error!("Voice agent initialization failed: {}", e);
+                    send_error(
+                        message_tx,
+                        format!("Voice agent initialization failed: {e}"),
+                    )
+                    .await;
+                    false
+                }
+            }
+        }
+        _ => false,
+    };
+
+    let conversation_enabled = if agent_enabled {
+        false
+    } else if dag_enabled {
         if conversation_ws_config.is_some() {
             warn!(
                 "Both dag_config and conversation_config provided; DAG takes precedence, \
@@ -720,11 +794,58 @@ pub async fn handle_config_message(
         audio_enabled = audio_enabled,
         dag_enabled = dag_enabled,
         conversation_enabled = conversation_enabled,
+        agent_enabled = agent_enabled,
         livekit = livekit_room_name.is_some(),
         "Connection configured and ready"
     );
 
+    // Spec 025: the greeting goes after `ready`, so the client is listening when it starts.
+    if agent_enabled && let Some(engine) = state.read().await.agent.clone() {
+        tokio::spawn(async move { engine.greet().await });
+    }
+
     true
+}
+
+/// What a voice-agent `/ws` config may not carry (spec 025 §5.6), or `None`.
+pub(crate) fn agent_config_refusal(
+    agent: &super::config::AgentWebSocketConfig,
+    bud_mode: bool,
+    audio: Option<bool>,
+    conversation: bool,
+    dag: bool,
+    alias: bool,
+) -> Option<String> {
+    if !bud_mode {
+        return Some(
+            "config.agent needs the Bud control plane: voice agents are Bud agents.".into(),
+        );
+    }
+    if agent.id.trim().is_empty() || agent.id.trim() == "prompt:" {
+        return Some("config.agent.id must name the agent (as in `prompt:<name>`).".into());
+    }
+    if audio == Some(false) {
+        return Some(
+            "config.agent needs audio: a voice agent listens and speaks. Use /v1/responses for text."
+                .into(),
+        );
+    }
+    let mut clash = Vec::new();
+    if conversation {
+        clash.push("conversation_config");
+    }
+    if dag {
+        clash.push("dag_config");
+    }
+    if alias {
+        clash.push("alias");
+    }
+    (!clash.is_empty()).then(|| {
+        format!(
+            "config.agent cannot be combined with {}: the agent runs the conversation.",
+            clash.join(" or ")
+        )
+    })
 }
 
 /// What a Bud-mode `/ws` config may not carry (FRD-023 RT0, FR-WS-2, FR-WS-3), or `None`.
@@ -791,6 +912,24 @@ async fn prepare_bud_legs(
     };
     let credential = state.read().await.credential.clone();
     super::bud_legs::prepare(app_state, credential.as_ref(), stt, tts, stream_id)
+        .await
+        .map(Some)
+}
+
+/// Resolve a voice-agent session's agent and legs (spec 025 §5.4).
+async fn prepare_agent_legs(
+    app_state: &Arc<AppState>,
+    state: &Arc<RwLock<ConnectionState>>,
+    model: &str,
+    stt: &mut Option<STTWebSocketConfig>,
+    tts: &mut Option<TTSWebSocketConfig>,
+    stream_id: &str,
+) -> Result<Option<super::bud_legs::PreparedAgent>, super::bud_legs::LegRefusal> {
+    let (Some(stt), Some(tts)) = (stt.as_mut(), tts.as_mut()) else {
+        return Ok(None);
+    };
+    let credential = state.read().await.credential.clone();
+    super::bud_legs::prepare_agent(app_state, credential.as_ref(), model, stt, tts, stream_id)
         .await
         .map(Some)
 }
@@ -4143,6 +4282,7 @@ mod frd023_bud_mode_tests {
             None,
             Some(conv),
             None,
+            None,
             &state,
             &tx,
             &app_state,
@@ -4257,6 +4397,7 @@ mod frd023_bud_mode_tests {
             None,
             None,
             None,
+            None,
             &state,
             &tx,
             &app_state,
@@ -4294,6 +4435,7 @@ mod frd023_bud_mode_tests {
             Some(true),
             Some(stt),
             Some(tts),
+            None,
             None,
             None,
             None,

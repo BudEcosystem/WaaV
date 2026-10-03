@@ -121,6 +121,12 @@ impl BudPlane {
             voice_skipped = voice.skipped,
             "voice table hydrated"
         );
+        let agents = hydrate::hydrate_voice_agents(self.store.as_ref(), &self.auth).await?;
+        tracing::info!(
+            voice_agents = agents.endpoints,
+            voice_agents_skipped = agents.skipped,
+            "voice agents hydrated"
+        );
         self.load_published_overlay().await;
         self.hydrated.store(true, Ordering::SeqCst);
         Ok(stats)
@@ -135,6 +141,7 @@ impl BudPlane {
         let stats = hydrate::hydrate_all(self.store.as_ref(), &self.auth).await?;
         let _ =
             hydrate::hydrate_voice_table(self.store.as_ref(), &self.auth, &self.decryptor).await?;
+        let _ = hydrate::hydrate_voice_agents(self.store.as_ref(), &self.auth).await?;
         // Publications made while the connection was down arrived as events nobody heard.
         self.load_published_overlay().await;
         self.hydrated.store(true, Ordering::SeqCst);
@@ -219,6 +226,56 @@ impl BudPlane {
         )
         .await?;
         Ok(())
+    }
+
+    /// An agent version's voice projection (spec 025). No I/O.
+    pub fn voice_agent(
+        &self,
+        prompt_id: &str,
+        version: i64,
+    ) -> Option<Arc<crate::voice_agent::VoiceAgentEntry>> {
+        self.auth.voice_agent(prompt_id, version)
+    }
+
+    /// Whether an API key, known only by its snapshot hash, still reaches ALIAS `alias`.
+    ///
+    /// Spec 025 revalidation: a voice-agent session is authorized by the agent's alias, not by its
+    /// legs' deployments (which the caller may not reach directly, D-6). `client_key` adds the
+    /// published overlay, as at connect.
+    pub fn hash_reaches_alias(
+        &self,
+        hashed: &str,
+        alias: &str,
+        client_key: bool,
+    ) -> Option<AliasMetadata> {
+        let own = self.auth.resolve(hashed)?;
+        if client_key && let Some(meta) = self.published.load().get(alias) {
+            return Some(meta.clone());
+        }
+        own.get(alias).cloned()
+    }
+
+    /// Whether a JWT subject still reaches ALIAS `alias` (spec 025 revalidation).
+    pub async fn subject_reaches_alias(&self, sub: &str, alias: &str) -> Option<AliasMetadata> {
+        self.subject_aliases(sub).await?.get(alias).cloned()
+    }
+
+    /// The alias entry a caller's raw credential reaches (spec 025: `prompt:<name>`).
+    ///
+    /// An API key resolves from its own snapshot map, no I/O. A JWT resolves through its subject's
+    /// project grants — fetched and cached on first use, as for any JWT request — rather than through
+    /// [`alias_metadata`](Self::alias_metadata), whose JWT branch sees only grants already cached.
+    pub async fn caller_alias(&self, raw: &str, alias: &str) -> Option<AliasMetadata> {
+        if let Some(meta) = self.alias_metadata(raw, alias) {
+            return Some(meta);
+        }
+        match self.authenticate(raw).await {
+            Ok(principal) if matches!(principal.via, PrincipalKind::Jwt) => {
+                let sub = principal.user_id?;
+                self.subject_reaches_alias(&sub, alias).await
+            }
+            _ => None,
+        }
     }
 
     /// Resolve a voice endpoint by id. Hot path for every audio request; no I/O.
@@ -930,6 +987,70 @@ mod realtime_reach_tests {
         assert!(plane.subject_reaches("sub-1", "ep-rt").await.is_none());
     }
 
+    /// Spec 025: a voice agent is addressed by alias (`prompt:<name>`). A signed-in user (a JWT, the
+    /// playground's credential) reaches it through their projects' grants, an API key through its own
+    /// map. Live, a JWT was refused `model_not_found` because only the cache-backed sync lookup ran.
+    #[tokio::test]
+    async fn a_caller_reaches_an_agent_alias_by_key_or_by_token() {
+        const JWKS: &str = include_str!("../tests/fixtures/test_jwks.json");
+        const PRIV: &str = include_str!("../tests/fixtures/test_rsa_private.pem");
+        struct Fixture;
+        #[async_trait::async_trait]
+        impl crate::jwt::JwksSource for Fixture {
+            async fn fetch(&self) -> Result<String, String> {
+                Ok(JWKS.to_string())
+            }
+        }
+        let cfg = crate::jwt::JwtConfig::from_lookup(|k| match k {
+            "OIDC_ISSUER" => Some("https://auth.test/realms/bud".into()),
+            "OIDC_ALLOWED_CLIENTS" => Some("bud-playground".into()),
+            _ => None,
+        })
+        .unwrap();
+        let jwt = Arc::new(JwtVerifier::new(cfg, Arc::new(Fixture)));
+        let agent = r#"{"prompt:support":{"prompt_id":"pid-1","version":1,"kind":"agent","project_id":"p1","endpoint_id":"ep-llm"}}"#;
+        let hashed = hash_api_key("bud_key");
+        let (_s, plane) = plane_with(
+            &[
+                (
+                    "user_projects:user-abc",
+                    r#"{"user_id":"u1","projects":["p1"]}"#.to_string(),
+                ),
+                ("project_models:p1", agent.to_string()),
+                (&format!("api_key:{hashed}"), agent.to_string()),
+            ],
+            Some(Arc::clone(&jwt)),
+        )
+        .await;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let claims = serde_json::json!({"iss": "https://auth.test/realms/bud", "sub": "user-abc",
+                                        "azp": "bud-playground", "exp": now + 300, "iat": now});
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+        header.kid = Some("test-key-1".into());
+        let token = jsonwebtoken::encode(
+            &header,
+            &claims,
+            &jsonwebtoken::EncodingKey::from_rsa_pem(PRIV.as_bytes()).unwrap(),
+        )
+        .unwrap();
+
+        let by_token = plane.caller_alias(&token, "prompt:support").await;
+        assert_eq!(by_token.and_then(|m| m.prompt_id).as_deref(), Some("pid-1"));
+        let by_key = plane.caller_alias("bud_key", "prompt:support").await;
+        assert_eq!(by_key.and_then(|m| m.prompt_id).as_deref(), Some("pid-1"));
+        assert!(plane.caller_alias(&token, "prompt:other").await.is_none());
+        assert!(
+            plane
+                .caller_alias("bud_unknown", "prompt:support")
+                .await
+                .is_none()
+        );
+    }
+
     #[tokio::test]
     async fn a_project_models_event_clears_every_cached_grant() {
         let jwt = verifier();
@@ -1220,6 +1341,79 @@ mod published_overlay_tests {
         assert!(
             plane
                 .endpoint_entry("bud_client_forged", "ep-pub")
+                .is_none()
+        );
+    }
+}
+
+#[cfg(test)]
+mod voice_agent_plane_tests {
+    //! Spec 025: what a voice-agent session reads from the plane — the projection, the agent's
+    //! `prompt_id` on the caller's alias, and whether the caller still reaches the ALIAS.
+    use super::*;
+    use crate::store::MemoryStore;
+
+    const HASH_KEY: &str = "bud_test_key";
+
+    fn agent_alias_blob() -> String {
+        r#"{"prompt:support":{"prompt_id":"c0de","endpoint_id":"llm-1","project_id":"p1","kind":"agent","version":3},"__metadata__":{"api_key_id":"ak1","user_id":"u1","api_key_project_id":"p1"}}"#.to_string()
+    }
+
+    fn entry() -> String {
+        r#"{"v":1,"prompt_id":"c0de","version":3,"stt":{"endpoint_id":"stt-1"},"tts":{"endpoint_id":"tts-1"}}"#.to_string()
+    }
+
+    async fn plane() -> (Arc<MemoryStore>, BudPlane) {
+        let store = Arc::new(MemoryStore::new());
+        store.set(
+            &format!("api_key:{}", hash_api_key(HASH_KEY)),
+            &agent_alias_blob(),
+        );
+        store.set("voice_agent:c0de:v3", &entry());
+        let plane = BudPlane::new(store.clone() as Arc<dyn ControlPlaneStore>, None);
+        plane.boot().await.unwrap();
+        (store, plane)
+    }
+
+    #[tokio::test]
+    async fn boot_hydrates_the_agent_projection() {
+        let (_store, plane) = plane().await;
+        let entry = plane.voice_agent("c0de", 3).expect("hydrated at boot");
+        assert_eq!(entry.stt.endpoint_id, "stt-1");
+    }
+
+    #[tokio::test]
+    async fn the_alias_carries_the_prompt_id_and_version() {
+        let (_store, plane) = plane().await;
+        let meta = plane.alias_metadata(HASH_KEY, "prompt:support").unwrap();
+        assert_eq!(meta.prompt_id.as_deref(), Some("c0de"));
+        assert_eq!(meta.version, Some(3));
+        assert_eq!(meta.kind.as_deref(), Some("agent"));
+    }
+
+    #[tokio::test]
+    async fn revalidation_checks_the_alias_not_the_legs() {
+        let (store, plane) = plane().await;
+        let hashed = hash_api_key(HASH_KEY);
+        assert!(
+            plane
+                .hash_reaches_alias(&hashed, "prompt:support", false)
+                .is_some()
+        );
+        // The legs are the AGENT's (D-6): the caller's own allowlist never names them.
+        assert!(plane.hash_reaches(&hashed, "stt-1", false).is_none());
+        // Removing the agent from the key's allowlist ends reachability.
+        store.set(
+            &format!("api_key:{hashed}"),
+            r#"{"other":{"endpoint_id":"e"},"__metadata__":{"api_key_id":"ak1"}}"#,
+        );
+        plane
+            .on_key_event(&format!("api_key:{hashed}"), KeyEvent::Set)
+            .await
+            .unwrap();
+        assert!(
+            plane
+                .hash_reaches_alias(&hashed, "prompt:support", false)
                 .is_none()
         );
     }

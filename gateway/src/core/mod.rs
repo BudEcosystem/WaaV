@@ -3,6 +3,7 @@
 /// provider construction so ops can re-point providers with ZERO client redeploy.
 /// Mirrors the [`crate::dag::templates`] named-whole-DAG indirection primitive;
 /// SSRF-safe (definitions are server-config-only).
+pub mod agent;
 pub mod alias;
 pub mod audio;
 pub mod cache;

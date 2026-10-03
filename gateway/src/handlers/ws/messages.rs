@@ -89,6 +89,11 @@ pub enum IncomingMessage {
         /// is unchanged.
         #[serde(skip_serializing_if = "Option::is_none")]
         conversation_config: Option<ConversationWebSocketConfig>,
+        /// A Bud voice agent for the session (spec 025): its STT and TTS deployments, voice and
+        /// turn-taking come from the agent; budprompt answers one turn per utterance. Mutually
+        /// exclusive with `conversation_config` and `dag_config`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<super::config::AgentWebSocketConfig>,
         /// Optional server-side ALIAS name (P3). Resolves to a server-defined
         /// `{stt, tts, llm}` / `dag_template` bundle BEFORE provider construction;
         /// any explicit field above OVERRIDES the alias default. The client supplies
@@ -214,6 +219,19 @@ pub enum IncomingMessage {
     /// ```
     #[serde(rename = "audio_end")]
     AudioEnd,
+    /// Voice-agent sessions (spec 025): the client played only `audio_end_ms` of the agent's
+    /// current (or last) reply — the agent's history keeps what was heard.
+    #[serde(rename = "truncate")]
+    Truncate {
+        /// Milliseconds of the reply's audio the client actually played.
+        audio_end_ms: u64,
+    },
+    /// Voice-agent sessions (spec 025): a typed user turn — no speech, the same agent turn.
+    #[serde(rename = "agent_input")]
+    AgentInput {
+        /// What the user typed.
+        text: String,
+    },
 }
 
 /// Unified message structure for all incoming messages from various sources
@@ -401,6 +419,68 @@ pub enum OutgoingMessage {
     /// Client must send an `auth` message before any other commands.
     #[serde(rename = "auth_required")]
     AuthRequired,
+    /// Voice agent (spec 025): an agent turn began (`kind`: `agent` or `greeting`).
+    #[serde(rename = "agent_response_started")]
+    AgentResponseStarted {
+        turn_index: u64,
+        kind: String,
+        /// The user's words that started it; absent for the greeting.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        input: Option<String>,
+    },
+    /// Voice agent: budprompt's id for this turn's run (`GET /v1/responses/{id}`).
+    #[serde(rename = "agent_response_created")]
+    AgentResponseCreated {
+        turn_index: u64,
+        response_id: String,
+    },
+    /// Voice agent: the agent's words, as they are spoken (or shown, in text mode).
+    #[serde(rename = "assistant_transcript")]
+    AssistantTranscript { turn_index: u64, delta: String },
+    /// Voice agent: a server-side tool's progress (`in_progress`, `completed`, `failed`).
+    #[serde(rename = "agent_tool")]
+    AgentTool {
+        turn_index: u64,
+        item_id: String,
+        name: String,
+        status: String,
+    },
+    /// Voice agent: a structured-output agent's JSON.
+    #[serde(rename = "agent_output")]
+    AgentOutput {
+        turn_index: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        response_id: Option<String>,
+        #[cfg_attr(feature = "openapi", schema(value_type = Object))]
+        output: serde_json::Value,
+    },
+    /// Voice agent: the turn ended (`completed`, `cancelled`, `failed`, `incomplete`).
+    #[serde(rename = "agent_response_done")]
+    AgentResponseDone {
+        turn_index: u64,
+        kind: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        response_id: Option<String>,
+        status: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(value_type = Object))]
+        usage: Option<serde_json::Value>,
+        /// What the caller heard (or was shown).
+        transcript: String,
+    },
+    /// Voice agent: the reply was cut off; the agent's history keeps `spoken`.
+    #[serde(rename = "agent_truncated")]
+    AgentTruncated {
+        turn_index: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        response_id: Option<String>,
+        spoken: String,
+        audio_end_ms: u64,
+    },
+    /// Voice agent: a non-fatal error with a stable code (`missing_variables`, `rate_limit_exceeded`,
+    /// `auth_expired`, `approval_required`, …).
+    #[serde(rename = "agent_error")]
+    AgentError { code: String, message: String },
     /// Plugin response message
     ///
     /// Generic response from a plugin handler for custom messages.
@@ -631,6 +711,15 @@ impl IncomingMessage {
             }
             IncomingMessage::Clear => {}
             IncomingMessage::AudioEnd => {}
+            IncomingMessage::Truncate { .. } => {}
+            IncomingMessage::AgentInput { text } => {
+                if text.len() > MAX_SPEAK_TEXT_SIZE {
+                    return Err(MessageValidationError::SpeakTextTooLarge {
+                        size: text.len(),
+                        max: MAX_SPEAK_TEXT_SIZE,
+                    });
+                }
+            }
             IncomingMessage::Custom {
                 message_type,
                 payload,
@@ -1008,6 +1097,7 @@ mod tests {
             livekit: None,
             dag_config: None,
             conversation_config: None,
+            agent: None,
             alias: None,
         };
         assert!(msg.validate_size().is_ok());
