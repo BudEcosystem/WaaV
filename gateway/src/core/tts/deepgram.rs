@@ -111,7 +111,7 @@ mod model_param_tests {
     /// `aura-2` deployment with the vendor-default voice failed every sentence with "Invalid 'model'
     /// value of 'aura-2'"). The family's own default voice stands in.
     #[test]
-    fn a_family_with_no_voice_speaks_in_the_familys_default_voice() {
+    fn a_family_with_no_voice_speaks_in_its_default_voice() {
         assert_eq!(
             deepgram_model(&cfg("aura-2", None)),
             Some("aura-2-thalia-en")
