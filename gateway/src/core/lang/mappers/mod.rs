@@ -167,12 +167,46 @@ impl LanguageMapper for DefaultLanguageMapper {
 // Registry
 // =============================================================================
 
+/// Deepgram detects the language (`multi`, code-switching) on Nova-3 and Nova-2 only; every other
+/// model refuses the handshake with a 400. There, auto is left out with a warning and the model's
+/// own default applies.
+struct DeepgramLanguageMapper(DefaultLanguageMapper);
+
+/// The Deepgram models that take `language=multi`.
+const DEEPGRAM_MULTI_MODELS: &[&str] = &["nova-3", "nova-3-general", "nova-2", "nova-2-general"];
+
+impl LanguageMapper for DeepgramLanguageMapper {
+    fn support(&self) -> ProviderLanguageSupport {
+        self.0.support()
+    }
+
+    fn map(&self, lang: CanonicalLanguage, model: &str) -> MappedLanguage {
+        let model = model.trim();
+        if lang == CanonicalLanguage::Auto
+            && !DEEPGRAM_MULTI_MODELS
+                .iter()
+                .any(|m| m.eq_ignore_ascii_case(model))
+        {
+            let named = if model.is_empty() {
+                "the default model".to_string()
+            } else {
+                format!("model '{model}'")
+            };
+            return MappedLanguage::omitted().warn(format!(
+                "Deepgram {named} cannot detect the language (multi needs Nova-3 or Nova-2); \
+                 the model's default language applies"
+            ));
+        }
+        self.0.map(lang, model)
+    }
+}
+
 /// Return the language mapper for `provider` (case-insensitive, alias-aware). Unknown providers get
 /// a safe BCP-47 pass-through (the research GENERIC FALLBACK) so a brand-new provider still works.
 pub fn get_language_mapper(provider: &str) -> Box<dyn LanguageMapper> {
     match provider.to_lowercase().as_str() {
         // ===== IDENTITY-BCP47 (region preserved; Chinese zh/cmn override) =====
-        "deepgram" => Box::new(
+        "deepgram" => Box::new(DeepgramLanguageMapper(
             DefaultLanguageMapper::new("deepgram", NotationKind::Bcp47, "Deepgram").with_overrides(
                 NotationMap::empty()
                     .with(CanonicalLanguage::CmnCn, "zh-CN")
@@ -181,7 +215,7 @@ pub fn get_language_mapper(provider: &str) -> Box<dyn LanguageMapper> {
                     // Nova-3 multilingual code-switch (NOT detect_language — streaming gap).
                     .with_auto("multi"),
             ),
-        ),
+        )),
         "azure" | "microsoft-azure" | "microsoft_azure" => Box::new(AzureLanguageMapper),
         "aws-transcribe" | "aws_transcribe" => Box::new(AwsTranscribeLanguageMapper),
         "aws-polly" | "aws_polly" | "amazon-polly" | "polly" => Box::new(AwsPollyLanguageMapper),
@@ -365,10 +399,66 @@ mod tests {
         // zh/cmn override
         assert_eq!(dg(CanonicalLanguage::CmnCn).native, "zh-CN");
         assert_eq!(dg(CanonicalLanguage::YueHk).native, "zh-HK");
-        // auto -> "multi"
-        let a = dg(CanonicalLanguage::Auto);
+        // auto -> "multi", on the models that take it
+        let a = to_provider_language(CanonicalLanguage::Auto, "deepgram", "nova-3");
         assert_eq!(a.native, "multi");
         assert!(!a.has_warnings());
+    }
+
+    /// Deepgram detects (`multi`) only on Nova-3 and Nova-2; every other model refuses the
+    /// handshake with a 400 (live: `model=base&language=multi`). There, auto is left out with a
+    /// warning and the model's own default applies.
+    #[test]
+    fn deepgram_detects_only_on_the_models_that_can() {
+        for model in ["nova-3", "nova-3-general", "nova-2", "Nova-2-General"] {
+            let m = to_provider_language(CanonicalLanguage::Auto, "deepgram", model);
+            assert_eq!(m.native, "multi", "{model}");
+            assert!(!m.omit && !m.has_warnings(), "{model}");
+        }
+        for model in [
+            "base",
+            "enhanced",
+            "nova",
+            "nova-3-medical",
+            "nova-2-phonecall",
+            "",
+            "whisper-large",
+        ] {
+            let m = to_provider_language(CanonicalLanguage::Auto, "deepgram", model);
+            assert!(m.omit, "{model}: auto must not reach Deepgram");
+            assert!(m.has_warnings(), "{model}: and the caller is told why");
+        }
+        // A named language is unaffected by the model.
+        assert_eq!(
+            to_provider_language(CanonicalLanguage::EnUs, "deepgram", "base").native,
+            "en-US"
+        );
+    }
+
+    /// Nothing chosen is not a choice of detection. Where the vendor can detect, an unset language
+    /// is left out, so the vendor's own default applies; it used to be sent as the vendor's auto
+    /// token, which is how an agent with no language reached Deepgram `base` as `multi`.
+    #[test]
+    fn an_unset_language_is_left_out_not_sent_as_detection() {
+        for (provider, model) in [
+            ("deepgram", "base"),
+            ("deepgram", "nova-3"),
+            ("elevenlabs", "scribe_v2_realtime"),
+            ("openai", ""),
+        ] {
+            for raw in ["", "  "] {
+                let m = crate::core::lang::map_language(raw, provider, model);
+                assert!(m.omit && m.native.is_empty(), "{provider}/{model}: {raw:?}");
+                assert!(
+                    !m.has_warnings(),
+                    "{provider}/{model}: unset is not worth a warning"
+                );
+            }
+        }
+        // A vendor that cannot detect keeps its default language for an unset one, as before.
+        let unset = crate::core::lang::map_language("", "cartesia", "");
+        let auto = to_provider_language(CanonicalLanguage::Auto, "cartesia", "");
+        assert_eq!((unset.native, unset.omit), (auto.native, auto.omit));
     }
 
     #[test]

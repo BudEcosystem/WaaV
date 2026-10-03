@@ -61,6 +61,12 @@ pub use types::{CanonicalLanguage, LANG_ALIASES};
 ///
 /// `model` disambiguates the model-aware providers (Google STT vs TTS, ElevenLabs v2.5).
 pub fn map_language(raw: &str, provider: &str, model: &str) -> MappedLanguage {
+    // Nothing chosen is not a choice of detection. Where the vendor can detect, an unset language is
+    // left out and the vendor's own default applies: sent as the vendor's auto token, it reached
+    // Deepgram `base` as `multi`, which every model but Nova-3/Nova-2 refuses with a 400.
+    if raw.trim().is_empty() && get_language_mapper(provider).support().supports_auto {
+        return MappedLanguage::omitted();
+    }
     match resolve(raw) {
         Some(canonical) => to_provider_language(canonical, provider, model),
         None => MappedLanguage::native(raw.to_string()).warn(format!(

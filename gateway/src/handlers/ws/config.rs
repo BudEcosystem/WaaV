@@ -1155,9 +1155,18 @@ mod config_tests {
 
     #[test]
     fn p2_stt_auto_becomes_provider_default_or_native_token() {
-        // Deepgram "auto" → the native "multi" code-switch token.
-        let dg = stt_ws("deepgram", "auto", "");
+        // Deepgram "auto" → the native "multi" code-switch token, where the model takes it.
+        let dg = stt_ws("deepgram", "auto", "nova-3");
         assert_eq!(dg.to_stt_config("k".into()).language, "multi");
+
+        // Deepgram `base` cannot detect: an unset language is left out (live: `language=multi`
+        // failed the handshake with a 400), and an explicit auto is too, with a warning.
+        let unset = stt_ws("deepgram", "", "base");
+        assert_eq!(unset.to_stt_config("k".into()).language, "");
+        assert!(!unset.language_mapping().has_warnings());
+        let auto = stt_ws("deepgram", "auto", "base");
+        assert_eq!(auto.to_stt_config("k".into()).language, "");
+        assert!(auto.language_mapping().has_warnings());
 
         // A provider with no auto token + auto request → empty string (provider falls back to its
         // own default), and a warning is recorded in the mapping.
