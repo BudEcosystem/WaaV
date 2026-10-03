@@ -49,16 +49,30 @@ pub fn deepgram_speak_url(model: &str) -> &'static str {
 /// `model` is still used when nothing names a voice. That is what a deployment published under a
 /// full voice id (`aura-asteria-en`) and a WebSocket client that sets only `model` rely on.
 ///
+/// A deployment published under a bare family (`aura-2`, `aura`) with no voice anywhere names no
+/// voice, and Deepgram refuses the family as a model ("Invalid 'model' value of 'aura-2'"): the
+/// family's own default voice stands in, so the deployment's choice of family is kept.
+///
 /// `None` when neither is set, and the parameter is then left off: Deepgram's `model` is optional,
 /// and choosing one here would be WaaV picking a voice nobody asked for.
 pub(crate) fn deepgram_model(config: &TTSConfig) -> Option<&str> {
-    config
+    let named = config
         .voice_id
         .as_deref()
         .map(str::trim)
         .filter(|v| !v.is_empty())
-        .or_else(|| Some(config.model.trim()).filter(|m| !m.is_empty()))
+        .or_else(|| Some(config.model.trim()).filter(|m| !m.is_empty()))?;
+    Some(
+        DEEPGRAM_FAMILY_DEFAULT_VOICE
+            .iter()
+            .find(|(family, _)| family.eq_ignore_ascii_case(named))
+            .map_or(named, |(_, voice)| voice),
+    )
 }
+
+/// Deepgram's default voice for each TTS family a deployment may be published under.
+const DEEPGRAM_FAMILY_DEFAULT_VOICE: &[(&str, &str)] =
+    &[("aura-2", "aura-2-thalia-en"), ("aura", "aura-asteria-en")];
 
 #[cfg(test)]
 mod model_param_tests {
@@ -90,6 +104,31 @@ mod model_param_tests {
         assert_eq!(
             deepgram_model(&cfg("aura-asteria-en", Some("  "))),
             Some("aura-asteria-en")
+        );
+    }
+
+    /// A family names no voice, and Deepgram refuses it as a model (live, bud-dev: an agent on an
+    /// `aura-2` deployment with the vendor-default voice failed every sentence with "Invalid 'model'
+    /// value of 'aura-2'"). The family's own default voice stands in.
+    #[test]
+    fn a_family_with_no_voice_speaks_in_the_familys_default_voice() {
+        assert_eq!(
+            deepgram_model(&cfg("aura-2", None)),
+            Some("aura-2-thalia-en")
+        );
+        assert_eq!(
+            deepgram_model(&cfg(" Aura-2 ", Some(" "))),
+            Some("aura-2-thalia-en")
+        );
+        assert_eq!(deepgram_model(&cfg("aura", None)), Some("aura-asteria-en"));
+        // A chosen voice, or a deployment published under a full voice id, is untouched.
+        assert_eq!(
+            deepgram_model(&cfg("aura-2", Some("aura-2-orion-en"))),
+            Some("aura-2-orion-en")
+        );
+        assert_eq!(
+            deepgram_model(&cfg("aura-2-ama-ja", None)),
+            Some("aura-2-ama-ja")
         );
     }
 
