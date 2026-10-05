@@ -15,6 +15,7 @@
 //! | [`resolve`] | The resolver: reads the map once per session and picks a transport or a named refusal |
 //! | [`rollout`] | The rollout switch, the allow-list and the effective release |
 //! | [`audio`] | Wire bytes to 16 kHz mono frames, and WAV encoding |
+//! | [`profile`] | Every engine threshold, merged from defaults, the capability row and the session |
 //! | [`detector`] | The speech detector trait, the energy detector and a scripted detector for tests |
 //! | [`segmenter`] | The state machine that confirms speech and cuts segments at pauses |
 //! | [`endpointer`] | The end-of-turn ladder: audio model, text model, silence ceiling |
@@ -31,6 +32,7 @@ pub mod endpointer;
 pub mod engine;
 pub mod limits;
 pub mod map;
+pub mod profile;
 pub mod resolve;
 pub mod rollout;
 pub mod segmenter;
