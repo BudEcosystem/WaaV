@@ -231,6 +231,9 @@ fn openai_compat(
         }
     };
     let auth = if adapter == "azure_openai_transcriptions" {
+        if spec.api_key.trim().is_empty() {
+            return Err("an Azure OpenAI deployment needs its api key".into());
+        }
         Auth::AzureApiKey(spec.api_key.clone())
     } else {
         Auth::Bearer(spec.api_key.clone())
@@ -706,6 +709,22 @@ mod tests {
                 .adapter,
             "azure_openai_transcriptions"
         );
+    }
+
+    /// Azure OpenAI reads only `api-key`: a deployment without one is refused at setup, as the
+    /// REST route refuses it, rather than sending an empty header on every utterance.
+    #[test]
+    fn an_azure_deployment_without_a_key_is_refused() {
+        let t = transport("azure_openai", "my-transcriber");
+        let s = TargetSpec {
+            api_base: Some("https://res.openai.azure.com".into()),
+            api_key: "  ".into(),
+            ..spec("azure_openai", "my-transcriber")
+        };
+        let err = build_transcriber(&t, &s, &clients())
+            .err()
+            .expect("an empty key was accepted");
+        assert!(err.contains("key"), "{err}");
     }
 
     #[test]

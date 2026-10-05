@@ -109,6 +109,27 @@ pub fn join_api_path(base: &str, path: &str) -> String {
     format!("{base}{path}")
 }
 
+/// The file name an upload of `content_type` goes out under. OpenAI and the servers that copy it
+/// read the format from the name's extension; a type it does not take keeps WAV's.
+pub fn upload_file_name(content_type: &str) -> &'static str {
+    let base = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    match base.as_str() {
+        "audio/mpeg" | "audio/mp3" => "audio.mp3",
+        "audio/mpga" => "audio.mpga",
+        "audio/mp4" | "video/mp4" => "audio.mp4",
+        "audio/m4a" | "audio/x-m4a" => "audio.m4a",
+        "audio/ogg" | "audio/opus" => "audio.ogg",
+        "audio/webm" | "video/webm" => "audio.webm",
+        "audio/flac" | "audio/x-flac" => "audio.flac",
+        _ => "audio.wav",
+    }
+}
+
 /// The prompt a model without a key-terms field gets: the caller's prompt first, then the key
 /// terms joined with `, `. Whisper has one prompt, so neither silently replaces the other.
 pub fn prompt_with_terms(prompt: Option<&str>, terms: &[String]) -> Option<String> {
@@ -271,6 +292,14 @@ mod tests {
                 .unwrap();
         assert_eq!(bare.first_listed_language(), Some("fr"));
         assert_eq!(bare.billed_seconds(), None, "only duration billing counts");
+    }
+
+    #[test]
+    fn an_upload_is_named_for_its_format() {
+        assert_eq!(upload_file_name("audio/mpeg"), "audio.mp3");
+        assert_eq!(upload_file_name("audio/webm; codecs=opus"), "audio.webm");
+        assert_eq!(upload_file_name("audio/wav"), "audio.wav");
+        assert_eq!(upload_file_name("application/octet-stream"), "audio.wav");
     }
 
     #[test]

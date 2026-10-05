@@ -663,7 +663,7 @@ pub fn build_openai_transcription(
     let b = &req.batch;
     let mut warnings = Vec::new();
 
-    let (audio_b64, _ct) = req
+    let (audio_b64, content_type) = req
         .audio
         .bytes()
         .ok_or_else(|| "openai batch requires inline audio bytes (no URL source)".to_string())?;
@@ -700,9 +700,15 @@ pub fn build_openai_transcription(
             fields.push(("timestamp_granularities[]".into(), "word".into()));
         }
     }
-    if !std.base.language.is_empty() && std.base.language != "auto" {
-        // Manual language hint (ISO-639-1). Not allowed on the translations endpoint, but this is
-        // the transcriptions endpoint.
+    // Translation EN fast-path flips the endpoint.
+    let translate = std
+        .translation
+        .as_ref()
+        .map(|t| !t.is_noop())
+        .unwrap_or(false);
+    // A manual language hint (ISO-639-1), on the transcriptions route only: the translations route
+    // takes no source language.
+    if !translate && !std.base.language.is_empty() && std.base.language != "auto" {
         let lang = std
             .base
             .language
@@ -731,26 +737,23 @@ pub fn build_openai_transcription(
         warnings.extend(t.warnings_for("openai", false));
     }
 
-    // Translation EN fast-path flips the endpoint.
-    let translate = std
-        .translation
-        .as_ref()
-        .map(|t| !t.is_noop())
-        .unwrap_or(false);
     let path = if translate {
         "/v1/audio/translations"
     } else {
         "/v1/audio/transcriptions"
     };
-    let host = base_url.trim_end_matches('/');
-
     let request = BatchHttpRequest {
         method: "POST".into(),
-        url: format!("{host}{path}"),
+        url: waav_segmented_stt::vendor::openai::join_api_path(base_url, path),
         headers: vec![("Authorization".into(), format!("Bearer {api_key}"))],
         body: BatchHttpBody::Multipart {
             fields,
-            file: Some(("file".into(), "audio.wav".into(), "audio/wav".into(), bytes)),
+            file: Some((
+                "file".into(),
+                waav_segmented_stt::vendor::openai::upload_file_name(content_type).into(),
+                content_type.into(),
+                bytes,
+            )),
         },
     };
     Ok(BatchSubmission {
@@ -1504,6 +1507,60 @@ mod tests {
         assert!(
             !whisper.contains("keyterm=") && !whisper.contains("keywords="),
             "{whisper}"
+        );
+    }
+
+    /// The file part says what the audio is (OpenAI reads the format from its name), a `/v1` base
+    /// is not doubled, and a translation names no source language (the translations route takes
+    /// none).
+    #[test]
+    fn openai_batch_labels_the_file_and_translates_without_a_language() {
+        let mut r = req_with(
+            "openai",
+            BatchAudioSource::Bytes {
+                audio_base64: "AAAA".into(),
+                content_type: Some("audio/mpeg".into()),
+            },
+            SttFeatures::default(),
+            BatchFeatures::default(),
+        );
+        r.config.base.model = "whisper-1".into();
+        r.config.base.language = "de-DE".into();
+        let sub = build_openai_transcription(&r, "sk", "https://api.openai.com/v1").unwrap();
+        assert_eq!(
+            sub.request.url,
+            "https://api.openai.com/v1/audio/transcriptions"
+        );
+        let BatchHttpBody::Multipart { fields, file } = &sub.request.body else {
+            panic!("expected multipart body")
+        };
+        let (_, name, content_type, _) = file.as_ref().expect("a file part");
+        assert_eq!(
+            (name.as_str(), content_type.as_str()),
+            ("audio.mp3", "audio/mpeg")
+        );
+        assert!(
+            fields.iter().any(|(k, v)| k == "language" && v == "de"),
+            "{fields:?}"
+        );
+
+        r.config.translation = Some(crate::core::stt::standard::TranslationConfig {
+            translate_to_english: Some(true),
+            ..Default::default()
+        });
+        let sub = build_openai_transcription(&r, "sk", "https://api.openai.com").unwrap();
+        assert_eq!(
+            sub.request.url,
+            "https://api.openai.com/v1/audio/translations"
+        );
+        let BatchHttpBody::Multipart { fields, .. } = &sub.request.body else {
+            panic!("expected multipart body")
+        };
+        assert!(
+            !fields
+                .iter()
+                .any(|(k, _)| k == "language" || k == "languages[]"),
+            "{fields:?}"
         );
     }
 
