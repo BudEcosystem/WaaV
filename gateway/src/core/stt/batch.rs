@@ -364,9 +364,15 @@ pub(crate) fn http_request(
                 form = form.text(name.clone(), value.clone());
             }
             if let Some((field, filename, ct, bytes)) = file {
-                let part = reqwest::multipart::Part::bytes(bytes.clone())
-                    .file_name(filename.clone())
-                    .mime_str(ct)
+                let part = |ct: &str| {
+                    reqwest::multipart::Part::bytes(bytes.clone())
+                        .file_name(filename.clone())
+                        .mime_str(ct)
+                };
+                // A caller's type that is not a media type (`mp3`) goes as `audio/wav`, as these
+                // uploads always did before the type was forwarded: the vendor reads the bytes.
+                let part = part(ct)
+                    .or_else(|_| part("audio/wav"))
                     .map_err(|e| format!("bad multipart mime: {e}"))?;
                 form = form.part(field.clone(), part);
             }
@@ -902,7 +908,7 @@ pub fn build_elevenlabs_transcription_with(
             content_type,
         } => Some((
             "file".to_string(),
-            "audio.wav".to_string(),
+            waav_segmented_stt::vendor::openai::upload_file_name(&content_type).to_string(),
             content_type,
             bytes,
         )),
@@ -1857,6 +1863,56 @@ mod tests {
             BatchHttpBody::Multipart { file, .. } => assert!(file.is_some()),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn elevenlabs_names_the_file_by_its_type() {
+        let sub = build_elevenlabs_transcription(
+            &eleven_req(
+                BatchAudioSource::Bytes {
+                    audio_base64: "AAAA".into(),
+                    content_type: Some("audio/mpeg".into()),
+                },
+                SttFeatures::default(),
+            ),
+            "xi-key",
+            "https://api.elevenlabs.io",
+        )
+        .unwrap();
+        let BatchHttpBody::Multipart { file, .. } = &sub.request.body else {
+            panic!("expected multipart body")
+        };
+        let (_, name, content_type, _) = file.as_ref().expect("a file part");
+        assert_eq!(
+            (name.as_str(), content_type.as_str()),
+            ("audio.mp3", "audio/mpeg")
+        );
+    }
+
+    #[test]
+    fn a_file_type_that_is_not_a_media_type_still_uploads() {
+        let request = BatchHttpRequest {
+            method: "POST".into(),
+            url: "https://api.openai.com/v1/audio/transcriptions".into(),
+            headers: vec![],
+            body: BatchHttpBody::Multipart {
+                fields: vec![("model".into(), "whisper-1".into())],
+                file: Some((
+                    "file".into(),
+                    "audio.wav".into(),
+                    "mp3".into(),
+                    vec![0u8; 4],
+                )),
+            },
+        };
+        let built = http_request(&reqwest::Client::new(), &request)
+            .expect("a bad media type falls back to audio/wav")
+            .build()
+            .unwrap();
+        let ct = built.headers()[reqwest::header::CONTENT_TYPE]
+            .to_str()
+            .unwrap();
+        assert!(ct.starts_with("multipart/form-data"), "{ct}");
     }
 
     #[test]
