@@ -17,12 +17,12 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use parking_lot::Mutex;
 use tokio::time::Instant;
 
-use super::breaker::{Admission, FileBreaker};
 use super::gate::{Limiter, RetryBudget};
 use super::{
     RequestPhase, RequestProgress, SegmentAudio, SegmentContext, SegmentError, SegmentTranscriber,
     SegmentTranscript, TranscriberInfo,
 };
+use crate::breaker::{Admission, Breaker};
 use crate::limits::SegmentDeadlines;
 use crate::types::ErrorClass;
 
@@ -234,7 +234,7 @@ const INTERIM_REQUEST_LIMIT: Duration = Duration::from_millis(2_000);
 /// The loop over one target.
 pub struct SegmentAttempts {
     pub transcriber: Arc<dyn SegmentTranscriber>,
-    pub breaker: Arc<FileBreaker>,
+    pub breaker: Arc<Breaker>,
     pub limiter: Arc<Limiter>,
     pub budget: Arc<RetryBudget>,
     pub policy: SecondRequestPolicy,
@@ -258,7 +258,7 @@ type ReqFuture = Pin<
 
 /// Records `None` on the breaker if the unit is dropped before its outcome is known.
 struct PermitGuard<'a> {
-    breaker: &'a FileBreaker,
+    breaker: &'a Breaker,
     admission: Admission,
     done: bool,
 }
@@ -630,9 +630,9 @@ fn repair_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::breaker::{BreakerConfig, BreakerState};
     use crate::limits::{DeadlineInputs, segment_deadlines};
     use crate::transcriber::TranscriberKind;
-    use crate::transcriber::breaker::{BreakerConfig, BreakerState};
     use crate::transcriber::gate::LimitSpec;
     use crate::transcriber::testing::{FakeStep, FakeTranscriber};
 
@@ -655,7 +655,7 @@ mod tests {
     fn attempts(t: Arc<FakeTranscriber>) -> SegmentAttempts {
         SegmentAttempts {
             transcriber: t,
-            breaker: Arc::new(FileBreaker::new(BreakerConfig::default())),
+            breaker: Arc::new(Breaker::new(BreakerConfig::default())),
             limiter: Arc::new(Limiter::new(LimitSpec::unlimited())),
             budget: Arc::new(RetryBudget::default()),
             policy: SecondRequestPolicy::OnFailureOrStall,

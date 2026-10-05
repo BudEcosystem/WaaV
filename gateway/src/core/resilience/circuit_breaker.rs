@@ -188,21 +188,7 @@ pub struct CircuitBreaker {
 impl CircuitBreaker {
     /// Create a breaker in the Closed state (no metrics label — stays silent on the gauge).
     pub fn new(config: CircuitBreakerConfig) -> Self {
-        let core = Breaker::new(BreakerConfig {
-            window: config.window_size.max(1) as usize,
-            min_requests: config.min_request_volume as usize,
-            failure_ratio: config.error_rate_threshold,
-            cooldown: config.cooldown,
-            probe_lease: config.cooldown.max(MIN_PROBE_LEASE),
-        });
-        Self {
-            config,
-            core,
-            quick_failures: AtomicU32::new(0),
-            fatal_opened_at_ns: AtomicU64::new(0),
-            permanently_failed: std::sync::atomic::AtomicBool::new(false),
-            label: None,
-        }
+        Self::build(config, None)
     }
 
     /// Create a labelled breaker. The `label` (the provider name) is stamped on every
@@ -210,8 +196,7 @@ impl CircuitBreaker {
     /// is attributed to the right provider. The [`crate::core::resilience::ResilienceRegistry`]
     /// uses this for every per-provider breaker it owns.
     pub fn with_label(config: CircuitBreakerConfig, label: impl Into<String>) -> Self {
-        let mut cb = Self::new(config);
-        cb.label = Some(label.into());
+        let cb = Self::build(config, Some(label.into()));
         // Seed the gauge at the initial (closed) state so the series exists from creation and a
         // scrape before the first failure reports "closed" rather than absent.
         cb.publish_state();
@@ -230,11 +215,7 @@ impl CircuitBreaker {
     /// is the gate the supervisor actually consults. (Otherwise a metrics scrape could
     /// "use up" the half-open probe.)
     pub fn state(&self) -> CircuitState {
-        match self.core.state() {
-            BreakerState::Open => CircuitState::Open,
-            BreakerState::HalfOpen => CircuitState::HalfOpen,
-            BreakerState::Closed => CircuitState::Closed,
-        }
+        circuit_state(self.core.state())
     }
 
     /// Whether a request (e.g. a reconnect attempt) may proceed *now*.
@@ -266,7 +247,7 @@ impl CircuitBreaker {
                 .compare_exchange(opened, now_ns(), Ordering::AcqRel, Ordering::Acquire)
                 .is_ok();
         }
-        self.observed(|core| core.allow())
+        self.core.allow()
     }
 
     /// Record a successful outcome.
@@ -274,7 +255,7 @@ impl CircuitBreaker {
     /// - HalfOpen → close the breaker and reset the window (recovery confirmed).
     /// - Closed → tally toward the window.
     pub fn record_success(&self) {
-        self.observed(|core| core.record_unscoped(Some(true)));
+        self.core.record_unscoped(Some(true));
     }
 
     /// Record a failed outcome.
@@ -282,14 +263,14 @@ impl CircuitBreaker {
     /// - HalfOpen → re-open and restart the cooldown (probe failed).
     /// - Closed → tally toward the window and trip if the rate crosses the threshold.
     pub fn record_failure(&self) {
-        self.observed(|core| core.record_unscoped(Some(false)));
+        self.core.record_unscoped(Some(false));
     }
 
     /// Record an outcome that says nothing about the upstream (the caller's own malformed
     /// request): it is not counted, and a half-open probe that got it is abandoned so the next
     /// caller probes, instead of the breaker staying half-open.
     pub fn record_neutral(&self) {
-        self.observed(|core| core.record_unscoped(None));
+        self.core.record_unscoped(None);
     }
 
     /// D-G2: record a connection's lifetime at close. Sub-stable, NON-clean
@@ -333,7 +314,7 @@ impl CircuitBreaker {
                     self.config.min_stable_duration.as_secs(),
                 );
             }
-            self.observed(|core| core.force_open());
+            self.core.force_open();
         }
     }
 
@@ -371,19 +352,41 @@ impl CircuitBreaker {
 
     /// Force the breaker back to Closed and clear the window (administrative reset).
     pub fn reset(&self) {
-        self.observed(|core| core.reset());
+        self.core.reset();
     }
 
     // --- internals -----------------------------------------------------------------
 
-    /// Run `op` on the state machine and publish the gauge if it changed the state.
-    fn observed<T>(&self, op: impl FnOnce(&Breaker) -> T) -> T {
-        let before = self.core.state();
-        let out = op(&self.core);
-        if self.core.state() != before {
-            self.publish_state();
+    /// A labelled breaker publishes its gauge from inside each operation that changes the state,
+    /// under the state machine's one lock: no transition is missed or published out of order.
+    fn build(config: CircuitBreakerConfig, label: Option<String>) -> Self {
+        let core_config = BreakerConfig {
+            window: config.window_size.max(1) as usize,
+            min_requests: config.min_request_volume as usize,
+            failure_ratio: config.error_rate_threshold,
+            cooldown: config.cooldown,
+            probe_lease: config.cooldown.max(MIN_PROBE_LEASE),
+        };
+        let core = match label.clone() {
+            Some(provider) => Breaker::with_transition_observer(
+                core_config,
+                Box::new(move |state| {
+                    crate::core::metrics::bridge::set_circuit_breaker_state(
+                        &provider,
+                        circuit_state(state).as_code(),
+                    )
+                }),
+            ),
+            None => Breaker::new(core_config),
+        };
+        Self {
+            config,
+            core,
+            quick_failures: AtomicU32::new(0),
+            fatal_opened_at_ns: AtomicU64::new(0),
+            permanently_failed: std::sync::atomic::AtomicBool::new(false),
+            label,
         }
-        out
     }
 
     /// Publish this breaker's current state on the `waav_circuit_breaker_state{provider}` gauge,
@@ -392,6 +395,14 @@ impl CircuitBreaker {
         if let Some(label) = self.label.as_deref() {
             crate::core::metrics::bridge::set_circuit_breaker_state(label, self.state().as_code());
         }
+    }
+}
+
+fn circuit_state(state: BreakerState) -> CircuitState {
+    match state {
+        BreakerState::Open => CircuitState::Open,
+        BreakerState::HalfOpen => CircuitState::HalfOpen,
+        BreakerState::Closed => CircuitState::Closed,
     }
 }
 

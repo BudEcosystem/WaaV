@@ -115,10 +115,23 @@ impl Inner {
     }
 }
 
-#[derive(Debug)]
+/// Told the new state, under the breaker's lock, each time an operation changes it.
+pub type OnTransition = Box<dyn Fn(BreakerState) + Send + Sync>;
+
 pub struct Breaker {
     cfg: BreakerConfig,
     inner: Mutex<Inner>,
+    on_transition: Option<OnTransition>,
+}
+
+impl std::fmt::Debug for Breaker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Breaker")
+            .field("cfg", &self.cfg)
+            .field("inner", &self.inner)
+            .field("on_transition", &self.on_transition.is_some())
+            .finish()
+    }
 }
 
 impl Breaker {
@@ -133,7 +146,31 @@ impl Breaker {
                 generation: 0,
                 trips: 0,
             }),
+            on_transition: None,
         }
+    }
+
+    /// A breaker that reports every change of state to `on_transition`, from inside the operation
+    /// that made it: nothing in between can be missed or reported out of order. It runs under
+    /// the breaker's lock, so it must not call back into the breaker.
+    pub fn with_transition_observer(cfg: BreakerConfig, on_transition: OnTransition) -> Self {
+        Self {
+            on_transition: Some(on_transition),
+            ..Self::new(cfg)
+        }
+    }
+
+    /// Run `op` under the lock and report a change of state it made.
+    fn update<T>(&self, op: impl FnOnce(&mut Inner) -> T) -> T {
+        let mut g = self.inner.lock();
+        let before = g.state;
+        let out = op(&mut g);
+        if g.state != before
+            && let Some(on_transition) = &self.on_transition
+        {
+            on_transition(g.state);
+        }
+        out
     }
 
     pub fn config(&self) -> &BreakerConfig {
@@ -168,26 +205,24 @@ impl Breaker {
     /// half-open probe.
     pub fn record_unscoped(&self, outcome: Option<bool>) {
         let now = Instant::now();
-        let mut g = self.inner.lock();
-        match (g.state, outcome) {
+        self.update(|g| match (g.state, outcome) {
             (BreakerState::Closed, Some(ok)) => g.push(ok, &self.cfg, now),
             (BreakerState::HalfOpen, Some(true)) => g.close(),
             (BreakerState::HalfOpen, Some(false)) => g.open(now),
             (BreakerState::HalfOpen, None) => g.abandon_probe(),
             _ => {}
-        }
+        })
     }
 
     /// Back to closed with an empty window (an operator's reset).
     pub fn reset(&self) {
-        self.inner.lock().close();
+        self.update(Inner::close);
     }
 
     /// `allow_probe = false` for a second request: it never takes the probe.
     pub fn try_acquire(&self, allow_probe: bool) -> Admission {
         let now = Instant::now();
-        let mut g = self.inner.lock();
-        match g.state {
+        self.update(|g| match g.state {
             BreakerState::Closed => Admission::Normal {
                 generation: g.generation,
             },
@@ -218,15 +253,14 @@ impl Breaker {
                     Admission::Denied
                 }
             }
-        }
+        })
     }
 
     /// Record a request's outcome. `healthy`: a success, or a failure that says nothing about the
     /// vendor (`None` means "do not count").
     pub fn record(&self, admission: Admission, outcome: Option<bool>) {
         let now = Instant::now();
-        let mut g = self.inner.lock();
-        match admission {
+        self.update(|g| match admission {
             Admission::Denied => {}
             Admission::Probe { generation } => {
                 if generation != g.generation || g.state != BreakerState::HalfOpen {
@@ -246,12 +280,13 @@ impl Breaker {
                 }
                 g.push(ok, &self.cfg, now);
             }
-        }
+        })
     }
 
     /// The silent-host rule: a host that answers nothing at all is opened at once.
     pub fn force_open(&self) {
-        self.inner.lock().open(Instant::now());
+        let now = Instant::now();
+        self.update(|g| g.open(now));
     }
 }
 
@@ -381,6 +416,38 @@ mod tests {
         b.reset();
         assert_eq!(b.counts(), (0, 0));
         assert_eq!(b.total_trips(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn every_change_of_state_is_reported_once_in_order() {
+        let seen: Arc<Mutex<Vec<BreakerState>>> = Arc::default();
+        let sink = Arc::clone(&seen);
+        let b = Breaker::with_transition_observer(cfg(), Box::new(move |s| sink.lock().push(s)));
+        for _ in 0..4 {
+            assert!(b.allow());
+            b.record_unscoped(Some(false));
+        }
+        assert!(!b.allow());
+        tokio::time::advance(Duration::from_secs(11)).await;
+        assert!(b.allow());
+        b.record_unscoped(None);
+        assert!(b.allow());
+        b.record_unscoped(Some(true));
+        b.record_unscoped(Some(true));
+        b.force_open();
+        b.reset();
+        assert_eq!(
+            *seen.lock(),
+            vec![
+                BreakerState::Open,
+                BreakerState::HalfOpen,
+                BreakerState::Open,
+                BreakerState::HalfOpen,
+                BreakerState::Closed,
+                BreakerState::Open,
+                BreakerState::Closed,
+            ]
+        );
     }
 
     #[test]

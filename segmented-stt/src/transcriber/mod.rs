@@ -6,11 +6,10 @@
 //! | One request in one vendor's dialect | a [`SegmentTranscriber`] in [`wire`] (or a commit socket) |
 //! | Whether and when a second request is sent, the breaker, the limiter, the deadline | [`attempts::SegmentAttempts`] |
 //! | Request rate and concurrency per vendor host, credential and model | [`gate::Limiter`] |
-//! | Failing fast while a vendor is down | [`breaker::FileBreaker`] |
+//! | Failing fast while a vendor is down | [`crate::breaker::Breaker`] |
 //! | Dropping invented text | [`quality`] |
 
 pub mod attempts;
-pub mod breaker;
 pub mod gate;
 pub mod http;
 pub mod language_vote;

@@ -8,6 +8,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use waav_segmented_stt::breaker::{BreakerConfig, BreakerRegistry};
 use waav_segmented_stt::endpointer::EndOfTurnTextModel;
 use waav_segmented_stt::engine::EngineConfig;
 use waav_segmented_stt::fallback::{FallbackTarget, FallbackUpload};
@@ -27,7 +28,6 @@ use waav_segmented_stt::sequencer::{AttemptsUpload, SegmentUpload};
 use waav_segmented_stt::transcriber::attempts::{
     RepairMemory, SecondRequestPolicy, SegmentAttempts, SessionHealth,
 };
-use waav_segmented_stt::transcriber::breaker::{BreakerConfig, BreakerRegistry};
 use waav_segmented_stt::transcriber::gate::{BudgetRegistry, LimiterRegistry};
 use waav_segmented_stt::transcriber::http::{HttpSettings, UploadClients};
 
