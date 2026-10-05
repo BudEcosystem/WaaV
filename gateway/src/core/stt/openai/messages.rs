@@ -5,252 +5,16 @@
 //!
 //! API Reference: https://platform.openai.com/docs/api-reference/audio/createTranscription
 
-use serde::{Deserialize, Serialize};
-
 // =============================================================================
-// Response Types
+// Response types: the shared OpenAI-compatible set, under this client's names
 // =============================================================================
 
-/// Simple transcription response (json format).
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct TranscriptionResponse {
-    /// The transcribed text.
-    pub text: String,
-}
-
-/// Verbose transcription response (verbose_json format).
-///
-/// Contains detailed information including word-level timestamps,
-/// segment information, and metadata.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct VerboseTranscriptionResponse {
-    /// The transcribed text (full transcript).
-    pub text: String,
-
-    /// The language of the audio (ISO-639-1 code).
-    #[serde(default)]
-    pub language: Option<String>,
-
-    /// Duration of the audio in seconds.
-    #[serde(default)]
-    pub duration: Option<f64>,
-
-    /// Transcription segments with timing information.
-    #[serde(default)]
-    pub segments: Vec<TranscriptionSegment>,
-
-    /// Word-level timing information (if requested).
-    #[serde(default)]
-    pub words: Vec<TranscriptionWord>,
-}
-
-/// A segment of transcribed text with timing.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct TranscriptionSegment {
-    /// Segment ID (0-indexed).
-    pub id: i32,
-
-    /// Start time of the segment in seconds.
-    pub start: f64,
-
-    /// End time of the segment in seconds.
-    pub end: f64,
-
-    /// Transcribed text for this segment.
-    pub text: String,
-
-    /// Token IDs for this segment.
-    #[serde(default)]
-    pub tokens: Vec<i32>,
-
-    /// Average log probability of tokens.
-    #[serde(default)]
-    pub avg_logprob: Option<f64>,
-
-    /// Compression ratio of the segment.
-    #[serde(default)]
-    pub compression_ratio: Option<f64>,
-
-    /// Probability that this segment is not speech.
-    #[serde(default)]
-    pub no_speech_prob: Option<f64>,
-
-    /// Temperature used for this segment.
-    #[serde(default)]
-    pub temperature: Option<f64>,
-
-    /// Seek position in the audio.
-    #[serde(default)]
-    pub seek: Option<i32>,
-}
-
-/// A word with timing information.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct TranscriptionWord {
-    /// The word text.
-    pub word: String,
-
-    /// Start time of the word in seconds.
-    pub start: f64,
-
-    /// End time of the word in seconds.
-    pub end: f64,
-}
-
-// =============================================================================
-// Diarization Response Types (for diarized_json format)
-// =============================================================================
-
-/// Diarized transcription response (diarized_json format).
-///
-/// Contains transcription with speaker identification, enabling attribution
-/// of speech to individual speakers. Available with gpt-4o-transcribe models.
-///
-/// API Reference: https://platform.openai.com/docs/api-reference/audio/createTranscription
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct DiarizedTranscriptionResponse {
-    /// The full transcribed text.
-    pub text: String,
-
-    /// The language of the audio (ISO-639-1 code).
-    #[serde(default)]
-    pub language: Option<String>,
-
-    /// Duration of the audio in seconds.
-    #[serde(default)]
-    pub duration: Option<f64>,
-
-    /// List of speakers identified in the audio.
-    /// Each speaker has an ID and optional recognized name.
-    #[serde(default)]
-    pub speakers: Vec<DiarizedSpeaker>,
-
-    /// Transcription segments with speaker attribution.
-    #[serde(default)]
-    pub segments: Vec<DiarizedSegment>,
-
-    /// Word-level information with speaker attribution (if include_logprobs is true).
-    #[serde(default)]
-    pub words: Vec<DiarizedWord>,
-}
-
-/// Speaker information from diarization.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct DiarizedSpeaker {
-    /// Unique speaker identifier (e.g., "speaker_0", "speaker_1").
-    pub id: String,
-
-    /// Recognized speaker name (if known speaker references were provided).
-    #[serde(default)]
-    pub name: Option<String>,
-
-    /// Confidence score for speaker identification (0.0 to 1.0).
-    #[serde(default)]
-    pub confidence: Option<f64>,
-}
-
-/// A segment of transcribed text with speaker attribution.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct DiarizedSegment {
-    /// Segment ID (0-indexed).
-    pub id: i32,
-
-    /// Start time of the segment in seconds.
-    pub start: f64,
-
-    /// End time of the segment in seconds.
-    pub end: f64,
-
-    /// Transcribed text for this segment.
-    pub text: String,
-
-    /// Speaker ID for this segment (e.g., "speaker_0").
-    #[serde(default)]
-    pub speaker: Option<String>,
-
-    /// Average log probability of tokens in this segment.
-    #[serde(default)]
-    pub avg_logprob: Option<f64>,
-
-    /// Probability that this segment contains no speech.
-    #[serde(default)]
-    pub no_speech_prob: Option<f64>,
-
-    /// Token IDs for this segment.
-    #[serde(default)]
-    pub tokens: Vec<i32>,
-
-    /// Temperature used for this segment.
-    #[serde(default)]
-    pub temperature: Option<f64>,
-
-    /// Compression ratio of the segment.
-    #[serde(default)]
-    pub compression_ratio: Option<f64>,
-
-    /// Seek position in the audio.
-    #[serde(default)]
-    pub seek: Option<i32>,
-}
-
-/// A word with timing and speaker information from diarization.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct DiarizedWord {
-    /// The word text.
-    pub word: String,
-
-    /// Start time of the word in seconds.
-    pub start: f64,
-
-    /// End time of the word in seconds.
-    pub end: f64,
-
-    /// Speaker ID for this word (e.g., "speaker_0").
-    #[serde(default)]
-    pub speaker: Option<String>,
-
-    /// Log probability of the word (available when include_logprobs is true).
-    #[serde(default)]
-    pub logprob: Option<f64>,
-}
-
-// =============================================================================
-// Error Types
-// =============================================================================
-
-/// OpenAI API error response.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct OpenAIErrorResponse {
-    /// Error details.
-    pub error: OpenAIError,
-}
-
-/// OpenAI API error details.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct OpenAIError {
-    /// Human-readable error message.
-    pub message: String,
-
-    /// Error type identifier.
-    #[serde(rename = "type")]
-    pub error_type: String,
-
-    /// Parameter that caused the error (if applicable).
-    #[serde(default)]
-    pub param: Option<String>,
-
-    /// Error code (if applicable).
-    #[serde(default)]
-    pub code: Option<String>,
-}
-
-impl std::fmt::Display for OpenAIError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} ({})", self.message, self.error_type)
-    }
-}
-
-impl std::error::Error for OpenAIError {}
+pub use waav_segmented_stt::vendor::openai::{
+    DiarizedSegment, DiarizedSpeaker, DiarizedTranscriptionResponse, DiarizedWord,
+    ErrorBody as OpenAIError, ErrorResponse as OpenAIErrorResponse,
+    Segment as TranscriptionSegment, TranscriptionResponse, VerboseTranscriptionResponse,
+    Word as TranscriptionWord,
+};
 
 // =============================================================================
 // Parsed Response (unified type)
@@ -447,6 +211,7 @@ mod tests {
     fn test_transcription_result_text() {
         let simple = TranscriptionResult::Simple(TranscriptionResponse {
             text: "Hello".to_string(),
+            ..Default::default()
         });
         assert_eq!(simple.text(), "Hello");
 
@@ -456,6 +221,7 @@ mod tests {
             duration: None,
             segments: vec![],
             words: vec![],
+            ..Default::default()
         });
         assert_eq!(verbose.text(), "World");
 
@@ -483,6 +249,7 @@ mod tests {
                 seek: None,
             }],
             words: vec![],
+            ..Default::default()
         });
 
         let confidence = verbose.confidence();
@@ -491,6 +258,7 @@ mod tests {
         // Test default confidence when no log probs
         let simple = TranscriptionResult::Simple(TranscriptionResponse {
             text: "Test".to_string(),
+            ..Default::default()
         });
         assert_eq!(simple.confidence(), 1.0);
     }
@@ -639,6 +407,7 @@ mod tests {
     fn test_transcription_result_has_diarization() {
         let simple = TranscriptionResult::Simple(TranscriptionResponse {
             text: "Test".to_string(),
+            ..Default::default()
         });
         assert!(!simple.has_diarization());
 
@@ -648,6 +417,7 @@ mod tests {
             duration: None,
             segments: vec![],
             words: vec![],
+            ..Default::default()
         });
         assert!(!verbose.has_diarization());
 

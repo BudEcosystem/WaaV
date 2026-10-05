@@ -3,114 +3,29 @@
 //! This module contains serde types for parsing API responses,
 //! including simple JSON, verbose JSON with timestamps, and error responses.
 
-use serde::{Deserialize, Serialize};
-
 /// Default confidence value when actual confidence is unavailable.
 /// Using 0.5 (neutral) to avoid overconfidence in systems that rely on this value.
 /// This indicates "unknown confidence" rather than "high confidence".
 pub const DEFAULT_UNKNOWN_CONFIDENCE: f64 = 0.5;
 
 // =============================================================================
-// Simple Transcription Response
+// Response types: the shared OpenAI-compatible set
 // =============================================================================
 
-/// Simple JSON transcription response.
-///
-/// Returned when `response_format` is `json`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TranscriptionResponse {
-    /// The transcribed text.
-    pub text: String,
+pub use waav_segmented_stt::vendor::openai::{
+    ErrorBody as GroqError, ErrorResponse as GroqErrorResponse, GroqMetadata, Segment,
+    TranscriptionResponse, VerboseTranscriptionResponse, Word,
+};
 
-    /// Groq-specific metadata.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub x_groq: Option<GroqMetadata>,
+/// Groq's reading of a segment: a confidence from its `avg_logprob`, and whether it holds speech.
+pub trait SegmentScore {
+    /// Calculate confidence score (0.0 to 1.0) from avg_logprob.
+    fn confidence(&self) -> f64;
+    /// Whether this segment likely contains speech: false when `no_speech_prob` is above 0.5.
+    fn is_speech(&self) -> bool;
 }
 
-/// Groq-specific metadata in responses.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GroqMetadata {
-    /// Unique request ID for debugging/tracking.
-    pub id: String,
-}
-
-// =============================================================================
-// Verbose Transcription Response
-// =============================================================================
-
-/// Verbose JSON transcription response with timestamps and metadata.
-///
-/// Returned when `response_format` is `verbose_json`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VerboseTranscriptionResponse {
-    /// The full transcribed text.
-    pub text: String,
-
-    /// Detected language of the audio.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub language: Option<String>,
-
-    /// Total duration of the audio in seconds.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub duration: Option<f64>,
-
-    /// Transcription segments with timestamps.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub segments: Vec<Segment>,
-
-    /// Word-level timestamps (if requested).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub words: Vec<Word>,
-
-    /// Groq-specific metadata.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub x_groq: Option<GroqMetadata>,
-}
-
-/// A transcription segment with timing and confidence information.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Segment {
-    /// Segment index (0-based).
-    pub id: u32,
-
-    /// Audio position in milliseconds (seek position).
-    #[serde(default)]
-    pub seek: u32,
-
-    /// Start time in seconds.
-    pub start: f64,
-
-    /// End time in seconds.
-    pub end: f64,
-
-    /// Transcribed text for this segment.
-    pub text: String,
-
-    /// Average log probability (confidence metric).
-    /// Closer to 0 = higher confidence.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub avg_logprob: Option<f64>,
-
-    /// Probability that this segment contains no speech.
-    /// 0-1 scale; higher = less likely to be speech.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub no_speech_prob: Option<f64>,
-
-    /// Compression ratio indicator.
-    /// Unusual values suggest clarity issues.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub compression_ratio: Option<f64>,
-
-    /// Token IDs for this segment.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tokens: Vec<i64>,
-
-    /// Temperature used for this segment.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub temperature: Option<f64>,
-}
-
-impl Segment {
+impl SegmentScore for Segment {
     /// Calculate confidence score (0.0 to 1.0) from avg_logprob.
     ///
     /// The log probability is typically negative, with values closer to 0
@@ -122,7 +37,7 @@ impl Segment {
     ///
     /// This implementation uses exponential mapping to preserve precision
     /// across the full range of log probabilities.
-    pub fn confidence(&self) -> f64 {
+    fn confidence(&self) -> f64 {
         self.avg_logprob
             .map(|lp| {
                 // Use exponential transformation: e^(logprob) gives probability
@@ -151,52 +66,9 @@ impl Segment {
     /// Check if this segment likely contains actual speech.
     ///
     /// Returns false if no_speech_prob is high (> 0.5).
-    pub fn is_speech(&self) -> bool {
+    fn is_speech(&self) -> bool {
         self.no_speech_prob.map(|p| p < 0.5).unwrap_or(true)
     }
-}
-
-/// Word-level timing information.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Word {
-    /// The word text.
-    pub word: String,
-
-    /// Start time in seconds.
-    pub start: f64,
-
-    /// End time in seconds.
-    pub end: f64,
-}
-
-// =============================================================================
-// Error Response
-// =============================================================================
-
-/// Error response from Groq API.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GroqErrorResponse {
-    /// The error details.
-    pub error: GroqError,
-}
-
-/// Error details from Groq API.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GroqError {
-    /// Human-readable error message.
-    pub message: String,
-
-    /// Error type classification.
-    #[serde(rename = "type")]
-    pub error_type: String,
-
-    /// Optional error code.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub code: Option<String>,
-
-    /// Optional parameter that caused the error.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub param: Option<String>,
 }
 
 // =============================================================================
@@ -353,7 +225,7 @@ mod tests {
     fn test_segment_confidence() {
         let segment = Segment {
             id: 0,
-            seek: 0,
+            seek: Some(0),
             start: 0.0,
             end: 1.0,
             text: "Test".to_string(),
@@ -373,7 +245,7 @@ mod tests {
     fn test_segment_no_speech() {
         let segment = Segment {
             id: 0,
-            seek: 0,
+            seek: Some(0),
             start: 0.0,
             end: 1.0,
             text: "".to_string(),
@@ -408,6 +280,7 @@ mod tests {
         let simple = TranscriptionResult::Simple(TranscriptionResponse {
             text: "Hello".to_string(),
             x_groq: None,
+            ..Default::default()
         });
         assert_eq!(simple.text(), "Hello");
 
@@ -418,6 +291,7 @@ mod tests {
             segments: vec![],
             words: vec![],
             x_groq: None,
+            ..Default::default()
         });
         assert_eq!(verbose.text(), "World");
 
@@ -433,7 +307,7 @@ mod tests {
             duration: None,
             segments: vec![Segment {
                 id: 0,
-                seek: 0,
+                seek: Some(0),
                 start: 0.0,
                 end: 1.0,
                 text: "Test".to_string(),
@@ -445,6 +319,7 @@ mod tests {
             }],
             words: vec![],
             x_groq: None,
+            ..Default::default()
         });
 
         let confidence = verbose.confidence();

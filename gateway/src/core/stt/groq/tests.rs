@@ -447,7 +447,7 @@ mod message_tests {
     fn test_segment_confidence() {
         let segment = Segment {
             id: 0,
-            seek: 0,
+            seek: Some(0),
             start: 0.0,
             end: 1.0,
             text: "Test".to_string(),
@@ -466,7 +466,7 @@ mod message_tests {
     fn test_segment_confidence_default() {
         let segment = Segment {
             id: 0,
-            seek: 0,
+            seek: Some(0),
             start: 0.0,
             end: 1.0,
             text: "Test".to_string(),
@@ -485,7 +485,7 @@ mod message_tests {
     fn test_segment_is_speech() {
         let speech_segment = Segment {
             id: 0,
-            seek: 0,
+            seek: Some(0),
             start: 0.0,
             end: 1.0,
             text: "Hello".to_string(),
@@ -499,7 +499,7 @@ mod message_tests {
 
         let silence_segment = Segment {
             id: 0,
-            seek: 0,
+            seek: Some(0),
             start: 0.0,
             end: 1.0,
             text: "".to_string(),
@@ -533,6 +533,7 @@ mod message_tests {
         let simple = TranscriptionResult::Simple(TranscriptionResponse {
             text: "Hello".to_string(),
             x_groq: None,
+            ..Default::default()
         });
         assert_eq!(simple.text(), "Hello");
 
@@ -543,6 +544,7 @@ mod message_tests {
             segments: vec![],
             words: vec![],
             x_groq: None,
+            ..Default::default()
         });
         assert_eq!(verbose.text(), "World");
 
@@ -559,12 +561,14 @@ mod message_tests {
             segments: vec![],
             words: vec![],
             x_groq: None,
+            ..Default::default()
         });
         assert_eq!(verbose.language(), Some("fr"));
 
         let simple = TranscriptionResult::Simple(TranscriptionResponse {
             text: "Test".to_string(),
             x_groq: None,
+            ..Default::default()
         });
         assert_eq!(simple.language(), None);
     }
@@ -578,12 +582,14 @@ mod message_tests {
             segments: vec![],
             words: vec![],
             x_groq: None,
+            ..Default::default()
         });
         assert_eq!(verbose.duration(), Some(5.5));
 
         let simple = TranscriptionResult::Simple(TranscriptionResponse {
             text: "Test".to_string(),
             x_groq: None,
+            ..Default::default()
         });
         assert_eq!(simple.duration(), None);
     }
@@ -1338,7 +1344,7 @@ mod confidence_tests {
             segments: vec![
                 Segment {
                     id: 0,
-                    seek: 0,
+                    seek: Some(0),
                     start: 0.0,
                     end: 1.0, // 1 second
                     text: "Short".to_string(),
@@ -1350,7 +1356,7 @@ mod confidence_tests {
                 },
                 Segment {
                     id: 1,
-                    seek: 0,
+                    seek: Some(0),
                     start: 1.0,
                     end: 4.0, // 3 seconds
                     text: "Longer segment".to_string(),
@@ -1363,6 +1369,7 @@ mod confidence_tests {
             ],
             words: vec![],
             x_groq: None,
+            ..Default::default()
         });
 
         let confidence = verbose.confidence();
@@ -1390,6 +1397,7 @@ mod confidence_tests {
             segments: vec![],
             words: vec![],
             x_groq: None,
+            ..Default::default()
         });
 
         // Should return DEFAULT_UNKNOWN_CONFIDENCE when no segments
@@ -1406,7 +1414,7 @@ mod confidence_tests {
             segments: vec![
                 Segment {
                     id: 0,
-                    seek: 0,
+                    seek: Some(0),
                     start: 0.0,
                     end: 0.0, // Zero duration
                     text: "A".to_string(),
@@ -1418,7 +1426,7 @@ mod confidence_tests {
                 },
                 Segment {
                     id: 1,
-                    seek: 0,
+                    seek: Some(0),
                     start: 0.0,
                     end: 0.0, // Zero duration
                     text: "B".to_string(),
@@ -1431,6 +1439,7 @@ mod confidence_tests {
             ],
             words: vec![],
             x_groq: None,
+            ..Default::default()
         });
 
         // Should fallback to simple average

@@ -9,6 +9,7 @@
 //! with only a prompt (Whisper) gets them joined into the prompt after the caller's own text, as
 //! the gateway's file client does; a row with neither drops them.
 
+use crate::vendor::openai::{Segment, VerboseTranscriptionResponse};
 use std::time::Duration;
 
 use reqwest::multipart::{Form, Part};
@@ -241,52 +242,34 @@ impl OpenAiCompatTranscriber {
             return Err(ex.not_a_transcript("it has no text field"));
         };
         t.text = text.trim().to_string();
+        // The rest is read through the shared response type. A body whose extras carry unexpected
+        // types still answers with its text.
+        let r: VerboseTranscriptionResponse =
+            serde_json::from_value(v).unwrap_or_else(|_| VerboseTranscriptionResponse {
+                text: t.text.clone(),
+                ..Default::default()
+            });
 
-        let token_mean = mean(
-            v.get("logprobs")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(|l| l.get("logprob").and_then(Value::as_f64)),
-        );
-        if let Some(segments) = v.get("segments").and_then(Value::as_array) {
-            let agg = aggregate_segments(segments);
+        if !r.segments.is_empty() {
+            let agg = aggregate_segments(&r.segments);
             t.avg_logprob = agg.avg_logprob;
             t.no_speech_prob = agg.no_speech_prob;
             t.compression_ratio = agg.compression_ratio;
         }
-        t.derived_confidence = token_mean
+        t.derived_confidence = r
+            .mean_token_logprob()
             .or(t.avg_logprob.map(f64::from))
             .map(|m| confidence_from_logprob(m as f32));
-
-        t.detected_language = v
-            .get("language")
-            .and_then(Value::as_str)
+        // gpt-transcribe: an empty `languages` list means the model was unsure.
+        t.detected_language = r
+            .language
+            .as_deref()
             .and_then(detected_language)
-            .or_else(|| {
-                // gpt-transcribe: an empty list means the model was unsure.
-                v.get("languages")
-                    .and_then(Value::as_array)
-                    .and_then(|l| l.first())
-                    .and_then(|l| l.get("code").or(Some(l)))
-                    .and_then(Value::as_str)
-                    .and_then(detected_language)
-            });
-        if let Some(usage) = v
-            .get("usage")
-            .filter(|u| u.get("type").and_then(Value::as_str) == Some("duration"))
-        {
-            t.billed_ms = usage
-                .get("seconds")
-                .and_then(Value::as_f64)
-                .map(|s| (s * 1000.0).round() as u32);
-        }
+            .or_else(|| r.first_listed_language().and_then(detected_language));
+        t.billed_ms = r.billed_seconds().map(|s| (s * 1000.0).round() as u32);
         if t.vendor_request_id.is_none() {
             // Groq puts its id in the body.
-            t.vendor_request_id = v
-                .pointer("/x_groq/id")
-                .and_then(Value::as_str)
-                .map(str::to_string);
+            t.vendor_request_id = r.x_groq.map(|g| g.id).filter(|id| !id.trim().is_empty());
         }
         Ok(t)
     }
@@ -328,14 +311,15 @@ pub(crate) struct SegmentSignals {
 /// mean when no segment has one), `no_speech_prob` the mean, `compression_ratio` the maximum, so
 /// one looping segment is not averaged away. An upload of at most 25 s fits one 30 s window, so
 /// the segments normally agree.
-pub(crate) fn aggregate_segments(segments: &[Value]) -> SegmentSignals {
-    let num = |s: &Value, k: &str| s.get(k).and_then(Value::as_f64).filter(|v| v.is_finite());
+pub(crate) fn aggregate_segments(segments: &[Segment]) -> SegmentSignals {
+    let finite = |v: Option<f64>| v.filter(|v| v.is_finite());
     let (mut weighted, mut weight, mut plain, mut n) = (0.0, 0.0, 0.0, 0usize);
     for s in segments {
-        if let Some(lp) = num(s, "avg_logprob") {
-            let dur = match (num(s, "start"), num(s, "end")) {
-                (Some(a), Some(b)) if b > a => b - a,
-                _ => 0.0,
+        if let Some(lp) = finite(s.avg_logprob) {
+            let dur = if s.end > s.start {
+                s.end - s.start
+            } else {
+                0.0
             };
             weighted += lp * dur;
             weight += dur;
@@ -350,11 +334,11 @@ pub(crate) fn aggregate_segments(segments: &[Value]) -> SegmentSignals {
     };
     SegmentSignals {
         avg_logprob,
-        no_speech_prob: mean(segments.iter().filter_map(|s| num(s, "no_speech_prob")))
+        no_speech_prob: mean(segments.iter().filter_map(|s| finite(s.no_speech_prob)))
             .map(|v| v as f32),
         compression_ratio: segments
             .iter()
-            .filter_map(|s| num(s, "compression_ratio"))
+            .filter_map(|s| finite(s.compression_ratio))
             .fold(None, |m: Option<f64>, v| Some(m.map_or(v, |m| m.max(v))))
             .map(|v| v as f32),
     }
@@ -1001,7 +985,7 @@ mod tests {
 
     #[test]
     fn segment_signals_aggregate_as_designed() {
-        let segs: Vec<Value> = serde_json::from_str(
+        let segs: Vec<Segment> = serde_json::from_str(
             r#"[{"avg_logprob":-1.0,"no_speech_prob":0.9,"compression_ratio":3.0},{"avg_logprob":-0.2,"no_speech_prob":0.1,"compression_ratio":1.0}]"#,
         )
         .unwrap();

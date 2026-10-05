@@ -309,6 +309,7 @@ mod message_tests {
     fn test_transcription_result_text_access() {
         let simple = TranscriptionResult::Simple(TranscriptionResponse {
             text: "Simple text".to_string(),
+            ..Default::default()
         });
         assert_eq!(simple.text(), "Simple text");
 
@@ -318,6 +319,7 @@ mod message_tests {
             duration: None,
             segments: vec![],
             words: vec![],
+            ..Default::default()
         });
         assert_eq!(verbose.text(), "Verbose text");
 
@@ -345,6 +347,7 @@ mod message_tests {
                 seek: None,
             }],
             words: vec![],
+            ..Default::default()
         });
 
         let confidence = verbose.confidence();
@@ -353,6 +356,7 @@ mod message_tests {
         // Test without segments (default confidence)
         let simple = TranscriptionResult::Simple(TranscriptionResponse {
             text: "Test".to_string(),
+            ..Default::default()
         });
         assert_eq!(simple.confidence(), 1.0);
     }
@@ -376,6 +380,7 @@ mod message_tests {
                     end: 1.0,
                 },
             ],
+            ..Default::default()
         });
 
         let words = verbose.words().unwrap();
@@ -386,6 +391,7 @@ mod message_tests {
         // Test without words
         let simple = TranscriptionResult::Simple(TranscriptionResponse {
             text: "Test".to_string(),
+            ..Default::default()
         });
         assert!(simple.words().is_none());
     }
