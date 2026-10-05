@@ -359,9 +359,8 @@ mod tests {
                     }
                     for m in [
                         format!(r#"{{"type":"transcript","text":"part {n}","is_final":false}}"#),
-                        format!(
-                            r#"{{"type":"transcript","text":"hello","is_final":true,"language":"en"}}"#
-                        ),
+                        r#"{"type":"transcript","text":"hello","is_final":true,"language":"en"}"#
+                            .to_string(),
                         format!(r#"{{"type":"transcript","text":"world {n}","is_final":true}}"#),
                         r#"{"type":"flush_done"}"#.to_string(),
                     ] {
