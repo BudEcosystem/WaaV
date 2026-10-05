@@ -1,0 +1,968 @@
+{
+  "openai-compatible-file": {
+    "transport": {
+      "input_mode": "file_upload",
+      "adapter": "openai_transcriptions",
+      "enabled_from_release": 1,
+      "disabled_reason": "Not implemented. The gateway has no component that uploads one utterance to an OpenAI-compatible transcription endpoint and returns a parsed transcript. The only code for a self-hosted deployment is a whole-file passthrough on the upload route, and a live call that names such a deployment is refused before any speech-to-text client is built (gateway/src/handlers/ws/bud_legs.rs:122-134 and :815-826).",
+      "interim_results": "none",
+      "endpointing_owner": "gateway",
+      "vendor_turn_signal": "none",
+      "latency": {
+        "class": "unknown",
+        "measurements": [],
+        "notes": "Depends on the operator's hardware and model. It must be measured per deployment and supplied through the deployment override or the gateway's latency store."
+      },
+      "limits": {
+        "max_upload_bytes": 26214400,
+        "max_audio_ms": 30000,
+        "min_audio_ms": null,
+        "rates": []
+      },
+      "upload": {
+        "accepted": [
+          "wav"
+        ],
+        "preferred": {
+          "container": "wav",
+          "encoding": "pcm_s16le",
+          "sample_rate_hz": 16000,
+          "channels": 1
+        },
+        "envelope": "multipart"
+      },
+      "quality_signals": [],
+      "dialect": {
+        "language_param": "language",
+        "context_params": [],
+        "response_formats": [
+          "json"
+        ],
+        "wire": "openai_multipart",
+        "language_shape": "single",
+        "language_format": "iso639_1",
+        "auth": "bearer_optional",
+        "path": "/audio/transcriptions",
+        "droppable_params": [
+          "language"
+        ]
+      },
+      "gateway_client": {
+        "status": "not_implemented",
+        "code_ref": "gateway/src/handlers/transcribe.rs:769-814 (transcribe_self_hosted) and :947-1027 (multipart fields, form and auth); URL join at gateway/src/core/tts/self_hosted.rs:71-73; live-call refusal at gateway/src/handlers/ws/bud_legs.rs:122-134 and :815-826",
+        "notes": "The request carries file, model and response_format=json and, when the session has a language, language in two-letter form. Every surveyed OpenAI-compatible server accepts the first three. language is listed in droppable_params because at least one server rejects it (WaaV Infer answers HTTP 400): the transcriber drops it, sends the request once more and remembers that for the deployment, and once the setup probe exists the answer is known before the first utterance (integration decisions section 15). prompt, temperature, verbose_json and stream are left out because at least one server rejects each of them. What exists today is reusable only in part: the request half (URL join {api_base}/audio/transcriptions where api_base already ends in /v1, multipart form, Bearer header that is omitted for an empty key) is correct, but it lives in the handler layer, uses a 300 second deadline (transcribe.rs:82), has no circuit breaker, returns the server's body unparsed, and nothing carries the deployment's base address to the speech-to-text side of a live session (PreparedLegs has tts_api_base only, bud_legs.rs:654-664; STTConfig has no base-address field, core/stt/base.rs:503-519). The base address must come only from the deployment record and must not pass through the client-settable endpoint_override, which is checked by the private-address filter (core/stt/standard.rs:366-381) and would reject an in-cluster server."
+      },
+      "file_request_mode": "sync"
+    },
+    "allowed_providers": [
+      "self_hosted"
+    ],
+    "provenance": {
+      "confidence": "assumed",
+      "verified_on": "2026-10-03",
+      "verified_by": "docs",
+      "owner": "waav-gateway",
+      "sources": [
+        "https://github.com/vllm-project/vllm/blob/bc21cba9673cfc2256a2726b4bc32f062237cd35/docs/serving/online_serving/speech_to_text.md",
+        "https://github.com/speaches-ai/speaches/blob/993994f7984bf3fe9655b267448328cf66fccb42/src/speaches/routers/stt.py",
+        "https://github.com/ggml-org/whisper.cpp/blob/60c0be6ac8fa71b1a2ae2dd938a31a34a508e774/examples/server/server.cpp",
+        "https://github.com/ggml-org/whisper.cpp/blob/60c0be6ac8fa71b1a2ae2dd938a31a34a508e774/examples/server/README.md",
+        "https://github.com/mudler/LocalAI/blob/9e373dba33254536eb0dbfe2e196c1f17c8037da/docs/content/features/audio-to-text.md",
+        "https://docs.nvidia.com/nim/speech/latest/reference/api-references/asr/http-asr.html"
+      ],
+      "code_refs": [
+        "gateway/src/handlers/transcribe.rs:769-814",
+        "gateway/src/handlers/transcribe.rs:947-1027",
+        "gateway/src/core/tts/self_hosted.rs:71-73",
+        "gateway/src/handlers/ws/bud_legs.rs:122-134",
+        "gateway/src/handlers/ws/bud_legs.rs:815-826"
+      ],
+      "unverified": [
+        "transport.latency (depends on the operator's hardware and model)",
+        "transport.limits.max_upload_bytes (25 MB is vLLM's default and the operator can change it; other servers state no cap)",
+        "transport.limits.max_audio_ms (30 s assumes a Whisper-style window; servers chunk or cut longer audio instead of rejecting it)",
+        "transport.limits.rates (no server publishes a request or concurrency ceiling; the operator declares it in the deployment override)",
+        "transport.dialect.language_param (decisions section 15: the language is sent and a server that rejects it is repaired by dropping it)"
+      ],
+      "notes": "Version 1 name openai_compat_file. The default for every self-hosted deployment (the self_hosted default row references it). Enabled from Release 1, first working calls."
+    }
+  },
+  "vllm-file": {
+    "transport": {
+      "input_mode": "file_upload",
+      "adapter": "openai_transcriptions",
+      "enabled_from_release": 2,
+      "disabled_reason": "Not implemented. The gateway has no component that uploads one utterance to an OpenAI-compatible transcription endpoint and returns a parsed transcript. The only code for a self-hosted deployment is a whole-file passthrough on the upload route, and a live call that names such a deployment is refused before any speech-to-text client is built (gateway/src/handlers/ws/bud_legs.rs:122-134 and :815-826).",
+      "interim_results": "none",
+      "endpointing_owner": "gateway",
+      "vendor_turn_signal": "none",
+      "latency": {
+        "class": "unknown",
+        "measurements": [],
+        "notes": "Depends on the operator's hardware and model. It must be measured per deployment and supplied through the deployment override or the gateway's latency store."
+      },
+      "limits": {
+        "max_upload_bytes": 26214400,
+        "max_audio_ms": 30000,
+        "min_audio_ms": null,
+        "rates": []
+      },
+      "upload": {
+        "accepted": [
+          "wav"
+        ],
+        "preferred": {
+          "container": "wav",
+          "encoding": "pcm_s16le",
+          "sample_rate_hz": 16000,
+          "channels": 1
+        },
+        "envelope": "multipart"
+      },
+      "quality_signals": [],
+      "dialect": {
+        "language_param": "language",
+        "context_params": [
+          {
+            "kind": "prompt",
+            "wire_name": "prompt"
+          }
+        ],
+        "response_formats": [
+          "json"
+        ],
+        "wire": "openai_multipart",
+        "language_shape": "single",
+        "language_format": "iso639_1",
+        "auth": "bearer_optional",
+        "path": "/audio/transcriptions"
+      },
+      "gateway_client": {
+        "status": "not_implemented",
+        "code_ref": "gateway/src/handlers/transcribe.rs:769-814 (transcribe_self_hosted) and :947-1027 (multipart fields, form and auth); URL join at gateway/src/core/tts/self_hosted.rs:71-73; live-call refusal at gateway/src/handlers/ws/bud_legs.rs:122-134 and :815-826",
+        "notes": "Same adapter as openai-compatible-file, with two more fields sent: language (ISO 639-1) and prompt (the tail of the previous transcript, or key terms). Pinning the language matters for a multilingual Whisper, which otherwise detects the language again on every short segment. Never select it for WaaV Infer, which answers HTTP 400 to a non-empty language or prompt, nor for NVIDIA Speech NIM, which expects a BCP-47 language (use nim-file). Select it for a vLLM server, whose transcription route accepts the standard OpenAI form fields. What exists today is reusable only in part: the request half (URL join {api_base}/audio/transcriptions where api_base already ends in /v1, multipart form, Bearer header that is omitted for an empty key) is correct, but it lives in the handler layer, uses a 300 second deadline (transcribe.rs:82), has no circuit breaker, returns the server's body unparsed, and nothing carries the deployment's base address to the speech-to-text side of a live session (PreparedLegs has tts_api_base only, bud_legs.rs:654-664; STTConfig has no base-address field, core/stt/base.rs:503-519). The base address must come only from the deployment record and must not pass through the client-settable endpoint_override, which is checked by the private-address filter (core/stt/standard.rs:366-381) and would reject an in-cluster server."
+      },
+      "file_request_mode": "sync"
+    },
+    "allowed_providers": [
+      "self_hosted"
+    ],
+    "provenance": {
+      "confidence": "documented",
+      "verified_on": "2026-10-03",
+      "verified_by": "docs",
+      "owner": "waav-gateway",
+      "sources": [
+        "https://github.com/vllm-project/vllm/blob/bc21cba9673cfc2256a2726b4bc32f062237cd35/docs/serving/online_serving/speech_to_text.md"
+      ],
+      "code_refs": [
+        "gateway/src/handlers/transcribe.rs:769-814",
+        "gateway/src/handlers/transcribe.rs:947-1027",
+        "gateway/src/core/tts/self_hosted.rs:71-73",
+        "gateway/src/handlers/ws/bud_legs.rs:122-134",
+        "gateway/src/handlers/ws/bud_legs.rs:815-826"
+      ],
+      "unverified": [
+        "transport.latency (depends on the operator's hardware and model)",
+        "transport.limits.max_upload_bytes (vLLM's default; operator-configurable)",
+        "transport.limits.max_audio_ms",
+        "transport.limits.rates"
+      ],
+      "notes": "Seeded from the version 1 profile openai_compat_file_language_prompt, which is retired (capability-map design section 3.11). Enabled from Release 2, dark launch complete, with the other self-hosted server profiles."
+    }
+  },
+  "speaches-file": {
+    "transport": {
+      "input_mode": "file_upload",
+      "adapter": "openai_transcriptions",
+      "enabled_from_release": 2,
+      "disabled_reason": "Not implemented. The gateway has no component that uploads one utterance to an OpenAI-compatible transcription endpoint and returns a parsed transcript. The only code for a self-hosted deployment is a whole-file passthrough on the upload route, and a live call that names such a deployment is refused before any speech-to-text client is built (gateway/src/handlers/ws/bud_legs.rs:122-134 and :815-826).",
+      "interim_results": "none",
+      "endpointing_owner": "gateway",
+      "vendor_turn_signal": "none",
+      "latency": {
+        "class": "unknown",
+        "measurements": [],
+        "notes": "Depends on the operator's hardware and model. It must be measured per deployment and supplied through the deployment override or the gateway's latency store."
+      },
+      "limits": {
+        "max_upload_bytes": 26214400,
+        "max_audio_ms": 30000,
+        "min_audio_ms": null,
+        "rates": []
+      },
+      "upload": {
+        "accepted": [
+          "wav"
+        ],
+        "preferred": {
+          "container": "wav",
+          "encoding": "pcm_s16le",
+          "sample_rate_hz": 16000,
+          "channels": 1
+        },
+        "envelope": "multipart"
+      },
+      "quality_signals": [],
+      "dialect": {
+        "language_param": "language",
+        "context_params": [
+          {
+            "kind": "prompt",
+            "wire_name": "prompt"
+          }
+        ],
+        "response_formats": [
+          "json"
+        ],
+        "wire": "openai_multipart",
+        "language_shape": "single",
+        "language_format": "iso639_1",
+        "auth": "bearer_optional",
+        "path": "/audio/transcriptions"
+      },
+      "gateway_client": {
+        "status": "not_implemented",
+        "code_ref": "gateway/src/handlers/transcribe.rs:769-814 (transcribe_self_hosted) and :947-1027 (multipart fields, form and auth); URL join at gateway/src/core/tts/self_hosted.rs:71-73; live-call refusal at gateway/src/handlers/ws/bud_legs.rs:122-134 and :815-826",
+        "notes": "Same adapter as openai-compatible-file, with two more fields sent: language (ISO 639-1) and prompt (the tail of the previous transcript, or key terms). Pinning the language matters for a multilingual Whisper, which otherwise detects the language again on every short segment. Never select it for WaaV Infer, which answers HTTP 400 to a non-empty language or prompt, nor for NVIDIA Speech NIM, which expects a BCP-47 language (use nim-file). Select it for a speaches server, which was confirmed in source to accept the standard OpenAI form fields. speaches may download the model on the first request that names it, so the first upload of a deployment can take far longer than the rest and needs a longer deadline (or a warm-up request before the call). What exists today is reusable only in part: the request half (URL join {api_base}/audio/transcriptions where api_base already ends in /v1, multipart form, Bearer header that is omitted for an empty key) is correct, but it lives in the handler layer, uses a 300 second deadline (transcribe.rs:82), has no circuit breaker, returns the server's body unparsed, and nothing carries the deployment's base address to the speech-to-text side of a live session (PreparedLegs has tts_api_base only, bud_legs.rs:654-664; STTConfig has no base-address field, core/stt/base.rs:503-519). The base address must come only from the deployment record and must not pass through the client-settable endpoint_override, which is checked by the private-address filter (core/stt/standard.rs:366-381) and would reject an in-cluster server."
+      },
+      "file_request_mode": "sync"
+    },
+    "allowed_providers": [
+      "self_hosted"
+    ],
+    "provenance": {
+      "confidence": "documented",
+      "verified_on": "2026-10-03",
+      "verified_by": "docs",
+      "owner": "waav-gateway",
+      "sources": [
+        "https://github.com/speaches-ai/speaches/blob/993994f7984bf3fe9655b267448328cf66fccb42/src/speaches/routers/stt.py"
+      ],
+      "code_refs": [
+        "gateway/src/handlers/transcribe.rs:769-814",
+        "gateway/src/handlers/transcribe.rs:947-1027",
+        "gateway/src/core/tts/self_hosted.rs:71-73",
+        "gateway/src/handlers/ws/bud_legs.rs:122-134",
+        "gateway/src/handlers/ws/bud_legs.rs:815-826"
+      ],
+      "unverified": [
+        "transport.latency (depends on the operator's hardware and model)",
+        "transport.limits.max_upload_bytes (vLLM's default; operator-configurable)",
+        "transport.limits.max_audio_ms",
+        "transport.limits.rates"
+      ],
+      "notes": "Seeded from the version 1 profile openai_compat_file_language_prompt, which is retired (capability-map design section 3.11). Enabled from Release 2, dark launch complete, with the other self-hosted server profiles."
+    }
+  },
+  "waav-infer-file": {
+    "transport": {
+      "input_mode": "file_upload",
+      "adapter": "openai_transcriptions",
+      "enabled_from_release": 1,
+      "disabled_reason": "Not implemented. The gateway has no per-utterance upload adapter, and it cannot reach WaaV Infer for speech-to-text at all today: the only adapter is a stub whose connect always fails (gateway/src/core/stt/infer.rs:59-65).",
+      "interim_results": "none",
+      "endpointing_owner": "gateway",
+      "vendor_turn_signal": "none",
+      "latency": {
+        "class": "unknown",
+        "measurements": [
+          {
+            "percentile": "p50",
+            "quantity": "inference_only",
+            "value_ms": 123,
+            "basis": "own_probe",
+            "source": "waav-infer/perf/COVERAGE.md:29",
+            "conditions": "Median engine-side model wall time for one transcription by whisper-base on a GB10 GPU with ONNX Runtime, no batching. No network, detection or queueing is included."
+          },
+          {
+            "percentile": "p50",
+            "quantity": "inference_only",
+            "value_ms": 439,
+            "basis": "own_probe",
+            "source": "waav-infer/perf/COVERAGE.md:28",
+            "conditions": "The same figure for nemotron-asr. Larger models are unmeasured."
+          }
+        ],
+        "notes": "No end-of-speech-to-final figure exists; the entries are engine-side inference time only."
+      },
+      "limits": {
+        "max_upload_bytes": 104857600,
+        "max_audio_ms": null,
+        "min_audio_ms": null,
+        "vendor_timeout_ms": 30000,
+        "rates": [
+          {
+            "metric": "concurrent_requests",
+            "per": "none",
+            "value": 64,
+            "plan": null,
+            "scope": "deployment",
+            "note": "Engine default (waav-infer-server/src/lib.rs:48, :151); the operator may change it. A request that waits more than 2 seconds for admission is answered with HTTP 429 admission_rejected, which is load shedding and must not open the breaker."
+          }
+        ]
+      },
+      "upload": {
+        "accepted": [
+          "wav"
+        ],
+        "preferred": {
+          "container": "wav",
+          "encoding": "pcm_s16le",
+          "sample_rate_hz": 16000,
+          "channels": 1
+        },
+        "envelope": "multipart"
+      },
+      "quality_signals": [],
+      "dialect": {
+        "language_param": null,
+        "context_params": [],
+        "response_formats": [
+          "json",
+          "text"
+        ],
+        "wire": "openai_multipart",
+        "language_format": "iso639_1",
+        "auth": "bearer_optional",
+        "path": "/audio/transcriptions"
+      },
+      "gateway_client": {
+        "status": "not_implemented",
+        "code_ref": "engine route: waav-infer/crates/waav-infer-server/src/lib.rs:1598-1765 (POST /v1/audio/transcriptions); gateway request code to extract: gateway/src/handlers/transcribe.rs:769-814 and :947-1027",
+        "notes": "Request restrictions enforced by the engine, each answered with HTTP 400 (unsupported_param): a non-empty language or prompt (lib.rs:1564-1574, :1663-1676); any response_format other than json or text, so verbose_json fails (lib.rs:1704-1715); any temperature other than 0 (lib.rs:1576-1596). The model field must be empty or name the loaded family, otherwise model_not_found (lib.rs:1647-1662; engine.rs:2750-2764). Unknown fields such as stream are read and ignored. The response is {\"text\": ...} only: no timestamps, no confidence, no detected language. Send 16 kHz audio, because the engine otherwise resamples linearly. Limits are the engine defaults (lib.rs:144-166, :48): 100 MiB upload, 64 concurrent requests, a 2 second wait for admission and then HTTP 429 with code admission_rejected, a 30 second deadline per request. A 429 from the engine is load shedding and must not count as a failure for the circuit breaker (gateway/src/core/resilience/infer_reject.rs). Concurrent uploads are folded into one batched forward pass of up to 24 clips with no added delay (waav-infer-server/src/stt_coalescer.rs:26-33, :142-145). The engine binds loopback with no authentication by default and serves one speech-to-text model per process."
+      },
+      "file_request_mode": "sync"
+    },
+    "allowed_providers": [
+      "self_hosted",
+      "waav-infer"
+    ],
+    "provenance": {
+      "confidence": "documented",
+      "verified_on": "2026-10-03",
+      "verified_by": "code_reading",
+      "owner": "waav-gateway",
+      "sources": [],
+      "code_refs": [
+        "waav-infer/crates/waav-infer-server/src/lib.rs:48",
+        "waav-infer/crates/waav-infer-server/src/lib.rs:144-166",
+        "waav-infer/crates/waav-infer-server/src/lib.rs:1564-1596",
+        "waav-infer/crates/waav-infer-server/src/lib.rs:1598-1765",
+        "waav-infer/crates/waav-infer-server/src/lib.rs:1647-1662",
+        "waav-infer/crates/waav-infer-server/src/lib.rs:1704-1715",
+        "waav-infer/crates/waav-infer-server/src/engine.rs:2750-2764",
+        "waav-infer/crates/waav-infer-server/src/stt_coalescer.rs:26-33",
+        "waav-infer/perf/COVERAGE.md:28-29",
+        "gateway/src/core/stt/infer.rs:59-65",
+        "gateway/src/handlers/transcribe.rs:769-814",
+        "gateway/src/handlers/transcribe.rs:947-1027"
+      ],
+      "unverified": [
+        "transport.latency (no end-of-speech-to-final measurement)",
+        "transport.limits.max_audio_ms",
+        "transport.limits.min_audio_ms"
+      ],
+      "notes": "Version 1 name waav_infer_file. No language and no prompt are sent, because the engine answers HTTP 400 to either. Enabled from Release 1, first working calls."
+    }
+  },
+  "whispercpp-file": {
+    "transport": {
+      "input_mode": "file_upload",
+      "adapter": "openai_transcriptions",
+      "enabled_from_release": 2,
+      "disabled_reason": "Not implemented. The gateway has no component that uploads one utterance to an OpenAI-compatible transcription endpoint and returns a parsed transcript. The only code for a self-hosted deployment is a whole-file passthrough on the upload route, and a live call that names such a deployment is refused before any speech-to-text client is built (gateway/src/handlers/ws/bud_legs.rs:122-134 and :815-826).",
+      "interim_results": "none",
+      "endpointing_owner": "gateway",
+      "vendor_turn_signal": "none",
+      "latency": {
+        "class": "unknown",
+        "measurements": [],
+        "notes": "Depends on the operator's hardware and model. It must be measured per deployment and supplied through the deployment override or the gateway's latency store."
+      },
+      "limits": {
+        "max_upload_bytes": null,
+        "max_audio_ms": null,
+        "min_audio_ms": null,
+        "context_window_ms": 30000,
+        "rates": [],
+        "single_process": true
+      },
+      "upload": {
+        "accepted": [
+          "wav"
+        ],
+        "preferred": {
+          "container": "wav",
+          "encoding": "pcm_s16le",
+          "sample_rate_hz": 16000,
+          "channels": 1
+        },
+        "envelope": "multipart"
+      },
+      "quality_signals": [
+        "segment_no_speech_prob"
+      ],
+      "quality_signals_require": [
+        "response_format=verbose_json"
+      ],
+      "dialect": {
+        "language_param": null,
+        "context_params": [],
+        "response_formats": [
+          "json",
+          "text",
+          "srt",
+          "vtt",
+          "verbose_json"
+        ],
+        "wire": "openai_multipart",
+        "auth": "bearer_optional",
+        "path": "/audio/transcriptions"
+      },
+      "gateway_client": {
+        "status": "not_implemented",
+        "code_ref": "gateway/src/handlers/transcribe.rs:769-814 (transcribe_self_hosted) and :947-1027 (multipart fields, form and auth); URL join at gateway/src/core/tts/self_hosted.rs:71-73; live-call refusal at gateway/src/handlers/ws/bud_legs.rs:122-134 and :815-826",
+        "notes": "For the whisper.cpp example server. It serves POST /inference by default; it answers on the OpenAI path only when started with --inference-path /v1/audio/transcriptions, so the deployment's base address plus /audio/transcriptions must match what the operator configured. It accepts WAV only unless started with --convert. Requests are served one at a time per process (limits.single_process), so one upload in flight must be enforced per endpoint across all sessions, not only per session. verbose_json carries no_speech_prob. Which WAV sample rates it accepts without --convert was not confirmed; send 16 kHz. Whether it accepts a language field on this route was not confirmed, so none is sent. What exists today is reusable only in part: the request half (URL join {api_base}/audio/transcriptions where api_base already ends in /v1, multipart form, Bearer header that is omitted for an empty key) is correct, but it lives in the handler layer, uses a 300 second deadline (transcribe.rs:82), has no circuit breaker, returns the server's body unparsed, and nothing carries the deployment's base address to the speech-to-text side of a live session (PreparedLegs has tts_api_base only, bud_legs.rs:654-664; STTConfig has no base-address field, core/stt/base.rs:503-519). The base address must come only from the deployment record and must not pass through the client-settable endpoint_override, which is checked by the private-address filter (core/stt/standard.rs:366-381) and would reject an in-cluster server."
+      },
+      "file_request_mode": "sync",
+      "segment_profile": {
+        "max_in_flight": 1,
+        "rationale": "The whisper.cpp server takes one global lock per inference, so a second upload only queues behind the first. One process serves one call well; every extra concurrent call adds its whole inference time to the others."
+      }
+    },
+    "allowed_providers": [
+      "self_hosted"
+    ],
+    "provenance": {
+      "confidence": "documented",
+      "verified_on": "2026-10-03",
+      "verified_by": "docs",
+      "owner": "waav-gateway",
+      "sources": [
+        "https://github.com/ggml-org/whisper.cpp/blob/60c0be6ac8fa71b1a2ae2dd938a31a34a508e774/examples/server/server.cpp",
+        "https://github.com/ggml-org/whisper.cpp/blob/60c0be6ac8fa71b1a2ae2dd938a31a34a508e774/examples/server/README.md"
+      ],
+      "code_refs": [
+        "gateway/src/handlers/transcribe.rs:769-814",
+        "gateway/src/handlers/transcribe.rs:947-1027",
+        "gateway/src/core/tts/self_hosted.rs:71-73",
+        "gateway/src/handlers/ws/bud_legs.rs:122-134",
+        "gateway/src/handlers/ws/bud_legs.rs:815-826"
+      ],
+      "unverified": [
+        "transport.latency (depends on the operator's hardware and model)",
+        "transport.upload.sample_rates_hz (which WAV rates the server accepts without --convert was not confirmed; 16 kHz is sent)",
+        "transport.dialect.language_param (whether the route accepts a language field was not confirmed, so none is sent)"
+      ],
+      "notes": "Version 1 name whisper_cpp_file. Enabled from Release 2, dark launch complete."
+    }
+  },
+  "nim-file": {
+    "transport": {
+      "input_mode": "file_upload",
+      "adapter": "openai_transcriptions",
+      "enabled_from_release": 2,
+      "disabled_reason": "Not implemented. The gateway has no component that uploads one utterance to an OpenAI-compatible transcription endpoint and returns a parsed transcript. The only code for a self-hosted deployment is a whole-file passthrough on the upload route, and a live call that names such a deployment is refused before any speech-to-text client is built (gateway/src/handlers/ws/bud_legs.rs:122-134 and :815-826).",
+      "interim_results": "none",
+      "endpointing_owner": "gateway",
+      "vendor_turn_signal": "none",
+      "latency": {
+        "class": "unknown",
+        "measurements": [],
+        "notes": "Depends on the operator's hardware and model. It must be measured per deployment and supplied through the deployment override or the gateway's latency store."
+      },
+      "limits": {
+        "max_upload_bytes": null,
+        "max_audio_ms": null,
+        "min_audio_ms": null,
+        "rates": []
+      },
+      "upload": {
+        "accepted": [
+          "wav",
+          "opus",
+          "flac"
+        ],
+        "preferred": {
+          "container": "wav",
+          "encoding": "pcm_s16le",
+          "sample_rate_hz": 16000,
+          "channels": 1
+        },
+        "envelope": "multipart"
+      },
+      "quality_signals": [],
+      "dialect": {
+        "language_param": "language",
+        "context_params": [],
+        "response_formats": [
+          "json",
+          "text"
+        ],
+        "wire": "openai_multipart",
+        "language_shape": "single",
+        "language_format": "bcp47",
+        "auth": "bearer_optional",
+        "path": "/audio/transcriptions"
+      },
+      "gateway_client": {
+        "status": "not_implemented",
+        "code_ref": "gateway/src/handlers/transcribe.rs:769-814 (transcribe_self_hosted) and :947-1027 (multipart fields, form and auth); URL join at gateway/src/core/tts/self_hosted.rs:71-73; live-call refusal at gateway/src/handlers/ws/bud_legs.rs:122-134 and :815-826",
+        "notes": "For the HTTP interface of an NVIDIA Speech NIM container (port 9000), which NVIDIA describes as the offline interface. Differences from the default profile: the language is a BCP-47 tag such as en-US or the value multi, and either language or model must be present or the server answers 400; only WAV, OPUS and FLAC files are accepted; response_format is json or text only, so no confidence or no-speech signal is available; the server answers 503 while a model loads. Whisper, Canary and Parakeet TDT run in offline mode only on NIM. Whether a container started with a streaming-only profile rejects uploads is not stated by NVIDIA. What exists today is reusable only in part: the request half (URL join {api_base}/audio/transcriptions where api_base already ends in /v1, multipart form, Bearer header that is omitted for an empty key) is correct, but it lives in the handler layer, uses a 300 second deadline (transcribe.rs:82), has no circuit breaker, returns the server's body unparsed, and nothing carries the deployment's base address to the speech-to-text side of a live session (PreparedLegs has tts_api_base only, bud_legs.rs:654-664; STTConfig has no base-address field, core/stt/base.rs:503-519). The base address must come only from the deployment record and must not pass through the client-settable endpoint_override, which is checked by the private-address filter (core/stt/standard.rs:366-381) and would reject an in-cluster server."
+      },
+      "file_request_mode": "sync"
+    },
+    "allowed_providers": [
+      "self_hosted"
+    ],
+    "provenance": {
+      "confidence": "documented",
+      "verified_on": "2026-10-03",
+      "verified_by": "docs",
+      "owner": "waav-gateway",
+      "sources": [
+        "https://docs.nvidia.com/nim/speech/latest/reference/api-references/asr/http-asr.html"
+      ],
+      "code_refs": [
+        "gateway/src/handlers/transcribe.rs:769-814",
+        "gateway/src/handlers/transcribe.rs:947-1027",
+        "gateway/src/core/tts/self_hosted.rs:71-73",
+        "gateway/src/handlers/ws/bud_legs.rs:122-134",
+        "gateway/src/handlers/ws/bud_legs.rs:815-826"
+      ],
+      "unverified": [
+        "transport.latency (depends on the operator's hardware and model)",
+        "transport.limits.max_upload_bytes",
+        "transport.limits.max_audio_ms",
+        "transport.limits.rates",
+        "transport.gateway_client (whether a container started with a streaming-only profile rejects uploads is not stated by NVIDIA)"
+      ],
+      "notes": "Version 1 name nvidia_nim_file. Enabled from Release 2, dark launch complete."
+    }
+  },
+  "azure-openai-file": {
+    "transport": {
+      "input_mode": "file_upload",
+      "adapter": "azure_openai_transcriptions",
+      "enabled_from_release": 1,
+      "disabled_reason": "Not implemented. The gateway has no per-utterance upload adapter; its only Azure OpenAI transcription code is a whole-file passthrough on the upload route, and a live call that names such a deployment is refused before any client is built (gateway/src/handlers/ws/bud_legs.rs:122-134 and :815-826). Even once the adapter exists, Azure's default quota of 3 audio requests per minute cannot carry a conversation, so a quota increase is a precondition and its absence must be reported as a configuration warning at session start.",
+      "interim_results": "none",
+      "endpointing_owner": "gateway",
+      "vendor_turn_signal": "none",
+      "latency": {
+        "class": "unknown",
+        "measurements": [],
+        "notes": "Microsoft publishes no latency for the audio API on short clips."
+      },
+      "limits": {
+        "max_upload_bytes": 20971520,
+        "max_audio_ms": null,
+        "min_audio_ms": null,
+        "rates": [
+          {
+            "metric": "requests",
+            "per": "minute",
+            "value": 3,
+            "plan": null,
+            "scope": "unknown",
+            "note": "Azure's default quota for the speech-to-text audio API. Microsoft raises it on request; a deployment with a higher quota declares it in the deployment override. Whether it counts per deployment, per resource or per subscription is not stated."
+          }
+        ]
+      },
+      "upload": {
+        "accepted": [
+          "mp3",
+          "mp4",
+          "mpeg",
+          "mpga",
+          "m4a",
+          "wav",
+          "webm"
+        ],
+        "preferred": {
+          "container": "wav",
+          "encoding": "pcm_s16le",
+          "sample_rate_hz": 16000,
+          "channels": 1
+        },
+        "envelope": "multipart"
+      },
+      "quality_signals": [],
+      "dialect": {
+        "language_param": null,
+        "context_params": [],
+        "response_formats": [
+          "json"
+        ],
+        "wire": "openai_multipart",
+        "auth": "api_key_header"
+      },
+      "gateway_client": {
+        "status": "not_implemented",
+        "code_ref": "gateway/src/handlers/transcribe.rs:839-913 (transcribe_azure_openai) and :947-1027; URL builder gateway/src/core/tts/self_hosted.rs:171-200; live-call refusal at gateway/src/handlers/ws/bud_legs.rs:122-134 and :815-826",
+        "notes": "The multipart body is OpenAI's, but the address is {api_base}/openai/deployments/{deployment}/audio/transcriptions?api-version=... and the key travels in an api-key header, never in Authorization (self_hosted.rs:125; transcribe.rs:1023-1025). The address must be https and must pass the private-address filter, so an Azure Private Link endpoint is refused today (self_hosted.rs:215-228). The gateway sends api-version 2025-04-01-preview unless the deployment sets provider_params.api_version (self_hosted.rs:115; gateway/src/handlers/openai_audio.rs:1557-1561). The existing code has a 300 second deadline, returns the body unparsed and has no circuit breaker, so only its request half can be reused. For a deployment whose base model is unknown the request carries only file, model and response_format=json; language and prompt are left out because the base models disagree on the language field."
+      },
+      "file_request_mode": "sync",
+      "segment_profile": {
+        "max_in_flight": 1,
+        "upload_policy": "per_turn",
+        "rationale": "Azure's default quota for the speech-to-text audio API is 3 requests per minute. One upload per caller turn is the most that quota can carry, so segments are held and uploaded once per turn, one at a time. Restore the gateway defaults (upload at each pause, two in flight) only for a deployment whose quota increase is confirmed."
+      }
+    },
+    "allowed_providers": [
+      "azure_openai"
+    ],
+    "provenance": {
+      "confidence": "assumed",
+      "verified_on": "2026-10-03",
+      "verified_by": "docs",
+      "owner": "waav-gateway",
+      "sources": [
+        "https://learn.microsoft.com/en-us/azure/foundry/foundry-models/concepts/models-sold-directly-by-azure",
+        "https://learn.microsoft.com/en-us/azure/ai-foundry/openai/whisper-quickstart",
+        "https://learn.microsoft.com/en-us/azure/foundry/openai/quotas-limits",
+        "https://learn.microsoft.com/en-us/azure/foundry/openai/reference-preview-latest"
+      ],
+      "code_refs": [
+        "gateway/src/handlers/transcribe.rs:839-913",
+        "gateway/src/handlers/transcribe.rs:947-1027",
+        "gateway/src/core/tts/self_hosted.rs:171-200",
+        "gateway/src/handlers/ws/bud_legs.rs:122-134",
+        "gateway/src/handlers/ws/bud_legs.rs:815-826"
+      ],
+      "unverified": [
+        "transport.latency (none published)",
+        "transport.limits.max_upload_bytes (Microsoft pages disagree: 25 MB against 20 MB; the lower is recorded)",
+        "transport.limits.rates (requests) (3 is the documented default for the audio API; per-model quotas are not listed)",
+        "transport.limits.rates[].scope (the page does not say whether the quota is per deployment, per resource or per subscription; the conversion rules name resource, the evidence does not confirm it)"
+      ],
+      "notes": "Built from the transport of the version 1 azure_openai default row (no version 1 profile existed). requires is not set: the default row works without underlying_model. Enabled from Release 1, first working calls."
+    }
+  },
+  "openai-realtime-transcription": {
+    "transport": {
+      "input_mode": "live_stream",
+      "adapter": "openai_realtime_transcription",
+      "enabled_from_release": null,
+      "disabled_reason": "Not implemented. The gateway has no speech-to-text client for the OpenAI Realtime transcription session. Its only code for that socket is a pass-through relay for customers who speak the Realtime protocol themselves, which cannot feed the gateway's own speech-to-text, language-model and text-to-speech chain. Decisions section 12 places the commit transport for OpenAI only.",
+      "interim_results": "live",
+      "endpointing_owner": "gateway",
+      "vendor_turn_signal": "none",
+      "latency": {
+        "class": "unknown",
+        "measurements": []
+      },
+      "limits": {
+        "max_session_ms": null,
+        "rates": []
+      },
+      "quality_signals": [],
+      "dialect": {
+        "language_param": null,
+        "context_params": [],
+        "wire": "openai_realtime_ga"
+      },
+      "gateway_client": {
+        "status": "not_implemented",
+        "code_ref": "relay only: gateway/src/handlers/openai_realtime/upstream.rs:113-191 (builds {base}/realtime?intent=transcription for openai and /openai/v1/realtime?intent=transcription with an api-key header for azure_openai); session and event types to reuse: gateway/src/core/realtime/openai/protocol.rs",
+        "notes": "How the session must work: open the socket with intent=transcription; send session.update with session.type set to transcription, input format audio/pcm at 24 kHz (the gateway must resample from the caller's rate), the transcription model, and turn_detection null; append base64 audio continuously; when the gateway's own voice detector decides the utterance has ended, send input_audio_buffer.commit. Text arrives as conversation.item.input_audio_transcription.delta while the caller speaks and as ...completed after the commit. Completions for different turns may arrive out of order and must be matched by item_id. A commit on an empty buffer is an error. The live models reject the vendor's own voice detection, which is why the gateway owns endpointing here. The intent=transcription query is what the gateway relay, Pipecat and LiveKit dial and what Microsoft's sample uses; it is absent from OpenAI's own pages. The language and context fields are left out of this profile because they differ by model (languages and keywords on gpt-live-transcribe, language and no prompt on gpt-realtime-whisper) and a profile cannot see the model."
+      },
+      "stream_audio": {
+        "encodings": [
+          "pcm_s16le",
+          "mulaw",
+          "alaw"
+        ],
+        "sample_rates_hz": [
+          24000
+        ]
+      },
+      "commit": {
+        "audio_gating": "speech_only"
+      }
+    },
+    "allowed_providers": [
+      "self_hosted",
+      "azure_openai"
+    ],
+    "fallback_profile": "openai-compatible-file",
+    "requires": [
+      "realtime_url"
+    ],
+    "provenance": {
+      "confidence": "documented",
+      "verified_on": "2026-10-03",
+      "verified_by": "docs",
+      "owner": "waav-gateway",
+      "sources": [
+        "https://developers.openai.com/api/docs/guides/speech-to-text"
+      ],
+      "code_refs": [
+        "gateway/src/handlers/openai_realtime/upstream.rs:113-191",
+        "gateway/src/core/realtime/openai/protocol.rs"
+      ],
+      "unverified": [
+        "transport.latency (unmeasured)",
+        "fallback_profile (openai-compatible-file allows only self_hosted; an azure_openai deployment that selects this profile has no file fallback it may use, a separate decision is needed)"
+      ],
+      "notes": "Version 1 name openai_realtime_transcription. Never enabled: decisions section 12 places the gateway-driven commit transport for OpenAI's own rows only."
+    }
+  },
+  "vllm-realtime": {
+    "transport": {
+      "input_mode": "live_stream",
+      "adapter": "planned_commit",
+      "enabled_from_release": null,
+      "disabled_reason": "Not implemented. The gateway has no client for vLLM's realtime transcription socket, whose messages differ from OpenAI's, and a self-hosted deployment has no field in which to declare the socket address.",
+      "interim_results": "live",
+      "endpointing_owner": "gateway",
+      "vendor_turn_signal": "none",
+      "latency": {
+        "class": "unknown",
+        "measurements": [
+          {
+            "percentile": "typical",
+            "quantity": "inference_only",
+            "value_ms": 480,
+            "basis": "vendor_claim",
+            "source": "https://huggingface.co/mistralai/Voxtral-Mini-4B-Realtime-2602",
+            "conditions": "Voxtral Realtime transcription delay recommended by the model card; fixed when the server is deployed and configurable from 240 ms to 2.4 s. Model delay, not end-of-speech-to-final latency."
+          }
+        ],
+        "notes": "No measurement. For Voxtral Realtime the model card describes a transcription delay that is fixed when the server is deployed: 480 ms recommended, configurable from 240 ms to 2.4 s. That is model delay, not end-of-speech-to-final latency."
+      },
+      "limits": {
+        "max_session_ms": null,
+        "rates": []
+      },
+      "quality_signals": [],
+      "dialect": {
+        "language_param": null,
+        "context_params": [],
+        "wire": "vllm_realtime"
+      },
+      "gateway_client": {
+        "status": "not_implemented",
+        "code_ref": "no gateway code exists for this transport; the nearest is the OpenAI Realtime relay at gateway/src/handlers/openai_realtime/upstream.rs",
+        "notes": "Socket ws://host/v1/realtime, read from vLLM source at commit bc21cba. The server sends session.created with an id and no session object. The client must send session.update {model} before anything else; the documentation calls it optional but the code rejects a commit without it (model_not_validated), and a valid update is not acknowledged. Audio is input_audio_buffer.append with base64 PCM16 at 16 kHz mono and nothing else, so the gateway must resample. input_audio_buffer.commit has the opposite meaning to OpenAI's: it starts generation and is sent before the audio; commit with final true ends the audio. A second commit while generation runs is ignored. Text arrives as transcription.delta (append-only) and transcription.done; errors carry a string, not an object. There is no voice detection on the server, so the gateway decides where a turn ends. The route exists only when the loaded model supports the realtime task (Voxtral Realtime and the Qwen3-ASR realtime class); otherwise the upgrade fails with HTTP 403, which looks like a permission error. The Qwen3-ASR class emits text only once per 5 second block, so for conversation it is no better than the file path. vLLM does not reclaim idle streaming sessions, so every open call holds capacity."
+      },
+      "stream_audio": {
+        "encodings": [
+          "pcm_s16le"
+        ],
+        "sample_rates_hz": [
+          16000
+        ],
+        "channels": 1
+      }
+    },
+    "allowed_providers": [
+      "self_hosted"
+    ],
+    "fallback_profile": "vllm-file",
+    "requires": [
+      "realtime_url",
+      "underlying_model"
+    ],
+    "provenance": {
+      "confidence": "documented",
+      "verified_on": "2026-10-03",
+      "verified_by": "docs",
+      "owner": "waav-gateway",
+      "sources": [
+        "https://github.com/vllm-project/vllm/blob/bc21cba9673cfc2256a2726b4bc32f062237cd35/vllm/entrypoints/speech_to_text/realtime/protocol.py",
+        "https://github.com/vllm-project/vllm/blob/bc21cba9673cfc2256a2726b4bc32f062237cd35/vllm/entrypoints/speech_to_text/realtime/connection.py",
+        "https://huggingface.co/mistralai/Voxtral-Mini-4B-Realtime-2602"
+      ],
+      "code_refs": [],
+      "unverified": [
+        "transport.latency (no end-of-speech-to-final measurement)"
+      ],
+      "notes": "Version 1 name vllm_realtime. No release builds its client (planned_commit)."
+    }
+  },
+  "nim-realtime": {
+    "transport": {
+      "input_mode": "live_stream",
+      "adapter": "planned_stream",
+      "enabled_from_release": null,
+      "disabled_reason": "Not implemented. The gateway has no client for the NVIDIA Speech NIM realtime socket, and a self-hosted deployment has no field in which to declare it.",
+      "interim_results": "live",
+      "endpointing_owner": "either",
+      "vendor_turn_signal": "silence",
+      "latency": {
+        "class": "unknown",
+        "measurements": []
+      },
+      "limits": {
+        "max_session_ms": 3600000,
+        "rates": [
+          {
+            "metric": "concurrent_sessions",
+            "per": "none",
+            "value": 100,
+            "plan": null,
+            "scope": "deployment"
+          }
+        ],
+        "idle_timeout_ms": 60000
+      },
+      "quality_signals": [],
+      "dialect": {
+        "language_param": "language",
+        "context_params": [
+          {
+            "kind": "prompt",
+            "wire_name": "prompt"
+          }
+        ],
+        "wire": "nvidia_nim_realtime",
+        "language_format": "bcp47"
+      },
+      "gateway_client": {
+        "status": "not_implemented",
+        "code_ref": "no gateway code exists for this transport",
+        "notes": "Socket ws://host:9000/v1/realtime?intent=transcription; a missing or wrong intent closes the socket with code 1008. The first server frame is conversation.created, not session.created. The client configures with transcription_session.update (input_audio_format pcm16, sample rate 16000 by default, model, BCP-47 language, prompt, endpointing_config, word_boosting), sends input_audio_buffer.append, and may send commit, clear and done. Text arrives as conversation.item.input_audio_transcription.delta and .completed, the latter with words_info, vad_states and is_last_result. Server defaults: sessions expire after 3600 seconds, close after 60 seconds without activity, at most 100 connections, messages up to 10 MB (the page also says 15 MB per append; plan for the smaller). An optional single-use token expires 60 seconds after it is issued. Streaming works only when the container was started with a streaming profile; Whisper, Canary and Parakeet TDT are offline only, Nemotron ASR Streaming and Parakeet CTC or RNNT have streaming profiles. Recorded as endpointing by either side with a silence signal because the session has an endpointing configuration and reports voice states; that reading is an inference and whether the server finalises a segment without a client commit was not confirmed. word_boosting may map to key terms; that mapping is not decided."
+      },
+      "stream_audio": {
+        "encodings": [
+          "pcm_s16le"
+        ],
+        "sample_rates_hz": [
+          16000
+        ]
+      }
+    },
+    "allowed_providers": [
+      "self_hosted"
+    ],
+    "fallback_profile": "nim-file",
+    "requires": [
+      "realtime_url"
+    ],
+    "provenance": {
+      "confidence": "documented",
+      "verified_on": "2026-10-03",
+      "verified_by": "docs",
+      "owner": "waav-gateway",
+      "sources": [
+        "https://docs.nvidia.com/nim/speech/latest/reference/api-references/asr/http-asr.html"
+      ],
+      "code_refs": [],
+      "unverified": [
+        "transport.endpointing_owner and transport.vendor_turn_signal (read from the session's endpointing configuration; whether the server finalises a segment without a client commit was not confirmed)",
+        "transport.limits.idle_timeout_ms (the server closes after 60 seconds without activity; recorded as the idle limit)"
+      ],
+      "notes": "Version 1 name nvidia_nim_realtime. No release builds its client (planned_stream)."
+    }
+  },
+  "speaches-realtime": {
+    "transport": {
+      "input_mode": "vendor_segmented",
+      "adapter": "planned_commit",
+      "enabled_from_release": null,
+      "disabled_reason": "Not implemented, and of little value: the speaches socket cuts the audio itself and then calls its own file transcription, so it is no faster than the gateway uploading the same segment to the same server, and it adds a second voice detector the gateway does not control.",
+      "interim_results": "none",
+      "endpointing_owner": "either",
+      "vendor_turn_signal": "silence",
+      "latency": {
+        "class": "unknown",
+        "measurements": []
+      },
+      "limits": {
+        "min_audio_ms": 100,
+        "max_session_ms": 1800000,
+        "rates": []
+      },
+      "quality_signals": [],
+      "dialect": {
+        "language_param": "language",
+        "context_params": [],
+        "wire": "openai_realtime_beta"
+      },
+      "gateway_client": {
+        "status": "not_implemented",
+        "code_ref": "no gateway code exists for this transport",
+        "notes": "A vendor-side segmenting facade: a socket that accepts live audio but runs a batch model once per utterance behind it. Socket /v1/realtime?model=...&intent=transcription&language=...&transcription_model=..., read from speaches source at commit 993994f. The route exists for every model. Incoming audio is treated as 24 kHz and resampled to 16 kHz by the server. The session uses the older OpenAI beta shape (input_audio_transcription.model, turn_detection.type server_vad), not the current session.type transcription shape. Server voice detection defaults: threshold 0.9, no prefix padding, 550 ms of silence. On speech stop or on a client commit the buffer is written to a WAV file and sent to the server's own file transcription; one conversation.item.input_audio_transcription.completed is published and no delta event. A committed buffer must hold at least 100 ms; a session lasts at most 30 minutes. Authentication is a Bearer header, an X-API-Key header or an api_key query parameter, and no OpenAI-Beta header. response.cancel and conversation.item.truncate are not supported. Whether turn detection can be switched off so that only the gateway commits was not confirmed."
+      },
+      "stream_audio": {
+        "encodings": [
+          "pcm_s16le"
+        ],
+        "sample_rates_hz": [
+          24000
+        ]
+      }
+    },
+    "allowed_providers": [
+      "self_hosted"
+    ],
+    "fallback_profile": "speaches-file",
+    "requires": [
+      "realtime_url"
+    ],
+    "provenance": {
+      "confidence": "documented",
+      "verified_on": "2026-10-03",
+      "verified_by": "docs",
+      "owner": "waav-gateway",
+      "sources": [
+        "https://github.com/speaches-ai/speaches/blob/993994f7984bf3fe9655b267448328cf66fccb42/src/speaches/routers/stt.py"
+      ],
+      "code_refs": [],
+      "unverified": [
+        "whether turn detection can be switched off so that only the gateway commits"
+      ],
+      "notes": "Version 1 name speaches_realtime. No release builds its client (planned_commit)."
+    }
+  },
+  "deepgram-compatible-stream": {
+    "transport": {
+      "input_mode": "live_stream",
+      "adapter": "planned_stream",
+      "enabled_from_release": null,
+      "disabled_reason": "Not wired and never exercised. The Deepgram streaming client can already dial another host, but a self-hosted deployment has no route to it: there is no factory arm for this vendor, no trusted channel that carries the deployment's base address to speech-to-text, and the client-settable address override is rejected for in-cluster hosts by the private-address filter.",
+      "interim_results": "live",
+      "endpointing_owner": "vendor",
+      "vendor_turn_signal": "silence",
+      "latency": {
+        "class": "unknown",
+        "measurements": []
+      },
+      "limits": {
+        "max_session_ms": null,
+        "rates": []
+      },
+      "quality_signals": [],
+      "dialect": {
+        "language_param": "language",
+        "context_params": [],
+        "wire": "deepgram_listen_v1_websocket"
+      },
+      "gateway_client": {
+        "status": "unverified",
+        "code_ref": "gateway/src/core/stt/deepgram.rs:465-480 (build_websocket_url appends /v1/listen to endpoint_override); override check at gateway/src/core/stt/standard.rs:366-381",
+        "notes": "For a server that speaks Deepgram's live socket at {base}/v1/listen: a self-hosted Deepgram engine, or WhisperLiveKit, whose /v1/listen is documented as a compatibility subset (interim_results, is_final, speech_final, KeepAlive and CloseStream are supported; Finalize is not). The gateway's Deepgram client never sends Finalize; it closes the stream instead, which fits the subset. WhisperLiveKit fixes raw audio at 16 kHz, while the gateway forwards the caller's bytes unchanged at whatever rate the caller sent (gateway/src/core/voice_manager/manager.rs:634-639) and only declares that rate in the URL (deepgram.rs:498), so audio at any other rate must be resampled first or the transcript is garbage with no error. Behind this socket WhisperLiveKit re-decodes a growing window with Whisper, so latency and GPU cost differ from a natively streaming model. Using this route for streaming Whisper is an idea from the research, not a tested path; no quality signal or context field is assumed."
+      }
+    },
+    "allowed_providers": [
+      "self_hosted"
+    ],
+    "fallback_profile": "openai-compatible-file",
+    "provenance": {
+      "confidence": "assumed",
+      "verified_on": "2026-10-03",
+      "verified_by": "code_reading",
+      "owner": "waav-gateway",
+      "sources": [],
+      "code_refs": [
+        "gateway/src/core/stt/deepgram.rs:465-480",
+        "gateway/src/core/stt/standard.rs:366-381",
+        "gateway/src/core/voice_manager/manager.rs:634-639",
+        "gateway/src/core/stt/deepgram.rs:498"
+      ],
+      "notes": "Version 1 name deepgram_compatible_stream. The Deepgram client exists but no factory arm reaches it for a self-hosted deployment, so the adapter is planned_stream, not native; gateway_client.status stays unverified."
+    }
+  }
+}

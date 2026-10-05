@@ -1,0 +1,535 @@
+{
+  "provider_id": "gladia",
+  "provider": {
+    "aliases": [
+      "gladia.io",
+      "gladia-io",
+      "gladia_io",
+      "gladia-stt"
+    ],
+    "default_model": "solaria-1",
+    "model_string": "wire_model",
+    "key_normalisation": {
+      "placeholder_as_unset": true
+    },
+    "registered_in_gateway": true,
+    "native_model_handling": "ignored",
+    "notes": "Aliases are the three registered at gateway/src/plugin/builtin/mod.rs:1724-1725 plus 'gladia-stt' from the static table at gateway/src/plugin/dispatch.rs:296. The standardized factory matches only the exact id 'gladia' (gateway/src/core/stt/standard.rs:426), so the resolver must map an alias to 'gladia' first. native_model_handling is 'ignored' because today's client never reads the configured model and always sends solaria-1 (gateway/src/core/stt/gladia/config.rs:493, 541-551). Gladia has two models with documentation. solaria-1 streams on the live socket, which the gateway already uses. solaria-3 is accepted only by the pre-recorded API, an asynchronous job (upload, create, poll); Gladia has no synchronous file endpoint that can select a model (its older synchronous route has no model field). A third id, solaria-fusion, appears only in the pre-recorded specification's model list and is left to the provider default. Gladia's public model listing endpoint returns solaria-1 only and cannot feed this map. The pre-recorded API must never be sent the same audio twice, because each accepted job is billed. The Python client library and the dashboard send the model 'nova-3' for every provider when the caller chose none (clients_sdk/python/bud_waav/ws/session.py:942; clients_sdk/dashboard/js/websocket.js:107); placeholder_as_unset makes the resolver read it as no model named, so those sessions resolve to solaria-1."
+  },
+  "rows": [
+    {
+      "id": "gladia:solaria-1",
+      "match": {
+        "provider": "gladia",
+        "model": "solaria-1"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "slow",
+            "measurements": [
+              {
+                "percentile": "p99",
+                "quantity": "end_of_speech_to_final",
+                "value_ms": 1490,
+                "basis": "third_party_benchmark",
+                "source": "https://raw.githubusercontent.com/pipecat-ai/pipecat/main/src/pipecat/services/stt_latency.py",
+                "conditions": "Pipecat's shipped constant GLADIA_TTFS_P99 = 1.49 s (time from end of speech to final transcript, voice detector hangover 0.2 s) for Gladia's live socket, which serves solaria-1 only. Not measured by WaaV on this network.",
+                "pause_ms_assumed": 200
+              }
+            ]
+          },
+          "limits": {
+            "vendor_timeout_ms": null,
+            "max_session_ms": 10800000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 30,
+                "plan": "paid",
+                "scope": "account",
+                "note": "Live sessions on any paid plan; Gladia answers HTTP 429 beyond the limit."
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 1,
+                "plan": "free",
+                "scope": "account"
+              }
+            ],
+            "assumed_plan": "paid"
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le",
+              "mulaw",
+              "alaw"
+            ],
+            "sample_rates_hz": [
+              8000,
+              16000,
+              32000,
+              44100,
+              48000
+            ]
+          },
+          "quality_signals": [
+            "utterance_confidence"
+          ],
+          "dialect": {
+            "language_param": "language_config.languages",
+            "language_shape": "list",
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "custom_vocabulary_config.vocabulary",
+                "note": "Sent with custom_vocabulary set to true. Today's client sends the list in custom_vocabulary instead, which the vendor schema types as a boolean (gateway/src/core/stt/gladia/config.rs:348-349)."
+              }
+            ],
+            "wire": "gladia_live_v2_websocket"
+          },
+          "gateway_client": {
+            "status": "wire_tested",
+            "defect": "The live request has drifted from Gladia's current schema: a word-timestamp field the schema does not have is sent on every session, and custom vocabulary and translation targets are sent in shapes the schema does not define; whether Gladia ignores or rejects them is unknown. A reconnect opens a new session instead of resuming the old one.",
+            "code_ref": "gateway/src/core/stt/gladia/client.rs:61-84,101-107,216-229,249-254,502,557-560; gateway/src/core/stt/gladia/config.rs:273-287,345-349,364-365,493,541-551; gateway/src/core/stt/gladia/mod.rs:58-79; gateway/tests/mock_endpoint_e2e.rs:1510-1530",
+            "notes": "Exercised only against an in-repo mock (a mock end-to-end test) and unit tests; the evidence records no run against Gladia. Connecting takes two steps: a POST to /v2/live with the X-Gladia-Key header returns a socket address for the session (client.rs:101-107), which the client then dials. Each caller chunk is forwarded at once, as a base64 JSON text frame through a 32-slot channel (client.rs:216-229, 502). Partial transcripts are requested by default (config.rs:273-287). Gladia decides where the utterance ends: the request asks for a cut after 50 ms of silence and a forced cut after 5 s without a pause (mod.rs:76-79; client.rs:75-76), and Gladia's final flag is copied into both is_final and is_speech_final (client.rs:249-254), so every vendor final ends the caller's turn. Gladia's own guidance for voice agents is a forced cut at 15 s. The model sent is always solaria-1, whatever the session asked for (config.rs:493, 541-551; client.rs:74). The request body has drifted from Gladia's current schema in three places. A word-timestamp field the schema does not have (words_accurate_timestamps) is written into every request, whether or not the session asked for word times, because the field has no rule to leave it out (config.rs:345-346; client.rs:79). A translation-target field the schema does not have, and custom vocabulary sent as a list where the schema has a boolean plus a separate list, are written only when the session asks for translation or key terms (config.rs:348-349, 364-365). Whether Gladia rejects or ignores a field it does not know is unknown, so every Gladia session today depends on Gladia ignoring the first one. A reconnect opens a new session (client.rs:557-560), although Gladia says reconnecting to the same address resumes the old one."
+          }
+        },
+        {
+          "input_mode": "file_upload",
+          "adapter": "planned_file",
+          "enabled_from_release": null,
+          "disabled_reason": "Not implemented, and of no use for this model: it streams, and the only file API is an asynchronous job (upload, create, poll) that would be slower than the socket.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "No latency is published for short audio. Gladia's blog gives about 60 seconds of processing per hour of audio, its documentation says queue time can be a large share of the total on short files, and its own SDK polls every 3 seconds. Each utterance costs at least three HTTP calls in sequence plus a wait in a queue shared by the whole account."
+          },
+          "limits": {
+            "max_upload_bytes": 1000000000,
+            "max_audio_ms": 8100000,
+            "min_audio_ms": null,
+            "vendor_timeout_ms": null,
+            "rates": [
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 25,
+                "plan": "paid",
+                "scope": "account",
+                "note": "Running pre-recorded jobs on any paid plan, plus 300 queued; Gladia answers HTTP 429 beyond that. The limit is shared by every session of the account, so a limiter across sessions is needed."
+              },
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 3,
+                "plan": "free",
+                "scope": "account"
+              }
+            ],
+            "assumed_plan": "paid"
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "flac",
+              "mp3",
+              "m4a",
+              "aac",
+              "ogg",
+              "opus"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "multipart"
+          },
+          "quality_signals": [
+            "utterance_confidence",
+            "word_confidence",
+            "detected_languages"
+          ],
+          "dialect": {
+            "language_param": "language_config.languages",
+            "language_shape": "list",
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "custom_vocabulary_config.vocabulary",
+                "note": "Sent with custom_vocabulary set to true; Gladia applies it after transcription, as a replacement by phoneme similarity."
+              }
+            ],
+            "wire": "gladia_prerecorded_job"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/batch.rs:839-844; gateway/src/core/stt/prerecorded.rs:72-94,102-123",
+            "notes": "The gateway has no file code for Gladia: it is absent from both lists of file-upload vendors (batch.rs:839-844; prerecorded.rs:102-123). The vendor's file API is an asynchronous job in three steps: upload the audio (POST /v2/upload, multipart field audio), create the job (POST /v2/pre-recorded with the returned audio address and the model), then poll (GET /v2/pre-recorded/{id}) until the status is done or error. Every call carries the x-gladia-key header. There is no synchronous endpoint that can select a model. The closest existing template is the AssemblyAI upload-and-poll driver, whose timing (first poll at 500 ms, backing off to 3 s, 300 s deadline, prerecorded.rs:72-94) suits whole files, not a live turn. Vendor rules an adapter must follow: never create a second job for the same audio once a job id has been returned, because each accepted job is billed and nothing is deduplicated; retry the upload or the create call only on a transport failure, a server error or a rate-limit response received before a job id exists; a failed poll may be retried. Uploaded audio and transcripts are kept three weeks on paid plans and a year on the free plan unless the job is deleted, and accounts with zero data retention cannot use the upload or the polling call at all."
+          },
+          "file_request_mode": "async_poll",
+          "billing": {
+            "unit": "audio_second",
+            "min_billed_ms": null,
+            "bills_silence": false,
+            "notes": "Pre-recorded API: 0.61 US dollars per hour of audio on the Starter plan and from 0.20 on Growth. Gladia reports the billed time per job in seconds, as audio duration multiplied by the number of channels, so upload mono. Each accepted job is billed separately and nothing is deduplicated. No minimum billed duration is documented. Only uploaded utterances are billed."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "audio_hour",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "Priced per hour of audio. Real-time: 0.75 US dollars per hour on the Starter plan and from 0.25 on Growth. Whether a live session is billed on the audio sent or on the time the session is open, and whether any minimum applies, are not in the evidence. gateway/src/config/pricing.rs has no Gladia entry, so no pricing_key is given and metering reports no price until one is added. The file transport carries its own billing block."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://docs.gladia.io/chapters/introduction/models.md",
+          "https://api.gladia.io/openapi.json",
+          "https://docs.gladia.io/api-reference/v2/live/init.md",
+          "https://docs.gladia.io/api-reference/v2/live/websocket.md",
+          "https://docs.gladia.io/chapters/live-stt/quickstart.md",
+          "https://docs.gladia.io/chapters/live-stt/features/endpointing.md",
+          "https://docs.gladia.io/chapters/live-stt/recommended-parameters.md",
+          "https://docs.gladia.io/chapters/limits-and-specifications/concurrency.md",
+          "https://www.gladia.io/pricing",
+          "https://docs.gladia.io/api-reference/v2/pre-recorded/init.md",
+          "https://docs.gladia.io/chapters/limits-and-specifications/supported-formats.md",
+          "https://raw.githubusercontent.com/pipecat-ai/pipecat/main/src/pipecat/services/stt_latency.py"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/gladia/client.rs:61-84,101-107,216-229,249-254,502,557-560",
+          "gateway/src/core/stt/gladia/config.rs:273-287,345-349,364-365,493,541-551",
+          "gateway/src/core/stt/gladia/mod.rs:58-79",
+          "gateway/tests/mock_endpoint_e2e.rs:1510-1530",
+          "gateway/src/core/stt/batch.rs:839-844",
+          "gateway/src/core/stt/prerecorded.rs:72-94,102-123",
+          "gateway/src/core/stt/gladia/config.rs:704"
+        ],
+        "unverified": [
+          "transports[0].limits.rates (concurrent_sessions) (30 live sessions is the paid-plan figure; the free plan allows 1)",
+          "transports[0].gateway_client (never run against Gladia; whether Gladia rejects or ignores the request fields that have drifted from its schema is unknown, and one of them is sent on every session)",
+          "billing.bills_silence and billing.min_billed_ms (not in the evidence for live sessions)",
+          "latency of the pre-recorded job on clips of 1 to 10 seconds (unpublished, unmeasured, for any model)",
+          "transports[1].limits.rates (concurrent_requests) (25 running jobs, plus 300 queued, is the paid-plan figure; the free plan allows 3; beyond the limit the vendor answers HTTP 429)",
+          "limits.rates (requests) (the vendor says an API-level rate limit exists and gives no number)",
+          "limits.min_audio_ms (no minimum accepted duration is documented)",
+          "limits.rates[].scope (the vendor's limits are per account; recorded as account)",
+          "billing.min_billed_ms (none documented)"
+        ],
+        "notes": "Gladia's default model on both of its APIs and the only model its live socket accepts; over 100 languages with code switching. The gateway already streams it and a live call keeps today's path. The file transport is listed only because the vendor offers it; no release builds it. The socket audio formats come from Gladia's live documentation and match the list the gateway's client validates (gateway/src/core/stt/gladia/config.rs:704)."
+      }
+    },
+    {
+      "id": "gladia:solaria-3",
+      "match": {
+        "provider": "gladia",
+        "model": "solaria-3"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "planned_file",
+          "enabled_from_release": null,
+          "disabled_reason": "Not implemented, and the only file API is an asynchronous job (upload, create, poll) with no published latency for short audio. Keep it disabled unless a measurement on a paid account shows a final transcript within about two seconds of the end of speech.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "constraints": {
+            "languages": {
+              "mode": "only",
+              "codes": [
+                "en",
+                "fr",
+                "de",
+                "es",
+                "it"
+              ],
+              "note": "Gladia lists English, French, German, Spanish and Italian for this model, with no code switching. One vendor page says exactly one language must be passed, another that several of the five may be; the safe reading is one."
+            }
+          },
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "No latency is published for short audio. Gladia's blog gives about 60 seconds of processing per hour of audio, its documentation says queue time can be a large share of the total on short files, and its own SDK polls every 3 seconds. Each utterance costs at least three HTTP calls in sequence plus a wait in a queue shared by the whole account."
+          },
+          "limits": {
+            "max_upload_bytes": 1000000000,
+            "max_audio_ms": 8100000,
+            "min_audio_ms": null,
+            "vendor_timeout_ms": null,
+            "rates": [
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 25,
+                "plan": "paid",
+                "scope": "account",
+                "note": "Running pre-recorded jobs on any paid plan, plus 300 queued; Gladia answers HTTP 429 beyond that. The limit is shared by every session of the account, so a limiter across sessions is needed."
+              },
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 3,
+                "plan": "free",
+                "scope": "account"
+              }
+            ],
+            "assumed_plan": "paid"
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "flac",
+              "mp3",
+              "m4a",
+              "aac",
+              "ogg",
+              "opus"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "multipart"
+          },
+          "quality_signals": [
+            "utterance_confidence",
+            "word_confidence",
+            "detected_languages"
+          ],
+          "dialect": {
+            "language_param": "language_config.languages",
+            "language_shape": "list",
+            "language_required": true,
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "custom_vocabulary_config.vocabulary",
+                "note": "Sent with custom_vocabulary set to true; Gladia applies it after transcription, as a replacement by phoneme similarity."
+              }
+            ],
+            "wire": "gladia_prerecorded_job"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/batch.rs:839-844; gateway/src/core/stt/prerecorded.rs:72-94,102-123",
+            "notes": "The gateway has no file code for Gladia: it is absent from both lists of file-upload vendors (batch.rs:839-844; prerecorded.rs:102-123). The vendor's file API is an asynchronous job in three steps: upload the audio (POST /v2/upload, multipart field audio), create the job (POST /v2/pre-recorded with the returned audio address and the model), then poll (GET /v2/pre-recorded/{id}) until the status is done or error. Every call carries the x-gladia-key header. There is no synchronous endpoint that can select a model. The closest existing template is the AssemblyAI upload-and-poll driver, whose timing (first poll at 500 ms, backing off to 3 s, 300 s deadline, prerecorded.rs:72-94) suits whole files, not a live turn. Vendor rules an adapter must follow: never create a second job for the same audio once a job id has been returned, because each accepted job is billed and nothing is deduplicated; retry the upload or the create call only on a transport failure, a server error or a rate-limit response received before a job id exists; a failed poll may be retried. Uploaded audio and transcripts are kept three weeks on paid plans and a year on the free plan unless the job is deleted, and accounts with zero data retention cannot use the upload or the polling call at all."
+          },
+          "file_request_mode": "async_poll",
+          "segment_profile": {
+            "request_timeout_ms": 10000,
+            "rationale": "The 10 s deadline covers the whole upload, create and poll cycle and is an engineering estimate from the vendor audit; nothing is published. The audit suggests about 5 s per HTTP call and a first poll about 200 ms after the job is created, backing off to 1 s; the schema has no field for poll timing. Two uploads in flight per session is unchanged, but jobs count against a limit for the whole account (3 on the free plan, 25 running plus 300 queued on paid plans), so a limiter shared across sessions is needed. Every other setting keeps the gateway default: Gladia converts everything to 16 kHz WAV and lists no conversion cost for WAV, mono avoids per-channel billing, and no minimum billed duration is documented, so short segments are not merged."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "streams_substituted_model",
+        "substituted_model": "solaria-1",
+        "code_ref": "gateway/src/core/stt/gladia/config.rs:493,541-551 (the configured model is never read; solaria-1 is always sent)",
+        "refuse_from_release": 3,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "async_only",
+          "text": "This Gladia model transcribes recorded files only, through a job that is queued and polled, so it cannot answer quickly enough for a live conversation. Choose solaria-1, Gladia's streaming model, for calls."
+        }
+      },
+      "billing": {
+        "unit": "audio_second",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "notes": "Same plan rates as solaria-1 on the pre-recorded API: 0.61 US dollars per hour on Starter and from 0.20 on Growth. Gladia reports the billed time per job in seconds, as audio duration multiplied by the number of channels, so upload mono. Each accepted job is billed separately and nothing is deduplicated. No minimum billed duration is documented. Only uploaded utterances are billed. gateway/src/config/pricing.rs has no Gladia entry, so no pricing_key is given and metering reports no price until one is added."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://docs.gladia.io/api-reference/v2/pre-recorded/init.md",
+          "https://docs.gladia.io/chapters/introduction/models.md",
+          "https://www.gladia.io/solaria-3",
+          "https://api.gladia.io/openapi.json",
+          "https://docs.gladia.io/api-reference/v2/upload/audio-file.md",
+          "https://docs.gladia.io/api-reference/v2/pre-recorded/get.md",
+          "https://docs.gladia.io/chapters/pre-recorded-stt/transcription-process.md",
+          "https://docs.gladia.io/chapters/limits-and-specifications/supported-formats.md",
+          "https://docs.gladia.io/chapters/limits-and-specifications/concurrency.md",
+          "https://docs.gladia.io/chapters/limits-and-specifications/data-retention.md",
+          "https://www.gladia.io/pricing",
+          "https://www.gladia.io/blog/gladia-async-transcription-integration-guide",
+          "https://raw.githubusercontent.com/gladiaio/sdk/main/packages/sdk-python/src/gladiaio_sdk/v2/prerecorded/client.py"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/batch.rs:839-844",
+          "gateway/src/core/stt/prerecorded.rs:72-94,102-123",
+          "gateway/src/core/stt/gladia/config.rs:493,541-551"
+        ],
+        "recheck_on": "2026-11-03",
+        "unverified": [
+          "latency of the pre-recorded job on clips of 1 to 10 seconds (unpublished, unmeasured, for any model)",
+          "transports[0].limits.rates (concurrent_requests) (25 running jobs, plus 300 queued, is the paid-plan figure; the free plan allows 3; beyond the limit the vendor answers HTTP 429)",
+          "limits.rates (requests) (the vendor says an API-level rate limit exists and gives no number)",
+          "limits.min_audio_ms (no minimum accepted duration is documented)",
+          "limits.rates[].scope (the vendor's limits are per account; recorded as account)",
+          "billing.min_billed_ms (none documented)",
+          "lifecycle.status (the vendor's product page shows availability as 'Free for 5 days' then general availability; whether every paid key can call the model is not established)",
+          "transports[0].constraints.languages and dialect.language_required: whether the model accepts more than one candidate language (one vendor page says exactly one of English, French, German, Spanish and Italian; another says several may be passed); the safe reading is exactly one",
+          "whether Gladia's own voice detection makes the 500 ms of trailing silence unnecessary"
+        ],
+        "notes": "Pre-recorded only. Gladia states the model is not available for live transcription and its product page says streaming is 'async only, for now'; the live socket's model list contains solaria-1 alone. Cutting the call into uploaded utterances is therefore the only way to use this model on a live call, and it is unproven: the file API is an asynchronous job with no published latency for short audio, and no voice-agent framework checked in the research runs calls on it. No release builds that transport. Today the streaming client ignores the configured model and silently serves solaria-1 (gateway/src/core/stt/gladia/config.rs:541-551); Releases 1 and 2 keep that with the warning stt_model_substituted, and from Release 3, default on, the session is refused (integration decisions, section 12). The model covers English, French, German, Spanish and Italian only, takes one language and does no code switching (constraints.languages). This row is time-sensitive: re-check it when Gladia adds streaming for this model."
+      }
+    },
+    {
+      "id": "gladia:any",
+      "match": {
+        "provider": "gladia",
+        "model_glob": "*"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "planned_file",
+          "enabled_from_release": null,
+          "disabled_reason": "Not implemented, and the only file API is an asynchronous job (upload, create, poll) with no published latency for short audio. Keep it disabled unless a measurement on a paid account shows a final transcript within about two seconds of the end of speech.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "No latency is published for short audio. Gladia's blog gives about 60 seconds of processing per hour of audio, its documentation says queue time can be a large share of the total on short files, and its own SDK polls every 3 seconds. Each utterance costs at least three HTTP calls in sequence plus a wait in a queue shared by the whole account."
+          },
+          "limits": {
+            "max_upload_bytes": 1000000000,
+            "max_audio_ms": 8100000,
+            "min_audio_ms": null,
+            "vendor_timeout_ms": null,
+            "rates": [
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 25,
+                "plan": "paid",
+                "scope": "account",
+                "note": "Running pre-recorded jobs on any paid plan, plus 300 queued; Gladia answers HTTP 429 beyond that. The limit is shared by every session of the account, so a limiter across sessions is needed."
+              },
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 3,
+                "plan": "free",
+                "scope": "account"
+              }
+            ],
+            "assumed_plan": "paid"
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "flac",
+              "mp3",
+              "m4a",
+              "aac",
+              "ogg",
+              "opus"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "multipart"
+          },
+          "quality_signals": [
+            "utterance_confidence",
+            "word_confidence",
+            "detected_languages"
+          ],
+          "dialect": {
+            "language_param": "language_config.languages",
+            "language_shape": "list",
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "custom_vocabulary_config.vocabulary",
+                "note": "Sent with custom_vocabulary set to true; Gladia applies it after transcription, as a replacement by phoneme similarity."
+              }
+            ],
+            "wire": "gladia_prerecorded_job"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/batch.rs:839-844; gateway/src/core/stt/prerecorded.rs:72-94,102-123",
+            "notes": "The gateway has no file code for Gladia: it is absent from both lists of file-upload vendors (batch.rs:839-844; prerecorded.rs:102-123). The vendor's file API is an asynchronous job in three steps: upload the audio (POST /v2/upload, multipart field audio), create the job (POST /v2/pre-recorded with the returned audio address and the model), then poll (GET /v2/pre-recorded/{id}) until the status is done or error. Every call carries the x-gladia-key header. There is no synchronous endpoint that can select a model. The closest existing template is the AssemblyAI upload-and-poll driver, whose timing (first poll at 500 ms, backing off to 3 s, 300 s deadline, prerecorded.rs:72-94) suits whole files, not a live turn. Vendor rules an adapter must follow: never create a second job for the same audio once a job id has been returned, because each accepted job is billed and nothing is deduplicated; retry the upload or the create call only on a transport failure, a server error or a rate-limit response received before a job id exists; a failed poll may be retried. Uploaded audio and transcripts are kept three weeks on paid plans and a year on the free plan unless the job is deleted, and accounts with zero data retention cannot use the upload or the polling call at all."
+          },
+          "file_request_mode": "async_poll"
+        }
+      ],
+      "when_unusable": {
+        "today": "streams_substituted_model",
+        "substituted_model": "solaria-1",
+        "code_ref": "gateway/src/core/stt/gladia/config.rs:493,541-551 (the configured model is never read; solaria-1 is always sent)",
+        "refuse_from_release": null
+      },
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "Nothing is known about how an unrecognised Gladia id is billed."
+      },
+      "provenance": {
+        "confidence": "assumed",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://api.gladia.io/openapi.json",
+          "https://docs.gladia.io/chapters/introduction/models.md",
+          "https://docs.gladia.io/api-reference/v2/pre-recorded/init.md"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/batch.rs:839-844",
+          "gateway/src/core/stt/prerecorded.rs:72-94,102-123",
+          "gateway/src/core/stt/gladia/client.rs:61-84,101-107,216-229,249-254,502,557-560",
+          "gateway/src/core/stt/gladia/config.rs:273-287,493,541-551",
+          "gateway/src/core/stt/gladia/mod.rs:58-79",
+          "gateway/tests/mock_endpoint_e2e.rs:1510-1530"
+        ],
+        "unverified": [
+          "everything in this row: it is the assumption for a Gladia id that no exact row matches"
+        ],
+        "notes": "Provider default, used for a Gladia id with no exact row. Today's streaming client is not listed as a transport, because it would transcribe any id with solaria-1 (when_unusable records that). The only other interface is the pre-recorded job, which no release builds. So no transport is enabled in any release, and a session naming an unknown Gladia id keeps today's behaviour, streaming with solaria-1, with the warning stt_model_substituted; it is not refused (integration decisions, section 12, names only solaria-3 for the refusal). The id solaria-fusion lands here: it appears in the model list of the pre-recorded API specification and nowhere else, with no documentation of what it is or who may use it, so it has no exact row. The placeholder 'nova-3' never reaches this row: the provider sets placeholder_as_unset, so the resolver reads it as no model named and answers with solaria-1."
+      }
+    }
+  ]
+}

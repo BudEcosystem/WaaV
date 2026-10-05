@@ -1,0 +1,1036 @@
+{
+  "provider_id": "yandex",
+  "provider": {
+    "aliases": [
+      "yandex-speechkit",
+      "yandex_speechkit",
+      "speechkit",
+      "yandex-stt",
+      "yandex_stt"
+    ],
+    "default_model": "general",
+    "model_string": "wire_model",
+    "registered_in_gateway": true,
+    "native_model_handling": "substituted",
+    "notes": "Yandex SpeechKit. The vendor streams only over gRPC (v3 recommended, v2 legacy; no WebSocket) and the gateway has no gRPC client for it, so every model that can serve a call needs the file-upload transport. The client registered today (gateway/src/core/stt/yandex/client.rs) is a synchronous REST client behind a 500 ms wall-clock timer. It is not a transport: when_unusable on each row records what a live session gets from it, and decisions section 5 keeps it, reported as known broken, until the file-upload transport is enabled. It is billed one 15 s unit for each half-second piece and ends a turn on every piece, so keeping it is costly and unusable for conversation. Aliases: the standardized factory accepts yandex, yandex-speechkit, yandex_speechkit and speechkit (gateway/src/core/stt/standard.rs:471); the plugin registry also accepts yandex-stt and yandex_stt (gateway/src/plugin/builtin/mod.rs:1744-1746), which today miss the standardized path. Gateway-side model aliases (gateway/src/core/stt/yandex/config.rs:187-201) are not wire strings: 'default' is a model_aliases entry of the general row, and 'rc' and 'realtime' of the general:rc row. 'batch' means the gateway's own id 'deferred' and has no alias entry (an alias cannot sit on the 'deferred*' pattern row), so the resolver must still rewrite it to 'deferred' before lookup; otherwise it falls to the provider default row and would be sent to the vendor as the 'topic' value. Today's client replaces any id it does not know with 'general' (gateway/src/core/stt/yandex/config.rs:291-295). The API host uses a publicly trusted certificate chain, unlike Sber and T-Bank."
+  },
+  "rows": [
+    {
+      "id": "yandex:general",
+      "match": {
+        "provider": "yandex",
+        "model": "general",
+        "model_aliases": [
+          "default"
+        ]
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "regional_rest",
+          "enabled_from_release": 5,
+          "disabled_reason": "The per-utterance file-upload adapter (segmented_yandex) is not implemented. The Yandex client registered today is not a substitute: it uploads whatever audio accumulated about every 500 ms on a wall-clock timer, speech or silence, and marks each piece as the end of a turn (gateway/src/core/stt/yandex/client.rs:219-332). Enable once the adapter ships and one live call has passed.",
+          "enable_requires": [
+            "live_probe"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_upload_bytes": 1000000,
+            "max_audio_ms": 30000,
+            "min_audio_ms": null,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "second",
+                "value": 20,
+                "plan": null,
+                "scope": "unknown",
+                "note": "Synchronous recognition requests. Whether the quota is per folder or per cloud is not stated."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "upload": {
+            "accepted": [
+              "raw_pcm",
+              "ogg"
+            ],
+            "preferred": {
+              "container": "raw_pcm",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "sample_rates_hz": [
+              8000,
+              16000,
+              48000
+            ],
+            "envelope": "raw_body",
+            "vendor_params": [
+              {
+                "name": "format",
+                "value": "lpcm",
+                "in": "query"
+              },
+              {
+                "name": "sampleRateHertz",
+                "value": "{sample_rate_hz}",
+                "in": "query"
+              }
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "lang",
+            "language_shape": "single",
+            "language_format": "bcp47",
+            "language_required": true,
+            "context_params": [],
+            "wire": "yandex_stt_v1_rest"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/yandex/client.rs:45-58 (request builder), :160-216 (recognize_sync); gateway/src/core/stt/yandex/config.rs:377-416 (query parameters)",
+            "notes": "The request and response code for the synchronous endpoint (POST /speech/v1/stt:recognize) already exists inside the legacy client and can be lifted into the adapter. The adapter must: send headerless PCM16, not WAV (the vendor accepts only LPCM without a WAV header, or OggOpus); send sampleRateHertz equal to the upload rate as well as format=lpcm (the vendor default is 48000 and only 8000, 16000 and 48000 are accepted); keep every upload under 30 s and 1 MB including pre-roll and trailing silence (the legacy overflow cap of 1,024,000 bytes at client.rs:37 is 32 s at 16 kHz); never upload a segment without speech, because an empty request is billed one 15 s unit; and report confidence as unknown instead of the hard-coded 0.95 (client.rs:293-297). limits.rates records the vendor quota of 20 synchronous requests per second in the vendor's own window; the limiter must hold the per-second rate. An HTTP 429 currently counts as a failure on the breaker shared by every Yandex session (gateway/src/core/stt/http_resilience.rs:137-140)."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "request_timeout_ms": 8000,
+            "rationale": "Only the HTTP request timeout deviates from the gateway defaults. 8000 ms in total, with about 2 s to connect, is the vendor audit's provisional value, not a measurement: Yandex publishes no latency for the synchronous endpoint, and the legacy client allows 60 s with no connect timeout (gateway/src/core/stt/yandex/client.rs:22-26). Replace it with measured P99 plus a margin. The other defaults fit the vendor limits: a 25 s segment with 400 ms pre-roll and 500 ms trailing silence is 25.9 s and about 829 kB at 16 kHz, inside 30 s and 1 MB; the adapter should still refuse to send more than 29 s, and must never upload 48 kHz PCM, where 1 MB holds about 10.9 s. Because every request is billed in 15 s units (billing.increment_ms), segments of the same turn that are still queued should be merged while the merged upload stays within 15 s. An upload must never be held back to wait for a merge, so upload_policy stays at the default (upload at each pause)."
+          }
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "planned_stream",
+          "enabled_from_release": null,
+          "disabled_reason": "No streaming client for Yandex exists in the gateway. The vendor streams only over gRPC (speechkit.stt.v3.Recognizer/RecognizeStreaming); the gateway's Yandex module speaks only the synchronous REST v1 endpoint, and its 'future gRPC v3' message types are unused placeholders (gateway/src/core/stt/yandex/messages.rs:33-42).",
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "unknown",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": 300000,
+            "idle_timeout_ms": 5000,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "second",
+                "value": 40,
+                "plan": null,
+                "scope": "unknown",
+                "note": "Streaming requests (new streams)."
+              }
+            ]
+          },
+          "quality_signals": [
+            "language_probability"
+          ],
+          "dialect": {
+            "language_param": "language_code",
+            "language_shape": "single",
+            "context_params": [],
+            "wire": "yandex_stt_v3_grpc"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/yandex/messages.rs:33-42 (unused placeholder types); gateway/Cargo.toml:282 (tonic 0.11 already a dependency)",
+            "notes": "Vendor endpointing through the default end-of-utterance classifier (sensitivity DEFAULT or HIGH, with a pause hint). The vendor sends a final result only when an end-of-utterance event fires. Session rules a client must respect: at most 5 minutes and 10 MB of audio per session, one channel, and the session is closed after 5 s without a message, so the client needs silence_chunk keep-alives and a rollover before the limit. The name of the language field in the gRPC v3 request is not in the evidence: dialect.language_param records 'language_code', the name used by the gateway's unused placeholder type (gateway/src/core/stt/yandex/messages.rs:41-43), and it must be confirmed against the v3 proto before a client is built. limits.rates records the vendor quota of 40 streaming requests per second. Billing starts when the settings message is sent."
+          }
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "planned_commit",
+          "enabled_from_release": null,
+          "disabled_reason": "No streaming client for Yandex exists in the gateway (see stream_yandex). This entry is the same gRPC v3 call opened with the external end-of-utterance classifier, where the gateway's own detector sends the 'eou' message.",
+          "interim_results": "live",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": 300000,
+            "idle_timeout_ms": 5000,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "second",
+                "value": 40,
+                "plan": null,
+                "scope": "unknown",
+                "note": "Streaming requests (new streams)."
+              }
+            ]
+          },
+          "quality_signals": [
+            "language_probability"
+          ],
+          "dialect": {
+            "language_param": "language_code",
+            "language_shape": "single",
+            "context_params": [],
+            "wire": "yandex_stt_v3_grpc"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/Cargo.toml:282 (tonic 0.11 already a dependency)",
+            "notes": "Same RPC as stream_yandex, opened with the ExternalEouClassifier option ('Use EOU provided by user' in the v3 proto) instead of the default classifier. Partial results still arrive while the caller speaks; the final result is produced when the gateway sends 'eou' ('Request to end current utterance. Works only with external EOU detector' in the v3 proto). Needs the gateway-owned detector from the segmented engine. Same session limits as stream_yandex."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "blind_timed_uploads",
+        "code_ref": "gateway/src/core/stt/yandex/client.rs:219-332",
+        "refuse_from_release": null
+      },
+      "billing": {
+        "unit": "audio_second",
+        "min_billed_ms": 15000,
+        "increment_ms": 15000,
+        "bills_silence": false,
+        "bills_failed_requests": null,
+        "notes": "An empty request is billed one 15 s unit. Streaming is billed by the same rule from the moment the settings message is sent. No pricing key exists for this provider in gateway/src/config/pricing.rs."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://aistudio.yandex.ru/docs/en/speechkit/stt/models",
+          "https://aistudio.yandex.ru/docs/en/speechkit/stt/api/request-api",
+          "https://aistudio.yandex.ru/docs/en/speechkit/stt/api/request-examples",
+          "https://aistudio.yandex.ru/docs/en/speechkit/formats",
+          "https://aistudio.yandex.ru/docs/en/speechkit/concepts/limits",
+          "https://aistudio.yandex.ru/docs/en/speechkit/pricing",
+          "https://aistudio.yandex.ru/docs/en/speechkit/stt/streaming",
+          "https://aistudio.yandex.ru/docs/en/speechkit/stt/eou",
+          "https://raw.githubusercontent.com/yandex-cloud/cloudapi/master/yandex/cloud/ai/stt/v3/stt.proto",
+          "https://raw.githubusercontent.com/yandex-cloud/cloudapi/master/yandex/cloud/ai/stt/v3/stt_service.proto"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/yandex/client.rs:45-58",
+          "gateway/src/core/stt/yandex/client.rs:160-216",
+          "gateway/src/core/stt/yandex/client.rs:219-332",
+          "gateway/src/core/stt/yandex/config.rs:187-201",
+          "gateway/src/core/stt/yandex/config.rs:291-295"
+        ],
+        "unverified": [
+          "transports[*].latency (the vendor publishes no latency for the synchronous endpoint or for streaming; nothing was measured)",
+          "transports[0].limits.max_upload_bytes (the vendor says 1 MB; whether that is 1,000,000 or 1,048,576 bytes is not stated; the lower is recorded)",
+          "transports[0].limits.min_audio_ms",
+          "transports[*].limits.rates (concurrent_requests, concurrent_sessions) (no concurrency limit is published apart from the requests-per-second quota)",
+          "transports[*].limits.rates[].scope (whether quotas apply per folder or per cloud is not stated)",
+          "transports[1].vendor_turn_signal (recorded as unknown, which is treated as silence: the proto describes an end-of-utterance classifier with a pause hint; it does not say whether it is silence-based or semantic)",
+          "transports[1].quality_signals and transports[2].quality_signals (language probabilities are in the v3 response message; never exercised)",
+          "the YaCloud-Billing-Units response header, which would let the adapter read billed units per request (seen by the audit in the vendor's example; the fact-check could not re-fetch that page)",
+          "vendor documentation pages were read through a summarising fetch tool, not raw HTML; only the proto files were read verbatim",
+          "transports[0].segment_profile.request_timeout_ms (8000 ms is the vendor audit's provisional value; no latency is published and nothing was measured)",
+          "transports[2].interim_results (that partial results keep arriving when the external end-of-utterance classifier is selected is inferred from the v3 proto, which states only that the 'eou' message works with the external classifier and that a final is sent when an end-of-utterance event fires)",
+          "transports[1].dialect.language_param and transports[2].dialect.language_param (the evidence does not give the name of the language field in the gRPC v3 request; 'language_code' comes from the gateway's unused placeholder type, not from the vendor proto)",
+          "transports[*].limits.rates (requests) (the vendor states quotas per second, 20 for synchronous requests and 40 for streaming; version 1 recorded them multiplied by 60 and they are now recorded in the vendor's window; a limiter must hold the per-second rate, because a burst above it is answered with HTTP 429, which today counts against the breaker shared by every Yandex session)"
+        ],
+        "notes": "Default model. The id is sent as the 'topic' query parameter on the synchronous endpoint and as RecognitionModelOptions.model on gRPC v3. The file upload is listed first because it is the path this plan delivers; the two gRPC entries describe a separate, later track. When a gRPC client exists and has been measured it should move ahead of the file upload, which then becomes the fallback. Nothing is usable with today's code, so this model has no correct live path until the file-upload transport is enabled."
+      }
+    },
+    {
+      "id": "yandex:general-rc",
+      "match": {
+        "provider": "yandex",
+        "model": "general:rc",
+        "model_aliases": [
+          "rc",
+          "realtime"
+        ]
+      },
+      "lifecycle": {
+        "status": "preview"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "regional_rest",
+          "enabled_from_release": 5,
+          "disabled_reason": "The per-utterance file-upload adapter (segmented_yandex) is not implemented. The Yandex client registered today is not a substitute: it uploads whatever audio accumulated about every 500 ms on a wall-clock timer, speech or silence, and marks each piece as the end of a turn (gateway/src/core/stt/yandex/client.rs:219-332). Enable once the adapter ships and one live call has passed.",
+          "enable_requires": [
+            "live_probe"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_upload_bytes": 1000000,
+            "max_audio_ms": 30000,
+            "min_audio_ms": null,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "second",
+                "value": 20,
+                "plan": null,
+                "scope": "unknown",
+                "note": "Synchronous recognition requests. Whether the quota is per folder or per cloud is not stated."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "upload": {
+            "accepted": [
+              "raw_pcm",
+              "ogg"
+            ],
+            "preferred": {
+              "container": "raw_pcm",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "sample_rates_hz": [
+              8000,
+              16000,
+              48000
+            ],
+            "envelope": "raw_body",
+            "vendor_params": [
+              {
+                "name": "format",
+                "value": "lpcm",
+                "in": "query"
+              },
+              {
+                "name": "sampleRateHertz",
+                "value": "{sample_rate_hz}",
+                "in": "query"
+              }
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "lang",
+            "language_shape": "single",
+            "language_format": "bcp47",
+            "language_required": true,
+            "context_params": [],
+            "wire": "yandex_stt_v1_rest"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/yandex/client.rs:45-58 (request builder), :160-216 (recognize_sync); gateway/src/core/stt/yandex/config.rs:377-416 (query parameters)",
+            "notes": "The request and response code for the synchronous endpoint (POST /speech/v1/stt:recognize) already exists inside the legacy client and can be lifted into the adapter. The adapter must: send headerless PCM16, not WAV (the vendor accepts only LPCM without a WAV header, or OggOpus); send sampleRateHertz equal to the upload rate as well as format=lpcm (the vendor default is 48000 and only 8000, 16000 and 48000 are accepted); keep every upload under 30 s and 1 MB including pre-roll and trailing silence (the legacy overflow cap of 1,024,000 bytes at client.rs:37 is 32 s at 16 kHz); never upload a segment without speech, because an empty request is billed one 15 s unit; and report confidence as unknown instead of the hard-coded 0.95 (client.rs:293-297). limits.rates records the vendor quota of 20 synchronous requests per second in the vendor's own window; the limiter must hold the per-second rate. An HTTP 429 currently counts as a failure on the breaker shared by every Yandex session (gateway/src/core/stt/http_resilience.rs:137-140)."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "request_timeout_ms": 8000,
+            "rationale": "Only the HTTP request timeout deviates from the gateway defaults. 8000 ms in total, with about 2 s to connect, is the vendor audit's provisional value, not a measurement: Yandex publishes no latency for the synchronous endpoint, and the legacy client allows 60 s with no connect timeout (gateway/src/core/stt/yandex/client.rs:22-26). Replace it with measured P99 plus a margin. The other defaults fit the vendor limits: a 25 s segment with 400 ms pre-roll and 500 ms trailing silence is 25.9 s and about 829 kB at 16 kHz, inside 30 s and 1 MB; the adapter should still refuse to send more than 29 s, and must never upload 48 kHz PCM, where 1 MB holds about 10.9 s. Because every request is billed in 15 s units (billing.increment_ms), segments of the same turn that are still queued should be merged while the merged upload stays within 15 s. An upload must never be held back to wait for a merge, so upload_policy stays at the default (upload at each pause)."
+          }
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "planned_stream",
+          "enabled_from_release": null,
+          "disabled_reason": "No streaming client for Yandex exists in the gateway. The vendor streams only over gRPC (speechkit.stt.v3.Recognizer/RecognizeStreaming); the gateway's Yandex module speaks only the synchronous REST v1 endpoint, and its 'future gRPC v3' message types are unused placeholders (gateway/src/core/stt/yandex/messages.rs:33-42).",
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "unknown",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": 300000,
+            "idle_timeout_ms": 5000,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "second",
+                "value": 40,
+                "plan": null,
+                "scope": "unknown",
+                "note": "Streaming requests (new streams)."
+              }
+            ]
+          },
+          "quality_signals": [
+            "language_probability"
+          ],
+          "dialect": {
+            "language_param": "language_code",
+            "language_shape": "single",
+            "context_params": [],
+            "wire": "yandex_stt_v3_grpc"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/yandex/messages.rs:33-42 (unused placeholder types); gateway/Cargo.toml:282 (tonic 0.11 already a dependency)",
+            "notes": "Vendor endpointing through the default end-of-utterance classifier (sensitivity DEFAULT or HIGH, with a pause hint). The vendor sends a final result only when an end-of-utterance event fires. Session rules a client must respect: at most 5 minutes and 10 MB of audio per session, one channel, and the session is closed after 5 s without a message, so the client needs silence_chunk keep-alives and a rollover before the limit. The name of the language field in the gRPC v3 request is not in the evidence: dialect.language_param records 'language_code', the name used by the gateway's unused placeholder type (gateway/src/core/stt/yandex/messages.rs:41-43), and it must be confirmed against the v3 proto before a client is built. limits.rates records the vendor quota of 40 streaming requests per second. Billing starts when the settings message is sent."
+          }
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "planned_commit",
+          "enabled_from_release": null,
+          "disabled_reason": "No streaming client for Yandex exists in the gateway (see stream_yandex). This entry is the same gRPC v3 call opened with the external end-of-utterance classifier, where the gateway's own detector sends the 'eou' message.",
+          "interim_results": "live",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": 300000,
+            "idle_timeout_ms": 5000,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "second",
+                "value": 40,
+                "plan": null,
+                "scope": "unknown",
+                "note": "Streaming requests (new streams)."
+              }
+            ]
+          },
+          "quality_signals": [
+            "language_probability"
+          ],
+          "dialect": {
+            "language_param": "language_code",
+            "language_shape": "single",
+            "context_params": [],
+            "wire": "yandex_stt_v3_grpc"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/Cargo.toml:282 (tonic 0.11 already a dependency)",
+            "notes": "Same RPC as stream_yandex, opened with the ExternalEouClassifier option ('Use EOU provided by user' in the v3 proto) instead of the default classifier. Partial results still arrive while the caller speaks; the final result is produced when the gateway sends 'eou' ('Request to end current utterance. Works only with external EOU detector' in the v3 proto). Needs the gateway-owned detector from the segmented engine. Same session limits as stream_yandex."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "blind_timed_uploads",
+        "code_ref": "gateway/src/core/stt/yandex/client.rs:219-332",
+        "refuse_from_release": null
+      },
+      "billing": {
+        "unit": "audio_second",
+        "min_billed_ms": 15000,
+        "increment_ms": 15000,
+        "bills_silence": false,
+        "bills_failed_requests": null,
+        "notes": "An empty request is billed one 15 s unit. Streaming is billed by the same rule from the moment the settings message is sent. No pricing key exists for this provider in gateway/src/config/pricing.rs."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://aistudio.yandex.ru/docs/en/speechkit/stt/models",
+          "https://aistudio.yandex.ru/docs/en/speechkit/stt/api/request-api",
+          "https://aistudio.yandex.ru/docs/en/speechkit/stt/api/request-examples",
+          "https://aistudio.yandex.ru/docs/en/speechkit/formats",
+          "https://aistudio.yandex.ru/docs/en/speechkit/concepts/limits",
+          "https://aistudio.yandex.ru/docs/en/speechkit/pricing",
+          "https://aistudio.yandex.ru/docs/en/speechkit/stt/streaming",
+          "https://aistudio.yandex.ru/docs/en/speechkit/stt/eou",
+          "https://raw.githubusercontent.com/yandex-cloud/cloudapi/master/yandex/cloud/ai/stt/v3/stt.proto",
+          "https://raw.githubusercontent.com/yandex-cloud/cloudapi/master/yandex/cloud/ai/stt/v3/stt_service.proto"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/yandex/client.rs:45-58",
+          "gateway/src/core/stt/yandex/client.rs:160-216",
+          "gateway/src/core/stt/yandex/client.rs:219-332",
+          "gateway/src/core/stt/yandex/config.rs:187-201",
+          "gateway/src/core/stt/yandex/config.rs:291-295"
+        ],
+        "unverified": [
+          "transports[*].latency (the vendor publishes no latency for the synchronous endpoint or for streaming; nothing was measured)",
+          "transports[0].limits.max_upload_bytes (the vendor says 1 MB; whether that is 1,000,000 or 1,048,576 bytes is not stated; the lower is recorded)",
+          "transports[0].limits.min_audio_ms",
+          "transports[*].limits.rates (concurrent_requests, concurrent_sessions) (no concurrency limit is published apart from the requests-per-second quota)",
+          "transports[*].limits.rates[].scope (whether quotas apply per folder or per cloud is not stated)",
+          "transports[1].vendor_turn_signal (recorded as unknown, which is treated as silence: the proto describes an end-of-utterance classifier with a pause hint; it does not say whether it is silence-based or semantic)",
+          "transports[1].quality_signals and transports[2].quality_signals (language probabilities are in the v3 response message; never exercised)",
+          "the YaCloud-Billing-Units response header, which would let the adapter read billed units per request (seen by the audit in the vendor's example; the fact-check could not re-fetch that page)",
+          "vendor documentation pages were read through a summarising fetch tool, not raw HTML; only the proto files were read verbatim",
+          "transports[0] (that the synchronous v1 'topic' parameter accepts general:rc is inferred from the shared models page; the v1 reference does not list tags)",
+          "transports[0].segment_profile.request_timeout_ms (8000 ms is the vendor audit's provisional value; no latency is published and nothing was measured)",
+          "transports[2].interim_results (that partial results keep arriving when the external end-of-utterance classifier is selected is inferred from the v3 proto, which states only that the 'eou' message works with the external classifier and that a final is sent when an end-of-utterance event fires)",
+          "transports[1].dialect.language_param and transports[2].dialect.language_param (the evidence does not give the name of the language field in the gRPC v3 request; 'language_code' comes from the gateway's unused placeholder type, not from the vendor proto)",
+          "transports[*].limits.rates (requests) (the vendor states quotas per second, 20 for synchronous requests and 40 for streaming; version 1 recorded them multiplied by 60 and they are now recorded in the vendor's window; a limiter must hold the per-second rate, because a burst above it is answered with HTTP 429, which today counts against the breaker shared by every Yandex session)"
+        ],
+        "notes": "Release candidate that the vendor makes available for testing and periodically promotes into 'general'; behaviour can change without notice. The gateway parser maps its own aliases 'rc' and 'realtime' to this id (gateway/src/core/stt/yandex/config.rs:187-201); those aliases are not wire strings and are this row's model_aliases."
+      }
+    },
+    {
+      "id": "yandex:general-deprecated",
+      "match": {
+        "provider": "yandex",
+        "model": "general:deprecated"
+      },
+      "lifecycle": {
+        "status": "legacy"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "regional_rest",
+          "enabled_from_release": 5,
+          "disabled_reason": "The per-utterance file-upload adapter (segmented_yandex) is not implemented. The Yandex client registered today is not a substitute: it uploads whatever audio accumulated about every 500 ms on a wall-clock timer, speech or silence, and marks each piece as the end of a turn (gateway/src/core/stt/yandex/client.rs:219-332). Enable once the adapter ships and one live call has passed.",
+          "enable_requires": [
+            "live_probe"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_upload_bytes": 1000000,
+            "max_audio_ms": 30000,
+            "min_audio_ms": null,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "second",
+                "value": 20,
+                "plan": null,
+                "scope": "unknown",
+                "note": "Synchronous recognition requests. Whether the quota is per folder or per cloud is not stated."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "upload": {
+            "accepted": [
+              "raw_pcm",
+              "ogg"
+            ],
+            "preferred": {
+              "container": "raw_pcm",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "sample_rates_hz": [
+              8000,
+              16000,
+              48000
+            ],
+            "envelope": "raw_body",
+            "vendor_params": [
+              {
+                "name": "format",
+                "value": "lpcm",
+                "in": "query"
+              },
+              {
+                "name": "sampleRateHertz",
+                "value": "{sample_rate_hz}",
+                "in": "query"
+              }
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "lang",
+            "language_shape": "single",
+            "language_format": "bcp47",
+            "language_required": true,
+            "context_params": [],
+            "wire": "yandex_stt_v1_rest"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/yandex/client.rs:45-58 (request builder), :160-216 (recognize_sync); gateway/src/core/stt/yandex/config.rs:377-416 (query parameters)",
+            "notes": "The request and response code for the synchronous endpoint (POST /speech/v1/stt:recognize) already exists inside the legacy client and can be lifted into the adapter. The adapter must: send headerless PCM16, not WAV (the vendor accepts only LPCM without a WAV header, or OggOpus); send sampleRateHertz equal to the upload rate as well as format=lpcm (the vendor default is 48000 and only 8000, 16000 and 48000 are accepted); keep every upload under 30 s and 1 MB including pre-roll and trailing silence (the legacy overflow cap of 1,024,000 bytes at client.rs:37 is 32 s at 16 kHz); never upload a segment without speech, because an empty request is billed one 15 s unit; and report confidence as unknown instead of the hard-coded 0.95 (client.rs:293-297). limits.rates records the vendor quota of 20 synchronous requests per second in the vendor's own window; the limiter must hold the per-second rate. An HTTP 429 currently counts as a failure on the breaker shared by every Yandex session (gateway/src/core/stt/http_resilience.rs:137-140)."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "request_timeout_ms": 8000,
+            "rationale": "Only the HTTP request timeout deviates from the gateway defaults. 8000 ms in total, with about 2 s to connect, is the vendor audit's provisional value, not a measurement: Yandex publishes no latency for the synchronous endpoint, and the legacy client allows 60 s with no connect timeout (gateway/src/core/stt/yandex/client.rs:22-26). Replace it with measured P99 plus a margin. The other defaults fit the vendor limits: a 25 s segment with 400 ms pre-roll and 500 ms trailing silence is 25.9 s and about 829 kB at 16 kHz, inside 30 s and 1 MB; the adapter should still refuse to send more than 29 s, and must never upload 48 kHz PCM, where 1 MB holds about 10.9 s. Because every request is billed in 15 s units (billing.increment_ms), segments of the same turn that are still queued should be merged while the merged upload stays within 15 s. An upload must never be held back to wait for a merge, so upload_policy stays at the default (upload at each pause)."
+          }
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "planned_stream",
+          "enabled_from_release": null,
+          "disabled_reason": "No streaming client for Yandex exists in the gateway. The vendor streams only over gRPC (speechkit.stt.v3.Recognizer/RecognizeStreaming); the gateway's Yandex module speaks only the synchronous REST v1 endpoint, and its 'future gRPC v3' message types are unused placeholders (gateway/src/core/stt/yandex/messages.rs:33-42).",
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "unknown",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": 300000,
+            "idle_timeout_ms": 5000,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "second",
+                "value": 40,
+                "plan": null,
+                "scope": "unknown",
+                "note": "Streaming requests (new streams)."
+              }
+            ]
+          },
+          "quality_signals": [
+            "language_probability"
+          ],
+          "dialect": {
+            "language_param": "language_code",
+            "language_shape": "single",
+            "context_params": [],
+            "wire": "yandex_stt_v3_grpc"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/yandex/messages.rs:33-42 (unused placeholder types); gateway/Cargo.toml:282 (tonic 0.11 already a dependency)",
+            "notes": "Vendor endpointing through the default end-of-utterance classifier (sensitivity DEFAULT or HIGH, with a pause hint). The vendor sends a final result only when an end-of-utterance event fires. Session rules a client must respect: at most 5 minutes and 10 MB of audio per session, one channel, and the session is closed after 5 s without a message, so the client needs silence_chunk keep-alives and a rollover before the limit. The name of the language field in the gRPC v3 request is not in the evidence: dialect.language_param records 'language_code', the name used by the gateway's unused placeholder type (gateway/src/core/stt/yandex/messages.rs:41-43), and it must be confirmed against the v3 proto before a client is built. limits.rates records the vendor quota of 40 streaming requests per second. Billing starts when the settings message is sent."
+          }
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "planned_commit",
+          "enabled_from_release": null,
+          "disabled_reason": "No streaming client for Yandex exists in the gateway (see stream_yandex). This entry is the same gRPC v3 call opened with the external end-of-utterance classifier, where the gateway's own detector sends the 'eou' message.",
+          "interim_results": "live",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": 300000,
+            "idle_timeout_ms": 5000,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "second",
+                "value": 40,
+                "plan": null,
+                "scope": "unknown",
+                "note": "Streaming requests (new streams)."
+              }
+            ]
+          },
+          "quality_signals": [
+            "language_probability"
+          ],
+          "dialect": {
+            "language_param": "language_code",
+            "language_shape": "single",
+            "context_params": [],
+            "wire": "yandex_stt_v3_grpc"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/Cargo.toml:282 (tonic 0.11 already a dependency)",
+            "notes": "Same RPC as stream_yandex, opened with the ExternalEouClassifier option ('Use EOU provided by user' in the v3 proto) instead of the default classifier. Partial results still arrive while the caller speaks; the final result is produced when the gateway sends 'eou' ('Request to end current utterance. Works only with external EOU detector' in the v3 proto). Needs the gateway-owned detector from the segmented engine. Same session limits as stream_yandex."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "blind_timed_uploads",
+        "code_ref": "gateway/src/core/stt/yandex/client.rs:219-332 (500 ms timer uploads); gateway/src/core/stt/yandex/config.rs:291-295 (an id the parser does not know is sent as general)",
+        "refuse_from_release": null
+      },
+      "billing": {
+        "unit": "audio_second",
+        "min_billed_ms": 15000,
+        "increment_ms": 15000,
+        "bills_silence": false,
+        "bills_failed_requests": null,
+        "notes": "An empty request is billed one 15 s unit. Streaming is billed by the same rule from the moment the settings message is sent. No pricing key exists for this provider in gateway/src/config/pricing.rs."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://aistudio.yandex.ru/docs/en/speechkit/stt/models",
+          "https://aistudio.yandex.ru/docs/en/speechkit/stt/api/request-api",
+          "https://aistudio.yandex.ru/docs/en/speechkit/stt/api/request-examples",
+          "https://aistudio.yandex.ru/docs/en/speechkit/formats",
+          "https://aistudio.yandex.ru/docs/en/speechkit/concepts/limits",
+          "https://aistudio.yandex.ru/docs/en/speechkit/pricing",
+          "https://aistudio.yandex.ru/docs/en/speechkit/stt/streaming",
+          "https://aistudio.yandex.ru/docs/en/speechkit/stt/eou",
+          "https://raw.githubusercontent.com/yandex-cloud/cloudapi/master/yandex/cloud/ai/stt/v3/stt.proto",
+          "https://raw.githubusercontent.com/yandex-cloud/cloudapi/master/yandex/cloud/ai/stt/v3/stt_service.proto"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/yandex/client.rs:45-58",
+          "gateway/src/core/stt/yandex/client.rs:160-216",
+          "gateway/src/core/stt/yandex/client.rs:219-332",
+          "gateway/src/core/stt/yandex/config.rs:187-201",
+          "gateway/src/core/stt/yandex/config.rs:291-295"
+        ],
+        "unverified": [
+          "transports[*].latency (the vendor publishes no latency for the synchronous endpoint or for streaming; nothing was measured)",
+          "transports[0].limits.max_upload_bytes (the vendor says 1 MB; whether that is 1,000,000 or 1,048,576 bytes is not stated; the lower is recorded)",
+          "transports[0].limits.min_audio_ms",
+          "transports[*].limits.rates (concurrent_requests, concurrent_sessions) (no concurrency limit is published apart from the requests-per-second quota)",
+          "transports[*].limits.rates[].scope (whether quotas apply per folder or per cloud is not stated)",
+          "transports[1].vendor_turn_signal (recorded as unknown, which is treated as silence: the proto describes an end-of-utterance classifier with a pause hint; it does not say whether it is silence-based or semantic)",
+          "transports[1].quality_signals and transports[2].quality_signals (language probabilities are in the v3 response message; never exercised)",
+          "the YaCloud-Billing-Units response header, which would let the adapter read billed units per request (seen by the audit in the vendor's example; the fact-check could not re-fetch that page)",
+          "vendor documentation pages were read through a summarising fetch tool, not raw HTML; only the proto files were read verbatim",
+          "transports[0] (that the synchronous v1 'topic' parameter accepts general:deprecated is inferred from the shared models page; the v1 reference does not list tags)",
+          "transports[0].segment_profile.request_timeout_ms (8000 ms is the vendor audit's provisional value; no latency is published and nothing was measured)",
+          "transports[2].interim_results (that partial results keep arriving when the external end-of-utterance classifier is selected is inferred from the v3 proto, which states only that the 'eou' message works with the external classifier and that a final is sent when an end-of-utterance event fires)",
+          "transports[1].dialect.language_param and transports[2].dialect.language_param (the evidence does not give the name of the language field in the gRPC v3 request; 'language_code' comes from the gateway's unused placeholder type, not from the vendor proto)",
+          "transports[*].limits.rates (requests) (the vendor states quotas per second, 20 for synchronous requests and 40 for streaming; version 1 recorded them multiplied by 60 and they are now recorded in the vendor's window; a limiter must hold the per-second rate, because a burst above it is answered with HTTP 429, which today counts against the breaker shared by every Yandex session)"
+        ],
+        "notes": "A rolling tag: it always points at the previous version of 'general', which the vendor supports for two weeks after each update of 'general'. The tag itself is current and has no retirement date, so lifecycle.status is 'legacy' (a rolling 'previous version' tag). The gateway parser does not know this id and silently sends 'general' instead (gateway/src/core/stt/yandex/config.rs:187-201 and :291-295)."
+      }
+    },
+    {
+      "id": "yandex:deferred-general",
+      "match": {
+        "provider": "yandex",
+        "model": "deferred-general"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [],
+      "when_unusable": {
+        "today": "blind_timed_uploads",
+        "code_ref": "gateway/src/core/stt/yandex/config.rs:291-295 (the parser does not know this id and sends general); gateway/src/core/stt/yandex/client.rs:219-332 (500 ms timer uploads)",
+        "refuse_from_release": 3,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "async_only",
+          "text": "Asynchronous job only. The vendor accepts this tag only on AsyncRecognizer.RecognizeFile (submit, then poll), says asynchronous recognition takes from several minutes up to 24 hours, and caps it at 500 requests per hour. There is no streaming interface and no synchronous file endpoint for it. For a live call choose general."
+        }
+      },
+      "billing": {
+        "unit": "audio_second",
+        "min_billed_ms": 15000,
+        "bills_silence": null,
+        "notes": "Asynchronous recognition is billed one 15 s unit and then per second from the 16th second. Recorded for completeness; the model has no live path."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://aistudio.yandex.ru/docs/en/speechkit/stt/models",
+          "https://aistudio.yandex.ru/docs/en/speechkit/stt/transcribation",
+          "https://aistudio.yandex.ru/docs/en/speechkit/stt/api/transcribation-api-v3",
+          "https://aistudio.yandex.ru/docs/en/speechkit/concepts/limits",
+          "https://aistudio.yandex.ru/docs/en/speechkit/pricing",
+          "https://raw.githubusercontent.com/yandex-cloud/cloudapi/master/yandex/cloud/ai/stt/v3/stt.proto"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/yandex/config.rs:182",
+          "gateway/src/core/stt/yandex/config.rs:194",
+          "gateway/src/core/stt/yandex/config.rs:291-295"
+        ],
+        "notes": "The vendor's statement about several minutes up to 24 hours covers both asynchronous modes, standard and deferred. The gateway's own id 'deferred' (alias 'batch') is not this tag: it is sent as topic=deferred to the synchronous endpoint (gateway/src/core/stt/yandex/config.rs:182 and :194). See the 'deferred*' row. Refusal moved from Release 0 to Release 3 on 2026-10-04: a session on this model starts today (today's client serves a different model), and integration decision 12 warns such sessions in Releases 0 to 2 and refuses them from Release 3."
+      }
+    },
+    {
+      "id": "yandex:deferred-general-rc",
+      "match": {
+        "provider": "yandex",
+        "model": "deferred-general:rc"
+      },
+      "lifecycle": {
+        "status": "preview"
+      },
+      "transports": [],
+      "when_unusable": {
+        "today": "blind_timed_uploads",
+        "code_ref": "gateway/src/core/stt/yandex/config.rs:291-295 (the parser does not know this id and sends general); gateway/src/core/stt/yandex/client.rs:219-332 (500 ms timer uploads)",
+        "refuse_from_release": 3,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "async_only",
+          "text": "Asynchronous job only. The vendor accepts this tag only on AsyncRecognizer.RecognizeFile (submit, then poll), says asynchronous recognition takes from several minutes up to 24 hours, and caps it at 500 requests per hour. There is no streaming interface and no synchronous file endpoint for it. For a live call choose general."
+        }
+      },
+      "billing": {
+        "unit": "audio_second",
+        "min_billed_ms": 15000,
+        "bills_silence": null,
+        "notes": "Asynchronous recognition is billed one 15 s unit and then per second from the 16th second. Recorded for completeness; the model has no live path."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://raw.githubusercontent.com/yandex-cloud/cloudapi/master/yandex/cloud/ai/stt/v3/stt.proto",
+          "https://aistudio.yandex.ru/docs/en/speechkit/stt/models",
+          "https://aistudio.yandex.ru/docs/en/speechkit/stt/transcribation",
+          "https://aistudio.yandex.ru/docs/en/speechkit/concepts/limits"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/yandex/config.rs:291-295"
+        ],
+        "unverified": [
+          "match.model (the tag appears only in one comment of the v3 proto; the vendor's models page names only deferred-general)"
+        ],
+        "notes": "Source is the v3 proto only (RecognitionModelOptions.model comment). Refusal moved from Release 0 to Release 3 on 2026-10-04: a session on this model starts today (today's client serves a different model), and integration decision 12 warns such sessions in Releases 0 to 2 and refuses them from Release 3."
+      }
+    },
+    {
+      "id": "yandex:deferred-general-deprecated",
+      "match": {
+        "provider": "yandex",
+        "model": "deferred-general:deprecated"
+      },
+      "lifecycle": {
+        "status": "legacy"
+      },
+      "transports": [],
+      "when_unusable": {
+        "today": "blind_timed_uploads",
+        "code_ref": "gateway/src/core/stt/yandex/config.rs:291-295 (the parser does not know this id and sends general); gateway/src/core/stt/yandex/client.rs:219-332 (500 ms timer uploads)",
+        "refuse_from_release": 3,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "async_only",
+          "text": "Asynchronous job only. The vendor accepts this tag only on AsyncRecognizer.RecognizeFile (submit, then poll), says asynchronous recognition takes from several minutes up to 24 hours, and caps it at 500 requests per hour. There is no streaming interface and no synchronous file endpoint for it. For a live call choose general."
+        }
+      },
+      "billing": {
+        "unit": "audio_second",
+        "min_billed_ms": 15000,
+        "bills_silence": null,
+        "notes": "Asynchronous recognition is billed one 15 s unit and then per second from the 16th second. Recorded for completeness; the model has no live path."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://raw.githubusercontent.com/yandex-cloud/cloudapi/master/yandex/cloud/ai/stt/v3/stt.proto",
+          "https://aistudio.yandex.ru/docs/en/speechkit/stt/models",
+          "https://aistudio.yandex.ru/docs/en/speechkit/stt/transcribation",
+          "https://aistudio.yandex.ru/docs/en/speechkit/concepts/limits"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/yandex/config.rs:291-295"
+        ],
+        "unverified": [
+          "match.model (the tag appears only in one comment of the v3 proto; the vendor's models page names only deferred-general)"
+        ],
+        "notes": "Source is the v3 proto only (RecognitionModelOptions.model comment). A rolling 'previous version' tag, so lifecycle.status is 'legacy', as for general:deprecated. Refusal moved from Release 0 to Release 3 on 2026-10-04: a session on this model starts today (today's client serves a different model), and integration decision 12 warns such sessions in Releases 0 to 2 and refuses them from Release 3."
+      }
+    },
+    {
+      "id": "yandex:deferred-any",
+      "match": {
+        "provider": "yandex",
+        "model_glob": "deferred*"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [],
+      "when_unusable": {
+        "today": "unknown",
+        "code_ref": "gateway/src/core/stt/yandex/config.rs:182 and :194 (the gateway's own id 'deferred', alias 'batch', is sent to the synchronous endpoint as topic=deferred); gateway/src/core/stt/yandex/config.rs:291-295 (any other id beginning with 'deferred' is sent as general)",
+        "refuse_from_release": 3,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "async_only",
+          "text": "Model ids that begin with 'deferred' name Yandex's deferred recognition, which the vendor offers only as an asynchronous job that takes from several minutes up to 24 hours, and the id 'deferred' itself is not a Yandex model. Neither can transcribe a live call. For a live call choose general."
+        }
+      },
+      "billing": {
+        "unit": "audio_second",
+        "min_billed_ms": 15000,
+        "bills_silence": null,
+        "notes": "Asynchronous recognition is billed one 15 s unit and then per second from the 16th second. Recorded for completeness; the model has no live path."
+      },
+      "provenance": {
+        "confidence": "assumed",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://raw.githubusercontent.com/yandex-cloud/cloudapi/master/yandex/cloud/ai/stt/v3/stt.proto",
+          "https://aistudio.yandex.ru/docs/en/speechkit/stt/models",
+          "https://aistudio.yandex.ru/docs/en/speechkit/stt/transcribation"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/yandex/config.rs:182",
+          "gateway/src/core/stt/yandex/config.rs:194",
+          "gateway/src/core/stt/yandex/config.rs:291-295",
+          "gateway/src/plugin/builtin/mod.rs:303"
+        ],
+        "unverified": [
+          "what the synchronous endpoint returns for topic=deferred (no call was made; if it accepts the value, sessions that use the gateway's 'deferred' id produce transcripts today and this row would refuse them)"
+        ],
+        "notes": "Not a vendor model. Catches the gateway's legacy id 'deferred' (gateway/src/core/stt/yandex/config.rs:182 and :194) and any future deferred tag. The exact rows for the three documented deferred-general tags take precedence over this glob. The gateway advertises 'deferred' as a Yandex model in its plugin metadata (gateway/src/plugin/builtin/mod.rs:303), so real sessions may carry it; today it is sent to the synchronous endpoint as topic=deferred. Refusing it follows the vendor audit, which found that the string is not a vendor tag and that the vendor's deferred mode exists only as an asynchronous job. The refusal is a change of behaviour for any session that uses the id today, so one request with a real key should settle what the synchronous endpoint does with topic=deferred before this row takes effect. If the endpoint turns out to accept it, remove 'deferred' from the gateway's vocabulary and tell customers to use 'general' instead of leaving a silent substitute in place. Version 1 reason, kept for the record: Guard row for the asynchronous family. Every vendor tag that begins with 'deferred' is accepted only by the asynchronous job API (several minutes up to 24 hours, 500 requests per hour), and the gateway's own legacy id 'deferred' is not a vendor tag at all. Without this row such ids would fall to the provider default and be uploaded to the synchronous endpoint. Refusal moved to Release 3 on 2026-10-04 (addendum B13): today's behaviour for this id is not established, so Release 0 keeps today's path."
+      }
+    },
+    {
+      "id": "yandex:any",
+      "match": {
+        "provider": "yandex",
+        "model_glob": "*"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "regional_rest",
+          "enabled_from_release": 5,
+          "disabled_reason": "The per-utterance file-upload adapter (segmented_yandex) is not implemented. The Yandex client registered today is not a substitute: it uploads whatever audio accumulated about every 500 ms on a wall-clock timer, speech or silence, and marks each piece as the end of a turn (gateway/src/core/stt/yandex/client.rs:219-332). Enable once the adapter ships and one live call has passed.",
+          "enable_requires": [
+            "live_probe"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_upload_bytes": 1000000,
+            "max_audio_ms": 30000,
+            "min_audio_ms": null,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "second",
+                "value": 20,
+                "plan": null,
+                "scope": "unknown",
+                "note": "Synchronous recognition requests. Whether the quota is per folder or per cloud is not stated."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "upload": {
+            "accepted": [
+              "raw_pcm",
+              "ogg"
+            ],
+            "preferred": {
+              "container": "raw_pcm",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "sample_rates_hz": [
+              8000,
+              16000,
+              48000
+            ],
+            "envelope": "raw_body",
+            "vendor_params": [
+              {
+                "name": "format",
+                "value": "lpcm",
+                "in": "query"
+              },
+              {
+                "name": "sampleRateHertz",
+                "value": "{sample_rate_hz}",
+                "in": "query"
+              }
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "lang",
+            "language_shape": "single",
+            "language_format": "bcp47",
+            "language_required": true,
+            "context_params": [],
+            "wire": "yandex_stt_v1_rest"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/yandex/client.rs:45-58 (request builder), :160-216 (recognize_sync); gateway/src/core/stt/yandex/config.rs:377-416 (query parameters)",
+            "notes": "The request and response code for the synchronous endpoint (POST /speech/v1/stt:recognize) already exists inside the legacy client and can be lifted into the adapter. The adapter must: send headerless PCM16, not WAV (the vendor accepts only LPCM without a WAV header, or OggOpus); send sampleRateHertz equal to the upload rate as well as format=lpcm (the vendor default is 48000 and only 8000, 16000 and 48000 are accepted); keep every upload under 30 s and 1 MB including pre-roll and trailing silence (the legacy overflow cap of 1,024,000 bytes at client.rs:37 is 32 s at 16 kHz); never upload a segment without speech, because an empty request is billed one 15 s unit; and report confidence as unknown instead of the hard-coded 0.95 (client.rs:293-297). limits.rates records the vendor quota of 20 synchronous requests per second in the vendor's own window; the limiter must hold the per-second rate. An HTTP 429 currently counts as a failure on the breaker shared by every Yandex session (gateway/src/core/stt/http_resilience.rs:137-140)."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "request_timeout_ms": 8000,
+            "rationale": "Only the HTTP request timeout deviates from the gateway defaults. 8000 ms in total, with about 2 s to connect, is the vendor audit's provisional value, not a measurement: Yandex publishes no latency for the synchronous endpoint, and the legacy client allows 60 s with no connect timeout (gateway/src/core/stt/yandex/client.rs:22-26). Replace it with measured P99 plus a margin. The other defaults fit the vendor limits: a 25 s segment with 400 ms pre-roll and 500 ms trailing silence is 25.9 s and about 829 kB at 16 kHz, inside 30 s and 1 MB; the adapter should still refuse to send more than 29 s, and must never upload 48 kHz PCM, where 1 MB holds about 10.9 s. Because every request is billed in 15 s units (billing.increment_ms), segments of the same turn that are still queued should be merged while the merged upload stays within 15 s. An upload must never be held back to wait for a merge, so upload_policy stays at the default (upload at each pause)."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "blind_timed_uploads",
+        "code_ref": "gateway/src/core/stt/yandex/client.rs:219-332 (500 ms timer uploads); gateway/src/core/stt/yandex/config.rs:291-295 (an id the parser does not know is sent as general)",
+        "refuse_from_release": null
+      },
+      "billing": {
+        "unit": "audio_second",
+        "min_billed_ms": 15000,
+        "increment_ms": 15000,
+        "bills_silence": false,
+        "bills_failed_requests": null,
+        "notes": "An empty request is billed one 15 s unit. Streaming is billed by the same rule from the moment the settings message is sent. No pricing key exists for this provider in gateway/src/config/pricing.rs."
+      },
+      "provenance": {
+        "confidence": "assumed",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://aistudio.yandex.ru/docs/en/speechkit/stt/api/request-api",
+          "https://aistudio.yandex.ru/docs/en/speechkit/formats",
+          "https://aistudio.yandex.ru/docs/en/speechkit/concepts/limits",
+          "https://aistudio.yandex.ru/docs/en/speechkit/pricing"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/yandex/client.rs:45-58",
+          "gateway/src/core/stt/yandex/client.rs:160-216",
+          "gateway/src/core/stt/yandex/client.rs:219-332",
+          "gateway/src/core/stt/yandex/config.rs:187-201",
+          "gateway/src/core/stt/yandex/config.rs:291-295"
+        ],
+        "unverified": [
+          "transports[0] (whether the synchronous endpoint accepts an unknown tag as 'topic' is not known)",
+          "transports[0].latency",
+          "transports[0].limits.max_upload_bytes (1 MB; exact byte count not stated; the lower is recorded)",
+          "transports[0].limits.rates[].scope",
+          "transports[0].segment_profile.request_timeout_ms (8000 ms is the vendor audit's provisional value; no latency is published and nothing was measured)",
+          "transports[0].limits.rates (requests) (the vendor states a quota of 20 synchronous requests per second; version 1 recorded it multiplied by 60 and it is now recorded in the vendor's window, which a limiter must hold)"
+        ],
+        "notes": "Fail-slow default for a Yandex model id the map does not know: file upload to the synchronous endpoint with the id passed as 'topic'. A wrong guess fails with a vendor error on the first segment instead of at session setup. Today the gateway silently replaces any unknown id with 'general' (gateway/src/core/stt/yandex/config.rs:291-295); the plan should replace that with strict parsing. The gateway's own aliases default, rc and realtime are model_aliases of the general and general:rc rows; 'batch' has no alias entry and must still be rewritten to 'deferred' before lookup, so that it does not land on this row and reach the vendor as a 'topic' value."
+      }
+    }
+  ]
+}

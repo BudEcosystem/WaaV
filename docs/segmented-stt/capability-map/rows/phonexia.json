@@ -1,0 +1,1592 @@
+{
+  "provider_id": "phonexia",
+  "provider": {
+    "aliases": [
+      "phonexia-stt",
+      "phonexia_stt"
+    ],
+    "default_model": null,
+    "model_string": "wire_model",
+    "registered_in_gateway": true,
+    "native_model_handling": "ignored",
+    "prerequisites": [
+      {
+        "kind": "private_address",
+        "detail": "An on-premises server needs a trusted way to configure a private address."
+      }
+    ],
+    "notes": "Registered in the plugin registry as phonexia with the aliases phonexia-stt and phonexia_stt (gateway/src/plugin/builtin/mod.rs:1733-1736). Phonexia is on-premises software: there is no vendor-hosted endpoint, no documented authentication, and every limit is a deployment setting. The current product, Speech Platform 4 (release 2026.07.0), has two engines, and both transcribe complete files only. The gateway's existing client is a WebSocket streaming client that matches no Phonexia product and refuses to connect unless WAAV_PHONEXIA_ALLOW_UNVERIFIED is set (gateway/src/core/stt/phonexia/client.rs:276-290), so no Phonexia call works today. The gateway reads the model field as a result type (config.rs:425-430) and the api_key field as the server address (config.rs:407-410). default_model is null because the evidence does not establish which engine an empty model should select; an empty or unknown model falls to the provider default row. The server address is checked against private networks (config.rs:282-287), which blocks the usual on-premises address. On gRPC one endpoint serves one language (6th generation) or one model (Whisper), so a deployment needs one configured endpoint for each."
+  },
+  "rows": [
+    {
+      "id": "phonexia:speech-to-text",
+      "match": {
+        "provider": "phonexia",
+        "model": "speech-to-text"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "regional_rest",
+          "enabled_from_release": 5,
+          "disabled_reason": "The file-upload adapter for live calls does not exist yet. The gateway has no gRPC client for Phonexia Speech Platform 4. Before it can be enabled, a deployment must also declare one gRPC endpoint for each language: for this engine the request has no language field and each microservice runs one language model, so a session sent to the wrong endpoint would be transcribed in the wrong language without any error. The plan builds this transport only when a customer needs it, because Phonexia runs on the customer's premises.",
+          "enable_requires": [
+            "live_probe"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "Not measured. The vendor publishes throughput only (for this engine, 1,800 to 3,700 hours of audio per day on one server CPU with 8 cores) and no latency for short audio. It depends on the customer's hardware and must be measured per deployment."
+          },
+          "limits": {
+            "max_upload_bytes": null,
+            "max_audio_ms": null,
+            "min_audio_ms": 0,
+            "rates": []
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "flac",
+              "raw_pcm"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "raw_body"
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": null,
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "preferred_phrases",
+                "note": "A field of TranscribeConfig."
+              },
+              {
+                "kind": "keywords",
+                "wire_name": "additional_words",
+                "note": "A field of TranscribeConfig: custom vocabulary, each word with optional pronunciations of at least three phonemes."
+              }
+            ],
+            "wire": "phonexia_grpc"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/batch.rs:839-844; gateway/src/core/stt/prerecorded.rs:116-123; gateway/src/core/stt/tinkoff/grpc.rs:230",
+            "notes": "No code exists for this transport. The call (Transcribe, default port 8080) is synchronous: the audio is uploaded in messages of at most 4 MiB, the client closes its side, and the transcript comes back on the same call. The vendor states that transcription starts only after the whole audio has been received, so this is a file upload and not a live stream. A 25 s segment at 16 kHz is about 800 kB and fits in one message. Audio must be mono. The gateway already has hand-written gRPC clients without code generation that can serve as a pattern (tinkoff/grpc.rs:230). Overload is answered with RESOURCE_EXHAUSTED and an expired licence with FAILED_PRECONDITION. No authentication is documented. For this engine the request has no language field: each microservice is started with one language model, so the deployment must configure one endpoint per language. Vocabulary can be biased with preferred_phrases and additional_words, recorded here as keyterms. The transcript contains literal <silence/> tokens that the adapter must strip. A confidence value exists only on the N-best and confusion-network alternatives, not on the one-best result, so no quality signal is listed. The default number of concurrent requests for this microservice is not printed in the vendor's help text."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "max_in_flight": 1,
+            "rationale": "On the Virtual Appliance each technology has one replica by default, so one request is processed at a time. For the stand-alone microservice of this engine the vendor's help text prints no default for the number of concurrent requests; one is assumed until a deployment says otherwise. A second upload in flight would be rejected with RESOURCE_EXHAUSTED on gRPC or would queue on REST, so it only moves the wait. A deployment that runs more instances should raise this through its override."
+          },
+          "privacy": {
+            "retention": {
+              "kind": "not_applicable"
+            }
+          }
+        },
+        {
+          "input_mode": "file_upload",
+          "adapter": "planned_file",
+          "enabled_from_release": null,
+          "disabled_reason": "The file-upload adapter for live calls does not exist yet, and this interface is an asynchronous task: the upload is answered with HTTP 202 and a Location header, and the result must be polled. Nothing in the evidence shows that it answers within about two seconds.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "Not measured. The task is queued, the media file is converted, and the result is polled; none of these steps has a published duration."
+          },
+          "limits": {
+            "max_upload_bytes": 500000000,
+            "max_audio_ms": 7200000,
+            "min_audio_ms": null,
+            "vendor_timeout_ms": 300000,
+            "rates": [
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 1,
+                "plan": null,
+                "scope": "deployment",
+                "note": "The Virtual Appliance's default of one replica per technology: one request is processed at a time and further requests are queued. A deployment may run more."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "mp3",
+              "mp4"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "multipart"
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "language_required": true,
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "preferred_phrases",
+                "note": "Sent inside the JSON of the config form field."
+              },
+              {
+                "kind": "keywords",
+                "wire_name": "additional_words",
+                "note": "Sent inside the JSON of the config form field: custom vocabulary, each word with optional pronunciations of at least three phonemes."
+              }
+            ],
+            "wire": "phonexia_rest_task"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/batch.rs:839-844; gateway/src/core/stt/prerecorded.rs:82-94",
+            "notes": "No code exists for this transport. The request is multipart form data with the field file, sent to the Virtual Appliance (port 8000 in the vendor's examples). The reply is 202 with a Location header; the gateway then polls the task until it is done, failed, rejected or cancelled, and should cancel it with DELETE /api/tasks/{task_id} when the caller interrupts or hangs up. The gateway's existing polling helper starts at 500 ms and backs off to 3 s (prerecorded.rs:82-94), which is too coarse for one turn of a conversation; the audit suggests a fixed 100 to 200 ms, which is its own estimate. The limits recorded are the vendor's configurable defaults: uploads up to 500 MB, audio up to 2 hours, processing cancelled after 5 minutes, one request at a time per technology, extra requests queued. Any media file is accepted and converted first; MP3 and MP4 are the examples the vendor names. The response has no confidence value. No authentication is documented. For this engine the path is /api/technology/speech-to-text, the language query parameter is required and selects the language model, and there is no model parameter. Whether a region tag such as en-US is accepted, or only the deployed names such as en, is not confirmed. Vocabulary is biased through preferred_phrases and additional_words in the config form field. On the Virtual Appliance instances of this engine are started on demand by default, which adds a cold start; a live deployment must make them permanent. The transcript contains literal <silence/> tokens."
+          },
+          "file_request_mode": "async_poll",
+          "segment_profile": {
+            "max_in_flight": 1,
+            "rationale": "On the Virtual Appliance each technology has one replica by default, so one request is processed at a time. For the stand-alone microservice of this engine the vendor's help text prints no default for the number of concurrent requests; one is assumed until a deployment says otherwise. A second upload in flight would be rejected with RESOURCE_EXHAUSTED on gRPC or would queue on REST, so it only moves the wait. A deployment that runs more instances should raise this through its override."
+          },
+          "privacy": {
+            "retention": {
+              "kind": "not_applicable"
+            }
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "fails",
+        "code_ref": "gateway/src/core/stt/phonexia/client.rs:276-290 (connect fails closed unless WAAV_PHONEXIA_ALLOW_UNVERIFIED is set); gateway/src/core/stt/phonexia/config.rs:282-287 (a private server address is rejected before that)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "Phonexia Speech Platform 4 transcribes complete files only, and this gateway has no working client for it yet: today's Phonexia client speaks a protocol no current Phonexia product offers, so the session cannot start. Use a streaming transcription provider for this call, or ask the operator to enable segmented speech-to-text for this deployment."
+        }
+      },
+      "billing": {
+        "unit": "audio_second",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "notes": "Phonexia is licensed per deployment and publishes no prices. The licence capacity is counted in seconds of processed audio per period, which is why the unit is audio_second. No minimum per request is documented. Only uploaded segments are processed, so silence between utterances is not counted. There is no Phonexia entry in gateway/src/config/pricing.rs, so no pricing_key is given."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/rest/api/speech-to-text-start-api-technology-speech-to-text-post",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/rest/api/speech-to-text-get-task-api-technology-speech-to-text-task-id-get",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/microservices/installation/phonexia-speech-to-text/readme",
+          "https://raw.githubusercontent.com/phonexia/protofiles/main/src/phonexia/grpc/technologies/speech_to_text/v1/speech_to_text.proto",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/rest/api/phonexia-speech-platform-4-rest-api-reference",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/virtual-appliance/rest_api/guides/speech_to_text/",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/virtual-appliance/configuration/limits",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/virtual-appliance/configuration/adjustments",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/microservices/audio-formats",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/rest/api/get-capacities-api-billing-capacities-get",
+          "https://raw.githubusercontent.com/phonexia/protofiles/main/src/phonexia/grpc/common/core.proto"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/batch.rs:839-844",
+          "gateway/src/core/stt/prerecorded.rs:82-94",
+          "gateway/src/core/stt/prerecorded.rs:116-123",
+          "gateway/src/core/stt/tinkoff/grpc.rs:230",
+          "gateway/src/core/stt/phonexia/client.rs:276-290",
+          "gateway/src/core/stt/phonexia/config.rs:282-287"
+        ],
+        "unverified": [
+          "transports[0].limits.rates (concurrent_requests) (the default for this microservice is not stated, so no entry is recorded)",
+          "transports[1].dialect.language_param values (whether en-US is accepted or only deployed names such as en)",
+          "transports[0].latency and transports[1].latency (no latency for short audio is published and no server was available to measure)",
+          "transports[0].limits.max_audio_ms (not documented for gRPC)",
+          "transports[0].limits.max_upload_bytes (no total size limit is documented for gRPC; the only stated limit is 4 MiB for each message)",
+          "transports[1].limits.min_audio_ms (the 'no minimum audio length' statement is in the gRPC definitions; nothing is stated for REST)",
+          "transports[1].limits.max_upload_bytes (the vendor says 500 MB by default without saying whether that is decimal or binary; the smaller reading is recorded)",
+          "all limits (they are configurable defaults of an on-premises product; a deployment may differ)",
+          "billing.min_billed_ms (none documented)",
+          "whether a deployment puts authentication in front of either interface (none is documented)",
+          "whether gRPC response messages arrive while decoding is still running",
+          "transports[0].upload.envelope (the gRPC call carries the audio bytes in protocol buffer messages of at most 4 MiB each; the schema has no envelope value for gRPC, so raw_body, the nearest, is recorded)"
+        ],
+        "notes": "This is the vendor's 6th-generation Speech to Text engine in Speech Platform 4. The vendor API has no model parameter for it, so the row key is the identifier that selects the product: the REST path segment speech-to-text. The system-information endpoint names the same engine speech_to_text and lists language codes as its 'models', so the gateway needs an explicit translation between the two spellings. The engine transcribes complete files only; the vendor has no live interface for it. The synchronous gRPC call is listed first because it answers in one exchange; the REST interface is an asynchronous task and comes second. The audit suggests a 10 s request timeout as a starting point; that is the auditor's estimate and must be replaced by a value measured on the deployment."
+      }
+    },
+    {
+      "id": "phonexia:speech-to-text-whisper-enhanced",
+      "match": {
+        "provider": "phonexia",
+        "model": "speech-to-text-whisper-enhanced"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "regional_rest",
+          "enabled_from_release": 5,
+          "disabled_reason": "The file-upload adapter for live calls does not exist yet. The gateway has no gRPC client for Phonexia Speech Platform 4. The plan builds this transport only when a customer needs it, because Phonexia runs on the customer's premises.",
+          "enable_requires": [
+            "live_probe"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "Not measured. The vendor publishes throughput only (for example about 17 times faster than real time for English Whisper on one named GPU with 100 s files) and no latency for short audio. It depends on the customer's hardware and must be measured per deployment."
+          },
+          "limits": {
+            "max_upload_bytes": null,
+            "max_audio_ms": null,
+            "min_audio_ms": 0,
+            "rates": [
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 1,
+                "plan": null,
+                "scope": "deployment",
+                "note": "The Whisper microservice's default of one instance per device. A deployment that runs more instances should raise it through its override."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "flac",
+              "raw_pcm"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "raw_body"
+          },
+          "quality_signals": [
+            "detected_languages"
+          ],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "context_params": [],
+            "wire": "phonexia_grpc"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/batch.rs:839-844; gateway/src/core/stt/prerecorded.rs:116-123; gateway/src/core/stt/tinkoff/grpc.rs:230",
+            "notes": "No code exists for this transport. The call (Transcribe, default port 8080) is synchronous: the audio is uploaded in messages of at most 4 MiB, the client closes its side, and the transcript comes back on the same call. The vendor states that transcription starts only after the whole audio has been received, so this is a file upload and not a live stream. A 25 s segment at 16 kHz is about 800 kB and fits in one message. Audio must be mono. The gateway already has hand-written gRPC clients without code generation that can serve as a pattern (tinkoff/grpc.rs:230). Overload is answered with RESOURCE_EXHAUSTED and an expired licence with FAILED_PRECONDITION. No authentication is documented. For this engine the request has no model field: the Whisper model is fixed when the microservice starts, so a model name in the session can only be honoured if the deployment declares that its endpoint runs that model. The language is optional and defaults to automatic detection, which the vendor bases on the first 30 s of audio; a live call should pin the language because short segments give detection little to work with. Each segment of the response carries the detected source language. There is no prompt or vocabulary field. The vendor states that this engine needs a GPU."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "max_in_flight": 1,
+            "rationale": "By default the vendor's software processes one request per engine at a time: on the Virtual Appliance each technology has one replica, and the Whisper microservice starts with one instance per device. A second upload in flight would be rejected with RESOURCE_EXHAUSTED on gRPC or would queue on REST, so it only moves the wait. A deployment that runs more instances should raise this through its override."
+          },
+          "privacy": {
+            "retention": {
+              "kind": "not_applicable"
+            }
+          }
+        },
+        {
+          "input_mode": "file_upload",
+          "adapter": "planned_file",
+          "enabled_from_release": null,
+          "disabled_reason": "The file-upload adapter for live calls does not exist yet, and this interface is an asynchronous task: the upload is answered with HTTP 202 and a Location header, and the result must be polled. Nothing in the evidence shows that it answers within about two seconds.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "Not measured. The task is queued, the media file is converted, and the result is polled; none of these steps has a published duration."
+          },
+          "limits": {
+            "max_upload_bytes": 500000000,
+            "max_audio_ms": 7200000,
+            "min_audio_ms": null,
+            "vendor_timeout_ms": 300000,
+            "rates": [
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 1,
+                "plan": null,
+                "scope": "deployment",
+                "note": "The Virtual Appliance's default of one replica per technology: one request is processed at a time and further requests are queued. A deployment may run more."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "mp3",
+              "mp4"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "multipart"
+          },
+          "quality_signals": [
+            "detected_languages"
+          ],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "context_params": [],
+            "wire": "phonexia_rest_task"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/batch.rs:839-844; gateway/src/core/stt/prerecorded.rs:82-94",
+            "notes": "No code exists for this transport. The request is multipart form data with the field file, sent to the Virtual Appliance (port 8000 in the vendor's examples). The reply is 202 with a Location header; the gateway then polls the task until it is done, failed, rejected or cancelled, and should cancel it with DELETE /api/tasks/{task_id} when the caller interrupts or hangs up. The gateway's existing polling helper starts at 500 ms and backs off to 3 s (prerecorded.rs:82-94), which is too coarse for one turn of a conversation; the audit suggests a fixed 100 to 200 ms, which is its own estimate. The limits recorded are the vendor's configurable defaults: uploads up to 500 MB, audio up to 2 hours, processing cancelled after 5 minutes, one request at a time per technology, extra requests queued. Any media file is accepted and converted first; MP3 and MP4 are the examples the vendor names. The response has no confidence value. No authentication is documented. For this engine the path is /api/technology/speech-to-text-whisper-enhanced. The optional model query parameter selects an installed Whisper model and defaults to 'default'; a model that is not deployed is answered with 404 model.not-deployed and a list of available models. The language is optional and defaults to automatic detection; each segment of the result carries the detected language."
+          },
+          "file_request_mode": "async_poll",
+          "segment_profile": {
+            "max_in_flight": 1,
+            "rationale": "By default the vendor's software processes one request per engine at a time: on the Virtual Appliance each technology has one replica, and the Whisper microservice starts with one instance per device. A second upload in flight would be rejected with RESOURCE_EXHAUSTED on gRPC or would queue on REST, so it only moves the wait. A deployment that runs more instances should raise this through its override."
+          },
+          "privacy": {
+            "retention": {
+              "kind": "not_applicable"
+            }
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "fails",
+        "code_ref": "gateway/src/core/stt/phonexia/client.rs:276-290 (connect fails closed unless WAAV_PHONEXIA_ALLOW_UNVERIFIED is set); gateway/src/core/stt/phonexia/config.rs:282-287 (a private server address is rejected before that)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "Phonexia Speech Platform 4 transcribes complete files only, and this gateway has no working client for it yet: today's Phonexia client speaks a protocol no current Phonexia product offers, so the session cannot start. Use a streaming transcription provider for this call, or ask the operator to enable segmented speech-to-text for this deployment."
+        }
+      },
+      "billing": {
+        "unit": "audio_second",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "notes": "Phonexia is licensed per deployment and publishes no prices. The licence capacity is counted in seconds of processed audio per period, which is why the unit is audio_second. No minimum per request is documented. Only uploaded segments are processed, so silence between utterances is not counted. There is no Phonexia entry in gateway/src/config/pricing.rs, so no pricing_key is given."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/rest/api/speech-to-text-whisper-start-api-technology-speech-to-text-whisper-enhanced-post",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/rest/api/speech-to-text-whisper-get-task-api-technology-speech-to-text-whisper-enhanced-task-id-get",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/rest/api/info-api-system-info-get",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/microservices/installation/enhanced-speech-to-text-built-on-whisper/readme",
+          "https://raw.githubusercontent.com/phonexia/protofiles/main/src/phonexia/grpc/technologies/enhanced_speech_to_text_built_on_whisper/v1/enhanced_speech_to_text_built_on_whisper.proto",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/rest/api/phonexia-speech-platform-4-rest-api-reference",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/virtual-appliance/rest_api/guides/speech_to_text/",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/virtual-appliance/configuration/limits",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/virtual-appliance/configuration/adjustments",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/microservices/audio-formats",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/rest/api/get-capacities-api-billing-capacities-get",
+          "https://raw.githubusercontent.com/phonexia/protofiles/main/src/phonexia/grpc/common/core.proto"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/batch.rs:839-844",
+          "gateway/src/core/stt/prerecorded.rs:82-94",
+          "gateway/src/core/stt/prerecorded.rs:116-123",
+          "gateway/src/core/stt/tinkoff/grpc.rs:230",
+          "gateway/src/core/stt/phonexia/client.rs:276-290",
+          "gateway/src/core/stt/phonexia/config.rs:282-287"
+        ],
+        "unverified": [
+          "transports[0].latency and transports[1].latency (no latency for short audio is published and no server was available to measure)",
+          "transports[0].limits.max_audio_ms (not documented for gRPC)",
+          "transports[0].limits.max_upload_bytes (no total size limit is documented for gRPC; the only stated limit is 4 MiB for each message)",
+          "transports[1].limits.min_audio_ms (the 'no minimum audio length' statement is in the gRPC definitions; nothing is stated for REST)",
+          "transports[1].limits.max_upload_bytes (the vendor says 500 MB by default without saying whether that is decimal or binary; the smaller reading is recorded)",
+          "all limits (they are configurable defaults of an on-premises product; a deployment may differ)",
+          "billing.min_billed_ms (none documented)",
+          "whether a deployment puts authentication in front of either interface (none is documented)",
+          "whether gRPC response messages arrive while decoding is still running",
+          "transports[0].upload.envelope (the gRPC call carries the audio bytes in protocol buffer messages of at most 4 MiB each; the schema has no envelope value for gRPC, so raw_body, the nearest, is recorded)"
+        ],
+        "notes": "This id selects the Whisper engine with whatever model the deployment has made its default. It is the REST path segment, used as the row key because it is the identifier that selects the product. The system-information endpoint names the same engine enhanced_speech_to_text_built_on_whisper. The engine is the vendor's 'Enhanced Speech to Text Built on Whisper' in Speech Platform 4. It transcribes complete files only; the vendor has no live interface for it. The synchronous gRPC call is listed first because it answers in one exchange; the REST interface is an asynchronous task and comes second. Because the model is a Whisper model, the gateway's list of phrases that Whisper invents on non-speech audio should be applied."
+      }
+    },
+    {
+      "id": "phonexia:default",
+      "match": {
+        "provider": "phonexia",
+        "model": "default"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "regional_rest",
+          "enabled_from_release": 5,
+          "disabled_reason": "The file-upload adapter for live calls does not exist yet. The gateway has no gRPC client for Phonexia Speech Platform 4. The plan builds this transport only when a customer needs it, because Phonexia runs on the customer's premises.",
+          "enable_requires": [
+            "live_probe"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "Not measured. The vendor publishes throughput only (for example about 17 times faster than real time for English Whisper on one named GPU with 100 s files) and no latency for short audio. It depends on the customer's hardware and must be measured per deployment."
+          },
+          "limits": {
+            "max_upload_bytes": null,
+            "max_audio_ms": null,
+            "min_audio_ms": 0,
+            "rates": [
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 1,
+                "plan": null,
+                "scope": "deployment",
+                "note": "The Whisper microservice's default of one instance per device. A deployment that runs more instances should raise it through its override."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "flac",
+              "raw_pcm"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "raw_body"
+          },
+          "quality_signals": [
+            "detected_languages"
+          ],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "context_params": [],
+            "wire": "phonexia_grpc"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/batch.rs:839-844; gateway/src/core/stt/prerecorded.rs:116-123; gateway/src/core/stt/tinkoff/grpc.rs:230",
+            "notes": "No code exists for this transport. The call (Transcribe, default port 8080) is synchronous: the audio is uploaded in messages of at most 4 MiB, the client closes its side, and the transcript comes back on the same call. The vendor states that transcription starts only after the whole audio has been received, so this is a file upload and not a live stream. A 25 s segment at 16 kHz is about 800 kB and fits in one message. Audio must be mono. The gateway already has hand-written gRPC clients without code generation that can serve as a pattern (tinkoff/grpc.rs:230). Overload is answered with RESOURCE_EXHAUSTED and an expired licence with FAILED_PRECONDITION. No authentication is documented. For this engine the request has no model field: the Whisper model is fixed when the microservice starts, so a model name in the session can only be honoured if the deployment declares that its endpoint runs that model. The language is optional and defaults to automatic detection, which the vendor bases on the first 30 s of audio; a live call should pin the language because short segments give detection little to work with. Each segment of the response carries the detected source language. There is no prompt or vocabulary field. The vendor states that this engine needs a GPU."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "max_in_flight": 1,
+            "rationale": "By default the vendor's software processes one request per engine at a time: on the Virtual Appliance each technology has one replica, and the Whisper microservice starts with one instance per device. A second upload in flight would be rejected with RESOURCE_EXHAUSTED on gRPC or would queue on REST, so it only moves the wait. A deployment that runs more instances should raise this through its override."
+          },
+          "privacy": {
+            "retention": {
+              "kind": "not_applicable"
+            }
+          }
+        },
+        {
+          "input_mode": "file_upload",
+          "adapter": "planned_file",
+          "enabled_from_release": null,
+          "disabled_reason": "The file-upload adapter for live calls does not exist yet, and this interface is an asynchronous task: the upload is answered with HTTP 202 and a Location header, and the result must be polled. Nothing in the evidence shows that it answers within about two seconds.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "Not measured. The task is queued, the media file is converted, and the result is polled; none of these steps has a published duration."
+          },
+          "limits": {
+            "max_upload_bytes": 500000000,
+            "max_audio_ms": 7200000,
+            "min_audio_ms": null,
+            "vendor_timeout_ms": 300000,
+            "rates": [
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 1,
+                "plan": null,
+                "scope": "deployment",
+                "note": "The Virtual Appliance's default of one replica per technology: one request is processed at a time and further requests are queued. A deployment may run more."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "mp3",
+              "mp4"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "multipart"
+          },
+          "quality_signals": [
+            "detected_languages"
+          ],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "context_params": [],
+            "wire": "phonexia_rest_task"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/batch.rs:839-844; gateway/src/core/stt/prerecorded.rs:82-94",
+            "notes": "No code exists for this transport. The request is multipart form data with the field file, sent to the Virtual Appliance (port 8000 in the vendor's examples). The reply is 202 with a Location header; the gateway then polls the task until it is done, failed, rejected or cancelled, and should cancel it with DELETE /api/tasks/{task_id} when the caller interrupts or hangs up. The gateway's existing polling helper starts at 500 ms and backs off to 3 s (prerecorded.rs:82-94), which is too coarse for one turn of a conversation; the audit suggests a fixed 100 to 200 ms, which is its own estimate. The limits recorded are the vendor's configurable defaults: uploads up to 500 MB, audio up to 2 hours, processing cancelled after 5 minutes, one request at a time per technology, extra requests queued. Any media file is accepted and converted first; MP3 and MP4 are the examples the vendor names. The response has no confidence value. No authentication is documented. For this engine the path is /api/technology/speech-to-text-whisper-enhanced. The optional model query parameter selects an installed Whisper model and defaults to 'default'; a model that is not deployed is answered with 404 model.not-deployed and a list of available models. The language is optional and defaults to automatic detection; each segment of the result carries the detected language."
+          },
+          "file_request_mode": "async_poll",
+          "segment_profile": {
+            "max_in_flight": 1,
+            "rationale": "By default the vendor's software processes one request per engine at a time: on the Virtual Appliance each technology has one replica, and the Whisper microservice starts with one instance per device. A second upload in flight would be rejected with RESOURCE_EXHAUSTED on gRPC or would queue on REST, so it only moves the wait. A deployment that runs more instances should raise this through its override."
+          },
+          "privacy": {
+            "retention": {
+              "kind": "not_applicable"
+            }
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "fails",
+        "code_ref": "gateway/src/core/stt/phonexia/client.rs:276-290 (connect fails closed unless WAAV_PHONEXIA_ALLOW_UNVERIFIED is set); gateway/src/core/stt/phonexia/config.rs:282-287 (a private server address is rejected before that)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "Phonexia Speech Platform 4 transcribes complete files only, and this gateway has no working client for it yet: today's Phonexia client speaks a protocol no current Phonexia product offers, so the session cannot start. Use a streaming transcription provider for this call, or ask the operator to enable segmented speech-to-text for this deployment."
+        }
+      },
+      "billing": {
+        "unit": "audio_second",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "notes": "Phonexia is licensed per deployment and publishes no prices. The licence capacity is counted in seconds of processed audio per period, which is why the unit is audio_second. No minimum per request is documented. Only uploaded segments are processed, so silence between utterances is not counted. There is no Phonexia entry in gateway/src/config/pricing.rs, so no pricing_key is given."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/rest/api/speech-to-text-whisper-start-api-technology-speech-to-text-whisper-enhanced-post",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/rest/api/speech-to-text-whisper-get-task-api-technology-speech-to-text-whisper-enhanced-task-id-get",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/rest/api/info-api-system-info-get",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/microservices/installation/enhanced-speech-to-text-built-on-whisper/readme",
+          "https://raw.githubusercontent.com/phonexia/protofiles/main/src/phonexia/grpc/technologies/enhanced_speech_to_text_built_on_whisper/v1/enhanced_speech_to_text_built_on_whisper.proto",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/rest/api/phonexia-speech-platform-4-rest-api-reference",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/virtual-appliance/rest_api/guides/speech_to_text/",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/virtual-appliance/configuration/limits",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/virtual-appliance/configuration/adjustments",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/microservices/audio-formats",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/rest/api/get-capacities-api-billing-capacities-get",
+          "https://raw.githubusercontent.com/phonexia/protofiles/main/src/phonexia/grpc/common/core.proto"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/batch.rs:839-844",
+          "gateway/src/core/stt/prerecorded.rs:82-94",
+          "gateway/src/core/stt/prerecorded.rs:116-123",
+          "gateway/src/core/stt/tinkoff/grpc.rs:230",
+          "gateway/src/core/stt/phonexia/client.rs:276-290",
+          "gateway/src/core/stt/phonexia/config.rs:282-287"
+        ],
+        "unverified": [
+          "transports[0].latency and transports[1].latency (no latency for short audio is published and no server was available to measure)",
+          "transports[0].limits.max_audio_ms (not documented for gRPC)",
+          "transports[0].limits.max_upload_bytes (no total size limit is documented for gRPC; the only stated limit is 4 MiB for each message)",
+          "transports[1].limits.min_audio_ms (the 'no minimum audio length' statement is in the gRPC definitions; nothing is stated for REST)",
+          "transports[1].limits.max_upload_bytes (the vendor says 500 MB by default without saying whether that is decimal or binary; the smaller reading is recorded)",
+          "all limits (they are configurable defaults of an on-premises product; a deployment may differ)",
+          "billing.min_billed_ms (none documented)",
+          "whether a deployment puts authentication in front of either interface (none is documented)",
+          "whether gRPC response messages arrive while decoding is still running",
+          "transports[0].upload.envelope (the gRPC call carries the audio bytes in protocol buffer messages of at most 4 MiB each; the schema has no envelope value for gRPC, so raw_body, the nearest, is recorded)"
+        ],
+        "notes": "'default' is the documented default value of the Whisper engine's model query parameter: the technology's default model is used. The engine is the vendor's 'Enhanced Speech to Text Built on Whisper' in Speech Platform 4. It transcribes complete files only; the vendor has no live interface for it. The synchronous gRPC call is listed first because it answers in one exchange; the REST interface is an asynchronous task and comes second. Because the model is a Whisper model, the gateway's list of phrases that Whisper invents on non-speech audio should be applied."
+      }
+    },
+    {
+      "id": "phonexia:large_v2",
+      "match": {
+        "provider": "phonexia",
+        "model": "large_v2"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "regional_rest",
+          "enabled_from_release": 5,
+          "disabled_reason": "The file-upload adapter for live calls does not exist yet. The gateway has no gRPC client for Phonexia Speech Platform 4. Before it can be enabled for this named model, a deployment must also declare that its gRPC endpoint runs this model: the request has no model field and the Whisper model is fixed when the microservice starts, so otherwise the session would be transcribed by a different model without any error. Only the REST interface can select a model for each request. The plan builds this transport only when a customer needs it, because Phonexia runs on the customer's premises.",
+          "enable_requires": [
+            "live_probe"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "Not measured. The vendor publishes throughput only (for example about 17 times faster than real time for English Whisper on one named GPU with 100 s files) and no latency for short audio. It depends on the customer's hardware and must be measured per deployment."
+          },
+          "limits": {
+            "max_upload_bytes": null,
+            "max_audio_ms": null,
+            "min_audio_ms": 0,
+            "rates": [
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 1,
+                "plan": null,
+                "scope": "deployment",
+                "note": "The Whisper microservice's default of one instance per device. A deployment that runs more instances should raise it through its override."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "flac",
+              "raw_pcm"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "raw_body"
+          },
+          "quality_signals": [
+            "detected_languages"
+          ],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "context_params": [],
+            "wire": "phonexia_grpc"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/batch.rs:839-844; gateway/src/core/stt/prerecorded.rs:116-123; gateway/src/core/stt/tinkoff/grpc.rs:230",
+            "notes": "No code exists for this transport. The call (Transcribe, default port 8080) is synchronous: the audio is uploaded in messages of at most 4 MiB, the client closes its side, and the transcript comes back on the same call. The vendor states that transcription starts only after the whole audio has been received, so this is a file upload and not a live stream. A 25 s segment at 16 kHz is about 800 kB and fits in one message. Audio must be mono. The gateway already has hand-written gRPC clients without code generation that can serve as a pattern (tinkoff/grpc.rs:230). Overload is answered with RESOURCE_EXHAUSTED and an expired licence with FAILED_PRECONDITION. No authentication is documented. For this engine the request has no model field: the Whisper model is fixed when the microservice starts, so a model name in the session can only be honoured if the deployment declares that its endpoint runs that model. The language is optional and defaults to automatic detection, which the vendor bases on the first 30 s of audio; a live call should pin the language because short segments give detection little to work with. Each segment of the response carries the detected source language. There is no prompt or vocabulary field. The vendor states that this engine needs a GPU."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "max_in_flight": 1,
+            "rationale": "By default the vendor's software processes one request per engine at a time: on the Virtual Appliance each technology has one replica, and the Whisper microservice starts with one instance per device. A second upload in flight would be rejected with RESOURCE_EXHAUSTED on gRPC or would queue on REST, so it only moves the wait. A deployment that runs more instances should raise this through its override."
+          },
+          "privacy": {
+            "retention": {
+              "kind": "not_applicable"
+            }
+          }
+        },
+        {
+          "input_mode": "file_upload",
+          "adapter": "planned_file",
+          "enabled_from_release": null,
+          "disabled_reason": "The file-upload adapter for live calls does not exist yet, and this interface is an asynchronous task: the upload is answered with HTTP 202 and a Location header, and the result must be polled. Nothing in the evidence shows that it answers within about two seconds.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "Not measured. The task is queued, the media file is converted, and the result is polled; none of these steps has a published duration."
+          },
+          "limits": {
+            "max_upload_bytes": 500000000,
+            "max_audio_ms": 7200000,
+            "min_audio_ms": null,
+            "vendor_timeout_ms": 300000,
+            "rates": [
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 1,
+                "plan": null,
+                "scope": "deployment",
+                "note": "The Virtual Appliance's default of one replica per technology: one request is processed at a time and further requests are queued. A deployment may run more."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "mp3",
+              "mp4"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "multipart"
+          },
+          "quality_signals": [
+            "detected_languages"
+          ],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "context_params": [],
+            "wire": "phonexia_rest_task"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/batch.rs:839-844; gateway/src/core/stt/prerecorded.rs:82-94",
+            "notes": "No code exists for this transport. The request is multipart form data with the field file, sent to the Virtual Appliance (port 8000 in the vendor's examples). The reply is 202 with a Location header; the gateway then polls the task until it is done, failed, rejected or cancelled, and should cancel it with DELETE /api/tasks/{task_id} when the caller interrupts or hangs up. The gateway's existing polling helper starts at 500 ms and backs off to 3 s (prerecorded.rs:82-94), which is too coarse for one turn of a conversation; the audit suggests a fixed 100 to 200 ms, which is its own estimate. The limits recorded are the vendor's configurable defaults: uploads up to 500 MB, audio up to 2 hours, processing cancelled after 5 minutes, one request at a time per technology, extra requests queued. Any media file is accepted and converted first; MP3 and MP4 are the examples the vendor names. The response has no confidence value. No authentication is documented. For this engine the path is /api/technology/speech-to-text-whisper-enhanced. The optional model query parameter selects an installed Whisper model and defaults to 'default'; a model that is not deployed is answered with 404 model.not-deployed and a list of available models. The language is optional and defaults to automatic detection; each segment of the result carries the detected language."
+          },
+          "file_request_mode": "async_poll",
+          "segment_profile": {
+            "max_in_flight": 1,
+            "rationale": "By default the vendor's software processes one request per engine at a time: on the Virtual Appliance each technology has one replica, and the Whisper microservice starts with one instance per device. A second upload in flight would be rejected with RESOURCE_EXHAUSTED on gRPC or would queue on REST, so it only moves the wait. A deployment that runs more instances should raise this through its override."
+          },
+          "privacy": {
+            "retention": {
+              "kind": "not_applicable"
+            }
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "fails",
+        "code_ref": "gateway/src/core/stt/phonexia/client.rs:276-290 (connect fails closed unless WAAV_PHONEXIA_ALLOW_UNVERIFIED is set); gateway/src/core/stt/phonexia/config.rs:282-287 (a private server address is rejected before that)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "Phonexia Speech Platform 4 transcribes complete files only, and this gateway has no working client for it yet: today's Phonexia client speaks a protocol no current Phonexia product offers, so the session cannot start. Use a streaming transcription provider for this call, or ask the operator to enable segmented speech-to-text for this deployment."
+        }
+      },
+      "billing": {
+        "unit": "audio_second",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "notes": "Phonexia is licensed per deployment and publishes no prices. The licence capacity is counted in seconds of processed audio per period, which is why the unit is audio_second. No minimum per request is documented. Only uploaded segments are processed, so silence between utterances is not counted. There is no Phonexia entry in gateway/src/config/pricing.rs, so no pricing_key is given."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/rest/api/speech-to-text-whisper-start-api-technology-speech-to-text-whisper-enhanced-post",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/rest/api/speech-to-text-whisper-get-task-api-technology-speech-to-text-whisper-enhanced-task-id-get",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/rest/api/info-api-system-info-get",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/microservices/installation/enhanced-speech-to-text-built-on-whisper/readme",
+          "https://raw.githubusercontent.com/phonexia/protofiles/main/src/phonexia/grpc/technologies/enhanced_speech_to_text_built_on_whisper/v1/enhanced_speech_to_text_built_on_whisper.proto",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/rest/api/phonexia-speech-platform-4-rest-api-reference",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/virtual-appliance/rest_api/guides/speech_to_text/",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/virtual-appliance/configuration/limits",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/virtual-appliance/configuration/adjustments",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/microservices/audio-formats",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/rest/api/get-capacities-api-billing-capacities-get",
+          "https://raw.githubusercontent.com/phonexia/protofiles/main/src/phonexia/grpc/common/core.proto"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/batch.rs:839-844",
+          "gateway/src/core/stt/prerecorded.rs:82-94",
+          "gateway/src/core/stt/prerecorded.rs:116-123",
+          "gateway/src/core/stt/tinkoff/grpc.rs:230",
+          "gateway/src/core/stt/phonexia/client.rs:276-290",
+          "gateway/src/core/stt/phonexia/config.rs:282-287"
+        ],
+        "unverified": [
+          "match.model (a documented example; whether a given deployment has this model installed is not known)",
+          "transports[0].latency and transports[1].latency (no latency for short audio is published and no server was available to measure)",
+          "transports[0].limits.max_audio_ms (not documented for gRPC)",
+          "transports[0].limits.max_upload_bytes (no total size limit is documented for gRPC; the only stated limit is 4 MiB for each message)",
+          "transports[1].limits.min_audio_ms (the 'no minimum audio length' statement is in the gRPC definitions; nothing is stated for REST)",
+          "transports[1].limits.max_upload_bytes (the vendor says 500 MB by default without saying whether that is decimal or binary; the smaller reading is recorded)",
+          "all limits (they are configurable defaults of an on-premises product; a deployment may differ)",
+          "billing.min_billed_ms (none documented)",
+          "whether a deployment puts authentication in front of either interface (none is documented)",
+          "whether gRPC response messages arrive while decoding is still running",
+          "transports[0].upload.envelope (the gRPC call carries the audio bytes in protocol buffer messages of at most 4 MiB each; the schema has no envelope value for gRPC, so raw_body, the nearest, is recorded)"
+        ],
+        "notes": "A Whisper model name, shown as the default model in the vendor's system-information example. The installed names differ between deployments and must be read from GET /api/system/info. Names must match the pattern of lower-case letters, digits and underscores, so the hyphenated spellings in the vendor's prose are not valid values. The engine is the vendor's 'Enhanced Speech to Text Built on Whisper' in Speech Platform 4. It transcribes complete files only; the vendor has no live interface for it. The synchronous gRPC call is listed first because it answers in one exchange; the REST interface is an asynchronous task and comes second. Because the model is a Whisper model, the gateway's list of phrases that Whisper invents on non-speech audio should be applied."
+      }
+    },
+    {
+      "id": "phonexia:large_v3",
+      "match": {
+        "provider": "phonexia",
+        "model": "large_v3"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "regional_rest",
+          "enabled_from_release": 5,
+          "disabled_reason": "The file-upload adapter for live calls does not exist yet. The gateway has no gRPC client for Phonexia Speech Platform 4. Before it can be enabled for this named model, a deployment must also declare that its gRPC endpoint runs this model: the request has no model field and the Whisper model is fixed when the microservice starts, so otherwise the session would be transcribed by a different model without any error. Only the REST interface can select a model for each request. The plan builds this transport only when a customer needs it, because Phonexia runs on the customer's premises.",
+          "enable_requires": [
+            "live_probe"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "Not measured. The vendor publishes throughput only (for example about 17 times faster than real time for English Whisper on one named GPU with 100 s files) and no latency for short audio. It depends on the customer's hardware and must be measured per deployment."
+          },
+          "limits": {
+            "max_upload_bytes": null,
+            "max_audio_ms": null,
+            "min_audio_ms": 0,
+            "rates": [
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 1,
+                "plan": null,
+                "scope": "deployment",
+                "note": "The Whisper microservice's default of one instance per device. A deployment that runs more instances should raise it through its override."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "flac",
+              "raw_pcm"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "raw_body"
+          },
+          "quality_signals": [
+            "detected_languages"
+          ],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "context_params": [],
+            "wire": "phonexia_grpc"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/batch.rs:839-844; gateway/src/core/stt/prerecorded.rs:116-123; gateway/src/core/stt/tinkoff/grpc.rs:230",
+            "notes": "No code exists for this transport. The call (Transcribe, default port 8080) is synchronous: the audio is uploaded in messages of at most 4 MiB, the client closes its side, and the transcript comes back on the same call. The vendor states that transcription starts only after the whole audio has been received, so this is a file upload and not a live stream. A 25 s segment at 16 kHz is about 800 kB and fits in one message. Audio must be mono. The gateway already has hand-written gRPC clients without code generation that can serve as a pattern (tinkoff/grpc.rs:230). Overload is answered with RESOURCE_EXHAUSTED and an expired licence with FAILED_PRECONDITION. No authentication is documented. For this engine the request has no model field: the Whisper model is fixed when the microservice starts, so a model name in the session can only be honoured if the deployment declares that its endpoint runs that model. The language is optional and defaults to automatic detection, which the vendor bases on the first 30 s of audio; a live call should pin the language because short segments give detection little to work with. Each segment of the response carries the detected source language. There is no prompt or vocabulary field. The vendor states that this engine needs a GPU."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "max_in_flight": 1,
+            "rationale": "By default the vendor's software processes one request per engine at a time: on the Virtual Appliance each technology has one replica, and the Whisper microservice starts with one instance per device. A second upload in flight would be rejected with RESOURCE_EXHAUSTED on gRPC or would queue on REST, so it only moves the wait. A deployment that runs more instances should raise this through its override."
+          },
+          "privacy": {
+            "retention": {
+              "kind": "not_applicable"
+            }
+          }
+        },
+        {
+          "input_mode": "file_upload",
+          "adapter": "planned_file",
+          "enabled_from_release": null,
+          "disabled_reason": "The file-upload adapter for live calls does not exist yet, and this interface is an asynchronous task: the upload is answered with HTTP 202 and a Location header, and the result must be polled. Nothing in the evidence shows that it answers within about two seconds.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "Not measured. The task is queued, the media file is converted, and the result is polled; none of these steps has a published duration."
+          },
+          "limits": {
+            "max_upload_bytes": 500000000,
+            "max_audio_ms": 7200000,
+            "min_audio_ms": null,
+            "vendor_timeout_ms": 300000,
+            "rates": [
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 1,
+                "plan": null,
+                "scope": "deployment",
+                "note": "The Virtual Appliance's default of one replica per technology: one request is processed at a time and further requests are queued. A deployment may run more."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "mp3",
+              "mp4"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "multipart"
+          },
+          "quality_signals": [
+            "detected_languages"
+          ],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "context_params": [],
+            "wire": "phonexia_rest_task"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/batch.rs:839-844; gateway/src/core/stt/prerecorded.rs:82-94",
+            "notes": "No code exists for this transport. The request is multipart form data with the field file, sent to the Virtual Appliance (port 8000 in the vendor's examples). The reply is 202 with a Location header; the gateway then polls the task until it is done, failed, rejected or cancelled, and should cancel it with DELETE /api/tasks/{task_id} when the caller interrupts or hangs up. The gateway's existing polling helper starts at 500 ms and backs off to 3 s (prerecorded.rs:82-94), which is too coarse for one turn of a conversation; the audit suggests a fixed 100 to 200 ms, which is its own estimate. The limits recorded are the vendor's configurable defaults: uploads up to 500 MB, audio up to 2 hours, processing cancelled after 5 minutes, one request at a time per technology, extra requests queued. Any media file is accepted and converted first; MP3 and MP4 are the examples the vendor names. The response has no confidence value. No authentication is documented. For this engine the path is /api/technology/speech-to-text-whisper-enhanced. The optional model query parameter selects an installed Whisper model and defaults to 'default'; a model that is not deployed is answered with 404 model.not-deployed and a list of available models. The language is optional and defaults to automatic detection; each segment of the result carries the detected language."
+          },
+          "file_request_mode": "async_poll",
+          "segment_profile": {
+            "max_in_flight": 1,
+            "rationale": "By default the vendor's software processes one request per engine at a time: on the Virtual Appliance each technology has one replica, and the Whisper microservice starts with one instance per device. A second upload in flight would be rejected with RESOURCE_EXHAUSTED on gRPC or would queue on REST, so it only moves the wait. A deployment that runs more instances should raise this through its override."
+          },
+          "privacy": {
+            "retention": {
+              "kind": "not_applicable"
+            }
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "fails",
+        "code_ref": "gateway/src/core/stt/phonexia/client.rs:276-290 (connect fails closed unless WAAV_PHONEXIA_ALLOW_UNVERIFIED is set); gateway/src/core/stt/phonexia/config.rs:282-287 (a private server address is rejected before that)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "Phonexia Speech Platform 4 transcribes complete files only, and this gateway has no working client for it yet: today's Phonexia client speaks a protocol no current Phonexia product offers, so the session cannot start. Use a streaming transcription provider for this call, or ask the operator to enable segmented speech-to-text for this deployment."
+        }
+      },
+      "billing": {
+        "unit": "audio_second",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "notes": "Phonexia is licensed per deployment and publishes no prices. The licence capacity is counted in seconds of processed audio per period, which is why the unit is audio_second. No minimum per request is documented. Only uploaded segments are processed, so silence between utterances is not counted. There is no Phonexia entry in gateway/src/config/pricing.rs, so no pricing_key is given."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/rest/api/speech-to-text-whisper-start-api-technology-speech-to-text-whisper-enhanced-post",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/rest/api/speech-to-text-whisper-get-task-api-technology-speech-to-text-whisper-enhanced-task-id-get",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/rest/api/info-api-system-info-get",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/microservices/installation/enhanced-speech-to-text-built-on-whisper/readme",
+          "https://raw.githubusercontent.com/phonexia/protofiles/main/src/phonexia/grpc/technologies/enhanced_speech_to_text_built_on_whisper/v1/enhanced_speech_to_text_built_on_whisper.proto",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/rest/api/phonexia-speech-platform-4-rest-api-reference",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/virtual-appliance/rest_api/guides/speech_to_text/",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/virtual-appliance/configuration/limits",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/virtual-appliance/configuration/adjustments",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/microservices/audio-formats",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/rest/api/get-capacities-api-billing-capacities-get",
+          "https://raw.githubusercontent.com/phonexia/protofiles/main/src/phonexia/grpc/common/core.proto"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/batch.rs:839-844",
+          "gateway/src/core/stt/prerecorded.rs:82-94",
+          "gateway/src/core/stt/prerecorded.rs:116-123",
+          "gateway/src/core/stt/tinkoff/grpc.rs:230",
+          "gateway/src/core/stt/phonexia/client.rs:276-290",
+          "gateway/src/core/stt/phonexia/config.rs:282-287"
+        ],
+        "unverified": [
+          "match.model (a documented example; whether a given deployment has this model installed is not known)",
+          "transports[0].latency and transports[1].latency (no latency for short audio is published and no server was available to measure)",
+          "transports[0].limits.max_audio_ms (not documented for gRPC)",
+          "transports[0].limits.max_upload_bytes (no total size limit is documented for gRPC; the only stated limit is 4 MiB for each message)",
+          "transports[1].limits.min_audio_ms (the 'no minimum audio length' statement is in the gRPC definitions; nothing is stated for REST)",
+          "transports[1].limits.max_upload_bytes (the vendor says 500 MB by default without saying whether that is decimal or binary; the smaller reading is recorded)",
+          "all limits (they are configurable defaults of an on-premises product; a deployment may differ)",
+          "billing.min_billed_ms (none documented)",
+          "whether a deployment puts authentication in front of either interface (none is documented)",
+          "whether gRPC response messages arrive while decoding is still running",
+          "transports[0].upload.envelope (the gRPC call carries the audio bytes in protocol buffer messages of at most 4 MiB each; the schema has no envelope value for gRPC, so raw_body, the nearest, is recorded)"
+        ],
+        "notes": "A Whisper model name, shown in the vendor's documented result example. The installed names differ between deployments and must be read from GET /api/system/info. The engine is the vendor's 'Enhanced Speech to Text Built on Whisper' in Speech Platform 4. It transcribes complete files only; the vendor has no live interface for it. The synchronous gRPC call is listed first because it answers in one exchange; the REST interface is an asynchronous task and comes second. Because the model is a Whisper model, the gateway's list of phrases that Whisper invents on non-speech audio should be applied."
+      }
+    },
+    {
+      "id": "phonexia:medium",
+      "match": {
+        "provider": "phonexia",
+        "model": "medium"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "regional_rest",
+          "enabled_from_release": 5,
+          "disabled_reason": "The file-upload adapter for live calls does not exist yet. The gateway has no gRPC client for Phonexia Speech Platform 4. Before it can be enabled for this named model, a deployment must also declare that its gRPC endpoint runs this model: the request has no model field and the Whisper model is fixed when the microservice starts, so otherwise the session would be transcribed by a different model without any error. Only the REST interface can select a model for each request. The plan builds this transport only when a customer needs it, because Phonexia runs on the customer's premises.",
+          "enable_requires": [
+            "live_probe"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "Not measured. The vendor publishes throughput only (for example about 17 times faster than real time for English Whisper on one named GPU with 100 s files) and no latency for short audio. It depends on the customer's hardware and must be measured per deployment."
+          },
+          "limits": {
+            "max_upload_bytes": null,
+            "max_audio_ms": null,
+            "min_audio_ms": 0,
+            "rates": [
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 1,
+                "plan": null,
+                "scope": "deployment",
+                "note": "The Whisper microservice's default of one instance per device. A deployment that runs more instances should raise it through its override."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "flac",
+              "raw_pcm"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "raw_body"
+          },
+          "quality_signals": [
+            "detected_languages"
+          ],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "context_params": [],
+            "wire": "phonexia_grpc"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/batch.rs:839-844; gateway/src/core/stt/prerecorded.rs:116-123; gateway/src/core/stt/tinkoff/grpc.rs:230",
+            "notes": "No code exists for this transport. The call (Transcribe, default port 8080) is synchronous: the audio is uploaded in messages of at most 4 MiB, the client closes its side, and the transcript comes back on the same call. The vendor states that transcription starts only after the whole audio has been received, so this is a file upload and not a live stream. A 25 s segment at 16 kHz is about 800 kB and fits in one message. Audio must be mono. The gateway already has hand-written gRPC clients without code generation that can serve as a pattern (tinkoff/grpc.rs:230). Overload is answered with RESOURCE_EXHAUSTED and an expired licence with FAILED_PRECONDITION. No authentication is documented. For this engine the request has no model field: the Whisper model is fixed when the microservice starts, so a model name in the session can only be honoured if the deployment declares that its endpoint runs that model. The language is optional and defaults to automatic detection, which the vendor bases on the first 30 s of audio; a live call should pin the language because short segments give detection little to work with. Each segment of the response carries the detected source language. There is no prompt or vocabulary field. The vendor states that this engine needs a GPU."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "max_in_flight": 1,
+            "rationale": "By default the vendor's software processes one request per engine at a time: on the Virtual Appliance each technology has one replica, and the Whisper microservice starts with one instance per device. A second upload in flight would be rejected with RESOURCE_EXHAUSTED on gRPC or would queue on REST, so it only moves the wait. A deployment that runs more instances should raise this through its override."
+          },
+          "privacy": {
+            "retention": {
+              "kind": "not_applicable"
+            }
+          }
+        },
+        {
+          "input_mode": "file_upload",
+          "adapter": "planned_file",
+          "enabled_from_release": null,
+          "disabled_reason": "The file-upload adapter for live calls does not exist yet, and this interface is an asynchronous task: the upload is answered with HTTP 202 and a Location header, and the result must be polled. Nothing in the evidence shows that it answers within about two seconds.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "Not measured. The task is queued, the media file is converted, and the result is polled; none of these steps has a published duration."
+          },
+          "limits": {
+            "max_upload_bytes": 500000000,
+            "max_audio_ms": 7200000,
+            "min_audio_ms": null,
+            "vendor_timeout_ms": 300000,
+            "rates": [
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 1,
+                "plan": null,
+                "scope": "deployment",
+                "note": "The Virtual Appliance's default of one replica per technology: one request is processed at a time and further requests are queued. A deployment may run more."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "mp3",
+              "mp4"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "multipart"
+          },
+          "quality_signals": [
+            "detected_languages"
+          ],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "context_params": [],
+            "wire": "phonexia_rest_task"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/batch.rs:839-844; gateway/src/core/stt/prerecorded.rs:82-94",
+            "notes": "No code exists for this transport. The request is multipart form data with the field file, sent to the Virtual Appliance (port 8000 in the vendor's examples). The reply is 202 with a Location header; the gateway then polls the task until it is done, failed, rejected or cancelled, and should cancel it with DELETE /api/tasks/{task_id} when the caller interrupts or hangs up. The gateway's existing polling helper starts at 500 ms and backs off to 3 s (prerecorded.rs:82-94), which is too coarse for one turn of a conversation; the audit suggests a fixed 100 to 200 ms, which is its own estimate. The limits recorded are the vendor's configurable defaults: uploads up to 500 MB, audio up to 2 hours, processing cancelled after 5 minutes, one request at a time per technology, extra requests queued. Any media file is accepted and converted first; MP3 and MP4 are the examples the vendor names. The response has no confidence value. No authentication is documented. For this engine the path is /api/technology/speech-to-text-whisper-enhanced. The optional model query parameter selects an installed Whisper model and defaults to 'default'; a model that is not deployed is answered with 404 model.not-deployed and a list of available models. The language is optional and defaults to automatic detection; each segment of the result carries the detected language."
+          },
+          "file_request_mode": "async_poll",
+          "segment_profile": {
+            "max_in_flight": 1,
+            "rationale": "By default the vendor's software processes one request per engine at a time: on the Virtual Appliance each technology has one replica, and the Whisper microservice starts with one instance per device. A second upload in flight would be rejected with RESOURCE_EXHAUSTED on gRPC or would queue on REST, so it only moves the wait. A deployment that runs more instances should raise this through its override."
+          },
+          "privacy": {
+            "retention": {
+              "kind": "not_applicable"
+            }
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "fails",
+        "code_ref": "gateway/src/core/stt/phonexia/client.rs:276-290 (connect fails closed unless WAAV_PHONEXIA_ALLOW_UNVERIFIED is set); gateway/src/core/stt/phonexia/config.rs:282-287 (a private server address is rejected before that)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "Phonexia Speech Platform 4 transcribes complete files only, and this gateway has no working client for it yet: today's Phonexia client speaks a protocol no current Phonexia product offers, so the session cannot start. Use a streaming transcription provider for this call, or ask the operator to enable segmented speech-to-text for this deployment."
+        }
+      },
+      "billing": {
+        "unit": "audio_second",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "notes": "Phonexia is licensed per deployment and publishes no prices. The licence capacity is counted in seconds of processed audio per period, which is why the unit is audio_second. No minimum per request is documented. Only uploaded segments are processed, so silence between utterances is not counted. There is no Phonexia entry in gateway/src/config/pricing.rs, so no pricing_key is given."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/rest/api/speech-to-text-whisper-start-api-technology-speech-to-text-whisper-enhanced-post",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/rest/api/speech-to-text-whisper-get-task-api-technology-speech-to-text-whisper-enhanced-task-id-get",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/rest/api/info-api-system-info-get",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/microservices/installation/enhanced-speech-to-text-built-on-whisper/readme",
+          "https://raw.githubusercontent.com/phonexia/protofiles/main/src/phonexia/grpc/technologies/enhanced_speech_to_text_built_on_whisper/v1/enhanced_speech_to_text_built_on_whisper.proto",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/rest/api/phonexia-speech-platform-4-rest-api-reference",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/virtual-appliance/rest_api/guides/speech_to_text/",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/virtual-appliance/configuration/limits",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/virtual-appliance/configuration/adjustments",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/microservices/audio-formats",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/rest/api/get-capacities-api-billing-capacities-get",
+          "https://raw.githubusercontent.com/phonexia/protofiles/main/src/phonexia/grpc/common/core.proto"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/batch.rs:839-844",
+          "gateway/src/core/stt/prerecorded.rs:82-94",
+          "gateway/src/core/stt/prerecorded.rs:116-123",
+          "gateway/src/core/stt/tinkoff/grpc.rs:230",
+          "gateway/src/core/stt/phonexia/client.rs:276-290",
+          "gateway/src/core/stt/phonexia/config.rs:282-287"
+        ],
+        "unverified": [
+          "match.model (a documented example; whether a given deployment has this model installed is not known)",
+          "transports[0].latency and transports[1].latency (no latency for short audio is published and no server was available to measure)",
+          "transports[0].limits.max_audio_ms (not documented for gRPC)",
+          "transports[0].limits.max_upload_bytes (no total size limit is documented for gRPC; the only stated limit is 4 MiB for each message)",
+          "transports[1].limits.min_audio_ms (the 'no minimum audio length' statement is in the gRPC definitions; nothing is stated for REST)",
+          "transports[1].limits.max_upload_bytes (the vendor says 500 MB by default without saying whether that is decimal or binary; the smaller reading is recorded)",
+          "all limits (they are configurable defaults of an on-premises product; a deployment may differ)",
+          "billing.min_billed_ms (none documented)",
+          "whether a deployment puts authentication in front of either interface (none is documented)",
+          "whether gRPC response messages arrive while decoding is still running",
+          "transports[0].upload.envelope (the gRPC call carries the audio bytes in protocol buffer messages of at most 4 MiB each; the schema has no envelope value for gRPC, so raw_body, the nearest, is recorded)"
+        ],
+        "notes": "A Whisper model name, shown in the vendor's system-information example. The installed names differ between deployments and must be read from GET /api/system/info. The engine is the vendor's 'Enhanced Speech to Text Built on Whisper' in Speech Platform 4. It transcribes complete files only; the vendor has no live interface for it. The synchronous gRPC call is listed first because it answers in one exchange; the REST interface is an asynchronous task and comes second. Because the model is a Whisper model, the gateway's list of phrases that Whisper invents on non-speech audio should be applied."
+      }
+    },
+    {
+      "id": "phonexia:en_us_6",
+      "match": {
+        "provider": "phonexia",
+        "model": "EN_US_6"
+      },
+      "lifecycle": {
+        "status": "retired",
+        "shutdown_on": "2026-05-01",
+        "dates_basis": "inferred",
+        "replacement": [
+          "speech-to-text"
+        ]
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": null,
+            "idle_timeout_ms": 10000,
+            "rates": []
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": null,
+            "context_params": [],
+            "wire": "phonexia_spe3_stream"
+          },
+          "gateway_client": {
+            "status": "known_broken",
+            "defect": "The existing WebSocket client matches no Phonexia product and refuses to connect unless an operator sets WAAV_PHONEXIA_ALLOW_UNVERIFIED. Against the legacy Speech Engine 3 stream interface it performs only the first of three steps: it opens the input socket but never binds the speech-to-text technology with a model and never reads the separate result resource. It also sends the wrong query parameter for the channel count.",
+            "code_ref": "gateway/src/core/stt/phonexia/client.rs:136-164, 276-290; gateway/src/core/stt/phonexia/config.rs:282-287, 338-362, 404-434; gateway/src/core/stt/phonexia/mod.rs:12-20",
+            "notes": "This is the client every Phonexia session gets today, and it fails at session setup. With a public server address it fails in connect() with a configuration error (client.rs:276-290); with a private address, which is the normal case for an on-premises server, it fails earlier because the server address is rejected by the check against private networks (config.rs:282-287). The client reads the session's model field as a result type and its api_key field as the server address (config.rs:407-430), so no real model can be selected. The only final result it recognises is the vendor's is_last flag, which marks the end of the whole stream, so even a connected session would never end a turn (client.rs:138-154). The module's own header says the protocol is unverified (mod.rs:12-20)."
+          },
+          "privacy": {
+            "retention": {
+              "kind": "not_applicable"
+            }
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "fails",
+        "code_ref": "gateway/src/core/stt/phonexia/client.rs:276-290 (connect fails closed unless WAAV_PHONEXIA_ALLOW_UNVERIFIED is set); gateway/src/core/stt/phonexia/config.rs:282-287 (a private server address is rejected before that)",
+        "refuse_from_release": 0,
+        "refusal": {
+          "code": "stt_model_retired",
+          "text": "EN_US_6 is a model of the legacy Speech Engine 3, whose newest listed version reached its published end of support on 2026-05-01. It was the only Phonexia product that accepted a live stream, and the gateway has no working client for it. Do not onboard it; use the Speech Platform 4 engine speech-to-text."
+        }
+      },
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "On-premises licence; nothing is published for the legacy product."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://download.phonexia.com/docs/spe/",
+          "https://docs.cloud.phonexia.com/products/speech-platform-3/maintenance/support-lifecycle-policy-psp",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/release-notes/2026_03_0"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/phonexia/client.rs:136-164",
+          "gateway/src/core/stt/phonexia/client.rs:276-290",
+          "gateway/src/core/stt/phonexia/config.rs:282-287",
+          "gateway/src/core/stt/phonexia/config.rs:404-434",
+          "gateway/src/core/stt/phonexia/mod.rs:12-20"
+        ],
+        "unverified": [
+          "lifecycle (2026-05-01 is the published end of support of Speech Engine 3.63, recorded as the shutdown date; on-premises software keeps running after that date, and whether the product is still sold or under extended support is not known)",
+          "transports[0].endpointing_owner and vendor_turn_signal (the legacy stream marks only the end of the whole stream; no per-utterance signal was found in the documentation read)",
+          "transports[0].limits.max_session_ms and idle_timeout_ms (the legacy documentation says only that a stream closes after 10 s without data, recorded as the idle limit; no cap on session length was found)",
+          "billing (nothing published)",
+          "transports[0].latency (never measured; nothing is published for the legacy stream interface)"
+        ],
+        "notes": "EN_US_6 is an example model id of the STT_STREAM technology in the legacy Speech Engine 3 documentation (version 3.63.1). The row exists to record that the one Phonexia interface the existing client resembles is retired and unusable, so that nobody adds it later as a streaming row. Other legacy ids such as CS_CZ_6 have no row and fall to the provider default. The legacy flow was: open an input stream, bind the speech-to-text technology to it with a model, then read results from a separate resource; the stream closes after 10 s without data."
+      }
+    },
+    {
+      "id": "phonexia:any",
+      "match": {
+        "provider": "phonexia",
+        "model_glob": "*"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "regional_rest",
+          "enabled_from_release": 5,
+          "disabled_reason": "The file-upload adapter for live calls does not exist yet. The gateway has no gRPC client for Phonexia Speech Platform 4. Before it can be enabled for a model id the map has not seen, a deployment must also declare which model its gRPC endpoint runs: the request has no model field and the Whisper model is fixed when the microservice starts, so a named model would otherwise be ignored without any error. Only the REST interface can select a model for each request. The plan builds this transport only when a customer needs it, because Phonexia runs on the customer's premises.",
+          "enable_requires": [
+            "live_probe"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "Not measured. The vendor publishes throughput only (for example about 17 times faster than real time for English Whisper on one named GPU with 100 s files) and no latency for short audio. It depends on the customer's hardware and must be measured per deployment."
+          },
+          "limits": {
+            "max_upload_bytes": null,
+            "max_audio_ms": null,
+            "min_audio_ms": 0,
+            "rates": [
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 1,
+                "plan": null,
+                "scope": "deployment",
+                "note": "The Whisper microservice's default of one instance per device. A deployment that runs more instances should raise it through its override."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "flac",
+              "raw_pcm"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "raw_body"
+          },
+          "quality_signals": [
+            "detected_languages"
+          ],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "context_params": [],
+            "wire": "phonexia_grpc"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/batch.rs:839-844; gateway/src/core/stt/prerecorded.rs:116-123; gateway/src/core/stt/tinkoff/grpc.rs:230",
+            "notes": "No code exists for this transport. The call (Transcribe, default port 8080) is synchronous: the audio is uploaded in messages of at most 4 MiB, the client closes its side, and the transcript comes back on the same call. The vendor states that transcription starts only after the whole audio has been received, so this is a file upload and not a live stream. A 25 s segment at 16 kHz is about 800 kB and fits in one message. Audio must be mono. The gateway already has hand-written gRPC clients without code generation that can serve as a pattern (tinkoff/grpc.rs:230). Overload is answered with RESOURCE_EXHAUSTED and an expired licence with FAILED_PRECONDITION. No authentication is documented. For this engine the request has no model field: the Whisper model is fixed when the microservice starts, so a model name in the session can only be honoured if the deployment declares that its endpoint runs that model. The language is optional and defaults to automatic detection, which the vendor bases on the first 30 s of audio; a live call should pin the language because short segments give detection little to work with. Each segment of the response carries the detected source language. There is no prompt or vocabulary field. The vendor states that this engine needs a GPU."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "max_in_flight": 1,
+            "rationale": "By default the vendor's software processes one request per engine at a time: on the Virtual Appliance each technology has one replica, and the Whisper microservice starts with one instance per device. A second upload in flight would be rejected with RESOURCE_EXHAUSTED on gRPC or would queue on REST, so it only moves the wait. A deployment that runs more instances should raise this through its override."
+          },
+          "privacy": {
+            "retention": {
+              "kind": "not_applicable"
+            }
+          }
+        },
+        {
+          "input_mode": "file_upload",
+          "adapter": "planned_file",
+          "enabled_from_release": null,
+          "disabled_reason": "The file-upload adapter for live calls does not exist yet, and this interface is an asynchronous task: the upload is answered with HTTP 202 and a Location header, and the result must be polled. Nothing in the evidence shows that it answers within about two seconds.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "Not measured. The task is queued, the media file is converted, and the result is polled; none of these steps has a published duration."
+          },
+          "limits": {
+            "max_upload_bytes": 500000000,
+            "max_audio_ms": 7200000,
+            "min_audio_ms": null,
+            "vendor_timeout_ms": 300000,
+            "rates": [
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 1,
+                "plan": null,
+                "scope": "deployment",
+                "note": "The Virtual Appliance's default of one replica per technology: one request is processed at a time and further requests are queued. A deployment may run more."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "mp3",
+              "mp4"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "multipart"
+          },
+          "quality_signals": [
+            "detected_languages"
+          ],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "context_params": [],
+            "wire": "phonexia_rest_task"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/batch.rs:839-844; gateway/src/core/stt/prerecorded.rs:82-94",
+            "notes": "No code exists for this transport. The request is multipart form data with the field file, sent to the Virtual Appliance (port 8000 in the vendor's examples). The reply is 202 with a Location header; the gateway then polls the task until it is done, failed, rejected or cancelled, and should cancel it with DELETE /api/tasks/{task_id} when the caller interrupts or hangs up. The gateway's existing polling helper starts at 500 ms and backs off to 3 s (prerecorded.rs:82-94), which is too coarse for one turn of a conversation; the audit suggests a fixed 100 to 200 ms, which is its own estimate. The limits recorded are the vendor's configurable defaults: uploads up to 500 MB, audio up to 2 hours, processing cancelled after 5 minutes, one request at a time per technology, extra requests queued. Any media file is accepted and converted first; MP3 and MP4 are the examples the vendor names. The response has no confidence value. No authentication is documented. For this engine the path is /api/technology/speech-to-text-whisper-enhanced. The optional model query parameter selects an installed Whisper model and defaults to 'default'; a model that is not deployed is answered with 404 model.not-deployed and a list of available models. The language is optional and defaults to automatic detection; each segment of the result carries the detected language."
+          },
+          "file_request_mode": "async_poll",
+          "segment_profile": {
+            "max_in_flight": 1,
+            "rationale": "By default the vendor's software processes one request per engine at a time: on the Virtual Appliance each technology has one replica, and the Whisper microservice starts with one instance per device. A second upload in flight would be rejected with RESOURCE_EXHAUSTED on gRPC or would queue on REST, so it only moves the wait. A deployment that runs more instances should raise this through its override."
+          },
+          "privacy": {
+            "retention": {
+              "kind": "not_applicable"
+            }
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "fails",
+        "code_ref": "gateway/src/core/stt/phonexia/client.rs:276-290 (connect fails closed unless WAAV_PHONEXIA_ALLOW_UNVERIFIED is set); gateway/src/core/stt/phonexia/config.rs:282-287 (a private server address is rejected before that)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "Phonexia Speech Platform 4 transcribes complete files only, and this gateway has no working client for it yet: today's Phonexia client speaks a protocol no current Phonexia product offers, so the session cannot start. Use a streaming transcription provider for this call, or ask the operator to enable segmented speech-to-text for this deployment."
+        }
+      },
+      "billing": {
+        "unit": "audio_second",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "notes": "Phonexia is licensed per deployment and publishes no prices. The licence capacity is counted in seconds of processed audio per period, which is why the unit is audio_second. No minimum per request is documented. Only uploaded segments are processed, so silence between utterances is not counted. There is no Phonexia entry in gateway/src/config/pricing.rs, so no pricing_key is given."
+      },
+      "provenance": {
+        "confidence": "assumed",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/rest/api/speech-to-text-whisper-start-api-technology-speech-to-text-whisper-enhanced-post",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/rest/api/speech-to-text-whisper-get-task-api-technology-speech-to-text-whisper-enhanced-task-id-get",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/rest/api/info-api-system-info-get",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/microservices/installation/enhanced-speech-to-text-built-on-whisper/readme",
+          "https://raw.githubusercontent.com/phonexia/protofiles/main/src/phonexia/grpc/technologies/enhanced_speech_to_text_built_on_whisper/v1/enhanced_speech_to_text_built_on_whisper.proto",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/rest/api/phonexia-speech-platform-4-rest-api-reference",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/virtual-appliance/rest_api/guides/speech_to_text/",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/virtual-appliance/configuration/limits",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/virtual-appliance/configuration/adjustments",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/microservices/audio-formats",
+          "https://docs.cloud.phonexia.com/products/speech-platform-4/rest/api/get-capacities-api-billing-capacities-get",
+          "https://raw.githubusercontent.com/phonexia/protofiles/main/src/phonexia/grpc/common/core.proto"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/batch.rs:839-844",
+          "gateway/src/core/stt/prerecorded.rs:82-94",
+          "gateway/src/core/stt/prerecorded.rs:116-123",
+          "gateway/src/core/stt/tinkoff/grpc.rs:230",
+          "gateway/src/core/stt/phonexia/client.rs:276-290",
+          "gateway/src/core/stt/phonexia/config.rs:282-287",
+          "gateway/src/plugin/builtin/mod.rs:262"
+        ],
+        "unverified": [
+          "everything in this row when applied to a model id the map has not seen",
+          "which engine an empty model should select (the evidence does not establish a default)",
+          "transports[0].latency and transports[1].latency (no latency for short audio is published and no server was available to measure)",
+          "transports[0].limits.max_audio_ms (not documented for gRPC)",
+          "transports[0].limits.max_upload_bytes (no total size limit is documented for gRPC; the only stated limit is 4 MiB for each message)",
+          "transports[1].limits.min_audio_ms (the 'no minimum audio length' statement is in the gRPC definitions; nothing is stated for REST)",
+          "transports[1].limits.max_upload_bytes (the vendor says 500 MB by default without saying whether that is decimal or binary; the smaller reading is recorded)",
+          "all limits (they are configurable defaults of an on-premises product; a deployment may differ)",
+          "billing.min_billed_ms (none documented)",
+          "whether a deployment puts authentication in front of either interface (none is documented)",
+          "whether gRPC response messages arrive while decoding is still running",
+          "transports[0].upload.envelope (the gRPC call carries the audio bytes in protocol buffer messages of at most 4 MiB each; the schema has no envelope value for gRPC, so raw_body, the nearest, is recorded)"
+        ],
+        "notes": "Provider default. Every model of the vendor's current product transcribes complete files only, so the row chooses file upload. An unknown id is treated as the name of a Whisper model installed on the deployment, because the other engine has no model parameter; an empty id selects the Whisper engine's default model. If the name is not installed the REST interface answers 404 model.not-deployed with the list of available models, which is a clear error; the gRPC interface gives no such error, because it has no model field. Other Whisper names in the vendor's documentation have no rows and fall here: large_v2_adapted_cs from the system-information example, and base, small, a turbo variant and distilled variants, which appear only in the vendor's prose. The prose writes the turbo and distilled names with hyphens, a spelling the model parameter does not accept, so their wire spelling is not established. The strings one_best, n_best and confusion_network, which the gateway's plugin metadata advertises as models (gateway/src/plugin/builtin/mod.rs:262), are result types and must not be sent as model names."
+      }
+    }
+  ]
+}

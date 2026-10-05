@@ -1,0 +1,1525 @@
+{
+  "provider_id": "baidu",
+  "provider": {
+    "aliases": [
+      "baidu-ai",
+      "baidu_ai",
+      "baiduai",
+      "百度",
+      "百度语音",
+      "baidu-speech",
+      "baidu_speech"
+    ],
+    "default_model": "1537",
+    "model_string": "wire_model",
+    "registered_in_gateway": true,
+    "native_model_handling": "substituted",
+    "prerequisites": [
+      {
+        "kind": "token_scope",
+        "detail": "The pro API needs the token scope brain_enhanced_asr.",
+        "wire": "baidu_pro_api"
+      }
+    ],
+    "notes": "Registered at gateway/src/plugin/builtin/mod.rs:1774-1775; dispatched at gateway/src/core/stt/standard.rs:413. MODEL KEY: the model id is Baidu's dev_pid, an integer on the wire, written here as a string. Language is fixed by the dev_pid. An empty model resolves to 1537 (gateway/src/core/stt/baidu/config.rs:39, fallback at :118). EVIDENCE QUALITY: Baidu's documentation hosts could not be reached by the audit or the fact-check. First-hand evidence is Baidu's official GitHub demo code; everything else is a third-party mirror of the official pages or a search excerpt that cites them, and nothing could be tested live. Rows that rest only on second-hand evidence are marked assumed. STREAMING CLIENT (adapter native, known_broken; read from code and official demo code, never run against the vendor; all paths under gateway/src/core/stt/baidu/): (1) The START frame is built from the API Key as 'appid' and the Secret Key as 'appkey' (client.rs:512-519), and appid is a string (messages.rs:27); Baidu's demos send an integer AppID and the API Key. The api_key|secret_key credential (config.rs:470-486) has no place for an AppID, so authentication very probably fails. (2) err_no is a required field of the response (messages.rs:138), so HEARTBEAT frames probably fail to parse. (3) Unknown model ids become 1537 (config.rs:118) and STTConfig.language is never read. (4) Confidence is hard-coded to 1.0 (client.rs:663). The repository mock ignores the START frame (gateway/tests/mock_endpoint_e2e.rs:803-827), so its passing test does not cover the credential mismatch. FILE UPLOAD (adapter regional_rest, not implemented): recognize_short_audio (client.rs:694-767) has no caller, targets https://vop.baidu.com/server_api only (config.rs:404-410), uses a 30 second HTTP timeout (client.rs:80) and returns an error for an empty result or any non-zero err_no (client.rs:756-766). The client's REST mode buffers without limit and never flushes (client.rs:880-883). The OAuth token cache is per client instance; a process-wide cache is needed. The gateway's Baidu error-code table (messages.rs:325) disagrees with the vendor's and must not be reused. From search excerpts of the official error table (not read first-hand): 3300 input parameter incorrect (never retry); 3301 audio quality too poor (a normal no-speech outcome, drop the segment); 3302 authentication failed (refresh the token once); 3303 back-end busy and 3307 back-end recognition error (retry once; the gateway labels 3303 'Audio file too long', messages.rs:341-342); 3304 concurrency exceeded, counted per AppID (back off and retry); 3305 daily quota exceeded; 3308 audio longer than 60 seconds and 3309 audio data problem (never retry). Concurrency is counted per AppID across all callers, so the limiter must be shared by every session on the credential. The adapter picks the endpoint from the row's dialect.wire: baidu_server_api or baidu_pro_api. The file API needs exactly the api_key|secret_key credential the gateway already accepts, so it is the first Baidu transport that can work. STATE TODAY: the streaming client is the native transport, enabled from Release 0, groundwork and honest refusal, and reported as known broken in ready.stt rather than refused (integration decisions, section 15); each native transport carries its defect. The file transport (regional_rest) is enabled from Release 5, wider vendor coverage and hardening, and only after a live probe with a real key (decisions section 12). Until then a model the gateway has no working path for is refused or warned as its when_unusable says. Segmentation is required for 80001 on first-hand evidence; 1637 and 1837 need it only if the socket rejects them, which is unverified. 8001 (a self-trained model, chosen with lm_id) is rowed as file upload only because nothing shows it on the socket. The two far-field ids, 1936 (file API) and 19362 (real-time), are rowed as retired. config/pricing.rs has no Baidu entries, so rows carry no pricing_key."
+  },
+  "rows": [
+    {
+      "id": "baidu:15372",
+      "match": {
+        "provider": "baidu",
+        "model": "15372"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": null,
+            "idle_timeout_ms": 5000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 50,
+                "plan": "prepaid",
+                "scope": "application",
+                "note": "With a prepaid pack ('supports 50 concurrent, expandable'), counted per AppID; from an undated third-party mirror of the price list. The default for other accounts is not published."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le"
+            ],
+            "sample_rates_hz": [
+              16000
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "engine_id",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [],
+            "wire": "baidu_realtime_ws"
+          },
+          "gateway_client": {
+            "status": "known_broken",
+            "defect": "Known broken against the vendor protocol: the START frame sends the API Key and Secret Key where the vendor expects an integer AppID and the API Key, so the client very probably cannot authenticate. The client also cannot select this model: it silently replaces the id with 1537. Repair the client and check it against the live service before enabling.",
+            "code_ref": "gateway/src/core/stt/baidu/client.rs:512-519,658-664; gateway/src/core/stt/baidu/messages.rs:25-43,138; gateway/src/core/stt/baidu/config.rs:110-120",
+            "notes": "The defect list with line references is in the provider notes. This dev_pid is not in the client's model list (config.rs:76-101); from_str falls back to 1537 (config.rs:118)."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "audio_hour",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "Real-time socket: per hour of audio. Source: an undated third-party mirror of the price list."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://raw.githubusercontent.com/Baidu-AIP/speech_realtime_api/master/python-realtime-asr/const.py",
+          "https://raw.githubusercontent.com/Baidu-AIP/speech_realtime_api/master/python-realtime-asr/realtime_asr.py",
+          "https://raw.githubusercontent.com/Baidu-AIP/speech_realtime_api/master/java-realtime-asr/src/main/java/com/baidu/ai/speech/realtime/full/download/Result.java",
+          "https://www.shangyun51.com/documentdetail?id=6414"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/baidu/config.rs:76-101",
+          "gateway/src/core/stt/baidu/config.rs:110-120",
+          "gateway/src/core/stt/baidu/client.rs:512-519"
+        ],
+        "unverified": [
+          "limits.max_session_ms and limits.rates (concurrent_sessions) of the streaming transport, and billing.bills_silence",
+          "whether the live service rejects the gateway's START frame (inferred from the official demo code)",
+          "billing.unit (per call for the file API and per hour for the socket, from an undated third-party mirror of the price list)",
+          "vendor_turn_signal of the streaming transport (the server cuts sentences and returns each with start and end times; how it decides the cut, and its silence threshold, are not stated in any source read)",
+          "limits.idle_timeout_ms of the streaming transport (a search excerpt says the connection is dropped with -3101 after 5 s without audio; the fact-check could not verify it)",
+          "limits.rates (concurrent_sessions) of the streaming transport (50 with a prepaid pack, from an undated third-party mirror; the default for other accounts is not published)"
+        ],
+        "notes": "Row key: Baidu's dev_pid, an integer on the wire. Real-time Mandarin with enhanced punctuation; the default in Baidu's official real-time demos (first-hand). It is not on the file API, so no segmented fallback exists; until the streaming client is repaired the model has no usable live path."
+      }
+    },
+    {
+      "id": "baidu:1537",
+      "match": {
+        "provider": "baidu",
+        "model": "1537"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "regional_rest",
+          "enabled_from_release": 5,
+          "disabled_reason": "Not implemented: no file-upload adapter for live calls exists for Baidu. The short-speech request code that exists has no caller.",
+          "enable_requires": [
+            "live_probe"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "The vendor publishes no absolute latency figure for the standard short-speech API."
+          },
+          "limits": {
+            "max_upload_bytes": null,
+            "max_audio_ms": 60000,
+            "min_audio_ms": null,
+            "rates": [
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 2,
+                "plan": null,
+                "scope": "application",
+                "note": "Counted per AppID across every caller. Search excerpts of the vendor's pages give 2 and 10 for accounts without a purchased pack and 50 with a prepaid pack; which figure applies to which account is unverified, so the lowest is recorded."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "upload": {
+            "accepted": [
+              "raw_pcm",
+              "wav"
+            ],
+            "preferred": {
+              "container": "raw_pcm",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "json_base64",
+            "vendor_params": [
+              {
+                "name": "format",
+                "value": "pcm",
+                "in": "json"
+              },
+              {
+                "name": "rate",
+                "value": "{sample_rate_hz}",
+                "in": "json"
+              },
+              {
+                "name": "channel",
+                "value": "1",
+                "in": "json"
+              }
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "engine_id",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [],
+            "wire": "baidu_server_api"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/baidu/client.rs:694-767; gateway/src/core/stt/baidu/messages.rs:208-275; gateway/src/core/stt/baidu/config.rs:404-410",
+            "notes": "JSON body with Base64 audio and an OAuth token. recognize_short_audio (client.rs:694-767) matches Baidu's official demo field for field but has no caller and targets server_api only; details are in the provider notes. An empty result and err_no 3301 (audio quality too poor) are normal no-speech outcomes, not errors."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "request_timeout_ms": 8000,
+            "rationale": "8000 ms is the audit's starting value, not a measurement; it replaces the client's 30 seconds and leaves room for cross-border network time. Raw PCM is preferred over WAV because the request states format and rate explicitly and every Baidu demo uses it. Audio is always sent at 16 kHz. A segment over 60 seconds is a hard error (err_no 3308)."
+          }
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": null,
+            "idle_timeout_ms": 5000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 50,
+                "plan": "prepaid",
+                "scope": "application",
+                "note": "With a prepaid pack ('supports 50 concurrent, expandable'), counted per AppID; from an undated third-party mirror of the price list. The default for other accounts is not published."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le"
+            ],
+            "sample_rates_hz": [
+              16000
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "engine_id",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [],
+            "wire": "baidu_realtime_ws"
+          },
+          "gateway_client": {
+            "status": "known_broken",
+            "defect": "Known broken against the vendor protocol: the START frame sends the API Key and Secret Key where the vendor expects an integer AppID and the API Key, so the client very probably cannot authenticate. Repair the client and check it against the live service before enabling.",
+            "code_ref": "gateway/src/core/stt/baidu/client.rs:512-519,658-664; gateway/src/core/stt/baidu/messages.rs:25-43,138; gateway/src/core/stt/baidu/config.rs:110-120",
+            "notes": "The defect list with line references is in the provider notes."
+          },
+          "billing": {
+            "unit": "audio_hour",
+            "min_billed_ms": null,
+            "bills_silence": true,
+            "notes": "Real-time socket: per hour of audio. Source: an undated third-party mirror of the price list."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "request",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "notes": "Short-speech file API: per call whatever the length. Source: an undated third-party mirror of the price list."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://raw.githubusercontent.com/Baidu-AIP/speech-demo/master/rest-api-asr/python/asr_json.py",
+          "https://raw.githubusercontent.com/Baidu-AIP/speech-demo/master/rest-api-asr/python/README.md",
+          "https://raw.githubusercontent.com/Baidu-AIP/speech_realtime_api/master/python-realtime-asr/const.py",
+          "https://raw.githubusercontent.com/Baidu-AIP/speech_realtime_api/master/python-realtime-asr/realtime_asr.py",
+          "https://raw.githubusercontent.com/Baidu-AIP/speech_realtime_api/master/java-realtime-asr/src/main/java/com/baidu/ai/speech/realtime/full/download/Result.java",
+          "https://www.shangyun51.com/documentdetail?id=10401",
+          "https://www.shangyun51.com/documentdetail?id=6414"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/baidu/config.rs:76-101",
+          "gateway/src/core/stt/baidu/config.rs:110-120",
+          "gateway/src/core/stt/baidu/client.rs:512-519",
+          "gateway/src/core/stt/baidu/client.rs:694-716"
+        ],
+        "unverified": [
+          "limits.max_session_ms and limits.rates (concurrent_sessions) of the streaming transport, and its billing.bills_silence",
+          "whether the live service rejects the gateway's START frame (inferred from the official demo code)",
+          "limits.max_upload_bytes of the file transport (a forum excerpt says only duration is limited)",
+          "limits.rates (concurrent_requests) of the file transport (excerpts give 2, 10 and 50 depending on the account)",
+          "limits.min_audio_ms and segment_profile.request_timeout_ms of the file transport",
+          "all latency figures, and current prices on Baidu's own site",
+          "that the real-time socket serves 1537 (search excerpt of the official model table only)",
+          "limits.max_audio_ms of the file transport (60 seconds comes from a third-party mirror and search excerpts of the official page and matches the gateway's own constant; it was not read first-hand)",
+          "billing.unit (per call for the file API and per hour for the socket, from an undated third-party mirror of the price list)",
+          "vendor_turn_signal of the streaming transport (the server cuts sentences and returns each with start and end times; how it decides the cut, and its silence threshold, are not stated in any source read)",
+          "limits.idle_timeout_ms of the streaming transport (a search excerpt says the connection is dropped with -3101 after 5 s without audio; the fact-check could not verify it)",
+          "limits.rates (concurrent_sessions) of the streaming transport (50 with a prepaid pack, from an undated third-party mirror; the default for other accounts is not published)"
+        ],
+        "notes": "Row key: Baidu's dev_pid, an integer on the wire. Mandarin; the gateway default. On the file API (server_api, first-hand) it returns punctuation; on the real-time socket the model table seen in a search excerpt lists it with weak or no punctuation and recommends 15372. Mandarin file results end with a full-width comma, which matters when the segments of one turn are joined."
+      }
+    },
+    {
+      "id": "baidu:1737",
+      "match": {
+        "provider": "baidu",
+        "model": "1737"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "regional_rest",
+          "enabled_from_release": 5,
+          "disabled_reason": "Not implemented: no file-upload adapter for live calls exists for Baidu. The short-speech request code that exists has no caller.",
+          "enable_requires": [
+            "live_probe"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "The vendor publishes no absolute latency figure for the standard short-speech API."
+          },
+          "limits": {
+            "max_upload_bytes": null,
+            "max_audio_ms": 60000,
+            "min_audio_ms": null,
+            "rates": [
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 2,
+                "plan": null,
+                "scope": "application",
+                "note": "Counted per AppID across every caller. Search excerpts of the vendor's pages give 2 and 10 for accounts without a purchased pack and 50 with a prepaid pack; which figure applies to which account is unverified, so the lowest is recorded."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "upload": {
+            "accepted": [
+              "raw_pcm",
+              "wav"
+            ],
+            "preferred": {
+              "container": "raw_pcm",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "json_base64",
+            "vendor_params": [
+              {
+                "name": "format",
+                "value": "pcm",
+                "in": "json"
+              },
+              {
+                "name": "rate",
+                "value": "{sample_rate_hz}",
+                "in": "json"
+              },
+              {
+                "name": "channel",
+                "value": "1",
+                "in": "json"
+              }
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "engine_id",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [],
+            "wire": "baidu_server_api"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/baidu/client.rs:694-767; gateway/src/core/stt/baidu/messages.rs:208-275; gateway/src/core/stt/baidu/config.rs:404-410",
+            "notes": "JSON body with Base64 audio and an OAuth token. recognize_short_audio (client.rs:694-767) matches Baidu's official demo field for field but has no caller and targets server_api only; details are in the provider notes. An empty result and err_no 3301 (audio quality too poor) are normal no-speech outcomes, not errors."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "request_timeout_ms": 8000,
+            "rationale": "8000 ms is the audit's starting value, not a measurement; it replaces the client's 30 seconds and leaves room for cross-border network time. Raw PCM is preferred over WAV because the request states format and rate explicitly and every Baidu demo uses it. Audio is always sent at 16 kHz. A segment over 60 seconds is a hard error (err_no 3308)."
+          }
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": null,
+            "idle_timeout_ms": 5000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 50,
+                "plan": "prepaid",
+                "scope": "application",
+                "note": "With a prepaid pack ('supports 50 concurrent, expandable'), counted per AppID; from an undated third-party mirror of the price list. The default for other accounts is not published."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le"
+            ],
+            "sample_rates_hz": [
+              16000
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "engine_id",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [],
+            "wire": "baidu_realtime_ws"
+          },
+          "gateway_client": {
+            "status": "known_broken",
+            "defect": "Known broken against the vendor protocol: the START frame sends the API Key and Secret Key where the vendor expects an integer AppID and the API Key, so the client very probably cannot authenticate. Whether the real-time socket serves this model at all is unverified. Repair the client and check it against the live service before enabling.",
+            "code_ref": "gateway/src/core/stt/baidu/client.rs:512-519,658-664; gateway/src/core/stt/baidu/messages.rs:25-43,138; gateway/src/core/stt/baidu/config.rs:110-120",
+            "notes": "The defect list with line references is in the provider notes."
+          },
+          "billing": {
+            "unit": "audio_hour",
+            "min_billed_ms": null,
+            "bills_silence": true,
+            "notes": "Real-time socket: per hour of audio. Source: an undated third-party mirror of the price list."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "request",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "notes": "Short-speech file API: per call whatever the length. Source: an undated third-party mirror of the price list."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://raw.githubusercontent.com/Baidu-AIP/speech-demo/master/rest-api-asr/python/README.md",
+          "https://raw.githubusercontent.com/Baidu-AIP/speech-demo/master/rest-api-asr/python/asr_json.py",
+          "https://www.shangyun51.com/documentdetail?id=10401",
+          "https://www.shangyun51.com/documentdetail?id=6414",
+          "https://raw.githubusercontent.com/Baidu-AIP/speech_realtime_api/master/python-realtime-asr/realtime_asr.py"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/baidu/config.rs:76-101",
+          "gateway/src/core/stt/baidu/config.rs:110-120",
+          "gateway/src/core/stt/baidu/client.rs:512-519",
+          "gateway/src/core/stt/baidu/client.rs:694-716"
+        ],
+        "unverified": [
+          "limits.max_upload_bytes of the file transport (a forum excerpt says only duration is limited)",
+          "limits.rates (concurrent_requests) of the file transport (excerpts give 2, 10 and 50 depending on the account)",
+          "limits.min_audio_ms and segment_profile.request_timeout_ms of the file transport",
+          "all latency figures, and current prices on Baidu's own site",
+          "limits.max_session_ms and limits.rates (concurrent_sessions) of the streaming transport, and its billing.bills_silence",
+          "whether the live service rejects the gateway's START frame (inferred from the official demo code)",
+          "whether the real-time socket serves 1737 (one search excerpt says the socket supports English models; no model table was read)",
+          "limits.max_audio_ms of the file transport (60 seconds comes from a third-party mirror and search excerpts of the official page and matches the gateway's own constant; it was not read first-hand)",
+          "billing.unit (per call for the file API and per hour for the socket, from an undated third-party mirror of the price list)",
+          "vendor_turn_signal of the streaming transport (the server cuts sentences and returns each with start and end times; how it decides the cut, and its silence threshold, are not stated in any source read)",
+          "limits.idle_timeout_ms of the streaming transport (a search excerpt says the connection is dropped with -3101 after 5 s without audio; the fact-check could not verify it)",
+          "limits.rates (concurrent_sessions) of the streaming transport (50 with a prepaid pack, from an undated third-party mirror; the default for other accounts is not published)"
+        ],
+        "notes": "Row key: Baidu's dev_pid, an integer on the wire. English, no punctuation, on the file API (server_api, first-hand). File upload is listed first because real-time support for this id is unverified."
+      }
+    },
+    {
+      "id": "baidu:15376",
+      "match": {
+        "provider": "baidu",
+        "model": "15376"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": null,
+            "idle_timeout_ms": 5000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 50,
+                "plan": "prepaid",
+                "scope": "application",
+                "note": "With a prepaid pack ('supports 50 concurrent, expandable'), counted per AppID; from an undated third-party mirror of the price list. The default for other accounts is not published."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le"
+            ],
+            "sample_rates_hz": [
+              16000
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "engine_id",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [],
+            "wire": "baidu_realtime_ws"
+          },
+          "gateway_client": {
+            "status": "known_broken",
+            "defect": "Known broken against the vendor protocol: the START frame sends the API Key and Secret Key where the vendor expects an integer AppID and the API Key, so the client very probably cannot authenticate. The client also cannot select this model: it silently replaces the id with 1537. This model also needs a 'user' field in the START frame, which the client does not send. Repair the client and check it against the live service before enabling.",
+            "code_ref": "gateway/src/core/stt/baidu/client.rs:512-519,658-664; gateway/src/core/stt/baidu/messages.rs:25-43,138; gateway/src/core/stt/baidu/config.rs:110-120",
+            "notes": "The defect list with line references is in the provider notes. This dev_pid is not in the client's model list (config.rs:76-101); from_str falls back to 1537 (config.rs:118)."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "audio_hour",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "Real-time socket: per hour of audio. Source: an undated third-party mirror of the price list."
+      },
+      "provenance": {
+        "confidence": "assumed",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://raw.githubusercontent.com/Baidu-AIP/speech_realtime_api/master/python-realtime-asr/realtime_asr.py",
+          "https://raw.githubusercontent.com/Baidu-AIP/speech_realtime_api/master/python-realtime-asr/const.py",
+          "https://www.shangyun51.com/documentdetail?id=6414"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/baidu/config.rs:76-101",
+          "gateway/src/core/stt/baidu/config.rs:110-120",
+          "gateway/src/core/stt/baidu/client.rs:512-519"
+        ],
+        "unverified": [
+          "limits.max_session_ms and limits.rates (concurrent_sessions) of the streaming transport, and billing.bills_silence",
+          "whether the live service rejects the gateway's START frame (inferred from the official demo code)",
+          "that the real-time socket serves 15376 and requires the 'user' field (two search excerpts of the official parameter table; the page was not read)",
+          "billing.unit (per call for the file API and per hour for the socket, from an undated third-party mirror of the price list)",
+          "vendor_turn_signal of the streaming transport (the server cuts sentences and returns each with start and end times; how it decides the cut, and its silence threshold, are not stated in any source read)",
+          "limits.idle_timeout_ms of the streaming transport (a search excerpt says the connection is dropped with -3101 after 5 s without audio; the fact-check could not verify it)",
+          "limits.rates (concurrent_sessions) of the streaming transport (50 with a prepaid pack, from an undated third-party mirror; the default for other accounts is not published)"
+        ],
+        "notes": "Row key: Baidu's dev_pid, an integer on the wire. Chinese multi-dialect real-time model. It is not on the file API, so no segmented fallback exists. Every fact about this model is second-hand, which is why the row is marked assumed."
+      }
+    },
+    {
+      "id": "baidu:80001",
+      "match": {
+        "provider": "baidu",
+        "model": "80001"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "regional_rest",
+          "enabled_from_release": 5,
+          "disabled_reason": "Not implemented: no file-upload adapter for live calls exists for Baidu. The short-speech request code that exists has no caller. That code targets the standard endpoint only, never pro_api.",
+          "enable_requires": [
+            "live_probe"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [
+              {
+                "percentile": "typical",
+                "quantity": "inference_only",
+                "value_ms": 500,
+                "basis": "vendor_claim",
+                "source": "https://cloud.baidu.com/product/speech/asrpro",
+                "conditions": "Audio of 5 seconds or less on the pro model, network time excluded. Seen only as an English paraphrase of the product page in a search excerpt; the original wording was not read."
+              }
+            ],
+            "notes": "The only figure is the second-hand product-page claim in measurements; it excludes network time and is not a basis for the segment deadline."
+          },
+          "limits": {
+            "max_upload_bytes": null,
+            "max_audio_ms": 60000,
+            "min_audio_ms": null,
+            "rates": [
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 2,
+                "plan": null,
+                "scope": "application",
+                "note": "Counted per AppID across every caller. Search excerpts of the vendor's pages give 2 and 10 for accounts without a purchased pack and 50 with a prepaid pack; which figure applies to which account is unverified, so the lowest is recorded."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "upload": {
+            "accepted": [
+              "raw_pcm",
+              "wav",
+              "m4a"
+            ],
+            "preferred": {
+              "container": "raw_pcm",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "json_base64",
+            "vendor_params": [
+              {
+                "name": "format",
+                "value": "pcm",
+                "in": "json"
+              },
+              {
+                "name": "rate",
+                "value": "{sample_rate_hz}",
+                "in": "json"
+              },
+              {
+                "name": "channel",
+                "value": "1",
+                "in": "json"
+              }
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "engine_id",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [
+              {
+                "kind": "vocabulary_id",
+                "wire_name": "lm_id",
+                "note": "Optional: a self-trained Mandarin language model on the pro interface."
+              }
+            ],
+            "wire": "baidu_pro_api"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/baidu/client.rs:694-767; gateway/src/core/stt/baidu/messages.rs:208-275; gateway/src/core/stt/baidu/config.rs:404-410",
+            "notes": "JSON body with Base64 audio and an OAuth token. recognize_short_audio (client.rs:694-767) matches Baidu's official demo field for field but has no caller and targets server_api only; details are in the provider notes. An empty result and err_no 3301 (audio quality too poor) are normal no-speech outcomes, not errors. This model is served only by https://vop.baidu.com/pro_api, accepts 16 kHz audio only, and needs a token whose scope includes brain_enhanced_asr (switched on in the Baidu console)."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "request_timeout_ms": 8000,
+            "rationale": "8000 ms is the audit's starting value, not a measurement; it replaces the client's 30 seconds and leaves room for cross-border network time. Raw PCM is preferred over WAV because the request states format and rate explicitly and every Baidu demo uses it. Audio is always sent at 16 kHz. A segment over 60 seconds is a hard error (err_no 3308)."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "streams_substituted_model",
+        "substituted_model": "1537",
+        "code_ref": "gateway/src/core/stt/baidu/config.rs:110-120 (from_str replaces an id it does not know with 1537 at :118; the streaming client then sends it)",
+        "refuse_from_release": null
+      },
+      "billing": {
+        "unit": "request",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "notes": "Short-speech file API: per call whatever the length. Source: an undated third-party mirror of the price list."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://raw.githubusercontent.com/Baidu-AIP/speech-demo/master/rest-api-asr/python/asr_json.py",
+          "https://raw.githubusercontent.com/Baidu-AIP/speech-demo/master/rest-api-asr/python/README.md",
+          "https://www.shangyun51.com/documentdetail?id=10400",
+          "https://www.shangyun51.com/documentdetail?id=6414"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/baidu/config.rs:76-101",
+          "gateway/src/core/stt/baidu/config.rs:110-120",
+          "gateway/src/core/stt/baidu/client.rs:694-716"
+        ],
+        "unverified": [
+          "limits.max_upload_bytes of the file transport (a forum excerpt says only duration is limited)",
+          "limits.rates (concurrent_requests) of the file transport (excerpts give 2, 10 and 50 depending on the account)",
+          "limits.min_audio_ms and segment_profile.request_timeout_ms of the file transport",
+          "all latency figures, and current prices on Baidu's own site",
+          "whether the real-time socket rejects 80001 (the official demo gives it its own endpoint and token scope, which is the basis for 'file only')",
+          "limits.max_audio_ms of the file transport (60 seconds comes from a third-party mirror and search excerpts of the official page and matches the gateway's own constant; it was not read first-hand)",
+          "billing.unit (per call for the file API and per hour for the socket, from an undated third-party mirror of the price list)"
+        ],
+        "notes": "Row key: Baidu's dev_pid, an integer on the wire. File-only model: the pro (极速版) Mandarin short-speech model, served only by pro_api. First-hand: the official demo gives it its own endpoint and its own token scope, brain_enhanced_asr. It needs segmentation. Today the gateway silently replaces the id with 1537 (gateway/src/core/stt/baidu/config.rs:118)."
+      }
+    },
+    {
+      "id": "baidu:1637",
+      "match": {
+        "provider": "baidu",
+        "model": "1637"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "regional_rest",
+          "enabled_from_release": 5,
+          "disabled_reason": "Not implemented: no file-upload adapter for live calls exists for Baidu. The short-speech request code that exists has no caller.",
+          "enable_requires": [
+            "live_probe"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "The vendor publishes no absolute latency figure for the standard short-speech API."
+          },
+          "limits": {
+            "max_upload_bytes": null,
+            "max_audio_ms": 60000,
+            "min_audio_ms": null,
+            "rates": [
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 2,
+                "plan": null,
+                "scope": "application",
+                "note": "Counted per AppID across every caller. Search excerpts of the vendor's pages give 2 and 10 for accounts without a purchased pack and 50 with a prepaid pack; which figure applies to which account is unverified, so the lowest is recorded."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "upload": {
+            "accepted": [
+              "raw_pcm",
+              "wav"
+            ],
+            "preferred": {
+              "container": "raw_pcm",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "json_base64",
+            "vendor_params": [
+              {
+                "name": "format",
+                "value": "pcm",
+                "in": "json"
+              },
+              {
+                "name": "rate",
+                "value": "{sample_rate_hz}",
+                "in": "json"
+              },
+              {
+                "name": "channel",
+                "value": "1",
+                "in": "json"
+              }
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "engine_id",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [],
+            "wire": "baidu_server_api"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/baidu/client.rs:694-767; gateway/src/core/stt/baidu/messages.rs:208-275; gateway/src/core/stt/baidu/config.rs:404-410",
+            "notes": "JSON body with Base64 audio and an OAuth token. recognize_short_audio (client.rs:694-767) matches Baidu's official demo field for field but has no caller and targets server_api only; details are in the provider notes. An empty result and err_no 3301 (audio quality too poor) are normal no-speech outcomes, not errors."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "request_timeout_ms": 8000,
+            "rationale": "8000 ms is the audit's starting value, not a measurement; it replaces the client's 30 seconds and leaves room for cross-border network time. Raw PCM is preferred over WAV because the request states format and rate explicitly and every Baidu demo uses it. Audio is always sent at 16 kHz. A segment over 60 seconds is a hard error (err_no 3308)."
+          }
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": null,
+            "idle_timeout_ms": 5000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 50,
+                "plan": "prepaid",
+                "scope": "application",
+                "note": "With a prepaid pack ('supports 50 concurrent, expandable'), counted per AppID; from an undated third-party mirror of the price list. The default for other accounts is not published."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le"
+            ],
+            "sample_rates_hz": [
+              16000
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "engine_id",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [],
+            "wire": "baidu_realtime_ws"
+          },
+          "gateway_client": {
+            "status": "known_broken",
+            "defect": "Known broken against the vendor protocol: the START frame sends the API Key and Secret Key where the vendor expects an integer AppID and the API Key, so the client very probably cannot authenticate. Whether the real-time socket serves this model at all is unverified. Repair the client and check it against the live service before enabling.",
+            "code_ref": "gateway/src/core/stt/baidu/client.rs:512-519,658-664; gateway/src/core/stt/baidu/messages.rs:25-43,138; gateway/src/core/stt/baidu/config.rs:110-120",
+            "notes": "The defect list with line references is in the provider notes."
+          },
+          "billing": {
+            "unit": "audio_hour",
+            "min_billed_ms": null,
+            "bills_silence": true,
+            "notes": "Real-time socket: per hour of audio. Source: an undated third-party mirror of the price list."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "request",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "notes": "Short-speech file API: per call whatever the length. Source: an undated third-party mirror of the price list."
+      },
+      "provenance": {
+        "confidence": "assumed",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://www.shangyun51.com/documentdetail?id=10401",
+          "https://raw.githubusercontent.com/Baidu-AIP/speech-demo/master/rest-api-asr/python/asr_json.py",
+          "https://www.shangyun51.com/documentdetail?id=6414"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/baidu/config.rs:76-101",
+          "gateway/src/core/stt/baidu/config.rs:110-120",
+          "gateway/src/core/stt/baidu/client.rs:512-519",
+          "gateway/src/core/stt/baidu/client.rs:694-716"
+        ],
+        "unverified": [
+          "limits.max_upload_bytes of the file transport (a forum excerpt says only duration is limited)",
+          "limits.rates (concurrent_requests) of the file transport (excerpts give 2, 10 and 50 depending on the account)",
+          "limits.min_audio_ms and segment_profile.request_timeout_ms of the file transport",
+          "all latency figures, and current prices on Baidu's own site",
+          "limits.max_session_ms and limits.rates (concurrent_sessions) of the streaming transport, and its billing.bills_silence",
+          "whether the live service rejects the gateway's START frame (inferred from the official demo code)",
+          "that the file API serves this id (third-party mirror and a search excerpt of the official table; consistent, not first-hand)",
+          "whether the real-time socket serves or rejects this id (no source shows the socket's full model table)",
+          "limits.max_audio_ms of the file transport (60 seconds comes from a third-party mirror and search excerpts of the official page and matches the gateway's own constant; it was not read first-hand)",
+          "billing.unit (per call for the file API and per hour for the socket, from an undated third-party mirror of the price list)",
+          "vendor_turn_signal of the streaming transport (the server cuts sentences and returns each with start and end times; how it decides the cut, and its silence threshold, are not stated in any source read)",
+          "limits.idle_timeout_ms of the streaming transport (a search excerpt says the connection is dropped with -3101 after 5 s without audio; the fact-check could not verify it)",
+          "limits.rates (concurrent_sessions) of the streaming transport (50 with a prepaid pack, from an undated third-party mirror; the default for other accounts is not published)"
+        ],
+        "notes": "Row key: Baidu's dev_pid, an integer on the wire. Cantonese with punctuation, documented on the file API (server_api). Whether it needs segmentation is unverified: it does only if the real-time socket rejects the id, which is why file upload is listed first. The gateway sends this id on the socket today. Every fact about this model is second-hand, which is why the row is marked assumed."
+      }
+    },
+    {
+      "id": "baidu:1837",
+      "match": {
+        "provider": "baidu",
+        "model": "1837"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "regional_rest",
+          "enabled_from_release": 5,
+          "disabled_reason": "Not implemented: no file-upload adapter for live calls exists for Baidu. The short-speech request code that exists has no caller.",
+          "enable_requires": [
+            "live_probe"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "The vendor publishes no absolute latency figure for the standard short-speech API."
+          },
+          "limits": {
+            "max_upload_bytes": null,
+            "max_audio_ms": 60000,
+            "min_audio_ms": null,
+            "rates": [
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 2,
+                "plan": null,
+                "scope": "application",
+                "note": "Counted per AppID across every caller. Search excerpts of the vendor's pages give 2 and 10 for accounts without a purchased pack and 50 with a prepaid pack; which figure applies to which account is unverified, so the lowest is recorded."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "upload": {
+            "accepted": [
+              "raw_pcm",
+              "wav"
+            ],
+            "preferred": {
+              "container": "raw_pcm",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "json_base64",
+            "vendor_params": [
+              {
+                "name": "format",
+                "value": "pcm",
+                "in": "json"
+              },
+              {
+                "name": "rate",
+                "value": "{sample_rate_hz}",
+                "in": "json"
+              },
+              {
+                "name": "channel",
+                "value": "1",
+                "in": "json"
+              }
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "engine_id",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [],
+            "wire": "baidu_server_api"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/baidu/client.rs:694-767; gateway/src/core/stt/baidu/messages.rs:208-275; gateway/src/core/stt/baidu/config.rs:404-410",
+            "notes": "JSON body with Base64 audio and an OAuth token. recognize_short_audio (client.rs:694-767) matches Baidu's official demo field for field but has no caller and targets server_api only; details are in the provider notes. An empty result and err_no 3301 (audio quality too poor) are normal no-speech outcomes, not errors."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "request_timeout_ms": 8000,
+            "rationale": "8000 ms is the audit's starting value, not a measurement; it replaces the client's 30 seconds and leaves room for cross-border network time. Raw PCM is preferred over WAV because the request states format and rate explicitly and every Baidu demo uses it. Audio is always sent at 16 kHz. A segment over 60 seconds is a hard error (err_no 3308)."
+          }
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": null,
+            "idle_timeout_ms": 5000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 50,
+                "plan": "prepaid",
+                "scope": "application",
+                "note": "With a prepaid pack ('supports 50 concurrent, expandable'), counted per AppID; from an undated third-party mirror of the price list. The default for other accounts is not published."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le"
+            ],
+            "sample_rates_hz": [
+              16000
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "engine_id",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [],
+            "wire": "baidu_realtime_ws"
+          },
+          "gateway_client": {
+            "status": "known_broken",
+            "defect": "Known broken against the vendor protocol: the START frame sends the API Key and Secret Key where the vendor expects an integer AppID and the API Key, so the client very probably cannot authenticate. Whether the real-time socket serves this model at all is unverified. Repair the client and check it against the live service before enabling.",
+            "code_ref": "gateway/src/core/stt/baidu/client.rs:512-519,658-664; gateway/src/core/stt/baidu/messages.rs:25-43,138; gateway/src/core/stt/baidu/config.rs:110-120",
+            "notes": "The defect list with line references is in the provider notes."
+          },
+          "billing": {
+            "unit": "audio_hour",
+            "min_billed_ms": null,
+            "bills_silence": true,
+            "notes": "Real-time socket: per hour of audio. Source: an undated third-party mirror of the price list."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "request",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "notes": "Short-speech file API: per call whatever the length. Source: an undated third-party mirror of the price list."
+      },
+      "provenance": {
+        "confidence": "assumed",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://www.shangyun51.com/documentdetail?id=10401",
+          "https://raw.githubusercontent.com/Baidu-AIP/speech-demo/master/rest-api-asr/python/asr_json.py",
+          "https://www.shangyun51.com/documentdetail?id=6414"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/baidu/config.rs:76-101",
+          "gateway/src/core/stt/baidu/config.rs:110-120",
+          "gateway/src/core/stt/baidu/client.rs:512-519",
+          "gateway/src/core/stt/baidu/client.rs:694-716"
+        ],
+        "unverified": [
+          "limits.max_upload_bytes of the file transport (a forum excerpt says only duration is limited)",
+          "limits.rates (concurrent_requests) of the file transport (excerpts give 2, 10 and 50 depending on the account)",
+          "limits.min_audio_ms and segment_profile.request_timeout_ms of the file transport",
+          "all latency figures, and current prices on Baidu's own site",
+          "limits.max_session_ms and limits.rates (concurrent_sessions) of the streaming transport, and its billing.bills_silence",
+          "whether the live service rejects the gateway's START frame (inferred from the official demo code)",
+          "that the file API serves this id (third-party mirror and a search excerpt of the official table; consistent, not first-hand)",
+          "whether the real-time socket serves or rejects this id (no source shows the socket's full model table)",
+          "limits.max_audio_ms of the file transport (60 seconds comes from a third-party mirror and search excerpts of the official page and matches the gateway's own constant; it was not read first-hand)",
+          "billing.unit (per call for the file API and per hour for the socket, from an undated third-party mirror of the price list)",
+          "vendor_turn_signal of the streaming transport (the server cuts sentences and returns each with start and end times; how it decides the cut, and its silence threshold, are not stated in any source read)",
+          "limits.idle_timeout_ms of the streaming transport (a search excerpt says the connection is dropped with -3101 after 5 s without audio; the fact-check could not verify it)",
+          "limits.rates (concurrent_sessions) of the streaming transport (50 with a prepaid pack, from an undated third-party mirror; the default for other accounts is not published)"
+        ],
+        "notes": "Row key: Baidu's dev_pid, an integer on the wire. Sichuan dialect with punctuation, documented on the file API (server_api). Whether it needs segmentation is unverified: it does only if the real-time socket rejects the id, which is why file upload is listed first. The gateway sends this id on the socket today. Every fact about this model is second-hand, which is why the row is marked assumed."
+      }
+    },
+    {
+      "id": "baidu:1936",
+      "match": {
+        "provider": "baidu",
+        "model": "1936"
+      },
+      "lifecycle": {
+        "status": "retired",
+        "deprecated_on": "2024-11-21",
+        "shutdown_on": "2024-12-23",
+        "replacement": [
+          "15372",
+          "1537"
+        ]
+      },
+      "transports": [],
+      "when_unusable": {
+        "today": "unknown",
+        "refuse_from_release": 0,
+        "refusal": {
+          "code": "stt_model_retired",
+          "text": "Baidu stopped its far-field speech recognition on 2024-12-23, so this model can no longer be used. Choose one of Baidu's current Mandarin models."
+        }
+      },
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "Retired model; billing was not researched."
+      },
+      "provenance": {
+        "confidence": "assumed",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://www.shangyun51.com/documentdetail?id=10401"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/baidu/config.rs:76-101",
+          "gateway/src/core/stt/baidu/config.rs:110-120"
+        ],
+        "unverified": [
+          "lifecycle.deprecated_on and lifecycle.shutdown_on (search excerpt of the official notice at ai.baidu.com/support/news?action=detail&id=3224, dated 2024-11-21, which says far-field recognition stops on 2024-12-23; the notice itself could not be fetched, so it is not listed under sources)",
+          "whether 1936 is still in the file-API model table"
+        ],
+        "notes": "Row key: Baidu's dev_pid, an integer on the wire. Far-field Mandarin. The id is still in the gateway's model list and plugin metadata (gateway/src/plugin/builtin/mod.rs:434) and should be removed. The notice recommends real-time Mandarin or short speech instead, hence the replacement ids. The real-time far-field id 19362 has its own retired row. Earlier refusal wording (engineering note, replaced 2026-10-04 by customer text): Baidu announced that far-field speech recognition stopped on 2024-12-23, so this model is treated as retired and must be refused at session setup with the replacement ids."
+      }
+    },
+    {
+      "id": "baidu:8001",
+      "match": {
+        "provider": "baidu",
+        "model": "8001"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "regional_rest",
+          "enabled_from_release": 5,
+          "disabled_reason": "Not implemented: no file-upload adapter for live calls exists for Baidu. The short-speech request code that exists has no caller. This model also needs an lm_id, which only the uncalled request code can send.",
+          "enable_requires": [
+            "live_probe"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "The vendor publishes no absolute latency figure for the standard short-speech API."
+          },
+          "limits": {
+            "max_upload_bytes": null,
+            "max_audio_ms": 60000,
+            "min_audio_ms": null,
+            "rates": [
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 2,
+                "plan": null,
+                "scope": "application",
+                "note": "Counted per AppID across every caller. Search excerpts of the vendor's pages give 2 and 10 for accounts without a purchased pack and 50 with a prepaid pack; which figure applies to which account is unverified, so the lowest is recorded."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "upload": {
+            "accepted": [
+              "raw_pcm",
+              "wav"
+            ],
+            "preferred": {
+              "container": "raw_pcm",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "json_base64",
+            "vendor_params": [
+              {
+                "name": "format",
+                "value": "pcm",
+                "in": "json"
+              },
+              {
+                "name": "rate",
+                "value": "{sample_rate_hz}",
+                "in": "json"
+              },
+              {
+                "name": "channel",
+                "value": "1",
+                "in": "json"
+              }
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "engine_id",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [
+              {
+                "kind": "vocabulary_id",
+                "wire_name": "lm_id",
+                "note": "Required: the id of the customer's self-trained Mandarin language model, set per deployment."
+              }
+            ],
+            "wire": "baidu_server_api"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/baidu/client.rs:694-767; gateway/src/core/stt/baidu/messages.rs:208-275; gateway/src/core/stt/baidu/config.rs:404-410",
+            "notes": "JSON body with Base64 audio and an OAuth token. recognize_short_audio (client.rs:694-767) matches Baidu's official demo field for field but has no caller and targets server_api only; details are in the provider notes. An empty result and err_no 3301 (audio quality too poor) are normal no-speech outcomes, not errors. This model also needs the customer's lm_id in the request. recognize_short_audio adds lm_id when it is configured (client.rs:712-716), but the client's model list has no 8001, so today it would send dev_pid 1537 with that lm_id."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "request_timeout_ms": 8000,
+            "rationale": "8000 ms is the audit's starting value, not a measurement; it replaces the client's 30 seconds and leaves room for cross-border network time. Raw PCM is preferred over WAV because the request states format and rate explicitly and every Baidu demo uses it. Audio is always sent at 16 kHz. A segment over 60 seconds is a hard error (err_no 3308)."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "streams_substituted_model",
+        "substituted_model": "1537",
+        "code_ref": "gateway/src/core/stt/baidu/config.rs:110-120 (from_str replaces an id it does not know with 1537 at :118; the streaming client then sends it)",
+        "refuse_from_release": null
+      },
+      "billing": {
+        "unit": "request",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "notes": "Short-speech file API: per call whatever the length. Source: an undated third-party mirror of the price list, which does not single out self-trained models."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://raw.githubusercontent.com/Baidu-AIP/speech-demo/master/rest-api-asr/python/asr_json.py",
+          "https://raw.githubusercontent.com/Baidu-AIP/speech-demo/master/rest-api-asr/python/README.md",
+          "https://www.shangyun51.com/documentdetail?id=6414"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/baidu/config.rs:76-101",
+          "gateway/src/core/stt/baidu/config.rs:110-120",
+          "gateway/src/core/stt/baidu/client.rs:694-716"
+        ],
+        "unverified": [
+          "whether the real-time socket accepts 8001 (a search excerpt lists lm_id as an optional real-time parameter, without saying which dev_pid goes with it); no streaming transport is listed for that reason",
+          "limits.max_upload_bytes of the file transport (a forum excerpt says only duration is limited)",
+          "limits.rates (concurrent_requests) of the file transport (excerpts give 2, 10 and 50 depending on the account)",
+          "limits.min_audio_ms and segment_profile.request_timeout_ms of the file transport",
+          "all latency figures, and current prices on Baidu's own site",
+          "whether self-trained models are billed at the standard short-speech rate",
+          "limits.max_audio_ms of the file transport (60 seconds comes from a third-party mirror and search excerpts of the official page and matches the gateway's own constant; it was not read first-hand)",
+          "billing.unit (per call for the file API and per hour for the socket, from an undated third-party mirror of the price list)"
+        ],
+        "notes": "Row key: Baidu's dev_pid, an integer on the wire. The dev_pid of a customer's self-trained Mandarin language model on the standard file API (server_api); the model itself is chosen by lm_id, a per-deployment setting recorded as a vocabulary_id context field of the file transport. First-hand: the official REST demo says a self-trained model is called with dev_pid 8001 and its lm_id (and with 80001 and lm_id on pro_api, which follows the 80001 row). Listed as file upload only because nothing shows this id on the real-time socket. Today the gateway silently replaces the id with 1537 (gateway/src/core/stt/baidu/config.rs:118)."
+      }
+    },
+    {
+      "id": "baidu:19362",
+      "match": {
+        "provider": "baidu",
+        "model": "19362"
+      },
+      "lifecycle": {
+        "status": "retired",
+        "deprecated_on": "2024-11-21",
+        "shutdown_on": "2024-12-23",
+        "replacement": [
+          "15372",
+          "1537"
+        ]
+      },
+      "transports": [],
+      "when_unusable": {
+        "today": "streams_substituted_model",
+        "substituted_model": "1537",
+        "code_ref": "gateway/src/core/stt/baidu/config.rs:110-120 (from_str replaces an id it does not know with 1537 at :118)",
+        "refuse_from_release": 3,
+        "refusal": {
+          "code": "stt_model_retired",
+          "text": "Baidu stopped its far-field speech recognition on 2024-12-23, so this real-time far-field model can no longer be used. Choose one of Baidu's current real-time Mandarin models."
+        }
+      },
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "Retired model; billing was not researched."
+      },
+      "provenance": {
+        "confidence": "assumed",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://raw.githubusercontent.com/Baidu-AIP/speech_realtime_api/master/python-realtime-asr/const.py"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/baidu/config.rs:76-101",
+          "gateway/src/core/stt/baidu/config.rs:110-120"
+        ],
+        "unverified": [
+          "lifecycle.deprecated_on and lifecycle.shutdown_on (search excerpt of the official notice at ai.baidu.com/support/news?action=detail&id=3224, dated 2024-11-21, which says far-field recognition stops on 2024-12-23; the notice itself could not be fetched, so it is not listed under sources)",
+          "whether the real-time socket still accepts this id"
+        ],
+        "notes": "Row key: Baidu's dev_pid, an integer on the wire. Far-field Mandarin on the real-time socket. The id is first-hand: Baidu's official real-time demo names it in a comment as an alternative model. Its retirement is second-hand, which is why the row is marked assumed. The id is not in the gateway's model list, so today the client silently replaces it with 1537 (gateway/src/core/stt/baidu/config.rs:118). The notice recommends real-time Mandarin or short speech instead, hence the replacement ids. Earlier refusal wording (engineering note, replaced 2026-10-04 by customer text): Baidu announced that far-field speech recognition stopped on 2024-12-23, so this real-time far-field model is treated as retired and must be refused at session setup with the replacement ids. Refusal moved from Release 0 to Release 3 on 2026-10-04: a session on this model starts today (today's client serves a different model), and integration decision 12 warns such sessions in Releases 0 to 2 and refuses them from Release 3."
+      }
+    },
+    {
+      "id": "baidu:any",
+      "match": {
+        "provider": "baidu",
+        "model_glob": "*"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "regional_rest",
+          "enabled_from_release": 5,
+          "disabled_reason": "Not implemented: no file-upload adapter for live calls exists for Baidu. The short-speech request code that exists has no caller. The vendor may reject an unknown model id.",
+          "enable_requires": [
+            "live_probe"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "The vendor publishes no absolute latency figure for the standard short-speech API."
+          },
+          "limits": {
+            "max_upload_bytes": null,
+            "max_audio_ms": 60000,
+            "min_audio_ms": null,
+            "rates": [
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 2,
+                "plan": null,
+                "scope": "application",
+                "note": "Counted per AppID across every caller. Search excerpts of the vendor's pages give 2 and 10 for accounts without a purchased pack and 50 with a prepaid pack; which figure applies to which account is unverified, so the lowest is recorded."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "upload": {
+            "accepted": [
+              "raw_pcm",
+              "wav"
+            ],
+            "preferred": {
+              "container": "raw_pcm",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "json_base64",
+            "vendor_params": [
+              {
+                "name": "format",
+                "value": "pcm",
+                "in": "json"
+              },
+              {
+                "name": "rate",
+                "value": "{sample_rate_hz}",
+                "in": "json"
+              },
+              {
+                "name": "channel",
+                "value": "1",
+                "in": "json"
+              }
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "engine_id",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [],
+            "wire": "baidu_server_api"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/baidu/client.rs:694-767; gateway/src/core/stt/baidu/messages.rs:208-275; gateway/src/core/stt/baidu/config.rs:404-410",
+            "notes": "JSON body with Base64 audio and an OAuth token. recognize_short_audio (client.rs:694-767) matches Baidu's official demo field for field but has no caller and targets server_api only; details are in the provider notes. An empty result and err_no 3301 (audio quality too poor) are normal no-speech outcomes, not errors."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "request_timeout_ms": 8000,
+            "rationale": "8000 ms is the audit's starting value, not a measurement; it replaces the client's 30 seconds and leaves room for cross-border network time. Raw PCM is preferred over WAV because the request states format and rate explicitly and every Baidu demo uses it. Audio is always sent at 16 kHz. A segment over 60 seconds is a hard error (err_no 3308)."
+          }
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": null,
+            "idle_timeout_ms": 5000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 50,
+                "plan": "prepaid",
+                "scope": "application",
+                "note": "With a prepaid pack ('supports 50 concurrent, expandable'), counted per AppID; from an undated third-party mirror of the price list. The default for other accounts is not published."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le"
+            ],
+            "sample_rates_hz": [
+              16000
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "engine_id",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "context_params": [],
+            "wire": "baidu_realtime_ws"
+          },
+          "gateway_client": {
+            "status": "known_broken",
+            "defect": "Known broken against the vendor protocol: the START frame sends the API Key and Secret Key where the vendor expects an integer AppID and the API Key, so the client very probably cannot authenticate. A model id the client does not know is silently replaced by 1537. Repair the client and check it against the live service before enabling.",
+            "code_ref": "gateway/src/core/stt/baidu/client.rs:512-519,658-664; gateway/src/core/stt/baidu/messages.rs:25-43,138; gateway/src/core/stt/baidu/config.rs:110-120",
+            "notes": "The defect list with line references is in the provider notes. from_str falls back to 1537 for any id it does not know (config.rs:118)."
+          },
+          "billing": {
+            "unit": "audio_hour",
+            "min_billed_ms": null,
+            "bills_silence": true,
+            "notes": "Unknown model: the real-time socket bills per hour of audio."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "request",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "notes": "Unknown model: the file API bills per call whatever the length."
+      },
+      "provenance": {
+        "confidence": "assumed",
+        "verified_on": "2026-10-03",
+        "verified_by": "none",
+        "owner": "waav-gateway",
+        "sources": [],
+        "code_refs": [
+          "gateway/src/core/stt/baidu/config.rs:76-101",
+          "gateway/src/core/stt/baidu/config.rs:110-120",
+          "gateway/src/core/stt/baidu/client.rs:512-519",
+          "gateway/src/core/stt/baidu/client.rs:694-716"
+        ],
+        "unverified": [
+          "every field: this row is a guess for a model id the map has never seen",
+          "limits.idle_timeout_ms of the streaming transport (a search excerpt says the connection is dropped with -3101 after 5 s without audio; the fact-check could not verify it)",
+          "limits.rates (concurrent_sessions) of the streaming transport (50 with a prepaid pack, from an undated third-party mirror; the default for other accounts is not published)"
+        ],
+        "notes": "Fail-slow default: Baidu has a planned file-upload adapter, so an unknown model id is assumed to need file upload on server_api. Two ids were left without an exact row because no source confirms them, and they land here: 17372 (named once as a real-time English id; if it exists it is a socket-only id, so file upload would be the wrong guess for it) and 1536 (a legacy Mandarin id still in the gateway's model list, absent from the current tables). The gateway sends 1536 verbatim on the socket today (gateway/src/core/stt/baidu/config.rs:76-101) and its plugin metadata advertises it (gateway/src/plugin/builtin/mod.rs:434); confirm it against the live service and give it an exact row, or remove it from the gateway's model list and metadata."
+      }
+    }
+  ]
+}

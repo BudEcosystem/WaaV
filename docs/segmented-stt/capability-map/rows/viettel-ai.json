@@ -1,0 +1,237 @@
+{
+  "provider_id": "viettel-ai",
+  "provider": {
+    "aliases": [
+      "viettel_ai",
+      "viettelai",
+      "viettel",
+      "vtai",
+      "viettel-stt",
+      "viettel_ai-stt"
+    ],
+    "default_model": null,
+    "model_string": "absent",
+    "registered_in_gateway": true,
+    "notes": "Registry id and aliases: gateway/src/plugin/builtin/mod.rs:1804-1805; the standardized factory that live sessions use accepts viettel-ai, viettel_ai, viettelai and viettel (gateway/src/core/stt/standard.rs:468-470). The vendor does stream (a documented WebSocket), but the gateway cannot: its only client is an HTTP client that buffers the call until 9.6 MB, hang-up or a client commit (client.rs:388-423), and it is not a transport. Nothing works today: that client posts to a host the vendor no longer controls and misreads the vendor's current reply, so the provider cannot serve a call or a file. Security fix needed regardless of this work: the speech-to-text and text-to-speech clients send the customer token and call audio to viettelgroup.ai (gateway/src/core/stt/viettel_ai/config.rs:40; gateway/src/core/tts/viettel_ai/config.rs:41, :44), a domain that the registry shows was newly registered through a privacy proxy on 2025-11-14 and is no longer the vendor's. The server has no credential mapping for this provider (gateway/src/config/mod.rs:679). Vietnamese only."
+  },
+  "rows": [
+    {
+      "id": "viettel-ai:any",
+      "match": {
+        "provider": "viettel-ai",
+        "model_glob": "*"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "regional_rest",
+          "enabled_from_release": 5,
+          "disabled_reason": "No file-upload adapter for live calls exists (not implemented), and the evidence says the vendor's file endpoint is far too slow for conversation: the vendor states about 30 seconds per file, and anonymous probes took 15.7 s and 22.5 s for a 3 s clip. Enable only if latency measured with a paid token meets the segment deadline. The existing HTTP client cannot be reused as it is: it posts to a retired host the vendor no longer controls and misreads the current reply.",
+          "enable_requires": [
+            "live_probe",
+            "latency_within_deadline"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "slow",
+            "measurements": [
+              {
+                "percentile": "mean",
+                "quantity": "request_round_trip",
+                "value_ms": 30000,
+                "basis": "vendor_claim",
+                "source": "https://viettelai.vn/",
+                "conditions": "The vendor's consumer-page FAQ: 'On average, processing takes about 30 seconds per audio file', for files of unstated length. Not an API commitment."
+              },
+              {
+                "percentile": "single_sample",
+                "quantity": "request_round_trip",
+                "value_ms": 15700,
+                "basis": "own_probe",
+                "source": "providers/viettel-ai.md:194",
+                "measured_on": "2026-10-03",
+                "conditions": "3 s of synthetic audio, 16 kHz mono WAV, anonymous request (no token), cold connection; time to first byte."
+              },
+              {
+                "percentile": "single_sample",
+                "quantity": "request_round_trip",
+                "value_ms": 22500,
+                "basis": "own_probe",
+                "source": "providers/viettel-ai.md:195",
+                "measured_on": "2026-10-03",
+                "conditions": "The same 3 s clip on a reused connection, anonymous; time to first byte."
+              },
+              {
+                "percentile": "single_sample",
+                "quantity": "request_round_trip",
+                "value_ms": 2600,
+                "basis": "own_probe",
+                "source": "providers/viettel-ai.md:192",
+                "measured_on": "2026-10-03",
+                "conditions": "0.5 s of digital silence, anonymous; the whole request including connection setup."
+              },
+              {
+                "percentile": "single_sample",
+                "quantity": "request_round_trip",
+                "value_ms": 9200,
+                "basis": "own_probe",
+                "source": "providers/viettel-ai.md:193",
+                "measured_on": "2026-10-03",
+                "conditions": "0.5 s of digital silence, anonymous."
+              },
+              {
+                "percentile": "single_sample",
+                "quantity": "request_round_trip",
+                "value_ms": 5900,
+                "basis": "own_probe",
+                "source": "verify/group-10.md:145",
+                "measured_on": "2026-10-03",
+                "conditions": "0.5 s of digital silence, anonymous (the fact-check's probe)."
+              }
+            ],
+            "notes": "Every figure is for an anonymous request; latency with a paid token is unmeasured, and anonymous requests may be given lower priority. No observation came near the 1.2 s boundary of the fast class. Enable only if a measurement with a paid token shows the transport answers within the segment deadline."
+          },
+          "limits": {
+            "max_upload_bytes": null,
+            "max_audio_ms": null,
+            "min_audio_ms": null,
+            "rates": [
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 15,
+                "plan": null,
+                "scope": "unknown",
+                "note": "max_coeval_request in the vendor's package data. The pricing page hides it for speech-to-text, and the same data sets the daily request limit equal to the package's seconds, so it may be a placeholder."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "upload": {
+            "accepted": [
+              "wav"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "multipart"
+          },
+          "quality_signals": [
+            "utterance_confidence",
+            "word_confidence"
+          ],
+          "dialect": {
+            "language_param": null,
+            "context_params": [],
+            "wire": "viettel_recognize_multipart"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/viettel_ai/client.rs:114-238 (existing request code, broken); gateway/src/core/stt/viettel_ai/config.rs:40, :183-211",
+            "notes": "Current vendor interface (documented and probed): POST https://viettelai.vn/asr/recognize, multipart fields file and token; reply {code, message, response.result[]} with transcript, confidence, word_alignment[] (word, beg, end, confidence) and segment; errors use {code, en_message, vi_message}; an invalid token returns HTTP 404. The existing client (ViettelStt::process_audio) does not match it: it posts to https://viettelgroup.ai/voice/api/asr/v1/rest/decode_file (config.rs:40), a domain re-registered by a third party on 2025-11-14 that does not resolve today; it sends the token as a header, which the current endpoint ignores (client.rs:157); and its parser expects {status, result} (config.rs:183-211), so a real success reads as an empty transcript and is dropped (inferred from reading, not run). It also hard-codes confidence 0.96 (client.rs:267), has no circuit breaker, never invokes its error callback and forwards any model string as an asr_model header the vendor does not define (client.rs:166-168). Its only test checks the gateway's assumed reply against the gateway's own mock (gateway/tests/mock_endpoint_e2e.rs:1031-1054). On non-speech audio the vendor returned an invented word with confidence 0.007, so a confidence floor is the natural filter here."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "request_timeout_ms": 30000,
+            "rationale": "Provisional. Every anonymous probe that carried audio took longer than a normal conversational budget (15.7 s and 22.5 s for 3 s of audio) and the vendor cites about 30 seconds per file, so a shorter timeout would fail every request. Replace it with the measured P99 plus a margin once a paid token is available; if that number is not within the segment deadline, do not enable this transport. All other settings stay at the gateway defaults: the vendor documents no limit, no minimum billing and no concurrency figure for speech-to-text."
+          }
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "planned_stream",
+          "enabled_from_release": null,
+          "disabled_reason": "The gateway has no streaming client for this vendor (not implemented). The vendor documents a live WebSocket interface, which is the right primary path for calls; once a client is built and its message format is confirmed with a valid token, this transport should be moved ahead of the file upload.",
+          "interim_results": "unknown",
+          "endpointing_owner": "either",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": null,
+            "rates": []
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": null,
+            "context_params": [],
+            "wire": "viettel_decode_online_ws"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "notes": "The provider directory holds only an HTTP client (client.rs, config.rs, mod.rs, tests.rs). Vendor interface as documented: wss://viettelai.vn/websocket/asr/ws/decode_online, with the audio format (raw PCM16, rate and channels) and the token in the query string; binary audio frames about four times a second; the text 'EOS' ends recognition, or the server ends it shortly after the last voice (hence endpointing_owner 'either'). Probed without credentials: the upgrade returns 101 with any token, the server stays silent until audio arrives, then sends the text 'Invalid token' and drops the socket with no close frame, so connect() cannot validate credentials. Unconfirmed until a probe with a valid token: whether interim hypotheses and a final flag are sent (the protocol resembles the open-source kaldi-gstreamer-server, which sends both; recorded here as 'none'), the frame size (the vendor's prose and its sample code disagree), which sample rates are accepted (the documented URL carries 48000; 16000 is a worked example), and whether status 9 means 'no data' or 'all recognisers busy'."
+          },
+          "billing": {
+            "unit": "audio_second",
+            "min_billed_ms": null,
+            "bills_silence": true,
+            "notes": "A socket is sent all call audio, and the vendor bills seconds of audio from the same prepaid packages."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "fails",
+        "code_ref": "gateway/src/core/stt/viettel_ai/config.rs:40 (the upload goes to viettelgroup.ai, which does not resolve), :183-211 (the parser does not match the vendor's current reply); gateway/src/core/stt/viettel_ai/client.rs:361-365 (the hang-up upload error is discarded)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "This gateway's Viettel AI speech-to-text client cannot reach the vendor's current service, so no transcript would be produced on any call. Choose a streaming transcription model from another provider."
+        }
+      },
+      "billing": {
+        "unit": "audio_second",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "notes": "Describes the file transport: only uploaded segments are billed. Prepaid 30-day packages of seconds (30,000 s to 600,000 s); 60 free minutes for new users. No entry for this provider exists in gateway/src/config/pricing.rs (checked 2026-10-03), so no pricing_key is given."
+      },
+      "provenance": {
+        "confidence": "probed",
+        "verified_on": "2026-10-03",
+        "verified_by": "live_probe",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://viettelai.vn/tai-lieu",
+          "https://viettelai.vn/_backend/api/document/list-all-parent-and-api?query=",
+          "https://viettelai.vn/_backend/api/document/get-document-service-menu",
+          "https://viettelai.vn/_backend/api/package/get-by-code/STT",
+          "https://viettelai.vn/en/bang-gia",
+          "https://viettelai.vn/asr/recognize",
+          "https://rdap.identitydigital.services/rdap/domain/viettelgroup.ai",
+          "https://raw.githubusercontent.com/alumae/kaldi-gstreamer-server/master/README.md",
+          "https://viettelai.vn/"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/viettel_ai/client.rs:114-238",
+          "gateway/src/core/stt/viettel_ai/config.rs:40",
+          "gateway/src/core/stt/viettel_ai/config.rs:183-211",
+          "gateway/src/core/stt/viettel_ai/client.rs:388-423",
+          "gateway/src/core/stt/viettel_ai/client.rs:361-365"
+        ],
+        "probe_ref": "verify/group-10.md",
+        "unverified": [
+          "transports[0].latency (the vendor's figure is an average and every other figure is a single anonymous request; nothing was measured with a paid token) and transports[1].latency (unmeasured)",
+          "transports[0].limits.max_upload_bytes (the web demo states 2 MB; the API documents nothing)",
+          "transports[0].limits.max_audio_ms and min_audio_ms",
+          "transports[0].limits.rates (concurrent_requests) (package data carries max_coeval_request 15, hidden on the pricing page for speech-to-text and possibly a placeholder; no request rate is documented)",
+          "transports[0].upload.accepted beyond 16 kHz mono PCM16 WAV (the web demo also accepts MP3; 8 kHz audio is untested)",
+          "transports[1].interim_results, endpointing_owner and vendor_turn_signal (the streaming message format was not seen with a valid token; the protocol resembles one that sends interim hypotheses)",
+          "transports[1].limits.max_session_ms and rates (nothing is documented for the socket)",
+          "billing.min_billed_ms and transports[1].billing (inferred: the vendor bills seconds of audio and a socket is sent all call audio)",
+          "whether the file and streaming interfaces run the same model",
+          "whether anonymous access to the file endpoint is intended or will last"
+        ],
+        "notes": "This is the provider's only row because the vendor has a single implicit Vietnamese service and accepts no model id; the gateway must send none (provider model_string 'absent', so the row is the declared answer, not a guess). The file endpoint, its request fields, its reply shape and its acceptance of 16 kHz mono WAV were probed without credentials on 2026-10-03, and the WebSocket upgrade was probed too. File upload is listed first because it is the only interface a release builds a client for. Neither transport is usable today. The order should be reversed when a streaming client is written: the vendor does stream, and its file endpoint looks far too slow for conversation, so the file upload is enabled only if latency measured with a paid token meets the segment deadline (decisions section 12)."
+      }
+    }
+  ]
+}

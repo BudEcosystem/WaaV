@@ -1,0 +1,744 @@
+{
+  "provider_id": "naver-clova",
+  "provider": {
+    "aliases": [
+      "naver_clova",
+      "naverclova",
+      "naver",
+      "clova",
+      "csr",
+      "네이버",
+      "클로바"
+    ],
+    "default_model": "csr",
+    "model_string": "gateway_alias",
+    "registered_in_gateway": true,
+    "native_model_handling": "ignored",
+    "notes": "NAVER Cloud Platform CLOVA speech recognition. The vendor has no model parameter; its four speech-to-text products are chosen by endpoint and credential type, so the row keys are gateway-defined product aliases (csr, clova-speech-short, clova-speech-long, clova-speech-streaming) and an empty model resolves to csr. Only CSR is implemented, and today's client never reads the session's model, so every NAVER session reaches CSR (gateway/src/core/stt/naver_clova/config.rs:276-334). The client registered today (gateway/src/core/stt/naver_clova/client.rs) buffers the whole call and uploads after 60 s of audio, at hang-up, or when the client sends audio_end (which disconnects and reconnects the speech-to-text client, gateway/src/core/voice_manager/manager.rs:1648-1672). It is not a transport: when_unusable on each row records what a live session gets from it. It also fails badly: after one failed upload it never clears its buffer, so every later audio frame is refused with an error and copies the 1.9 MB buffer again, even while the breaker is open (client.rs:117-120, :152 and :354-360; gateway/src/handlers/ws/audio_handler.rs:130-133). Only the 'csr' row and the default row describe an endpoint that today's credentials can reach: the key must have the form client_id|client_secret (gateway/src/core/stt/naver_clova/config.rs:283-298). The three CLOVA Speech rows need a different credential (a per-domain secret, and for long-sentence recognition a per-domain address) that this configuration cannot carry. Three of the four products are file-only at the vendor and their file endpoints answer in one request, so segmentation is both required and feasible; only CSR is placed in a release (decisions section 12). The vendor's minimum sample rate is 16 kHz. Aliases: the registry accepts naver_clova, naverclova, naver, clova, csr and two Korean spellings (gateway/src/plugin/builtin/mod.rs:1788-1791); the standardized factory omits one Korean spelling (gateway/src/core/stt/standard.rs:439)."
+  },
+  "rows": [
+    {
+      "id": "naver-clova:csr",
+      "match": {
+        "provider": "naver-clova",
+        "model": "csr"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "regional_rest",
+          "enabled_from_release": 5,
+          "disabled_reason": "The per-utterance file-upload adapter (segmented_naver_clova) is not implemented. The NAVER client registered today is not a substitute: it buffers every frame and uploads only when 60 s of audio has accumulated or the caller hangs up (gateway/src/core/stt/naver_clova/client.rs:328-373), so a live call gets no transcript in time to take a turn.",
+          "enable_requires": [
+            "live_probe"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "constraints": {
+            "languages": {
+              "mode": "only",
+              "codes": [
+                "ko",
+                "en",
+                "ja",
+                "zh"
+              ],
+              "note": "The vendor's codes are Kor, Eng, Jpn and Chn; there is no language detection."
+            }
+          },
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_upload_bytes": 3000000,
+            "max_audio_ms": 60000,
+            "min_audio_ms": 400,
+            "rates": [
+              {
+                "metric": "audio_seconds",
+                "per": "month",
+                "value": 300000,
+                "plan": null,
+                "scope": "application",
+                "note": "Default quota per console application, adjustable up to 30,000,000 audio seconds a month. HTTP 429 means the quota is used up."
+              },
+              {
+                "metric": "audio_seconds",
+                "per": "day",
+                "value": 30000,
+                "plan": null,
+                "scope": "application",
+                "note": "Default daily cap per console application, as both guide pages give it; a product page that could not be loaded gave 10,000."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "mp3",
+              "aac",
+              "ogg",
+              "flac"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "raw_body",
+            "content_type": "application/octet-stream"
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "lang",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "language_required": true,
+            "context_params": [],
+            "wire": "naver_csr_rest"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/naver_clova/client.rs:116-224 (transcribe_buffer); gateway/src/core/stt/naver_clova/config.rs:47 (endpoint) and :147-153 (content types)",
+            "notes": "CLOVA Speech Recognition (CSR): POST https://naveropenapi.apigw.ntruss.com/recog/v1/stt?lang=<Kor|Eng|Jpn|Chn>, raw file body, text-only response. transcribe_buffer already builds this request and can be lifted into the adapter. The adapter must: always wrap PCM in a WAV container and always send Content-Type application/octet-stream (the vendor rejects any other content type and lists no raw PCM format; today the client sends headerless PCM by default and audio/wav or audio/mpeg otherwise, client.rs:136-140, config.rs:147-153); resample to 16 kHz, the vendor minimum (the constructor rejects lower session rates, config.rs:369-374); keep uploads longer than 400 ms (min_audio_ms is an exclusive bound), under 60 s and under 3 MB; treat the vendor's HTTP 500 for unreadable audio as a request fault so one bad upload does not open the breaker shared by all sessions; and report confidence as unknown instead of the hard-coded 1.0 (client.rs:349). The quota in limits.rates is per console application and adjustable; HTTP 429 means it is used up. The legacy client reports every HTTP 413 as 'Audio too long (max 60 seconds)' (client.rs:197-199), although the vendor answers 413 both for audio over 60 s and for a body over 3 MB; the adapter should tell the two apart by the vendor's error code."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "request_timeout_ms": 10000,
+            "rationale": "Only the HTTP request timeout deviates from the gateway defaults. 10000 ms is the vendor audit's starting value, not a measurement: no latency is published for any NAVER file API, and the legacy client allows 30 s (gateway/src/core/stt/naver_clova/client.rs:54-58). Replace it with measured P99 plus a margin. The other defaults fit: a 25 s segment with 400 ms pre-roll and 500 ms trailing silence is 25.9 s and about 829 kB as 16 kHz WAV, inside 60 s and 3 MB, and the default padding keeps every upload above the 400 ms minimum. Because every request is billed in 15 s units (billing.increment_ms), segments of the same turn that are still queued should be merged while the merged upload stays within 15 s. An upload must never be held back to wait for a merge, so upload_policy stays at the default (upload at each pause). Calls that arrive at 8 kHz must be upsampled to 16 kHz before upload."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "buffers_until_hangup",
+        "code_ref": "gateway/src/core/stt/naver_clova/client.rs:328-373 (uploads only once 60 s of audio has accumulated); gateway/src/core/stt/naver_clova/client.rs:282-322 (uploads the rest at disconnect, which a client audio_end also triggers through gateway/src/core/voice_manager/manager.rs:1648-1672)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "CLOVA Speech Recognition transcribes uploaded files only and has no streaming interface for servers. This gateway does not yet cut a live call into utterances for it, so it cannot serve a voice agent that decides when the caller has finished speaking. Set the agent's turn detection to manual, ask the operator whether segmented speech-to-text can be enabled for this deployment, or choose a provider with a streaming model."
+        }
+      },
+      "billing": {
+        "unit": "audio_second",
+        "min_billed_ms": 15000,
+        "increment_ms": 15000,
+        "bills_silence": false,
+        "notes": "Usage is rounded up to 15 s units per request. Silence inside an uploaded file counts as usage, and the vendor charges nothing beyond 60 s per request. The unit price is not confirmed. No pricing key exists for this provider in gateway/src/config/pricing.rs."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://api.ncloud-docs.com/docs/en/ai-naver-clovaspeechrecognition",
+          "https://api.ncloud-docs.com/docs/en/ai-naver-clovaspeechrecognition-stt",
+          "https://guide.ncloud-docs.com/docs/en/csr-spec",
+          "https://www.ncloud.com/product/aiService/csr"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/naver_clova/client.rs:116-224",
+          "gateway/src/core/stt/naver_clova/client.rs:282-322",
+          "gateway/src/core/stt/naver_clova/client.rs:328-373",
+          "gateway/src/core/stt/naver_clova/config.rs:47",
+          "gateway/src/core/stt/naver_clova/config.rs:147-153",
+          "gateway/src/core/stt/naver_clova/config.rs:276-334",
+          "gateway/src/core/voice_manager/manager.rs:1648-1672"
+        ],
+        "unverified": [
+          "transports[0].latency (no latency is published for any NAVER file API; nothing was measured)",
+          "billing.min_billed_ms and billing.increment_ms (the 15 s round-up for CSR could not be re-read by the fact-check because the product page did not load; a search summary and the 15 s usage unit of CLOVA Speech support it)",
+          "transports[0].limits.max_upload_bytes (the vendor says 3 MB; exact byte count not stated; the lower is recorded)",
+          "transports[0].limits.rates (requests, concurrent_requests) (not published)",
+          "whether CSR really rejects headerless PCM and the audio/wav content type (documentation only; no live call)",
+          "the shape of the CSR error body (no example is published)",
+          "the 16 kHz minimum sample rate and the regions were read through a summarising fetch tool, not raw text",
+          "transports[0].segment_profile.request_timeout_ms (10000 ms is the vendor audit's starting value; no latency is published and nothing was measured)",
+          "transports[0].limits.rates (audio_seconds) (the vendor quota is per month and per day, 300,000 and 30,000 audio seconds by default per console application; both guide pages give 30,000 a day, and the 10,000 a day of a product page could not be re-read)"
+        ],
+        "notes": "CLOVA Speech Recognition (CSR), the only NAVER product the gateway reaches today and what an empty model resolves to. File-only at the vendor for a server: CSR streaming exists only inside the Android and iOS SDKs. The id is a gateway-defined product alias proposed by the vendor audit, not a vendor wire string: NAVER has no model parameter and selects the product by endpoint and credential type. The gateway does not read the session's model for this provider today (gateway/src/core/stt/naver_clova/config.rs:276-334). 'csr' is also a registered provider alias (gateway/src/core/stt/standard.rs:439)."
+      }
+    },
+    {
+      "id": "naver-clova:clova-speech-short",
+      "match": {
+        "provider": "naver-clova",
+        "model": "clova-speech-short"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "planned_file",
+          "enabled_from_release": null,
+          "disabled_reason": "Not implemented: the gateway has no client for CLOVA Speech short-sentence recognition (a different host and key header from the CSR endpoint the gateway calls today). The adapter id is shared with the 'csr' row only because adapters are named per provider; this product has its own host, key header and credential, so shipping the CSR adapter does not make this row ready. Keep it disabled until its own request code and credential field exist and one live call has passed.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "constraints": {
+            "languages": {
+              "mode": "only",
+              "codes": [
+                "ko",
+                "en",
+                "ja",
+                "zh"
+              ],
+              "note": "The vendor's codes are Kor, Eng, Jpn and Chn; there is no language detection."
+            }
+          },
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_upload_bytes": 10000000,
+            "max_audio_ms": 60000,
+            "min_audio_ms": null,
+            "rates": []
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "mp3",
+              "aac",
+              "ogg",
+              "flac",
+              "m4a"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "raw_body",
+            "content_type": "application/octet-stream"
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "lang",
+            "language_shape": "single",
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "boostings",
+                "max_chars": 512,
+                "note": "Tab-separated keywords of 3 characters or more each, sent as a query parameter; Korean only."
+              }
+            ],
+            "wire": "clova_speech_short_rest"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "notes": "POST https://clovaspeech-gw.ncloud.com/recog/v1/stt?lang=<Kor|Eng|Jpn|Chn> with header X-CLOVASPEECH-API-KEY (a per-domain secret) and Content-Type application/octet-stream; synchronous, text-only response plus a usage figure in 15 s units. Keyword boosting ('boostings': tab-separated, 512 characters or fewer in total, each keyword 3 characters or more) works for Korean only. Korea region only. Telephone-network codecs are not supported; convert to 16 kHz mono PCM first."
+          },
+          "file_request_mode": "sync"
+        }
+      ],
+      "when_unusable": {
+        "today": "buffers_until_hangup",
+        "code_ref": "gateway/src/core/stt/naver_clova/client.rs:328-373 (uploads only once 60 s of audio has accumulated); gateway/src/core/stt/naver_clova/client.rs:282-322 (uploads the rest at disconnect, which a client audio_end also triggers through gateway/src/core/voice_manager/manager.rs:1648-1672)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "CLOVA Speech short-sentence recognition transcribes uploaded files only, and this gateway has no client for it; a session naming it is sent to CLOVA Speech Recognition (csr) instead. It cannot serve a voice agent that decides when the caller has finished speaking. Choose csr and set the agent's turn detection to manual, or choose a provider with a streaming model."
+        }
+      },
+      "billing": {
+        "unit": "audio_second",
+        "min_billed_ms": 15000,
+        "increment_ms": 15000,
+        "bills_silence": false,
+        "notes": "Usage is rounded up to 15 s units per request. The unit price is not confirmed. No pricing key exists for this provider in gateway/src/config/pricing.rs."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://api.ncloud-docs.com/docs/ai-application-service-clovaspeech-shortsentence.md",
+          "https://api.ncloud-docs.com/docs/en/ai-application-service-clovaspeech",
+          "https://www.ncloud.com/product/aiService/clovaSpeech",
+          "https://guide.ncloud-docs.com/docs/en/clovaspeech-spec"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/naver_clova/client.rs:282-322",
+          "gateway/src/core/stt/naver_clova/client.rs:328-373",
+          "gateway/src/core/stt/naver_clova/config.rs:276-334"
+        ],
+        "unverified": [
+          "transports[0].latency",
+          "whether short-sentence recognition needs the per-domain invoke URL instead of the fixed host shown in its example",
+          "transports[0].limits.min_audio_ms (the 400 ms minimum is documented for CSR; not confirmed for this product)",
+          "transports[0].limits.max_upload_bytes (10 MB; exact byte count not stated; the lower is recorded)",
+          "transports[0].limits.rates[].scope and any request-rate or concurrency limit (not published)",
+          "unit price"
+        ],
+        "notes": "CLOVA Speech short-sentence recognition. File-only. The id is a gateway-defined product alias proposed by the vendor audit, not a vendor wire string: NAVER has no model parameter and selects the product by endpoint and credential type. The gateway does not read the session's model for this provider today (gateway/src/core/stt/naver_clova/config.rs:276-334)."
+      }
+    },
+    {
+      "id": "naver-clova:clova-speech-long",
+      "match": {
+        "provider": "naver-clova",
+        "model": "clova-speech-long"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "planned_file",
+          "enabled_from_release": null,
+          "disabled_reason": "Not implemented: the gateway has no client for CLOVA Speech long-sentence recognition (multipart upload to a per-domain invoke URL). The adapter id is shared with the 'csr' row only because adapters are named per provider; this product has its own host, key header and credential, so shipping the CSR adapter does not make this row ready. Keep it disabled until its own request code and credential field exist and one live call has passed.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_upload_bytes": 2000000000,
+            "max_audio_ms": 7200000,
+            "min_audio_ms": null,
+            "rates": []
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "mp3",
+              "aac",
+              "ogg",
+              "flac",
+              "m4a"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "multipart"
+          },
+          "quality_signals": [
+            "utterance_confidence"
+          ],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "boostings",
+                "max_items": 1000,
+                "note": "Korean and English keywords."
+              }
+            ],
+            "wire": "clova_speech_long_multipart"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "notes": "POST {InvokeURL}/recognizer/upload, multipart form with the file and a JSON parameter block, header X-CLOVASPEECH-API-KEY. The vendor's default is an asynchronous job; setting completion=sync makes the same request block and return the result, which is the mode a live call must use and the mode LiveKit's Clova plugin uses. It is the only NAVER file API that returns confidence (overall and per segment, 0 to 1) and word times. For short segments switch off the defaults that add work: speaker diarization, noise filtering and word alignment are all on by default. Languages ko-KR, en-US, enko (mixed), ja, zh-cn, zh-tw. Telephone-network codecs are not supported; convert to 16 kHz mono PCM first. The asynchronous mode (token, then polling) must not be used on calls."
+          },
+          "file_request_mode": "sync_wait"
+        }
+      ],
+      "when_unusable": {
+        "today": "buffers_until_hangup",
+        "code_ref": "gateway/src/core/stt/naver_clova/client.rs:328-373 (uploads only once 60 s of audio has accumulated); gateway/src/core/stt/naver_clova/client.rs:282-322 (uploads the rest at disconnect, which a client audio_end also triggers through gateway/src/core/voice_manager/manager.rs:1648-1672)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "CLOVA Speech long-sentence recognition transcribes uploaded files only, and this gateway has no client for it; a session naming it is sent to CLOVA Speech Recognition (csr) instead. It cannot serve a voice agent that decides when the caller has finished speaking. Choose csr and set the agent's turn detection to manual, or choose a provider with a streaming model."
+        }
+      },
+      "billing": {
+        "unit": "audio_second",
+        "min_billed_ms": 15000,
+        "increment_ms": 15000,
+        "bills_silence": false,
+        "notes": "Usage is rounded up to 15 s units per request. The vendor's own example confirms the rule for this product (10 s is charged as one unit, 32 s as three). No pricing key exists for this provider in gateway/src/config/pricing.rs."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://api.ncloud-docs.com/docs/ai-application-service-clovaspeech-longsentence-local.md",
+          "https://api.ncloud-docs.com/docs/en/ai-application-service-clovaspeech",
+          "https://www.ncloud.com/product/aiService/clovaSpeech",
+          "https://guide.ncloud-docs.com/docs/en/clovaspeech-spec",
+          "https://raw.githubusercontent.com/livekit/agents/main/livekit-plugins/livekit-plugins-clova/livekit/plugins/clova/stt.py"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/naver_clova/client.rs:282-322",
+          "gateway/src/core/stt/naver_clova/client.rs:328-373",
+          "gateway/src/core/stt/naver_clova/config.rs:276-334"
+        ],
+        "unverified": [
+          "transports[0].latency",
+          "transports[0].upload.accepted (the format list is the CLOVA Speech product list; not re-read for the long-sentence endpoint specifically)",
+          "transports[0].limits.max_upload_bytes (2 GB; exact byte count not stated; the lower is recorded)",
+          "transports[0].limits.rates[].scope and any request-rate or concurrency limit (not published)"
+        ],
+        "notes": "CLOVA Speech long-sentence recognition (NEST engine) in its blocking mode. File-only. The id is a gateway-defined product alias proposed by the vendor audit, not a vendor wire string: NAVER has no model parameter and selects the product by endpoint and credential type. The gateway does not read the session's model for this provider today (gateway/src/core/stt/naver_clova/config.rs:276-334)."
+      }
+    },
+    {
+      "id": "naver-clova:clova-speech-streaming",
+      "match": {
+        "provider": "naver-clova",
+        "model": "clova-speech-streaming"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "planned_stream",
+          "enabled_from_release": null,
+          "disabled_reason": "No client for CLOVA Speech live streaming exists in the gateway. The product is reachable only over gRPC (NestService.recognize at clovaspeech-gw.ncloud.com:50051).",
+          "interim_results": "none",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "unknown",
+          "constraints": {
+            "languages": {
+              "mode": "only",
+              "codes": [
+                "ko",
+                "en",
+                "ja"
+              ],
+              "note": "Korean, English and Japanese only; no Chinese on the live stream (use csr)."
+            }
+          },
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": 300000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 15,
+                "plan": null,
+                "scope": "credential",
+                "note": "At most 15 connections per CLOVA Speech domain; each domain has its own secret key."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le"
+            ],
+            "sample_rates_hz": [
+              16000
+            ],
+            "channels": 1
+          },
+          "quality_signals": [
+            "utterance_confidence",
+            "word_confidence"
+          ],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "keywordBoosting",
+                "note": "A block of the JSON configuration sent in the first message."
+              }
+            ],
+            "wire": "clova_speech_nest_grpc"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/Cargo.toml:282 (tonic 0.11 already a dependency; no client code exists)",
+            "notes": "Bidirectional gRPC; first message is a JSON configuration, then audio chunks. Audio must be headerless PCM, 16 kHz, mono, 16-bit. Languages ko, en, ja only (no Chinese). Basic long-sentence plan only. At most 15 connections per domain and a 5-minute connection lifetime, so the client must reconnect within a call. The vendor decides where a chunk ends through its 'semanticEpd' settings (gapThreshold in milliseconds of silence, durationThreshold, syllableThreshold, usePeriodEpd, useWordEpd) and emits one result per chunk with confidence and per-word alignment; no unstable partial results are documented, hence interim_results 'none'. vendor_turn_signal records 'unknown', which turn-taking treats as silence: the one mechanism the evidence establishes is the silence gap, and nothing shows that the punctuation and word rules amount to a semantic end-of-turn decision. Recording 'semantic' would let turn-taking trust the vendor's cut more than the evidence allows. The concurrent_sessions entry of limits.rates is the per-domain connection cap."
+          }
+        },
+        {
+          "input_mode": "vendor_segmented",
+          "adapter": "planned_commit",
+          "enabled_from_release": null,
+          "disabled_reason": "No client for CLOVA Speech live streaming exists in the gateway (see stream_naver_clova). This entry is the same gRPC call with the gateway's own detector forcing recognition of the buffered audio.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "constraints": {
+            "languages": {
+              "mode": "only",
+              "codes": [
+                "ko",
+                "en",
+                "ja"
+              ],
+              "note": "Korean, English and Japanese only; no Chinese on the live stream (use csr)."
+            }
+          },
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": 300000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 15,
+                "plan": null,
+                "scope": "credential",
+                "note": "At most 15 connections per CLOVA Speech domain; each domain has its own secret key."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le"
+            ],
+            "sample_rates_hz": [
+              16000
+            ],
+            "channels": 1
+          },
+          "quality_signals": [
+            "utterance_confidence",
+            "word_confidence"
+          ],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "keywordBoosting",
+                "note": "A block of the JSON configuration sent in the first message."
+              }
+            ],
+            "wire": "clova_speech_nest_grpc"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "notes": "Same RPC as stream_naver_clova. The client sets epFlag=true with a non-zero seqId in a data request to force the server to recognise what it has buffered and tag the result; without it the server waits for its own end-point rules or for 10 s without requests. Whether the vendor's own end-pointing can be switched off while the gateway drives the flush is not documented. Same connection limits as stream_naver_clova."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "buffers_until_hangup",
+        "code_ref": "gateway/src/core/stt/naver_clova/client.rs:328-373 (uploads only once 60 s of audio has accumulated); gateway/src/core/stt/naver_clova/client.rs:282-322 (uploads the rest at disconnect, which a client audio_end also triggers through gateway/src/core/voice_manager/manager.rs:1648-1672)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "CLOVA Speech live streaming is not served by this gateway, which has no client for it; a session naming it is sent to CLOVA Speech Recognition (csr), which returns text only when the client ends the turn or hangs up. It cannot serve a voice agent that decides when the caller has finished speaking. Choose csr and set the agent's turn detection to manual, or choose a provider with a streaming model."
+        }
+      },
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "The billing unit and price for live streaming are not confirmed. No pricing key exists for this provider in gateway/src/config/pricing.rs."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://api.ncloud-docs.com/docs/en/ai-application-service-clovaspeech-grpc",
+          "https://api.ncloud-docs.com/docs/ai-application-service-clovaspeech-troubleshoot-grpc.md",
+          "https://api.ncloud-docs.com/docs/en/ai-application-service-clovaspeech",
+          "https://www.ncloud.com/product/aiService/clovaSpeech"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/naver_clova/client.rs:282-322",
+          "gateway/src/core/stt/naver_clova/client.rs:328-373",
+          "gateway/src/core/stt/naver_clova/config.rs:276-334"
+        ],
+        "unverified": [
+          "transports[*].latency",
+          "transports[0].interim_results (no unstable partial results are documented; results appear when an end-point rule fires)",
+          "transports[0].vendor_turn_signal (recorded as 'unknown', which is treated as silence: the vendor names its end-point settings 'semanticEpd', and they include punctuation and word rules next to a plain silence gap; whether any of them is a semantic end-of-turn decision is not documented)",
+          "transports[*].dialect.language_param (the language is a field of the JSON configuration's transcription block; the exact field name was not quoted in the evidence)",
+          "transports[1] (whether the vendor's own end-pointing can be disabled while the gateway forces a flush)",
+          "billing.unit, billing.min_billed_ms, billing.bills_silence",
+          "the 'Lifespan expired' threshold (blank in the vendor documentation)"
+        ],
+        "notes": "CLOVA Speech live streaming (NEST engine), the one NAVER product that accepts a live audio stream. It needs no gateway segmentation, but the gateway has no client for it, so it has no usable path today. For Chinese, which this product does not serve, use the 'csr' row. The id is a gateway-defined product alias proposed by the vendor audit, not a vendor wire string: NAVER has no model parameter and selects the product by endpoint and credential type. The gateway does not read the session's model for this provider today (gateway/src/core/stt/naver_clova/config.rs:276-334)."
+      }
+    },
+    {
+      "id": "naver-clova:any",
+      "match": {
+        "provider": "naver-clova",
+        "model_glob": "*"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "regional_rest",
+          "enabled_from_release": 5,
+          "disabled_reason": "The per-utterance file-upload adapter (segmented_naver_clova) is not implemented. The NAVER client registered today is not a substitute: it buffers every frame and uploads only when 60 s of audio has accumulated or the caller hangs up (gateway/src/core/stt/naver_clova/client.rs:328-373), so a live call gets no transcript in time to take a turn.",
+          "enable_requires": [
+            "live_probe"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "constraints": {
+            "languages": {
+              "mode": "only",
+              "codes": [
+                "ko",
+                "en",
+                "ja",
+                "zh"
+              ],
+              "note": "The vendor's codes are Kor, Eng, Jpn and Chn; there is no language detection."
+            }
+          },
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_upload_bytes": 3000000,
+            "max_audio_ms": 60000,
+            "min_audio_ms": 400,
+            "rates": [
+              {
+                "metric": "audio_seconds",
+                "per": "month",
+                "value": 300000,
+                "plan": null,
+                "scope": "application",
+                "note": "Default quota per console application, adjustable up to 30,000,000 audio seconds a month. HTTP 429 means the quota is used up."
+              },
+              {
+                "metric": "audio_seconds",
+                "per": "day",
+                "value": 30000,
+                "plan": null,
+                "scope": "application",
+                "note": "Default daily cap per console application, as both guide pages give it; a product page that could not be loaded gave 10,000."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "mp3",
+              "aac",
+              "ogg",
+              "flac"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "raw_body",
+            "content_type": "application/octet-stream"
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "lang",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "language_required": true,
+            "context_params": [],
+            "wire": "naver_csr_rest"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/naver_clova/client.rs:116-224 (transcribe_buffer); gateway/src/core/stt/naver_clova/config.rs:47 (endpoint) and :147-153 (content types)",
+            "notes": "CLOVA Speech Recognition (CSR): POST https://naveropenapi.apigw.ntruss.com/recog/v1/stt?lang=<Kor|Eng|Jpn|Chn>, raw file body, text-only response. transcribe_buffer already builds this request and can be lifted into the adapter. The adapter must: always wrap PCM in a WAV container and always send Content-Type application/octet-stream (the vendor rejects any other content type and lists no raw PCM format; today the client sends headerless PCM by default and audio/wav or audio/mpeg otherwise, client.rs:136-140, config.rs:147-153); resample to 16 kHz, the vendor minimum (the constructor rejects lower session rates, config.rs:369-374); keep uploads longer than 400 ms (min_audio_ms is an exclusive bound), under 60 s and under 3 MB; treat the vendor's HTTP 500 for unreadable audio as a request fault so one bad upload does not open the breaker shared by all sessions; and report confidence as unknown instead of the hard-coded 1.0 (client.rs:349). The quota in limits.rates is per console application and adjustable; HTTP 429 means it is used up. The legacy client reports every HTTP 413 as 'Audio too long (max 60 seconds)' (client.rs:197-199), although the vendor answers 413 both for audio over 60 s and for a body over 3 MB; the adapter should tell the two apart by the vendor's error code."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "request_timeout_ms": 10000,
+            "rationale": "Only the HTTP request timeout deviates from the gateway defaults. 10000 ms is the vendor audit's starting value, not a measurement: no latency is published for any NAVER file API, and the legacy client allows 30 s (gateway/src/core/stt/naver_clova/client.rs:54-58). Replace it with measured P99 plus a margin. The other defaults fit: a 25 s segment with 400 ms pre-roll and 500 ms trailing silence is 25.9 s and about 829 kB as 16 kHz WAV, inside 60 s and 3 MB, and the default padding keeps every upload above the 400 ms minimum. Because every request is billed in 15 s units (billing.increment_ms), segments of the same turn that are still queued should be merged while the merged upload stays within 15 s. An upload must never be held back to wait for a merge, so upload_policy stays at the default (upload at each pause). Calls that arrive at 8 kHz must be upsampled to 16 kHz before upload."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "buffers_until_hangup",
+        "code_ref": "gateway/src/core/stt/naver_clova/client.rs:328-373 (uploads only once 60 s of audio has accumulated); gateway/src/core/stt/naver_clova/client.rs:282-322 (uploads the rest at disconnect, which a client audio_end also triggers through gateway/src/core/voice_manager/manager.rs:1648-1672)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "NAVER has no model parameter and this id is not one of the NAVER products this gateway knows, so the session would use CLOVA Speech Recognition, which transcribes uploaded files only. This gateway does not yet cut a live call into utterances for it, so it cannot serve a voice agent that decides when the caller has finished speaking. Use csr, set the agent's turn detection to manual, ask the operator whether segmented speech-to-text can be enabled for this deployment, or choose a provider with a streaming model."
+        }
+      },
+      "billing": {
+        "unit": "audio_second",
+        "min_billed_ms": 15000,
+        "increment_ms": 15000,
+        "bills_silence": false,
+        "notes": "Usage is rounded up to 15 s units per request. Silence inside an uploaded file counts as usage, and the vendor charges nothing beyond 60 s per request. The unit price is not confirmed. No pricing key exists for this provider in gateway/src/config/pricing.rs."
+      },
+      "provenance": {
+        "confidence": "assumed",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://api.ncloud-docs.com/docs/en/ai-naver-clovaspeechrecognition",
+          "https://api.ncloud-docs.com/docs/en/ai-naver-clovaspeechrecognition-stt",
+          "https://guide.ncloud-docs.com/docs/en/csr-spec"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/naver_clova/client.rs:116-224",
+          "gateway/src/core/stt/naver_clova/client.rs:282-322",
+          "gateway/src/core/stt/naver_clova/client.rs:328-373",
+          "gateway/src/core/stt/naver_clova/config.rs:47",
+          "gateway/src/core/stt/naver_clova/config.rs:147-153",
+          "gateway/src/core/stt/naver_clova/config.rs:276-334",
+          "gateway/src/core/voice_manager/manager.rs:1648-1672"
+        ],
+        "unverified": [
+          "transports[0].latency (no latency is published for any NAVER file API; nothing was measured)",
+          "billing.min_billed_ms and billing.increment_ms (the 15 s round-up for CSR could not be re-read by the fact-check because the product page did not load; a search summary and the 15 s usage unit of CLOVA Speech support it)",
+          "transports[0].limits.max_upload_bytes (the vendor says 3 MB; exact byte count not stated; the lower is recorded)",
+          "transports[0].limits.rates (requests, concurrent_requests) (not published)",
+          "whether CSR really rejects headerless PCM and the audio/wav content type (documentation only; no live call)",
+          "the shape of the CSR error body (no example is published)",
+          "the 16 kHz minimum sample rate and the regions were read through a summarising fetch tool, not raw text",
+          "transports[0].segment_profile.request_timeout_ms (10000 ms is the vendor audit's starting value; no latency is published and nothing was measured)",
+          "transports[0].limits.rates (audio_seconds) (the vendor quota is per month and per day, 300,000 and 30,000 audio seconds by default per console application; both guide pages give 30,000 a day, and the 10,000 a day of a product page could not be re-read)"
+        ],
+        "notes": "Fail-slow default: file upload to CSR. The vendor has no model parameter and the gateway ignores the session's model for this provider, so today every model string already reaches CSR; this row keeps that behaviour for an id the map does not know."
+      }
+    }
+  ]
+}

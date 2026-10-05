@@ -1,0 +1,818 @@
+{
+  "provider_id": "revai",
+  "provider": {
+    "aliases": [
+      "rev-ai",
+      "rev_ai",
+      "rev.ai"
+    ],
+    "default_model": "machine",
+    "model_string": "wire_model",
+    "registered_in_gateway": true,
+    "native_model_handling": "substituted",
+    "notes": "Aliases are the ones registered at gateway/src/plugin/builtin/mod.rs:1729-1730 and matched by the standard factory at gateway/src/core/stt/standard.rs:451-453. An empty model resolves to the default transcriber, for which the gateway omits the transcriber query parameter (gateway/src/core/stt/revai/config.rs:146-151 and 541-553); the vendor treats that as 'machine'. Rev AI needs no segmented path: its live-capable models stream and the gateway already streams to them. Its other transcribers exist only on an asynchronous job API answered in minutes, so they get rows with no transport and a refusal reason, never a file-upload transport. Rev AI has a European deployment (wss://ec1.api.rev.ai/speechtotext/v1/stream/) that the gateway cannot select except through an endpoint override. No transport on this vendor is verified live; the gateway holds no Rev AI key. The gateway's model gate compares the model string exactly, after trimming and without folding case (gateway/src/core/stt/revai/config.rs:540-553), while the map matches ids without regard to case. A session that names 'Machine_V2' therefore lands on the machine_v2 row but the client omits the transcriber parameter and the vendor's default model answers. The resolver must hand the client the row's id, not the customer's spelling. Today's client serves any id its model gate does not recognise, including the deprecated low_cost and fusion, with the account's default streaming model and no warning (gateway/src/core/stt/revai/config.rs:540-553), which is why native_model_handling is substituted."
+  },
+  "rows": [
+    {
+      "id": "revai:machine",
+      "match": {
+        "provider": "revai",
+        "model": "machine"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "none",
+          "constraints": {
+            "languages": {
+              "mode": "only",
+              "codes": [
+                "en",
+                "fr",
+                "de",
+                "it",
+                "ja",
+                "ko",
+                "zh",
+                "cmn",
+                "pt",
+                "es"
+              ],
+              "note": "Rev AI's nine streaming languages (vendor streaming request page, confirmed by the fact-check). Mandarin is cmn on the wire; today's client sends any zh tag as cmn (gateway/src/core/stt/revai/config.rs:28-46), so zh is listed too. Every other language exists only on the asynchronous job API; today's client passes it through for Rev AI to refuse."
+            }
+          },
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": 10800000,
+            "vendor_timeout_ms": null,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 10,
+                "plan": null,
+                "scope": "unknown",
+                "note": "Streaming concurrency limit; Rev AI support can raise it. The audit reads it as account-wide, but the vendor page does not say what it counts against."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "quality_signals": [
+            "word_confidence"
+          ],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "language_required": true,
+            "context_params": [
+              {
+                "kind": "vocabulary_id",
+                "wire_name": "custom_vocabulary_id",
+                "note": "A custom vocabulary registered with Rev AI beforehand. The vendor says it cannot be combined with the language parameter, which today's client sends whenever the session language is set (config.rs:465-484); whether language=en with it is rejected is unverified. Not usable with the foreign-language model, which is chosen by the language parameter."
+              }
+            ],
+            "wire": "revai_stream_websocket"
+          },
+          "gateway_client": {
+            "status": "wire_tested",
+            "code_ref": "gateway/src/core/stt/revai/client.rs:79-200,321-356; gateway/src/core/stt/revai/config.rs:438-524,527-568; gateway/tests/mock_endpoint_e2e.rs:246-334",
+            "notes": "Never exercised against Rev AI: the only end-to-end test runs against an in-repo mock (gateway/tests/mock_endpoint_e2e.rs:9 says the gateway holds no Rev AI key). One long-lived socket per call; each caller chunk is forwarded at once as a binary frame (client.rs:111-116). Vendor 'partial' becomes an interim result and vendor 'final' becomes is_final and is_speech_final (client.rs:327-348). Defects found by reading, none of which stop transcription: partial text is joined with no separator, so interim text reads 'onetooth' (messages.rs:188-190); connect() returns on the HTTP upgrade, not on the vendor 'connected' frame, although the vendor requires waiting for it (client.rs:90-97, 323-326); every vendor final is flagged end of speech although Rev AI finals are commit points, not end-of-utterance markers (client.rs:348); a server Close frame with a standard code such as 1001, 1011, 1012 or 1013 ends the session instead of reconnecting (messages.rs:34-45, 62-64; client.rs:142-157); chunks are not aggregated to the 250 ms the vendor asks for (mod.rs:100 is unused). For this id the gateway omits the transcriber query parameter (config.rs:502-504), which the vendor treats the same as transcriber=machine.",
+            "defect": "Found by reading, none of which stops transcription: interim text is joined without spaces, every vendor final is flagged end of speech although Rev AI finals are commit points, and a server Close frame with a standard code such as 1001, 1011, 1012 or 1013 ends the session instead of reconnecting (messages.rs:188-190; client.rs:348; messages.rs:62-64 with client.rs:142-157). It also sends audio before the vendor's connected frame and does not aggregate chunks to the 250 ms the vendor asks for (client.rs:90-97; mod.rs:100)."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "audio_hour",
+        "min_billed_ms": 15000,
+        "increment_ms": 1000,
+        "bills_silence": true,
+        "notes": "Billing is per stream, not per utterance: Rev AI charges the larger of stream duration and audio duration, rounded up to the second, with a 15 second minimum for each connection, so silence on an open stream is billed. Each connect also places a 10 minute credit hold, and another 5 minutes after every 5 minutes of stream time. Reconnects therefore add minimum charges. There is no Rev AI entry in gateway/src/config/pricing.rs, so no pricing_key is given."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://docs.rev.ai/api/streaming/",
+          "https://docs.rev.ai/api/streaming/requests/",
+          "https://docs.rev.ai/api/streaming/responses/",
+          "https://docs.rev.ai/api/streaming/transcribers/",
+          "https://docs.rev.ai/api/streaming/billing/",
+          "https://docs.rev.ai/api/streaming/example-session/",
+          "https://www.rev.ai/pricing",
+          "https://docs.rev.ai/api/asynchronous/"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/revai/client.rs:79-200,321-356",
+          "gateway/src/core/stt/revai/config.rs:438-524,527-568",
+          "gateway/tests/mock_endpoint_e2e.rs:246-334",
+          "gateway/tests/mock_endpoint_e2e.rs:9",
+          "gateway/src/plugin/builtin/mod.rs:238",
+          "gateway/src/core/stt/revai/config.rs:540-553",
+          "gateway/src/core/stt/revai/config.rs:28-46"
+        ],
+        "unverified": [
+          "transports[0].latency (Rev AI publishes no streaming latency; the only figure found was a competitor's claim and is not used)",
+          "transports[0].limits.rates[].scope (the vendor states a streaming concurrency limit of 10, adjustable by support; the audit reads it as account-wide but the page does not say)",
+          "transports[0].limits.vendor_timeout_ms (whether Rev AI sends WebSocket pings during caller silence is unknown; the gateway treats 60 s without any inbound message as a dead socket, client.rs:44)",
+          "transports[0].gateway_client (whether audio sent before the vendor 'connected' frame is dropped or buffered)",
+          "whether language=en together with filter_profanity, remove_disfluencies or custom_vocabulary_id is rejected (the vendor text forbids the combination; the gateway sends language whenever the session language is non-empty, config.rs:465-467)"
+        ],
+        "notes": "'machine' is the exact value of the vendor's transcriber option and the vendor default: the account's default model, which is Reverb for current accounts. The option is ignored for non-English requests, where the language selects the foreign-language model. Streaming languages are en, fr, de, it, ja, ko, cmn, pt, es; the gateway's advertised list is wrong (gateway/src/plugin/builtin/mod.rs:238 lists ru, ar, hi and omits it, ko). No file-upload transport is listed on purpose. Rev AI's only file interface is the asynchronous job API (POST /jobs, then poll or webhook, then GET /jobs/{id}/transcript). The vendor describes its turnaround as '5 minutes or less' for short files, its tutorial says to wait 'approximately 1 minute', and each file is billed a 15 second minimum. The fact-check concluded that Rev AI must never be wrapped in the segmented adapter. Opening one short socket per utterance and sending EOS to force a final was also rejected: each connection bills 15 seconds, places a 10 minute credit hold and counts against the limit of 10 concurrent streams."
+      }
+    },
+    {
+      "id": "revai:machine_v2",
+      "match": {
+        "provider": "revai",
+        "model": "machine_v2"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "none",
+          "constraints": {
+            "languages": {
+              "mode": "only",
+              "codes": [
+                "en",
+                "fr",
+                "de",
+                "it",
+                "ja",
+                "ko",
+                "zh",
+                "cmn",
+                "pt",
+                "es"
+              ],
+              "note": "Rev AI's nine streaming languages (vendor streaming request page, confirmed by the fact-check). Mandarin is cmn on the wire; today's client sends any zh tag as cmn (gateway/src/core/stt/revai/config.rs:28-46), so zh is listed too. Every other language exists only on the asynchronous job API; today's client passes it through for Rev AI to refuse."
+            }
+          },
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": 10800000,
+            "vendor_timeout_ms": null,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 10,
+                "plan": null,
+                "scope": "unknown",
+                "note": "Streaming concurrency limit; Rev AI support can raise it. The audit reads it as account-wide, but the vendor page does not say what it counts against."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "quality_signals": [
+            "word_confidence"
+          ],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "language_required": true,
+            "context_params": [
+              {
+                "kind": "vocabulary_id",
+                "wire_name": "custom_vocabulary_id",
+                "note": "A custom vocabulary registered with Rev AI beforehand. The vendor says it cannot be combined with the language parameter, which today's client sends whenever the session language is set (config.rs:465-484); whether language=en with it is rejected is unverified. Not usable with the foreign-language model, which is chosen by the language parameter."
+              }
+            ],
+            "wire": "revai_stream_websocket"
+          },
+          "gateway_client": {
+            "status": "wire_tested",
+            "code_ref": "gateway/src/core/stt/revai/client.rs:79-200,321-356; gateway/src/core/stt/revai/config.rs:438-524,527-568; gateway/tests/mock_endpoint_e2e.rs:246-334",
+            "notes": "Never exercised against Rev AI: the only end-to-end test runs against an in-repo mock (gateway/tests/mock_endpoint_e2e.rs:9 says the gateway holds no Rev AI key). One long-lived socket per call; each caller chunk is forwarded at once as a binary frame (client.rs:111-116). Vendor 'partial' becomes an interim result and vendor 'final' becomes is_final and is_speech_final (client.rs:327-348). Defects found by reading, none of which stop transcription: partial text is joined with no separator, so interim text reads 'onetooth' (messages.rs:188-190); connect() returns on the HTTP upgrade, not on the vendor 'connected' frame, although the vendor requires waiting for it (client.rs:90-97, 323-326); every vendor final is flagged end of speech although Rev AI finals are commit points, not end-of-utterance markers (client.rs:348); a server Close frame with a standard code such as 1001, 1011, 1012 or 1013 ends the session instead of reconnecting (messages.rs:34-45, 62-64; client.rs:142-157); chunks are not aggregated to the 250 ms the vendor asks for (mod.rs:100 is unused). For this id the gateway sends transcriber=machine_v2 (config.rs:502-504). A session that asks for diarization is forced onto machine_v2 whatever model was named (config.rs:581-586). The priority option is forwarded without checking that the language is English or Spanish (config.rs:515-517).",
+            "defect": "Found by reading, none of which stops transcription: interim text is joined without spaces, every vendor final is flagged end of speech although Rev AI finals are commit points, and a server Close frame with a standard code such as 1001, 1011, 1012 or 1013 ends the session instead of reconnecting (messages.rs:188-190; client.rs:348; messages.rs:62-64 with client.rs:142-157). It also sends audio before the vendor's connected frame and does not aggregate chunks to the 250 ms the vendor asks for (client.rs:90-97; mod.rs:100)."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "audio_hour",
+        "min_billed_ms": 15000,
+        "increment_ms": 1000,
+        "bills_silence": true,
+        "notes": "Billing is per stream, not per utterance: Rev AI charges the larger of stream duration and audio duration, rounded up to the second, with a 15 second minimum for each connection, so silence on an open stream is billed. Each connect also places a 10 minute credit hold, and another 5 minutes after every 5 minutes of stream time. Reconnects therefore add minimum charges. There is no Rev AI entry in gateway/src/config/pricing.rs, so no pricing_key is given."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://docs.rev.ai/api/streaming/",
+          "https://docs.rev.ai/api/streaming/requests/",
+          "https://docs.rev.ai/api/streaming/responses/",
+          "https://docs.rev.ai/api/streaming/transcribers/",
+          "https://docs.rev.ai/api/streaming/billing/",
+          "https://docs.rev.ai/api/streaming/example-session/",
+          "https://www.rev.ai/pricing",
+          "https://docs.rev.ai/changelog"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/revai/client.rs:79-200,321-356",
+          "gateway/src/core/stt/revai/config.rs:438-524,527-568",
+          "gateway/tests/mock_endpoint_e2e.rs:246-334",
+          "gateway/tests/mock_endpoint_e2e.rs:9",
+          "gateway/src/core/stt/revai/config.rs:540-553",
+          "gateway/src/core/stt/revai/config.rs:28-46"
+        ],
+        "unverified": [
+          "transports[0].latency (Rev AI publishes no streaming latency; the only figure found was a competitor's claim and is not used)",
+          "transports[0].limits.rates[].scope (the vendor states a streaming concurrency limit of 10, adjustable by support; the audit reads it as account-wide but the page does not say)",
+          "transports[0].limits.vendor_timeout_ms (whether Rev AI sends WebSocket pings during caller silence is unknown; the gateway treats 60 s without any inbound message as a dead socket, client.rs:44)",
+          "transports[0].gateway_client (whether audio sent before the vendor 'connected' frame is dropped or buffered)",
+          "whether language=en together with filter_profanity, remove_disfluencies or custom_vocabulary_id is rejected (the vendor text forbids the combination; the gateway sends language whenever the session language is non-empty, config.rs:465-467)"
+        ],
+        "notes": "'machine_v2' always selects the Reverb model on the streaming API and is required for speaker switching and for the priority option (priority is English and Spanish only). The lifecycle status describes the streaming API. On the asynchronous job API the same value was deprecated on 2022-09-15 and silently routes to 'machine'; that does not affect live calls. No file-upload transport is listed on purpose. Rev AI's only file interface is the asynchronous job API (POST /jobs, then poll or webhook, then GET /jobs/{id}/transcript). The vendor describes its turnaround as '5 minutes or less' for short files, its tutorial says to wait 'approximately 1 minute', and each file is billed a 15 second minimum. The fact-check concluded that Rev AI must never be wrapped in the segmented adapter. Opening one short socket per utterance and sending EOS to force a final was also rejected: each connection bills 15 seconds, places a 10 minute credit hold and counts against the limit of 10 concurrent streams."
+      }
+    },
+    {
+      "id": "revai:reverb",
+      "match": {
+        "provider": "revai",
+        "model": "reverb"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "none",
+          "constraints": {
+            "languages": {
+              "mode": "only",
+              "codes": [
+                "en",
+                "fr",
+                "de",
+                "it",
+                "ja",
+                "ko",
+                "zh",
+                "cmn",
+                "pt",
+                "es"
+              ],
+              "note": "Rev AI's nine streaming languages (vendor streaming request page, confirmed by the fact-check). Mandarin is cmn on the wire; today's client sends any zh tag as cmn (gateway/src/core/stt/revai/config.rs:28-46), so zh is listed too. Every other language exists only on the asynchronous job API; today's client passes it through for Rev AI to refuse."
+            }
+          },
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": 10800000,
+            "vendor_timeout_ms": null,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 10,
+                "plan": null,
+                "scope": "unknown",
+                "note": "Streaming concurrency limit; Rev AI support can raise it. The audit reads it as account-wide, but the vendor page does not say what it counts against."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "quality_signals": [
+            "word_confidence"
+          ],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "language_required": true,
+            "context_params": [
+              {
+                "kind": "vocabulary_id",
+                "wire_name": "custom_vocabulary_id",
+                "note": "A custom vocabulary registered with Rev AI beforehand. The vendor says it cannot be combined with the language parameter, which today's client sends whenever the session language is set (config.rs:465-484); whether language=en with it is rejected is unverified. Not usable with the foreign-language model, which is chosen by the language parameter."
+              }
+            ],
+            "wire": "revai_stream_websocket"
+          },
+          "gateway_client": {
+            "status": "wire_tested",
+            "code_ref": "gateway/src/core/stt/revai/client.rs:79-200,321-356; gateway/src/core/stt/revai/config.rs:438-524,527-568; gateway/tests/mock_endpoint_e2e.rs:246-334",
+            "notes": "Never exercised against Rev AI: the only end-to-end test runs against an in-repo mock (gateway/tests/mock_endpoint_e2e.rs:9 says the gateway holds no Rev AI key). One long-lived socket per call; each caller chunk is forwarded at once as a binary frame (client.rs:111-116). Vendor 'partial' becomes an interim result and vendor 'final' becomes is_final and is_speech_final (client.rs:327-348). Defects found by reading, none of which stop transcription: partial text is joined with no separator, so interim text reads 'onetooth' (messages.rs:188-190); connect() returns on the HTTP upgrade, not on the vendor 'connected' frame, although the vendor requires waiting for it (client.rs:90-97, 323-326); every vendor final is flagged end of speech although Rev AI finals are commit points, not end-of-utterance markers (client.rs:348); a server Close frame with a standard code such as 1001, 1011, 1012 or 1013 ends the session instead of reconnecting (messages.rs:34-45, 62-64; client.rs:142-157); chunks are not aggregated to the 250 ms the vendor asks for (mod.rs:100 is unused). For this id the gateway omits the transcriber query parameter: it is not one of the three strings the model gate recognises, so it falls to the default transcriber (config.rs:541-553; the test at config.rs:770-784 pins this).",
+            "defect": "Found by reading, none of which stops transcription: interim text is joined without spaces, every vendor final is flagged end of speech although Rev AI finals are commit points, and a server Close frame with a standard code such as 1001, 1011, 1012 or 1013 ends the session instead of reconnecting (messages.rs:188-190; client.rs:348; messages.rs:62-64 with client.rs:142-157). It also sends audio before the vendor's connected frame and does not aggregate chunks to the 250 ms the vendor asks for (client.rs:90-97; mod.rs:100)."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "audio_hour",
+        "min_billed_ms": 15000,
+        "increment_ms": 1000,
+        "bills_silence": true,
+        "notes": "Billing is per stream, not per utterance: Rev AI charges the larger of stream duration and audio duration, rounded up to the second, with a 15 second minimum for each connection, so silence on an open stream is billed. Each connect also places a 10 minute credit hold, and another 5 minutes after every 5 minutes of stream time. Reconnects therefore add minimum charges. There is no Rev AI entry in gateway/src/config/pricing.rs, so no pricing_key is given."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://docs.rev.ai/api/streaming/",
+          "https://docs.rev.ai/api/streaming/requests/",
+          "https://docs.rev.ai/api/streaming/responses/",
+          "https://docs.rev.ai/api/streaming/transcribers/",
+          "https://docs.rev.ai/api/streaming/billing/",
+          "https://docs.rev.ai/api/streaming/example-session/",
+          "https://www.rev.ai/pricing"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/revai/client.rs:79-200,321-356",
+          "gateway/src/core/stt/revai/config.rs:438-524,527-568",
+          "gateway/tests/mock_endpoint_e2e.rs:246-334",
+          "gateway/tests/mock_endpoint_e2e.rs:9",
+          "gateway/src/core/stt/revai/config.rs:540-553",
+          "gateway/src/core/stt/revai/config.rs:28-46"
+        ],
+        "unverified": [
+          "transports[0].latency (Rev AI publishes no streaming latency; the only figure found was a competitor's claim and is not used)",
+          "transports[0].limits.rates[].scope (the vendor states a streaming concurrency limit of 10, adjustable by support; the audit reads it as account-wide but the page does not say)",
+          "transports[0].limits.vendor_timeout_ms (whether Rev AI sends WebSocket pings during caller silence is unknown; the gateway treats 60 s without any inbound message as a dead socket, client.rs:44)",
+          "transports[0].gateway_client (whether audio sent before the vendor 'connected' frame is dropped or buffered)",
+          "whether language=en together with filter_profanity, remove_disfluencies or custom_vocabulary_id is rejected (the vendor text forbids the combination; the gateway sends language whenever the session language is non-empty, config.rs:465-467)",
+          "match.model (where the catalog name 'reverb' comes from: it appears only in config.rs comments and tests; no catalog file was found by the audit)"
+        ],
+        "notes": "'reverb' is NOT a value the Rev AI API accepts. It is the identifier the gateway uses to select Rev AI's default English streaming product; the gateway maps it to 'omit the transcriber parameter', which the vendor serves with the same model as 'machine'. The row exists so that this identifier resolves to a documented row instead of the provider default. No file-upload transport is listed on purpose. Rev AI's only file interface is the asynchronous job API (POST /jobs, then poll or webhook, then GET /jobs/{id}/transcript). The vendor describes its turnaround as '5 minutes or less' for short files, its tutorial says to wait 'approximately 1 minute', and each file is billed a 15 second minimum. The fact-check concluded that Rev AI must never be wrapped in the segmented adapter. Opening one short socket per utterance and sending EOS to force a final was also rejected: each connection bills 15 seconds, places a 10 minute credit hold and counts against the limit of 10 concurrent streams."
+      }
+    },
+    {
+      "id": "revai:reverb-foreign-language",
+      "match": {
+        "provider": "revai",
+        "model": "reverb-foreign-language"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "none",
+          "constraints": {
+            "languages": {
+              "mode": "only",
+              "codes": [
+                "en",
+                "fr",
+                "de",
+                "it",
+                "ja",
+                "ko",
+                "zh",
+                "cmn",
+                "pt",
+                "es"
+              ],
+              "note": "Rev AI's nine streaming languages (vendor streaming request page, confirmed by the fact-check). Mandarin is cmn on the wire; today's client sends any zh tag as cmn (gateway/src/core/stt/revai/config.rs:28-46), so zh is listed too. Every other language exists only on the asynchronous job API; today's client passes it through for Rev AI to refuse."
+            }
+          },
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": 10800000,
+            "vendor_timeout_ms": null,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 10,
+                "plan": null,
+                "scope": "unknown",
+                "note": "Streaming concurrency limit; Rev AI support can raise it. The audit reads it as account-wide, but the vendor page does not say what it counts against."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "quality_signals": [
+            "word_confidence"
+          ],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "language_required": true,
+            "context_params": [],
+            "wire": "revai_stream_websocket"
+          },
+          "gateway_client": {
+            "status": "wire_tested",
+            "code_ref": "gateway/src/core/stt/revai/client.rs:79-200,321-356; gateway/src/core/stt/revai/config.rs:438-524,527-568; gateway/tests/mock_endpoint_e2e.rs:246-334",
+            "notes": "Never exercised against Rev AI: the only end-to-end test runs against an in-repo mock (gateway/tests/mock_endpoint_e2e.rs:9 says the gateway holds no Rev AI key). One long-lived socket per call; each caller chunk is forwarded at once as a binary frame (client.rs:111-116). Vendor 'partial' becomes an interim result and vendor 'final' becomes is_final and is_speech_final (client.rs:327-348). Defects found by reading, none of which stop transcription: partial text is joined with no separator, so interim text reads 'onetooth' (messages.rs:188-190); connect() returns on the HTTP upgrade, not on the vendor 'connected' frame, although the vendor requires waiting for it (client.rs:90-97, 323-326); every vendor final is flagged end of speech although Rev AI finals are commit points, not end-of-utterance markers (client.rs:348); a server Close frame with a standard code such as 1001, 1011, 1012 or 1013 ends the session instead of reconnecting (messages.rs:34-45, 62-64; client.rs:142-157); chunks are not aggregated to the 250 ms the vendor asks for (mod.rs:100 is unused). For this id the gateway omits the transcriber query parameter (config.rs:541-553, test at config.rs:770-784); the model is chosen by the language parameter alone. The gateway sends filter_profanity, remove_disfluencies and custom_vocabulary_id without checking the language, although the vendor says those cannot be combined with a language (config.rs:465-484).",
+            "defect": "Found by reading, none of which stops transcription: interim text is joined without spaces, every vendor final is flagged end of speech although Rev AI finals are commit points, and a server Close frame with a standard code such as 1001, 1011, 1012 or 1013 ends the session instead of reconnecting (messages.rs:188-190; client.rs:348; messages.rs:62-64 with client.rs:142-157). It also sends audio before the vendor's connected frame and does not aggregate chunks to the 250 ms the vendor asks for (client.rs:90-97; mod.rs:100)."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "audio_hour",
+        "min_billed_ms": 15000,
+        "increment_ms": 1000,
+        "bills_silence": true,
+        "notes": "Billing is per stream, not per utterance: Rev AI charges the larger of stream duration and audio duration, rounded up to the second, with a 15 second minimum for each connection, so silence on an open stream is billed. Each connect also places a 10 minute credit hold, and another 5 minutes after every 5 minutes of stream time. Reconnects therefore add minimum charges. There is no Rev AI entry in gateway/src/config/pricing.rs, so no pricing_key is given."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://docs.rev.ai/api/streaming/",
+          "https://docs.rev.ai/api/streaming/requests/",
+          "https://docs.rev.ai/api/streaming/responses/",
+          "https://docs.rev.ai/api/streaming/transcribers/",
+          "https://docs.rev.ai/api/streaming/billing/",
+          "https://docs.rev.ai/api/streaming/example-session/",
+          "https://www.rev.ai/pricing"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/revai/client.rs:79-200,321-356",
+          "gateway/src/core/stt/revai/config.rs:438-524,527-568",
+          "gateway/tests/mock_endpoint_e2e.rs:246-334",
+          "gateway/tests/mock_endpoint_e2e.rs:9",
+          "gateway/src/core/stt/revai/config.rs:540-553",
+          "gateway/src/core/stt/revai/config.rs:28-46"
+        ],
+        "unverified": [
+          "transports[0].latency (Rev AI publishes no streaming latency; the only figure found was a competitor's claim and is not used)",
+          "transports[0].limits.rates[].scope (the vendor states a streaming concurrency limit of 10, adjustable by support; the audit reads it as account-wide but the page does not say)",
+          "transports[0].limits.vendor_timeout_ms (whether Rev AI sends WebSocket pings during caller silence is unknown; the gateway treats 60 s without any inbound message as a dead socket, client.rs:44)",
+          "transports[0].gateway_client (whether audio sent before the vendor 'connected' frame is dropped or buffered)",
+          "whether language=en together with filter_profanity, remove_disfluencies or custom_vocabulary_id is rejected (the vendor text forbids the combination; the gateway sends language whenever the session language is non-empty, config.rs:465-467)",
+          "match.model (where the catalog name 'reverb-foreign-language' comes from: it appears only in config.rs comments and tests)"
+        ],
+        "notes": "The vendor has no model parameter for its foreign-language streaming model: 'The transcriber option is ignored for non-English transcription requests', and the model is selected by the language parameter. 'reverb-foreign-language' is therefore the identifier the gateway uses to select the product, not a wire string. Streaming covers eight non-English languages: fr, de, it, ja, ko, cmn, pt, es. For those, the vendor accepts only raw or FLAC audio and raw audio must be 16-bit little-endian. The wider list of 60 language codes exists only on the asynchronous job API, where non-English turnaround is documented as up to 6 hours. No file-upload transport is listed on purpose. Rev AI's only file interface is the asynchronous job API (POST /jobs, then poll or webhook, then GET /jobs/{id}/transcript). The vendor describes its turnaround as '5 minutes or less' for short files, its tutorial says to wait 'approximately 1 minute', and each file is billed a 15 second minimum. The fact-check concluded that Rev AI must never be wrapped in the segmented adapter. Opening one short socket per utterance and sending EOS to force a final was also rejected: each connection bills 15 seconds, places a 10 minute credit hold and counts against the limit of 10 concurrent streams."
+      }
+    },
+    {
+      "id": "revai:human",
+      "match": {
+        "provider": "revai",
+        "model": "human"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [],
+      "when_unusable": {
+        "today": "unknown",
+        "refuse_from_release": 3,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "disabled",
+          "text": "'human' is transcription by people, with a turnaround of hours, so it cannot answer a caller during a call. Choose 'machine' for live transcription."
+        }
+      },
+      "billing": {
+        "unit": "audio_minute",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "Not billable on a live call because there is no live path. The vendor's API documentation says human transcription has a 1 minute minimum charge; its pricing page prints a 15 second minimum under the same product. The two disagree, so no minimum is recorded."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://docs.rev.ai/api/asynchronous/",
+          "https://docs.rev.ai/api/asynchronous/get-started/",
+          "https://docs.rev.ai/api/asynchronous/transcribers/",
+          "https://docs.rev.ai/_bundle/api/asynchronous/reference.yaml",
+          "https://docs.rev.ai/changelog",
+          "https://www.rev.ai/pricing",
+          "https://docs.rev.ai/api/streaming/transcribers/"
+        ],
+        "code_refs": [
+          "gateway/src/plugin/builtin/mod.rs:239",
+          "gateway/src/core/stt/revai/config.rs:544",
+          "gateway/src/core/stt/revai/config.rs:540-553"
+        ],
+        "unverified": [
+          "billing.min_billed_ms (vendor pages conflict: 1 minute in the API documentation, 15 seconds on the pricing page)",
+          "what the streaming server does when it receives transcriber=human (reject with close code 4002, or ignore and use the default model)"
+        ],
+        "notes": "The gateway accepts this id today, advertises it (gateway/src/plugin/builtin/mod.rs:239) and sends transcriber=human to the streaming socket (gateway/src/core/stt/revai/config.rs:544 and 502-504). That is a defect: the streaming documentation names only 'machine' and 'machine_v2'. This row turns it into a refusal. Earlier refusal wording (engineering note, replaced 2026-10-04 by customer text): 'human' is transcription by people, with a documented turnaround of 12 to 24 hours, English only. It exists only on the asynchronous job API (POST /jobs, then poll or webhook, then fetch the transcript). Rev AI documents that API's turnaround in minutes and bills a 15 second minimum per file, so an utterance cannot be answered within a conversational turn. The streaming API accepts only the transcribers 'machine' and 'machine_v2'. The session must be refused at setup with a message that names the model and suggests 'machine'. Refusal moved to Release 3 on 2026-10-04 (addendum B13): today's behaviour for this id is not established, so Release 0 keeps today's path."
+      }
+    },
+    {
+      "id": "revai:low_cost",
+      "match": {
+        "provider": "revai",
+        "model": "low_cost"
+      },
+      "lifecycle": {
+        "status": "deprecated",
+        "deprecated_on": "2026-07-28",
+        "replacement": [
+          "machine"
+        ]
+      },
+      "transports": [],
+      "when_unusable": {
+        "today": "streams_substituted_model",
+        "substituted_model": "machine",
+        "code_ref": "gateway/src/core/stt/revai/config.rs:541-553 (an id the model gate does not recognise omits the transcriber parameter, so the account's default streaming model answers)",
+        "refuse_from_release": 3,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "async_only",
+          "text": "'low_cost' was retired by Rev AI on 2026-07-28 and only ever processed whole files in minutes, so it cannot be used on a call. Choose 'machine' for live transcription."
+        }
+      },
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": 15000,
+        "bills_silence": null,
+        "notes": "Not billable on a live call because there is no live path. The 15 second minimum is the asynchronous API's per-file minimum. The product no longer appears on the pricing page read on 2026-10-03, so the unit is unknown."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://docs.rev.ai/api/asynchronous/",
+          "https://docs.rev.ai/api/asynchronous/get-started/",
+          "https://docs.rev.ai/api/asynchronous/transcribers/",
+          "https://docs.rev.ai/_bundle/api/asynchronous/reference.yaml",
+          "https://docs.rev.ai/changelog",
+          "https://www.rev.ai/pricing"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/revai/config.rs:541-553",
+          "gateway/src/core/stt/revai/config.rs:540-553"
+        ],
+        "unverified": [
+          "lifecycle.shutdown_on (the changelog says the option 'will be removed in a future release' and gives no date)",
+          "billing.unit",
+          "whether POST /jobs still accepts transcriber=low_cost (the value is gone from the OpenAPI enum, which now lists only machine and human)"
+        ],
+        "notes": "The gateway does not refuse this id today: it is not one of the strings the model gate recognises, so the session is silently served by the default streaming model (gateway/src/core/stt/revai/config.rs:541-553). Answering with a different model than the one named is the defect this row removes. The vendor's changelog recommends 'the default machine transcriber for new jobs'. The map records today's substitution in when_unusable: in Releases 1 and 2 a session that names this id is warned with stt_model_substituted, and from Release 3 it is refused (integration decisions section 12). Earlier refusal wording (engineering note, replaced 2026-10-04 by customer text): 'low_cost' (Reverb Turbo) was deprecated on 2026-07-28 and existed only on the asynchronous job API (POST /jobs, then poll or webhook, then fetch the transcript). Rev AI documents that API's turnaround in minutes and bills a 15 second minimum per file, so an utterance cannot be answered within a conversational turn. The streaming API accepts only the transcribers 'machine' and 'machine_v2'. The session must be refused at setup with a message that names the model and suggests 'machine'."
+      }
+    },
+    {
+      "id": "revai:fusion",
+      "match": {
+        "provider": "revai",
+        "model": "fusion"
+      },
+      "lifecycle": {
+        "status": "deprecated",
+        "deprecated_on": "2026-08-20",
+        "replacement": [
+          "machine"
+        ]
+      },
+      "transports": [],
+      "when_unusable": {
+        "today": "streams_substituted_model",
+        "substituted_model": "machine",
+        "code_ref": "gateway/src/core/stt/revai/config.rs:541-553 (an id the model gate does not recognise omits the transcriber parameter, so the account's default streaming model answers)",
+        "refuse_from_release": 3,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "async_only",
+          "text": "'fusion' was retired by Rev AI on 2026-08-20 and only ever processed whole files in minutes, so it cannot be used on a call. Choose 'machine' for live transcription."
+        }
+      },
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": 15000,
+        "bills_silence": null,
+        "notes": "Not billable on a live call because there is no live path. The 15 second minimum is the asynchronous API's per-file minimum. The product no longer appears on the pricing page read on 2026-10-03, so the unit is unknown."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://docs.rev.ai/api/asynchronous/",
+          "https://docs.rev.ai/api/asynchronous/get-started/",
+          "https://docs.rev.ai/api/asynchronous/transcribers/",
+          "https://docs.rev.ai/_bundle/api/asynchronous/reference.yaml",
+          "https://docs.rev.ai/changelog",
+          "https://www.rev.ai/pricing"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/revai/config.rs:541-553",
+          "gateway/src/core/stt/revai/config.rs:540-553"
+        ],
+        "unverified": [
+          "lifecycle.shutdown_on (the changelog says the option 'will be removed in a future release' and gives no date)",
+          "billing.unit",
+          "whether POST /jobs still accepts transcriber=fusion (the value is gone from the OpenAPI enum)"
+        ],
+        "notes": "The gateway does not refuse this id today: the session is silently served by the default streaming model (gateway/src/core/stt/revai/config.rs:541-553). The vendor's changelog recommends 'the default transcriber for new jobs'. The map records today's substitution in when_unusable: in Releases 1 and 2 a session that names this id is warned with stt_model_substituted, and from Release 3 it is refused (integration decisions section 12). Earlier refusal wording (engineering note, replaced 2026-10-04 by customer text): 'fusion' (Whisper Fusion) was deprecated on 2026-08-20 and existed only on the asynchronous job API (POST /jobs, then poll or webhook, then fetch the transcript). Rev AI documents that API's turnaround in minutes and bills a 15 second minimum per file, so an utterance cannot be answered within a conversational turn. The streaming API accepts only the transcribers 'machine' and 'machine_v2'. The session must be refused at setup with a message that names the model and suggests 'machine'."
+      }
+    },
+    {
+      "id": "revai:any-whisper-any",
+      "match": {
+        "provider": "revai",
+        "model_glob": "*whisper*"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [],
+      "when_unusable": {
+        "today": "refused_at_setup",
+        "code_ref": "gateway/src/core/stt/revai/config.rs:545-551 (any model id containing 'whisper' is refused with a configuration error before the socket is opened)",
+        "refuse_from_release": 0,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "async_only",
+          "text": "Rev AI's streaming API has no Whisper transcriber: it accepts only 'machine' and 'machine_v2'. Rev AI sells 'Whisper Large Transcription' on its pricing page, but no API value that selects it was found (the asynchronous API's transcriber enum is 'machine' and 'human'), and anything on the asynchronous job API is answered in minutes, not within a turn. The gateway already refuses any Rev AI model id that contains 'whisper' rather than serve it with a different model."
+        }
+      },
+      "billing": {
+        "unit": "audio_minute",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "Not billable on a live call because there is no live path. The pricing page lists Whisper Large Transcription per minute."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://docs.rev.ai/api/streaming/transcribers/",
+          "https://docs.rev.ai/_bundle/api/asynchronous/reference.yaml",
+          "https://www.rev.ai/pricing"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/revai/config.rs:545-551",
+          "gateway/src/core/stt/revai/config.rs:540-553"
+        ],
+        "unverified": [
+          "match.model_glob (no exact wire string is known for Whisper Large; the glob mirrors the gateway's own gate, which refuses any id containing 'whisper')",
+          "billing.min_billed_ms",
+          "whether Whisper Large is asynchronous-only"
+        ],
+        "notes": "This is a glob row, not an exact row, because the vendor publishes no model id for the product. It mirrors the existing refusal in gateway/src/core/stt/revai/config.rs:545-551 so that the map and the client agree. Today's gateway already refuses these ids at setup with a configuration error that names the model, so when_unusable.today is refused_at_setup."
+      }
+    },
+    {
+      "id": "revai:any",
+      "match": {
+        "provider": "revai",
+        "model_glob": "*"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "none",
+          "constraints": {
+            "languages": {
+              "mode": "only",
+              "codes": [
+                "en",
+                "fr",
+                "de",
+                "it",
+                "ja",
+                "ko",
+                "zh",
+                "cmn",
+                "pt",
+                "es"
+              ],
+              "note": "Rev AI's nine streaming languages (vendor streaming request page, confirmed by the fact-check). Mandarin is cmn on the wire; today's client sends any zh tag as cmn (gateway/src/core/stt/revai/config.rs:28-46), so zh is listed too. Every other language exists only on the asynchronous job API; today's client passes it through for Rev AI to refuse."
+            }
+          },
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": 10800000,
+            "vendor_timeout_ms": null,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 10,
+                "plan": null,
+                "scope": "unknown",
+                "note": "Streaming concurrency limit; Rev AI support can raise it. The audit reads it as account-wide, but the vendor page does not say what it counts against."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "quality_signals": [
+            "word_confidence"
+          ],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "language_format": "vendor",
+            "language_required": true,
+            "context_params": [
+              {
+                "kind": "vocabulary_id",
+                "wire_name": "custom_vocabulary_id",
+                "note": "A custom vocabulary registered with Rev AI beforehand. The vendor says it cannot be combined with the language parameter, which today's client sends whenever the session language is set (config.rs:465-484); whether language=en with it is rejected is unverified. Not usable with the foreign-language model, which is chosen by the language parameter."
+              }
+            ],
+            "wire": "revai_stream_websocket"
+          },
+          "gateway_client": {
+            "status": "wire_tested",
+            "code_ref": "gateway/src/core/stt/revai/client.rs:79-200,321-356; gateway/src/core/stt/revai/config.rs:438-524,527-568; gateway/tests/mock_endpoint_e2e.rs:246-334",
+            "notes": "Never exercised against Rev AI: the only end-to-end test runs against an in-repo mock (gateway/tests/mock_endpoint_e2e.rs:9 says the gateway holds no Rev AI key). One long-lived socket per call; each caller chunk is forwarded at once as a binary frame (client.rs:111-116). Vendor 'partial' becomes an interim result and vendor 'final' becomes is_final and is_speech_final (client.rs:327-348). Defects found by reading, none of which stop transcription: partial text is joined with no separator, so interim text reads 'onetooth' (messages.rs:188-190); connect() returns on the HTTP upgrade, not on the vendor 'connected' frame, although the vendor requires waiting for it (client.rs:90-97, 323-326); every vendor final is flagged end of speech although Rev AI finals are commit points, not end-of-utterance markers (client.rs:348); a server Close frame with a standard code such as 1001, 1011, 1012 or 1013 ends the session instead of reconnecting (messages.rs:34-45, 62-64; client.rs:142-157); chunks are not aggregated to the 250 ms the vendor asks for (mod.rs:100 is unused). For an id the gateway does not recognise it omits the transcriber query parameter, so the account's default streaming model answers (config.rs:541-553; the test at config.rs:759-766 pins that an unknown id does not error).",
+            "defect": "Found by reading, none of which stops transcription: interim text is joined without spaces, every vendor final is flagged end of speech although Rev AI finals are commit points, and a server Close frame with a standard code such as 1001, 1011, 1012 or 1013 ends the session instead of reconnecting (messages.rs:188-190; client.rs:348; messages.rs:62-64 with client.rs:142-157). It also sends audio before the vendor's connected frame and does not aggregate chunks to the 250 ms the vendor asks for (client.rs:90-97; mod.rs:100)."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "audio_hour",
+        "min_billed_ms": 15000,
+        "increment_ms": 1000,
+        "bills_silence": true,
+        "notes": "Billing is per stream, not per utterance: Rev AI charges the larger of stream duration and audio duration, rounded up to the second, with a 15 second minimum for each connection, so silence on an open stream is billed. Each connect also places a 10 minute credit hold, and another 5 minutes after every 5 minutes of stream time. Reconnects therefore add minimum charges. There is no Rev AI entry in gateway/src/config/pricing.rs, so no pricing_key is given."
+      },
+      "provenance": {
+        "confidence": "assumed",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://docs.rev.ai/api/streaming/",
+          "https://docs.rev.ai/api/streaming/requests/",
+          "https://docs.rev.ai/api/streaming/responses/",
+          "https://docs.rev.ai/api/streaming/transcribers/",
+          "https://docs.rev.ai/api/streaming/billing/",
+          "https://docs.rev.ai/api/streaming/example-session/",
+          "https://www.rev.ai/pricing"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/revai/client.rs:79-200,321-356",
+          "gateway/src/core/stt/revai/config.rs:438-524,527-568",
+          "gateway/tests/mock_endpoint_e2e.rs:246-334",
+          "gateway/tests/mock_endpoint_e2e.rs:9",
+          "gateway/src/core/stt/revai/config.rs:540-553",
+          "gateway/src/core/stt/revai/config.rs:28-46"
+        ],
+        "unverified": [
+          "transports[0].latency (Rev AI publishes no streaming latency; the only figure found was a competitor's claim and is not used)",
+          "transports[0].limits.rates[].scope (the vendor states a streaming concurrency limit of 10, adjustable by support; the audit reads it as account-wide but the page does not say)",
+          "transports[0].limits.vendor_timeout_ms (whether Rev AI sends WebSocket pings during caller silence is unknown; the gateway treats 60 s without any inbound message as a dead socket, client.rs:44)",
+          "transports[0].gateway_client (whether audio sent before the vendor 'connected' frame is dropped or buffered)",
+          "whether language=en together with filter_profanity, remove_disfluencies or custom_vocabulary_id is rejected (the vendor text forbids the combination; the gateway sends language whenever the session language is non-empty, config.rs:465-467)",
+          "the whole row: an unknown Rev AI id may be an asynchronous-only transcriber, in which case the session is answered by a different model than the one named"
+        ],
+        "notes": "Default for a Rev AI model id the map has never seen. Neither usual rule fits this vendor. File upload cannot be the default, because the only file interface is an asynchronous job answered in minutes. A plain 'every model streams' is not true either, because 'human' and the deprecated 'low_cost' and 'fusion' exist only on the job API. The row keeps today's behaviour, which is the choice that keeps the call working: the existing streaming client serves the session with the account's default streaming model, and the resolver must attach a warning that the capability was assumed. The vendor audit recommends the stricter alternative, refusing unknown ids at setup; the capability-map workstream should decide between the two. No file-upload transport is listed on purpose. Rev AI's only file interface is the asynchronous job API (POST /jobs, then poll or webhook, then GET /jobs/{id}/transcript). The vendor describes its turnaround as '5 minutes or less' for short files, its tutorial says to wait 'approximately 1 minute', and each file is billed a 15 second minimum. The fact-check concluded that Rev AI must never be wrapped in the segmented adapter. Opening one short socket per utterance and sending EOS to force a final was also rejected: each connection bills 15 seconds, places a 10 minute credit hold and counts against the limit of 10 concurrent streams. The provider's native_model_handling (substituted) is what makes the resolver attach that warning."
+      }
+    }
+  ]
+}

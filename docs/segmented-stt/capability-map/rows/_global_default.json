@@ -1,0 +1,51 @@
+{
+  "provider_id": "*",
+  "provider": {
+    "aliases": [],
+    "default_model": null,
+    "model_string": "wire_model",
+    "registered_in_gateway": false,
+    "notes": "Not a provider. This file holds the single row used when the provider name matches no provider in the map after alias resolution. Every provider the gateway can dispatch to has its own default row, so this row is reached only by a provider registered at run time or through the plugin interface, by a spelling the map's alias table lacks, or by a name that does not exist."
+  },
+  "rows": [
+    {
+      "id": "global:any",
+      "match": {
+        "provider": "*",
+        "model_glob": "*"
+      },
+      "passthrough": true,
+      "lifecycle": {
+        "status": "unknown"
+      },
+      "transports": [],
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "Nothing is known about an unknown provider's billing; metering stays exactly as today."
+      },
+      "provenance": {
+        "confidence": "assumed",
+        "verified_on": "2026-10-03",
+        "verified_by": "none",
+        "owner": "waav-gateway",
+        "sources": [],
+        "code_refs": [
+          "gateway/src/core/stt/standard.rs:390-478",
+          "gateway/src/core/stt/mod.rs:488-495",
+          "gateway/src/plugin/registry.rs:303-340",
+          "gateway/src/core/voice_manager/manager.rs:197-205",
+          "gateway/src/core/stt/base.rs:805",
+          "gateway/src/core/capabilities.rs:674-682"
+        ],
+        "unverified": [
+          "billing.unit (nothing is known about a provider the map does not list)",
+          "billing.min_billed_ms",
+          "billing.bills_silence"
+        ],
+        "notes": "Meaning: take today's path unchanged (passthrough). The resolver calls create_stt_standard(provider, config) exactly as the voice manager does today (gateway/src/core/voice_manager/manager.rs:197-205) and changes nothing else: it does not install the segmenter, does not apply a dialect and uploads nothing. A provider registered at run time or through the plugin interface gets its own factory, as today. A name nobody registered gets today's setup error, \"Unknown STT provider\" (create_stt_standard at gateway/src/core/stt/standard.rs:390-478, whose fallback arm at :476 calls create_stt_provider, gateway/src/core/stt/mod.rs:488-495, which asks the registry, gateway/src/plugin/registry.rs:303-340). Why not file upload. An OpenAI-compatible server never reaches this row: it arrives as vendor self_hosted (or one of its three aliases) and has its own default row. What does reach it is a provider with its own factory and its own wire protocol. Uploading that provider's audio as an OpenAI multipart request has no address to go to, because the speech-to-text configuration carries no base address (gateway/src/core/stt/base.rs:503-519). The nearest existing fallback is the OpenAI client's production host (gateway/src/core/stt/openai/config.rs:29-49), and using it would send another vendor's API key to a third party. A file-upload default would also silently reroute every runtime-registered plugin that streams correctly today. Why not a refusal. An empty transport list with a refusal would refuse providers that work today; the gateway's rule for uncatalogued providers is that unknown does not mean unsupported (gateway/src/core/capabilities.rs:674-682). What the customer sees. A name nobody registered still fails at session setup with today's error. A provider that was registered works as today, and the session-start announcement should say that the capability was assumed from the global default and report interim results and endpointing as unknown. A counter keyed by provider shows which unknown names are in use, which is the queue for new rows. Known residual risk. A runtime-registered client that buffers audio until the call ends will go on doing so. Proposed additive safeguard: after the client is built, read BaseSTT::is_request_response() (gateway/src/core/stt/base.rs:805); when it is true the client answers only when the call ends, so emit a coded warning and count it, without rerouting."
+      }
+    }
+  ]
+}
