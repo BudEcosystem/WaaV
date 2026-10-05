@@ -180,16 +180,8 @@ impl SileroVAD {
 
     /// Gets the model path, downloading if necessary.
     async fn get_or_download_model() -> Result<std::path::PathBuf> {
-        // Check standard locations
-        let possible_paths = [
-            std::path::PathBuf::from("models/silero_vad.onnx"),
-            std::path::PathBuf::from("./silero_vad.onnx"),
-            dirs::cache_dir()
-                .unwrap_or_default()
-                .join("waav")
-                .join("models")
-                .join("silero_vad.onnx"),
-        ];
+        // Check standard locations (the image bakes the model under `$CACHE_PATH/models`).
+        let possible_paths = crate::core::model_dir::model_candidates("silero_vad.onnx");
 
         for path in &possible_paths {
             if path.exists() {
@@ -199,10 +191,7 @@ impl SileroVAD {
         }
 
         // Download the model
-        let cache_dir = dirs::cache_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join("waav")
-            .join("models");
+        let cache_dir = crate::core::model_dir::model_cache_dir();
 
         tokio::fs::create_dir_all(&cache_dir)
             .await

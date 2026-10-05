@@ -421,16 +421,8 @@ impl SmartTurnDetector {
             anyhow::bail!("Configured model path does not exist: {:?}", path);
         }
 
-        // Check standard locations
-        let possible_paths: [PathBuf; 3] = [
-            PathBuf::from("models/smart_turn.onnx"),
-            PathBuf::from("./smart_turn.onnx"),
-            dirs::cache_dir()
-                .unwrap_or_default()
-                .join("waav")
-                .join("models")
-                .join("smart_turn.onnx"),
-        ];
+        // Check standard locations (the image bakes the model under `$CACHE_PATH/models`).
+        let possible_paths = crate::core::model_dir::model_candidates("smart_turn.onnx");
 
         for path in &possible_paths {
             if path.exists() {
@@ -443,10 +435,7 @@ impl SmartTurnDetector {
         let model_url = smart_turn_model_download_url(config.model_url.as_deref())
             .map_err(|e| anyhow::anyhow!(e))?;
 
-        let cache_dir: PathBuf = dirs::cache_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("waav")
-            .join("models");
+        let cache_dir: PathBuf = crate::core::model_dir::model_cache_dir();
 
         tokio::fs::create_dir_all(&cache_dir)
             .await
