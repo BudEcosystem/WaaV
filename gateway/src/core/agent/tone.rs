@@ -1,6 +1,6 @@
-//! The tool-call tone: a gentle pulse a voice agent plays while one of its tools runs, after the
-//! tool's first phrase ("One moment."), so the caller hears that the agent is working rather than
-//! dead air.
+//! The tool-call tone: a gentle pulse a voice agent plays while it works on a tool call (from the
+//! call until it speaks again, the model's thinking around the tool included), after the call's
+//! phrase ("One moment."), so the caller hears that the agent is working rather than dead air.
 //!
 //! Generated rather than recorded, so there is no asset to license or ship: a soft 440 Hz tone with
 //! its octave, eased in and out over [`PULSE_MS`], at about -24 dBFS peak. One pulse is played every

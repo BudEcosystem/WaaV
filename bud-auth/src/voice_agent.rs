@@ -164,8 +164,9 @@ pub struct AgentFillers {
     pub follow_up_after_ms: u64,
     pub messages: Vec<String>,
     pub use_tool_status_messages: bool,
-    /// A gentle pulsing tone while a tool runs, after its first phrase, so the caller never hears
-    /// dead air. On by default; while it plays, no further phrase is said for that wait.
+    /// A gentle pulsing tone while the agent works on a tool call (from the call until it speaks
+    /// again), after the call's phrase, so the caller never hears dead air. On by default; while it
+    /// plays, no further phrase is said for that wait.
     pub tool_call_sound: bool,
 }
 

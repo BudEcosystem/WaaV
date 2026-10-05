@@ -905,6 +905,85 @@ async fn the_tone_follows_the_tool_phrase_until_the_tool_finishes() {
     }
 }
 
+/// Live, an agent's tools return in under a second while its model thinks for seconds before and
+/// after each one: the caller waits on the agent's work, not on the tool. The phrase and the tone
+/// cover that work, from the tool call until the agent speaks again.
+#[tokio::test(start_paused = true)]
+async fn the_tone_covers_the_agent_thinking_after_a_quick_tool() {
+    let mut h = harness(fillers_with_tone(2000, true), None, false);
+    h.speech.paced.store(true, Ordering::Release);
+    h.backend.push(Ok(vec![
+        created("resp_1"),
+        Step::Ev(AgentEvent::ToolStarted {
+            item_id: "mcp_1".into(),
+            name: "lookup_order".into(),
+            kind: "mcp_call".into(),
+        }),
+        Step::Wait(Duration::from_millis(300)),
+        Step::Ev(AgentEvent::ToolFinished {
+            item_id: "mcp_1".into(),
+            name: "lookup_order".into(),
+            ok: true,
+        }),
+        Step::Wait(Duration::from_millis(6_000)),
+        delta("Found it."),
+        completed(),
+    ]));
+    let start = tokio::time::Instant::now();
+    h.engine.start_turn("order?".into()).await;
+    let _ = until_done(&mut h, 0).await;
+    assert_eq!(h.speech.spoken(), vec!["Let me look that up.", "Found it."]);
+    assert_eq!(
+        h.speech.timeline(),
+        vec!["say:Let me look that up.", "tone", "say:Found it."]
+    );
+    let pulses: Vec<Duration> = h.speech.pulses.lock().iter().map(|t| *t - start).collect();
+    assert!(pulses.len() >= 3, "the tone fills the thinking: {pulses:?}");
+    assert!(
+        pulses.iter().all(|p| *p < Duration::from_millis(6_300)),
+        "{pulses:?}"
+    );
+}
+
+/// Once the agent speaks again, the tone is over: a pause later in the answer is not tool work.
+#[tokio::test(start_paused = true)]
+async fn the_tone_ends_when_the_agent_speaks_again() {
+    let mut h = harness(fillers_with_tone(2000, true), None, false);
+    h.speech.paced.store(true, Ordering::Release);
+    h.backend.push(Ok(vec![
+        created("resp_1"),
+        Step::Ev(AgentEvent::ToolStarted {
+            item_id: "mcp_1".into(),
+            name: "lookup_order".into(),
+            kind: "mcp_call".into(),
+        }),
+        Step::Wait(Duration::from_millis(300)),
+        Step::Ev(AgentEvent::ToolFinished {
+            item_id: "mcp_1".into(),
+            name: "lookup_order".into(),
+            ok: true,
+        }),
+        Step::Wait(Duration::from_millis(4_000)),
+        delta("I found your order. "),
+        delta("It shipped on Monday"),
+        Step::Wait(Duration::from_millis(6_000)),
+        delta(", and it arrives on Friday."),
+        completed(),
+    ]));
+    h.engine.start_turn("order?".into()).await;
+    let _ = until_done(&mut h, 0).await;
+    let timeline = h.speech.timeline();
+    let said = timeline
+        .iter()
+        .position(|e| e == "say:I found your order.")
+        .expect("the answer was spoken");
+    assert!(
+        !timeline[said..].iter().any(|e| e == "tone"),
+        "no tone after the agent spoke again: {timeline:?}"
+    );
+    assert!(timeline[..said].iter().any(|e| e == "tone"), "{timeline:?}");
+}
+
 /// A caller who talks over the tone stops it at once; nothing more of it is played.
 #[tokio::test(start_paused = true)]
 async fn a_barge_in_stops_the_tone() {
