@@ -339,8 +339,34 @@ impl Limiter {
         std::mem::take(&mut self.bucket.lock().pressure)
     }
 
+    /// A changed limit (a deployment override, a new capability map) applies from now on: tokens
+    /// earned at the old rate are kept up to the new burst, and concurrency slots are added or
+    /// retired (a slot in use is retired when it is released).
     pub fn set_spec(&self, spec: LimitSpec) {
-        *self.spec.lock() = spec;
+        let mut b = self.bucket.lock();
+        self.refill(&mut b, Instant::now());
+        let mut current = self.spec.lock();
+        if *current == spec {
+            return;
+        }
+        b.tokens = b.tokens.min(spec.burst);
+        if spec.max_concurrent > current.max_concurrent {
+            self.slots
+                .add_permits(spec.max_concurrent - current.max_concurrent);
+        } else if spec.max_concurrent < current.max_concurrent {
+            let retire = current.max_concurrent - spec.max_concurrent;
+            let retired = self.slots.forget_permits(retire);
+            if retired < retire {
+                let slots = Arc::clone(&self.slots);
+                let rest = (retire - retired) as u32;
+                tokio::spawn(async move {
+                    if let Ok(p) = slots.acquire_many_owned(rest).await {
+                        p.forget();
+                    }
+                });
+            }
+        }
+        *current = spec;
     }
 }
 
@@ -355,14 +381,17 @@ impl LimiterRegistry {
         Self::default()
     }
 
-    /// The limiter for a key, created with `spec` on first use.
+    /// The limiter for a key, created with `spec` on first use and brought to `spec` after: the
+    /// latest session's limits (its deployment's override, the current map) are the key's.
     pub fn get(&self, key: &str, spec: LimitSpec) -> Arc<Limiter> {
-        Arc::clone(
+        let limiter = Arc::clone(
             self.map
                 .lock()
                 .entry(key.to_string())
                 .or_insert_with(|| Arc::new(Limiter::new(spec))),
-        )
+        );
+        limiter.set_spec(spec);
+        limiter
     }
 }
 
@@ -421,6 +450,64 @@ impl BudgetRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A changed limit reaches the live limiter (found on pde-ditto: a deployment override of
+    /// Azure's 3-requests-a-minute default never applied until the gateway restarted).
+    #[tokio::test(start_paused = true)]
+    async fn a_changed_limit_applies_to_the_limiter_already_in_use() {
+        let reg = LimiterRegistry::new();
+        let slow = reg.get("k", LimitSpec::from_rpm(3, 1));
+        while slow.has_headroom() {
+            let _ = slow.acquire(Instant::now()).await.unwrap();
+        }
+        // At 2.4 a minute the next token is 25 s away.
+        tokio::time::advance(Duration::from_millis(500)).await;
+        assert!(!slow.has_headroom());
+
+        let fast = reg.get("k", LimitSpec::from_rpm(600, 4));
+        assert!(
+            Arc::ptr_eq(&slow, &fast),
+            "one limiter per key, updated in place"
+        );
+        tokio::time::advance(Duration::from_millis(500)).await;
+        assert!(fast.has_headroom(), "the new rate refills the bucket");
+        let passes: Vec<_> = futures_util_join(&fast, 4).await;
+        assert_eq!(
+            passes.len(),
+            4,
+            "four requests at once under the new concurrency"
+        );
+
+        // Back down: the slots and the burst shrink with it.
+        drop(passes);
+        // Plenty of tokens, so only a slot can refuse below.
+        tokio::time::advance(Duration::from_secs(3)).await;
+        let narrow = reg.get("k", LimitSpec::from_rpm(600, 1));
+        let one = narrow
+            .acquire(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(!narrow.has_headroom(), "the one slot is taken");
+        assert!(
+            narrow
+                .acquire(Instant::now() + Duration::from_millis(50))
+                .await
+                .is_err()
+        );
+        drop(one);
+    }
+
+    async fn futures_util_join(l: &Limiter, n: usize) -> Vec<GatePass> {
+        let mut out = Vec::new();
+        for _ in 0..n {
+            out.push(
+                l.acquire(Instant::now() + Duration::from_secs(1))
+                    .await
+                    .unwrap(),
+            );
+        }
+        out
+    }
 
     #[tokio::test(start_paused = true)]
     async fn an_hourly_budget_refuses_at_the_gate_and_frees_up_as_the_hour_moves() {
