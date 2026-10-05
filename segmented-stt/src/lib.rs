@@ -17,6 +17,7 @@
 //! | [`control`] | The control record: deployments and rows switched off on a running gateway |
 //! | [`breaker`] | The circuit-breaker state machine, shared with the gateway's breakers |
 //! | [`audio`] | Wire bytes to 16 kHz mono frames, and WAV encoding |
+//! | [`resample`] | The streaming resampler core, shared with the gateway's egress resampler |
 //! | [`profile`] | Every engine threshold, merged from defaults, the capability row and the session |
 //! | [`detector`] | The speech detector trait, the energy detector and a scripted detector for tests |
 //! | [`segmenter`] | The state machine that confirms speech and cuts segments at pauses |
@@ -44,6 +45,7 @@ pub mod live;
 pub mod map;
 pub mod net;
 pub mod profile;
+pub mod resample;
 pub mod resolve;
 pub mod rollout;
 pub mod segmenter;

@@ -9,8 +9,6 @@
 //! across any gap between chunks (the gateway's own resampler resets after 200 ms of wall time,
 //! which would make a network jitter gap change the audio).
 
-use rubato::{FftFixedIn, Resampler};
-
 use crate::types::{FRAME_SAMPLES, SAMPLE_RATE};
 
 /// One 32 ms frame of 16 kHz mono 16-bit PCM.
@@ -142,53 +140,26 @@ pub enum AudioError {
     Unsupported(String),
 }
 
-/// A streaming resampler to 16 kHz that counts time in samples.
+/// A streaming resampler to 16 kHz that counts time in samples (the shared core; a chunk that
+/// fails to resample is dropped).
 struct Resampler16k {
-    inner: FftFixedIn<f32>,
-    pending: Vec<f32>,
+    inner: crate::resample::MonoResampler,
 }
 
 impl Resampler16k {
     fn new(in_rate: u32) -> Result<Self, AudioError> {
-        let chunk = ((in_rate as usize) / 50).clamp(64, 2048);
-        let inner = FftFixedIn::<f32>::new(in_rate as usize, SAMPLE_RATE as usize, chunk, 2, 1)
+        let inner = crate::resample::MonoResampler::new(in_rate, SAMPLE_RATE, 2048)
             .map_err(|e| AudioError::Unsupported(format!("resampler for {in_rate} Hz: {e}")))?;
-        Ok(Self {
-            inner,
-            pending: Vec::new(),
-        })
+        Ok(Self { inner })
     }
 
     fn push(&mut self, input: &[f32], out: &mut Vec<f32>) {
-        self.pending.extend_from_slice(input);
-        loop {
-            let chunk = self.inner.input_frames_next().max(1);
-            if self.pending.len() < chunk {
-                break;
-            }
-            let take: Vec<f32> = self.pending.drain(..chunk).collect();
-            if let Ok(mut resampled) = self.inner.process(&[take], None)
-                && let Some(channel) = resampled.pop()
-            {
-                out.extend_from_slice(&channel);
-            }
-        }
+        let _ = self.inner.push(input, out);
     }
 
     /// Push the held tail through with zeros, so the last consonant is not lost at a forced cut.
     fn flush(&mut self, out: &mut Vec<f32>) {
-        if self.pending.is_empty() {
-            return;
-        }
-        let chunk = self.inner.input_frames_next().max(1);
-        let mut tail = std::mem::take(&mut self.pending);
-        tail.resize(chunk, 0.0);
-        if let Ok(mut resampled) = self.inner.process(&[tail], None)
-            && let Some(channel) = resampled.pop()
-        {
-            out.extend_from_slice(&channel);
-        }
-        self.inner.reset();
+        let _ = self.inner.flush(out);
     }
 }
 
