@@ -1004,7 +1004,12 @@ mod rate_limit_tests {
     fn test_rate_limit_parse_duration_string_invalid() {
         assert!(RateLimitInfo::parse_duration_string("invalid").is_none());
         assert!(RateLimitInfo::parse_duration_string("").is_none());
-        assert!(RateLimitInfo::parse_duration_string("5h").is_none()); // hours not supported
+        assert_eq!(RateLimitInfo::parse_duration_string("1h"), Some(3_600_000));
+        // The form Groq sends in x-ratelimit-reset-requests.
+        assert_eq!(
+            RateLimitInfo::parse_duration_string("2m59.56s"),
+            Some(179_560)
+        );
     }
 
     #[test]

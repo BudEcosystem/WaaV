@@ -9,6 +9,7 @@
 //! Key terms add a 20 % surcharge and, above 100 per request, a 20 s minimum bill; the plan step
 //! warns about the first and caps the second through `keyterms_max`.
 
+use crate::vendor::retention;
 use std::time::Duration;
 
 use reqwest::multipart::{Form, Part};
@@ -23,7 +24,7 @@ use crate::transcriber::{
     SegmentTranscript, TranscriberInfo,
 };
 
-pub const DEFAULT_BASE_URL: &str = "https://api.elevenlabs.io";
+pub const DEFAULT_BASE_URL: &str = crate::vendor::hosts::ELEVENLABS;
 
 /// The vendor's limits on one key term.
 const KEYTERM_MAX_CHARS: usize = 49;
@@ -77,7 +78,11 @@ impl ElevenLabsTranscriber {
         }
         let mut url = join_url(&cfg.base_url, "/v1/speech-to-text")?;
         if cfg.zero_retention {
-            url.push_str("?enable_logging=false");
+            url.push_str(&format!(
+                "?{}={}",
+                retention::ELEVENLABS.0,
+                retention::ELEVENLABS.1
+            ));
         }
         let mut droppable: Vec<String> = [
             "language_code",

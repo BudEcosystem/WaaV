@@ -179,35 +179,17 @@ impl RateLimitInfo {
         })
     }
 
-    /// Parse Retry-After header value.
-    /// Can be seconds (integer) or duration string.
+    /// Parse a Retry-After value, in milliseconds: seconds (whole or fractional), an HTTP date, or
+    /// a duration string such as `500ms` or `2m59.56s`.
     pub fn parse_retry_after(s: &str) -> Option<u64> {
-        // Try parsing as seconds (integer)
-        if let Ok(secs) = s.parse::<u64>() {
-            return Some(secs * 1000); // Convert to ms
-        }
-        // Try parsing as duration string
-        Self::parse_duration_string(s)
+        waav_segmented_stt::vendor::parse_retry_after(s, std::time::SystemTime::now())
+            .or_else(|| waav_segmented_stt::vendor::parse_compound_duration(s))
+            .map(|d| d.as_millis() as u64)
     }
 
-    /// Parse duration strings like "1s", "500ms", "1m".
+    /// Parse a duration string, in milliseconds: `500ms`, `5s`, `2m`, `2m59.56s`, `1h`.
     pub fn parse_duration_string(s: &str) -> Option<u64> {
-        let s = s.trim();
-        if s.ends_with("ms") {
-            s.trim_end_matches("ms").parse().ok()
-        } else if s.ends_with('s') {
-            s.trim_end_matches('s')
-                .parse::<u64>()
-                .ok()
-                .map(|v| v * 1000)
-        } else if s.ends_with('m') {
-            s.trim_end_matches('m')
-                .parse::<u64>()
-                .ok()
-                .map(|v| v * 60 * 1000)
-        } else {
-            None
-        }
+        waav_segmented_stt::vendor::parse_compound_duration(s).map(|d| d.as_millis() as u64)
     }
 }
 
@@ -743,11 +725,8 @@ impl GroqSTT {
         self.rate_limit_info = rate_limit_info;
 
         // Extract request ID for debugging
-        self.last_request_id = response
-            .headers()
-            .get("x-request-id")
-            .and_then(|v| v.to_str().ok())
-            .map(String::from);
+        self.last_request_id =
+            waav_segmented_stt::vendor::request_id(response.headers(), &["x-request-id"]);
 
         if let Some(ref request_id) = self.last_request_id {
             debug!("Groq request ID: {}", request_id);

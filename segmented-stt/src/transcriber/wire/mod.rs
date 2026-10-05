@@ -39,7 +39,7 @@ pub mod openai_realtime;
 #[cfg(test)]
 pub(crate) mod testkit;
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
@@ -57,6 +57,8 @@ use super::{
     RequestPhase, RequestProgress, SegmentAudio, SegmentContext, SegmentError, TranscriberInfo,
 };
 use crate::types::ErrorClass;
+pub(crate) use crate::vendor::{VendorBody, field_key, redact};
+pub use crate::vendor::{parse_compound_duration, parse_retry_after, request_id, retry_after};
 
 /// The adapter ids this crate can construct a transcriber for. The resolver must never name an
 /// adapter outside this list.
@@ -152,7 +154,7 @@ impl Auth {
             Self::None => return Ok(req),
             Self::Bearer(s) if s.is_empty() => return Ok(req),
             Self::Bearer(s) => ("authorization", format!("Bearer {s}")),
-            Self::AzureApiKey(s) => ("api-key", s.clone()),
+            Self::AzureApiKey(s) => (crate::vendor::azure_openai::API_KEY_HEADER, s.clone()),
             Self::Header { secret, .. } if secret.is_empty() => return Ok(req),
             Self::Header {
                 name,
@@ -290,15 +292,6 @@ pub(crate) fn check_limits(
         ));
     }
     Ok(())
-}
-
-/// One spelling per field, so a vendor's `languages`, `language_codes` or `languageCodes` matches
-/// the `languages[]`, `language_codes` or `languageCodes` that was sent.
-pub(crate) fn field_key(name: &str) -> String {
-    name.trim()
-        .trim_end_matches("[]")
-        .replace(['_', '-'], "")
-        .to_ascii_lowercase()
 }
 
 /// Whether an optional field may go out on this request.
@@ -682,125 +675,6 @@ const LANGUAGE_NAMES: &[(&str, &str)] = &[
     ("chinese", "zh"),
 ];
 
-/// The wait a vendor asked for: `Retry-After` (seconds, fractional seconds or an HTTP date),
-/// then Azure's `retry-after-ms`, then the request-limit reset (`x-ratelimit-reset-requests`,
-/// `2m59.56s` style, as Groq and OpenAI send it).
-pub fn retry_after(headers: &HeaderMap) -> Option<Duration> {
-    let get = |name: &str| {
-        headers
-            .get(name)
-            .and_then(|v| v.to_str().ok())
-            .map(str::trim)
-    };
-    if let Some(d) = get("retry-after").and_then(|v| parse_retry_after(v, SystemTime::now())) {
-        return Some(d);
-    }
-    if let Some(ms) = get("retry-after-ms")
-        .and_then(|v| v.parse::<f64>().ok())
-        .filter(|ms| ms.is_finite() && *ms >= 0.0)
-    {
-        return Some(Duration::from_secs_f64(ms / 1000.0));
-    }
-    get("x-ratelimit-reset-requests").and_then(parse_compound_duration)
-}
-
-/// A `Retry-After` value: delay seconds (integer or fractional) or an IMF-fixdate.
-pub fn parse_retry_after(value: &str, now: SystemTime) -> Option<Duration> {
-    let value = value.trim();
-    if let Ok(secs) = value.parse::<f64>() {
-        return (secs.is_finite() && secs >= 0.0).then(|| Duration::from_secs_f64(secs));
-    }
-    let at = parse_http_date(value)?;
-    Some(at.duration_since(now).unwrap_or(Duration::ZERO))
-}
-
-/// `Sun, 06 Nov 1994 08:49:37 GMT`, the one date form senders must use (RFC 9110, 5.6.7).
-fn parse_http_date(value: &str) -> Option<SystemTime> {
-    let rest = value.split_once(", ")?.1;
-    let mut it = rest.split_ascii_whitespace();
-    let day: u64 = it.next()?.parse().ok()?;
-    let month = match it.next()? {
-        "Jan" => 1,
-        "Feb" => 2,
-        "Mar" => 3,
-        "Apr" => 4,
-        "May" => 5,
-        "Jun" => 6,
-        "Jul" => 7,
-        "Aug" => 8,
-        "Sep" => 9,
-        "Oct" => 10,
-        "Nov" => 11,
-        "Dec" => 12,
-        _ => return None,
-    };
-    let year: i64 = it.next()?.parse().ok()?;
-    let mut hms = it.next()?.split(':').map(|p| p.parse::<u64>().ok());
-    let (h, m, s) = (hms.next()??, hms.next()??, hms.next()??);
-    if it.next()? != "GMT" || !(1..=31).contains(&day) || h > 23 || m > 59 || s > 60 {
-        return None;
-    }
-    // Days from the civil date (Howard Hinnant's algorithm).
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let mp = (month + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + day as i64 - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146_097 + doe - 719_468;
-    let secs = u64::try_from(days).ok()? * 86_400 + h * 3600 + m * 60 + s;
-    Some(UNIX_EPOCH + Duration::from_secs(secs))
-}
-
-/// `2m59.56s`, `7.66s`, `1h2m`, `250ms` or a bare number of seconds.
-pub fn parse_compound_duration(value: &str) -> Option<Duration> {
-    let value = value.trim();
-    if value.is_empty() {
-        return None;
-    }
-    if let Ok(secs) = value.parse::<f64>() {
-        return (secs.is_finite() && secs >= 0.0).then(|| Duration::from_secs_f64(secs));
-    }
-    let mut total = 0.0f64;
-    let mut rest = value;
-    while !rest.is_empty() {
-        let num_len = rest.find(|c: char| !(c.is_ascii_digit() || c == '.'))?;
-        if num_len == 0 {
-            return None;
-        }
-        let n: f64 = rest[..num_len].parse().ok()?;
-        rest = &rest[num_len..];
-        let unit_len = rest
-            .find(|c: char| c.is_ascii_digit() || c == '.')
-            .unwrap_or(rest.len());
-        let scale = match &rest[..unit_len] {
-            "h" => 3600.0,
-            "m" => 60.0,
-            "s" => 1.0,
-            "ms" => 0.001,
-            _ => return None,
-        };
-        total += n * scale;
-        rest = &rest[unit_len..];
-    }
-    Some(Duration::from_secs_f64(total))
-}
-
-/// The first non-empty header of `names`, at most 200 characters.
-pub fn request_id(headers: &HeaderMap, names: &[&str]) -> Option<String> {
-    names
-        .iter()
-        .find_map(|n| {
-            headers
-                .get(*n)
-                .and_then(|v| v.to_str().ok())
-                .map(str::trim)
-                .filter(|v| !v.is_empty())
-        })
-        .filter(|v| v.len() <= 200)
-        .map(str::to_string)
-}
-
 /// A confidence from a mean log-probability, comparable within one model only.
 pub fn confidence_from_logprob(mean_logprob: f32) -> f32 {
     mean_logprob.exp().clamp(0.0, 1.0)
@@ -933,135 +807,6 @@ fn describe(e: reqwest::Error) -> String {
     out
 }
 
-/// What a vendor's error body says, from whichever envelope it uses.
-#[derive(Debug, Default, Clone, PartialEq)]
-pub(crate) struct VendorBody {
-    pub message: Option<String>,
-    pub code: Option<String>,
-    /// OpenAI's `error.param`: the field the vendor refused.
-    pub param: Option<String>,
-    /// FastAPI validation `detail[].loc`, last element of each.
-    pub locs: Vec<String>,
-    /// WaaV Infer's envelope, recognised by `error.retriable` being a boolean.
-    pub infer: Option<InferEnvelope>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct InferEnvelope {
-    pub code: String,
-    pub retry_after: Option<Duration>,
-}
-
-impl VendorBody {
-    pub fn parse(body: &str) -> Self {
-        let mut out = Self::default();
-        let Ok(v) = serde_json::from_str::<Value>(body) else {
-            return out;
-        };
-        let text = |v: &Value| {
-            v.as_str()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-        };
-        if let Some(err) = v.get("error") {
-            if err.is_object() {
-                out.message = err.get("message").and_then(text);
-                out.code = err
-                    .get("code")
-                    .and_then(text)
-                    .or_else(|| err.get("status").and_then(text));
-                out.param = err.get("param").and_then(text);
-                if let (Some(code), Some(_)) =
-                    (&out.code, err.get("retriable").and_then(Value::as_bool))
-                {
-                    out.infer = Some(InferEnvelope {
-                        code: code.clone(),
-                        retry_after: err
-                            .get("retry_after_ms")
-                            .and_then(Value::as_u64)
-                            .map(Duration::from_millis),
-                    });
-                }
-            } else {
-                out.message = text(err);
-            }
-        }
-        match v.get("detail") {
-            Some(Value::Array(items)) => {
-                let mut msgs = Vec::new();
-                for d in items {
-                    let loc: Vec<String> = d
-                        .get("loc")
-                        .and_then(Value::as_array)
-                        .map(|l| {
-                            l.iter()
-                                .filter_map(|p| p.as_str().map(str::to_string))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    if let Some(last) = loc.last() {
-                        out.locs.push(last.clone());
-                    }
-                    let msg = d.get("msg").and_then(text).unwrap_or_default();
-                    msgs.push(if loc.is_empty() {
-                        msg
-                    } else {
-                        format!("{}: {msg}", loc.join("."))
-                    });
-                }
-                if out.message.is_none() && !msgs.is_empty() {
-                    out.message = Some(msgs.join("; "));
-                }
-            }
-            Some(d @ Value::Object(_)) => {
-                out.message = out.message.or_else(|| d.get("message").and_then(text));
-                out.code = out
-                    .code
-                    .or_else(|| d.get("code").and_then(text))
-                    .or_else(|| d.get("status").and_then(text));
-            }
-            Some(d) => out.message = out.message.or_else(|| text(d)),
-            None => {}
-        }
-        out.message = out
-            .message
-            .or_else(|| v.get("err_msg").and_then(text))
-            .or_else(|| v.get("message").and_then(text));
-        out.code = out
-            .code
-            .or_else(|| v.get("error_code").and_then(text))
-            .or_else(|| v.get("err_code").and_then(text));
-        out
-    }
-
-    /// The vendor's code in one spelling: lower case, no separators.
-    pub fn code_key(&self) -> Option<String> {
-        self.code.as_deref().map(field_key)
-    }
-
-    fn names_the_model(&self) -> bool {
-        const MODEL_FIELDS: &[&str] = &["model", "modelid", "xaaimodel", "speechmodel"];
-        const MODEL_CODES: &[&str] = &[
-            "modelnotfound",
-            "modelnotavailable",
-            "modelnotsupported",
-            "invalidmodel",
-            "deploymentnotfound",
-        ];
-        self.param
-            .as_deref()
-            .is_some_and(|p| MODEL_FIELDS.contains(&field_key(p).as_str()))
-            || self
-                .locs
-                .iter()
-                .any(|l| MODEL_FIELDS.contains(&field_key(l).as_str()))
-            || self
-                .code_key()
-                .is_some_and(|c| MODEL_CODES.contains(&c.as_str()))
-    }
-}
-
 /// One failed answer and what is needed to judge it.
 pub(crate) struct Failure<'a> {
     pub vendor: &'a str,
@@ -1163,18 +908,11 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-/// Removes a credential a vendor echoed back. Short secrets are left alone: replacing a
-/// three-character key would mangle ordinary words, and no vendor issues one that short.
-pub(crate) fn redact(message: &str, secret: Option<&str>) -> String {
-    match secret.map(str::trim).filter(|s| s.len() >= 8) {
-        Some(s) => message.replace(s, "[redacted]"),
-        None => message.to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vendor::InferEnvelope;
+    use std::time::UNIX_EPOCH;
 
     #[test]
     fn built_adapters_name_the_map_ids_once_each() {

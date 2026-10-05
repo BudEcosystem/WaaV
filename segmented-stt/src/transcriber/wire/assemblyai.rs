@@ -31,7 +31,7 @@ use crate::transcriber::{
 };
 use crate::types::ErrorClass;
 
-pub const DEFAULT_BASE_URL: &str = "https://sync.assemblyai.com";
+pub const DEFAULT_BASE_URL: &str = crate::vendor::hosts::ASSEMBLYAI_SYNC;
 pub const MODEL: &str = "universal-3-5-pro";
 
 #[derive(Debug, Clone)]

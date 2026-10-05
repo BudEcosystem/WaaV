@@ -4,6 +4,7 @@
 //! The gateway supplies only what it alone knows (the credential, a deployment's address, the
 //! shared HTTP clients); every vendor default and every dialect choice is made here, from the row.
 
+use crate::vendor::{azure_openai, hosts};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -194,9 +195,7 @@ fn openai_compat(
     let url = match (&spec.url, adapter) {
         (Some(u), _) => u.clone(),
         (None, "groq_transcriptions") => join(
-            spec.api_base
-                .as_deref()
-                .unwrap_or("https://api.groq.com/openai"),
+            spec.api_base.as_deref().unwrap_or(hosts::GROQ_OPENAI),
             "/v1/audio/transcriptions",
         ),
         (None, "azure_openai_transcriptions") => {
@@ -204,18 +203,18 @@ fn openai_compat(
                 .api_base
                 .as_deref()
                 .ok_or("an Azure OpenAI deployment needs its resource endpoint")?;
-            format!(
-                "{}/openai/deployments/{}/audio/transcriptions?api-version={}",
-                base.trim_end_matches('/'),
+            azure_openai::audio_url(
+                base,
                 model,
-                spec.api_version.as_deref().unwrap_or("2025-03-01-preview")
-            )
+                azure_openai::AudioRoute::Transcriptions,
+                spec.api_version.as_deref(),
+            )?
         }
         (None, _) if spec.provider == "openai" => join(
             spec.api_base.as_deref().unwrap_or(if is_eu(spec) {
-                "https://eu.api.openai.com"
+                hosts::OPENAI_EU
             } else {
-                "https://api.openai.com"
+                hosts::OPENAI
             }),
             t.dialect
                 .path
@@ -329,7 +328,7 @@ fn realtime_url(spec: &TargetSpec) -> Result<String, String> {
             ))
         }
         "openai" => Ok(join(
-            &to_ws(spec.api_base.as_deref().unwrap_or("https://api.openai.com")),
+            &to_ws(spec.api_base.as_deref().unwrap_or(hosts::OPENAI)),
             "/v1/realtime?intent=transcription",
         )),
         _ => Err("a self-hosted realtime transcription server needs its realtime_url".into()),
@@ -411,7 +410,7 @@ pub fn build_transcriber(
             if let Some(b) = spec.url.clone().or_else(|| spec.api_base.clone()) {
                 c.base_url = b;
             } else if is_eu(spec) {
-                c.base_url = "https://api.eu.residency.elevenlabs.io".into();
+                c.base_url = hosts::ELEVENLABS_EU.into();
             }
             c.zero_retention = spec.no_retention;
             let row = limits_of(t);
@@ -421,9 +420,9 @@ pub fn build_transcriber(
         }
         "deepgram_prerecorded" => {
             let base = spec.api_base.as_deref().unwrap_or(if is_eu(spec) {
-                "https://api.eu.deepgram.com"
+                hosts::DEEPGRAM_EU
             } else {
-                "https://api.deepgram.com"
+                hosts::DEEPGRAM
             });
             let mut c = wire::deepgram::DeepgramPrerecordedConfig::for_model(
                 base,
@@ -448,7 +447,7 @@ pub fn build_transcriber(
             if let Some(b) = spec.api_base.clone() {
                 c.base_url = b;
             } else if is_eu(spec) {
-                c.base_url = "https://sync.eu.assemblyai.com".into();
+                c.base_url = hosts::ASSEMBLYAI_SYNC_EU.into();
             }
             let row = limits_of(t);
             c.limits.max_audio_ms = row.max_audio_ms.or(c.limits.max_audio_ms);

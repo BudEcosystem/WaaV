@@ -152,7 +152,7 @@ impl OpenAiRealtimeTranscriber {
         })?;
         let header = match &self.cfg.auth {
             Auth::Bearer(s) if !s.is_empty() => Some(("authorization", format!("Bearer {s}"))),
-            Auth::AzureApiKey(s) => Some(("api-key", s.clone())),
+            Auth::AzureApiKey(s) => Some((crate::vendor::azure_openai::API_KEY_HEADER, s.clone())),
             Auth::Header {
                 name,
                 scheme,

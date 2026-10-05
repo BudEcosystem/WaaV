@@ -10,6 +10,7 @@
 //! With no session language the request asks for detection (`detect_language=true`, which works
 //! on prerecorded audio including Whisper); without it Deepgram assumes English.
 
+use crate::vendor::retention;
 use std::time::Duration;
 
 use serde_json::Value;
@@ -24,7 +25,7 @@ use crate::transcriber::{
 };
 use crate::types::ErrorClass;
 
-pub const DEFAULT_BASE_URL: &str = "https://api.deepgram.com";
+pub const DEFAULT_BASE_URL: &str = crate::vendor::hosts::DEEPGRAM;
 
 #[derive(Debug, Clone)]
 pub struct DeepgramPrerecordedConfig {
@@ -120,7 +121,7 @@ impl DeepgramPrerecordedTranscriber {
         f.optional(ctx, "punctuate", ["true"]);
         f.optional(ctx, "smart_format", ["true"]);
         if self.cfg.mip_opt_out {
-            f.required("mip_opt_out", "true");
+            f.required(retention::DEEPGRAM.0, retention::DEEPGRAM.1);
         }
         if let Some(name) = &self.cfg.keyterms_param {
             let terms = ctx

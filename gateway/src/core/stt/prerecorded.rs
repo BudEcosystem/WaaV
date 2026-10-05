@@ -47,6 +47,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
+use waav_segmented_stt::vendor::{hosts, retention};
 
 use super::base::{
     BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback, SpeakerInfo,
@@ -134,18 +135,18 @@ impl PrerecordedVendor {
     /// The vendor's production host, used when the deployment names no override.
     pub fn default_base_url(&self) -> &'static str {
         match self {
-            Self::Deepgram => "https://api.deepgram.com",
-            Self::AssemblyAI => "https://api.assemblyai.com",
-            Self::ElevenLabs => "https://api.elevenlabs.io",
+            Self::Deepgram => hosts::DEEPGRAM,
+            Self::AssemblyAI => hosts::ASSEMBLYAI,
+            Self::ElevenLabs => hosts::ELEVENLABS,
         }
     }
 
     /// The vendor's EU host, for a deployment with `stt.data_region: eu`.
     pub fn eu_base_url(&self) -> &'static str {
         match self {
-            Self::Deepgram => "https://api.eu.deepgram.com",
-            Self::AssemblyAI => "https://api.eu.assemblyai.com",
-            Self::ElevenLabs => "https://api.eu.residency.elevenlabs.io",
+            Self::Deepgram => hosts::DEEPGRAM_EU,
+            Self::AssemblyAI => hosts::ASSEMBLYAI_EU,
+            Self::ElevenLabs => hosts::ELEVENLABS_EU,
         }
     }
 
@@ -285,13 +286,13 @@ impl PrerecordedSTT {
         if !data.no_retention {
             return url;
         }
-        let pair = match self.vendor {
-            PrerecordedVendor::Deepgram => "mip_opt_out=true",
-            PrerecordedVendor::ElevenLabs => "enable_logging=false",
+        let (key, value) = match self.vendor {
+            PrerecordedVendor::Deepgram => retention::DEEPGRAM,
+            PrerecordedVendor::ElevenLabs => retention::ELEVENLABS,
             PrerecordedVendor::AssemblyAI => return url,
         };
         let sep = if url.contains('?') { '&' } else { '?' };
-        format!("{url}{sep}{pair}")
+        format!("{url}{sep}{key}={value}")
     }
 
     /// The envelope the shared builders read features from.
@@ -770,13 +771,7 @@ fn vendor_status_error(status: reqwest::StatusCode, message: String) -> STTError
 
 /// The vendor's id for a request, from the response headers the three vendors use.
 fn header_request_id(headers: &reqwest::header::HeaderMap) -> Option<String> {
-    ["dg-request-id", "request-id", "x-request-id"]
-        .iter()
-        .find_map(|name| headers.get(*name))
-        .and_then(|v| v.to_str().ok())
-        .map(str::trim)
-        .filter(|v| !v.is_empty() && v.len() <= 200)
-        .map(str::to_string)
+    crate::observability::vendor_span::request_id_from_headers(headers)
 }
 
 /// Render a vendor's error body as one line that names what was wrong.

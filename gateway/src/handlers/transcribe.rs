@@ -40,6 +40,7 @@
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use waav_segmented_stt::vendor::hosts;
 
 use axum::{
     extract::{Path, State},
@@ -605,19 +606,15 @@ async fn build_submission(
     state: &AppState,
 ) -> Result<BatchSubmission, String> {
     match provider {
-        "deepgram" => {
-            build_deepgram_prerecorded(req, api_key, base_url.unwrap_or("https://api.deepgram.com"))
-        }
-        "openai" => {
-            build_openai_transcription(req, api_key, base_url.unwrap_or("https://api.openai.com"))
-        }
+        "deepgram" => build_deepgram_prerecorded(req, api_key, base_url.unwrap_or(hosts::DEEPGRAM)),
+        "openai" => build_openai_transcription(req, api_key, base_url.unwrap_or(hosts::OPENAI)),
         "elevenlabs" => crate::core::stt::batch::build_elevenlabs_transcription(
             req,
             api_key,
-            base_url.unwrap_or("https://api.elevenlabs.io"),
+            base_url.unwrap_or(hosts::ELEVENLABS),
         ),
         "assemblyai" => {
-            let host = base_url.unwrap_or("https://api.assemblyai.com");
+            let host = base_url.unwrap_or(hosts::ASSEMBLYAI);
             // URL source → pass through; bytes source → upload first to obtain an audio_url.
             let audio_url = if let Some(u) = req.audio.url() {
                 u.to_string()
@@ -1080,13 +1077,8 @@ async fn send_upstream_transcription(
 
     let status = resp.status();
     call.status(status.as_u16());
-    let vendor_request_id = ["x-request-id", "request-id"]
-        .iter()
-        .find_map(|name| resp.headers().get(*name))
-        .and_then(|v| v.to_str().ok())
-        .map(str::trim)
-        .filter(|v| !v.is_empty() && v.len() <= 200)
-        .map(str::to_string);
+    let vendor_request_id =
+        waav_segmented_stt::vendor::request_id(resp.headers(), &["x-request-id", "request-id"]);
     call.vendor_request_id(vendor_request_id.as_deref());
     let body = match resp.text().await {
         Ok(body) => body,
