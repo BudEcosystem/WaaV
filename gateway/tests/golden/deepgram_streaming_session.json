@@ -1,0 +1,80 @@
+[
+  {
+    "livekit_url": "http://localhost:7880",
+    "protocol_version": "1.0",
+    "stream_id": "<stream_id>",
+    "type": "ready"
+  },
+  {
+    "confidence": 0.95,
+    "is_final": true,
+    "is_speech_final": false,
+    "transcript": "Mock transcript chunk 1",
+    "type": "stt_result"
+  },
+  {
+    "confidence": 0.95,
+    "is_final": true,
+    "is_speech_final": false,
+    "transcript": "Mock transcript chunk 2",
+    "type": "stt_result"
+  },
+  {
+    "confidence": 0.95,
+    "is_final": true,
+    "is_speech_final": false,
+    "transcript": "Mock transcript chunk 3",
+    "type": "stt_result"
+  },
+  {
+    "confidence": 0.95,
+    "is_final": true,
+    "is_speech_final": false,
+    "transcript": "Mock transcript chunk 4",
+    "type": "stt_result"
+  },
+  {
+    "confidence": 0.95,
+    "is_final": true,
+    "is_speech_final": true,
+    "segment_transcript": "Mock transcript chunk 1 Mock transcript chunk 2 Mock transcript chunk 3 Mock transcript chunk 4 Mock transcript chunk 5",
+    "transcript": "Mock transcript chunk 5",
+    "type": "stt_result"
+  },
+  {
+    "confidence": 0.95,
+    "is_final": true,
+    "is_speech_final": false,
+    "transcript": "Mock transcript chunk 6",
+    "type": "stt_result"
+  },
+  {
+    "confidence": 0.95,
+    "is_final": true,
+    "is_speech_final": false,
+    "transcript": "Mock transcript chunk 7",
+    "type": "stt_result"
+  },
+  {
+    "confidence": 0.95,
+    "is_final": true,
+    "is_speech_final": false,
+    "transcript": "Mock transcript chunk 8",
+    "type": "stt_result"
+  },
+  {
+    "confidence": 0.95,
+    "is_final": true,
+    "is_speech_final": false,
+    "transcript": "Mock transcript chunk 9",
+    "type": "stt_result"
+  },
+  {
+    "confidence": 0.95,
+    "is_final": true,
+    "is_speech_final": true,
+    "segment_transcript": "Mock transcript chunk 6 Mock transcript chunk 7 Mock transcript chunk 8 Mock transcript chunk 9 Mock transcript chunk 10",
+    "transcript": "Mock transcript chunk 10",
+    "type": "stt_result"
+  }
+]
