@@ -129,6 +129,9 @@ neither them nor how a client declares support, and launching without it is a si
 | A reply after a protected greeting could never be cleared | `core/voice_manager/{manager,state}.rs` | Fixed behind `WAAV_PER_UTTERANCE_INTERRUPTIBILITY` |
 | A `/ws` client could name a private `base_url` for uploads (SSRF) | `segmented-stt/src/transcriber/http.rs` | Fixed: public-only resolver, plan-time check |
 | Two deployments behind one host on different paths shared a setup-probe verdict and a breaker: a healthy one's cached "served" hid an outage at the other (found by the Bud-mode end-to-end run) | `gateway/src/core/stt/segmented/live.rs` | Fixed: keyed by the target's address, tagged; unit test |
+| A deployment's changed limit (its override, a new map) never reached the limiter already in use: an Azure OpenAI deployment kept the 3-requests-a-minute default after its override raised it (found live on pde-ditto) | `segmented-stt/src/transcriber/gate.rs` | Fixed: the registry applies each session's spec; test proven to fail without it |
+| `/v1/audio/transcriptions` checked the data settings after the Azure OpenAI and self-hosted passthrough, so those uploads were sent anyway (found live on pde-ditto) | `gateway/src/handlers/openai_audio.rs` | Fixed: the check runs before any branch sends the file; route test |
+| ONNX Runtime logged ~500 INFO lines each time a session loaded its models (3,187 in 10 minutes of test calls) | `gateway/src/observability/tracing_init.rs`, `gateway/Dockerfile` | Fixed: default `RUST_LOG=info,ort=warn` |
 | Continuous SmartTurn never runs on live packets | `core/smart_turn/mel_extractor.rs` | Confirmed by test, not fixed (plan) |
 | `today's refusal text` for an unsupported deployment carries an 18-space run | `handlers/ws/bud_legs.rs` | Kept byte-identical for uncovered sessions |
 
@@ -161,6 +164,20 @@ neither them nor how a client declares support, and launching without it is a si
   - a deployment asking for no retention on OpenAI is refused live and on `/v1/audio/transcriptions`
     before any upload;
   - a self-hosted deployment returns re-decoded live interims (growing partial clips, then one final).
+- Live on pde-ditto (2026-10-05), real vendors through `wss://gateway.ditto.bud.studio`. The images
+  were overlays on the namespace's live builds, so its other in-flight work stayed.
+  - Deepgram `nova-3` streaming: unchanged.
+  - ElevenLabs `scribe_v2`: segmented, two turns, about 1.0 s from end of speech to final.
+  - A temporary voice agent on `scribe_v2` with Deepgram `aura-2` speech:
+    - on `/v1/realtime`: greeting, a spoken turn, a barge-in truncating the reply with no audio after
+      it, a typed turn;
+    - on `/ws`: a turn answered 1.6 s voice to voice.
+  - budapp: the save-time warning for a file-only agent model; `audio-stt-capability` read from the
+    gateway's record; the new settings validated (422 on a wrong value); a capability-override limit
+    applied to live calls.
+  - No retention on Azure OpenAI is refused on calls and uploads. On Deepgram it is carried: the live
+    call went to `wss://api.eu.deepgram.com` with `mip_opt_out=true` once EU was set too.
+  - budadmin renders the Live calls and Data handling cards from the live record.
 - budapp `tests/test_audio_config.py`, `test_voice_agent_config.py`, `test_audio_voices.py`; budadmin
   (full suite); budplayground `app/lib/realtime`; chart `tests/test_waav_segmented_stt_chart.py`;
   BudModelCatalog-SDK scraper tests; the TypeScript (328) and Python (444) SDK unit suites, green apart
