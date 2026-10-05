@@ -13,7 +13,6 @@ use crate::vendor::retention;
 use std::time::Duration;
 
 use reqwest::multipart::{Form, Part};
-use serde_json::Value;
 
 use super::{
     Auth, Exchanged, Failure, Fields, RowLimits, check_limits, confidence_from_logprob,
@@ -140,49 +139,24 @@ impl ElevenLabsTranscriber {
 
     fn parse(&self, ex: &Exchanged) -> Result<SegmentTranscript, SegmentError> {
         let v = ex.json()?;
-        let words = v
-            .get("words")
-            .and_then(Value::as_array)
-            .filter(|w| !w.is_empty());
-        let text = match words {
-            Some(words) => {
-                let mut text = String::new();
-                for w in words {
-                    if matches!(
-                        w.get("type").and_then(Value::as_str),
-                        Some("word" | "spacing")
-                    ) {
-                        text.push_str(w.get("text").and_then(Value::as_str).unwrap_or_default());
-                    }
-                }
-                // Removing an audio event can leave two spacing tokens side by side.
-                text.split_whitespace().collect::<Vec<_>>().join(" ")
-            }
-            None => match v.get("text").and_then(Value::as_str) {
-                Some(t) => t.trim().to_string(),
-                None => return Err(ex.not_a_transcript("it has neither text nor words")),
-            },
+        let answer = crate::vendor::elevenlabs::parse(&v);
+        let Some(c) = answer.channels.first() else {
+            return Err(ex.not_a_transcript("it has neither text nor words"));
         };
-        let logprobs: Vec<f64> = words
-            .into_iter()
-            .flatten()
-            .filter(|w| w.get("type").and_then(Value::as_str) == Some("word"))
-            .filter_map(|w| w.get("logprob").and_then(Value::as_f64))
-            .collect();
-        let mean =
-            (!logprobs.is_empty()).then(|| logprobs.iter().sum::<f64>() / logprobs.len() as f64);
+        // From the tokens, so a tagged audio event never reaches the turn's text.
+        let text = match c.spoken_text().or_else(|| c.text.clone()) {
+            Some(text) => text,
+            None => return Err(ex.not_a_transcript("it has neither text nor words")),
+        };
         Ok(SegmentTranscript {
             text,
-            derived_confidence: mean.map(|m| confidence_from_logprob(m as f32)),
+            derived_confidence: c
+                .mean_word_logprob()
+                .map(|m| confidence_from_logprob(m as f32)),
             // Documented as ISO 639-3 (`eng`); reported as ISO 639-1.
-            detected_language: v
-                .get("language_code")
-                .and_then(Value::as_str)
-                .and_then(detected_language),
-            vendor_request_id: v
-                .get("transcription_id")
-                .and_then(Value::as_str)
-                .map(str::to_string)
+            detected_language: c.language_code.as_deref().and_then(detected_language),
+            vendor_request_id: answer
+                .transcription_id
                 .or_else(|| request_id(&ex.headers, &["request-id", "x-request-id"])),
             ..Default::default()
         })

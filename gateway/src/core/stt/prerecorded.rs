@@ -848,106 +848,57 @@ pub fn parse_response(
     }
 }
 
-/// Deepgram prerecorded: `results.channels[].alternatives[0]`.
+/// Deepgram prerecorded: `results.channels[].alternatives[0]`, read by the shared parser.
 ///
 /// One result per channel rather than a concatenation, so a multi-channel response keeps each
 /// channel's own word timeline instead of merging two into one nonsensical sequence.
 fn parse_deepgram(body: &serde_json::Value) -> Result<Vec<STTResult>, String> {
-    let channels = body
-        .pointer("/results/channels")
-        .and_then(|c| c.as_array())
-        .ok_or("no results.channels in the response")?;
-    let duration = body
-        .pointer("/metadata/duration")
-        .and_then(serde_json::Value::as_f64);
-    let detected_language = body
-        .pointer("/results/channels/0/detected_language")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let request_id = body
-        .pointer("/metadata/request_id")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(str::to_string);
-
-    let mut out = Vec::with_capacity(channels.len());
-    for channel in channels {
-        let Some(alt) = channel.pointer("/alternatives/0") else {
+    let answer = waav_segmented_stt::vendor::deepgram::parse_prerecorded(body)?;
+    let detected_language = answer
+        .channels
+        .first()
+        .and_then(|c| c.detected_language.clone());
+    let mut out = Vec::with_capacity(answer.channels.len());
+    for channel in &answer.channels {
+        let Some(best) = channel.alternatives.first() else {
             continue;
         };
-        let transcript = alt
-            .get("transcript")
-            .and_then(|t| t.as_str())
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        let reported_confidence = alt
-            .get("confidence")
-            .and_then(serde_json::Value::as_f64)
-            .filter(|c| c.is_finite());
-        let confidence = reported_confidence.unwrap_or(1.0) as f32;
-
-        let words: Option<Vec<WordTiming>> =
-            alt.get("words").and_then(|w| w.as_array()).map(|ws| {
-                ws.iter()
-                    .map(|w| WordTiming {
-                        // `punctuated_word` is what `smart_format` produces; falling back to the
-                        // bare `word` means a punctuated transcript and unpunctuated word list,
-                        // which is the kind of mismatch nobody notices until they rebuild the
-                        // text from the words.
-                        word: w
-                            .get("punctuated_word")
-                            .or_else(|| w.get("word"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_default()
-                            .to_string(),
-                        start: w
-                            .get("start")
-                            .and_then(serde_json::Value::as_f64)
-                            .unwrap_or(0.0),
-                        end: w
-                            .get("end")
-                            .and_then(serde_json::Value::as_f64)
-                            .unwrap_or(0.0),
-                        confidence: w
-                            .get("confidence")
-                            .and_then(serde_json::Value::as_f64)
-                            .map(|c| c as f32),
-                        // Deepgram numbers its speakers; the canonical form is a label.
-                        speaker_id: w
-                            .get("speaker")
-                            .and_then(serde_json::Value::as_u64)
-                            .map(|n| format!("speaker_{n}")),
-                        logprob: None,
-                    })
-                    .collect()
-            });
-
-        let mut result = STTResult::new(transcript, true, true, confidence);
+        let words: Option<Vec<WordTiming>> = best.words.as_ref().map(|ws| {
+            ws.iter()
+                .map(|w| WordTiming {
+                    word: w.text.clone(),
+                    start: w.start,
+                    end: w.end,
+                    confidence: w.confidence.map(|c| c as f32),
+                    // Deepgram numbers its speakers; the canonical form is a label.
+                    speaker_id: w.speaker.map(|n| format!("speaker_{n}")),
+                    logprob: None,
+                })
+                .collect()
+        });
+        let mut result = STTResult::new(
+            best.transcript.clone(),
+            true,
+            true,
+            best.confidence.unwrap_or(1.0) as f32,
+        );
         // Only what Deepgram actually said: the 1.0 above is a default, and analytics must not
         // count "no confidence" as "fully confident" (FRD-021 DEG-5).
-        result.vendor_confidence = reported_confidence.map(|c| c as f32);
-        result.vendor_request_id = request_id.clone();
+        result.vendor_confidence = best.confidence.map(|c| c as f32);
+        result.vendor_request_id = answer.request_id.clone();
         result.speakers = speakers_from(words.as_deref());
         result.words = words;
         result.detected_language = detected_language.clone();
-        result.audio_duration = duration;
-        // The RUNNER-UP hypotheses. `alternatives=3` asked Deepgram for three, Deepgram returned
-        // three, and keeping only `[0]` meant the setting reached the vendor, was honoured, and
-        // could not be seen — the same defect as the word timings above it.
+        result.audio_duration = answer.duration_secs;
+        // The RUNNER-UP hypotheses (`alternatives=N`): kept, or the setting reaches the vendor,
+        // is honoured, and cannot be seen.
         let runners_up: Vec<String> = channel
-            .get("alternatives")
-            .and_then(|a| a.as_array())
-            .map(|alts| {
-                alts.iter()
-                    .skip(1)
-                    .filter_map(|a| a.get("transcript").and_then(|t| t.as_str()))
-                    .map(|t| t.trim().to_string())
-                    .filter(|t| !t.is_empty())
-                    .collect()
-            })
-            .unwrap_or_default();
+            .alternatives
+            .iter()
+            .skip(1)
+            .map(|a| a.transcript.clone())
+            .filter(|t| !t.is_empty())
+            .collect();
         if !runners_up.is_empty() {
             result.alternatives = Some(runners_up);
         }
@@ -1014,52 +965,29 @@ fn parse_assemblyai(body: &serde_json::Value) -> Result<Vec<STTResult>, String> 
     Ok(vec![result])
 }
 
-/// ElevenLabs: `text` + `words`, or a `transcripts` array when multi-channel was requested.
+/// ElevenLabs: `text` + `words`, or a `transcripts` array when multi-channel was requested, read
+/// by the shared parser. The vendor's own `text` is returned, as the caller asked for it.
 fn parse_elevenlabs(body: &serde_json::Value) -> Result<Vec<STTResult>, String> {
-    let channels: Vec<&serde_json::Value> = match body.get("transcripts").and_then(|t| t.as_array())
-    {
-        Some(list) => list.iter().collect(),
-        None => vec![body],
-    };
-    let mut out = Vec::with_capacity(channels.len());
-    for channel in channels {
-        let transcript = channel
-            .get("text")
-            .and_then(|t| t.as_str())
-            .ok_or("no text in the response")?
-            .trim()
-            .to_string();
-
-        let words: Option<Vec<WordTiming>> =
-            channel.get("words").and_then(|w| w.as_array()).map(|ws| {
-                ws.iter()
-                    // `spacing` and `audio_event` tokens are not words; keeping them would put
-                    // bare whitespace entries in an array every consumer indexes by word.
-                    .filter(|w| w.get("type").and_then(|t| t.as_str()).unwrap_or("word") == "word")
-                    .map(|w| WordTiming {
-                        word: w
-                            .get("text")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_default()
-                            .to_string(),
-                        start: w
-                            .get("start")
-                            .and_then(serde_json::Value::as_f64)
-                            .unwrap_or(0.0),
-                        end: w
-                            .get("end")
-                            .and_then(serde_json::Value::as_f64)
-                            .unwrap_or(0.0),
-                        confidence: None,
-                        speaker_id: w
-                            .get("speaker_id")
-                            .and_then(|v| v.as_str())
-                            .map(str::to_string),
-                        logprob: w.get("logprob").and_then(serde_json::Value::as_f64),
-                    })
-                    .collect()
-            });
-
+    let answer = waav_segmented_stt::vendor::elevenlabs::parse(body);
+    let mut out = Vec::with_capacity(answer.channels.len());
+    for channel in &answer.channels {
+        let transcript = channel.text.clone().ok_or("no text in the response")?;
+        // `spacing` and `audio_event` tokens are not words; keeping them would put bare
+        // whitespace entries in an array every consumer indexes by word.
+        let words: Option<Vec<WordTiming>> = channel.tokens.as_ref().map(|tokens| {
+            tokens
+                .iter()
+                .filter(|t| t.is_word_or_untyped())
+                .map(|t| WordTiming {
+                    word: t.text.clone(),
+                    start: t.start,
+                    end: t.end,
+                    confidence: None,
+                    speaker_id: t.speaker_id.clone(),
+                    logprob: t.logprob,
+                })
+                .collect()
+        });
         let mut result = STTResult::new(
             transcript, true, true,
             // ElevenLabs reports a LANGUAGE probability, not a transcript confidence. Using it as
@@ -1068,13 +996,8 @@ fn parse_elevenlabs(body: &serde_json::Value) -> Result<Vec<STTResult>, String> 
         );
         result.speakers = speakers_from(words.as_deref());
         result.words = words;
-        result.detected_language = channel
-            .get("language_code")
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
-        result.audio_duration = channel
-            .get("audio_duration_secs")
-            .and_then(serde_json::Value::as_f64);
+        result.detected_language = channel.language_code.clone();
+        result.audio_duration = channel.audio_duration_secs;
         out.push(result);
     }
     Ok(out)

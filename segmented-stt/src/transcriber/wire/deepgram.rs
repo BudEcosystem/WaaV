@@ -13,8 +13,6 @@
 use crate::vendor::retention;
 use std::time::Duration;
 
-use serde_json::Value;
-
 use super::{
     Auth, Exchanged, Failure, Fields, LanguageFormat, RowLimits, check_limits, detected_language,
     exchange, info_for, join_url, may_send, request_id, session_language, wire_language,
@@ -162,35 +160,24 @@ impl DeepgramPrerecordedTranscriber {
 
     fn parse(&self, ex: &Exchanged) -> Result<SegmentTranscript, SegmentError> {
         let v = ex.json()?;
-        let channel = v.pointer("/results/channels/0");
-        let Some(alt) = channel.and_then(|c| c.pointer("/alternatives/0")) else {
-            return Err(ex.not_a_transcript("it has no results.channels[0].alternatives[0]"));
-        };
+        let missing = || ex.not_a_transcript("it has no results.channels[0].alternatives[0]");
+        let p = crate::vendor::deepgram::parse_prerecorded(&v).map_err(|_| missing())?;
+        let channel = p.channels.first();
+        let alt = channel
+            .and_then(|c| c.alternatives.first())
+            .ok_or_else(missing)?;
         Ok(SegmentTranscript {
-            text: alt
-                .get("transcript")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .trim()
-                .to_string(),
-            vendor_confidence: alt
-                .get("confidence")
-                .and_then(Value::as_f64)
-                .map(|c| c as f32),
+            text: alt.transcript.clone(),
+            vendor_confidence: alt.confidence.map(|c| c as f32),
             detected_language: channel
-                .and_then(|c| c.get("detected_language"))
-                .and_then(Value::as_str)
+                .and_then(|c| c.detected_language.as_deref())
                 .and_then(detected_language),
-            vendor_request_id: v
-                .pointer("/metadata/request_id")
-                .and_then(Value::as_str)
-                .map(str::to_string)
+            vendor_request_id: p
+                .request_id
+                .clone()
                 .or_else(|| request_id(&ex.headers, &["dg-request-id", "x-request-id"])),
             // Deepgram bills exactly the audio duration, per second, with no minimum.
-            billed_ms: v
-                .pointer("/metadata/duration")
-                .and_then(Value::as_f64)
-                .map(|s| (s * 1000.0).round() as u32),
+            billed_ms: p.duration_secs.map(|s| (s * 1000.0).round() as u32),
             ..Default::default()
         })
     }

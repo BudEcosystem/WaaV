@@ -5,6 +5,8 @@
 //! Used by segmented sessions' utterance uploads and by the gateway's upload clients, REST route and
 //! TTS error rendering, so a vendor's quirks are fixed once.
 
+pub mod deepgram;
+pub mod elevenlabs;
 pub mod openai;
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
