@@ -40,6 +40,11 @@ pub trait SegmentUpload: Send + Sync {
     fn min_audio_ms(&self) -> u32;
     /// End of speech to the release of the unit's text.
     fn record_end_to_final(&self, _ms: u32) {}
+    /// Re-decode the open segment for interim text (Release 6): one request, no retry, only when
+    /// the limiter has room. `None` when the target offers no re-decoding or it failed.
+    async fn redecode(&self, _audio: SegmentAudio, _ctx: SegmentContext) -> Option<String> {
+        None
+    }
 }
 
 /// The production upload: the attempt loop, with limits from the latency store.
@@ -106,6 +111,10 @@ impl SegmentUpload for AttemptsUpload {
 
     fn record_end_to_final(&self, ms: u32) {
         self.store.record_end_to_final(&self.key, ms);
+    }
+
+    async fn redecode(&self, audio: SegmentAudio, ctx: SegmentContext) -> Option<String> {
+        self.attempts.run_interim(audio, ctx).await
     }
 }
 

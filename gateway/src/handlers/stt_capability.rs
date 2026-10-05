@@ -223,6 +223,8 @@ fn deployment_leg(id: &str, ep: &bud_auth::VoiceEndpoint) -> LiveLeg {
         segmented: stt.segmented.clone(),
         capability_override: stt.capability_override.clone(),
         expected_languages: stt.expected_languages.clone().unwrap_or_default(),
+        data: crate::core::stt::data_settings::DataSettings::from_settings(&stt),
+        fallbacks: Vec::new(),
     }
 }
 

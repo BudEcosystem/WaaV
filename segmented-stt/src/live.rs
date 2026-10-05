@@ -31,6 +31,12 @@ pub struct TargetSpec {
     /// The address came from a Bud deployment record, so the in-cluster client may be used.
     pub trusted: bool,
     pub region: Option<String>,
+    /// The deployment's data region (`stt.data_region: eu`, Release 5). Kept apart from `region`,
+    /// which for some vendors names a resource's host.
+    pub data_region: Option<String>,
+    /// The deployment asked the vendor to keep nothing (`data_retention: none`, Release 5): sent
+    /// where the vendor has a request switch (ElevenLabs logging, Deepgram's improvement programme).
+    pub no_retention: bool,
     pub api_version: Option<String>,
     /// Vendor parameters a deployment carries (`project`, `location`, `recognizer`, …).
     pub extras: BTreeMap<String, String>,
@@ -58,6 +64,89 @@ pub fn adapter_built(adapter: &str, spec: &TargetSpec) -> bool {
         }
         a => wire::built_adapters().contains(&a),
     }
+}
+
+/// The deployment's region is the EU (`data_region: eu`, or a vendor `region: eu`).
+fn is_eu(spec: &TargetSpec) -> bool {
+    [&spec.data_region, &spec.region].into_iter().any(|r| {
+        r.as_deref()
+            .is_some_and(|r| r.trim().eq_ignore_ascii_case("eu"))
+    })
+}
+
+/// A deployment data setting a transport cannot carry (Release 5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnappliedSetting {
+    pub setting: &'static str,
+    pub reason: &'static str,
+}
+
+/// A resource region inside the EU: Azure and Google name their hosts by it.
+fn eu_resource_region(region: &str) -> bool {
+    const EU: &[&str] = &[
+        "europe",
+        "france",
+        "germany",
+        "sweden",
+        "poland",
+        "italy",
+        "spain",
+        "austria",
+        "belgium",
+        "denmark",
+        "finland",
+        "greece",
+        "ireland",
+        "netherlands",
+    ];
+    let r = region.trim().to_ascii_lowercase();
+    r == "eu" || r.starts_with("eu-") || EU.iter().any(|c| r.contains(c))
+}
+
+/// The deployment's data settings this transport cannot carry. EU processing needs the vendor's
+/// EU address, an EU resource region or the deployment's own address; no retention needs a
+/// request switch (ElevenLabs logging, Deepgram's improvement programme) or the operator's own
+/// server. The caller refuses the session rather than serve it elsewhere.
+pub fn unapplied_data_settings(adapter: &str, spec: &TargetSpec) -> Vec<UnappliedSetting> {
+    let own_address = spec.api_base.is_some() || spec.url.is_some();
+    let own_server = own_address
+        && matches!(
+            adapter,
+            "openai_transcriptions" | "openai_realtime_transcription"
+        )
+        && spec.provider != "openai";
+    let mut out = Vec::new();
+    if is_eu(spec) {
+        let carried = own_address
+            || match adapter {
+                "elevenlabs_batch" | "deepgram_prerecorded" | "assemblyai_sync" => true,
+                "openai_transcriptions" => spec.provider == "openai",
+                "azure_fast_transcription" => {
+                    spec.region.as_deref().is_some_and(eu_resource_region)
+                }
+                "google_recognize" => spec
+                    .extras
+                    .get("location")
+                    .is_some_and(|l| eu_resource_region(l)),
+                _ => false,
+            };
+        if !carried {
+            out.push(UnappliedSetting {
+                setting: "stt.data_region",
+                reason: "no_eu_address",
+            });
+        }
+    }
+    if spec.no_retention
+        && !own_server
+        && !matches!(adapter, "elevenlabs_batch" | "deepgram_prerecorded")
+    {
+        out.push(UnappliedSetting {
+            setting: "stt.data_retention",
+            reason: "no_request_switch",
+        });
+    }
+    out
 }
 
 fn join(base: &str, path: &str) -> String {
@@ -123,7 +212,11 @@ fn openai_compat(
             )
         }
         (None, _) if spec.provider == "openai" => join(
-            spec.api_base.as_deref().unwrap_or("https://api.openai.com"),
+            spec.api_base.as_deref().unwrap_or(if is_eu(spec) {
+                "https://eu.api.openai.com"
+            } else {
+                "https://api.openai.com"
+            }),
             t.dialect
                 .path
                 .as_deref()
@@ -317,17 +410,21 @@ pub fn build_transcriber(
             );
             if let Some(b) = spec.url.clone().or_else(|| spec.api_base.clone()) {
                 c.base_url = b;
+            } else if is_eu(spec) {
+                c.base_url = "https://api.eu.residency.elevenlabs.io".into();
             }
+            c.zero_retention = spec.no_retention;
             let row = limits_of(t);
             c.limits.max_audio_ms = row.max_audio_ms.or(c.limits.max_audio_ms);
             c.limits.max_upload_bytes = row.max_upload_bytes.or(c.limits.max_upload_bytes);
             Ok(Arc::new(wire::elevenlabs::ElevenLabsTranscriber::new(c)?))
         }
         "deepgram_prerecorded" => {
-            let base = spec
-                .api_base
-                .as_deref()
-                .unwrap_or("https://api.deepgram.com");
+            let base = spec.api_base.as_deref().unwrap_or(if is_eu(spec) {
+                "https://api.eu.deepgram.com"
+            } else {
+                "https://api.deepgram.com"
+            });
             let mut c = wire::deepgram::DeepgramPrerecordedConfig::for_model(
                 base,
                 Auth::deepgram(spec.api_key.clone()),
@@ -335,6 +432,7 @@ pub fn build_transcriber(
                 clients.client(spec.trusted).clone(),
             );
             c.limits = limits_of(t);
+            c.mip_opt_out = spec.no_retention;
             Ok(Arc::new(
                 wire::deepgram::DeepgramPrerecordedTranscriber::new(c)?,
             ))
@@ -714,6 +812,162 @@ mod tests {
         let tr = build_transcriber(&t, &spec("cartesia", "ink-whisper"), &clients()).unwrap();
         assert_eq!(tr.info().kind, crate::transcriber::TranscriberKind::Commit);
         assert_eq!(tr.info().host_key, "https://api.cartesia.ai:443");
+    }
+
+    /// Release 5: the canonical region and retention options reach each vendor's own switch.
+    #[test]
+    fn region_and_retention_reach_the_vendors_switches() {
+        let eu = |p: &str, m: &str| TargetSpec {
+            region: Some("eu".into()),
+            no_retention: true,
+            ..spec(p, m)
+        };
+        let host = |p: &str, m: &str| {
+            build_transcriber(&transport(p, m), &eu(p, m), &clients())
+                .unwrap()
+                .info()
+                .host_key
+                .clone()
+        };
+        assert_eq!(
+            host("elevenlabs", "scribe_v2"),
+            "https://api.eu.residency.elevenlabs.io:443"
+        );
+        assert_eq!(
+            host("deepgram", "whisper-large"),
+            "https://api.eu.deepgram.com:443"
+        );
+        assert_eq!(
+            host("openai", "gpt-transcribe"),
+            "https://eu.api.openai.com:443"
+        );
+        assert_eq!(
+            host("assemblyai", "universal-3-5-pro"),
+            "https://sync.eu.assemblyai.com:443"
+        );
+        // A deployment's own address wins over the region.
+        let own = TargetSpec {
+            api_base: Some("https://proxy.example.com".into()),
+            trusted: true,
+            ..eu("deepgram", "whisper-large")
+        };
+        assert_eq!(
+            build_transcriber(&transport("deepgram", "whisper-large"), &own, &clients())
+                .unwrap()
+                .info()
+                .host_key,
+            "https://proxy.example.com:443"
+        );
+        assert!(!host("elevenlabs", "scribe_v2").contains("api.elevenlabs.io"));
+    }
+
+    /// Release 5: the canonical `data_region` reaches the EU host without touching a vendor's own
+    /// region (an Azure Speech resource's region still names its host).
+    #[test]
+    fn the_canonical_data_region_selects_the_eu_host() {
+        let canonical = TargetSpec {
+            data_region: Some("eu".into()),
+            ..spec("deepgram", "whisper-large")
+        };
+        assert_eq!(
+            build_transcriber(
+                &transport("deepgram", "whisper-large"),
+                &canonical,
+                &clients()
+            )
+            .unwrap()
+            .info()
+            .host_key,
+            "https://api.eu.deepgram.com:443"
+        );
+    }
+
+    /// Release 5: a transport that cannot carry a deployment's data setting is named, so the
+    /// session is refused rather than served from elsewhere or kept by the vendor.
+    #[test]
+    fn each_transport_names_the_data_settings_it_cannot_carry() {
+        let both = |p: &str, m: &str| TargetSpec {
+            data_region: Some("eu".into()),
+            no_retention: true,
+            ..spec(p, m)
+        };
+        let unapplied = |p: &str, m: &str, s: &TargetSpec| -> Vec<&'static str> {
+            unapplied_data_settings(&transport(p, m).adapter, s)
+                .into_iter()
+                .map(|u| u.setting)
+                .collect()
+        };
+        // Both carried: an EU host and a request switch.
+        assert!(unapplied("elevenlabs", "scribe_v2", &both("elevenlabs", "scribe_v2")).is_empty());
+        assert!(
+            unapplied(
+                "deepgram",
+                "whisper-large",
+                &both("deepgram", "whisper-large")
+            )
+            .is_empty()
+        );
+        // An EU host, but the vendor keeps audio by account, not by request.
+        assert_eq!(
+            unapplied(
+                "openai",
+                "gpt-transcribe",
+                &both("openai", "gpt-transcribe")
+            ),
+            vec!["stt.data_retention"]
+        );
+        assert_eq!(
+            unapplied(
+                "assemblyai",
+                "universal-3-5-pro",
+                &both("assemblyai", "universal-3-5-pro")
+            ),
+            vec!["stt.data_retention"]
+        );
+        // Neither: no EU host and no switch.
+        assert_eq!(
+            unapplied(
+                "groq",
+                "whisper-large-v3",
+                &both("groq", "whisper-large-v3")
+            ),
+            vec!["stt.data_region", "stt.data_retention"]
+        );
+        // Nothing asked, nothing named.
+        assert!(
+            unapplied(
+                "groq",
+                "whisper-large-v3",
+                &spec("groq", "whisper-large-v3")
+            )
+            .is_empty()
+        );
+        // The operator's own server: its address decides where audio goes and what is kept.
+        let own = TargetSpec {
+            api_base: Some("https://asr.internal.example.com".into()),
+            trusted: true,
+            ..both("vllm", "whisper-large-v3")
+        };
+        assert!(unapplied_data_settings("openai_transcriptions", &own).is_empty());
+        // A resource-region vendor: an EU resource region carries it, another does not.
+        let azure = |region: &str| TargetSpec {
+            region: Some(region.into()),
+            data_region: Some("eu".into()),
+            ..spec("azure", "mai-transcribe-1")
+        };
+        assert!(
+            unapplied_data_settings("azure_fast_transcription", &azure("westeurope")).is_empty()
+        );
+        assert!(
+            unapplied_data_settings("azure_fast_transcription", &azure("swedencentral")).is_empty()
+        );
+        assert_eq!(
+            unapplied_data_settings("azure_fast_transcription", &azure("eastus"))
+                .into_iter()
+                .map(|u| u.setting)
+                .collect::<Vec<_>>(),
+            vec!["stt.data_region"]
+        );
     }
 
     #[test]

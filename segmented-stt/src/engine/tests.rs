@@ -40,6 +40,12 @@ struct Call {
 
 struct ScriptedUpload {
     responder: Responder,
+    /// Text a re-decode of the open segment returns (self-hosted interims); `None` = not offered.
+    redecode: Mutex<Option<&'static str>>,
+    redecode_delay_ms: AtomicUsize,
+    redecodes: AtomicUsize,
+    /// A fallback deployment that serves every unit (Release 5).
+    served_by: Mutex<Option<crate::transcriber::attempts::ServedBy>>,
     calls: Mutex<Vec<Call>>,
     speculative: AtomicBool,
     in_flight: AtomicUsize,
@@ -51,6 +57,10 @@ impl ScriptedUpload {
     fn new(clock: Arc<TokioClock>, responder: Responder) -> Arc<Self> {
         Arc::new(Self {
             responder,
+            redecode: Mutex::new(None),
+            redecode_delay_ms: AtomicUsize::new(80),
+            redecodes: AtomicUsize::new(0),
+            served_by: Mutex::new(None),
             calls: Mutex::new(Vec::new()),
             speculative: AtomicBool::new(true),
             in_flight: AtomicUsize::new(0),
@@ -120,6 +130,7 @@ impl SegmentUpload for ScriptedUpload {
             round_trip: Some(delay),
             fatal,
             warnings: Vec::new(),
+            served_by: self.served_by.lock().clone(),
         }
     }
     fn deadline_ms(&self) -> u32 {
@@ -131,6 +142,12 @@ impl SegmentUpload for ScriptedUpload {
     async fn prewarm(&self, _connections: usize) {}
     fn min_audio_ms(&self) -> u32 {
         0
+    }
+    async fn redecode(&self, audio: SegmentAudio, _ctx: SegmentContext) -> Option<String> {
+        let text = (*self.redecode.lock())?;
+        let n = self.redecodes.fetch_add(1, Ordering::SeqCst) + 1;
+        tokio::time::sleep(ms(self.redecode_delay_ms.load(Ordering::SeqCst) as u64)).await;
+        Some(format!("{text} {n} ({} ms)", audio.audio_ms()))
     }
 }
 
@@ -980,6 +997,81 @@ fn languages_sent(h: &Harness) -> Vec<Option<String>> {
         .collect()
 }
 
+fn redecoding(interval_ms: u32) -> EngineConfig {
+    let mut p = SegmentProfile::for_tests();
+    p.redecode_interval_ms = Some(interval_ms);
+    EngineConfig::new(p)
+}
+
+/// Release 6: a self-hosted model is re-decoded while the caller speaks, so text arrives during
+/// speech; the segment's own upload still gives the turn's text.
+#[tokio::test(start_paused = true)]
+async fn a_self_hosted_session_gets_text_while_the_caller_speaks() {
+    let h = Harness::with_config(
+        redecoding(500),
+        constant(100, "the whole sentence"),
+        None,
+        None,
+    );
+    *h.upload.redecode.lock() = Some("so far");
+    h.silence(200).await;
+    h.speech(1_600).await;
+    let during: Vec<String> = h.results().into_iter().map(|(_, r)| r.transcript).collect();
+    assert!(
+        during.iter().any(|t| t.starts_with("so far")),
+        "interim text before the pause: {during:?}"
+    );
+    assert!(
+        h.results().iter().all(|(_, r)| !r.is_final),
+        "never final from a re-decode"
+    );
+    h.silence(800).await;
+    let finals = h.finals();
+    assert_eq!(finals.len(), 1);
+    assert_eq!(finals[0].1.transcript, "the whole sentence");
+    // The growing window: each re-decode carries more audio than the one before.
+    let lens: Vec<u32> = during
+        .iter()
+        .filter_map(|t| t.split('(').nth(1)?.split(' ').next()?.parse().ok())
+        .collect();
+    assert!(lens.windows(2).all(|w| w[1] > w[0]), "{lens:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_re_decode_that_returns_after_the_cut_is_not_shown() {
+    let h = Harness::with_config(redecoding(500), constant(100, "x"), None, None);
+    *h.upload.redecode.lock() = Some("late");
+    h.upload.redecode_delay_ms.store(900, Ordering::SeqCst);
+    h.silence(200).await;
+    // One re-decode starts after 500 ms of speech and answers 900 ms later; the pause cuts the
+    // segment first, so its answer is stale and must not be shown.
+    h.speech(600).await;
+    h.silence(1_500).await;
+    assert!(
+        h.upload.redecodes.load(Ordering::SeqCst) >= 1,
+        "a re-decode was started"
+    );
+    let shown: Vec<String> = h.results().into_iter().map(|(_, r)| r.transcript).collect();
+    assert!(shown.iter().all(|t| !t.starts_with("late")), "{shown:?}");
+    assert_eq!(h.finals().len(), 1);
+    assert_eq!(h.finals()[0].1.transcript, "x");
+}
+
+#[tokio::test(start_paused = true)]
+async fn without_the_interval_nothing_is_re_decoded() {
+    let h = Harness::with_config(
+        EngineConfig::new(SegmentProfile::for_tests()),
+        constant(100, "x"),
+        None,
+        None,
+    );
+    *h.upload.redecode.lock() = Some("never");
+    h.silence(200).await;
+    h.speech(1_600).await;
+    h.silence(800).await;
+    assert_eq!(h.upload.redecodes.load(Ordering::SeqCst), 0);
+}
+
 /// Release 5: each outcome carries what the vendor bills, by the row's rule (Groq: 10 s minimum).
 #[tokio::test(start_paused = true)]
 async fn an_outcome_is_billed_at_the_vendor_minimum() {
@@ -994,6 +1086,31 @@ async fn an_outcome_is_billed_at_the_vendor_minimum() {
     h.silence(800).await;
     let o = h.sink.outcomes.lock()[0].clone();
     assert!(o.uploaded_seconds < 3.0, "{}", o.uploaded_seconds);
+    assert_eq!(o.billed_seconds, 10.0);
+}
+
+/// Release 5: a unit a fallback deployment served is billed by that vendor's rule and names it,
+/// so the gateway meters it on that deployment.
+#[tokio::test(start_paused = true)]
+async fn a_unit_a_fallback_served_is_billed_by_its_rule_and_names_it() {
+    let h = Harness::with_config(
+        EngineConfig::new(SegmentProfile::for_tests()),
+        constant(100, "x"),
+        None,
+        None,
+    );
+    *h.upload.served_by.lock() = Some(crate::transcriber::attempts::ServedBy {
+        name: "ep-fallback".into(),
+        billing: crate::types::BillingRule {
+            min_billed_ms: 10_000,
+            increment_ms: 0,
+        },
+    });
+    h.silence(200).await;
+    h.speech(600).await;
+    h.silence(800).await;
+    let o = h.sink.outcomes.lock()[0].clone();
+    assert_eq!(o.served_by.as_deref(), Some("ep-fallback"));
     assert_eq!(o.billed_seconds, 10.0);
 }
 

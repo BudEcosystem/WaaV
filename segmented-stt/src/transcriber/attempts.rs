@@ -80,6 +80,15 @@ pub struct UploadResolution {
     pub fatal: Option<ErrorClass>,
     /// `(code, message)` warnings for the client, for example a field the vendor refused.
     pub warnings: Vec<(String, String)>,
+    /// A fallback deployment served the unit (Release 5); `None`: the session's own target.
+    pub served_by: Option<ServedBy>,
+}
+
+/// The fallback deployment that served a unit, and what its vendor bills.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServedBy {
+    pub name: String,
+    pub billing: crate::types::BillingRule,
 }
 
 /// Reports each request's timing, for the latency store.
@@ -219,6 +228,9 @@ impl RepairMemory {
     }
 }
 
+/// The limit on one re-decode request: interim text later than this is no longer interim.
+const INTERIM_REQUEST_LIMIT: Duration = Duration::from_millis(2_000);
+
 /// The loop over one target.
 pub struct SegmentAttempts {
     pub transcriber: Arc<dyn SegmentTranscriber>,
@@ -281,6 +293,25 @@ fn retry_wait(retry_after: Option<Duration>) -> Duration {
 }
 
 impl SegmentAttempts {
+    /// The second entry point (Release 6): re-decode a growing open segment for interim text.
+    /// One request, never retried, never counted by the breaker or the session's health, and only
+    /// when the limiter has room at once, so it can never delay the segment's real upload.
+    pub async fn run_interim(&self, audio: SegmentAudio, ctx: SegmentContext) -> Option<String> {
+        if !self.limiter.has_headroom() {
+            return None;
+        }
+        let _pass = self.limiter.acquire(Instant::now()).await.ok()?;
+        let mut ctx = ctx;
+        self.repairs.apply(self.transcriber.info(), &mut ctx);
+        let progress = RequestProgress::new();
+        let t = self
+            .transcriber
+            .transcribe(&audio, &ctx, INTERIM_REQUEST_LIMIT, &progress)
+            .await
+            .ok()?;
+        Some(t.text).filter(|t| !t.trim().is_empty())
+    }
+
     pub fn info(&self) -> &TranscriberInfo {
         self.transcriber.info()
     }
@@ -328,6 +359,7 @@ impl SegmentAttempts {
                 round_trip,
                 fatal,
                 warnings,
+                served_by: None,
             };
         if let Some(c) = self.health.fatal() {
             return resolution(

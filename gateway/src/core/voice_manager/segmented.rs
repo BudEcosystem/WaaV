@@ -206,6 +206,7 @@ mod tests {
             short: false,
             detector: crate::core::stt::speech_activity::DetectorKind::Scripted,
             vendor_request_id: None,
+            served_by: None,
         };
         sink.record(&o);
         let late = Arc::new(Mutex::new(0));

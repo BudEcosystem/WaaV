@@ -451,6 +451,12 @@ enum Done {
         seq: u32,
         resolution: UploadResolution,
     },
+    /// A re-decode of the open segment answered (Release 6 interims).
+    Redecoded {
+        turn_id: u64,
+        generation: u64,
+        text: Option<String>,
+    },
     AudioVerdict {
         turn_id: u64,
         pause: usize,
@@ -496,6 +502,12 @@ struct Engine {
     /// The session language vote, while the session has no language (addendum B7).
     vote: Option<crate::transcriber::language_vote::LanguageVote>,
     last_run_start: Option<u64>,
+    /// Re-decoding (Release 6): one request at a time; any cut makes an answer in flight stale.
+    redecode_in_flight: bool,
+    redecode_generation: u64,
+    redecode_last_sample: u64,
+    /// Where the open segment began: the last cut or split (0 before any).
+    segment_from_sample: u64,
 }
 
 impl Engine {
@@ -553,6 +565,10 @@ impl Engine {
             idle_frames: 0,
             detector_kind,
             last_run_start: None,
+            redecode_in_flight: false,
+            redecode_generation: 0,
+            redecode_last_sample: 0,
+            segment_from_sample: 0,
         }
     }
 
@@ -689,6 +705,7 @@ impl Engine {
         for e in events {
             self.on_segmenter_event(e);
         }
+        self.maybe_redecode();
         // The longest turn.
         if let Some(t) = self.current_turn()
             && samples_to_ms(
@@ -769,6 +786,12 @@ impl Engine {
     }
 
     fn on_segmenter_event(&mut self, e: SegmenterEvent) {
+        if matches!(e, SegmenterEvent::Split(_) | SegmenterEvent::Cut { .. }) {
+            // The open segment's own upload now carries its text; a re-decode is stale.
+            self.redecode_generation += 1;
+            self.redecode_last_sample = self.segmenter.now_sample();
+            self.segment_from_sample = self.segmenter.now_sample();
+        }
         match e {
             SegmenterEvent::Started {
                 first_speech_sample,
@@ -1128,6 +1151,37 @@ impl Engine {
 
     fn on_done(&mut self, d: Done) {
         match d {
+            Done::Redecoded {
+                turn_id,
+                generation,
+                text,
+            } => {
+                self.redecode_in_flight = false;
+                let open = matches!(
+                    self.segmenter.phase(),
+                    SegPhase::Speech | SegPhase::Hangover
+                );
+                let Some(text) = text.filter(|t| !t.trim().is_empty()) else {
+                    return;
+                };
+                if generation != self.redecode_generation || !open {
+                    return;
+                }
+                let Some(t) = self.current_turn().filter(|t| t.id == turn_id) else {
+                    return;
+                };
+                if self.queued_interims.load(Ordering::Acquire) >= 64 {
+                    return;
+                }
+                let mut r = t.text.interim(turn_id);
+                r.transcript = if r.transcript.trim().is_empty() {
+                    text.trim().to_string()
+                } else {
+                    format!("{} {}", r.transcript.trim_end(), text.trim())
+                };
+                self.queued_interims.fetch_add(1, Ordering::AcqRel);
+                let _ = self.results_tx.send(r);
+            }
             Done::Upload { seq, resolution } => {
                 let now = self.now_ms();
                 if let Some(u) = self.units.get_mut(&seq)
@@ -1274,6 +1328,8 @@ impl Engine {
     ) -> SegmentOutcome {
         let u = &self.units[&seq];
         let ledger = u.resolution.as_ref().map(|r| r.ledger).unwrap_or_default();
+        let served_by = u.resolution.as_ref().and_then(|r| r.served_by.clone());
+        let billing = served_by.as_ref().map_or(self.cfg.billing, |s| s.billing);
         let audio_ms = samples_to_ms(u.audio_samples() as u64) as u32;
         let uploaded_seconds = ledger.uploaded_ms as f64 / 1000.0;
         SegmentOutcome {
@@ -1286,11 +1342,7 @@ impl Engine {
             audio_ms,
             joined_text_offset: offset,
             uploaded_seconds,
-            billed_seconds: self
-                .cfg
-                .billing
-                .billed_ms(ledger.requests, ledger.uploaded_ms) as f64
-                / 1000.0,
+            billed_seconds: billing.billed_ms(ledger.requests, ledger.uploaded_ms) as f64 / 1000.0,
             timings: SegmentTimings {
                 released_ms: self.now_ms(),
                 ..u.timings
@@ -1303,6 +1355,7 @@ impl Engine {
             short: u.short,
             detector: self.detector_kind,
             vendor_request_id: transcript_request_id,
+            served_by: served_by.map(|s| s.name),
         }
     }
 
@@ -1702,8 +1755,63 @@ impl Engine {
         }
     }
 
+    /// Start a re-decode of the open segment once it has grown by the interval (Release 6).
+    fn maybe_redecode(&mut self) {
+        let Some(interval) = self.p.redecode_interval_ms else {
+            return;
+        };
+        if self.redecode_in_flight
+            || self.p.interims == InterimMode::Off
+            || !matches!(
+                self.segmenter.phase(),
+                SegPhase::Speech | SegPhase::Hangover
+            )
+        {
+            return;
+        }
+        let Some(run_start) = self.last_run_start else {
+            return;
+        };
+        let Some(turn_id) = self.current_turn().map(|t| t.id) else {
+            return;
+        };
+        let now = self.segmenter.now_sample();
+        let since = now.saturating_sub(run_start.max(self.redecode_last_sample));
+        if samples_to_ms(since) < interval as u64 {
+            return;
+        }
+        let from = run_start.saturating_sub(ms_to_samples(self.p.pre_roll_ms as u64));
+        let pcm = self.segmenter.tail(from.max(self.segment_from_sample));
+        if pcm.is_empty() {
+            return;
+        }
+        self.redecode_in_flight = true;
+        self.redecode_last_sample = now;
+        let ctx = SegmentContext {
+            turn_id,
+            seq: 0,
+            language: self.language.clone(),
+            candidate_languages: self.cfg.candidate_languages.clone(),
+            prompt: self.cfg.prompt.clone(),
+            keywords: self.cfg.keywords.clone(),
+            omit_fields: Vec::new(),
+            minimal: false,
+        };
+        let upload = Arc::clone(&self.upload);
+        let tx = self.done_tx.clone();
+        let generation = self.redecode_generation;
+        tokio::spawn(async move {
+            let text = upload.redecode(SegmentAudio::new(pcm), ctx).await;
+            let _ = tx.send(Done::Redecoded {
+                turn_id,
+                generation,
+                text,
+            });
+        });
+    }
+
     fn emit_interims(&mut self) {
-        if self.p.interims != InterimMode::PerSegment {
+        if self.p.interims == InterimMode::Off {
             return;
         }
         let Some(front) = self.turns.front_mut() else {

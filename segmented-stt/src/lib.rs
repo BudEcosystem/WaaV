@@ -33,6 +33,7 @@ pub mod control;
 pub mod detector;
 pub mod endpointer;
 pub mod engine;
+pub mod fallback;
 pub mod limits;
 pub mod live;
 pub mod map;

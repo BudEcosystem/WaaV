@@ -1234,6 +1234,7 @@ mod segmented_chain {
                 round_trip: None,
                 fatal: None,
                 warnings: Vec::new(),
+                served_by: None,
             }
         }
         fn deadline_ms(&self) -> u32 {

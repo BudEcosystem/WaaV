@@ -100,6 +100,8 @@ pub struct SegmentProfile {
     pub noise_step: f32,
     pub noise_ceiling: f32,
     pub interims: InterimMode,
+    /// Re-decode the open segment after every this much speech (self-hosted models); `None` off.
+    pub redecode_interval_ms: Option<u32>,
     pub ingest_budget_bytes: usize,
     /// Continuous idle audio after which the detector's recurrent state is reset.
     pub idle_reset_ms: u32,
@@ -144,6 +146,7 @@ impl Default for SegmentProfile {
             noise_step: 0.1,
             noise_ceiling: 0.8,
             interims: InterimMode::PerSegment,
+            redecode_interval_ms: None,
             ingest_budget_bytes: 6 * 1024 * 1024,
             idle_reset_ms: 5000,
             min_commit_audio_ms: 100,

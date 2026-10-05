@@ -662,6 +662,40 @@ mod client_tests {
         assert!(matches!(stt.state, ConnectionState::Disconnected));
     }
 
+    /// Release 5: a deployment's canonical data settings reach the EU residency host and
+    /// zero-retention logging; without them the URL is today's.
+    #[test]
+    fn the_deployment_data_settings_reach_the_streaming_url() {
+        use crate::core::stt::standard::{ProviderExtras, StandardSTTConfig};
+        let stt = ElevenLabsSTT::default();
+        let url = |extras: serde_json::Value| {
+            let std_cfg = StandardSTTConfig {
+                base: STTConfig {
+                    api_key: "k".to_string(),
+                    sample_rate: 16000,
+                    ..Default::default()
+                },
+                features: Default::default(),
+                extras: ProviderExtras(extras.as_object().unwrap().clone()),
+                translation: None,
+            };
+            stt.build_websocket_url(&ElevenLabsSTTConfig::from_standard(&std_cfg))
+                .unwrap()
+        };
+        let asked = url(serde_json::json!({"data_region": "eu", "data_retention": "none"}));
+        assert!(
+            asked.starts_with("wss://api.eu.residency.elevenlabs.io/v1/speech-to-text/realtime?"),
+            "{asked}"
+        );
+        assert!(asked.contains("&enable_logging=false"), "{asked}");
+        let today = url(serde_json::json!({}));
+        assert!(today.starts_with("wss://api.elevenlabs.io/"), "{today}");
+        assert!(!today.contains("enable_logging"), "{today}");
+        let mut cfg = ElevenLabsSTTConfig::default();
+        cfg.zero_retention = true;
+        assert!(cfg.build_websocket_url().contains("&enable_logging=false"));
+    }
+
     #[test]
     fn test_url_building() {
         let stt = ElevenLabsSTT::default();

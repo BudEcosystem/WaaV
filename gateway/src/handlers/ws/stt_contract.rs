@@ -312,6 +312,7 @@ pub fn ready_stt(
     let interims = match mode {
         "segmented" => match facts.engine.as_ref().map(|f| f.interims) {
             Some(waav_segmented_stt::types::InterimMode::Off) => "none",
+            Some(waav_segmented_stt::types::InterimMode::Live) => "live",
             _ => "per_segment",
         },
         "buffered" => "none",
@@ -1101,6 +1102,7 @@ mod tests {
             short: false,
             detector: crate::core::stt::speech_activity::DetectorKind::Silero,
             vendor_request_id: None,
+            served_by: None,
         };
         let j = serde_json::to_value(segment_failed(&o).unwrap()).unwrap();
         assert_eq!(j["type"], "stt_warning");

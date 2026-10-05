@@ -140,6 +140,15 @@ impl PrerecordedVendor {
         }
     }
 
+    /// The vendor's EU host, for a deployment with `stt.data_region: eu`.
+    pub fn eu_base_url(&self) -> &'static str {
+        match self {
+            Self::Deepgram => "https://api.eu.deepgram.com",
+            Self::AssemblyAI => "https://api.eu.assemblyai.com",
+            Self::ElevenLabs => "https://api.eu.residency.elevenlabs.io",
+        }
+    }
+
     /// Whether the vendor answers the submit itself, or hands back a job to poll.
     pub fn is_async(&self) -> bool {
         matches!(self, Self::AssemblyAI)
@@ -251,14 +260,38 @@ impl PrerecordedSTT {
         &self.warnings
     }
 
-    /// The base URL: the deployment's override, else the vendor's production host.
+    /// The base URL: the deployment's override, else the vendor's EU host for an EU deployment,
+    /// else its production host.
     fn base_url(&self) -> String {
+        let data = super::data_settings::DataSettings::from_extras(&self.config.extras.0);
         self.config
             .endpoint_override()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| self.vendor.default_base_url())
+            .unwrap_or_else(|| {
+                if data.eu {
+                    self.vendor.eu_base_url()
+                } else {
+                    self.vendor.default_base_url()
+                }
+            })
             .to_string()
+    }
+
+    /// The submit URL with the vendor's retention switch, for a deployment with
+    /// `stt.data_retention: none` (AssemblyAI has none; the gateway refuses that pairing first).
+    fn with_retention_switch(&self, url: String) -> String {
+        let data = super::data_settings::DataSettings::from_extras(&self.config.extras.0);
+        if !data.no_retention {
+            return url;
+        }
+        let pair = match self.vendor {
+            PrerecordedVendor::Deepgram => "mip_opt_out=true",
+            PrerecordedVendor::ElevenLabs => "enable_logging=false",
+            PrerecordedVendor::AssemblyAI => return url,
+        };
+        let sep = if url.contains('?') { '&' } else { '?' };
+        format!("{url}{sep}{pair}")
     }
 
     /// The envelope the shared builders read features from.
@@ -398,6 +431,8 @@ impl PrerecordedSTT {
             }
         }
         .map_err(STTError::ConfigurationError)?;
+        let mut submission = submission;
+        submission.request.url = self.with_retention_switch(submission.request.url);
 
         self.warnings = submission.config_warnings.clone();
         for w in &self.warnings {
@@ -1218,6 +1253,52 @@ mod tests {
             encoding: "linear16".into(),
             model: model.into(),
         })
+    }
+
+    /// Release 5: a deployment's canonical data settings pick each vendor's EU host and reach
+    /// its retention switch; without them the host and the URL are today's.
+    #[test]
+    fn the_deployment_data_settings_pick_the_eu_host_and_the_retention_switch() {
+        let with = |vendor: PrerecordedVendor, extras: serde_json::Value| {
+            let mut c = cfg(vendor.id(), "m");
+            c.extras.0 = extras.as_object().unwrap().clone();
+            PrerecordedSTT::new_standard(vendor, &c).unwrap()
+        };
+        let both = serde_json::json!({"data_region": "eu", "data_retention": "none"});
+        for (vendor, eu) in [
+            (PrerecordedVendor::Deepgram, "https://api.eu.deepgram.com"),
+            (
+                PrerecordedVendor::AssemblyAI,
+                "https://api.eu.assemblyai.com",
+            ),
+            (
+                PrerecordedVendor::ElevenLabs,
+                "https://api.eu.residency.elevenlabs.io",
+            ),
+        ] {
+            assert_eq!(with(vendor, both.clone()).base_url(), eu);
+            assert_eq!(
+                with(vendor, serde_json::json!({})).base_url(),
+                vendor.default_base_url()
+            );
+        }
+        let dg = with(PrerecordedVendor::Deepgram, both.clone());
+        assert_eq!(
+            dg.with_retention_switch("https://api.eu.deepgram.com/v1/listen?model=nova-3".into()),
+            "https://api.eu.deepgram.com/v1/listen?model=nova-3&mip_opt_out=true"
+        );
+        let el = with(PrerecordedVendor::ElevenLabs, both);
+        assert_eq!(
+            el.with_retention_switch(
+                "https://api.eu.residency.elevenlabs.io/v1/speech-to-text".into()
+            ),
+            "https://api.eu.residency.elevenlabs.io/v1/speech-to-text?enable_logging=false"
+        );
+        let today = with(PrerecordedVendor::Deepgram, serde_json::json!({}));
+        assert_eq!(
+            today.with_retention_switch("https://api.deepgram.com/v1/listen?model=nova-3".into()),
+            "https://api.deepgram.com/v1/listen?model=nova-3"
+        );
     }
 
     // -------------------------------------------------------------------------------------

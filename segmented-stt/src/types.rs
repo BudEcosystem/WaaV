@@ -208,6 +208,9 @@ pub struct FlushOutcome {
 pub enum InterimMode {
     /// One interim per returned segment, carrying the whole turn so far.
     PerSegment,
+    /// Per segment, and also while the caller speaks: the open segment re-decoded as it grows
+    /// (self-hosted models, Release 6). Reported to clients as `live`.
+    Live,
     /// None (the client set `interim_results: false`, or the row uploads once per turn).
     Off,
 }
@@ -448,6 +451,8 @@ pub struct SegmentOutcome {
     pub short: bool,
     pub detector: DetectorKind,
     pub vendor_request_id: Option<String>,
+    /// The fallback deployment that served the unit (Release 5); `None`: the session's own.
+    pub served_by: Option<String>,
 }
 
 /// What the vendor bills per request: at least `min_billed_ms` (Groq bills 10 s), rounded up to

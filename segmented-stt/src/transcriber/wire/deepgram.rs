@@ -38,6 +38,9 @@ pub struct DeepgramPrerecordedConfig {
     pub language_format: LanguageFormat,
     /// `keyterm` (Nova-3), `keywords` (Nova-2 and older), or `None`.
     pub keyterms_param: Option<String>,
+    /// `mip_opt_out=true`: the audio is not kept for Deepgram's model improvement programme (the
+    /// canonical `data_retention: none`, Release 5). Not sent by default.
+    pub mip_opt_out: bool,
     pub client: reqwest::Client,
     pub limits: RowLimits,
 }
@@ -59,6 +62,7 @@ impl DeepgramPrerecordedConfig {
             model: model.to_string(),
             language_format,
             keyterms_param,
+            mip_opt_out: false,
             client,
             limits: RowLimits::default(),
         }
@@ -115,6 +119,9 @@ impl DeepgramPrerecordedTranscriber {
         }
         f.optional(ctx, "punctuate", ["true"]);
         f.optional(ctx, "smart_format", ["true"]);
+        if self.cfg.mip_opt_out {
+            f.required("mip_opt_out", "true");
+        }
         if let Some(name) = &self.cfg.keyterms_param {
             let terms = ctx
                 .keywords
@@ -279,6 +286,24 @@ mod tests {
     }
 
     contract_tests!(super::harness);
+
+    #[tokio::test]
+    async fn no_retention_opts_out_of_model_improvement() {
+        let vendor = MockVendor::start(Reply::json(200, SUCCESS)).await;
+        let mut cfg = config(&vendor.base, "nova-3");
+        cfg.mip_opt_out = true;
+        kit::run(build(cfg).as_ref(), &ctx()).await.0.unwrap();
+        assert_eq!(vendor.last().query_values("mip_opt_out"), vec!["true"]);
+        let vendor = MockVendor::start(Reply::json(200, SUCCESS)).await;
+        kit::run(build(config(&vendor.base, "nova-3")).as_ref(), &ctx())
+            .await
+            .0
+            .unwrap();
+        assert!(
+            vendor.last().query_values("mip_opt_out").is_empty(),
+            "not sent by default"
+        );
+    }
 
     #[tokio::test]
     async fn whisper_gets_a_bare_language_and_never_key_terms() {

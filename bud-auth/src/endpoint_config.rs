@@ -189,6 +189,16 @@ pub struct SttSettings {
     /// when the session names none (detection on short segments is unreliable).
     #[serde(default)]
     pub expected_languages: Option<Vec<String>>,
+
+    /// `eu`: the vendor processes the audio in the EU, or the deployment is refused on a vendor
+    /// that cannot be asked to. Absent or `vendor_default`: the vendor's default location.
+    #[serde(default)]
+    pub data_region: Option<String>,
+    /// `none`: the vendor keeps nothing (ElevenLabs zero-retention logging, Deepgram's
+    /// improvement-programme opt-out), or the deployment is refused on a vendor without that
+    /// switch. Absent or `vendor_default`: the vendor's default.
+    #[serde(default)]
+    pub data_retention: Option<String>,
 }
 
 /// Parse a block, or drop it with a warning: one bad value must not take the deployment down.
@@ -651,14 +661,33 @@ mod tests {
         let ov = stt.capability_override.as_ref().unwrap();
         assert_eq!(ov.profile.as_deref(), Some("vllm-file"));
         assert_eq!(ov.limits.as_ref().unwrap().requests_per_minute, Some(30));
-        assert_eq!(stt.expected_languages.as_deref(), Some(&["en".to_string(), "hi".to_string()][..]));
+        assert_eq!(
+            stt.expected_languages.as_deref(),
+            Some(&["en".to_string(), "hi".to_string()][..])
+        );
 
         let bad = parse_endpoint_settings(
             "ep",
             &serde_json::json!({"stt": {"model": "scribe_v2", "segmented": {"deadline_ms": "soon"}}}),
         );
-        assert_eq!(bad.stt().model.as_deref(), Some("scribe_v2"), "the rest of the block survives");
+        assert_eq!(
+            bad.stt().model.as_deref(),
+            Some("scribe_v2"),
+            "the rest of the block survives"
+        );
         assert!(bad.stt().segmented.is_none());
+    }
+
+    #[test]
+    fn the_data_settings_parse() {
+        let s = parse_endpoint_settings(
+            "ep",
+            &serde_json::json!({"stt": {"data_region": "eu", "data_retention": "none"}}),
+        );
+        assert_eq!(s.stt().data_region.as_deref(), Some("eu"));
+        assert_eq!(s.stt().data_retention.as_deref(), Some("none"));
+        let absent = parse_endpoint_settings("ep", &serde_json::json!({"stt": {}}));
+        assert!(absent.stt().data_region.is_none() && absent.stt().data_retention.is_none());
     }
 
     use super::*;

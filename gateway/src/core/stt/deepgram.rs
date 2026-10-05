@@ -180,6 +180,9 @@ impl DeepgramSTTConfig {
     pub fn from_standard(std: &super::standard::StandardSTTConfig) -> Self {
         let f = &std.features;
         let ex = &std.extras.0;
+        // A deployment's canonical data settings (Release 5): the EU host, and the opt-out of
+        // Deepgram's model improvement programme for `data_retention: none`.
+        let data = super::data_settings::DataSettings::from_extras(ex);
         // Helper: read a `Vec<String>` from an extras key that may be a JSON string or array.
         let str_vec = |key: &str| -> Vec<String> {
             match ex.get(key) {
@@ -234,7 +237,9 @@ impl DeepgramSTTConfig {
             mip_opt_out: ex
                 .get("mip_opt_out")
                 .and_then(|v| v.as_bool())
-                .unwrap_or(false),
+                .unwrap_or(false)
+                || data.no_retention,
+            use_eu_endpoint: data.eu,
             extra: str_vec("extra"),
             version: ex
                 .get("version")
@@ -2065,6 +2070,46 @@ mod tests {
         assert!(url.contains("&extra=tenant%3Aacme"), "{url}");
         assert!(url.contains("&extra=trace%3A42"), "{url}");
         assert!(url.contains("&version=beta"), "{url}");
+    }
+
+    /// Release 5: a deployment's canonical data settings reach Deepgram's EU host and its
+    /// improvement-programme opt-out; without them the URL is today's, byte for byte.
+    #[tokio::test]
+    async fn the_deployment_data_settings_reach_the_streaming_url() {
+        use super::super::standard::{ProviderExtras, StandardSTTConfig};
+        let stt = DeepgramSTT::default();
+        let std_cfg = |extras: serde_json::Value| StandardSTTConfig {
+            base: STTConfig {
+                model: "nova-3".into(),
+                api_key: "k".into(),
+                ..Default::default()
+            },
+            features: Default::default(),
+            extras: ProviderExtras(extras.as_object().unwrap().clone()),
+            translation: None,
+        };
+        let url = |extras| {
+            stt.build_websocket_url(&DeepgramSTTConfig::from_standard(&std_cfg(extras)))
+                .unwrap()
+        };
+        let asked = url(serde_json::json!({"data_region": "eu", "data_retention": "none"}));
+        assert!(
+            asked.starts_with("wss://api.eu.deepgram.com/v1/listen?"),
+            "{asked}"
+        );
+        assert!(asked.contains("&mip_opt_out=true"), "{asked}");
+        let today = url(serde_json::json!({}));
+        assert!(
+            today.starts_with("wss://api.deepgram.com/v1/listen?"),
+            "{today}"
+        );
+        assert!(!today.contains("mip_opt_out"), "{today}");
+        assert_eq!(
+            url(
+                serde_json::json!({"data_region": "vendor_default", "data_retention": "vendor_default"})
+            ),
+            today
+        );
     }
 
     #[tokio::test]

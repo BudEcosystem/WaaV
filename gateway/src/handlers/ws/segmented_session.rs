@@ -249,7 +249,7 @@ pub fn wire(
             } else {
                 o.uploaded_seconds
             };
-            meter.stt_uploaded(seconds, charged, o.kind.as_str());
+            meter.stt_uploaded_by(o.served_by.as_deref(), seconds, charged, o.kind.as_str());
         }));
     }
     {

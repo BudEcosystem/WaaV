@@ -9,6 +9,8 @@ mod base;
 pub mod batch;
 pub mod bhashini;
 pub mod cartesia;
+/// A deployment's data region and retention, carried to every vendor client (Release 5).
+pub mod data_settings;
 pub mod deepgram;
 pub mod elevenlabs;
 pub mod fpt_ai;
