@@ -185,6 +185,91 @@ export interface ReadyMessage {
   audio_in_codec?: string;
   /** D8 negotiated downlink transport codec in effect (`linear16` | `opus`); present only on request. */
   audio_out_codec?: string;
+  /**
+   * What speech-to-text this session got (segmented STT): streaming, segmented or buffered, the
+   * kind of interim results, who ends utterances, the expected latency and its basis, and notices.
+   * Present only on sessions the gateway's rollout switch covers; absent = no statement.
+   */
+  stt?: ReadyStt;
+}
+
+/** A string union that still accepts values a newer gateway may add. */
+type OpenString<T extends string> = T | (string & {});
+
+/** A fact about the session reported on `ready.stt.notices` instead of a message. */
+export interface SttNotice {
+  /** Stable machine code, e.g. `stt_language_unset`, `stt_capability_assumed`. */
+  code: string;
+  /** Human-readable explanation. */
+  message: string;
+  /** Optional structured detail. */
+  detail?: Record<string, unknown>;
+}
+
+/**
+ * The `ready.stt` object (gateway docs/segmented-stt/customer-contract-reference.md section 2).
+ *
+ * Wire keys stay snake_case, like {@link ResolvedAlias}. Every known key is optional and the object
+ * is open: keys a newer gateway adds are kept as-is.
+ */
+export interface ReadyStt {
+  /** Canonical provider id after alias or deployment resolution. */
+  provider?: string;
+  /** The model that runs (absent when the gateway does not know it). */
+  model?: string;
+  /** Where `model` came from. */
+  model_source?: OpenString<'request' | 'deployment' | 'provider_default' | 'substituted'>;
+  /** The Bud deployment name the client used (named-deployment sessions only). */
+  deployment?: string;
+  /**
+   * `streaming`: text while the caller speaks. `segmented`: text after each pause. `buffered`: text
+   * only at `audio_end` or hang-up.
+   */
+  transcription_mode?: OpenString<'streaming' | 'segmented' | 'buffered'>;
+  /** The preference that applied; differs from `transcription_mode` when unmet. */
+  requested_mode?: OpenString<'auto' | 'streaming' | 'segmented'>;
+  /** The level the preference came from. */
+  requested_mode_source?: OpenString<'request' | 'deployment' | 'default'>;
+  /** `live`: revisable interims during speech. `per_segment`: the whole turn so far, after a pause. */
+  interim_results?: OpenString<'live' | 'per_segment' | 'none'>;
+  /** Who ends utterances. */
+  endpointing?: OpenString<'vendor' | 'gateway' | 'client'>;
+  /** Which `vad_event` messages arrive. */
+  speech_events?: OpenString<'detector' | 'transcript' | 'none'>;
+  /** Sustained speech needed for `turn_start` while audio plays. */
+  barge_in_ms?: number;
+  /** The voice detector in use (gateway-endpointed sessions). */
+  detector?: OpenString<'silero' | 'energy' | 'scripted'>;
+  /** Where `confidence` comes from; `none` means it is exactly 1.0, so do not filter on it. */
+  confidence_source?: OpenString<'vendor' | 'derived' | 'none' | 'unknown'>;
+  /** Latency bucket of the slow figure. */
+  latency_class?: OpenString<'realtime' | 'fast' | 'slow' | 'unknown'>;
+  /** 50th-percentile end-of-speech to text, in ms. */
+  final_latency_typical_ms?: number | null;
+  /** Slow-percentile end-of-speech to text, in ms. */
+  final_latency_slow_ms?: number | null;
+  /** Which percentile the slow figure is (95 or 99). */
+  final_latency_slow_percentile?: number;
+  /** How the latency figures were obtained. */
+  latency_basis?: OpenString<'measured' | 'provisional' | 'seed' | 'none'>;
+  /** How long the gateway waits for a segment's text before reporting it lost, in ms. */
+  final_deadline_ms?: number | null;
+  /** Vendor lifecycle of the model. */
+  lifecycle?: OpenString<'ga' | 'preview' | 'deprecated'>;
+  /** Shutdown date (`YYYY-MM-DD`) of a deprecated model. */
+  shutdown_on?: string;
+  /** The capability-map layer that matched. */
+  capability_source?: OpenString<
+    'deployment_override' | 'exact' | 'glob' | 'model_unset' | 'provider_default' | 'global_default'
+  >;
+  /** Same-provider models that stream. */
+  streaming_alternatives?: string[];
+  /** Facts reported without a message. */
+  notices?: SttNotice[];
+  /** Capability map version. */
+  map_version?: string;
+  /** Keys a newer gateway adds. */
+  [key: string]: unknown;
 }
 
 /**
@@ -310,17 +395,21 @@ export interface TTSPlaybackCompleteMessage {
 }
 
 /**
- * Error message
+ * Error message. An uncoded gateway error is just `{type, message}`; a coded one adds `code`,
+ * `recoverable` and `details` (and `message` keeps its `"{code}: "` prefix).
  */
 export interface ErrorMessage {
   type: 'error';
-  /** Error code */
+  /** Stable machine code (e.g. `stt_live_unsupported`); absent on an uncoded error. */
   code?: string;
   /** Error message */
   message: string;
-  /** Additional error details */
+  /** Structured detail of a coded error. */
   details?: Record<string, unknown>;
-  /** Whether the error is recoverable */
+  /**
+   * `true`: the socket is still usable; a setup refusal accepts a corrected `config`.
+   * `false`: the session is over or will never transcribe. Absent on an uncoded error.
+   */
   recoverable?: boolean;
 }
 
@@ -392,6 +481,45 @@ export interface ConfigWarningMessage {
   detail?: Record<string, unknown>;
 }
 
+/** The `event` of a {@link VadEventMessage}. */
+export type VadEventKind = 'speech_start' | 'speech_end' | 'turn_start' | 'turn_end' | 'turn_closed';
+
+/**
+ * Detector-timed speech events and the gateway's turn decisions (segmented STT). Which ones arrive
+ * is given by `ready.stt.speech_events`; match them by `turn_id`.
+ */
+export interface VadEventMessage {
+  type: 'vad_event';
+  /** `speech_start`, `speech_end`, `turn_start`, `turn_end` or `turn_closed`. */
+  event: OpenString<VadEventKind>;
+  /** The turn this event belongs to. */
+  turn_id: number;
+  /** Position in the received audio (first speech sample for starts, last for ends). */
+  audio_ms?: number;
+  /** Sustained speech before the gateway took the turn (`turn_start`). */
+  sustained_ms?: number;
+  /** The cut segment was discarded rather than uploaded (`speech_end`). */
+  discarded?: boolean;
+  /** Whether the turn produced text (`turn_closed`). */
+  had_transcript?: boolean;
+  /** Why a turn closed without text (`turn_closed`): `no_speech`, `transcription_failed`, `ignored`. */
+  reason?: OpenString<'no_speech' | 'transcription_failed' | 'ignored'>;
+}
+
+/**
+ * A speech-to-text problem that does not end the call (a lost segment, dropped audio, rate
+ * limiting). Never sent as `error`, so never treat it as a disconnect.
+ */
+export interface SttWarningMessage {
+  type: 'stt_warning';
+  /** Stable machine code (e.g. `stt_segment_failed`). */
+  code: string;
+  /** Human-readable explanation. */
+  message: string;
+  /** Optional structured detail (e.g. `{turn_id, segment_seq, ...}`). */
+  detail?: Record<string, unknown>;
+}
+
 /**
  * Union type for all incoming messages (received by client from server)
  */
@@ -406,7 +534,9 @@ export type IncomingMessage =
   | SessionUpdateMessage
   | ErrorMessage
   | SIPTransferErrorMessage
-  | ConfigWarningMessage;
+  | ConfigWarningMessage
+  | VadEventMessage
+  | SttWarningMessage;
 
 /**
  * Common message type identifier
@@ -430,7 +560,9 @@ export type MessageType =
   | 'session_update'
   | 'error'
   | 'sip_transfer_error'
-  | 'config_warning';
+  | 'config_warning'
+  | 'vad_event'
+  | 'stt_warning';
 
 // ============================================================================
 // Message Serialization Helpers

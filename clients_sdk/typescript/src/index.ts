@@ -36,6 +36,7 @@ export type {
   STTConfig,
   TTSConfig,
   TranslationConfig,
+  TranscriptionMode,
   Pronunciation,
   LiveKitConfig,
   SessionConfig,
@@ -82,6 +83,8 @@ export { conversationConfigToWire } from './types/conversation.js';
 
 // config_warning typed advisory.
 export type { ConfigWarningEvent, ConfigWarningCode, ConfigWarningMessage } from './types/warnings.js';
+// stt_warning typed mid-call speech-to-text warning (segmented STT).
+export type { SttWarningEvent, SttWarningCode, SttWarningMessage } from './types/warnings.js';
 
 export type {
   ConfigMessage,
@@ -89,8 +92,12 @@ export type {
   IncomingMessage,
   ReadyMessage,
   ResolvedAlias,
+  ReadyStt,
+  SttNotice,
   STTResultMessage,
   ErrorMessage,
+  VadEventMessage,
+  VadEventKind,
   OutgoingMessage,
 } from './types/messages.js';
 
@@ -279,6 +286,7 @@ export type {
   ReadyEvent,
   SessionErrorEvent,
   ConfigWarningEvent as WSConfigWarningEvent,
+  SessionVadEvent,
   ConnectionStateEvent,
   MetricsEvent,
   ReconnectEvent,

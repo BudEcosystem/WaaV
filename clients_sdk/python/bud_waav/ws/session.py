@@ -18,6 +18,7 @@ from ..types import (
     STTConfig, TTSConfig, STTResult, TranscriptEvent, AudioEvent,
     AudioFeatures, DAGConfig, ConversationConfig, intensity_to_number,
     Translation,
+    ReadySTT,
 )
 from ..errors import (
     ConnectionError,
@@ -26,6 +27,7 @@ from ..errors import (
     RateLimitError,
     FatalConnectionError,
     ProtocolVersionError,
+    GatewayError,
 )
 from .queue import MessageQueue, QueueConfig
 
@@ -327,6 +329,9 @@ class WebSocketSession:
         # D8: the transport codecs the gateway negotiated (set on `ready` only when requested).
         self._audio_in_codec: Optional[str] = None
         self._audio_out_codec: Optional[str] = None
+        # Segmented STT: what speech-to-text the session got (`ready.stt`; None when the gateway's
+        # rollout does not cover the session).
+        self._stt: Optional[ReadySTT] = None
         self._connected = False
         self._connecting = False
         self._closed = False
@@ -433,6 +438,17 @@ class WebSocketSession:
         Same downgrade semantics as :attr:`audio_in_codec`.
         """
         return self._audio_out_codec
+
+    @property
+    def stt(self) -> Optional[ReadySTT]:
+        """What speech-to-text this session got (the gateway's ``ready.stt``; segmented STT).
+
+        ``transcription_mode`` (``streaming`` | ``segmented`` | ``buffered``), ``interim_results``,
+        ``endpointing``, ``speech_events``, latency figures, ``notices``, ... ``None`` until
+        ``ready``, and when the gateway's rollout does not cover the session (no statement).
+        ``.to_wire()`` returns the object exactly as sent.
+        """
+        return self._stt
 
     def on(self, event: str, handler: Callable[..., Any]) -> None:
         """
@@ -945,6 +961,10 @@ class WebSocketSession:
             # the effective codec on `ready` and degrades to linear16 if its build lacks opus.
             if getattr(self.stt_config, "audio_in_codec", None):
                 stt_dict["audio_in_codec"] = self.stt_config.audio_in_codec
+            # Segmented STT: the kind of speech-to-text wanted (auto|streaming|segmented); only set
+            # when requested (absent = auto). The mode the session got comes back on `ready.stt`.
+            if getattr(self.stt_config, "transcription_mode", None):
+                stt_dict["transcription_mode"] = self.stt_config.transcription_mode
             # A VENDOR key only -- never the session's own Bud credential.
             vendor_key = self._vendor_api_key()
             if vendor_key:
@@ -1249,6 +1269,10 @@ class WebSocketSession:
                         # opus) — callers should send/decode linear16.
                         self._audio_in_codec = data.get("audio_in_codec")
                         self._audio_out_codec = data.get("audio_out_codec")
+                        # Segmented STT: what speech-to-text the session got. Absent when the
+                        # gateway's rollout does not cover the session.
+                        stt = data.get("stt")
+                        self._stt = ReadySTT.from_wire(stt) if isinstance(stt, dict) else None
                         # Capture + drift-check the wire protocol version (plan W-K1).
                         # The gateway emits this specifically so SDKs detect a
                         # breaking contract change instead of silent field drift.
@@ -1351,7 +1375,9 @@ class WebSocketSession:
                         await self._get_message_queue().put({"type": "turn_completed", "data": data})
 
                     elif msg_type == "vad_event":
-                        # Voice Activity Detection event (speech_start/speech_end)
+                        # Gateway speech event (segmented STT): speech_start/speech_end and the
+                        # turn decisions turn_start/turn_end/turn_closed, matched by turn_id.
+                        # Raw dict payload; parse with bud_waav.VadEvent.from_wire for a typed view.
                         self._emit("vad_event", data)
                         await self._get_message_queue().put({"type": "vad_event", "data": data})
 
@@ -1364,13 +1390,12 @@ class WebSocketSession:
                         await self._get_message_queue().put({"type": "participant_disconnected", "data": data.get("participant")})
 
                     elif msg_type == "error":
-                        from ..errors import BudError
-                        error = BudError(
-                            message=data.get("message", "Unknown error"),
-                            code=data.get("code"),
-                        )
-                        self._emit("error", error)
-                        await self._get_message_queue().put({"type": "error", "error": error})
+                        # Uncoded: {type, message}. Coded: + code, recoverable, details
+                        # (recoverable=True: the socket is still open; a corrected config may
+                        # be sent). GatewayError is a BudError.
+                        gateway_error = GatewayError.from_wire(data)
+                        self._emit("error", gateway_error)
+                        await self._get_message_queue().put({"type": "error", "error": gateway_error})
 
                     elif msg_type == "pong":
                         self._emit("pong", data.get("timestamp"))
@@ -1417,6 +1442,14 @@ class WebSocketSession:
                         # silent server-side degrade becomes visible to the developer.
                         self._emit("config_warning", data)
                         await self._get_message_queue().put({"type": "config_warning", "data": data})
+
+                    elif msg_type == "stt_warning":
+                        # Non-fatal speech-to-text problem mid-call (segmented STT): a lost
+                        # segment, dropped audio, rate limiting. NEVER routed to `error`, which
+                        # callers treat as a disconnect. Raw dict payload, like config_warning;
+                        # parse with bud_waav.SttWarning.from_wire for a typed view.
+                        self._emit("stt_warning", data)
+                        await self._get_message_queue().put({"type": "stt_warning", "data": data})
 
                     elif msg_type is not None:
                         # Forward-compat: never silently drop an unrecognized server

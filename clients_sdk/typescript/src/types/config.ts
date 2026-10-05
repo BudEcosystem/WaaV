@@ -218,6 +218,17 @@ export interface TranslationConfig {
 }
 
 /**
+ * The kind of speech-to-text a client asks for (gateway `stt_config.transcription_mode`):
+ * - `auto` (the default when omitted): whatever the model supports;
+ * - `streaming`: text while the caller speaks; the gateway refuses a model that cannot stream;
+ * - `segmented`: the gateway cuts the audio at pauses and uploads each utterance, even for a model
+ *   that streams. A plain session on a file-only model needs this to get text at each pause.
+ *
+ * What the session actually got comes back on `ready.stt.transcription_mode`.
+ */
+export type TranscriptionMode = 'auto' | 'streaming' | 'segmented';
+
+/**
  * STT (Speech-to-Text) Configuration
  * Maps to the gateway STTWebSocketConfig in src/handlers/ws/config.rs
  */
@@ -243,6 +254,11 @@ export interface STTConfig {
    * its build lacks opus. Distinct from {@link encoding}.
    */
   audioInCodec?: 'linear16' | 'opus';
+  /**
+   * The kind of speech-to-text wanted (wire `transcription_mode`). Omit for `auto`. See
+   * {@link TranscriptionMode}; the mode the session got is reported on `ready.stt`.
+   */
+  transcriptionMode?: TranscriptionMode;
   /** Model to use for transcription (e.g., "nova-2", "nova-3") */
   model?: string;
   /** Enable interim/partial results */

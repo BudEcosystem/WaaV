@@ -82,6 +82,8 @@ const STT_SDK = new Set([
   'encoding', 'model', 'apiKey', 'extras',
   // D8 uplink transport codec (linear16|opus):
   'audioInCodec',
+  // Segmented STT: requested kind of speech-to-text (auto|streaming|segmented):
+  'transcriptionMode',
   // features{} canonical surface (flattened onto STTConfig):
   'interimResults', 'diarize', 'wordTimestamps', 'smartFormat', 'profanityFilter',
   'fillerWords', 'vadEvents', 'endpointingMs', 'utteranceEndMsFeature', 'keyterms',

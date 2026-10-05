@@ -79,6 +79,7 @@ SDK_CONFIG_REACH: dict[str, set[str]] = {
         "punctuation",  # STTConfig.punctuate (SDK alias)
         "encoding",  # STTConfig.encoding
         "audio_in_codec",  # D8 STTConfig.audio_in_codec (uplink transport codec)
+        "transcription_mode",  # segmented STT: STTConfig.transcription_mode (auto|streaming|segmented)
         "model",  # STTConfig.model
         "api_key",  # session api_key override
         "features",  # nested SttFeatures (see SttFeatures below)
