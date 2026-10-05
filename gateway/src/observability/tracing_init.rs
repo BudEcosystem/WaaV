@@ -56,10 +56,14 @@ fn resource_attributes(raw: &str) -> Vec<KeyValue> {
         .collect()
 }
 
+/// The filter when `RUST_LOG` is unset. ONNX Runtime logs every graph optimisation at INFO, about
+/// 500 lines each time a session loads its detector and end-of-turn models; its warnings stay.
+pub const DEFAULT_FILTER: &str = "info,ort=warn";
+
 /// Install the subscriber, exporting to OTLP when an endpoint is configured.
 pub fn init() -> TracingGuard {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(DEFAULT_FILTER));
 
     let endpoint = std::env::var("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
         .ok()
@@ -125,7 +129,13 @@ pub fn init() -> TracingGuard {
 
 #[cfg(test)]
 mod tests {
-    use super::resource_attributes;
+    use super::{DEFAULT_FILTER, resource_attributes};
+
+    #[test]
+    fn the_default_filter_keeps_onnx_runtime_warnings_only() {
+        let f = tracing_subscriber::EnvFilter::new(DEFAULT_FILTER).to_string();
+        assert!(f.contains("ort=warn") && f.contains("info"), "{f}");
+    }
 
     #[test]
     fn parses_the_comma_separated_form_the_chart_writes() {
