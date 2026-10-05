@@ -280,7 +280,6 @@ mod tests {
         let simple = TranscriptionResult::Simple(TranscriptionResponse {
             text: "Hello".to_string(),
             x_groq: None,
-            ..Default::default()
         });
         assert_eq!(simple.text(), "Hello");
 

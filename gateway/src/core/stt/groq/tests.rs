@@ -533,7 +533,6 @@ mod message_tests {
         let simple = TranscriptionResult::Simple(TranscriptionResponse {
             text: "Hello".to_string(),
             x_groq: None,
-            ..Default::default()
         });
         assert_eq!(simple.text(), "Hello");
 
@@ -568,7 +567,6 @@ mod message_tests {
         let simple = TranscriptionResult::Simple(TranscriptionResponse {
             text: "Test".to_string(),
             x_groq: None,
-            ..Default::default()
         });
         assert_eq!(simple.language(), None);
     }
@@ -589,7 +587,6 @@ mod message_tests {
         let simple = TranscriptionResult::Simple(TranscriptionResponse {
             text: "Test".to_string(),
             x_groq: None,
-            ..Default::default()
         });
         assert_eq!(simple.duration(), None);
     }
