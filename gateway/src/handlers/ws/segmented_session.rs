@@ -36,13 +36,14 @@ pub struct LiveSetup {
 /// Which kind of session asks.
 pub fn session_kind(
     agent: Option<&crate::state::ResolvedVoiceAgent>,
+    agent_manual: Option<bool>,
     conversation: bool,
     dag: bool,
     stt: &STTWebSocketConfig,
 ) -> LiveSessionKind {
     if let Some(a) = agent {
         LiveSessionKind::Agent {
-            manual: a.entry.turn_detection.kind == "manual",
+            manual: agent_manual.unwrap_or(a.entry.turn_detection.kind == "manual"),
         }
     } else if conversation {
         LiveSessionKind::Conversation {
@@ -158,24 +159,40 @@ pub fn refusal_message(
     };
     let vendor = setup.req.provider.as_str();
     match (r.code.as_str(), &setup.req.leg) {
-        ("unsupported_deployment", Some(leg)) if leg.site == LegSite::Named => Some(OutgoingMessage::Error {
-            message: format!(
-                "unsupported_deployment: {}",
-                super::bud_legs::todays_unsupported_deployment_text(&leg.name, vendor)
-            ),
-        }),
-        ("stt_not_streaming", Some(leg)) if leg.site == LegSite::Agent => Some(OutgoingMessage::Error {
-            message: format!(
-                "stt_not_streaming: {}",
-                super::bud_legs::todays_stt_not_streaming_text(agent_name.unwrap_or_default(), vendor)
-            ),
-        }),
-        _ => Some(stt_contract::refusal_error(&setup.live, r, shared.map, shared.rollout.release)),
+        ("unsupported_deployment", Some(leg)) if leg.site == LegSite::Named => {
+            Some(OutgoingMessage::Error {
+                message: format!(
+                    "unsupported_deployment: {}",
+                    super::bud_legs::todays_unsupported_deployment_text(&leg.name, vendor)
+                ),
+            })
+        }
+        ("stt_not_streaming", Some(leg)) if leg.site == LegSite::Agent => {
+            Some(OutgoingMessage::Error {
+                message: format!(
+                    "stt_not_streaming: {}",
+                    super::bud_legs::todays_stt_not_streaming_text(
+                        agent_name.unwrap_or_default(),
+                        vendor
+                    )
+                ),
+            })
+        }
+        _ => Some(stt_contract::refusal_error(
+            &setup.live,
+            r,
+            shared.map,
+            shared.rollout.release,
+        )),
     }
 }
 
 /// `ready.stt`: on a session the switch covers, and on every session from Release 3.
-pub async fn ready_stt(setup: &LiveSetup, shared: &SttLiveShared, vm: Option<&Arc<VoiceManager>>) -> Option<serde_json::Value> {
+pub async fn ready_stt(
+    setup: &LiveSetup,
+    shared: &SttLiveShared,
+    vm: Option<&Arc<VoiceManager>>,
+) -> Option<serde_json::Value> {
     if !setup.live.covered && shared.rollout.release < 3 {
         return None;
     }
@@ -213,7 +230,9 @@ pub fn wire(
     meter: Option<Arc<LegMeter>>,
     tracker: &crate::core::observability::SessionTaskTracker,
 ) {
-    let Some(dispatch) = vm.segmented() else { return };
+    let Some(dispatch) = vm.segmented() else {
+        return;
+    };
     let (tx, mut rx) = mpsc::unbounded_channel::<OutgoingMessage>();
     if let Some(meter) = meter {
         meter.set_segmented();
@@ -284,12 +303,16 @@ mod tests {
 
     #[test]
     fn an_agents_eagerness_picks_the_ceiling_and_3000_reads_as_unset() {
-        let e = entry(serde_json::json!({"turn_detection": {"type": "semantic", "eagerness": "high", "silence_ms": 500, "max_endpointing_ms": 3000}}));
+        let e = entry(
+            serde_json::json!({"turn_detection": {"type": "semantic", "eagerness": "high", "silence_ms": 500, "max_endpointing_ms": 3000}}),
+        );
         let t = agent_tuning(&e);
         assert_eq!(t.silence_ceiling_ms, Some(1000));
         assert_eq!(t.min_end_silence_ms, Some(500));
         assert_eq!(t.policy, EndpointPolicy::Auto);
-        let e = entry(serde_json::json!({"turn_detection": {"type": "server_vad", "eagerness": "auto", "silence_ms": 700, "max_endpointing_ms": 2200}}));
+        let e = entry(
+            serde_json::json!({"turn_detection": {"type": "server_vad", "eagerness": "auto", "silence_ms": 700, "max_endpointing_ms": 2200}}),
+        );
         let t = agent_tuning(&e);
         assert_eq!(t.silence_ceiling_ms, Some(2200));
         assert_eq!(t.policy, EndpointPolicy::Silence);

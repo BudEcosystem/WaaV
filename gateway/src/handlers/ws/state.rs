@@ -58,6 +58,9 @@ pub struct ConnectionState {
     pub leg_admissions: Vec<crate::core::deployment_policy::Admission>,
     /// Spec 025: the session's voice agent, when `config.agent` named one.
     pub agent: Option<Arc<crate::core::agent::AgentEngine>>,
+    /// The turn mode a `/v1/realtime` client chose before its agent session started (the agent's
+    /// own `turn_detection` otherwise).
+    pub agent_manual: Option<bool>,
 
     /// D8 uplink opus decoder (feature `opus-codec`): `Some` only when the session negotiated
     /// `stt_config.audio_in_codec = opus`. Each client WS binary frame is one opus packet decoded
@@ -106,6 +109,7 @@ impl ConnectionState {
             leg_meter: None,
             leg_admissions: Vec::new(),
             agent: None,
+            agent_manual: None,
             #[cfg(feature = "opus-codec")]
             opus_decoder: None,
             #[cfg(feature = "dag-routing")]
@@ -138,6 +142,7 @@ impl ConnectionState {
             leg_meter: None,
             leg_admissions: Vec::new(),
             agent: None,
+            agent_manual: None,
             #[cfg(feature = "opus-codec")]
             opus_decoder: None,
             #[cfg(feature = "dag-routing")]

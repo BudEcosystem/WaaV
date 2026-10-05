@@ -7,20 +7,29 @@ use std::collections::HashMap;
 
 use serde_json::{Value, json};
 use waav_segmented_stt::limits::{LatencyBasis, LatencyClass, LatencyEstimate};
-use waav_segmented_stt::map::{CapabilityMap, InputMode, LifecycleStatus, ModelString, QualitySignal};
+use waav_segmented_stt::map::{
+    CapabilityMap, InputMode, LifecycleStatus, ModelString, QualitySignal,
+};
 use waav_segmented_stt::resolve::{Delivery, Layer, Refusal};
 
 use super::messages::OutgoingMessage;
 use crate::core::stt::segmented::live::{LiveDecision, LiveResolution};
 use crate::core::stt::speech_activity::{
-    NoticeKind, SegmentOutcome, SegmentResultKind, SpeechActivity, SttLiveFacts, SttNotice, TurnCloseReason,
+    NoticeKind, SegmentOutcome, SegmentResultKind, SpeechActivity, SttLiveFacts, SttNotice,
 };
 
 /// What `ready.stt` says about the session's transcription.
-fn transcription_mode(live: &LiveResolution) -> &'static str {
+pub(crate) fn transcription_mode(live: &LiveResolution) -> &'static str {
     match live.decision {
         LiveDecision::Segmented => "segmented",
-        _ if live.resolution.warnings.iter().any(|w| w.code == "stt_buffered_until_commit") => "buffered",
+        _ if live
+            .resolution
+            .warnings
+            .iter()
+            .any(|w| w.code == "stt_buffered_until_commit") =>
+        {
+            "buffered"
+        }
         _ => "streaming",
     }
 }
@@ -38,12 +47,19 @@ fn capability_source(layer: Layer) -> &'static str {
 
 fn confidence_source(live: &LiveResolution) -> &'static str {
     let Some(t) = live.transport() else {
-        return if transcription_mode(live) == "buffered" { "derived" } else { "vendor" };
+        return if transcription_mode(live) == "buffered" {
+            "derived"
+        } else {
+            "vendor"
+        };
     };
     let has = |s: QualitySignal| t.quality_signals.contains(&s);
     if has(QualitySignal::UtteranceConfidence) || has(QualitySignal::WordConfidence) {
         "vendor"
-    } else if has(QualitySignal::SegmentAvgLogprob) || has(QualitySignal::TokenLogprobs) || has(QualitySignal::WordLogprob) {
+    } else if has(QualitySignal::SegmentAvgLogprob)
+        || has(QualitySignal::TokenLogprobs)
+        || has(QualitySignal::WordLogprob)
+    {
         "derived"
     } else {
         "none"
@@ -51,21 +67,35 @@ fn confidence_source(live: &LiveResolution) -> &'static str {
 }
 
 /// Same-provider models that stream on today's client in this release.
-pub fn streaming_alternatives(map: &CapabilityMap, live: &LiveResolution, release: u8) -> Vec<String> {
+pub fn streaming_alternatives(
+    map: &CapabilityMap,
+    live: &LiveResolution,
+    release: u8,
+) -> Vec<String> {
     let provider = live.resolution.provider.as_str();
     let mut out = Vec::new();
     for row in map.rows_for(provider) {
-        let Some(model) = row.r#match.model.as_deref() else { continue };
+        let Some(model) = row.r#match.model.as_deref() else {
+            continue;
+        };
         if row.id == live.resolution.row_id
-            || !matches!(row.lifecycle.status, LifecycleStatus::Ga | LifecycleStatus::Preview | LifecycleStatus::Legacy)
+            || !matches!(
+                row.lifecycle.status,
+                LifecycleStatus::Ga | LifecycleStatus::Preview | LifecycleStatus::Legacy
+            )
         {
             continue;
         }
         let streams = map.transports(row).iter().any(|t| {
             t.transport.adapter == "native"
                 && t.transport.input_mode == InputMode::LiveStream
-                && t.transport.enabled_from_release.is_some_and(|r| r <= release)
-                && t.transport.gateway_client.as_ref().is_none_or(|c| c.status.as_str() != "known_broken")
+                && t.transport
+                    .enabled_from_release
+                    .is_some_and(|r| r <= release)
+                && t.transport
+                    .gateway_client
+                    .as_ref()
+                    .is_none_or(|c| c.status.as_str() != "known_broken")
         });
         if streams {
             out.push(model.to_string());
@@ -79,12 +109,24 @@ pub fn streaming_alternatives(map: &CapabilityMap, live: &LiveResolution, releas
 
 fn notice_text(code: &str) -> &'static str {
     match code {
-        "stt_language_unset" => "No language is set. File models guess the language poorly on short segments; set `language` for reliable transcripts.",
-        "stt_capability_assumed" => "This model is not in the gateway's capability map; its capabilities were assumed from the provider's defaults.",
-        "stt_model_deprecated" => "This model is deprecated by its vendor and has a shutdown date; move to its replacement.",
-        "stt_model_substituted" => "Today's client for this provider runs a different model than the one named.",
-        "stt_client_unverified" => "The gateway's client for this model has not been verified on live calls.",
-        "stt_placeholder_model_ignored" => "The SDK's placeholder model name was treated as no model; the provider's default runs.",
+        "stt_language_unset" => {
+            "No language is set. File models guess the language poorly on short segments; set `language` for reliable transcripts."
+        }
+        "stt_capability_assumed" => {
+            "This model is not in the gateway's capability map; its capabilities were assumed from the provider's defaults."
+        }
+        "stt_model_deprecated" => {
+            "This model is deprecated by its vendor and has a shutdown date; move to its replacement."
+        }
+        "stt_model_substituted" => {
+            "Today's client for this provider runs a different model than the one named."
+        }
+        "stt_client_unverified" => {
+            "The gateway's client for this model has not been verified on live calls."
+        }
+        "stt_placeholder_model_ignored" => {
+            "The SDK's placeholder model name was treated as no model; the provider's default runs."
+        }
         "stt_narrowband_audio" => "Audio under 16 kHz is upsampled before transcription.",
         _ => "",
     }
@@ -148,7 +190,9 @@ pub fn config_warnings(live: &LiveResolution) -> Vec<OutgoingMessage> {
     let mut by_code: HashMap<&str, Value> = HashMap::new();
     for w in &live.resolution.warnings {
         if w.delivery == Delivery::Frame {
-            by_code.entry(w.code.as_str()).or_insert_with(|| Value::Object(w.detail.clone()));
+            by_code
+                .entry(w.code.as_str())
+                .or_insert_with(|| Value::Object(w.detail.clone()));
         }
     }
     for w in &live.extra {
@@ -179,7 +223,12 @@ pub fn config_warnings(live: &LiveResolution) -> Vec<OutgoingMessage> {
 }
 
 /// A setup refusal as a coded `error`. The socket stays usable for a corrected `config`.
-pub fn refusal_error(live: &LiveResolution, refusal: &Refusal, map: &CapabilityMap, release: u8) -> OutgoingMessage {
+pub fn refusal_error(
+    live: &LiveResolution,
+    refusal: &Refusal,
+    map: &CapabilityMap,
+    release: u8,
+) -> OutgoingMessage {
     let mut details = serde_json::Map::new();
     details.insert("provider".into(), json!(live.resolution.provider));
     if !live.resolution.model_input.is_empty() {
@@ -194,7 +243,10 @@ pub fn refusal_error(live: &LiveResolution, refusal: &Refusal, map: &CapabilityM
     for (k, v) in &refusal.details {
         details.entry(k.clone()).or_insert(v.clone());
     }
-    details.insert("streaming_alternatives".into(), json!(streaming_alternatives(map, live, release)));
+    details.insert(
+        "streaming_alternatives".into(),
+        json!(streaming_alternatives(map, live, release)),
+    );
     OutgoingMessage::CodedError {
         message: format!("{}: {}", refusal.code, refusal.text),
         code: refusal.code.clone(),
@@ -214,7 +266,12 @@ pub struct ReadyFacts {
 }
 
 /// `ready.stt`.
-pub fn ready_stt(live: &LiveResolution, facts: &ReadyFacts, map: &CapabilityMap, release: u8) -> Value {
+pub fn ready_stt(
+    live: &LiveResolution,
+    facts: &ReadyFacts,
+    map: &CapabilityMap,
+    release: u8,
+) -> Value {
     let classes = map.latency_classes();
     let (realtime_max, fast_max) = (classes.realtime_max_ms, classes.fast_max_ms);
     let row = live.resolution.row(map);
@@ -228,9 +285,17 @@ pub fn ready_stt(live: &LiveResolution, facts: &ReadyFacts, map: &CapabilityMap,
     if !sensitive && !live.resolution.model_sent.is_empty() {
         o.insert("model".into(), json!(live.resolution.model_sent));
     }
-    let model_source = if live.resolution.warnings.iter().any(|w| w.code == "stt_model_substituted") {
+    let model_source = if live
+        .resolution
+        .warnings
+        .iter()
+        .any(|w| w.code == "stt_model_substituted")
+    {
         "substituted"
-    } else if matches!(live.resolution.layer, Layer::ModelUnset | Layer::DeclaredDefault) {
+    } else if matches!(
+        live.resolution.layer,
+        Layer::ModelUnset | Layer::DeclaredDefault
+    ) {
         "provider_default"
     } else if live.deployment.is_some() && !facts.named_model {
         "deployment"
@@ -261,28 +326,59 @@ pub fn ready_stt(live: &LiveResolution, facts: &ReadyFacts, map: &CapabilityMap,
             _ => "vendor",
         }),
     );
-    let speech_events = if gateway_endpointed && facts.speech_events { "detector" } else { "none" };
+    let speech_events = if gateway_endpointed && facts.speech_events {
+        "detector"
+    } else {
+        "none"
+    };
     o.insert("speech_events".into(), json!(speech_events));
     if speech_events == "detector" {
-        o.insert("barge_in_ms".into(), json!(facts.barge_in_ms.unwrap_or(500).max(500)));
+        o.insert(
+            "barge_in_ms".into(),
+            json!(facts.barge_in_ms.unwrap_or(500).max(500)),
+        );
     }
     if gateway_endpointed {
-        let detector = facts.engine.as_ref().map(|f| f.detector).unwrap_or(live.detector.kind);
+        let detector = facts
+            .engine
+            .as_ref()
+            .map(|f| f.detector)
+            .unwrap_or(live.detector.kind);
         o.insert("detector".into(), json!(detector.as_str()));
     }
     o.insert("confidence_source".into(), json!(confidence_source(live)));
     let est = facts.latency;
-    let seed = live.transport().and_then(waav_segmented_stt::live::seed_p99).or_else(|| {
-        map.transports(row).iter().find_map(|t| waav_segmented_stt::live::seed_p99(t.transport))
-    });
+    let seed = live
+        .transport()
+        .and_then(waav_segmented_stt::live::seed_p99)
+        .or_else(|| {
+            map.transports(row)
+                .iter()
+                .find_map(|t| waav_segmented_stt::live::seed_p99(t.transport))
+        });
     let (slow, percentile, basis, typical) = match est {
         Some(e) if matches!(e.basis, LatencyBasis::Measured | LatencyBasis::Provisional) => {
             (e.p95_ms, Some(95), e.basis, e.p50_ms)
         }
-        _ => (seed, seed.map(|_| 99), if seed.is_some() { LatencyBasis::Seed } else { LatencyBasis::None }, None),
+        _ => (
+            seed,
+            seed.map(|_| 99),
+            if seed.is_some() {
+                LatencyBasis::Seed
+            } else {
+                LatencyBasis::None
+            },
+            None,
+        ),
     };
-    let class_p99 = est.and_then(|e| e.p99_ms).filter(|_| basis != LatencyBasis::Seed).or(seed);
-    o.insert("latency_class".into(), json!(LatencyClass::of(class_p99, realtime_max, fast_max).as_str()));
+    let class_p99 = est
+        .and_then(|e| e.p99_ms)
+        .filter(|_| basis != LatencyBasis::Seed)
+        .or(seed);
+    o.insert(
+        "latency_class".into(),
+        json!(LatencyClass::of(class_p99, realtime_max, fast_max).as_str()),
+    );
     o.insert("final_latency_typical_ms".into(), json!(typical));
     o.insert("final_latency_slow_ms".into(), json!(slow));
     if let Some(p) = percentile.filter(|_| slow.is_some()) {
@@ -291,11 +387,20 @@ pub fn ready_stt(live: &LiveResolution, facts: &ReadyFacts, map: &CapabilityMap,
     o.insert("latency_basis".into(), json!(basis.as_str()));
     o.insert(
         "final_deadline_ms".into(),
-        json!(gateway_endpointed.then_some(facts.engine.as_ref().map_or(live.deadline_ms, |f| f.final_deadline_ms))),
+        json!(
+            gateway_endpointed.then_some(
+                facts
+                    .engine
+                    .as_ref()
+                    .map_or(live.deadline_ms, |f| f.final_deadline_ms)
+            )
+        ),
     );
     let lifecycle = match row.lifecycle.status {
         LifecycleStatus::Preview => "preview",
-        LifecycleStatus::Deprecated | LifecycleStatus::Retiring | LifecycleStatus::Legacy => "deprecated",
+        LifecycleStatus::Deprecated | LifecycleStatus::Retiring | LifecycleStatus::Legacy => {
+            "deprecated"
+        }
         _ if row.lifecycle.shutdown_on.is_some() => "deprecated",
         _ => "ga",
     };
@@ -303,7 +408,10 @@ pub fn ready_stt(live: &LiveResolution, facts: &ReadyFacts, map: &CapabilityMap,
     if let Some(d) = &row.lifecycle.shutdown_on {
         o.insert("shutdown_on".into(), json!(d));
     }
-    o.insert("capability_source".into(), json!(capability_source(live.resolution.layer)));
+    o.insert(
+        "capability_source".into(),
+        json!(capability_source(live.resolution.layer)),
+    );
     let alts = streaming_alternatives(map, live, release);
     if !alts.is_empty() && mode != "streaming" {
         o.insert("streaming_alternatives".into(), json!(alts));
@@ -315,10 +423,16 @@ pub fn ready_stt(live: &LiveResolution, facts: &ReadyFacts, map: &CapabilityMap,
         .collect();
     for w in &live.extra {
         if w.delivery == Delivery::Notice {
-            notices.push(json!({"code": w.code, "message": notice_text(w.code), "detail": w.detail}));
+            notices
+                .push(json!({"code": w.code, "message": notice_text(w.code), "detail": w.detail}));
         }
     }
-    if let Some(hz) = facts.engine.as_ref().and_then(|f| f.resampled_from_hz).filter(|hz| *hz < 16_000) {
+    if let Some(hz) = facts
+        .engine
+        .as_ref()
+        .and_then(|f| f.resampled_from_hz)
+        .filter(|hz| *hz < 16_000)
+    {
         notices.push(json!({"code": "stt_narrowband_audio", "message": notice_text("stt_narrowband_audio"), "detail": {"input_hz": hz}}));
     }
     if !notices.is_empty() {
@@ -357,7 +471,12 @@ impl VadEvents {
             reason: None,
         };
         match a {
-            SpeechActivity::Started { turn_id, at_sample, sustained_ms, .. } => {
+            SpeechActivity::Started {
+                turn_id,
+                at_sample,
+                sustained_ms,
+                ..
+            } => {
                 let audio_ms = at_sample / 16;
                 if !self.started.insert(*turn_id, true).unwrap_or(false) {
                     let mut m = ev("speech_start", *turn_id);
@@ -369,37 +488,60 @@ impl VadEvents {
                 let turn_now = !agent_audible || *sustained_ms >= self.barge_in_ms;
                 if turn_now && !self.turn_started.insert(*turn_id, true).unwrap_or(false) {
                     let mut m = ev("turn_start", *turn_id);
-                    if let OutgoingMessage::VadEvent { audio_ms: a, sustained_ms: s, .. } = &mut m {
+                    if let OutgoingMessage::VadEvent {
+                        audio_ms: a,
+                        sustained_ms: s,
+                        ..
+                    } = &mut m
+                    {
                         *a = Some(audio_ms);
                         *s = Some(*sustained_ms);
                     }
                     out.push(m);
                 }
             }
-            SpeechActivity::Stopped { turn_id, at_sample, will_upload, .. } => {
+            SpeechActivity::Stopped {
+                turn_id,
+                at_sample,
+                will_upload,
+                ..
+            } => {
                 let mut m = ev("speech_end", *turn_id);
-                if let OutgoingMessage::VadEvent { audio_ms, discarded, .. } = &mut m {
+                if let OutgoingMessage::VadEvent {
+                    audio_ms,
+                    discarded,
+                    ..
+                } = &mut m
+                {
                     *audio_ms = Some(at_sample / 16);
                     *discarded = (!will_upload).then_some(true);
                 }
                 out.push(m);
             }
             SpeechActivity::EndpointDecided { turn_id, .. } => out.push(ev("turn_end", *turn_id)),
-            SpeechActivity::TurnClosed { turn_id, had_text, gaps, reason, .. } => {
+            SpeechActivity::TurnClosed {
+                turn_id,
+                had_text,
+                gaps,
+                ..
+            } => {
                 self.started.remove(turn_id);
                 self.turn_started.remove(turn_id);
                 let mut m = ev("turn_closed", *turn_id);
-                if let OutgoingMessage::VadEvent { had_transcript, reason: r, .. } = &mut m {
+                if let OutgoingMessage::VadEvent {
+                    had_transcript,
+                    reason: r,
+                    ..
+                } = &mut m
+                {
                     *had_transcript = Some(*had_text);
                     if !had_text {
-                        *r = Some(if *gaps > 0 {
+                        let why = if *gaps > 0 {
                             "transcription_failed"
-                        } else if *reason == TurnCloseReason::Commit {
-                            "no_speech"
                         } else {
                             "no_speech"
-                        }
-                        .to_string());
+                        };
+                        *r = Some(why.to_string());
                     }
                 }
                 out.push(m);
@@ -472,12 +614,19 @@ pub fn notice_warning(n: &SttNotice) -> Option<OutgoingMessage> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::stt::segmented::live::{LiveRequest, LiveSessionKind, SttLiveShared, resolve_session};
+    use crate::core::stt::segmented::live::{
+        LiveRequest, LiveSessionKind, SttLiveShared, resolve_session,
+    };
+    use crate::core::stt::speech_activity::TurnCloseReason;
     use std::collections::BTreeMap;
     use waav_segmented_stt::profile::EndpointTuning;
 
     fn shared() -> SttLiveShared {
-        SttLiveShared::from_lookup(|k| (k == "WAAV_SEGMENTED_STT").then(|| "on".to_string()), None).unwrap()
+        SttLiveShared::from_lookup(
+            |k| (k == "WAAV_SEGMENTED_STT").then(|| "on".to_string()),
+            None,
+        )
+        .unwrap()
     }
 
     fn live(provider: &str, model: &str, kind: LiveSessionKind) -> LiveResolution {
@@ -505,8 +654,22 @@ mod tests {
     #[test]
     fn ready_stt_for_a_segmented_agent_matches_the_worked_example() {
         let s = shared();
-        let l = live("elevenlabs", "scribe_v2", LiveSessionKind::Agent { manual: false });
-        let v = ready_stt(&l, &ReadyFacts { speech_events: true, barge_in_ms: Some(500), named_model: true, ..Default::default() }, s.map, 6);
+        let l = live(
+            "elevenlabs",
+            "scribe_v2",
+            LiveSessionKind::Agent { manual: false },
+        );
+        let v = ready_stt(
+            &l,
+            &ReadyFacts {
+                speech_events: true,
+                barge_in_ms: Some(500),
+                named_model: true,
+                ..Default::default()
+            },
+            s.map,
+            6,
+        );
         assert_eq!(v["transcription_mode"], "segmented");
         assert_eq!(v["interim_results"], "per_segment");
         assert_eq!(v["endpointing"], "gateway");
@@ -518,7 +681,13 @@ mod tests {
         assert_eq!(v["final_latency_slow_percentile"], 99);
         assert_eq!(v["latency_basis"], "seed");
         assert_eq!(v["capability_source"], "exact");
-        assert!(v["streaming_alternatives"].as_array().unwrap().iter().any(|m| m == "scribe_v2_realtime"));
+        assert!(
+            v["streaming_alternatives"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m == "scribe_v2_realtime")
+        );
         assert_eq!(v["map_version"], s.map.map_version());
     }
 
@@ -543,7 +712,9 @@ mod tests {
         assert_eq!(v["endpointing"], "client");
         assert_eq!(v["interim_results"], "none");
         let w = config_warnings(&l);
-        assert!(matches!(&w[0], OutgoingMessage::ConfigWarning { code, .. } if code == "stt_buffered_until_commit"));
+        assert!(
+            matches!(&w[0], OutgoingMessage::ConfigWarning { code, .. } if code == "stt_buffered_until_commit")
+        );
     }
 
     #[test]
@@ -568,19 +739,28 @@ mod tests {
                 extras: BTreeMap::new(),
             },
         );
-        let LiveDecision::Refused(r) = &l.decision else { panic!("{:?}", l.decision) };
+        let LiveDecision::Refused(r) = &l.decision else {
+            panic!("{:?}", l.decision)
+        };
         let m = refusal_error(&l, r, s.map, 6);
         let j = serde_json::to_value(&m).unwrap();
         assert_eq!(j["type"], "error");
         assert_eq!(j["code"], "stt_live_unsupported");
         assert_eq!(j["recoverable"], true);
         assert_eq!(j["details"]["reason"], "not_covered_yet");
-        assert!(j["message"].as_str().unwrap().starts_with("stt_live_unsupported: "));
+        assert!(
+            j["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("stt_live_unsupported: ")
+        );
     }
 
     #[test]
     fn a_fatal_engine_error_becomes_stt_unavailable() {
-        let m = stt_unavailable("Provider error: stt_unavailable (credential_rejected): 401 bad key").unwrap();
+        let m =
+            stt_unavailable("Provider error: stt_unavailable (credential_rejected): 401 bad key")
+                .unwrap();
         let j = serde_json::to_value(&m).unwrap();
         assert_eq!(j["code"], "stt_unavailable");
         assert_eq!(j["recoverable"], false);
@@ -590,14 +770,24 @@ mod tests {
 
     #[test]
     fn an_uncoded_error_keeps_its_exact_bytes() {
-        let m = OutgoingMessage::Error { message: "boom".into() };
-        assert_eq!(serde_json::to_string(&m).unwrap(), r#"{"type":"error","message":"boom"}"#);
+        let m = OutgoingMessage::Error {
+            message: "boom".into(),
+        };
+        assert_eq!(
+            serde_json::to_string(&m).unwrap(),
+            r#"{"type":"error","message":"boom"}"#
+        );
     }
 
     #[test]
     fn speech_events_follow_the_contract_order() {
         let mut v = VadEvents::new(500);
-        let started = |s| SpeechActivity::Started { turn_id: 7, at_sample: 192_000, sustained_ms: s, at_mono_ms: 0 };
+        let started = |s| SpeechActivity::Started {
+            turn_id: 7,
+            at_sample: 192_000,
+            sustained_ms: s,
+            at_mono_ms: 0,
+        };
         let names = |ms: Vec<OutgoingMessage>| -> Vec<String> {
             ms.into_iter()
                 .map(|m| match m {
@@ -606,10 +796,25 @@ mod tests {
                 })
                 .collect()
         };
-        assert_eq!(names(v.on_activity(&started(224), true)), vec!["speech_start"]);
-        assert_eq!(names(v.on_activity(&started(384), true)), Vec::<String>::new());
-        assert_eq!(names(v.on_activity(&started(512), true)), vec!["turn_start"]);
-        let stop = SpeechActivity::Stopped { turn_id: 7, at_sample: 230_400, voiced_ms: 2400, will_upload: true, at_mono_ms: 0 };
+        assert_eq!(
+            names(v.on_activity(&started(224), true)),
+            vec!["speech_start"]
+        );
+        assert_eq!(
+            names(v.on_activity(&started(384), true)),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            names(v.on_activity(&started(512), true)),
+            vec!["turn_start"]
+        );
+        let stop = SpeechActivity::Stopped {
+            turn_id: 7,
+            at_sample: 230_400,
+            voiced_ms: 2400,
+            will_upload: true,
+            at_mono_ms: 0,
+        };
         assert_eq!(names(v.on_activity(&stop, false)), vec!["speech_end"]);
         let closed = SpeechActivity::TurnClosed {
             turn_id: 7,
@@ -623,7 +828,10 @@ mod tests {
         };
         let m = v.on_activity(&closed, false);
         let j = serde_json::to_value(&m[0]).unwrap();
-        assert_eq!(j, json!({"type":"vad_event","event":"turn_closed","turn_id":7,"had_transcript":false,"reason":"transcription_failed"}));
+        assert_eq!(
+            j,
+            json!({"type":"vad_event","event":"turn_closed","turn_id":7,"had_transcript":false,"reason":"transcription_failed"})
+        );
     }
 
     #[test]

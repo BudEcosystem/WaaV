@@ -254,8 +254,17 @@ pub(super) async fn initialize_agent_loop(
         tracker.track("agent-session-limit", handle);
     }
 
-    // Turn-taking: the same controller the conversation loop uses, with the agent's settings.
-    let start_strategy = start_strategy(&entry);
+    // Turn-taking: the same controller the conversation loop uses, with the agent's settings. On a
+    // segmented session the gateway's detector starts turns and interrupts; text arrives too late.
+    let segmented = vm.is_gateway_endpointed();
+    let start_strategy: Box<dyn crate::core::turn::UserTurnStartStrategy> = if segmented {
+        Box::new(crate::core::turn::strategies::DetectorSpeechStart::new(
+            entry.interruption.min_speech_ms.min(u32::MAX as u64) as u32,
+            entry.interruption.min_words,
+        ))
+    } else {
+        start_strategy(&entry)
+    };
     let vm_probe = Arc::clone(vm);
     let engine_probe = Arc::clone(&engine);
     let controller = Arc::new(
@@ -294,6 +303,10 @@ pub(super) async fn initialize_agent_loop(
         }
     }
 
+    if segmented {
+        wire_segmented_agent(vm, &engine, &controller, &entry, message_tx, state).await;
+    }
+
     let tx = message_tx.clone();
     let eng = Arc::clone(&engine);
     let ctrl = Arc::clone(&controller);
@@ -304,6 +317,71 @@ pub(super) async fn initialize_agent_loop(
         let ctrl = Arc::clone(&ctrl);
         let ignore = ignore.clone();
         Box::pin(async move {
+            // A segmented result was admitted when the caller started speaking (the voice
+            // manager's gate is the agent's rule); its arrival time says nothing.
+            if let Some(turn) = stt.speech_turn_id {
+                let busy = eng.has_active_turn();
+                // Text the agent does not take as input is not shown: a backchannel or the agent's
+                // own words coming back, while it speaks.
+                let text = stt.turn_transcript().to_string();
+                let ignored =
+                    busy && (is_ignored_phrase(&text, &ignore) || eng.is_probable_echo(&text));
+                if ignored {
+                    if stt.is_speech_final {
+                        let events =
+                            ctrl.feed(&crate::core::turn::ControllerSignal::SpeechTurnClosed {
+                                had_text: false,
+                            });
+                        eng.handle_turn_events(&events).await;
+                        eng.note_final_turn(turn);
+                    }
+                    return;
+                }
+                send_with_policy(
+                    &tx,
+                    MessageRoute::Outgoing(OutgoingMessage::STTResult {
+                        transcript: stt.transcript.clone(),
+                        is_final: stt.is_final,
+                        is_speech_final: stt.is_speech_final,
+                        confidence: stt.confidence,
+                        segment_transcript: stt.segment_transcript.clone(),
+                        translations: stt.translations.clone(),
+                    }),
+                    MessageClass::Transcript,
+                )
+                .await;
+                eng.poke_idle();
+                let final_text = stt.is_speech_final;
+                let signal = if final_text {
+                    crate::core::turn::ControllerSignal::SttFinal {
+                        text,
+                        is_speech_final: true,
+                        is_finalized: stt.is_finalized,
+                    }
+                } else {
+                    crate::core::turn::ControllerSignal::SttInterim {
+                        text,
+                        confidence: stt.confidence,
+                    }
+                };
+                let events = ctrl.feed(&signal);
+                if eng.is_manual() {
+                    for event in &events {
+                        match event {
+                            crate::core::turn::TurnEvent::Stopped { transcript, .. } => {
+                                eng.append_input(transcript)
+                            }
+                            other => eng.handle_turn_events(std::slice::from_ref(other)).await,
+                        }
+                    }
+                } else if !events.is_empty() {
+                    eng.handle_turn_events(&events).await;
+                }
+                if final_text {
+                    eng.note_final_turn(turn);
+                }
+                return;
+            }
             // Interruptions off: while the agent answers, the caller's speech is not input — not
             // shown, not a turn — as during a greeting that cannot be talked over.
             if !eng.accepts_speech() {
@@ -372,6 +450,104 @@ pub(super) async fn initialize_agent_loop(
         "voice agent session started"
     );
     Ok(())
+}
+
+/// A segmented session's agent side: speech-time admission by the agent's own rule, detector
+/// barge-in on a task of its own (an interruption never waits behind a reply), and the lost-turn
+/// rule: a caller turn whose speech was lost gets a spoken notice twice; the third in a row, or one
+/// refused credential, ends the call with `stt_unavailable`.
+async fn wire_segmented_agent(
+    vm: &Arc<VoiceManager>,
+    engine: &Arc<AgentEngine>,
+    controller: &Arc<crate::core::turn::TurnController>,
+    entry: &Arc<bud_auth::VoiceAgentEntry>,
+    message_tx: &mpsc::Sender<MessageRoute>,
+    state: &Arc<RwLock<ConnectionState>>,
+) {
+    use crate::core::stt::speech_activity::SpeechActivity;
+    let Some(dispatch) = vm.segmented() else {
+        return;
+    };
+    let weak = Arc::downgrade(engine);
+    dispatch.set_gate(Arc::new(move || {
+        weak.upgrade().is_none_or(|e| e.accepts_speech())
+    }));
+    let (tx, mut rx) = mpsc::unbounded_channel::<SpeechActivity>();
+    dispatch.add_speech_listener(Arc::new(move |a| {
+        let _ = tx.send(a);
+    }));
+    let eng = Arc::clone(engine);
+    let ctrl = Arc::clone(controller);
+    let notice = entry.degradation_message.clone();
+    let out = message_tx.clone();
+    let tracker = state.read().await.task_tracker.clone();
+    let handle = tokio::spawn(async move {
+        let mut lost_in_a_row = 0u32;
+        while let Some(a) = rx.recv().await {
+            match a {
+                SpeechActivity::Started { sustained_ms, .. } => {
+                    eng.poke_idle();
+                    let events =
+                        ctrl.feed(&crate::core::turn::ControllerSignal::Speech { sustained_ms });
+                    if !events.is_empty() {
+                        eng.handle_turn_events(&events).await;
+                    }
+                }
+                SpeechActivity::TurnClosed {
+                    turn_id,
+                    had_text,
+                    result_follows,
+                    gaps,
+                    ..
+                } => {
+                    if !had_text {
+                        let events =
+                            ctrl.feed(&crate::core::turn::ControllerSignal::SpeechTurnClosed {
+                                had_text: false,
+                            });
+                        eng.handle_turn_events(&events).await;
+                    }
+                    if !result_follows {
+                        eng.note_final_turn(turn_id);
+                    }
+                    if had_text {
+                        lost_in_a_row = 0;
+                    } else if gaps > 0 {
+                        lost_in_a_row += 1;
+                        if lost_in_a_row >= 3 {
+                            let _ = send_with_policy(
+                                &out,
+                                MessageRoute::Outgoing(OutgoingMessage::CodedError {
+                                    message: "stt_unavailable: three caller turns in a row could not be transcribed.".into(),
+                                    code: "stt_unavailable".into(),
+                                    recoverable: false,
+                                    details: Some(serde_json::json!({ "reason": "repeated_loss" })),
+                                }),
+                                MessageClass::Critical,
+                            )
+                            .await;
+                            eng.shutdown().await;
+                            let _ = send_with_policy(
+                                &out,
+                                MessageRoute::CloseWith {
+                                    code: CLOSE_NORMAL,
+                                    reason: "stt_unavailable".into(),
+                                },
+                                MessageClass::Critical,
+                            )
+                            .await;
+                            return;
+                        }
+                        let eng = Arc::clone(&eng);
+                        let text = notice.clone();
+                        tokio::spawn(async move { eng.speak_notice(&text).await });
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
+    tracker.track("agent-segmented-speech", handle);
 }
 
 /// What starts a caller's turn, and so interrupts the agent while it speaks. The words needed

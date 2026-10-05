@@ -133,6 +133,12 @@ pub fn create_api_router() -> Router<Arc<AppState>> {
             "/capabilities/features",
             get(capabilities::list_feature_capabilities),
         )
+        // Capability discovery: how each speech-to-text model is served on a live call
+        // (streaming, segmented, buffered or refused) for each kind of session.
+        .route(
+            "/capabilities/stt",
+            get(crate::handlers::stt_capability::stt_capabilities),
+        )
         // DAG routing endpoints
         .route("/dag/templates", get(dag::list_templates))
         .route("/dag/templates/{template_name}", get(dag::get_template))

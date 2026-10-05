@@ -367,8 +367,10 @@ pub async fn handle_config_message(
     let live_setup = match stt_ws_config.as_ref().filter(|_| audio_enabled) {
         Some(stt) => {
             let shared = &app_state.core_state.stt_live;
+            let agent_manual = state.read().await.agent_manual;
             let kind = super::segmented_session::session_kind(
                 resolved_agent.as_ref(),
+                agent_manual,
                 conversation_ws_config.is_some(),
                 dag_ws_config.is_some(),
                 stt,
@@ -838,7 +840,12 @@ pub async fn handle_config_message(
     };
 
     if let Some(setup) = live_setup.as_ref() {
-        ready_stt = super::segmented_session::ready_stt(setup, &app_state.core_state.stt_live, voice_manager.as_ref()).await;
+        ready_stt = super::segmented_session::ready_stt(
+            setup,
+            &app_state.core_state.stt_live,
+            voice_manager.as_ref(),
+        )
+        .await;
     }
 
     // Send ready message with optional LiveKit room information
@@ -1547,11 +1554,20 @@ async fn initialize_conversation_loop(
     // strategy: the MinWords barge-in gate (A-G3) when configured, else the
     // legacy any-speech behavior. The bot-speaking truth comes from the
     // VoiceManager's live playout estimate (probe), not a stale flag.
-    let start_strategy: Box<dyn crate::core::turn::UserTurnStartStrategy> =
+    // A segmented session interrupts on the gateway's detector: its transcript arrives only after
+    // the caller's first pause plus an upload, which would let the bot talk over a whole sentence.
+    let segmented = voice_manager.is_gateway_endpointed();
+    let start_strategy: Box<dyn crate::core::turn::UserTurnStartStrategy> = if segmented {
+        Box::new(crate::core::turn::strategies::DetectorSpeechStart::new(
+            500,
+            conv_config.barge_in_min_words.unwrap_or(1),
+        ))
+    } else {
         match conv_config.barge_in_min_words {
             Some(n) if n >= 1 => Box::new(crate::core::turn::strategies::MinWordsStart::new(n)),
             _ => Box::new(crate::core::turn::strategies::AnySpeechStart),
-        };
+        }
+    };
     // D-G3: a FATAL turn error (auth/config — every turn would fail
     // identically) surfaces to the client as a Critical error message.
     {
@@ -1655,6 +1671,38 @@ async fn initialize_conversation_loop(
         {
             warn!("failed to register eager smart-turn callback: {e}");
         }
+    }
+
+    if segmented && let Some(dispatch) = voice_manager.segmented() {
+        use crate::core::stt::speech_activity::SpeechActivity;
+        let (tx, mut rx) = mpsc::unbounded_channel::<SpeechActivity>();
+        dispatch.add_speech_listener(Arc::new(move |a| {
+            let _ = tx.send(a);
+        }));
+        let orch = orchestrator.clone();
+        let ctrl = turn_controller.clone();
+        crate::core::observability::spawn_observed_detached(
+            "conversation.segmented-speech",
+            async move {
+                while let Some(a) = rx.recv().await {
+                    let signal = match a {
+                        SpeechActivity::Started { sustained_ms, .. } => {
+                            crate::core::turn::ControllerSignal::Speech { sustained_ms }
+                        }
+                        SpeechActivity::TurnClosed {
+                            had_text: false, ..
+                        } => crate::core::turn::ControllerSignal::SpeechTurnClosed {
+                            had_text: false,
+                        },
+                        _ => continue,
+                    };
+                    let events = ctrl.feed(&signal);
+                    if !events.is_empty() {
+                        orch.handle_turn_events(&events).await;
+                    }
+                }
+            },
+        );
     }
 
     // Store on the connection so teardown can cancel any in-flight turn.
@@ -2057,9 +2105,9 @@ async fn initialize_voice_manager(
 
     // Segmented speech-to-text: the engine owns its own detector, so the continuous smart-turn
     // pipeline is not built for the session.
-    if let Some(setup) = live_setup.filter(|s| {
-        s.live.decision == crate::core::stt::segmented::live::LiveDecision::Segmented
-    }) {
+    if let Some(setup) = live_setup
+        .filter(|s| s.live.decision == crate::core::stt::segmented::live::LiveDecision::Segmented)
+    {
         match crate::core::stt::segmented::live::build_plan(
             &app_state.core_state.stt_live,
             &setup.live,

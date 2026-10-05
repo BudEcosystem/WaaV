@@ -28,6 +28,7 @@ pub mod recording;
 pub mod sip;
 pub mod speak;
 pub mod transcribe;
+pub mod stt_capability;
 pub mod voice_catalog;
 pub mod voices;
 pub mod ws;

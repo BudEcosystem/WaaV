@@ -173,6 +173,56 @@ fn not_found(model: &str) -> HandshakeError {
     .param("model")
 }
 
+/// A name that is not a realtime deployment: a file-only transcription deployment the caller can
+/// reach is refused as `stt_live_unsupported` (`realtime_needs_agent`), with today's status; any
+/// other name keeps `model_not_found`.
+fn needs_agent_or_not_found(state: &AppState, model: &str, credential: &str) -> HandshakeError {
+    let stt = crate::handlers::ws::bud_legs::STT_CAPABILITY;
+    let file_only = state
+        .resolve_voice_endpoint(model, stt, Some(credential))
+        .and_then(|r| {
+            state
+                .bud_mode
+                .as_ref()
+                .and_then(|b| b.plane().voice_endpoint(&r.endpoint_id))
+        })
+        .filter(|ep| ep.serves(stt))
+        .map(|ep| {
+            let settings = ep.config.stt();
+            let m = settings
+                .model
+                .clone()
+                .filter(|m| !m.trim().is_empty())
+                .or_else(|| ep.model.clone())
+                .unwrap_or_default();
+            (ep.vendor.clone(), m)
+        })
+        .filter(|(vendor, m)| {
+            crate::core::stt::segmented::live::is_file_only(&state.core_state.stt_live, vendor, m)
+        });
+    match file_only {
+        Some((provider, m)) => realtime_needs_agent(model, &provider, &m),
+        None => not_found(model),
+    }
+}
+
+fn realtime_needs_agent(name: &str, provider: &str, model: &str) -> HandshakeError {
+    HandshakeError::new(
+        StatusCode::NOT_FOUND,
+        "stt_live_unsupported",
+        format!(
+            "'{name}' is a speech-to-text deployment whose model transcribes files, not a live stream. Realtime sessions need a voice agent (model=prompt:<agent>) to take turns on it, or use /ws."
+        ),
+    )
+    .param("model")
+    .details(serde_json::json!({
+        "reason": "realtime_needs_agent",
+        "provider": provider,
+        "model": model,
+        "deployment": name,
+    }))
+}
+
 /// Authenticate a Bud key or JWT.
 pub async fn authenticate(
     state: &AppState,
@@ -373,7 +423,7 @@ pub async fn prepare(
         let caller = authenticate(state, &hs.credential).await?;
         let resolved = state
             .resolve_voice_endpoint(&hs.model, REALTIME_CAPABILITY, Some(hs.credential.expose()))
-            .ok_or_else(|| not_found(&hs.model))?;
+            .ok_or_else(|| needs_agent_or_not_found(state, &hs.model, hs.credential.expose()))?;
         (caller, resolved.endpoint_id, resolved.alias)
     };
 
@@ -1162,6 +1212,31 @@ pub(super) async fn finish(
 #[cfg(test)]
 mod tests {
     use super::End;
+
+    #[tokio::test]
+    async fn a_file_only_deployment_without_an_agent_is_refused_with_its_reason() {
+        use super::{not_found, realtime_needs_agent};
+        use axum::http::StatusCode;
+        let e = realtime_needs_agent("my-scribe", "elevenlabs", "scribe_v2");
+        assert_eq!(e.status, StatusCode::NOT_FOUND, "today's status");
+        assert_eq!(e.code, "stt_live_unsupported");
+        let resp = axum::response::IntoResponse::into_response(e);
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["error"]["code"], "stt_live_unsupported");
+        assert_eq!(v["error"]["param"], "model");
+        assert_eq!(v["error"]["details"]["reason"], "realtime_needs_agent");
+        assert_eq!(v["error"]["details"]["model"], "scribe_v2");
+        let nf = axum::response::IntoResponse::into_response(not_found("x"));
+        let body = axum::body::to_bytes(nf.into_body(), 1 << 16).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            v["error"].get("details").is_none(),
+            "OpenAI's shape is unchanged"
+        );
+    }
 
     #[test]
     fn a_normal_vendor_close_ends_the_session_without_an_error() {

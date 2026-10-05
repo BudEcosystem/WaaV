@@ -263,6 +263,10 @@ async fn main() -> anyhow::Result<()> {
     if waav_gateway::handlers::voice_catalog::spawn(app_state.clone()).is_some() {
         println!("Voice catalog publisher active: voice lists written to voice_catalog:*");
     }
+    // How each transcription deployment is served on a live call, for budapp (Release 2).
+    if waav_gateway::handlers::stt_capability::spawn(app_state.clone()).is_some() {
+        println!("Speech-to-text capability publisher active: written to voice_capability:*");
+    }
 
     // Create protected API routes with authentication middleware
     let protected_routes = routes::api::create_api_router().layer(middleware::from_fn_with_state(
