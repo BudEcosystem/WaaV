@@ -100,14 +100,16 @@ impl SpeechOut for FakeSpeech {
         }
         self.remaining.load(Ordering::Acquire)
     }
-    fn sound_rate(&self) -> Option<u32> {
-        (!self.no_sound.load(Ordering::Acquire)).then_some(16_000)
+    fn tone_pulse(&self) -> Option<Arc<crate::core::tts::AudioData>> {
+        (!self.no_sound.load(Ordering::Acquire))
+            .then(|| super::tone::pulse_audio(Some("linear16"), Some(16_000)).map(Arc::new))
+            .flatten()
     }
-    async fn play_sound(&self, pcm: &[i16], epoch: usize) -> bool {
+    async fn play_sound(&self, sound: &crate::core::tts::AudioData, epoch: usize) -> bool {
         if self.epoch.load(Ordering::Acquire) != epoch {
             return false;
         }
-        let ms = pcm.len() as u64 * 1000 / 16_000;
+        let ms = u64::from(sound.duration_ms.unwrap_or(0));
         self.pulses.lock().push(tokio::time::Instant::now());
         {
             let mut t = self.timeline.lock();
@@ -942,6 +944,41 @@ async fn the_tone_covers_the_agent_thinking_after_a_quick_tool() {
     assert!(
         pulses.iter().all(|p| *p < Duration::from_millis(6_300)),
         "{pulses:?}"
+    );
+}
+
+/// A second tool in the same span of tool work is covered by the tone: its phrase is not said
+/// over the pulses.
+#[tokio::test(start_paused = true)]
+async fn a_second_tool_in_the_span_gets_the_tone_not_a_phrase() {
+    let mut h = harness(fillers_with_tone(2000, true), None, false);
+    h.speech.paced.store(true, Ordering::Release);
+    let tool = |id: &str, run: u64| {
+        vec![
+            Step::Ev(AgentEvent::ToolStarted {
+                item_id: id.into(),
+                name: "lookup_order".into(),
+                kind: "mcp_call".into(),
+            }),
+            Step::Wait(Duration::from_millis(run)),
+            Step::Ev(AgentEvent::ToolFinished {
+                item_id: id.into(),
+                name: "lookup_order".into(),
+                ok: true,
+            }),
+        ]
+    };
+    let mut steps = vec![created("resp_1")];
+    steps.extend(tool("mcp_1", 3_000));
+    steps.extend(tool("mcp_2", 3_000));
+    steps.extend([delta("Found it."), completed()]);
+    h.backend.push(Ok(steps));
+    h.engine.start_turn("order?".into()).await;
+    let _ = until_done(&mut h, 0).await;
+    assert_eq!(h.speech.spoken(), vec!["Let me look that up.", "Found it."]);
+    assert_eq!(
+        h.speech.timeline(),
+        vec!["say:Let me look that up.", "tone", "say:Found it."]
     );
 }
 

@@ -112,6 +112,9 @@ pub struct VoiceManager {
     // Configuration
     config: VoiceManagerConfig,
 
+    /// The voice agent's tool-call tone pulse, made from `config` on first use.
+    tone_pulse: std::sync::OnceLock<Option<Arc<AudioData>>>,
+
     // Notification for audio clear completion instead of sleep
     clear_notify: Arc<Notify>,
 
@@ -311,6 +314,7 @@ impl VoiceManager {
             smart_turn_callback: Arc::new(SyncRwLock::new(None)),
             interruption_state,
             config,
+            tone_pulse: std::sync::OnceLock::new(),
             clear_notify: Arc::new(Notify::new()),
             clear_epoch: Arc::new(AtomicUsize::new(0)),
             observers: Arc::new(SyncRwLock::new(None)),
@@ -836,6 +840,18 @@ impl VoiceManager {
             .await
             .map_err(VoiceManagerError::TTSError)?;
         Ok(true)
+    }
+
+    /// The voice agent's tool-call tone pulse for this session's output, made once: the session's
+    /// TTS config never changes. `None` when the output cannot carry it.
+    pub fn tone_pulse(&self) -> Option<Arc<AudioData>> {
+        self.tone_pulse
+            .get_or_init(|| {
+                let tts = &self.config.tts_config;
+                crate::core::agent::tone::pulse_audio(tts.audio_format.as_deref(), tts.sample_rate)
+                    .map(Arc::new)
+            })
+            .clone()
     }
 
     /// Epoch-gated delivery of audio the gateway made itself (a voice agent's tool-call tone). It

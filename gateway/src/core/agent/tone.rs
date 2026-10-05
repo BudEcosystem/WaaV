@@ -8,6 +8,7 @@
 //! arrives between pulses is heard at once, and one that arrives during a pulse waits at most
 //! [`PULSE_MS`].
 
+use crate::core::tts::AudioData;
 use crate::core::tts::sniff::{is_g711, is_linear_pcm16};
 
 /// From the start of one pulse to the start of the next.
@@ -39,6 +40,29 @@ pub fn pulse(rate: u32) -> Vec<i16> {
 pub fn can_encode(format: Option<&str>) -> bool {
     let f = format.unwrap_or("linear16");
     is_linear_pcm16(f) || is_g711(f)
+}
+
+/// The rate a tone is made at for a session's TTS output: G.711 is telephony audio, played at
+/// 8 kHz whatever rate the session names; PCM at the session's rate, 24 kHz by default.
+pub fn rate(format: Option<&str>, sample_rate: Option<u32>) -> u32 {
+    if format.is_some_and(is_g711) {
+        8_000
+    } else {
+        sample_rate.unwrap_or(24_000)
+    }
+}
+
+/// One pulse made and encoded for a session's TTS output (`format` and `sample_rate` as its
+/// config names them), ready to play like speech; `None` when the output cannot carry it.
+pub fn pulse_audio(format: Option<&str>, sample_rate: Option<u32>) -> Option<AudioData> {
+    let rate = rate(format, sample_rate);
+    let pcm = pulse(rate);
+    Some(AudioData {
+        data: encode(&pcm, format)?,
+        sample_rate: rate,
+        format: format.unwrap_or("linear16").to_string(),
+        duration_ms: Some((pcm.len() as u64 * 1000 / u64::from(rate.max(1))) as u32),
+    })
 }
 
 /// `pcm` in the session's TTS output `format`; `None` when [`can_encode`] is false.
@@ -132,6 +156,27 @@ mod tests {
             );
         }
         assert!(can_encode(None) && can_encode(Some("mulaw")));
+    }
+
+    #[test]
+    fn a_telephony_pulse_is_made_at_8_khz_whatever_rate_is_named() {
+        for (format, named) in [
+            ("mulaw", None),
+            ("ulaw", Some(16_000)),
+            ("alaw", Some(24_000)),
+        ] {
+            let a = pulse_audio(Some(format), named).unwrap();
+            assert_eq!(a.sample_rate, 8_000, "{format}");
+            assert_eq!(a.data.len(), 8_000 * PULSE_MS as usize / 1000, "{format}");
+            assert_eq!(a.duration_ms, Some(PULSE_MS), "{format}");
+        }
+        let pcm = pulse_audio(None, None).unwrap();
+        assert_eq!((pcm.sample_rate, pcm.format.as_str()), (24_000, "linear16"));
+        assert_eq!(
+            pulse_audio(Some("pcm"), Some(16_000)).unwrap().sample_rate,
+            16_000
+        );
+        assert!(pulse_audio(Some("mp3"), None).is_none());
     }
 
     #[test]

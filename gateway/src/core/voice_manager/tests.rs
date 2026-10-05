@@ -1629,12 +1629,16 @@ async fn a_generated_sound_goes_out_like_speech_and_a_clear_stops_it() {
     .await
     .unwrap();
 
+    let pulse = SpeechOut::tone_pulse(&vm).expect("the default output carries the tone");
     assert_eq!(
-        vm.sound_rate(),
-        Some(24_000),
+        (pulse.sample_rate, pulse.format.as_str()),
+        (24_000, "linear16"),
         "the default output is 24 kHz PCM16"
     );
-    let pulse = crate::core::agent::tone::pulse(24_000);
+    assert!(
+        Arc::ptr_eq(&pulse, &SpeechOut::tone_pulse(&vm).unwrap()),
+        "made once per session"
+    );
     let before = vm.audio_out_ms();
     let epoch = SpeechOut::clear_epoch(&vm);
     assert!(vm.play_sound(&pulse, epoch).await);
@@ -1643,7 +1647,7 @@ async fn a_generated_sound_goes_out_like_speech_and_a_clear_stops_it() {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].format, "linear16");
         assert_eq!(got[0].sample_rate, 24_000);
-        assert_eq!(got[0].data.len(), pulse.len() * 2);
+        assert_eq!(got[0].data.len(), 24_000 * 360 / 1000 * 2);
         assert_eq!(got[0].duration_ms, Some(crate::core::agent::tone::PULSE_MS));
     }
     assert_eq!(
@@ -1681,12 +1685,12 @@ async fn a_compressed_output_carries_no_generated_sound() {
         ..Default::default()
     };
     let vm = VoiceManager::new(VoiceManagerConfig::new(stt_config, tts_config), None).unwrap();
-    assert_eq!(vm.sound_rate(), None);
+    assert!(SpeechOut::tone_pulse(&vm).is_none());
     let mulaw = TTSConfig {
         provider: "deepgram".to_string(),
         api_key: "test_key".to_string(),
         audio_format: Some("mulaw".to_string()),
-        sample_rate: Some(8_000),
+        sample_rate: None,
         ..Default::default()
     };
     let vm = VoiceManager::new(
@@ -1701,9 +1705,10 @@ async fn a_compressed_output_carries_no_generated_sound() {
         None,
     )
     .unwrap();
+    let pulse = SpeechOut::tone_pulse(&vm).expect("telephony mu-law can carry it");
     assert_eq!(
-        vm.sound_rate(),
-        Some(8_000),
-        "telephony mu-law can carry it"
+        (pulse.sample_rate, pulse.format.as_str()),
+        (8_000, "mulaw"),
+        "made at 8 kHz though the session names no rate"
     );
 }

@@ -59,14 +59,14 @@ pub trait SpeechOut: Send + Sync + 'static {
     fn audio_out_ms(&self) -> u64;
     /// Delivered audio not played yet, in ms.
     fn playout_remaining_ms(&self) -> u64;
-    /// The sample rate a generated sound (the tool-call tone) is made at, or `None` when this output
-    /// cannot carry one (a compressed TTS format): the agent keeps its phrases instead.
-    fn sound_rate(&self) -> Option<u32> {
+    /// One pulse of the tool-call tone, encoded for this output, or `None` when this output cannot
+    /// carry one (a compressed TTS format): the agent keeps its phrases instead.
+    fn tone_pulse(&self) -> Option<Arc<crate::core::tts::AudioData>> {
         None
     }
-    /// Play a generated sound, 16-bit mono PCM at [`Self::sound_rate`], the way speech is played:
-    /// after what is queued, cut by a barge-in. `false` when a clear happened since `epoch`.
-    async fn play_sound(&self, _pcm: &[i16], _epoch: usize) -> bool {
+    /// Play a generated sound the way speech is played: after what is queued, cut by a barge-in.
+    /// `false` when a clear happened since `epoch`.
+    async fn play_sound(&self, _sound: &crate::core::tts::AudioData, _epoch: usize) -> bool {
         false
     }
 }
@@ -99,26 +99,11 @@ impl SpeechOut for crate::core::voice_manager::VoiceManager {
     fn playout_remaining_ms(&self) -> u64 {
         crate::core::voice_manager::VoiceManager::playout_remaining_ms(self)
     }
-    fn sound_rate(&self) -> Option<u32> {
-        let tts = &self.get_config().tts_config;
-        tone::can_encode(tts.audio_format.as_deref()).then(|| tts.sample_rate.unwrap_or(24_000))
+    fn tone_pulse(&self) -> Option<Arc<crate::core::tts::AudioData>> {
+        crate::core::voice_manager::VoiceManager::tone_pulse(self)
     }
-    async fn play_sound(&self, pcm: &[i16], epoch: usize) -> bool {
-        let tts = &self.get_config().tts_config;
-        let Some(data) = tone::encode(pcm, tts.audio_format.as_deref()) else {
-            return false;
-        };
-        let rate = tts.sample_rate.unwrap_or(24_000);
-        let audio = crate::core::tts::AudioData {
-            data,
-            sample_rate: rate,
-            format: tts
-                .audio_format
-                .clone()
-                .unwrap_or_else(|| "linear16".to_string()),
-            duration_ms: Some((pcm.len() as u64 * 1000 / u64::from(rate.max(1))) as u32),
-        };
-        self.play_if_epoch(audio, epoch).await
+    async fn play_sound(&self, sound: &crate::core::tts::AudioData, epoch: usize) -> bool {
+        self.play_if_epoch(sound.clone(), epoch).await
     }
 }
 
@@ -277,7 +262,7 @@ const TONE_GAP: Duration = Duration::from_millis(400);
 /// The tool-call tone of one turn (D-16): a pulse every [`tone::PERIOD_MS`] while a tool runs,
 /// once the tool's phrase has played.
 struct ToneCursor {
-    pulse: Vec<i16>,
+    pulse: Arc<crate::core::tts::AudioData>,
     next_at: Option<Instant>,
     /// The last thing this turn sent to TTS: when, and the audio-out counter before it.
     spoke: Option<(Instant, u64)>,
@@ -293,9 +278,8 @@ impl ToneCursor {
         if !fillers.tool_call_sound {
             return None;
         }
-        let rate = speech.sound_rate()?;
         Some(Self {
-            pulse: tone::pulse(rate),
+            pulse: speech.tone_pulse()?,
             next_at: None,
             spoke: None,
             last_out: speech.audio_out_ms(),
@@ -1201,7 +1185,10 @@ impl AgentEngine {
                     }
                     // Fillers (D-16): a running tool's own phrase, or the list in order while the wait lasts.
                     let fillers = &self.entry.fillers;
-                    if fillers.tool_call_after_ms > 0 {
+                    // With the tone, a span's first phrase is its only one: a later tool in the
+                    // span is covered by the pulse.
+                    let toned = tone.is_some() && work.as_ref().is_some_and(|w| w.phrased);
+                    if fillers.tool_call_after_ms > 0 && !toned {
                         let due: Option<String> = tools
                             .values_mut()
                             .find(|(_, since, done)| !*done && since.elapsed() >= Duration::from_millis(fillers.tool_call_after_ms))
