@@ -116,7 +116,9 @@ pub fn unapplied(
             reason: "no_eu_address",
         });
     }
-    if settings.no_retention && !matches!(v.as_str(), "deepgram" | "elevenlabs") {
+    // The operator's own server keeps what its operator decides.
+    let own_server = own_address && crate::core::tts::self_hosted::is_self_hosted(&v);
+    if settings.no_retention && !own_server && !matches!(v.as_str(), "deepgram" | "elevenlabs") {
         out.push(Unapplied {
             setting: "stt.data_retention",
             reason: "no_request_switch",
@@ -231,6 +233,13 @@ mod tests {
                 false
             )
             .is_empty()
+        );
+        // A self-hosted server at the deployment's own address carries both; Azure OpenAI's own
+        // resource address carries the region only (retention is an account setting there).
+        assert!(names("self_hosted", ClientPath::Prerecorded, true).is_empty());
+        assert_eq!(
+            names("azure_openai", ClientPath::Prerecorded, true),
+            vec!["stt.data_retention"]
         );
     }
 

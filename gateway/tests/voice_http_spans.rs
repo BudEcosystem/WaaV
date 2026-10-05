@@ -1689,6 +1689,70 @@ async fn tts_failures_without_a_vendor_answer_are_classified() {
     f.assert_none();
 }
 
+/// Release 5 data settings on the upload route. Azure OpenAI keeps audio by account setting, so a
+/// deployment asking for no retention is refused before anything is sent, on the passthrough that
+/// forwards the file whole (found on pde-ditto: that branch returned before the check). A
+/// self-hosted server is the operator's own, so it carries both settings and is served.
+#[tokio::test]
+async fn the_upload_route_refuses_a_data_setting_the_vendor_cannot_carry() {
+    let vendor = stt_vendor().await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/openai/deployments/whisper-deploy/audio/transcriptions",
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/json")
+                .set_body_json(json!({"text": "from azure"})),
+        )
+        .mount(&vendor)
+        .await;
+    let azure = json!({
+        "vendor": "azure_openai",
+        "api_base": vendor.uri(),
+        "endpoints": ["audio_transcription"],
+        "model": "whisper-deploy",
+        "credential": TEST_CREDENTIAL.trim(),
+        "config": {"stt": {"data_retention": "none"}},
+    });
+    let app = gateway(vec![(STT_EP, azure)]).await;
+    let wav = wav_secs(1.0, 16_000);
+    let reply = upload(
+        &app,
+        "/v1/audio/transcriptions",
+        &[("model", "stt-a")],
+        ("a.wav", "audio/wav", &wav),
+    )
+    .await;
+    assert_eq!(reply.status, 500, "{}", reply.text());
+    assert!(
+        reply.text().contains("stt_data_setting_unavailable"),
+        "{}",
+        reply.text()
+    );
+    assert!(
+        vendor
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
+        "no audio reached the vendor"
+    );
+
+    // A self-hosted server carries both: it is the operator's own address.
+    let mut hosted = stt_entry(&base(&vendor), None);
+    hosted["config"] = json!({"stt": {"data_retention": "none", "data_region": "eu"}});
+    let app = gateway(vec![(STT_EP, hosted)]).await;
+    let reply = upload(
+        &app,
+        "/v1/audio/transcriptions",
+        &[("model", "stt-a")],
+        ("a.wav", "audio/wav", &wav),
+    )
+    .await;
+    assert_eq!(reply.status, 200, "{}", reply.text());
+}
+
 /// ⚑ TC-EMIT-03 (STT rows), TC-EMIT-04.
 #[tokio::test]
 async fn stt_failures_are_classified() {

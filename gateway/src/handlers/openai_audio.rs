@@ -2811,6 +2811,15 @@ async fn transcribe_on(
     let mut advisories = base_advisories.clone();
     let api_key = endpoint.credential.clone().unwrap_or_default();
 
+    // Before any branch that sends the file: the passthrough below forwards it whole.
+    if let Some(refusal) = data_setting_refusal(endpoint, label) {
+        return Err(SttFailure::Refused(PlanRefusal::classified(
+            VoiceErrorType::Config,
+            crate::core::stt::data_settings::REFUSAL_CODE,
+            refusal,
+        )));
+    }
+
     // A self-hosted deployment already speaks this exact API, so the file is FORWARDED whole
     // rather than decoded and replayed through a streaming provider. That is not a shortcut:
     // decoding would impose WaaV's WAV-only limit on a backend that may well accept mp3, and
@@ -2954,14 +2963,6 @@ async fn transcribe_on(
     if let Some(refusal) = endpoint_misconfiguration(endpoint, label, &mut advisories) {
         return Err(SttFailure::Refused(PlanRefusal::unclassified(refusal)));
     }
-    if let Some(refusal) = data_setting_refusal(endpoint, label) {
-        return Err(SttFailure::Refused(PlanRefusal::classified(
-            VoiceErrorType::Config,
-            crate::core::stt::data_settings::REFUSAL_CODE,
-            refusal,
-        )));
-    }
-
     info!(
         endpoint = %label,
         vendor = %endpoint.vendor,
