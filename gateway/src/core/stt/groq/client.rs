@@ -39,7 +39,6 @@ use super::super::http_resilience::HttpBreaker;
 use super::config::{FlushStrategy, GroqResponseFormat, GroqSTTConfig};
 use super::messages::{
     GroqErrorResponse, TranscriptionResponse, TranscriptionResult, VerboseTranscriptionResponse,
-    wav,
 };
 
 // =============================================================================
@@ -519,8 +518,11 @@ impl GroqSTT {
         // Clone config values we need since we can't borrow config across await
         let sample_rate = config.base.sample_rate;
         let channels = config.base.channels;
-        let wav_data = wav::try_create_wav(&self.audio_buffer, sample_rate, channels)
-            .map_err(|e| STTError::AudioProcessingError(format!("Failed to create WAV: {e}")))?;
+        let wav_data =
+            super::super::wav::encode_pcm16_wav(&self.audio_buffer, sample_rate, channels)
+                .map_err(|e| {
+                    STTError::AudioProcessingError(format!("Failed to create WAV: {e}"))
+                })?;
 
         // Clone config for use in retry loop (needed because send_request takes &mut self)
         let config_clone = config.clone();

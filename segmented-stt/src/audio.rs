@@ -382,25 +382,8 @@ pub fn rms(frame: &[i16]) -> f32 {
 /// A 16 kHz mono 16-bit PCM WAV file. Groq and ElevenLabs both state that uncompressed audio gives
 /// the lowest latency.
 pub fn wav_16k_mono(pcm: &[i16]) -> Vec<u8> {
-    let data_len = (pcm.len() * 2) as u32;
-    let mut out = Vec::with_capacity(44 + data_len as usize);
-    out.extend_from_slice(b"RIFF");
-    out.extend_from_slice(&(36 + data_len).to_le_bytes());
-    out.extend_from_slice(b"WAVE");
-    out.extend_from_slice(b"fmt ");
-    out.extend_from_slice(&16u32.to_le_bytes());
-    out.extend_from_slice(&1u16.to_le_bytes()); // PCM
-    out.extend_from_slice(&1u16.to_le_bytes()); // mono
-    out.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
-    out.extend_from_slice(&(SAMPLE_RATE * 2).to_le_bytes()); // byte rate
-    out.extend_from_slice(&2u16.to_le_bytes()); // block align
-    out.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
-    out.extend_from_slice(b"data");
-    out.extend_from_slice(&data_len.to_le_bytes());
-    for s in pcm {
-        out.extend_from_slice(&s.to_le_bytes());
-    }
-    out
+    // An utterance is capped at minutes of audio, far inside a WAV file's 4 GB limit.
+    crate::wav::encode_i16_wav(pcm, SAMPLE_RATE, 1).expect("an utterance fits a WAV file")
 }
 
 #[cfg(test)]

@@ -139,5 +139,4 @@ pub use messages::{
     DEFAULT_UNKNOWN_CONFIDENCE as MESSAGE_DEFAULT_UNKNOWN_CONFIDENCE, GroqError, GroqErrorResponse,
     GroqMetadata, Segment, TranscriptionResponse, TranscriptionResult,
     VerboseTranscriptionResponse, Word,
-    wav::{HEADER_SIZE as WAV_HEADER_SIZE, WavError, create_wav, try_create_wav},
 };

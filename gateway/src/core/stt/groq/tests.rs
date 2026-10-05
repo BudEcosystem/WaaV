@@ -590,62 +590,6 @@ mod message_tests {
 }
 
 // =============================================================================
-// WAV Tests
-// =============================================================================
-
-mod wav_tests {
-    use super::messages::wav;
-
-    #[test]
-    fn test_wav_header_size() {
-        assert_eq!(wav::HEADER_SIZE, 44);
-    }
-
-    #[test]
-    fn test_wav_creation_header() {
-        let pcm_data = vec![0u8; 100];
-        let wav_file = wav::create_wav(&pcm_data, 16000, 1);
-
-        // Check RIFF header
-        assert_eq!(&wav_file[0..4], b"RIFF");
-        assert_eq!(&wav_file[8..12], b"WAVE");
-        assert_eq!(&wav_file[12..16], b"fmt ");
-        assert_eq!(&wav_file[36..40], b"data");
-    }
-
-    #[test]
-    fn test_wav_creation_size() {
-        let pcm_data = vec![0u8; 100];
-        let wav_file = wav::create_wav(&pcm_data, 16000, 1);
-
-        assert_eq!(wav_file.len(), wav::HEADER_SIZE + pcm_data.len());
-    }
-
-    #[test]
-    fn test_wav_creation_stereo() {
-        let pcm_data = vec![0u8; 200];
-        let wav_file = wav::create_wav(&pcm_data, 44100, 2);
-
-        // Check channels (bytes 22-23)
-        let channels = u16::from_le_bytes([wav_file[22], wav_file[23]]);
-        assert_eq!(channels, 2);
-
-        // Check sample rate (bytes 24-27)
-        let sample_rate =
-            u32::from_le_bytes([wav_file[24], wav_file[25], wav_file[26], wav_file[27]]);
-        assert_eq!(sample_rate, 44100);
-    }
-
-    #[test]
-    fn test_wav_creation_empty() {
-        let pcm_data = vec![];
-        let wav_file = wav::create_wav(&pcm_data, 16000, 1);
-
-        assert_eq!(wav_file.len(), wav::HEADER_SIZE);
-    }
-}
-
-// =============================================================================
 // Client Tests
 // =============================================================================
 
@@ -1104,62 +1048,6 @@ mod rate_limit_tests {
         assert!(info.remaining_requests.is_none());
         assert!(info.remaining_tokens.is_none());
         assert!(info.retry_after_ms.is_none());
-    }
-}
-
-// =============================================================================
-// WAV Validation Tests
-// =============================================================================
-
-mod wav_validation_tests {
-    use super::messages::wav::{WavError, try_create_wav};
-
-    #[test]
-    fn test_wav_zero_sample_rate() {
-        let pcm_data = vec![0u8; 100];
-        let result = try_create_wav(&pcm_data, 0, 1);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), WavError::ZeroSampleRate);
-    }
-
-    #[test]
-    fn test_wav_zero_channels() {
-        let pcm_data = vec![0u8; 100];
-        let result = try_create_wav(&pcm_data, 16000, 0);
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), WavError::ZeroChannels);
-    }
-
-    #[test]
-    fn test_wav_valid_params() {
-        let pcm_data = vec![0u8; 100];
-        let result = try_create_wav(&pcm_data, 16000, 1);
-        assert!(result.is_ok());
-        let wav = result.unwrap();
-        assert_eq!(wav.len(), 44 + 100); // header + data
-    }
-
-    #[test]
-    fn test_wav_error_display() {
-        assert_eq!(
-            WavError::ZeroSampleRate.to_string(),
-            "Sample rate cannot be zero"
-        );
-        assert_eq!(
-            WavError::ZeroChannels.to_string(),
-            "Number of channels cannot be zero"
-        );
-        assert_eq!(
-            WavError::DataTooLarge.to_string(),
-            "PCM data exceeds maximum WAV file size (4GB)"
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "Invalid WAV parameters")]
-    fn test_wav_create_panics_on_zero_sample_rate() {
-        let pcm_data = vec![0u8; 100];
-        let _ = super::messages::wav::create_wav(&pcm_data, 0, 1);
     }
 }
 

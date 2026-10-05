@@ -35,7 +35,7 @@ use super::super::http_resilience::HttpBreaker;
 use super::config::{FlushStrategy, OpenAISTTConfig, ResponseFormat};
 use super::messages::{
     DiarizedTranscriptionResponse, OpenAIErrorResponse, TranscriptionResponse, TranscriptionResult,
-    VerboseTranscriptionResponse, wav,
+    VerboseTranscriptionResponse,
 };
 
 // =============================================================================
@@ -396,7 +396,7 @@ impl OpenAISTT {
         }
 
         // Create WAV file from buffered PCM data
-        let wav_data = wav::try_create_wav(
+        let wav_data = super::super::wav::encode_pcm16_wav(
             &self.audio_buffer,
             config.base.sample_rate,
             config.base.channels,
@@ -1330,7 +1330,7 @@ mod tests {
         match err {
             STTError::AudioProcessingError(msg) => {
                 assert!(msg.contains("Invalid WAV parameters"), "{msg}");
-                assert!(msg.contains("WAV header arithmetic overflowed"), "{msg}");
+                assert!(msg.contains("WAV header arithmetic overflow"), "{msg}");
             }
             other => panic!("expected AudioProcessingError, got {other:?}"),
         }

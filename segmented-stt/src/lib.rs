@@ -27,6 +27,7 @@
 //! | [`transcriber`] | One interface for "transcribe this utterance", the attempt loop, limiter and breaker |
 //! | [`engine`] | The per-session task that owns all of the above |
 //! | [`types`] | The values the engine reports: speech activity, outcomes, facts, notices |
+//! | [`wav`] | The one WAV writer, shared with the gateway's file-upload clients |
 
 pub mod audio;
 pub mod control;
@@ -45,3 +46,4 @@ pub mod sequencer;
 pub mod transcriber;
 pub mod turn;
 pub mod types;
+pub mod wav;

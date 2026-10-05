@@ -111,5 +111,5 @@ pub use config::{
 };
 pub use messages::{
     OpenAIError, OpenAIErrorResponse, TranscriptionResponse, TranscriptionResult,
-    TranscriptionSegment, TranscriptionWord, VerboseTranscriptionResponse, wav,
+    TranscriptionSegment, TranscriptionWord, VerboseTranscriptionResponse,
 };
