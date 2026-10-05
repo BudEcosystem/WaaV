@@ -157,18 +157,13 @@ impl OpenAiCompatTranscriber {
             f.optional(ctx, &name, terms.clone());
         }
         if let Some(name) = &cfg.prompt_param {
-            let own = ctx
-                .prompt
-                .as_deref()
-                .map(str::trim)
-                .filter(|p| !p.is_empty());
-            let folded =
-                (cfg.keywords_param.is_none() && !terms.is_empty()).then(|| terms.join(", "));
-            let prompt = match (own, folded) {
-                (Some(p), Some(t)) => Some(format!("{p} {t}")),
-                (Some(p), None) => Some(p.to_string()),
-                (None, t) => t,
+            // A model with a key-terms field gets them there, not in the prompt.
+            let folded: &[String] = if cfg.keywords_param.is_none() {
+                &terms
+            } else {
+                &[]
             };
+            let prompt = crate::vendor::openai::prompt_with_terms(ctx.prompt.as_deref(), folded);
             f.optional(ctx, name, prompt);
         }
         for (k, v) in &cfg.extra_fields {

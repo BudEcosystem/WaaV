@@ -97,6 +97,30 @@ pub struct Usage {
     pub seconds: Option<f64>,
 }
 
+/// `base` + `path` for an OpenAI-shaped API. SDK-style bases often end in `/v1` already, and
+/// `path` starts with one: never `/v1/v1`.
+pub fn join_api_path(base: &str, path: &str) -> String {
+    let base = base.trim_end_matches('/');
+    let path = if base.ends_with("/v1") {
+        path.strip_prefix("/v1").unwrap_or(path)
+    } else {
+        path
+    };
+    format!("{base}{path}")
+}
+
+/// The prompt a model without a key-terms field gets: the caller's prompt first, then the key
+/// terms joined with `, `. Whisper has one prompt, so neither silently replaces the other.
+pub fn prompt_with_terms(prompt: Option<&str>, terms: &[String]) -> Option<String> {
+    let own = prompt.map(str::trim).filter(|p| !p.is_empty());
+    let folded = (!terms.is_empty()).then(|| terms.join(", "));
+    match (own, folded) {
+        (Some(p), Some(t)) => Some(format!("{p} {t}")),
+        (Some(p), None) => Some(p.to_string()),
+        (None, t) => t,
+    }
+}
+
 impl VerboseTranscriptionResponse {
     /// The first detected language `gpt-transcribe` names (`languages[0].code`, or a bare code).
     pub fn first_listed_language(&self) -> Option<&str> {
@@ -247,6 +271,37 @@ mod tests {
                 .unwrap();
         assert_eq!(bare.first_listed_language(), Some("fr"));
         assert_eq!(bare.billed_seconds(), None, "only duration billing counts");
+    }
+
+    #[test]
+    fn a_v1_base_is_not_doubled() {
+        let p = "/v1/audio/transcriptions";
+        assert_eq!(
+            join_api_path("https://h/v1/", p),
+            "https://h/v1/audio/transcriptions"
+        );
+        assert_eq!(
+            join_api_path("https://h", p),
+            "https://h/v1/audio/transcriptions"
+        );
+        assert_eq!(
+            join_api_path("https://h/openai", p),
+            "https://h/openai/v1/audio/transcriptions"
+        );
+    }
+
+    #[test]
+    fn a_prompt_keeps_the_callers_text_before_the_terms() {
+        let terms = vec!["Acme".to_string(), "Zed".to_string()];
+        assert_eq!(
+            prompt_with_terms(Some(" Say hi "), &terms).as_deref(),
+            Some("Say hi Acme, Zed")
+        );
+        assert_eq!(
+            prompt_with_terms(None, &terms).as_deref(),
+            Some("Acme, Zed")
+        );
+        assert_eq!(prompt_with_terms(Some("  "), &[]), None);
     }
 
     #[test]

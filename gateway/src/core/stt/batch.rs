@@ -418,9 +418,13 @@ pub fn build_deepgram_prerecorded_with(
             qs.push(("redact".into(), r.clone()));
         }
     }
-    if let Some(kw) = &f.keyterms {
-        for k in kw {
-            qs.push(("keyterm".into(), k.clone()));
+    // The parameter the model reads key terms in: `keyterm` on Nova-3, `keywords` on older models,
+    // none on Whisper.
+    if let Some(kw) = &f.keyterms
+        && let Some(param) = waav_segmented_stt::vendor::deepgram::key_terms_param(model)
+    {
+        for k in kw.iter().map(|k| k.trim()).filter(|k| !k.is_empty()) {
+            qs.push((param.into(), k.to_string()));
         }
     }
     // Async callback.
@@ -1461,6 +1465,46 @@ mod tests {
         )
         .expect_err("non-HTTP webhook URL must be rejected");
         assert!(err.contains("URL scheme"), "{err}");
+    }
+
+    /// Key terms reach Deepgram in the parameter the model reads: `keyterm` on Nova-3 only, the
+    /// older `keywords` elsewhere, and nothing on its hosted Whisper.
+    #[test]
+    fn deepgram_key_terms_follow_the_model() {
+        let url_for = |model: &str| {
+            let mut r = req_with(
+                "deepgram",
+                BatchAudioSource::Bytes {
+                    audio_base64: "AAAA".into(),
+                    content_type: None,
+                },
+                SttFeatures {
+                    keyterms: Some(vec![" Acme ".into(), " ".into()]),
+                    ..Default::default()
+                },
+                BatchFeatures::default(),
+            );
+            r.config.base.model = model.into();
+            build_deepgram_prerecorded(&r, "k", "https://api.deepgram.com")
+                .unwrap()
+                .request
+                .url
+        };
+        let nova3 = url_for("nova-3");
+        assert!(
+            nova3.contains("keyterm=Acme") && !nova3.contains("keywords="),
+            "{nova3}"
+        );
+        let nova2 = url_for("nova-2");
+        assert!(
+            nova2.contains("keywords=Acme") && !nova2.contains("keyterm="),
+            "{nova2}"
+        );
+        let whisper = url_for("whisper-large");
+        assert!(
+            !whisper.contains("keyterm=") && !whisper.contains("keywords="),
+            "{whisper}"
+        );
     }
 
     #[test]

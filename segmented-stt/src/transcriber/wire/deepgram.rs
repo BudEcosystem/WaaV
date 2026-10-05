@@ -47,14 +47,12 @@ pub struct DeepgramPrerecordedConfig {
 impl DeepgramPrerecordedConfig {
     /// The defaults the vendor documents for the model's family.
     pub fn for_model(base_url: &str, auth: Auth, model: &str, client: reqwest::Client) -> Self {
-        let lower = model.trim().to_ascii_lowercase();
-        let (language_format, keyterms_param) = if is_whisper(&lower) {
-            (LanguageFormat::Iso639_1, None)
-        } else if lower.starts_with("nova-3") {
-            (LanguageFormat::Bcp47, Some("keyterm".to_string()))
+        let language_format = if is_whisper(model) {
+            LanguageFormat::Iso639_1
         } else {
-            (LanguageFormat::Bcp47, Some("keywords".to_string()))
+            LanguageFormat::Bcp47
         };
+        let keyterms_param = crate::vendor::deepgram::key_terms_param(model).map(str::to_string);
         Self {
             base_url: base_url.to_string(),
             auth,
@@ -68,9 +66,7 @@ impl DeepgramPrerecordedConfig {
     }
 }
 
-fn is_whisper(model: &str) -> bool {
-    model.trim().to_ascii_lowercase().starts_with("whisper")
-}
+use crate::vendor::deepgram::is_whisper;
 
 #[derive(Debug)]
 pub struct DeepgramPrerecordedTranscriber {

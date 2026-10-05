@@ -150,16 +150,7 @@ pub fn unapplied_data_settings(adapter: &str, spec: &TargetSpec) -> Vec<Unapplie
     out
 }
 
-fn join(base: &str, path: &str) -> String {
-    let base = base.trim_end_matches('/');
-    // `OPENAI_BASE_URL`-style bases often end in `/v1` already: never `/v1/v1`.
-    let path = if base.ends_with("/v1") {
-        path.strip_prefix("/v1").unwrap_or(path)
-    } else {
-        path
-    };
-    format!("{base}{path}")
-}
+use crate::vendor::openai::join_api_path as join;
 
 fn limits_of(t: &Transport) -> RowLimits {
     RowLimits {

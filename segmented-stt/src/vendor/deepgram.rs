@@ -42,6 +42,24 @@ pub struct Word {
     pub speaker: Option<u64>,
 }
 
+/// Whether a Deepgram model is its hosted Whisper.
+pub fn is_whisper(model: &str) -> bool {
+    model.trim().to_ascii_lowercase().starts_with("whisper")
+}
+
+/// The query parameter a Deepgram model takes key terms in: `keyterm` on Nova-3, `keywords` on
+/// Nova-2 and older (an empty model is Deepgram's legacy default), none on Whisper.
+pub fn key_terms_param(model: &str) -> Option<&'static str> {
+    let lower = model.trim().to_ascii_lowercase();
+    if is_whisper(&lower) {
+        None
+    } else if lower.starts_with("nova-3") {
+        Some("keyterm")
+    } else {
+        Some("keywords")
+    }
+}
+
 /// Reads `results.channels[].alternatives[]` and `metadata`. An error only when the answer has no
 /// `results.channels` list at all.
 pub fn parse_prerecorded(body: &Value) -> Result<Prerecorded, String> {
@@ -104,6 +122,14 @@ pub fn parse_prerecorded(body: &Value) -> Result<Prerecorded, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn key_terms_go_in_the_parameter_the_model_reads() {
+        assert_eq!(key_terms_param("nova-3-medical"), Some("keyterm"));
+        assert_eq!(key_terms_param("nova-2"), Some("keywords"));
+        assert_eq!(key_terms_param(""), Some("keywords"));
+        assert_eq!(key_terms_param("whisper-large"), None);
+    }
 
     #[test]
     fn every_channel_word_and_runner_up_is_read() {

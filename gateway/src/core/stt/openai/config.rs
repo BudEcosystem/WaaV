@@ -10,7 +10,7 @@ use super::super::base::STTConfig;
 use serde::{Deserialize, Serialize};
 
 const OPENAI_BASE_URL_ENV: &str = "OPENAI_BASE_URL";
-const OPENAI_API_BASE_URL: &str = "https://api.openai.com";
+const OPENAI_API_BASE_URL: &str = waav_segmented_stt::vendor::hosts::OPENAI;
 
 fn openai_audio_url_from_base(
     source: &str,
@@ -23,7 +23,9 @@ fn openai_audio_url_from_base(
     }
     crate::core::net::validate_url_for_ssrf(base, &["http", "https"])
         .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))?;
-    Ok(Some(format!("{base}{path}")))
+    Ok(Some(waav_segmented_stt::vendor::openai::join_api_path(
+        base, path,
+    )))
 }
 
 fn resolve_openai_audio_url(endpoint_override: Option<&str>, path: &str) -> Result<String, String> {
@@ -797,7 +799,7 @@ impl OpenAISTTConfig {
             if cfg.takes_candidate_lists() {
                 cfg.keywords = k.clone();
             } else {
-                cfg.prompt = Some(k.join(", "));
+                cfg.prompt = waav_segmented_stt::vendor::openai::prompt_with_terms(None, k);
             }
         }
         // interim_results → stream (typed).
@@ -812,10 +814,8 @@ impl OpenAISTTConfig {
         if let Some(p) = e.get("prompt").and_then(|v| v.as_str()).map(str::trim)
             && !p.is_empty()
         {
-            cfg.prompt = Some(match cfg.prompt.take() {
-                Some(terms) => format!("{p} {terms}"),
-                None => p.to_string(),
-            });
+            let terms: Vec<String> = cfg.prompt.take().into_iter().collect();
+            cfg.prompt = waav_segmented_stt::vendor::openai::prompt_with_terms(Some(p), &terms);
         }
         if let Some(t) = e.get("temperature").and_then(|v| v.as_f64()) {
             cfg.temperature = Some(t as f32);

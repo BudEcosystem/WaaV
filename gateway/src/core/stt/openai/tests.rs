@@ -210,6 +210,12 @@ mod config_tests {
             config.try_api_url().unwrap(),
             "https://openai-compatible.invalid/v1/audio/transcriptions"
         );
+        // SDK-style bases end in `/v1` already: never `/v1/v1`.
+        unsafe { std::env::set_var("OPENAI_BASE_URL", "https://openai-compatible.invalid/v1") };
+        assert_eq!(
+            config.try_api_url().unwrap(),
+            "https://openai-compatible.invalid/v1/audio/transcriptions"
+        );
 
         unsafe { std::env::remove_var("OPENAI_BASE_URL") };
         assert_eq!(
