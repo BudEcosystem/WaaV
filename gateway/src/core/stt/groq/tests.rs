@@ -1773,6 +1773,34 @@ mod resilience_tests {
         stt
     }
 
+    /// Addendum B5: a flush that fails at `audio_end` is reported, and its audio is not uploaded
+    /// again with the next turn's (the buffer used to be kept "for recovery" that nothing did).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_flush_does_not_carry_its_audio_into_the_next_turn() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("POST", "/openai/v1/audio/transcriptions")
+            .with_status(400)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"error":{"message":"bad request","type":"invalid_request_error"}}"#)
+            .create_async()
+            .await;
+        let reg = ResilienceRegistry::new(4);
+        let mut stt = breaker_wired_stt(
+            format!("{}/openai/v1/audio/transcriptions", server.url()),
+            &reg,
+        );
+        stt.connect().await.unwrap();
+        stt.send_audio(Bytes::from(vec![7u8; 6400])).await.unwrap();
+        assert!(stt.buffer_len() > 0);
+        assert!(stt.disconnect().await.is_err(), "the failure is reported");
+        assert_eq!(
+            stt.buffer_len(),
+            0,
+            "the lost turn's audio must not join the next turn's"
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn breaker_ignores_a_callers_upstream_4xx() {
         // Uniformity gate: the provider feeds the SAME shared per-provider breaker the registry

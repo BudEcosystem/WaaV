@@ -1079,9 +1079,9 @@ impl BaseSTT for GroqSTT {
     ///
     /// # Error Handling
     ///
-    /// If the flush fails, the error is returned to the caller so they can
-    /// decide how to handle it (e.g., retry, save audio to disk, etc.).
-    /// The connection state is still updated to disconnected.
+    /// If the flush fails, the error is returned to the caller and the turn's audio is dropped.
+    /// The connection state is still updated to disconnected; the voice manager reconnects and
+    /// registers its callbacks again either way.
     async fn disconnect(&mut self) -> Result<(), STTError> {
         if !self.connected.load(Ordering::Acquire) {
             return Ok(()); // Already disconnected
@@ -1098,8 +1098,9 @@ impl BaseSTT for GroqSTT {
                         "Failed to flush {} bytes of audio during disconnect: {}",
                         buffer_len, e
                     );
-                    // Audio buffer is NOT cleared here - caller can retrieve it
-                    // via audio_buffer field if needed for recovery
+                    // The turn is lost and reported; its audio must not be uploaded again at the
+                    // front of the next turn's (nothing ever recovered it from here).
+                    self.audio_buffer.clear();
                     Err(e)
                 }
             }

@@ -77,6 +77,10 @@ pub struct VoiceManager {
     // Callbacks - using parking_lot RwLock for faster synchronization
     stt_callback: Arc<SyncRwLock<Option<STTCallback>>>,
     stt_error_callback: Arc<SyncRwLock<Option<STTErrorCallback>>>,
+    /// The wrappers registered on the provider, kept to register again after `finalize_stt`'s
+    /// reconnect: the buffering clients (OpenAI, Groq) drop their callbacks in `disconnect`.
+    provider_result_callback: Arc<SyncRwLock<Option<crate::core::stt::STTResultCallback>>>,
+    provider_error_callback: Arc<SyncRwLock<Option<crate::core::stt::STTErrorCallback>>>,
     tts_audio_callback: Arc<SyncRwLock<Option<TTSAudioCallback>>>,
     tts_error_callback: Arc<SyncRwLock<Option<TTSErrorCallback>>>,
     audio_clear_callback: Arc<SyncRwLock<Option<AudioClearCallback>>>,
@@ -260,6 +264,8 @@ impl VoiceManager {
             stt: Arc::new(RwLock::new(stt)),
             stt_callback: Arc::new(SyncRwLock::new(None)),
             stt_error_callback: Arc::new(SyncRwLock::new(None)),
+            provider_result_callback: Arc::new(SyncRwLock::new(None)),
+            provider_error_callback: Arc::new(SyncRwLock::new(None)),
             tts_audio_callback: Arc::new(SyncRwLock::new(None)),
             tts_error_callback: Arc::new(SyncRwLock::new(None)),
             audio_clear_callback: Arc::new(SyncRwLock::new(None)),
@@ -329,6 +335,23 @@ impl VoiceManager {
             .write()
             .await
             .connect()
+            .await
+            .map_err(VoiceManagerError::STTError)
+    }
+
+    /// Test seam: put a provider in place of the one the factory built.
+    #[cfg(test)]
+    pub async fn test_replace_stt(&self, stt: Box<dyn BaseSTT>) {
+        *self.stt.write().await = stt;
+    }
+
+    /// Test seam: hand audio straight to the STT provider.
+    #[cfg(test)]
+    pub async fn test_send_stt(&self, audio: Bytes) -> VoiceManagerResult<()> {
+        self.stt
+            .write()
+            .await
+            .send_audio(audio)
             .await
             .map_err(VoiceManagerError::STTError)
     }
@@ -1145,6 +1168,7 @@ impl VoiceManager {
         });
 
         // Register callback with STT provider
+        *self.provider_result_callback.write() = Some(wrapper_callback.clone());
         {
             let mut stt = self.stt.write().await;
             stt.on_result(wrapper_callback)
@@ -1207,6 +1231,7 @@ impl VoiceManager {
         });
 
         // Register callback with STT provider
+        *self.provider_error_callback.write() = Some(wrapper_callback.clone());
         {
             let mut stt = self.stt.write().await;
             stt.on_error(wrapper_callback)
@@ -1727,31 +1752,42 @@ impl VoiceManager {
         // Disconnect STT to trigger CloseStream message
         // NOTE: The Deepgram implementation now waits for speech_final during disconnect,
         // so the final transcripts should arrive before this returns
-        {
+        let flushed = {
             let mut stt = self.stt.write().await;
-            stt.disconnect()
-                .await
-                .map_err(VoiceManagerError::STTError)?;
-        }
+            stt.disconnect().await
+        };
 
         // Small delay to ensure callbacks have processed the final results
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
-        // Reconnect STT for continued use
+        // Reconnect STT for continued use, even after a failed flush: stopping here left the
+        // client disconnected and every frame of the next turn an error (addendum B5). The
+        // buffering clients drop their callbacks in `disconnect`, so they are registered again.
         {
             let mut stt = self.stt.write().await;
             stt.connect().await.map_err(VoiceManagerError::STTError)?;
+            let result_cb = self.provider_result_callback.read().clone();
+            if let Some(cb) = result_cb {
+                stt.on_result(cb)
+                    .await
+                    .map_err(VoiceManagerError::STTError)?;
+            }
+            let error_cb = self.provider_error_callback.read().clone();
+            if let Some(cb) = error_cb {
+                stt.on_error(cb)
+                    .await
+                    .map_err(VoiceManagerError::STTError)?;
+            }
         }
 
+        flushed.map_err(VoiceManagerError::STTError)?;
         tracing::info!("STT stream finalized and reconnected");
         Ok(())
     }
 
     /// A client commit on a segmented session: the flush outcome (which turn was sealed and
     /// whether a result follows). `None` on a provider that cannot flush.
-    pub async fn flush_stt(
-        &self,
-    ) -> Option<crate::core::stt::speech_activity::FlushOutcome> {
+    pub async fn flush_stt(&self) -> Option<crate::core::stt::speech_activity::FlushOutcome> {
         let pending = { self.stt.write().await.request_flush() };
         match pending {
             Some(rx) => rx.await.ok(),
