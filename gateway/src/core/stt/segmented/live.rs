@@ -50,6 +50,13 @@ pub struct SttLiveShared {
     /// gateway's detector (`finalize`) instead of Cartesia's own, a deliberate change to a
     /// streaming session (addendum B8), off until a live probe passes.
     pub cartesia_finalize: bool,
+    /// Tests only: the detector support every session sees, instead of the process-wide model
+    /// state, which other tests in the same process change.
+    pub detector_override: Option<models::DetectorSupport>,
+    /// `WAAV_STT_SETUP_PROBE` (default on): probe a guessed row or a self-hosted server with one
+    /// silent clip before the caller speaks.
+    pub setup_probe: bool,
+    pub probe_cache: Arc<waav_segmented_stt::transcriber::probe::ProbeCache>,
     pub latency: Arc<LatencyStore>,
     pub limiters: LimiterRegistry,
     pub breakers: BreakerRegistry,
@@ -128,6 +135,9 @@ impl SttLiveShared {
             budgets: BudgetRegistry::default(),
             repairs: Arc::new(RepairMemory::default()),
             clients: UploadClients::new(&http)?,
+            detector_override: None,
+            setup_probe: parse_flag("WAAV_STT_SETUP_PROBE", get("WAAV_STT_SETUP_PROBE"), true)?,
+            probe_cache: Arc::default(),
             control: Arc::default(),
             text_model: turn_detector
                 .map(|t| Arc::new(super::models::TextTurnModel(t)) as Arc<dyn EndOfTurnTextModel>),
@@ -254,6 +264,19 @@ pub struct LiveResolution {
 
 impl LiveResolution {
     /// The chosen transport, when the session is segmented.
+    /// Whether the setup probe should check this session's target: a row the map only guessed
+    /// (a pattern or a default), a self-hosted server, or a deployment's declared profile.
+    pub fn needs_probe(&self) -> bool {
+        self.decision == LiveDecision::Segmented
+            && (!matches!(
+                self.resolution.layer,
+                waav_segmented_stt::resolve::Layer::Exact
+            ) || matches!(
+                self.resolution.provider.as_str(),
+                "self_hosted" | "waav_infer"
+            ))
+    }
+
     pub fn transport(&self) -> Option<&Transport> {
         self.resolution.transport.as_ref().map(|t| &t.transport)
     }
@@ -406,7 +429,10 @@ pub fn resolve_session(shared: &SttLiveShared, req: &LiveRequest) -> LiveResolut
     let language = language_of(&req.language);
     let underlying = ovr.and_then(|o| o.underlying_model.clone());
     let profile = ovr.and_then(|o| o.profile.clone());
-    let detector = models::build_support(shared.allow_energy_detector);
+    let detector = shared
+        .detector_override
+        .clone()
+        .unwrap_or_else(|| models::build_support(shared.allow_energy_detector));
 
     // The resolver, with this build's adapters.
     let probe_spec = target_spec(req, &req.provider, &req.model);
@@ -544,6 +570,85 @@ pub fn resolve_session(shared: &SttLiveShared, req: &LiveRequest) -> LiveResolut
 }
 
 /// Build the segmented engine's plan. `api_key` is the vendor credential of the leg.
+/// What a session starting on this target is told about its key: room in the row's hourly and
+/// daily budgets, and whether recent uploads were lost to rate limits.
+pub fn admission(
+    shared: &SttLiveShared,
+    live: &LiveResolution,
+    req: &LiveRequest,
+    api_key: &str,
+) -> waav_segmented_stt::transcriber::gate::Admission {
+    use waav_segmented_stt::transcriber::gate::Admission;
+    let Some(t) = live.transport() else {
+        return Admission::Ok;
+    };
+    let mut spec = target_spec(req, &live.resolution.provider, &live.resolution.model_sent);
+    spec.api_key = api_key.to_string();
+    let Ok(transcriber) = build_transcriber(t, &spec, &shared.clients) else {
+        return Admission::Ok;
+    };
+    let info = transcriber.info();
+    let key = format!(
+        "{}|{}|{}",
+        info.host_key,
+        credential_tag(&spec.api_key),
+        info.model
+    );
+    let limiter = shared.limiters.get(&key, limit_spec(t));
+    limiter.set_windows(&waav_segmented_stt::live::long_windows(t));
+    limiter.admission()
+}
+
+/// Run the setup probe for a session about to be built (cached per target and credential).
+pub async fn probe_session(
+    shared: &SttLiveShared,
+    live: &LiveResolution,
+    req: &LiveRequest,
+    api_key: String,
+) -> waav_segmented_stt::transcriber::probe::ProbeVerdict {
+    use waav_segmented_stt::transcriber::probe::{ProbeVerdict, probe};
+    let Some(t) = live.transport() else {
+        return ProbeVerdict::Served;
+    };
+    let mut spec = target_spec(req, &live.resolution.provider, &live.resolution.model_sent);
+    spec.api_key = api_key;
+    let transcriber = match build_transcriber(t, &spec, &shared.clients) {
+        Ok(tr) => tr,
+        Err(e) => return ProbeVerdict::Unknown { message: e },
+    };
+    let info = transcriber.info().clone();
+    let key = format!(
+        "{}|{}|{}|{}",
+        info.host_key,
+        info.adapter,
+        info.model,
+        credential_tag(&spec.api_key)
+    );
+    if let Some(v) = shared.probe_cache.get(&key) {
+        return v;
+    }
+    let ctx = waav_segmented_stt::transcriber::SegmentContext {
+        language: language_of(&req.language),
+        prompt: req.prompt.clone(),
+        keywords: req.keyterms.clone(),
+        candidate_languages: req
+            .leg
+            .as_ref()
+            .map(|l| l.expected_languages.clone())
+            .unwrap_or_default(),
+        ..Default::default()
+    };
+    let verdict = probe(
+        transcriber.as_ref(),
+        &ctx,
+        std::time::Duration::from_millis(2_000),
+        &shared.repairs,
+    )
+    .await;
+    shared.probe_cache.put(&key, &verdict);
+    verdict
+}
+
 pub fn build_plan(
     shared: &SttLiveShared,
     live: &LiveResolution,
@@ -576,6 +681,7 @@ pub fn build_plan(
         }
     }
     let limiter = shared.limiters.get(&limiter_key, lspec);
+    limiter.set_windows(&waav_segmented_stt::live::long_windows(t));
     let breaker = shared
         .breakers
         .get(&format!("{row_id}|{}|{cred_tag}", info.host_key));
@@ -658,6 +764,8 @@ pub fn build_plan(
     engine.quality = quality_policy(t, req.prompt.as_deref());
     engine.detector_fallback = live.detector.fallback;
     engine.allow_energy_fallback = shared.allow_energy_detector;
+    engine.billing =
+        waav_segmented_stt::live::billing_rule(&live.resolution.row(shared.map).billing);
     let audio_model = (engine.profile.endpoint_policy
         == waav_segmented_stt::profile::EndpointPolicy::Auto)
         .then(models::audio_model)
@@ -891,7 +999,17 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
-        SttLiveShared::from_lookup(|k| m.get(k).cloned(), None).unwrap()
+        let mut s = SttLiveShared::from_lookup(|k| m.get(k).cloned(), None).unwrap();
+        // A build whose detector loaded (or, without Silero, the energy detector).
+        s.detector_override = Some(models::support_for(
+            if cfg!(feature = "silero-vad") {
+                models::ModelState::Ready
+            } else {
+                models::ModelState::NotBuilt
+            },
+            false,
+        ));
+        s
     }
 
     fn req(provider: &str, model: &str, kind: LiveSessionKind) -> LiveRequest {

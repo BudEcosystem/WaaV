@@ -980,6 +980,69 @@ fn languages_sent(h: &Harness) -> Vec<Option<String>> {
         .collect()
 }
 
+/// Release 5: each outcome carries what the vendor bills, by the row's rule (Groq: 10 s minimum).
+#[tokio::test(start_paused = true)]
+async fn an_outcome_is_billed_at_the_vendor_minimum() {
+    let mut cfg = EngineConfig::new(SegmentProfile::for_tests());
+    cfg.billing = crate::types::BillingRule {
+        min_billed_ms: 10_000,
+        increment_ms: 0,
+    };
+    let h = Harness::with_config(cfg, constant(100, "x"), None, None);
+    h.silence(200).await;
+    h.speech(600).await;
+    h.silence(800).await;
+    let o = h.sink.outcomes.lock()[0].clone();
+    assert!(o.uploaded_seconds < 3.0, "{}", o.uploaded_seconds);
+    assert_eq!(o.billed_seconds, 10.0);
+}
+
+/// LiveKit and SIP: a frame the transport dropped advances no sample time, so lost audio can only
+/// delay a pause threshold, never shorten it; only the input-stall rule (a client that stopped
+/// sending for a second) cuts on wall time.
+#[tokio::test(start_paused = true)]
+async fn a_dropped_frame_advances_no_sample_time() {
+    let run = |drop_ms: u64| async move {
+        let mut profile = SegmentProfile::for_tests();
+        profile.input_stall_ms = Some(1000);
+        let h = Harness::with_config(EngineConfig::new(profile), constant(100, "x"), None, None);
+        h.silence(200).await;
+        h.speech(600).await;
+        // Frames lost in transport: wall time passes, no samples arrive.
+        tokio::time::sleep(ms(drop_ms)).await;
+        h.speech(600).await;
+        h.silence(800).await;
+        h.upload.calls.lock().clone()
+    };
+    let control = run(0).await;
+    let dropped = run(400).await;
+    assert_eq!(dropped.len(), 1, "the gap was not a pause: one segment");
+    assert_eq!(
+        dropped[0].audio_ms, control[0].audio_ms,
+        "the lost 400 ms adds no sample time to the segment"
+    );
+
+    // A client that stops sending for longer than the stall limit does end the segment.
+    let h = Harness::with_config(
+        EngineConfig::new({
+            let mut p = SegmentProfile::for_tests();
+            p.input_stall_ms = Some(1000);
+            p
+        }),
+        constant(100, "x"),
+        None,
+        None,
+    );
+    h.silence(200).await;
+    h.speech(600).await;
+    tokio::time::sleep(ms(1_500)).await;
+    assert_eq!(
+        h.upload.calls.lock().len(),
+        1,
+        "the stall rule cut the open segment"
+    );
+}
+
 /// Addendum B7: with no session language, two segments the vendor detected alike pin it for every
 /// later upload.
 #[tokio::test(start_paused = true)]

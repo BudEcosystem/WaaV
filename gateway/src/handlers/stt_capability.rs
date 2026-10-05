@@ -306,13 +306,29 @@ pub fn spawn(state: Arc<AppState>) -> Option<tokio::task::JoinHandle<()>> {
 mod tests {
     use super::*;
 
+    /// A healthy detector, independent of the process-wide model state other tests change.
+    fn healthy(mut s: SttLiveShared) -> SttLiveShared {
+        use crate::core::stt::segmented::models::{ModelState, support_for};
+        s.detector_override = Some(support_for(
+            if cfg!(feature = "silero-vad") {
+                ModelState::Ready
+            } else {
+                ModelState::NotBuilt
+            },
+            false,
+        ));
+        s
+    }
+
     fn shared(switch: &str) -> SttLiveShared {
         let switch = switch.to_string();
-        SttLiveShared::from_lookup(
-            move |k| (k == "WAAV_SEGMENTED_STT").then(|| switch.clone()),
-            None,
+        healthy(
+            SttLiveShared::from_lookup(
+                move |k| (k == "WAAV_SEGMENTED_STT").then(|| switch.clone()),
+                None,
+            )
+            .unwrap(),
         )
-        .unwrap()
     }
 
     #[test]

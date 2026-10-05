@@ -551,6 +551,123 @@ impl VadEvents {
     }
 }
 
+/// `stt_degraded`: on a session without an agent (an agent's own rule ends the call instead),
+/// three caller turns in a row lost to failed uploads are reported once per run of losses.
+#[derive(Debug, Default)]
+pub struct LossStreak {
+    lost: u32,
+    said: bool,
+}
+
+impl LossStreak {
+    /// One caller turn closed. `Some(warning)` when this one completes a run of three.
+    pub fn on_turn_closed(&mut self, had_text: bool, gaps: u16) -> Option<OutgoingMessage> {
+        if had_text {
+            self.lost = 0;
+            self.said = false;
+            return None;
+        }
+        if gaps == 0 {
+            return None;
+        }
+        self.lost += 1;
+        if self.lost >= 3 && !self.said {
+            self.said = true;
+            return Some(OutgoingMessage::SttWarning {
+                code: "stt_degraded".into(),
+                message: "Three caller turns in a row could not be transcribed; the speech-to-text vendor may be failing.".into(),
+                detail: Some(json!({ "lost_turns": self.lost })),
+            });
+        }
+        None
+    }
+}
+
+/// What a session hears of its key's capacity at setup: from Release 3 an overloaded key is
+/// refused (`stt_overloaded`); before that, and for a budget running low, `stt_capacity_low`.
+pub fn admission_outcome(
+    admission: &waav_segmented_stt::transcriber::gate::Admission,
+    provider: &str,
+    release: u8,
+) -> ProbeOutcome {
+    use waav_segmented_stt::transcriber::gate::Admission as A;
+    match admission {
+        A::Ok => ProbeOutcome::Proceed,
+        A::Overloaded { retry_after } if release >= 3 => {
+            let secs = retry_after.as_secs().max(1);
+            ProbeOutcome::Refuse(OutgoingMessage::CodedError {
+                message: format!(
+                    "stt_overloaded: {provider} is refusing this key's uploads for rate limits; try again in {secs} s."
+                ),
+                code: "stt_overloaded".into(),
+                recoverable: true,
+                details: Some(json!({ "scope": "key", "retry_after_s": secs })),
+            })
+        }
+        A::Overloaded { .. } => ProbeOutcome::Warn(OutgoingMessage::ConfigWarning {
+            code: "stt_capacity_low".into(),
+            message: format!(
+                "{provider} recently refused this key's uploads for rate limits; turns may be lost."
+            ),
+            detail: Some(json!({ "scope": "key" })),
+        }),
+        A::CapacityLow { remaining } => ProbeOutcome::Warn(OutgoingMessage::ConfigWarning {
+            code: "stt_capacity_low".into(),
+            message: format!(
+                "Less than a fifth of this key's hourly or daily {provider} budget is left; uploads stop when it runs out."
+            ),
+            detail: Some(
+                json!({ "scope": "long_window", "remaining_fraction": (remaining * 100.0).round() / 100.0 }),
+            ),
+        }),
+    }
+}
+
+/// What the client hears of the setup probe's verdict: a refusal (the session is not built), a
+/// `config_warning`, or nothing.
+pub enum ProbeOutcome {
+    Refuse(OutgoingMessage),
+    Warn(OutgoingMessage),
+    Proceed,
+}
+
+pub fn probe_outcome(
+    verdict: &waav_segmented_stt::transcriber::probe::ProbeVerdict,
+    provider: &str,
+    model: &str,
+) -> ProbeOutcome {
+    use waav_segmented_stt::transcriber::probe::ProbeVerdict as V;
+    match verdict {
+        V::ModelNotServed { message } => ProbeOutcome::Refuse(OutgoingMessage::CodedError {
+            message: format!(
+                "stt_live_unsupported: {provider} does not serve the model '{model}' ({message}). Check the model id."
+            ),
+            code: "stt_live_unsupported".into(),
+            recoverable: true,
+            details: Some(
+                json!({ "provider": provider, "model": model, "reason": "model_not_served" }),
+            ),
+        }),
+        V::CredentialRejected { .. } => ProbeOutcome::Refuse(OutgoingMessage::CodedError {
+            message: format!(
+                "deployment_misconfigured: {provider} refused this deployment's credential for speech-to-text."
+            ),
+            code: "deployment_misconfigured".into(),
+            recoverable: true,
+            details: Some(json!({ "provider": provider, "reason": "credential_rejected" })),
+        }),
+        V::FieldsReduced { not_sent } => ProbeOutcome::Warn(OutgoingMessage::ConfigWarning {
+            code: "stt_fields_reduced".into(),
+            message: format!(
+                "{provider} refused some optional request fields for '{model}'; they are not sent on this session: {}.",
+                not_sent.join(", ")
+            ),
+            detail: Some(json!({ "not_sent": not_sent })),
+        }),
+        V::Served | V::Unknown { .. } => ProbeOutcome::Proceed,
+    }
+}
+
 /// The segmented engine stopped transcribing for good (`stt_unavailable (<reason>): <message>`).
 pub fn stt_unavailable(error: &str) -> Option<OutgoingMessage> {
     let rest = error.strip_prefix("Provider error: ").unwrap_or(error);
@@ -621,12 +738,28 @@ mod tests {
     use std::collections::BTreeMap;
     use waav_segmented_stt::profile::EndpointTuning;
 
+    /// A healthy detector, independent of the process-wide model state other tests change.
+    fn healthy(mut s: SttLiveShared) -> SttLiveShared {
+        use crate::core::stt::segmented::models::{ModelState, support_for};
+        s.detector_override = Some(support_for(
+            if cfg!(feature = "silero-vad") {
+                ModelState::Ready
+            } else {
+                ModelState::NotBuilt
+            },
+            false,
+        ));
+        s
+    }
+
     fn shared() -> SttLiveShared {
-        SttLiveShared::from_lookup(
-            |k| (k == "WAAV_SEGMENTED_STT").then(|| "on".to_string()),
-            None,
+        healthy(
+            SttLiveShared::from_lookup(
+                |k| (k == "WAAV_SEGMENTED_STT").then(|| "on".to_string()),
+                None,
+            )
+            .unwrap(),
         )
-        .unwrap()
     }
 
     fn live(provider: &str, model: &str, kind: LiveSessionKind) -> LiveResolution {
@@ -777,6 +910,118 @@ mod tests {
             serde_json::to_string(&m).unwrap(),
             r#"{"type":"error","message":"boom"}"#
         );
+    }
+
+    #[test]
+    fn three_lost_turns_in_a_row_are_reported_once_per_run() {
+        let mut s = LossStreak::default();
+        assert!(s.on_turn_closed(false, 1).is_none());
+        assert!(
+            s.on_turn_closed(false, 0).is_none(),
+            "a turn with no speech is not a loss"
+        );
+        assert!(s.on_turn_closed(false, 2).is_none());
+        let w = s.on_turn_closed(false, 1).expect("the third loss");
+        assert_eq!(serde_json::to_value(&w).unwrap()["code"], "stt_degraded");
+        assert!(s.on_turn_closed(false, 1).is_none(), "once per run");
+        assert!(s.on_turn_closed(true, 0).is_none());
+        for _ in 0..2 {
+            assert!(s.on_turn_closed(false, 1).is_none());
+        }
+        assert!(
+            s.on_turn_closed(false, 1).is_some(),
+            "a new run after a success"
+        );
+    }
+
+    #[test]
+    fn an_overloaded_key_is_refused_from_release_3_and_a_low_budget_warned() {
+        use std::time::Duration;
+        use waav_segmented_stt::transcriber::gate::Admission as A;
+        let over = A::Overloaded {
+            retry_after: Duration::from_secs(42),
+        };
+        let ProbeOutcome::Refuse(m) = admission_outcome(&over, "groq", 6) else {
+            panic!("refuse")
+        };
+        let j = serde_json::to_value(&m).unwrap();
+        assert_eq!(j["code"], "stt_overloaded");
+        assert_eq!(j["details"]["retry_after_s"], 42);
+        let ProbeOutcome::Warn(m) = admission_outcome(&over, "groq", 2) else {
+            panic!("warn")
+        };
+        assert_eq!(
+            serde_json::to_value(&m).unwrap()["code"],
+            "stt_capacity_low"
+        );
+        let ProbeOutcome::Warn(m) =
+            admission_outcome(&A::CapacityLow { remaining: 0.1 }, "groq", 6)
+        else {
+            panic!("warn")
+        };
+        let j = serde_json::to_value(&m).unwrap();
+        assert_eq!(j["detail"]["scope"], "long_window");
+        assert!(matches!(
+            admission_outcome(&A::Ok, "groq", 6),
+            ProbeOutcome::Proceed
+        ));
+    }
+
+    #[test]
+    fn the_probe_refuses_a_model_not_served_and_warns_of_reduced_fields() {
+        use waav_segmented_stt::transcriber::probe::ProbeVerdict as V;
+        let ProbeOutcome::Refuse(m) = probe_outcome(
+            &V::ModelNotServed {
+                message: "404".into(),
+            },
+            "self_hosted",
+            "whispr",
+        ) else {
+            panic!("refuse")
+        };
+        let j = serde_json::to_value(&m).unwrap();
+        assert_eq!(j["code"], "stt_live_unsupported");
+        assert_eq!(j["details"]["reason"], "model_not_served");
+        assert_eq!(j["recoverable"], true);
+        let ProbeOutcome::Refuse(m) = probe_outcome(
+            &V::CredentialRejected {
+                message: "401".into(),
+            },
+            "openai",
+            "m",
+        ) else {
+            panic!("refuse")
+        };
+        assert_eq!(
+            serde_json::to_value(&m).unwrap()["code"],
+            "deployment_misconfigured"
+        );
+        let ProbeOutcome::Warn(m) = probe_outcome(
+            &V::FieldsReduced {
+                not_sent: vec!["prompt".into()],
+            },
+            "openai",
+            "m",
+        ) else {
+            panic!("warn")
+        };
+        let j = serde_json::to_value(&m).unwrap();
+        assert_eq!(j["code"], "stt_fields_reduced");
+        assert_eq!(j["detail"]["not_sent"], json!(["prompt"]));
+        assert!(matches!(
+            probe_outcome(&V::Served, "openai", "m"),
+            ProbeOutcome::Proceed
+        ));
+        assert!(matches!(
+            probe_outcome(
+                &V::Unknown {
+                    message: "x".into()
+                },
+                "openai",
+                "m"
+            ),
+            ProbeOutcome::Proceed
+        ));
     }
 
     #[test]

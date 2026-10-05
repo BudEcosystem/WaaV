@@ -506,6 +506,38 @@ pub fn limit_spec(t: &Transport) -> LimitSpec {
     }
 }
 
+/// The row's billing rule: the vendor's minimum per request and its increment.
+pub fn billing_rule(billing: &crate::map::Billing) -> crate::types::BillingRule {
+    crate::types::BillingRule {
+        min_billed_ms: billing.min_billed_ms.unwrap_or(0).min(u32::MAX as u64) as u32,
+        increment_ms: billing.increment_ms.unwrap_or(0).min(u32::MAX as u64) as u32,
+    }
+}
+
+/// The row's hourly and daily limits on requests and audio, for the limiter's long windows.
+pub fn long_windows(t: &Transport) -> Vec<crate::transcriber::gate::LongWindow> {
+    use crate::transcriber::gate::{LongWindow, WindowMetric};
+    let plan = t.limits.assumed_plan.as_deref();
+    t.limits
+        .rates
+        .iter()
+        .filter(|r| r.plan.is_none() || plan.is_none() || r.plan.as_deref() == plan)
+        .filter_map(|r| {
+            let span = match r.per {
+                RatePer::Hour => std::time::Duration::from_secs(3_600),
+                RatePer::Day => std::time::Duration::from_secs(86_400),
+                _ => return None,
+            };
+            let metric = match r.metric {
+                RateMetric::Requests => WindowMetric::Requests,
+                RateMetric::AudioSeconds => WindowMetric::AudioSeconds,
+                _ => return None,
+            };
+            Some(LongWindow::new(span, metric, r.value as f64))
+        })
+        .collect()
+}
+
 /// The quality policy: the no-speech signal only where the row trusts it.
 pub fn quality_policy(t: &Transport, prompt: Option<&str>) -> QualityPolicy {
     QualityPolicy {
@@ -709,6 +741,21 @@ mod tests {
             "ws://asr.svc:8000/v1/realtime".into(),
         );
         assert_eq!(realtime_url(&h).unwrap(), "ws://asr.svc:8000/v1/realtime");
+    }
+
+    #[test]
+    fn groq_has_long_windows_and_a_vendor_without_them_has_none() {
+        let groq = long_windows(&transport("groq", "whisper-large-v3-turbo"));
+        assert!(
+            !groq.is_empty(),
+            "Groq publishes hourly audio and daily request caps"
+        );
+        assert!(groq.iter().all(|w| w.limit > 0.0));
+        assert!(
+            long_windows(&transport("elevenlabs", "scribe_v2"))
+                .iter()
+                .all(|w| w.limit > 0.0)
+        );
     }
 
     #[test]

@@ -2108,6 +2108,60 @@ async fn initialize_voice_manager(
     if let Some(setup) = live_setup
         .filter(|s| s.live.decision == crate::core::stt::segmented::live::LiveDecision::Segmented)
     {
+        // The setup probe (Release 2): a guessed row or a self-hosted server answers one silent
+        // clip before the caller speaks, so a mistyped model is refused here, not at the first turn.
+        let shared = &app_state.core_state.stt_live;
+        let admission = crate::core::stt::segmented::live::admission(
+            shared,
+            &setup.live,
+            &setup.req,
+            &segmented_key,
+        );
+        match super::stt_contract::admission_outcome(
+            &admission,
+            &setup.live.resolution.provider,
+            shared.rollout.release,
+        ) {
+            super::stt_contract::ProbeOutcome::Refuse(m) => {
+                warn!(
+                    ?admission,
+                    "segmented speech-to-text: the key is overloaded; session refused"
+                );
+                send_critical(message_tx, MessageRoute::Outgoing(m)).await;
+                return None;
+            }
+            super::stt_contract::ProbeOutcome::Warn(m) => {
+                send_critical(message_tx, MessageRoute::Outgoing(m)).await;
+            }
+            super::stt_contract::ProbeOutcome::Proceed => {}
+        }
+        if shared.setup_probe && setup.live.needs_probe() {
+            let verdict = crate::core::stt::segmented::live::probe_session(
+                shared,
+                &setup.live,
+                &setup.req,
+                segmented_key.clone(),
+            )
+            .await;
+            match super::stt_contract::probe_outcome(
+                &verdict,
+                &setup.live.resolution.provider,
+                &setup.live.resolution.model_sent,
+            ) {
+                super::stt_contract::ProbeOutcome::Refuse(m) => {
+                    warn!(
+                        ?verdict,
+                        "segmented speech-to-text: the setup probe refused the session"
+                    );
+                    send_critical(message_tx, MessageRoute::Outgoing(m)).await;
+                    return None;
+                }
+                super::stt_contract::ProbeOutcome::Warn(m) => {
+                    send_critical(message_tx, MessageRoute::Outgoing(m)).await;
+                }
+                super::stt_contract::ProbeOutcome::Proceed => {}
+            }
+        }
         match crate::core::stt::segmented::live::build_plan(
             &app_state.core_state.stt_live,
             &setup.live,

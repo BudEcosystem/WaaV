@@ -236,12 +236,20 @@ pub fn wire(
     let (tx, mut rx) = mpsc::unbounded_channel::<OutgoingMessage>();
     if let Some(meter) = meter {
         meter.set_segmented();
+        // From Release 5 a unit is priced at what the vendor bills (its minimum per request, its
+        // increment); before, at the seconds uploaded.
+        let vendor_minimum = setup.live.resolution.release >= 5;
         dispatch.add_outcome_listener(Arc::new(move |o| {
             let charged = matches!(
                 o.kind,
                 SegmentResultKind::Text | SegmentResultKind::Empty | SegmentResultKind::Filtered(_)
             );
-            meter.stt_uploaded(o.uploaded_seconds, charged, o.kind.as_str());
+            let seconds = if vendor_minimum {
+                o.billed_seconds.max(o.uploaded_seconds)
+            } else {
+                o.uploaded_seconds
+            };
+            meter.stt_uploaded(seconds, charged, o.kind.as_str());
         }));
     }
     {
@@ -256,6 +264,18 @@ pub fn wire(
         let tx = tx.clone();
         dispatch.add_notice_listener(Arc::new(move |n| {
             if let Some(w) = stt_contract::notice_warning(&n) {
+                let _ = tx.send(w);
+            }
+        }));
+    }
+    // `stt_degraded` on sessions without an agent: an agent ends the call by its own rule.
+    if !setup.req.kind.is_agent() {
+        let tx = tx.clone();
+        let streak = Arc::new(parking_lot::Mutex::new(stt_contract::LossStreak::default()));
+        dispatch.add_speech_listener(Arc::new(move |a: SpeechActivity| {
+            if let SpeechActivity::TurnClosed { had_text, gaps, .. } = a
+                && let Some(w) = streak.lock().on_turn_closed(had_text, gaps)
+            {
                 let _ = tx.send(w);
             }
         }));

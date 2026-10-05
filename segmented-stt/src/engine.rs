@@ -136,6 +136,8 @@ pub struct EngineConfig {
     /// After ten consecutive detector failures, switch to the energy detector instead of ending
     /// the session (`WAAV_STT_SEGMENT_ALLOW_ENERGY_DETECTOR=1`).
     pub allow_energy_fallback: bool,
+    /// The row's billing rule, for each outcome's `billed_seconds`.
+    pub billing: crate::types::BillingRule,
 }
 
 impl EngineConfig {
@@ -152,6 +154,7 @@ impl EngineConfig {
             quality: QualityPolicy::default(),
             detector_fallback: None,
             allow_energy_fallback: false,
+            billing: crate::types::BillingRule::default(),
         }
     }
 }
@@ -1283,7 +1286,11 @@ impl Engine {
             audio_ms,
             joined_text_offset: offset,
             uploaded_seconds,
-            billed_seconds: uploaded_seconds,
+            billed_seconds: self
+                .cfg
+                .billing
+                .billed_ms(ledger.requests, ledger.uploaded_ms) as f64
+                / 1000.0,
             timings: SegmentTimings {
                 released_ms: self.now_ms(),
                 ..u.timings

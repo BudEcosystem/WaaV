@@ -48,7 +48,77 @@ impl LimitSpec {
 pub enum GateRefusal {
     /// No token before the latest instant the caller could wait to.
     QueueTimeout,
+    /// An hourly or daily budget of the row is spent; nothing was sent.
+    BudgetExhausted,
 }
+
+/// What a long window counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowMetric {
+    Requests,
+    AudioSeconds,
+}
+
+/// A row's hourly or daily limit (Groq's audio hours, a daily request cap), at the 80% target.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LongWindow {
+    pub span: Duration,
+    pub metric: WindowMetric,
+    pub limit: f64,
+}
+
+impl LongWindow {
+    pub fn new(span: Duration, metric: WindowMetric, published: f64) -> Self {
+        Self {
+            span,
+            metric,
+            limit: published * 0.8,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct WindowLedger {
+    window: LongWindow,
+    events: std::collections::VecDeque<(Instant, f64)>,
+    used: f64,
+}
+
+impl WindowLedger {
+    fn expire(&mut self, now: Instant) {
+        while let Some((at, v)) = self.events.front().copied() {
+            if now.saturating_duration_since(at) < self.window.span {
+                break;
+            }
+            self.events.pop_front();
+            self.used -= v;
+        }
+        self.used = self.used.max(0.0);
+    }
+
+    fn remaining_fraction(&self) -> f64 {
+        ((self.window.limit - self.used) / self.window.limit.max(1e-9)).clamp(0.0, 1.0)
+    }
+}
+
+/// What a new session is told about a key at setup.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Admission {
+    Ok,
+    /// Less than a fifth of an hourly or daily budget is left (`stt_capacity_low`).
+    CapacityLow {
+        remaining: f64,
+    },
+    /// Three uploads lost to rate limits within 30 s (`stt_overloaded`).
+    Overloaded {
+        retry_after: Duration,
+    },
+}
+
+/// Losses to rate limits within this span mark a key overloaded.
+const OVERLOAD_SPAN: Duration = Duration::from_secs(30);
+const OVERLOAD_LOSSES: usize = 3;
+const OVERLOAD_HOLD: Duration = Duration::from_secs(60);
 
 /// Holds a concurrency slot for one request.
 #[derive(Debug)]
@@ -73,6 +143,9 @@ pub struct Limiter {
     spec: Mutex<LimitSpec>,
     bucket: Mutex<Bucket>,
     slots: Arc<Semaphore>,
+    windows: Mutex<Vec<WindowLedger>>,
+    losses: Mutex<std::collections::VecDeque<Instant>>,
+    overloaded_until: Mutex<Option<Instant>>,
 }
 
 impl Limiter {
@@ -86,6 +159,93 @@ impl Limiter {
             }),
             slots: Arc::new(Semaphore::new(spec.max_concurrent)),
             spec: Mutex::new(spec),
+            windows: Mutex::new(Vec::new()),
+            losses: Mutex::new(Default::default()),
+            overloaded_until: Mutex::new(None),
+        }
+    }
+
+    /// The row's hourly and daily limits. Ledgers of windows already known are kept.
+    pub fn set_windows(&self, windows: &[LongWindow]) {
+        let mut g = self.windows.lock();
+        if g.len() == windows.len() && g.iter().zip(windows).all(|(l, w)| l.window == *w) {
+            return;
+        }
+        *g = windows
+            .iter()
+            .map(|w| WindowLedger {
+                window: *w,
+                events: Default::default(),
+                used: 0.0,
+            })
+            .collect();
+    }
+
+    /// One request reached the vendor with this much audio.
+    pub fn record_upload(&self, audio: Duration) {
+        let now = Instant::now();
+        for l in self.windows.lock().iter_mut() {
+            let v = match l.window.metric {
+                WindowMetric::Requests => 1.0,
+                WindowMetric::AudioSeconds => audio.as_secs_f64(),
+            };
+            l.events.push_back((now, v));
+            l.used += v;
+        }
+    }
+
+    /// Whether every long window has room for one more request.
+    fn windows_open(&self, now: Instant) -> bool {
+        let mut g = self.windows.lock();
+        g.iter_mut().all(|l| {
+            l.expire(now);
+            match l.window.metric {
+                WindowMetric::Requests => l.used + 1.0 <= l.window.limit,
+                WindowMetric::AudioSeconds => l.used < l.window.limit,
+            }
+        })
+    }
+
+    /// An upload lost to a rate limit (the vendor's or this gate's): three within 30 s mark the
+    /// key overloaded for a minute.
+    pub fn note_rate_limited_loss(&self) {
+        let now = Instant::now();
+        let mut l = self.losses.lock();
+        l.push_back(now);
+        while l
+            .front()
+            .is_some_and(|t| now.saturating_duration_since(*t) > OVERLOAD_SPAN)
+        {
+            l.pop_front();
+        }
+        if l.len() >= OVERLOAD_LOSSES {
+            *self.overloaded_until.lock() = Some(now + OVERLOAD_HOLD);
+            l.clear();
+        }
+    }
+
+    /// What a session starting on this key is told.
+    pub fn admission(&self) -> Admission {
+        let now = Instant::now();
+        if let Some(until) = *self.overloaded_until.lock()
+            && until > now
+        {
+            return Admission::Overloaded {
+                retry_after: until - now,
+            };
+        }
+        let mut g = self.windows.lock();
+        let remaining = g
+            .iter_mut()
+            .map(|l| {
+                l.expire(now);
+                l.remaining_fraction()
+            })
+            .fold(1.0f64, f64::min);
+        if remaining < 0.2 {
+            Admission::CapacityLow { remaining }
+        } else {
+            Admission::Ok
         }
     }
 
@@ -110,6 +270,10 @@ impl Limiter {
     /// Wait for a token and a slot, no later than `latest`.
     pub async fn acquire(&self, latest: Instant) -> Result<GatePass, GateRefusal> {
         let start = Instant::now();
+        if !self.windows_open(start) {
+            self.bucket.lock().pressure += 1;
+            return Err(GateRefusal::BudgetExhausted);
+        }
         loop {
             let now = Instant::now();
             let wait = {
@@ -257,6 +421,85 @@ impl BudgetRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn an_hourly_budget_refuses_at_the_gate_and_frees_up_as_the_hour_moves() {
+        let l = Limiter::new(LimitSpec::unlimited());
+        l.set_windows(&[LongWindow::new(
+            Duration::from_secs(3600),
+            WindowMetric::AudioSeconds,
+            100.0,
+        )]);
+        for _ in 0..8 {
+            l.acquire(Instant::now() + Duration::from_secs(1))
+                .await
+                .unwrap();
+            l.record_upload(Duration::from_secs(10));
+        }
+        assert_eq!(l.admission(), Admission::CapacityLow { remaining: 0.0 });
+        assert_eq!(
+            l.acquire(Instant::now() + Duration::from_secs(1))
+                .await
+                .unwrap_err(),
+            GateRefusal::BudgetExhausted
+        );
+        tokio::time::advance(Duration::from_secs(3601)).await;
+        assert_eq!(l.admission(), Admission::Ok);
+        assert!(
+            l.acquire(Instant::now() + Duration::from_secs(1))
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_daily_request_cap_counts_requests() {
+        let l = Limiter::new(LimitSpec::unlimited());
+        l.set_windows(&[LongWindow::new(
+            Duration::from_secs(86_400),
+            WindowMetric::Requests,
+            10.0,
+        )]);
+        for _ in 0..7 {
+            l.record_upload(Duration::from_secs(3));
+        }
+        assert!(
+            matches!(l.admission(), Admission::CapacityLow { .. }),
+            "{:?}",
+            l.admission()
+        );
+        l.record_upload(Duration::from_secs(3));
+        assert!(
+            l.acquire(Instant::now() + Duration::from_secs(1))
+                .await
+                .is_err()
+        );
+        // The same windows again keep their ledger.
+        l.set_windows(&[LongWindow::new(
+            Duration::from_secs(86_400),
+            WindowMetric::Requests,
+            10.0,
+        )]);
+        assert!(
+            l.acquire(Instant::now() + Duration::from_secs(1))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn three_rate_limited_losses_in_thirty_seconds_mark_the_key_overloaded() {
+        let l = Limiter::new(LimitSpec::unlimited());
+        l.note_rate_limited_loss();
+        tokio::time::advance(Duration::from_secs(31)).await;
+        l.note_rate_limited_loss();
+        l.note_rate_limited_loss();
+        assert_eq!(l.admission(), Admission::Ok, "the first loss aged out");
+        l.note_rate_limited_loss();
+        assert!(matches!(l.admission(), Admission::Overloaded { .. }));
+        tokio::time::advance(Duration::from_secs(61)).await;
+        assert_eq!(l.admission(), Admission::Ok);
+    }
 
     #[tokio::test(start_paused = true)]
     async fn a_burst_passes_then_requests_are_spaced_at_the_rate() {

@@ -94,7 +94,18 @@ pub trait AttemptObserver: Send + Sync {
 pub struct SessionHealth {
     inner: Mutex<HealthInner>,
     fatal_flag: AtomicBool,
+    /// `stt_rate_limited` was said to this session.
+    rate_limited_noticed: AtomicBool,
 }
+
+impl SessionHealth {
+    /// True exactly once per session: the first time a rate limit held a unit back.
+    fn first_rate_limit(&self) -> bool {
+        !self.rate_limited_noticed.swap(true, Ordering::AcqRel)
+    }
+}
+
+const RATE_LIMITED_TEXT: &str = "The vendor's rate limit is slowing this call's transcription; some turns may arrive late or be lost.";
 
 #[derive(Debug, Default)]
 struct HealthInner {
@@ -170,7 +181,7 @@ impl RepairMemory {
         format!("{}|{}|{}", info.host_key, info.adapter, info.model)
     }
 
-    fn apply(&self, info: &TranscriberInfo, ctx: &mut SegmentContext) {
+    pub(crate) fn apply(&self, info: &TranscriberInfo, ctx: &mut SegmentContext) {
         let now = Instant::now();
         let mut g = self.map.lock();
         let key = Self::key(info);
@@ -188,6 +199,17 @@ impl RepairMemory {
             Some((_, Repair::Minimal)) => ctx.minimal = true,
             None => {}
         }
+    }
+
+    /// Omit these optional fields on this target for the next ten minutes (the setup probe found
+    /// the vendor refuses them).
+    pub fn remember_omitted(&self, info: &TranscriberInfo, fields: Vec<String>) {
+        self.remember(info, Repair::Omit(fields));
+    }
+
+    /// Send only the file and the model on this target for the next ten minutes.
+    pub fn remember_minimal(&self, info: &TranscriberInfo) {
+        self.remember(info, Repair::Minimal);
     }
 
     fn remember(&self, info: &TranscriberInfo, repair: Repair) {
@@ -379,6 +401,10 @@ impl SegmentAttempts {
         let pass = match self.limiter.acquire(latest).await {
             Ok(p) => p,
             Err(_) => {
+                self.limiter.note_rate_limited_loss();
+                if self.health.first_rate_limit() {
+                    warnings.push(("stt_rate_limited".into(), RATE_LIMITED_TEXT.into()));
+                }
                 permit.resolve(None);
                 return resolution(
                     Err(UnitFailure::LimiterRefused),
@@ -401,6 +427,8 @@ impl SegmentAttempts {
         self.budget.on_request();
         let first_progress = RequestProgress::new();
         inflight.push(self.spawn(1, &audio, &ctx, limit, Arc::clone(&first_progress)));
+        self.limiter
+            .record_upload(Duration::from_millis(u64::from(audio_ms)));
         ledger.requests = 1;
         ledger.uploaded_ms = audio_ms;
         let first_sent = Instant::now();
@@ -518,6 +546,12 @@ impl SegmentAttempts {
                 None,
                 warnings,
             );
+        }
+        if e.class == ErrorClass::RateLimited {
+            self.limiter.note_rate_limited_loss();
+            if self.health.first_rate_limit() {
+                warnings.push(("stt_rate_limited".into(), RATE_LIMITED_TEXT.into()));
+            }
         }
         let fatal = self.health.failure(&e);
         resolution(
@@ -875,6 +909,33 @@ mod tests {
         assert_eq!(r.result.unwrap_err(), UnitFailure::LimiterRefused);
         assert!(Instant::now() - start <= ms(1500));
         assert_eq!(t.calls(), 1);
+    }
+
+    /// The contract's `stt_rate_limited`: said once per session, the first time a unit is held
+    /// back by a rate limit (the gate's queue or the vendor's 429).
+    #[tokio::test(start_paused = true)]
+    async fn a_session_is_told_once_that_rate_limits_are_slowing_it() {
+        let t = FakeTranscriber::file([]);
+        let mut a = attempts(Arc::clone(&t));
+        a.limiter = Arc::new(Limiter::new(LimitSpec {
+            requests_per_minute: 1.0,
+            burst: 1.0,
+            max_concurrent: 4,
+        }));
+        t.push(FakeStep::text("ok", ms(10)));
+        let first = a.run(audio(), request(deadlines())).await;
+        assert!(first.warnings.iter().all(|(c, _)| c != "stt_rate_limited"));
+        let held = a.run(audio(), request(deadlines())).await;
+        assert!(
+            held.warnings.iter().any(|(c, _)| c == "stt_rate_limited"),
+            "{:?}",
+            held.warnings
+        );
+        let again = a.run(audio(), request(deadlines())).await;
+        assert!(
+            again.warnings.iter().all(|(c, _)| c != "stt_rate_limited"),
+            "once per session"
+        );
     }
 
     #[tokio::test(start_paused = true)]

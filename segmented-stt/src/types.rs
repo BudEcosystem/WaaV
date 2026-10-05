@@ -450,6 +450,29 @@ pub struct SegmentOutcome {
     pub vendor_request_id: Option<String>,
 }
 
+/// What the vendor bills per request: at least `min_billed_ms` (Groq bills 10 s), rounded up to
+/// `increment_ms`. Zero for both bills the audio as sent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BillingRule {
+    pub min_billed_ms: u32,
+    pub increment_ms: u32,
+}
+
+impl BillingRule {
+    /// The vendor's charge for `requests` requests that carried `uploaded_ms` of audio in all.
+    pub fn billed_ms(&self, requests: u8, uploaded_ms: u32) -> u32 {
+        if requests == 0 {
+            return 0;
+        }
+        let per = uploaded_ms / u32::from(requests);
+        let mut each = per.max(self.min_billed_ms);
+        if self.increment_ms > 1 {
+            each = each.div_ceil(self.increment_ms) * self.increment_ms;
+        }
+        each * u32::from(requests)
+    }
+}
+
 /// One result the engine emits. Only two shapes exist: an interim (`is_final == false`) carrying
 /// the turn so far, and the turn's final with `is_final` and `is_speech_final` both true.
 #[derive(Debug, Clone, PartialEq)]
@@ -480,6 +503,33 @@ pub trait SegmentOutcomeSink: Send + Sync {
     fn record(&self, outcome: &SegmentOutcome);
     /// On the engine task, before the turn's final is queued.
     fn turn_closing(&self, _turn_id: u64, _closed: &SpeechActivity) {}
+}
+
+#[cfg(test)]
+mod billing_tests {
+    use super::BillingRule;
+
+    #[test]
+    fn a_vendor_minimum_and_increment_shape_the_bill() {
+        let groq = BillingRule {
+            min_billed_ms: 10_000,
+            increment_ms: 0,
+        };
+        assert_eq!(groq.billed_ms(1, 3_200), 10_000);
+        assert_eq!(groq.billed_ms(1, 12_300), 12_300);
+        assert_eq!(
+            groq.billed_ms(2, 6_400),
+            20_000,
+            "each request is billed its minimum"
+        );
+        let per_second = BillingRule {
+            min_billed_ms: 0,
+            increment_ms: 1_000,
+        };
+        assert_eq!(per_second.billed_ms(1, 3_200), 4_000);
+        assert_eq!(BillingRule::default().billed_ms(1, 3_200), 3_200);
+        assert_eq!(BillingRule::default().billed_ms(0, 0), 0);
+    }
 }
 
 #[cfg(test)]

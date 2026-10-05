@@ -115,7 +115,12 @@ pub struct DetectorSupport {
 /// unless the operator allowed the energy detector; a build without Silero uses the energy
 /// detector and says so.
 pub fn build_support(allow_energy: bool) -> DetectorSupport {
-    match silero_state() {
+    support_for(silero_state(), allow_energy)
+}
+
+/// [`build_support`] for a given model state.
+pub fn support_for(state: ModelState, allow_energy: bool) -> DetectorSupport {
+    match state {
         ModelState::Ready | ModelState::Loading => DetectorSupport {
             kind: DetectorKind::Silero,
             fallback: None,
@@ -304,13 +309,12 @@ mod tests {
 
     #[test]
     fn a_failed_silero_model_refuses_unless_the_operator_allows_energy() {
-        let m = models();
-        let before = m.silero.read().clone();
-        *m.silero.write() = ModelState::Failed("no file".into());
-        assert!(build_support(false).refused.is_some());
-        let allowed = build_support(true);
+        // Pure: the process-wide model state is shared with every other test.
+        let failed = || ModelState::Failed("no file".into());
+        assert!(support_for(failed(), false).refused.is_some());
+        let allowed = support_for(failed(), true);
         assert_eq!(allowed.kind, DetectorKind::Energy);
         assert_eq!(allowed.fallback, Some(DetectorFallback::ModelUnavailable));
-        *m.silero.write() = before;
+        assert!(support_for(ModelState::Loading, false).refused.is_none());
     }
 }
