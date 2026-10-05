@@ -277,6 +277,9 @@ pub async fn handle_config_message(
 
     // Determine if audio processing is enabled (default to true)
     let audio_enabled = audio.unwrap_or(true);
+    // What speech-to-text the session got (`ready.stt`), when the rollout switch covers it.
+    #[allow(unused_mut)]
+    let mut ready_stt: Option<serde_json::Value> = None;
 
     info!(
         "Configuring connection with audio_enabled: {}, LiveKit: {}",
@@ -777,6 +780,7 @@ pub async fn handle_config_message(
         message_tx,
         MessageRoute::Outgoing(OutgoingMessage::Ready {
             protocol_version: crate::handlers::ws::messages::PROTOCOL_VERSION.to_string(),
+            stt: ready_stt.clone().map(Box::new),
             stream_id: stream_id.clone(),
             livekit_room_name: livekit_room_name.clone(),
             livekit_url: Some(app_state.config.livekit_public_url.clone()),

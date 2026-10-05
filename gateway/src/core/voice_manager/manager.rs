@@ -141,6 +141,10 @@ pub struct VoiceManager {
     /// Atomic so it can be toggled before `on_tts_audio` (and in tests) without
     /// a process-global env var.
     uninterruptible_playback: AtomicBool,
+
+    /// Set on a segmented session: the fan-out of the engine's speech events, outcomes and
+    /// notices, and the speech-time admission of caller turns.
+    segmented: Option<Arc<super::segmented::SegmentedDispatch>>,
 }
 
 impl VoiceManager {
@@ -194,14 +198,22 @@ impl VoiceManager {
             None => create_tts_provider(&config.tts_config.provider, config.tts_config.clone())
                 .map_err(VoiceManagerError::TTSError)?,
         };
-        let mut stt = match &config.standard_stt {
-            Some(std_stt) => crate::core::stt::standard::create_stt_standard(
+        // The live factory: a session the capability map routed to the segmented engine gets the
+        // engine; every other session gets exactly today's client.
+        let mut stt: Box<dyn BaseSTT> = match (&config.segmented, &config.standard_stt) {
+            (Some(plan), _) => Box::new(crate::core::stt::segmented::SegmentedStt::from_plan(
+                config.stt_config.clone(),
+                plan.clone(),
+            )),
+            (None, Some(std_stt)) => crate::core::stt::standard::create_stt_standard(
                 &std_stt.base.provider,
                 std_stt.clone(),
             )
             .map_err(VoiceManagerError::STTError)?,
-            None => create_stt_provider(&config.stt_config.provider, config.stt_config.clone())
-                .map_err(VoiceManagerError::STTError)?,
+            (None, None) => {
+                create_stt_provider(&config.stt_config.provider, config.stt_config.clone())
+                    .map_err(VoiceManagerError::STTError)?
+            }
         };
         // W-D2 cross-session wiring: inject the shared process-global resilience handles (the
         // single reconnect governor + this provider's shared circuit breaker) so all sessions of
@@ -211,6 +223,33 @@ impl VoiceManager {
         if let Some(resilience) = &config.resilience {
             stt.set_resilience(resilience.clone());
         }
+
+        let interruption_state = Arc::new(InterruptionState {
+            allow_interruption: AtomicBool::new(true),
+            non_interruptible_until_ms: AtomicUsize::new(0),
+            current_sample_rate: AtomicU32::new(24000),
+            is_completed: AtomicBool::new(true), // Start as completed
+            playout_end_ms: AtomicUsize::new(0), // Silent at start
+            audio_out_ms_total: std::sync::atomic::AtomicU64::new(0),
+        });
+
+        // A segmented session: the engine's events go through one dispatcher; by default speech
+        // is input unless a non-interruptible utterance plays.
+        let segmented = config.segmented.as_ref().map(|_| {
+            let d = Arc::new(super::segmented::SegmentedDispatch::default());
+            let st = Arc::clone(&interruption_state);
+            d.set_gate(Arc::new(move || st.can_interrupt()));
+            let st = Arc::clone(&interruption_state);
+            d.set_agent_audible(Arc::new(move || st.is_audibly_speaking()));
+            let dd = Arc::clone(&d);
+            stt.on_speech_activity(Arc::new(move |a| dd.on_activity(a)));
+            let dd = Arc::clone(&d);
+            stt.set_segment_admission(Arc::new(move |meta| dd.admission(meta)));
+            stt.set_outcome_sink(Arc::new(super::segmented::DispatchSink(Arc::clone(&d))));
+            let dd = Arc::clone(&d);
+            stt.on_notice(Arc::new(move |n| dd.on_notice(n)));
+            d
+        });
 
         // Pre-allocate string buffers with reasonable capacity
         const TEXT_BUFFER_CAPACITY: usize = 1024;
@@ -246,14 +285,7 @@ impl VoiceManager {
             ),
             #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
             smart_turn_callback: Arc::new(SyncRwLock::new(None)),
-            interruption_state: Arc::new(InterruptionState {
-                allow_interruption: AtomicBool::new(true),
-                non_interruptible_until_ms: AtomicUsize::new(0),
-                current_sample_rate: AtomicU32::new(24000),
-                is_completed: AtomicBool::new(true), // Start as completed
-                playout_end_ms: AtomicUsize::new(0), // Silent at start
-                audio_out_ms_total: std::sync::atomic::AtomicU64::new(0),
-            }),
+            interruption_state,
             config,
             clear_notify: Arc::new(Notify::new()),
             clear_epoch: Arc::new(AtomicUsize::new(0)),
@@ -262,7 +294,24 @@ impl VoiceManager {
             stt_final_observer: Arc::new(SyncRwLock::new(None)),
             playback_pump: Arc::new(SyncRwLock::new(None)),
             uninterruptible_playback: AtomicBool::new(uninterruptible_playback),
+            segmented,
         })
+    }
+
+    /// Whether the gateway decides where this session's utterances end (the segmented engine).
+    pub fn is_gateway_endpointed(&self) -> bool {
+        self.segmented.is_some()
+    }
+
+    /// The dispatcher of a segmented session: register speech, outcome and notice listeners, and
+    /// replace the speech gate.
+    pub fn segmented(&self) -> Option<&Arc<super::segmented::SegmentedDispatch>> {
+        self.segmented.as_ref()
+    }
+
+    /// What a gateway-endpointed provider knows about itself, once started.
+    pub async fn live_facts(&self) -> Option<crate::core::stt::speech_activity::SttLiveFacts> {
+        self.stt.read().await.live_facts()
     }
 
     /// A-G6: enable/disable uninterruptible playback (the metered pump path).
@@ -271,6 +320,17 @@ impl VoiceManager {
     pub fn set_uninterruptible_playback(&self, enabled: bool) {
         self.uninterruptible_playback
             .store(enabled, Ordering::Release);
+    }
+
+    /// Test seam: connect only the STT provider (no TTS network dial).
+    #[cfg(test)]
+    pub async fn test_connect_stt(&self) -> VoiceManagerResult<()> {
+        self.stt
+            .write()
+            .await
+            .connect()
+            .await
+            .map_err(VoiceManagerError::STTError)
     }
 
     /// Test seam: is the A-G6 playback pump engaged?
@@ -1031,9 +1091,11 @@ impl VoiceManager {
         .with_stt_ttfs_p99_ms(provider_ttfs);
         let stt_processor = STTResultProcessor::new(processing_config);
 
+        let segmented_clone = self.segmented.clone();
         let wrapper_callback: STTResultCallback = Arc::new(move |result| {
             // Clone Arc references per invocation (lightweight operation)
             let callback = callback.clone();
+            let segmented = segmented_clone.clone();
             let speech_final_state = speech_final_state_clone.clone();
             let interruption_state = interruption_state_clone.clone();
             let turn_detector = turn_detector_clone.clone();
@@ -1048,8 +1110,14 @@ impl VoiceManager {
             }
 
             Box::pin(async move {
-                // Fast synchronous check for interruption - execute before any async ops
-                if !interruption_state.can_interrupt() {
+                // A segmented result belongs to a caller turn whose admission was decided when the
+                // caller started speaking; arrival time says nothing, it is a second or more later.
+                if let (Some(d), Some(turn)) = (segmented.as_ref(), result.speech_turn_id) {
+                    if !d.result_admitted(turn, result.is_speech_final) {
+                        return;
+                    }
+                } else if !interruption_state.can_interrupt() {
+                    // Fast synchronous check for interruption - execute before any async ops
                     // Still within non-interruptible period, ignore STT result
                     return;
                 }
@@ -1646,6 +1714,14 @@ impl VoiceManager {
     /// # }
     /// ```
     pub async fn finalize_stt(&self) -> VoiceManagerResult<()> {
+        // A provider that can flush (the segmented engine) gets a commit ordered behind the audio
+        // already sent; the lock is held only to ask, never across the wait, so audio intake goes on.
+        let pending = { self.stt.write().await.request_flush() };
+        if let Some(reached) = pending {
+            let _ = reached.await;
+            return Ok(());
+        }
+
         tracing::info!("Finalizing STT stream - sending CloseStream signal");
 
         // Disconnect STT to trigger CloseStream message
@@ -1669,6 +1745,18 @@ impl VoiceManager {
 
         tracing::info!("STT stream finalized and reconnected");
         Ok(())
+    }
+
+    /// A client commit on a segmented session: the flush outcome (which turn was sealed and
+    /// whether a result follows). `None` on a provider that cannot flush.
+    pub async fn flush_stt(
+        &self,
+    ) -> Option<crate::core::stt::speech_activity::FlushOutcome> {
+        let pending = { self.stt.write().await.request_flush() };
+        match pending {
+            Some(rx) => rx.await.ok(),
+            None => None,
+        }
     }
 }
 

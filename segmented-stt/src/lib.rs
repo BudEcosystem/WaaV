@@ -21,6 +21,7 @@
 //! | [`endpointer`] | The end-of-turn ladder: audio model, text model, silence ceiling |
 //! | [`sequencer`] | Upload units, holding and joining, in-order release |
 //! | [`turn`] | Joining a turn's text and the two result shapes the engine can emit |
+//! | [`live`] | Planning one session: the transcriber, the engine profile, the limiter rate |
 //! | [`limits`] | Every time limit of one upload, and the latency store |
 //! | [`transcriber`] | One interface for "transcribe this utterance", the attempt loop, limiter and breaker |
 //! | [`engine`] | The per-session task that owns all of the above |
@@ -31,6 +32,7 @@ pub mod detector;
 pub mod endpointer;
 pub mod engine;
 pub mod limits;
+pub mod live;
 pub mod map;
 pub mod profile;
 pub mod resolve;

@@ -311,6 +311,7 @@ fn test_outgoing_message_serialization() {
     // Test ready message without LiveKit
     let ready_msg = OutgoingMessage::Ready {
         protocol_version: crate::handlers::ws::messages::PROTOCOL_VERSION.to_string(),
+        stt: None,
         stream_id: "test-stream".to_string(),
         livekit_room_name: None,
         livekit_url: None,
@@ -326,6 +327,7 @@ fn test_outgoing_message_serialization() {
     // Test ready message with LiveKit room info
     let ready_msg_with_livekit = OutgoingMessage::Ready {
         protocol_version: crate::handlers::ws::messages::PROTOCOL_VERSION.to_string(),
+        stt: None,
         stream_id: "test-stream".to_string(),
         livekit_room_name: Some("test-room".to_string()),
         livekit_url: Some("ws://localhost:7880".to_string()),

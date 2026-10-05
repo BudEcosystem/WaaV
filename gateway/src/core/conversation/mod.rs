@@ -2035,6 +2035,9 @@ impl ConversationOrchestrator {
                 }
                 // MuteChanged lands with the mute strategies (A-G5).
                 TurnEvent::MuteChanged { .. } => {}
+                // A segmented caller turn closed with no input: nothing to answer. A barge-in it
+                // caused has already stopped the reply.
+                TurnEvent::Aborted { .. } => {}
             }
         }
         // A speculation taken for a batch whose Stopped carried no usable

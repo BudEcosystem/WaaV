@@ -688,6 +688,49 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
 
+    // --- Segmented sessions: the two shapes the engine emits arm nothing ---
+
+    fn empty_state() -> Arc<SyncRwLock<SpeechFinalState>> {
+        Arc::new(SyncRwLock::new(SpeechFinalState {
+            text_buffer: String::new(),
+            turn_detection_handle: None,
+            hard_timeout_handle: None,
+            waiting_for_speech_final: AtomicBool::new(false),
+            user_callback: None,
+            turn_detection_last_fired_ms: AtomicUsize::new(0),
+            last_forced_text: String::new(),
+            segment_start_ms: AtomicUsize::new(0),
+            hard_timeout_deadline_ms: AtomicUsize::new(0),
+            fire_generation: AtomicUsize::new(0),
+        }))
+    }
+
+    /// The 600 ms and 1,500 ms timers are armed only for a result that is final but not end of
+    /// turn. The segmented engine emits interims and one final that is also end of turn, so a late
+    /// second segment can never be cut off by a timer. This pins the rule.
+    #[tokio::test]
+    async fn segmented_result_shapes_arm_no_forced_final_timers() {
+        let p = STTResultProcessor::new(STTProcessingConfig::default());
+        let state = empty_state();
+        let interim = STTResult::new("I'd like to".into(), false, false, 1.0);
+        assert!(p.process_result(interim, state.clone(), None).await.is_some());
+        let final_ = STTResult::new("I'd like to change my booking.".into(), true, true, 1.0).finalized();
+        let out = p.process_result(final_, state.clone(), None).await.expect("delivered");
+        assert!(out.segment_transcript.is_none(), "the final already holds the whole turn");
+        let s = state.read();
+        assert!(s.turn_detection_handle.is_none());
+        assert!(s.hard_timeout_handle.is_none());
+        assert!(!s.waiting_for_speech_final.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(s.hard_timeout_deadline_ms.load(std::sync::atomic::Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn an_empty_final_after_a_commit_passes_the_processor() {
+        let p = STTResultProcessor::new(STTProcessingConfig::default());
+        let empty = STTResult::new(String::new(), true, true, 1.0).finalized();
+        assert!(p.process_result(empty, empty_state(), None).await.is_some());
+    }
+
     // --- A-G2: TTFS-aware effective wait ---
 
     #[test]

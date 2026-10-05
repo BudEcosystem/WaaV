@@ -1184,3 +1184,178 @@ async fn test_hard_timeout_observability() {
     // The implementation emits: tracing::warn!("Hard timeout fired after {}ms - forcing speech_final...")
     // This allows SREs to create alerts on fallback frequency.
 }
+
+// ---------------------------------------------------------------------------------------------
+// Segmented sessions: the engine behind a real VoiceManager
+// ---------------------------------------------------------------------------------------------
+
+mod segmented_chain {
+    use super::*;
+    use crate::core::stt::segmented::SegmentedPlan;
+    use crate::core::stt::speech_activity::SpeechActivity;
+    use waav_segmented_stt::detector::{DetectorError, SpeechDetector};
+    use waav_segmented_stt::engine::{EngineConfig, TokioClock};
+    use waav_segmented_stt::profile::SegmentProfile;
+    use waav_segmented_stt::sequencer::{SegmentUpload, UnitUpload};
+    use waav_segmented_stt::transcriber::attempts::{Ledger, UploadResolution};
+    use waav_segmented_stt::transcriber::{SegmentAudio, SegmentTranscript};
+    use waav_segmented_stt::types::DetectorKind;
+
+    struct Level;
+    impl SpeechDetector for Level {
+        fn probability(&mut self, f: &[f32]) -> Result<f32, DetectorError> {
+            let rms = (f.iter().map(|s| s * s).sum::<f32>() / f.len() as f32).sqrt();
+            Ok(if rms > 0.02 { 0.9 } else { 0.02 })
+        }
+        fn reset(&mut self) {}
+        fn kind(&self) -> DetectorKind {
+            DetectorKind::Scripted
+        }
+    }
+
+    struct Vendor {
+        calls: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl SegmentUpload for Vendor {
+        async fn run(&self, audio: SegmentAudio, _req: UnitUpload) -> UploadResolution {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            UploadResolution {
+                result: Ok(SegmentTranscript {
+                    text: format!("segment {}", n + 1),
+                    ..Default::default()
+                }),
+                ledger: Ledger { requests: 1, uploaded_ms: audio.audio_ms() },
+                queue_wait: std::time::Duration::ZERO,
+                round_trip: None,
+                fatal: None,
+                warnings: Vec::new(),
+            }
+        }
+        fn deadline_ms(&self) -> u32 {
+            6000
+        }
+        fn try_speculative(&self) -> bool {
+            true
+        }
+        async fn prewarm(&self, _n: usize) {}
+        fn min_audio_ms(&self) -> u32 {
+            0
+        }
+    }
+
+    fn manager(vendor: Arc<Vendor>) -> VoiceManager {
+        let stt_config = STTConfig {
+            provider: "elevenlabs".to_string(),
+            model: "scribe_v2".into(),
+            api_key: "k".to_string(),
+            ..Default::default()
+        };
+        let tts_config = TTSConfig {
+            provider: "deepgram".to_string(),
+            api_key: "test_key".to_string(),
+            ..Default::default()
+        };
+        let plan = SegmentedPlan {
+            engine: EngineConfig::new(SegmentProfile::for_tests()),
+            detector: Arc::new(|| Box::pin(async { Ok(Box::new(Level) as Box<dyn SpeechDetector>) })),
+            upload: vendor,
+            audio_model: None,
+            text_model: None,
+            clock: Arc::new(TokioClock::default()),
+            provider_info: "segmented:elevenlabs_batch",
+        };
+        VoiceManager::new(VoiceManagerConfig::new(stt_config, tts_config).with_segmented(plan), None).unwrap()
+    }
+
+    async fn feed(vm: &VoiceManager, ms: u64, loud: bool) {
+        for _ in 0..ms / 20 {
+            let level: i16 = if loud { 4000 } else { 0 };
+            let bytes: Vec<u8> = (0..320).flat_map(|i| (if i % 2 == 0 { level } else { -level }).to_le_bytes()).collect();
+            vm.receive_audio(bytes::Bytes::from(bytes)).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transcripts_reach_the_session_callback_with_their_turn_and_speech_events_come_first() {
+        let vendor = Arc::new(Vendor { calls: AtomicUsize::new(0) });
+        let vm = manager(Arc::clone(&vendor));
+        assert!(vm.is_gateway_endpointed());
+        let results = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let r = Arc::clone(&results);
+        vm.on_stt_result(move |res| {
+            r.lock().push(res);
+            Box::pin(async {})
+        })
+        .await
+        .unwrap();
+        let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let e = Arc::clone(&events);
+        vm.segmented().unwrap().add_speech_listener(Arc::new(move |a| e.lock().push(a)));
+        vm.test_connect_stt().await.unwrap();
+        feed(&vm, 200, false).await;
+        feed(&vm, 1000, true).await;
+        assert!(results.lock().is_empty());
+        assert!(events.lock().iter().any(|a| matches!(a, SpeechActivity::Started { .. })));
+        feed(&vm, 1500, false).await;
+        // The upload can return just before the silence rule closes the turn, so an interim with
+        // the same text may come first; exactly one final, always end of turn.
+        let got = results.lock().clone();
+        let finals: Vec<_> = got.iter().filter(|r| r.is_final).collect();
+        assert_eq!(finals.len(), 1, "{got:?}");
+        assert!(got.iter().all(|r| r.is_final == r.is_speech_final));
+        assert!(finals[0].is_finalized);
+        assert_eq!(finals[0].transcript, "segment 1");
+        assert!(got.iter().all(|r| r.speech_turn_id == Some(1)));
+        let facts = vm.live_facts().await.expect("facts");
+        assert_eq!(facts.final_deadline_ms, 6000);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn speech_over_a_protected_utterance_is_not_input_and_is_never_uploaded() {
+        let vendor = Arc::new(Vendor { calls: AtomicUsize::new(0) });
+        let vm = manager(Arc::clone(&vendor));
+        let results = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let r = Arc::clone(&results);
+        vm.on_stt_result(move |res| {
+            r.lock().push(res);
+            Box::pin(async {})
+        })
+        .await
+        .unwrap();
+        vm.segmented().unwrap().set_gate(Arc::new(|| false));
+        vm.test_connect_stt().await.unwrap();
+        feed(&vm, 200, false).await;
+        feed(&vm, 1000, true).await;
+        feed(&vm, 1500, false).await;
+        assert!(results.lock().is_empty());
+        assert_eq!(vendor.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn finalize_stt_flushes_without_a_reconnect_and_the_commit_is_answered() {
+        let vendor = Arc::new(Vendor { calls: AtomicUsize::new(0) });
+        let vm = manager(Arc::clone(&vendor));
+        let results = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let r = Arc::clone(&results);
+        vm.on_stt_result(move |res| {
+            r.lock().push(res);
+            Box::pin(async {})
+        })
+        .await
+        .unwrap();
+        vm.test_connect_stt().await.unwrap();
+        feed(&vm, 200, false).await;
+        feed(&vm, 400, true).await;
+        let out = vm.flush_stt().await.expect("the engine flushes");
+        assert!(out.result_follows && out.will_upload);
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let got = results.lock().clone();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].transcript, "segment 1");
+        // finalize_stt on the same session: a flush, never a disconnect.
+        vm.finalize_stt().await.unwrap();
+    }
+}

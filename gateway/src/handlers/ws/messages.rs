@@ -325,6 +325,14 @@ pub enum OutgoingMessage {
         #[serde(skip_serializing_if = "Option::is_none")]
         #[cfg_attr(feature = "openapi", schema(example = "opus"))]
         audio_out_codec: Option<String>,
+        /// What speech-to-text this session got: streaming, segmented (the gateway cuts the
+        /// caller's audio at pauses and uploads each utterance) or buffered, the kind of interim
+        /// results, who decides where an utterance ends, the expected latency and its basis, and
+        /// notices. The fields are defined in `docs/segmented-stt/customer-contract-reference.md`.
+        /// Absent when the rollout switch does not cover the session.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(value_type = Option<Object>))]
+        stt: Option<Box<serde_json::Value>>,
     },
     #[serde(rename = "stt_result")]
     STTResult {
@@ -373,6 +381,45 @@ pub enum OutgoingMessage {
     Error {
         /// Error message
         message: String,
+    },
+    /// An `error` with a stable code. Same `type` as [`Self::Error`]; an uncoded error keeps its
+    /// exact bytes. `recoverable: true` means the socket is still usable (a refusal made before
+    /// the session id is stored accepts a corrected `config`).
+    #[serde(rename = "error")]
+    CodedError {
+        message: String,
+        code: String,
+        recoverable: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(value_type = Option<Object>))]
+        details: Option<serde_json::Value>,
+    },
+    /// Detector-timed speech events (segmented sessions) and the gateway's turn decisions.
+    /// `event`: `speech_start`, `speech_end`, `turn_start`, `turn_end`, `turn_closed`.
+    #[serde(rename = "vad_event")]
+    VadEvent {
+        event: String,
+        turn_id: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        audio_ms: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sustained_ms: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        discarded: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        had_transcript: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    /// A speech-to-text problem that does not end the call (a lost segment, dropped audio). Never
+    /// sent as `error`, which deployed widgets treat as a disconnect.
+    #[serde(rename = "stt_warning")]
+    SttWarning {
+        code: String,
+        message: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(value_type = Option<Object>))]
+        detail: Option<serde_json::Value>,
     },
     /// Non-fatal configuration advisory (D1 / REALTIME_REASONING.md §7.4).
     ///
@@ -755,6 +802,7 @@ mod tests {
     fn test_ready_message_serialization_full() {
         let ready = OutgoingMessage::Ready {
             protocol_version: PROTOCOL_VERSION.to_string(),
+            stt: None,
             stream_id: "test-stream-123".to_string(),
             livekit_room_name: Some("room-456".to_string()),
             livekit_url: Some("ws://localhost:7880".to_string()),
@@ -778,6 +826,7 @@ mod tests {
         // assert it on connect (plan W-K1 / exit E9).
         let ready = OutgoingMessage::Ready {
             protocol_version: PROTOCOL_VERSION.to_string(),
+            stt: None,
             stream_id: "proto-stream".to_string(),
             livekit_room_name: None,
             livekit_url: None,
@@ -800,6 +849,7 @@ mod tests {
     fn test_ready_message_serialization_minimal() {
         let ready = OutgoingMessage::Ready {
             protocol_version: PROTOCOL_VERSION.to_string(),
+            stt: None,
             stream_id: "minimal-stream".to_string(),
             livekit_room_name: None,
             livekit_url: None,
@@ -826,6 +876,7 @@ mod tests {
 
         let ready = OutgoingMessage::Ready {
             protocol_version: PROTOCOL_VERSION.to_string(),
+            stt: None,
             stream_id: uuid.clone(),
             livekit_room_name: None,
             livekit_url: None,
@@ -845,6 +896,7 @@ mod tests {
     fn test_ready_message_stream_id_position() {
         let ready = OutgoingMessage::Ready {
             protocol_version: PROTOCOL_VERSION.to_string(),
+            stt: None,
             stream_id: "first-field".to_string(),
             livekit_room_name: Some("room".to_string()),
             livekit_url: None,
@@ -874,6 +926,7 @@ mod tests {
         // SDK can detect a downgrade; absent fields mean default linear16 (no new wire surface).
         let with_opus = OutgoingMessage::Ready {
             protocol_version: PROTOCOL_VERSION.to_string(),
+            stt: None,
             stream_id: "codec-stream".to_string(),
             livekit_room_name: None,
             livekit_url: None,
@@ -893,6 +946,7 @@ mod tests {
         // Default session (no codec requested) omits both fields entirely.
         let default = OutgoingMessage::Ready {
             protocol_version: PROTOCOL_VERSION.to_string(),
+            stt: None,
             stream_id: "default-stream".to_string(),
             livekit_room_name: None,
             livekit_url: None,
