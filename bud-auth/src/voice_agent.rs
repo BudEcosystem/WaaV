@@ -63,7 +63,18 @@ pub struct AgentTurnDetection {
     /// `low` | `medium` | `high` | `auto`.
     pub eagerness: String,
     pub silence_ms: u64,
-    pub max_endpointing_ms: u64,
+    /// The longest silence before the turn ends, when the agent chose one. Optional so a value
+    /// left out can be told from a chosen one; the gateway still reads exactly 3,000 (the default
+    /// Bud publishes) as unset until Bud stops publishing it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_endpointing_ms: Option<u64>,
+}
+
+impl AgentTurnDetection {
+    /// The ceiling the agent chose, or `None` when it left the default.
+    pub fn chosen_max_endpointing_ms(&self) -> Option<u64> {
+        self.max_endpointing_ms.filter(|v| *v != 3000)
+    }
 }
 
 impl Default for AgentTurnDetection {
@@ -72,7 +83,7 @@ impl Default for AgentTurnDetection {
             kind: "semantic".into(),
             eagerness: "auto".into(),
             silence_ms: 500,
-            max_endpointing_ms: 3000,
+            max_endpointing_ms: None,
         }
     }
 }

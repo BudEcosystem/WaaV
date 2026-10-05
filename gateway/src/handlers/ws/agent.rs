@@ -43,6 +43,7 @@ fn kind_str(kind: TurnKind) -> &'static str {
     match kind {
         TurnKind::Agent => "agent",
         TurnKind::Greeting => "greeting",
+        TurnKind::Notice => "notice",
     }
 }
 

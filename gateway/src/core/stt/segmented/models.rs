@@ -9,7 +9,9 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 
 use parking_lot::RwLock;
-use waav_segmented_stt::detector::{DetectorError, DetectorFactory, EnergyDetector, SpeechDetector};
+#[cfg(feature = "silero-vad")]
+use waav_segmented_stt::detector::DetectorError;
+use waav_segmented_stt::detector::{DetectorFactory, EnergyDetector, SpeechDetector};
 use waav_segmented_stt::endpointer::{EndOfTurnError, EndOfTurnModel, EndOfTurnTextModel};
 use waav_segmented_stt::types::{DetectorFallback, DetectorKind};
 

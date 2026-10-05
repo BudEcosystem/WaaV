@@ -33,8 +33,8 @@ pub use credentials::{
 };
 pub use endpoint_config::{
     Pronunciation, RealtimeDefaults, RealtimeLimits, RealtimePolicy, RealtimeSettings,
-    RealtimeTranscription, SttSettings, TranslationSettings, TtsSettings, VoiceDescriptor,
-    VoiceEndpointSettings,
+    OverrideLatency, OverrideLimits, RealtimeTranscription, SttCapabilityOverride, SttSegmented,
+    SttSettings, TranslationSettings, TtsSettings, VoiceDescriptor, VoiceEndpointSettings,
 };
 pub use guards::{Denied, EscalationPermit, KeyShape, MissGuardConfig, MissGuards};
 pub use hash::hash_api_key;

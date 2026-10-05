@@ -427,7 +427,9 @@ pub mod error;
 pub mod handler;
 pub mod messages;
 pub mod processor;
+pub mod segmented_session;
 pub mod state;
+pub mod stt_contract;
 
 #[cfg(test)]
 mod tests;

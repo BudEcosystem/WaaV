@@ -344,6 +344,7 @@ fn default_alias_stt() -> STTWebSocketConfig {
         extras: Default::default(),
         translation: None,
         turn_detection: None,
+        transcription_mode: None,
         audio_in_codec: None,
     }
 }

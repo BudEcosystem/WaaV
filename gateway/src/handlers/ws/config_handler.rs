@@ -190,6 +190,13 @@ pub async fn handle_config_message(
         }
     }
 
+    // What the client itself asked of speech-to-text, before any deployment's settings are laid
+    // over its config: `vad_events` and a named model.
+    let client_vad_events = stt_ws_config.as_ref().and_then(|s| s.features.vad_events);
+    let client_named_model = stt_ws_config
+        .as_ref()
+        .is_some_and(|s| !s.model.trim().is_empty() && app_state.bud_mode.is_none());
+
     // FRD-023 RT0 (X-1, X-2): in Bud mode a client never chooses where a platform-side call goes
     // or which credential it carries. Refused before anything is built, so nothing is dialled.
     if app_state.bud_mode.is_some()
@@ -354,6 +361,49 @@ pub async fn handle_config_message(
         }
     }
 
+    // Segmented speech-to-text: how this session's model is reached on a live call, decided once
+    // and before anything is built. A refused session holds nothing (its leg admissions are
+    // released as `bud_legs` drops) and may send a corrected `config` on the same socket.
+    let live_setup = match stt_ws_config.as_ref().filter(|_| audio_enabled) {
+        Some(stt) => {
+            let shared = &app_state.core_state.stt_live;
+            let kind = super::segmented_session::session_kind(
+                resolved_agent.as_ref(),
+                conversation_ws_config.is_some(),
+                dag_ws_config.is_some(),
+                stt,
+            );
+            let leg = bud_legs.as_ref().and_then(|l| l.stt_leg.clone());
+            let setup = super::segmented_session::resolve(
+                shared,
+                stt,
+                kind,
+                leg,
+                resolved_agent.as_ref(),
+                client_vad_events,
+                client_named_model,
+            );
+            if let Some(refusal) = super::segmented_session::refusal_message(
+                &setup,
+                shared,
+                resolved_agent.as_ref().map(|a| a.prompt_name.as_str()),
+            ) {
+                warn!(
+                    provider = %setup.live.resolution.provider,
+                    row = %setup.live.resolution.row_id,
+                    "Refusing a live session the capability map cannot serve"
+                );
+                send_critical(message_tx, MessageRoute::Outgoing(refusal)).await;
+                return true;
+            }
+            for warning in super::stt_contract::config_warnings(&setup.live) {
+                send_critical(message_tx, MessageRoute::Outgoing(warning)).await;
+            }
+            Some(setup)
+        }
+        None => None,
+    };
+
     if bud_legs.is_none()
         && let Some(tts) = tts_ws_config.as_mut()
     {
@@ -419,10 +469,23 @@ pub async fn handle_config_message(
             app_state,
             message_tx,
             bud_legs.as_ref(),
+            live_setup.as_ref(),
         )
         .await
         {
             Some(vm) => {
+                // A segmented session: its engine's events reach the client and metering bills
+                // uploaded seconds.
+                if let Some(setup) = live_setup.as_ref().filter(|_| vm.is_gateway_endpointed()) {
+                    let tracker = state.read().await.task_tracker.clone();
+                    super::segmented_session::wire(
+                        &vm,
+                        setup,
+                        message_tx,
+                        bud_legs.as_ref().map(|l| Arc::clone(&l.meter)),
+                        &tracker,
+                    );
+                }
                 // FRD-023 RT6: the session now holds its legs' admissions; meter each leg (STT
                 // per final transcript, TTS per synthesis) and revalidate the caller.
                 if let Some(legs) = bud_legs.take() {
@@ -773,6 +836,10 @@ pub async fn handle_config_message(
         }
         false
     };
+
+    if let Some(setup) = live_setup.as_ref() {
+        ready_stt = super::segmented_session::ready_stt(setup, &app_state.core_state.stt_live, voice_manager.as_ref()).await;
+    }
 
     // Send ready message with optional LiveKit room information
     // (D8 audio_in_codec/audio_out_codec were negotiated early, before the audio pipeline.)
@@ -1811,6 +1878,7 @@ async fn initialize_voice_manager(
     app_state: &Arc<AppState>,
     message_tx: &mpsc::Sender<MessageRoute>,
     bud_legs: Option<&super::bud_legs::PreparedLegs>,
+    live_setup: Option<&super::segmented_session::LiveSetup>,
 ) -> Option<Arc<VoiceManager>> {
     info!(
         "Initializing voice manager with STT provider: {} and TTS provider: {}",
@@ -1922,6 +1990,7 @@ async fn initialize_voice_manager(
     // `create_stt_standard`/`create_tts_standard` → `from_standard` instead of dropping features
     // on the flat factory path. The flat `stt_config`/`tts_config` are still derived (== the
     // standardized bases) for cache hashing and other flat consumers below.
+    let segmented_key = stt_api_key.clone();
     let standard_stt = stt_ws_config.to_standard_stt(stt_api_key);
     let mut standard_tts = tts_ws_config.to_standard_tts(tts_api_key);
     if let Some(legs) = bud_legs {
@@ -1983,6 +2052,41 @@ async fn initialize_voice_manager(
                  silero-vad features — session degrades to timer fallback"
             );
             crate::core::metrics::bridge::record_degraded("turn_detection", "feature_not_built");
+        }
+    }
+
+    // Segmented speech-to-text: the engine owns its own detector, so the continuous smart-turn
+    // pipeline is not built for the session.
+    if let Some(setup) = live_setup.filter(|s| {
+        s.live.decision == crate::core::stt::segmented::live::LiveDecision::Segmented
+    }) {
+        match crate::core::stt::segmented::live::build_plan(
+            &app_state.core_state.stt_live,
+            &setup.live,
+            &setup.req,
+            segmented_key,
+        ) {
+            Ok(plan) => {
+                #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
+                {
+                    voice_config.smart_turn_config = None;
+                }
+                voice_config = voice_config.with_segmented(plan);
+            }
+            Err(e) => {
+                error!(error = %e, "segmented speech-to-text could not be planned");
+                send_critical(
+                    message_tx,
+                    MessageRoute::Outgoing(OutgoingMessage::CodedError {
+                        message: format!("stt_segmentation_unavailable: {e}"),
+                        code: "stt_segmentation_unavailable".into(),
+                        recoverable: true,
+                        details: Some(serde_json::json!({ "reason": "plan_failed" })),
+                    }),
+                )
+                .await;
+                return None;
+            }
         }
     }
 
@@ -2113,9 +2217,11 @@ async fn register_stt_error_callback(
         .on_stt_error(move |error| {
             let message_tx = message_tx_clone.clone();
             Box::pin(async move {
-                let msg = OutgoingMessage::Error {
-                    message: format!("STT streaming error: {error}"),
-                };
+                let msg = super::stt_contract::stt_unavailable(&error.to_string()).unwrap_or(
+                    OutgoingMessage::Error {
+                        message: format!("STT streaming error: {error}"),
+                    },
+                );
                 send_with_policy(
                     &message_tx,
                     MessageRoute::Outgoing(msg),
@@ -3671,6 +3777,7 @@ mod tests {
             extras: Default::default(),
             translation: None,
             turn_detection: None,
+            transcription_mode: None,
         }
     }
 

@@ -152,6 +152,9 @@ pub enum TurnKind {
     Agent,
     /// The static greeting: spoken by WaaV, never part of the agent's history.
     Greeting,
+    /// Something the gateway says itself (a lost turn on a segmented session): never part of the
+    /// agent's history, always interruptible.
+    Notice,
 }
 
 /// Everything a front-end shows, in the order it happened.
@@ -325,6 +328,9 @@ pub struct AgentEngine {
     manual_input: Mutex<String>,
     /// The client's choice of manual turns (GA `turn_detection: null`), over the agent's.
     manual_override: Mutex<Option<bool>>,
+    /// Segmented sessions: the latest caller turn whose final transcript was handled, so a client
+    /// commit waits for the transcript of the turn it sealed instead of a fixed sleep.
+    final_turn: tokio::sync::watch::Sender<u64>,
 }
 
 impl std::fmt::Debug for AgentEngine {
@@ -380,7 +386,96 @@ impl AgentEngine {
             closed: AtomicBool::new(false),
             manual_input: Mutex::new(String::new()),
             manual_override: Mutex::new(None),
+            final_turn: tokio::sync::watch::channel(0).0,
         })
+    }
+
+    /// A segmented session handled the final transcript of caller turn `turn_id`.
+    pub fn note_final_turn(&self, turn_id: u64) {
+        self.final_turn.send_if_modified(|t| {
+            let newer = turn_id > *t;
+            if newer {
+                *t = turn_id;
+            }
+            newer
+        });
+    }
+
+    /// Wait, at most `timeout`, until the final transcript of caller turn `turn_id` was handled.
+    pub async fn wait_final_turn(&self, turn_id: u64, timeout: std::time::Duration) -> bool {
+        let mut rx = self.final_turn.subscribe();
+        tokio::time::timeout(timeout, rx.wait_for(|t| *t >= turn_id))
+            .await
+            .is_ok_and(|r| r.is_ok())
+    }
+
+    /// Whether `text` is probably the agent's own words coming back (no echo cancellation on the
+    /// caller's side): the whole of it appears in what the agent is saying or just said.
+    pub fn is_probable_echo(&self, text: &str) -> bool {
+        let norm = |s: &str| -> String {
+            s.chars()
+                .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+                .collect::<String>()
+                .to_lowercase()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let t = norm(text);
+        if t.split_whitespace().count() < 2 {
+            return false;
+        }
+        let spoken = {
+            let active = self.turn.lock().as_ref().map(|a| a.shared.lock().generated.clone());
+            let last = self.last.lock().as_ref().map(|(_, s)| s.lock().generated.clone());
+            format!("{} {}", active.unwrap_or_default(), last.unwrap_or_default())
+        };
+        norm(&spoken).contains(&t)
+    }
+
+    /// Say `text` as the gateway's own notice: not part of the agent's history, interruptible.
+    pub async fn speak_notice(self: &Arc<Self>, text: &str) {
+        let text = text.trim().to_string();
+        if text.is_empty() || self.is_closed() {
+            return;
+        }
+        let id = self.next_turn.fetch_add(1, Ordering::AcqRel);
+        let token = CancellationToken::new();
+        let shared = Arc::new(Mutex::new(TurnShared::new(TurnKind::Notice)));
+        *self.turn.lock() = Some(ActiveTurn {
+            id,
+            token: token.clone(),
+            shared: Arc::clone(&shared),
+        });
+        self.signal(AgentSignal::ResponseStarted {
+            turn: id,
+            kind: TurnKind::Notice,
+            input: None,
+        });
+        let text_only = self.cfg.lock().text_only;
+        let epoch = self.speech.clear_epoch();
+        let mut spoke = true;
+        if !text_only {
+            let speech = transform_for_speech(&text, &self.entry.text_transforms);
+            let mark = self.speech.audio_out_ms();
+            spoke = self.speech.speak(&speech, epoch, true).await;
+            if spoke {
+                shared.lock().ledger.push(&text, &speech, false, mark);
+            }
+        }
+        if spoke {
+            shared.lock().transcript = text.clone();
+            self.signal(AgentSignal::Transcript { turn: id, delta: text });
+        }
+        if !text_only {
+            self.drain(&token, &shared).await;
+        }
+        let status = if token.is_cancelled() {
+            TurnStatus::Cancelled
+        } else {
+            TurnStatus::Completed
+        };
+        self.finish(id, &shared, status, None);
     }
 
     pub fn entry(&self) -> &Arc<VoiceAgentEntry> {
@@ -480,7 +575,7 @@ impl AgentEngine {
         match kind {
             Some(TurnKind::Greeting) => self.entry.greeting.interruptible,
             Some(TurnKind::Agent) => self.entry.interruption.enabled,
-            None => true,
+            Some(TurnKind::Notice) | None => true,
         }
     }
 
