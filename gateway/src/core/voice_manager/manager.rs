@@ -838,6 +838,29 @@ impl VoiceManager {
         Ok(true)
     }
 
+    /// Epoch-gated delivery of audio the gateway made itself (a voice agent's tool-call tone). It
+    /// goes out the way TTS audio does: after what is queued, counted in the playout estimate, cut
+    /// by a barge-in. It is not synthesis, so it never marks an utterance as under way. `false`
+    /// when a clear happened since `epoch` or no audio egress is registered.
+    pub async fn play_if_epoch(&self, audio: AudioData, epoch: usize) -> bool {
+        // Held like `speak_if_epoch` holds it, so a concurrent barge-in clear is seen.
+        let _tts = self.tts.write().await;
+        if self.clear_epoch.load(Ordering::Acquire) != epoch {
+            return false;
+        }
+        let Some(egress) = self.tts_audio_callback.read().clone() else {
+            return false;
+        };
+        let completed = self.interruption_state.is_completed.load(Ordering::Acquire);
+        egress(audio).await;
+        if completed {
+            self.interruption_state
+                .is_completed
+                .store(true, Ordering::Release);
+        }
+        true
+    }
+
     /// Every synthesis request passes here: the D-G9 cost proxy and the RT6 speak observer.
     fn note_speak(&self, text: &str) {
         crate::core::metrics::bridge::count_tts_chars(

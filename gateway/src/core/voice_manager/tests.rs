@@ -1612,3 +1612,98 @@ mod greeting_fix {
         assert!(!per_utterance_interruptibility(Some("segmented"), false));
     }
 }
+
+/// A voice agent's tool-call tone reaches the caller like TTS audio, in the session's format, and
+/// never after a barge-in: a clear since the turn's epoch drops it.
+#[tokio::test]
+#[serial]
+async fn a_generated_sound_goes_out_like_speech_and_a_clear_stops_it() {
+    use crate::core::agent::SpeechOut;
+    let vm = ag6_voice_manager();
+    let got: Arc<parking_lot::Mutex<Vec<crate::core::tts::AudioData>>> = Arc::default();
+    let sink = Arc::clone(&got);
+    vm.on_tts_audio(move |a| {
+        let sink = Arc::clone(&sink);
+        Box::pin(async move { sink.lock().push(a) })
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        vm.sound_rate(),
+        Some(24_000),
+        "the default output is 24 kHz PCM16"
+    );
+    let pulse = crate::core::agent::tone::pulse(24_000);
+    let before = vm.audio_out_ms();
+    let epoch = SpeechOut::clear_epoch(&vm);
+    assert!(vm.play_sound(&pulse, epoch).await);
+    {
+        let got = got.lock();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].format, "linear16");
+        assert_eq!(got[0].sample_rate, 24_000);
+        assert_eq!(got[0].data.len(), pulse.len() * 2);
+        assert_eq!(got[0].duration_ms, Some(crate::core::agent::tone::PULSE_MS));
+    }
+    assert_eq!(
+        vm.audio_out_ms() - before,
+        u64::from(crate::core::agent::tone::PULSE_MS),
+        "counted in the playout estimate"
+    );
+    assert!(vm.playout_remaining_ms() > 0);
+    assert!(
+        vm.get_config().tts_config.audio_format.is_some(),
+        "the default config names its format"
+    );
+
+    vm.clear_tts().await.unwrap();
+    assert!(
+        !vm.play_sound(&pulse, epoch).await,
+        "a stale epoch plays nothing"
+    );
+    assert_eq!(got.lock().len(), 1);
+}
+
+#[tokio::test]
+#[serial]
+async fn a_compressed_output_carries_no_generated_sound() {
+    use crate::core::agent::SpeechOut;
+    let tts_config = TTSConfig {
+        provider: "deepgram".to_string(),
+        api_key: "test_key".to_string(),
+        audio_format: Some("mp3".to_string()),
+        ..Default::default()
+    };
+    let stt_config = STTConfig {
+        provider: "deepgram".to_string(),
+        api_key: "test_key".to_string(),
+        ..Default::default()
+    };
+    let vm = VoiceManager::new(VoiceManagerConfig::new(stt_config, tts_config), None).unwrap();
+    assert_eq!(vm.sound_rate(), None);
+    let mulaw = TTSConfig {
+        provider: "deepgram".to_string(),
+        api_key: "test_key".to_string(),
+        audio_format: Some("mulaw".to_string()),
+        sample_rate: Some(8_000),
+        ..Default::default()
+    };
+    let vm = VoiceManager::new(
+        VoiceManagerConfig::new(
+            STTConfig {
+                provider: "deepgram".to_string(),
+                api_key: "test_key".to_string(),
+                ..Default::default()
+            },
+            mulaw,
+        ),
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        vm.sound_rate(),
+        Some(8_000),
+        "telephony mu-law can carry it"
+    );
+}

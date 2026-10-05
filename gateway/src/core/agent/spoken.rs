@@ -32,6 +32,9 @@ pub struct SpokenLedger {
     entries: Vec<Entry>,
     /// The gateway's audio-out counter when this turn's first chunk was sent.
     audio_mark_ms: Option<u64>,
+    /// Audio out since the mark that was not speech (the tool-call tone): it takes playback time
+    /// but carries no text.
+    sound_ms: u64,
 }
 
 /// The heard part of a reply.
@@ -71,25 +74,41 @@ impl SpokenLedger {
         )
     }
 
+    /// A sound (not speech) was delivered: `ms` of audio-out that no chunk accounts for. Before the
+    /// turn's first chunk it is outside the turn's audio already.
+    pub fn push_sound(&mut self, ms: u64) {
+        if self.audio_mark_ms.is_some() {
+            self.sound_ms += ms;
+        }
+    }
+
+    /// `ms` of this turn's audio, less its sounds: the part that was speech. For a client's own
+    /// played position (`audio_end_ms`), which counts every sound it played.
+    pub fn speech_ms(&self, ms: u64) -> u64 {
+        ms.saturating_sub(self.sound_ms)
+    }
+
     /// Every character the TTS vendor received this turn.
     pub fn speech_chars(&self) -> usize {
         self.entries.iter().map(|e| e.speech_chars).sum()
     }
 
-    /// Milliseconds of this turn's audio the user has heard, from the gateway's counters.
+    /// Milliseconds of this turn's speech the user has heard, from the gateway's counters.
     pub fn played_ms(&self, audio_out_ms_now: u64, playout_remaining_ms: u64) -> u64 {
         let Some(mark) = self.audio_mark_ms else {
             return 0;
         };
-        audio_out_ms_now
-            .saturating_sub(mark)
-            .saturating_sub(playout_remaining_ms)
+        self.speech_ms(
+            audio_out_ms_now
+                .saturating_sub(mark)
+                .saturating_sub(playout_remaining_ms),
+        )
     }
 
-    /// The emitted audio length of this turn (for rate calibration once it has all played).
+    /// The emitted speech length of this turn (for rate calibration once it has all played).
     pub fn emitted_ms(&self, audio_out_ms_now: u64) -> u64 {
         self.audio_mark_ms
-            .map(|mark| audio_out_ms_now.saturating_sub(mark))
+            .map(|mark| self.speech_ms(audio_out_ms_now.saturating_sub(mark)))
             .unwrap_or(0)
     }
 
@@ -217,6 +236,30 @@ mod tests {
             l.push(text, text, *reply, 1000);
         }
         l
+    }
+
+    /// The tool-call tone takes playback time but is not speech: what was heard of the reply, and
+    /// the speaking rate, count speech only.
+    #[test]
+    fn a_sound_is_not_counted_as_speech() {
+        let mut l = SpokenLedger::default();
+        l.push_sound(360);
+        assert_eq!(
+            l.speech_ms(1_000),
+            1_000,
+            "before the first chunk it is not this turn's"
+        );
+        l.push("One moment.", "One moment.", false, 1_000);
+        l.push_sound(360);
+        l.push_sound(360);
+        l.push("Found it.", "Found it.", true, 2_620);
+        // 900 ms of phrase, 720 ms of tone, 500 ms of the reply delivered; 200 ms still queued.
+        assert_eq!(l.played_ms(3_120, 200), 1_200);
+        assert_eq!(l.emitted_ms(3_120), 1_400);
+        assert_eq!(l.speech_ms(1_620), 900);
+        // Cut in the second pulse: the queued part of the tone is counted out twice, so the
+        // estimate errs short, inside the filler, never into the reply.
+        assert_eq!(l.played_ms(2_620, 180), 720);
     }
 
     #[test]

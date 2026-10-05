@@ -10,6 +10,7 @@ pub mod brain;
 pub mod engine;
 pub mod spoken;
 pub mod text;
+pub mod tone;
 
 pub use brain::{AgentBrain, AgentEvent, AgentTurnRequest, Truncate, TurnFailure};
 pub use engine::{

@@ -37,6 +37,7 @@ use super::spoken::{SpeechRate, SpokenLedger};
 use super::text::{
     CodeFenceFilter, SpeakFieldExtractor, SpeechChunker, chunk_separator, transform_for_speech,
 };
+use super::tone;
 use crate::core::text::ThinkStripper;
 
 // =============================================================================================
@@ -58,6 +59,16 @@ pub trait SpeechOut: Send + Sync + 'static {
     fn audio_out_ms(&self) -> u64;
     /// Delivered audio not played yet, in ms.
     fn playout_remaining_ms(&self) -> u64;
+    /// The sample rate a generated sound (the tool-call tone) is made at, or `None` when this output
+    /// cannot carry one (a compressed TTS format): the agent keeps its phrases instead.
+    fn sound_rate(&self) -> Option<u32> {
+        None
+    }
+    /// Play a generated sound, 16-bit mono PCM at [`Self::sound_rate`], the way speech is played:
+    /// after what is queued, cut by a barge-in. `false` when a clear happened since `epoch`.
+    async fn play_sound(&self, _pcm: &[i16], _epoch: usize) -> bool {
+        false
+    }
 }
 
 #[async_trait]
@@ -87,6 +98,27 @@ impl SpeechOut for crate::core::voice_manager::VoiceManager {
     }
     fn playout_remaining_ms(&self) -> u64 {
         crate::core::voice_manager::VoiceManager::playout_remaining_ms(self)
+    }
+    fn sound_rate(&self) -> Option<u32> {
+        let tts = &self.get_config().tts_config;
+        tone::can_encode(tts.audio_format.as_deref()).then(|| tts.sample_rate.unwrap_or(24_000))
+    }
+    async fn play_sound(&self, pcm: &[i16], epoch: usize) -> bool {
+        let tts = &self.get_config().tts_config;
+        let Some(data) = tone::encode(pcm, tts.audio_format.as_deref()) else {
+            return false;
+        };
+        let rate = tts.sample_rate.unwrap_or(24_000);
+        let audio = crate::core::tts::AudioData {
+            data,
+            sample_rate: rate,
+            format: tts
+                .audio_format
+                .clone()
+                .unwrap_or_else(|| "linear16".to_string()),
+            duration_ms: Some((pcm.len() as u64 * 1000 / u64::from(rate.max(1))) as u32),
+        };
+        self.play_if_epoch(audio, epoch).await
     }
 }
 
@@ -233,6 +265,63 @@ const MAX_DRAIN: Duration = Duration::from_secs(30);
 const DRAIN_QUIET: Duration = Duration::from_millis(600);
 /// How often fillers and the drain are checked.
 const TICK: Duration = Duration::from_millis(100);
+
+/// When a tool's tone starts if the agent has no tool phrase (`tool_call_after_ms` 0).
+const TONE_AFTER: Duration = Duration::from_millis(1_200);
+/// How long the tone waits for a phrase's audio to start arriving before it stops waiting on it
+/// (synthesis failed, or produced nothing).
+const TONE_PHRASE_GRACE: Duration = Duration::from_millis(1_500);
+
+/// The tool-call tone of one turn (D-16): a pulse every [`tone::PERIOD_MS`] while a tool runs,
+/// once the tool's phrase has played.
+struct ToneCursor {
+    pulse: Vec<i16>,
+    next_at: Option<Instant>,
+    /// The last thing this turn sent to TTS: when, and the audio-out counter before it.
+    spoke: Option<(Instant, u64)>,
+    /// The audio-out counter at the previous check: audio still arriving holds the pulse back.
+    last_out: u64,
+}
+
+impl ToneCursor {
+    /// `None` when the agent turned the tone off or the session's output cannot carry it.
+    fn new(fillers: &bud_auth::voice_agent::AgentFillers, speech: &dyn SpeechOut) -> Option<Self> {
+        if !fillers.tool_call_sound {
+            return None;
+        }
+        let rate = speech.sound_rate()?;
+        Some(Self {
+            pulse: tone::pulse(rate),
+            next_at: None,
+            spoke: None,
+            last_out: speech.audio_out_ms(),
+        })
+    }
+
+    /// Text was just sent to TTS; `mark` is the audio-out counter from before.
+    fn spoke(&mut self, mark: u64) {
+        self.spoke = Some((Instant::now(), mark));
+    }
+
+    /// Whether a pulse is due: its period has come round and the output is quiet, with what was
+    /// last said heard first (its audio arrived and played out, or never came).
+    fn due(&mut self, audio_out_ms: u64, playout_remaining_ms: u64) -> bool {
+        let arriving = audio_out_ms != self.last_out;
+        self.last_out = audio_out_ms;
+        if arriving || playout_remaining_ms > 0 {
+            return false;
+        }
+        if self.next_at.is_some_and(|at| Instant::now() < at) {
+            return false;
+        }
+        !matches!(self.spoke, Some((at, mark)) if audio_out_ms <= mark && at.elapsed() < TONE_PHRASE_GRACE)
+    }
+
+    fn played(&mut self, audio_out_ms: u64) {
+        self.next_at = Some(Instant::now() + Duration::from_millis(tone::PERIOD_MS));
+        self.last_out = audio_out_ms;
+    }
+}
 
 /// Where a turn is in its filler list (D-16). Each turn starts from the first phrase.
 #[derive(Debug, Default)]
@@ -763,12 +852,14 @@ impl AgentEngine {
         if s.kind != TurnKind::Agent || (s.truncated_exact && exact_ms.is_none()) {
             return;
         }
-        let played = exact_ms.unwrap_or_else(|| {
-            s.ledger.played_ms(
-                self.speech.audio_out_ms(),
-                self.speech.playout_remaining_ms(),
-            )
-        });
+        let played = exact_ms
+            .map(|ms| s.ledger.speech_ms(ms))
+            .unwrap_or_else(|| {
+                s.ledger.played_ms(
+                    self.speech.audio_out_ms(),
+                    self.speech.playout_remaining_ms(),
+                )
+            });
         let prefix = s
             .ledger
             .spoken_prefix(played, self.rate.lock().chars_per_ms());
@@ -991,6 +1082,13 @@ impl AgentEngine {
             first_token_at: None,
         };
         let mut tools: HashMap<String, (String, Instant, bool)> = HashMap::new();
+        let mut tone = (!text_only)
+            .then(|| ToneCursor::new(&self.entry.fillers, self.speech.as_ref()))
+            .flatten();
+        let tone_after = match self.entry.fillers.tool_call_after_ms {
+            0 => TONE_AFTER,
+            ms => Duration::from_millis(ms),
+        };
         let mut status = TurnStatus::Completed;
         let mut usage: Option<Value> = None;
         let mut failure: Option<TurnFailure> = None;
@@ -1029,12 +1127,15 @@ impl AgentEngine {
                     Some(Ok(AgentEvent::ToolStarted { item_id, name, .. })) => {
                         // The text before a tool call is a finished thought ("Let me check."): say it
                         // now. Held, it would be heard after the tool's fillers, run into the answer.
-                        if !text_only
-                            && let Some(held) = pump.chunker.flush()
-                            && !self.speak_chunk(id, &shared, &mut pump, &held, epoch, &token).await
-                        {
-                            status = TurnStatus::Cancelled;
-                            break;
+                        let mark = self.speech.audio_out_ms();
+                        if !text_only && let Some(held) = pump.chunker.flush() {
+                            if !self.speak_chunk(id, &shared, &mut pump, &held, epoch, &token).await {
+                                status = TurnStatus::Cancelled;
+                                break;
+                            }
+                            if let Some(t) = tone.as_mut() {
+                                t.spoke(mark);
+                            }
                         }
                         self.signal(AgentSignal::Tool { turn: id, item_id: item_id.clone(), name: name.clone(), status: "in_progress" });
                         tools.insert(item_id, (name, Instant::now(), false));
@@ -1084,11 +1185,27 @@ impl AgentEngine {
                                 // Timed from when it was due, like the list's phrases: speaking
                                 // waits on synthesis, which would stretch the next gap.
                                 filler.last_at = Some(Instant::now());
+                                let mark = self.speech.audio_out_ms();
                                 self.speak_aside(id, &shared, &phrase, epoch).await;
+                                if let Some(t) = tone.as_mut() {
+                                    t.spoke(mark);
+                                }
                             }
                         }
                     }
-                    if list_filler_due(fillers, filler.last_at, started, pump.spoke_reply, !tools.is_empty()) {
+                    // The tone fills a tool's wait once its phrase is said: no list phrase over it,
+                    // and the list resumes a full gap after it ends.
+                    if let Some(t) = tone.as_mut()
+                        && tools.values().any(|(_, since, _)| since.elapsed() >= tone_after)
+                    {
+                        filler.last_at = Some(Instant::now());
+                        if t.due(self.speech.audio_out_ms(), self.speech.playout_remaining_ms()) {
+                            if self.speech.play_sound(&t.pulse, epoch).await {
+                                shared.lock().ledger.push_sound(u64::from(tone::PULSE_MS));
+                            }
+                            t.played(self.speech.audio_out_ms());
+                        }
+                    } else if list_filler_due(fillers, filler.last_at, started, pump.spoke_reply, !tools.is_empty()) {
                         filler.last_at = Some(Instant::now());
                         if let Some(phrase) = filler.take(&fillers.messages) {
                             self.speak_aside(id, &shared, &phrase, epoch).await;
