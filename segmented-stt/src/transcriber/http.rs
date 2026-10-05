@@ -32,6 +32,10 @@ pub struct HttpSettings {
     /// Equal to the largest depth the warming rule asks for, so the cap never undoes a warm-up.
     pub pool_max_idle_per_host: usize,
     pub tcp_keepalive: Duration,
+    /// The operator's escape hatch (the gateway's `WAAV_ALLOW_LOOPBACK_ENDPOINTS`, for local
+    /// development and tests): the public pool may then connect to private addresses, and a base
+    /// a client named may be one.
+    pub public_may_reach_private: bool,
 }
 
 impl Default for HttpSettings {
@@ -43,6 +47,7 @@ impl Default for HttpSettings {
             pool_idle_timeout: Duration::from_millis(50_000),
             pool_max_idle_per_host: 64,
             tcp_keepalive: Duration::from_secs(15),
+            public_may_reach_private: false,
         }
     }
 }
@@ -164,14 +169,22 @@ impl UploadClients {
         let http2 = if settings.http2_hosts.is_empty() {
             None
         } else {
-            Some((build(settings, false)?, build(settings, false)?))
+            Some((
+                build(settings, false, !settings.public_may_reach_private)?,
+                build(settings, false, false)?,
+            ))
         };
         Ok(Self {
-            public: build(settings, true)?,
-            trusted: build(settings, true)?,
+            public: build(settings, true, !settings.public_may_reach_private)?,
+            trusted: build(settings, true, false)?,
             http2,
             settings: settings.clone(),
         })
+    }
+
+    /// Whether a base a client named may be a private address (the operator's escape hatch).
+    pub fn public_may_reach_private(&self) -> bool {
+        self.settings.public_may_reach_private
     }
 
     /// The HTTP/1.1 client for public vendor hosts, or for a trusted in-cluster base.
@@ -198,7 +211,7 @@ impl UploadClients {
     }
 }
 
-fn build(s: &HttpSettings, http1_only: bool) -> Result<reqwest::Client, String> {
+fn build(s: &HttpSettings, http1_only: bool, public_only: bool) -> Result<reqwest::Client, String> {
     let b = reqwest::Client::builder()
         .use_rustls_tls()
         .redirect(Policy::none())
@@ -208,6 +221,11 @@ fn build(s: &HttpSettings, http1_only: bool) -> Result<reqwest::Client, String> 
         .pool_max_idle_per_host(s.pool_max_idle_per_host)
         .tcp_keepalive(s.tcp_keepalive)
         .tcp_nodelay(true);
+    let b = if public_only {
+        b.dns_resolver(std::sync::Arc::new(PublicOnlyResolver))
+    } else {
+        b
+    };
     let b = if http1_only {
         b.http1_only()
     } else {
@@ -217,6 +235,97 @@ fn build(s: &HttpSettings, http1_only: bool) -> Result<reqwest::Client, String> 
     };
     b.build()
         .map_err(|e| format!("could not build the segment upload client: {e}"))
+}
+
+/// The public pool's resolver: a name is used only through its public addresses, so a vendor host
+/// (or a host a client named) that resolves to a private, loopback or metadata address is never
+/// dialled. An IP literal skips resolution; [`check_untrusted_base`] refuses those at plan time.
+struct PublicOnlyResolver;
+
+impl reqwest::dns::Resolve for PublicOnlyResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        Box::pin(async move {
+            let host = name.as_str().to_string();
+            let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host.as_str(), 0))
+                .await?
+                .filter(|a| is_public_ip(&a.ip()))
+                .collect();
+            if addrs.is_empty() {
+                return Err(format!(
+                    "'{host}' resolves only to private addresses (SSRF protection)"
+                )
+                .into());
+            }
+            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+/// Whether an address is on the public internet: not loopback, private, link-local (cloud
+/// metadata), carrier-grade NAT, unspecified, broadcast, documentation, benchmarking, reserved or
+/// multicast; an IPv4-mapped IPv6 address is judged as its IPv4 address.
+pub fn is_public_ip(ip: &std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            !(v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.is_multicast()
+                || o[0] == 0
+                || (o[0] == 100 && (64..128).contains(&o[1]))
+                || (o[0] == 198 && (o[1] == 18 || o[1] == 19))
+                || o[0] >= 240)
+        }
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_public_ip(&IpAddr::V4(v4));
+            }
+            let seg = v6.segments();
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (seg[0] & 0xfe00) == 0xfc00
+                || (seg[0] & 0xffc0) == 0xfe80
+                || seg[0] == 0x2001 && seg[1] == 0x0db8)
+        }
+    }
+}
+
+/// A base address a client named (not one from a Bud deployment record): `http` or `https`, and
+/// not a private address or `localhost`. Names are checked again at connect time by the public
+/// pool's resolver. `allow_private` is the operator's escape hatch.
+pub fn check_untrusted_base(base: &str, allow_private: bool) -> Result<(), String> {
+    let u = url::Url::parse(base.trim())
+        .map_err(|e| format!("'{base}' is not a valid address: {e}"))?;
+    if !matches!(u.scheme(), "http" | "https") {
+        return Err(format!(
+            "'{base}': only http and https addresses are accepted"
+        ));
+    }
+    if allow_private {
+        return Ok(());
+    }
+    match u.host() {
+        Some(url::Host::Ipv4(ip)) if !is_public_ip(&ip.into()) => Err(format!(
+            "'{base}' is a private or loopback address (SSRF protection)"
+        )),
+        Some(url::Host::Ipv6(ip)) if !is_public_ip(&ip.into()) => Err(format!(
+            "'{base}' is a private or loopback address (SSRF protection)"
+        )),
+        Some(url::Host::Domain(d))
+            if d.eq_ignore_ascii_case("localhost")
+                || d.to_ascii_lowercase().ends_with(".localhost") =>
+        {
+            Err(format!("'{base}' is a loopback address (SSRF protection)"))
+        }
+        None => Err(format!("'{base}' has no host")),
+        _ => Ok(()),
+    }
 }
 
 /// The limiter, breaker and pool key of a URL: `scheme://host:port`, lower case, with the port
@@ -380,6 +489,91 @@ mod tests {
         );
         assert_eq!(host_key("http://127.0.0.1:9/a?b=c"), "http://127.0.0.1:9");
         assert_eq!(host_key("http://[::1]:8080/"), "http://[::1]:8080");
+    }
+
+    /// The public pool serves vendor hosts, and on a standalone session a host the client named:
+    /// it must never connect to a private address, whatever the name resolves to (DNS rebinding).
+    #[tokio::test]
+    async fn the_public_pool_never_reaches_a_private_address_by_name() {
+        let (addr, _) = counting_server().await;
+        let by_name = format!("http://localhost:{}/v1/audio/transcriptions", addr.port());
+        let clients = UploadClients::new(&HttpSettings::default()).unwrap();
+        let refused = clients.client(false).head(by_name.as_str()).send().await;
+        assert!(refused.is_err(), "localhost resolves only to loopback");
+        let trusted = clients.client(true).head(by_name.as_str()).send().await;
+        assert!(
+            trusted.is_ok(),
+            "a Bud deployment's in-cluster base may be private"
+        );
+
+        let dev = UploadClients::new(&HttpSettings {
+            public_may_reach_private: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(
+            dev.client(false)
+                .head(by_name.as_str())
+                .send()
+                .await
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn only_public_addresses_pass_the_filter() {
+        use std::net::IpAddr;
+        let ips: Vec<IpAddr> = [
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.16.0.9",
+            "192.168.1.1",
+            "169.254.169.254",
+            "100.64.0.1",
+            "0.0.0.0",
+            "224.0.0.1",
+            "::1",
+            "fd00::1",
+            "fe80::1",
+            "::ffff:10.0.0.1",
+            "93.184.216.34",
+            "2606:4700:4700::1111",
+        ]
+        .iter()
+        .map(|s| s.parse().unwrap())
+        .collect();
+        let public: Vec<String> = ips
+            .iter()
+            .filter(|ip| is_public_ip(ip))
+            .map(|ip| ip.to_string())
+            .collect();
+        assert_eq!(public, vec!["93.184.216.34", "2606:4700:4700::1111"]);
+    }
+
+    #[test]
+    fn a_client_named_base_must_be_public() {
+        for bad in [
+            "http://127.0.0.1:9/v1",
+            "http://localhost/v1",
+            "https://169.254.169.254/latest",
+            "http://[::1]/v1",
+            "http://10.0.0.5:8000",
+            "ftp://files.example.com",
+            "not a url",
+        ] {
+            assert!(check_untrusted_base(bad, false).is_err(), "{bad}");
+        }
+        for good in ["https://api.example.com/v1", "http://asr.example.com:8000"] {
+            assert!(check_untrusted_base(good, false).is_ok(), "{good}");
+        }
+        assert!(
+            check_untrusted_base("http://127.0.0.1:9/v1", true).is_ok(),
+            "the operator's escape hatch"
+        );
+        assert!(
+            check_untrusted_base("ftp://x.example.com", true).is_err(),
+            "never another scheme"
+        );
     }
 
     #[test]

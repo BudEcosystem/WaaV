@@ -490,6 +490,8 @@ struct Engine {
     idle_frames: u32,
     detector_kind: DetectorKind,
     language: Option<String>,
+    /// The session language vote, while the session has no language (addendum B7).
+    vote: Option<crate::transcriber::language_vote::LanguageVote>,
     last_run_start: Option<u64>,
 }
 
@@ -516,6 +518,10 @@ impl Engine {
             thresholds: LadderThresholds::from_profile(&p),
             segmenter: Segmenter::new(&p),
             language: cfg.language.clone(),
+            vote: cfg
+                .language
+                .is_none()
+                .then(crate::transcriber::language_vote::LanguageVote::new),
             p,
             cfg,
             frontend,
@@ -568,7 +574,13 @@ impl Engine {
                         self.drive();
                         let _ = reply.send(outcome);
                     }
-                    Some(Ingest::Language(l)) => self.language = l,
+                    Some(Ingest::Language(l)) => {
+                        // A language the client chose is never overridden by the vote.
+                        if l.is_some() {
+                            self.vote = None;
+                        }
+                        self.language = l;
+                    }
                     None => break,
                 },
                 _ = tick.tick() => self.on_tick(),
@@ -1330,7 +1342,16 @@ impl Engine {
                                 .admission
                                 .agent_spoke_since_previous_segment,
                         };
-                        match evaluate(t, &ev, &self.cfg.quality) {
+                        let verdict = evaluate(t, &ev, &self.cfg.quality);
+                        if matches!(verdict, QualityVerdict::Keep { .. })
+                            && let Some(vote) = self.vote.as_mut()
+                            && let Some(lang) = vote.record(t.detected_language.as_deref())
+                        {
+                            tracing::info!(language = %lang, "segmented speech-to-text: session language agreed and pinned");
+                            self.language = Some(lang);
+                            self.vote = None;
+                        }
+                        match verdict {
                             QualityVerdict::Keep { text, suspect, .. } => (
                                 turn_id,
                                 SegmentResultKind::Text,

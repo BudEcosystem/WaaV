@@ -14,6 +14,7 @@
 //! | [`map`] | The capability map: one row per provider and model saying how a live call reaches it |
 //! | [`resolve`] | The resolver: reads the map once per session and picks a transport or a named refusal |
 //! | [`rollout`] | The rollout switch, the allow-list and the effective release |
+//! | [`control`] | The control record: deployments and rows switched off on a running gateway |
 //! | [`audio`] | Wire bytes to 16 kHz mono frames, and WAV encoding |
 //! | [`profile`] | Every engine threshold, merged from defaults, the capability row and the session |
 //! | [`detector`] | The speech detector trait, the energy detector and a scripted detector for tests |
@@ -28,6 +29,7 @@
 //! | [`types`] | The values the engine reports: speech activity, outcomes, facts, notices |
 
 pub mod audio;
+pub mod control;
 pub mod detector;
 pub mod endpointer;
 pub mod engine;

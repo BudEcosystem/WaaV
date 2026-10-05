@@ -950,6 +950,75 @@ async fn the_session_language_travels_with_every_upload() {
     assert_eq!(langs, vec![Some("en".into()), Some("de".into())]);
 }
 
+fn detected(lang: &'static str) -> Responder {
+    Arc::new(move |_, _| {
+        (
+            ms(100),
+            Ok(SegmentTranscript {
+                text: "words".into(),
+                detected_language: Some(lang.into()),
+                ..Default::default()
+            }),
+        )
+    })
+}
+
+async fn utterances(h: &Harness, n: usize) {
+    h.silence(200).await;
+    for _ in 0..n {
+        h.speech(600).await;
+        h.silence(800).await;
+    }
+}
+
+fn languages_sent(h: &Harness) -> Vec<Option<String>> {
+    h.upload
+        .calls
+        .lock()
+        .iter()
+        .map(|c| c.language.clone())
+        .collect()
+}
+
+/// Addendum B7: with no session language, two segments the vendor detected alike pin it for every
+/// later upload.
+#[tokio::test(start_paused = true)]
+async fn two_agreeing_segments_pin_the_session_language_for_later_uploads() {
+    let h = Harness::with_config(
+        EngineConfig::new(SegmentProfile::for_tests()),
+        detected("english"),
+        None,
+        None,
+    );
+    utterances(&h, 4).await;
+    assert_eq!(
+        languages_sent(&h),
+        vec![None, None, Some("en".into()), Some("en".into())]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_session_that_named_its_language_never_votes() {
+    let mut cfg = EngineConfig::new(SegmentProfile::for_tests());
+    cfg.language = Some("hi".into());
+    let h = Harness::with_config(cfg, detected("english"), None, None);
+    utterances(&h, 3).await;
+    assert_eq!(languages_sent(&h), vec![Some("hi".into()); 3]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_language_the_client_sets_mid_call_ends_the_vote() {
+    let h = Harness::with_config(
+        EngineConfig::new(SegmentProfile::for_tests()),
+        detected("english"),
+        None,
+        None,
+    );
+    h.handle.set_language(Some("fr".into()));
+    utterances(&h, 3).await;
+    assert_eq!(languages_sent(&h), vec![Some("fr".into()); 3]);
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_refused_credential_reaches_the_fatal_callback_once() {
     let refused: Responder = Arc::new(|_, _| {

@@ -13,6 +13,7 @@ pub mod attempts;
 pub mod breaker;
 pub mod gate;
 pub mod http;
+pub mod language_vote;
 pub mod quality;
 pub mod testing;
 pub mod wire;

@@ -11,7 +11,9 @@ use std::sync::Arc;
 use waav_segmented_stt::endpointer::EndOfTurnTextModel;
 use waav_segmented_stt::engine::EngineConfig;
 use waav_segmented_stt::limits::{LatencyStore, effective_deadline_ms};
-use waav_segmented_stt::live::{TargetSpec, adapter_built, build_transcriber, limit_spec, profile_for, quality_policy, seed_p99};
+use waav_segmented_stt::live::{
+    TargetSpec, adapter_built, build_transcriber, limit_spec, profile_for, quality_policy, seed_p99,
+};
 use waav_segmented_stt::map::{CapabilityMap, Transport};
 use waav_segmented_stt::profile::{EndpointTuning, SegmentProfile, UploadPolicy};
 use waav_segmented_stt::resolve::{
@@ -20,7 +22,9 @@ use waav_segmented_stt::resolve::{
 };
 use waav_segmented_stt::rollout::Rollout;
 use waav_segmented_stt::sequencer::AttemptsUpload;
-use waav_segmented_stt::transcriber::attempts::{RepairMemory, SecondRequestPolicy, SegmentAttempts, SessionHealth};
+use waav_segmented_stt::transcriber::attempts::{
+    RepairMemory, SecondRequestPolicy, SegmentAttempts, SessionHealth,
+};
 use waav_segmented_stt::transcriber::breaker::{BreakerConfig, BreakerRegistry};
 use waav_segmented_stt::transcriber::gate::{BudgetRegistry, LimiterRegistry};
 use waav_segmented_stt::transcriber::http::{HttpSettings, UploadClients};
@@ -44,6 +48,8 @@ pub struct SttLiveShared {
     pub budgets: BudgetRegistry,
     pub repairs: Arc<RepairMemory>,
     pub clients: UploadClients,
+    /// The control record, refreshed from Bud's Redis (see [`spawn_control_refresh`]).
+    pub control: Arc<parking_lot::RwLock<waav_segmented_stt::control::ControlRecord>>,
     pub text_model: Option<Arc<dyn EndOfTurnTextModel>>,
 }
 
@@ -76,7 +82,15 @@ impl SttLiveShared {
         turn_detector: Option<Arc<tokio::sync::RwLock<crate::core::turn_detect::TurnDetector>>>,
     ) -> Result<Self, String> {
         let rollout = Rollout::from_lookup(&get)?;
-        let http = HttpSettings::from_lookup(&get)?;
+        let mut http = HttpSettings::from_lookup(&get)?;
+        // The gateway's one escape hatch for loopback and private vendor addresses (local
+        // development and tests) applies to segmented uploads too.
+        http.public_may_reach_private = get("WAAV_ALLOW_LOOPBACK_ENDPOINTS").is_some_and(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        });
         Ok(Self {
             map: CapabilityMap::embedded(),
             rollout,
@@ -85,14 +99,20 @@ impl SttLiveShared {
                 get("WAAV_STT_SEGMENT_ALLOW_ENERGY_DETECTOR"),
                 false,
             )?,
-            file_only_refusal: parse_flag("WAAV_STT_FILE_ONLY_REFUSAL", get("WAAV_STT_FILE_ONLY_REFUSAL"), true)?,
+            file_only_refusal: parse_flag(
+                "WAAV_STT_FILE_ONLY_REFUSAL",
+                get("WAAV_STT_FILE_ONLY_REFUSAL"),
+                true,
+            )?,
             latency: Arc::new(LatencyStore::new()),
             limiters: LimiterRegistry::new(),
             breakers: BreakerRegistry::new(BreakerConfig::default()),
             budgets: BudgetRegistry::default(),
             repairs: Arc::new(RepairMemory::default()),
             clients: UploadClients::new(&http)?,
-            text_model: turn_detector.map(|t| Arc::new(super::models::TextTurnModel(t)) as Arc<dyn EndOfTurnTextModel>),
+            control: Arc::default(),
+            text_model: turn_detector
+                .map(|t| Arc::new(super::models::TextTurnModel(t)) as Arc<dyn EndOfTurnTextModel>),
         })
     }
 
@@ -117,10 +137,15 @@ impl LiveSessionKind {
     fn resolver_kind(self) -> SessionKind {
         match self {
             Self::Agent { manual: false } => SessionKind::Gateway,
-            Self::Agent { manual: true } | Self::Dag | Self::Conversation { turn_detection: true } => {
-                SessionKind::PushToTalk
+            Self::Agent { manual: true }
+            | Self::Dag
+            | Self::Conversation {
+                turn_detection: true,
+            } => SessionKind::PushToTalk,
+            Self::Conversation {
+                turn_detection: false,
             }
-            Self::Conversation { turn_detection: false } | Self::Plain => SessionKind::Plain,
+            | Self::Plain => SessionKind::Plain,
         }
     }
 
@@ -244,7 +269,8 @@ fn parse_mode(s: &str) -> Option<TranscriptionMode> {
 
 fn language_of(raw: &str) -> Option<String> {
     let l = raw.trim();
-    (!l.is_empty() && !l.eq_ignore_ascii_case("auto") && !l.eq_ignore_ascii_case("multi")).then(|| l.to_string())
+    (!l.is_empty() && !l.eq_ignore_ascii_case("auto") && !l.eq_ignore_ascii_case("multi"))
+        .then(|| l.to_string())
 }
 
 /// The target as the session knows it (no credential).
@@ -263,17 +289,19 @@ fn target_spec(req: &LiveRequest, provider: &str, model: &str) -> TargetSpec {
             spec.extras = leg.provider_params.clone();
         }
         None => {
-            spec.api_base = req
+            // A base the client named is checked before any upload; the operator's
+            // `OPENAI_BASE_URL` is trusted like a deployment record.
+            let named = req
                 .extras
                 .get("base_url")
                 .or_else(|| req.extras.get("api_base"))
-                .cloned()
-                .or_else(|| {
-                    (provider == "openai")
-                        .then(|| std::env::var("OPENAI_BASE_URL").ok())
-                        .flatten()
-                        .filter(|s| !s.trim().is_empty())
-                });
+                .cloned();
+            let operator = (provider == "openai")
+                .then(|| std::env::var("OPENAI_BASE_URL").ok())
+                .flatten()
+                .filter(|s| !s.trim().is_empty());
+            spec.trusted = named.is_none() && operator.is_some();
+            spec.api_base = named.or(operator);
             spec.region = req.extras.get("region").cloned();
             spec.api_version = req.extras.get("api_version").cloned();
             spec.extras = req.extras.clone();
@@ -286,11 +314,16 @@ fn target_spec(req: &LiveRequest, provider: &str, model: &str) -> TargetSpec {
 pub fn resolve_session(shared: &SttLiveShared, req: &LiveRequest) -> LiveResolution {
     let mut extra = Vec::new();
     let seg = req.leg.as_ref().and_then(|l| l.segmented.as_ref());
-    let ovr = req.leg.as_ref().and_then(|l| l.capability_override.as_ref());
+    let ovr = req
+        .leg
+        .as_ref()
+        .and_then(|l| l.capability_override.as_ref());
 
     // The preference: the request's, then the deployment's, then the default. A voice agent's
     // own settings choose for it; a request preference there is ignored with a warning.
-    let deployment_mode = seg.and_then(|s| s.transcription_mode.as_deref()).and_then(parse_mode);
+    let deployment_mode = seg
+        .and_then(|s| s.transcription_mode.as_deref())
+        .and_then(parse_mode);
     let (mut mode, mut mode_source) = match deployment_mode {
         Some(m) => (m, "deployment"),
         None => (TranscriptionMode::Auto, "default"),
@@ -323,11 +356,20 @@ pub fn resolve_session(shared: &SttLiveShared, req: &LiveRequest) -> LiveResolut
     let deployment_name = req.leg.as_ref().map(|l| l.name.clone());
     let deployment_on = seg.and_then(|s| s.enabled) != Some(false);
     let covered = deployment_on
-        && (shared.rollout.covers(req.leg.as_ref().map(|l| l.name.as_str()), &req.provider, &req.model)
-            || req.leg.as_ref().is_some_and(|l| shared.rollout.covers(Some(&l.id), &req.provider, &req.model)));
+        && (shared.rollout.covers(
+            req.leg.as_ref().map(|l| l.name.as_str()),
+            &req.provider,
+            &req.model,
+        ) || req.leg.as_ref().is_some_and(|l| {
+            shared
+                .rollout
+                .covers(Some(&l.id), &req.provider, &req.model)
+        }));
     let tuning_profile = SegmentProfile::default().with_tuning(&req.tuning);
-    let (deadline_ms, deadline_raised) =
-        effective_deadline_ms(seg.and_then(|s| s.deadline_ms), tuning_profile.max_endpointing_ms);
+    let (deadline_ms, deadline_raised) = effective_deadline_ms(
+        seg.and_then(|s| s.deadline_ms),
+        tuning_profile.max_endpointing_ms,
+    );
     if deadline_raised {
         extra.push(ExtraWarning {
             code: "deployment_setting_not_applied",
@@ -358,6 +400,20 @@ pub fn resolve_session(shared: &SttLiveShared, req: &LiveRequest) -> LiveResolut
     rreq.latency_tier = latency_tier;
     rreq.adapter_built = Some(&built);
     let mut resolution = resolve(shared.map, &rreq);
+    // The control record narrows the switch at session start: a listed deployment or row is
+    // resolved as uncovered (today's path or today's refusal), never more.
+    if covered {
+        let names: Vec<&str> = req
+            .leg
+            .iter()
+            .flat_map(|l| [l.name.as_str(), l.id.as_str()])
+            .collect();
+        if shared.control.read().disables(&names, &resolution.row_id) {
+            tracing::info!(row = %resolution.row_id, "segmented speech-to-text switched off for this session by the control record");
+            rreq.covered = false;
+            resolution = resolve(shared.map, &rreq);
+        }
+    }
 
     let mut decision = match resolution.outcome {
         Outcome::Native => LiveDecision::Native,
@@ -390,7 +446,10 @@ pub fn resolve_session(shared: &SttLiveShared, req: &LiveRequest) -> LiveResolut
                 code: "stt_buffered_until_commit".into(),
                 delivery: Delivery::Frame,
                 detail: serde_json::Map::from_iter([
-                    ("provider".to_string(), serde_json::json!(resolution.provider)),
+                    (
+                        "provider".to_string(),
+                        serde_json::json!(resolution.provider),
+                    ),
                     ("model".to_string(), serde_json::json!(req.model)),
                 ]),
             },
@@ -470,24 +529,40 @@ pub fn build_plan(
     let row_id = live.resolution.row_id.clone();
     let limiter_key = format!("{}|{}|{}", info.host_key, cred_tag, info.model);
     let mut lspec = limit_spec(t);
-    if let Some(l) = req.leg.as_ref().and_then(|l| l.capability_override.as_ref()).and_then(|o| o.limits.as_ref()) {
+    if let Some(l) = req
+        .leg
+        .as_ref()
+        .and_then(|l| l.capability_override.as_ref())
+        .and_then(|o| o.limits.as_ref())
+    {
         if let Some(rpm) = l.requests_per_minute {
-            lspec = waav_segmented_stt::transcriber::gate::LimitSpec::from_rpm(rpm, lspec.max_concurrent);
+            lspec = waav_segmented_stt::transcriber::gate::LimitSpec::from_rpm(
+                rpm,
+                lspec.max_concurrent,
+            );
         }
         if let Some(c) = l.max_concurrent_requests {
             lspec.max_concurrent = c.max(1) as usize;
         }
     }
     let limiter = shared.limiters.get(&limiter_key, lspec);
-    let breaker = shared.breakers.get(&format!("{row_id}|{}|{cred_tag}", info.host_key));
-    let budget = shared.budgets.get(&format!("{}|{cred_tag}", live.resolution.provider));
+    let breaker = shared
+        .breakers
+        .get(&format!("{row_id}|{}|{cred_tag}", info.host_key));
+    let budget = shared
+        .budgets
+        .get(&format!("{}|{cred_tag}", live.resolution.provider));
     let low_latency = live.latency_tier == LatencyTier::LowLatency;
     let attempts = SegmentAttempts {
         transcriber,
         breaker,
         limiter: Arc::clone(&limiter),
         budget,
-        policy: if low_latency { SecondRequestPolicy::Hedge } else { SecondRequestPolicy::OnFailureOrStall },
+        policy: if low_latency {
+            SecondRequestPolicy::Hedge
+        } else {
+            SecondRequestPolicy::OnFailureOrStall
+        },
         health: Arc::new(SessionHealth::default()),
         repairs: Arc::clone(&shared.repairs),
         observer: None,
@@ -502,9 +577,11 @@ pub fn build_plan(
         .or_else(|| seed_p99(t));
     shared.latency.seed(&store_key, seed);
     let seg = req.leg.as_ref().and_then(|l| l.segmented.as_ref());
-    let row_timeout = seg
-        .and_then(|s| s.request_timeout_ms)
-        .or_else(|| t.segment_profile.as_ref().and_then(|p| p.request_timeout_ms));
+    let row_timeout = seg.and_then(|s| s.request_timeout_ms).or_else(|| {
+        t.segment_profile
+            .as_ref()
+            .and_then(|p| p.request_timeout_ms)
+    });
     let upload = AttemptsUpload {
         attempts,
         store: Arc::clone(&shared.latency),
@@ -535,7 +612,11 @@ pub fn build_plan(
             }
         }
     }
-    let candidates = req.leg.as_ref().map(|l| l.expected_languages.clone()).unwrap_or_default();
+    let candidates = req
+        .leg
+        .as_ref()
+        .map(|l| l.expected_languages.clone())
+        .unwrap_or_default();
     let mut engine = EngineConfig::new(profile);
     engine.encoding = req.encoding.clone();
     engine.sample_rate = req.sample_rate;
@@ -547,7 +628,8 @@ pub fn build_plan(
     engine.quality = quality_policy(t, req.prompt.as_deref());
     engine.detector_fallback = live.detector.fallback;
     engine.allow_energy_fallback = shared.allow_energy_detector;
-    let audio_model = (engine.profile.endpoint_policy == waav_segmented_stt::profile::EndpointPolicy::Auto)
+    let audio_model = (engine.profile.endpoint_policy
+        == waav_segmented_stt::profile::EndpointPolicy::Auto)
         .then(models::audio_model)
         .flatten();
     Ok(SegmentedPlan {
@@ -569,12 +651,152 @@ fn credential_tag(secret: &str) -> String {
     d[..6].iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// How often the control record is read from Redis.
+pub const CONTROL_REFRESH: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Keep [`SttLiveShared::control`] in step with Bud's control record (`waav:stt_live:control` in
+/// the Bud Redis, `WAAV_REDIS_URL` / `WAAV_REDIS_DB`). An absent key disables nothing; a Redis that
+/// cannot be read keeps the last record, so an outage never switches a deployment back on or off.
+pub fn spawn_control_refresh(shared: Arc<SttLiveShared>, redis_url: String, db: u8) {
+    tokio::spawn(async move {
+        use redis::AsyncCommands;
+        let client = {
+            use redis::IntoConnectionInfo;
+            let mut info = match redis_url.as_str().into_connection_info() {
+                Ok(i) => i,
+                Err(e) => {
+                    tracing::warn!(error = %e, "segmented speech-to-text control record: invalid Redis address");
+                    return;
+                }
+            };
+            if db != 0 {
+                info.redis.db = i64::from(db);
+            }
+            match redis::Client::open(info) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(error = %e, "segmented speech-to-text control record: invalid Redis config");
+                    return;
+                }
+            }
+        };
+        let mut conn: Option<redis::aio::MultiplexedConnection> = None;
+        loop {
+            if conn.is_none() {
+                conn = client.get_multiplexed_async_connection().await.ok();
+            }
+            if let Some(c) = conn.as_mut() {
+                let read: redis::RedisResult<Option<String>> =
+                    c.get(waav_segmented_stt::control::CONTROL_KEY).await;
+                match read {
+                    Ok(value) => apply_control(&shared, value.as_deref()),
+                    Err(e) => {
+                        tracing::debug!(error = %e, "segmented speech-to-text control record: read failed; keeping the last one");
+                        conn = None;
+                    }
+                }
+            }
+            tokio::time::sleep(CONTROL_REFRESH).await;
+        }
+    });
+}
+
+/// Apply one read of the control record: absent clears it, unreadable keeps the last one.
+pub fn apply_control(shared: &SttLiveShared, value: Option<&str>) {
+    let next = match value {
+        None => waav_segmented_stt::control::ControlRecord::default(),
+        Some(json) => match waav_segmented_stt::control::ControlRecord::parse(json) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(error = %e, "segmented speech-to-text control record ignored");
+                return;
+            }
+        },
+    };
+    let mut current = shared.control.write();
+    if *current != next {
+        tracing::info!(
+            empty = next.is_empty(),
+            "segmented speech-to-text control record changed"
+        );
+        *current = next;
+    }
+}
+
+/// Whether a model is file-only on a live call: with every release built and the switch covering
+/// it, a voice agent with automatic turns would not get a streaming client. `/v1/realtime` without an
+/// agent refuses such a deployment with `realtime_needs_agent` (it has no turn-taking to segment for).
+pub fn is_file_only(shared: &SttLiveShared, provider: &str, model: &str) -> bool {
+    let mut req = waav_segmented_stt::resolve::ResolveRequest::new(provider, model);
+    req.release = waav_segmented_stt::rollout::BUILT_RELEASE;
+    req.bud_leg = true;
+    let r = waav_segmented_stt::resolve::resolve(shared.map, &req);
+    r.outcome != Outcome::Native
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_control_record_switches_a_row_or_deployment_off_at_session_start() {
+        let s = shared(&[("WAAV_SEGMENTED_STT", "on")]);
+        assert_eq!(
+            resolve_session(&s, &req("elevenlabs", "scribe_v2", AGENT)).decision,
+            LiveDecision::Segmented
+        );
+        apply_control(&s, Some(r#"{"disabled_rows": ["elevenlabs:scribe_v2"]}"#));
+        let r = resolve_session(&s, &req("elevenlabs", "scribe_v2", AGENT));
+        assert!(
+            matches!(r.decision, LiveDecision::Refused(_)),
+            "{:?}",
+            r.decision
+        );
+        // Unreadable keeps the last record; absent clears it.
+        apply_control(&s, Some("garbage"));
+        assert!(matches!(
+            resolve_session(&s, &req("elevenlabs", "scribe_v2", AGENT)).decision,
+            LiveDecision::Refused(_)
+        ));
+        apply_control(&s, None);
+        assert_eq!(
+            resolve_session(&s, &req("elevenlabs", "scribe_v2", AGENT)).decision,
+            LiveDecision::Segmented
+        );
+        // A deployment by name.
+        apply_control(&s, Some(r#"{"disabled_deployments": ["my-scribe"]}"#));
+        let mut on_leg = req("elevenlabs", "scribe_v2", AGENT);
+        on_leg.leg = Some(LiveLeg {
+            name: "my-scribe".into(),
+            id: "ep-1".into(),
+            site: LegSite::Agent,
+            api_base: None,
+            provider_params: BTreeMap::new(),
+            segmented: None,
+            capability_override: None,
+            expected_languages: Vec::new(),
+        });
+        assert!(matches!(
+            resolve_session(&s, &on_leg).decision,
+            LiveDecision::Refused(_)
+        ));
+    }
+
+    #[test]
+    fn file_only_models_are_told_apart_from_streaming_ones() {
+        let s = shared(&[]);
+        assert!(is_file_only(&s, "elevenlabs", "scribe_v2"));
+        assert!(is_file_only(&s, "openai", "whisper-1"));
+        assert!(is_file_only(&s, "groq", "whisper-large-v3-turbo"));
+        assert!(!is_file_only(&s, "deepgram", "nova-3"));
+        assert!(!is_file_only(&s, "elevenlabs", "scribe_v2_realtime"));
+    }
+
     fn shared(env: &[(&str, &str)]) -> SttLiveShared {
-        let m: BTreeMap<String, String> = env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let m: BTreeMap<String, String> = env
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
         SttLiveShared::from_lookup(|k| m.get(k).cloned(), None).unwrap()
     }
 
@@ -614,17 +836,32 @@ mod tests {
         let on = shared(&[("WAAV_SEGMENTED_STT", "on")]);
         let r = resolve_session(&on, &req("elevenlabs", "scribe_v2", AGENT));
         assert_eq!(r.decision, LiveDecision::Segmented);
-        assert!(r.frame_warnings().iter().any(|w| w.code == "stt_segmented_mode"));
+        assert!(
+            r.frame_warnings()
+                .iter()
+                .any(|w| w.code == "stt_segmented_mode")
+        );
         let off = shared(&[("WAAV_SEGMENTED_STT", "off")]);
         let r = resolve_session(&off, &req("openai", "gpt-transcribe", AGENT));
-        assert!(matches!(&r.decision, LiveDecision::Refused(x) if x.code == "stt_live_unsupported" && x.reason.as_deref() == Some("not_covered_yet")));
+        assert!(
+            matches!(&r.decision, LiveDecision::Refused(x) if x.code == "stt_live_unsupported" && x.reason.as_deref() == Some("not_covered_yet"))
+        );
     }
 
     #[test]
     fn the_allowlist_covers_listed_deployments_and_provider_models_only() {
-        let s = shared(&[("WAAV_SEGMENTED_STT", "allowlist"), ("WAAV_SEGMENTED_STT_ALLOWLIST", "openai:gpt-transcribe")]);
-        assert_eq!(resolve_session(&s, &req("openai", "gpt-transcribe", AGENT)).decision, LiveDecision::Segmented);
-        assert!(matches!(resolve_session(&s, &req("groq", "whisper-large-v3", AGENT)).decision, LiveDecision::Refused(_)));
+        let s = shared(&[
+            ("WAAV_SEGMENTED_STT", "allowlist"),
+            ("WAAV_SEGMENTED_STT_ALLOWLIST", "openai:gpt-transcribe"),
+        ]);
+        assert_eq!(
+            resolve_session(&s, &req("openai", "gpt-transcribe", AGENT)).decision,
+            LiveDecision::Segmented
+        );
+        assert!(matches!(
+            resolve_session(&s, &req("groq", "whisper-large-v3", AGENT)).decision,
+            LiveDecision::Refused(_)
+        ));
     }
 
     #[test]
@@ -632,7 +869,11 @@ mod tests {
         let s = shared(&[("WAAV_SEGMENTED_STT", "on")]);
         let r = resolve_session(&s, &req("openai", "whisper-1", LiveSessionKind::Plain));
         assert_eq!(r.decision, LiveDecision::Native);
-        assert!(r.frame_warnings().iter().any(|w| w.code == "stt_buffered_until_commit"));
+        assert!(
+            r.frame_warnings()
+                .iter()
+                .any(|w| w.code == "stt_buffered_until_commit")
+        );
         let mut asking = req("openai", "whisper-1", LiveSessionKind::Plain);
         asking.requested_mode = Some("segmented".into());
         let r = resolve_session(&s, &asking);
@@ -643,9 +884,27 @@ mod tests {
     #[test]
     fn a_conversation_loop_with_turn_detection_off_is_treated_as_plain() {
         let s = shared(&[("WAAV_SEGMENTED_STT", "on")]);
-        let r = resolve_session(&s, &req("groq", "whisper-large-v3", LiveSessionKind::Conversation { turn_detection: false }));
+        let r = resolve_session(
+            &s,
+            &req(
+                "groq",
+                "whisper-large-v3",
+                LiveSessionKind::Conversation {
+                    turn_detection: false,
+                },
+            ),
+        );
         assert_eq!(r.decision, LiveDecision::Native);
-        let r = resolve_session(&s, &req("groq", "whisper-large-v3", LiveSessionKind::Conversation { turn_detection: true }));
+        let r = resolve_session(
+            &s,
+            &req(
+                "groq",
+                "whisper-large-v3",
+                LiveSessionKind::Conversation {
+                    turn_detection: true,
+                },
+            ),
+        );
         assert_eq!(r.decision, LiveDecision::Segmented);
     }
 
@@ -656,10 +915,19 @@ mod tests {
         a.requested_mode = Some("streaming".into());
         let r = resolve_session(&s, &a);
         assert_eq!(r.decision, LiveDecision::Segmented);
-        assert!(r.extra.iter().any(|w| w.code == "stt_transcription_mode_ignored"));
+        assert!(
+            r.extra
+                .iter()
+                .any(|w| w.code == "stt_transcription_mode_ignored")
+        );
         let mut p = req("deepgram", "nova-3", LiveSessionKind::Plain);
         p.requested_mode = Some("fast".into());
-        assert!(resolve_session(&s, &p).extra.iter().any(|w| w.code == "stt_transcription_mode_invalid"));
+        assert!(
+            resolve_session(&s, &p)
+                .extra
+                .iter()
+                .any(|w| w.code == "stt_transcription_mode_invalid")
+        );
     }
 
     #[test]
@@ -667,7 +935,9 @@ mod tests {
         let s = shared(&[("WAAV_SEGMENTED_STT", "on")]);
         let mut p = req("openai", "gpt-transcribe", LiveSessionKind::Plain);
         p.requested_mode = Some("streaming".into());
-        assert!(matches!(resolve_session(&s, &p).decision, LiveDecision::Refused(r) if r.code == "stt_not_streaming"));
+        assert!(
+            matches!(resolve_session(&s, &p).decision, LiveDecision::Refused(r) if r.code == "stt_not_streaming")
+        );
     }
 
     #[test]
@@ -675,14 +945,23 @@ mod tests {
         let s = shared(&[("WAAV_SEGMENTED_STT", "on")]);
         let mut a = req("elevenlabs", "scribe_v2", AGENT);
         a.encoding = "opus".into();
-        assert!(matches!(resolve_session(&s, &a).decision, LiveDecision::Refused(r) if r.code == "stt_segmentation_unavailable"));
+        assert!(
+            matches!(resolve_session(&s, &a).decision, LiveDecision::Refused(r) if r.code == "stt_segmentation_unavailable")
+        );
     }
 
     #[test]
     fn uncovered_self_hosted_legs_keep_todays_code_per_site() {
         let s = shared(&[("WAAV_SEGMENTED_STT", "off")]);
-        for (site, code) in [(LegSite::Agent, "stt_not_streaming"), (LegSite::Named, "unsupported_deployment")] {
-            let mut r = req("self_hosted", "whisper", LiveSessionKind::Agent { manual: true });
+        for (site, code) in [
+            (LegSite::Agent, "stt_not_streaming"),
+            (LegSite::Named, "unsupported_deployment"),
+        ] {
+            let mut r = req(
+                "self_hosted",
+                "whisper",
+                LiveSessionKind::Agent { manual: true },
+            );
             r.leg = Some(LiveLeg {
                 name: "my-whisper".into(),
                 id: "ep-1".into(),
@@ -693,13 +972,19 @@ mod tests {
                 capability_override: None,
                 expected_languages: Vec::new(),
             });
-            assert!(matches!(resolve_session(&s, &r).decision, LiveDecision::Refused(x) if x.code == code), "{site:?}");
+            assert!(
+                matches!(resolve_session(&s, &r).decision, LiveDecision::Refused(x) if x.code == code),
+                "{site:?}"
+            );
         }
     }
 
     #[test]
     fn the_withdrawal_switch_keeps_a_buffering_agent_on_todays_client_with_a_warning() {
-        let s = shared(&[("WAAV_SEGMENTED_STT", "off"), ("WAAV_STT_FILE_ONLY_REFUSAL", "off")]);
+        let s = shared(&[
+            ("WAAV_SEGMENTED_STT", "off"),
+            ("WAAV_STT_FILE_ONLY_REFUSAL", "off"),
+        ]);
         let r = resolve_session(&s, &req("openai", "gpt-transcribe", AGENT));
         assert_eq!(r.decision, LiveDecision::Native);
         assert_eq!(r.frame_warnings()[0].code, "stt_buffered_until_commit");
@@ -715,13 +1000,20 @@ mod tests {
             site: LegSite::Agent,
             api_base: None,
             provider_params: BTreeMap::new(),
-            segmented: Some(bud_auth::SttSegmented { deadline_ms: Some(3000), ..Default::default() }),
+            segmented: Some(bud_auth::SttSegmented {
+                deadline_ms: Some(3000),
+                ..Default::default()
+            }),
             capability_override: None,
             expected_languages: Vec::new(),
         });
         let r = resolve_session(&s, &a);
         assert_eq!((r.deadline_ms, r.deadline_raised), (4000, true));
-        assert!(r.extra.iter().any(|w| w.code == "deployment_setting_not_applied"));
+        assert!(
+            r.extra
+                .iter()
+                .any(|w| w.code == "deployment_setting_not_applied")
+        );
     }
 
     #[test]
@@ -729,13 +1021,22 @@ mod tests {
         let s = shared(&[("WAAV_SEGMENTED_STT", "on")]);
         let mut a = req("elevenlabs", "scribe_v2", AGENT);
         a.language = "auto".into();
-        assert!(resolve_session(&s, &a).extra.iter().any(|w| w.code == "stt_language_unset"));
+        assert!(
+            resolve_session(&s, &a)
+                .extra
+                .iter()
+                .any(|w| w.code == "stt_language_unset")
+        );
     }
 
     #[tokio::test]
     async fn the_plan_builds_for_every_release_one_vendor() {
         let s = shared(&[("WAAV_SEGMENTED_STT", "on")]);
-        for (p, m) in [("openai", "gpt-transcribe"), ("groq", "whisper-large-v3-turbo"), ("elevenlabs", "scribe_v2")] {
+        for (p, m) in [
+            ("openai", "gpt-transcribe"),
+            ("groq", "whisper-large-v3-turbo"),
+            ("elevenlabs", "scribe_v2"),
+        ] {
             let r = req(p, m, AGENT);
             let live = resolve_session(&s, &r);
             assert_eq!(live.decision, LiveDecision::Segmented, "{p}");

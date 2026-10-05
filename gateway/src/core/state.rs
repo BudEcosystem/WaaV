@@ -174,6 +174,22 @@ impl CoreState {
             turn_detector.clone(),
         )?);
         crate::core::stt::segmented::models::warm_up();
+        // Under the Bud control plane the control record can switch a row or deployment off on
+        // a running gateway; a standalone gateway has only the process switch.
+        if let Some(url) = std::env::var("WAAV_REDIS_URL")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+        {
+            let db = std::env::var("WAAV_REDIS_DB")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0);
+            crate::core::stt::segmented::live::spawn_control_refresh(
+                Arc::clone(&stt_live),
+                url,
+                db,
+            );
+        }
         tracing::info!(stt_live = ?stt_live, "segmented speech-to-text configured");
 
         Ok(Arc::new(Self {
