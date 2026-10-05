@@ -292,7 +292,11 @@ impl LatencyStore {
                 p50_ms: derived_p50,
                 p95_ms: derived_p95,
                 p99_ms: p99,
-                basis: if p99.is_some() { LatencyBasis::Seed } else { LatencyBasis::None },
+                basis: if p99.is_some() {
+                    LatencyBasis::Seed
+                } else {
+                    LatencyBasis::None
+                },
                 tail_censored: false,
                 samples: n,
             };
@@ -364,7 +368,9 @@ impl LatencyStore {
         low_latency: bool,
     ) -> SegmentDeadlines {
         let rt = self.round_trip(key);
-        let p99 = rt.p99_ms.unwrap_or(GLOBAL_DEFAULT_P99_MS - PUBLISHED_PAUSE_MS);
+        let p99 = rt
+            .p99_ms
+            .unwrap_or(GLOBAL_DEFAULT_P99_MS - PUBLISHED_PAUSE_MS);
         segment_deadlines(&DeadlineInputs {
             round_trip_p99_ms: p99,
             round_trip_p50_ms: rt.p50_ms.unwrap_or(p99 / 2),
@@ -396,18 +402,39 @@ mod tests {
     #[test]
     fn stall_timeout_is_p99_times_margin_plus_constant_within_floor_and_cap() {
         // ElevenLabs scribe_v2: seed 2,010 ms measured with a 200 ms pause => round trip 1,810.
-        assert_eq!(segment_deadlines(&inputs(1810)).stall_timeout, Duration::from_millis(2513));
-        assert_eq!(segment_deadlines(&inputs(100)).stall_timeout, Duration::from_millis(1500));
-        assert_eq!(segment_deadlines(&inputs(9000)).stall_timeout, Duration::from_millis(3500));
-        let long = DeadlineInputs { audio_ms: 9000, ..inputs(1810) };
-        assert_eq!(segment_deadlines(&long).stall_timeout, Duration::from_millis(2713));
+        assert_eq!(
+            segment_deadlines(&inputs(1810)).stall_timeout,
+            Duration::from_millis(2513)
+        );
+        assert_eq!(
+            segment_deadlines(&inputs(100)).stall_timeout,
+            Duration::from_millis(1500)
+        );
+        assert_eq!(
+            segment_deadlines(&inputs(9000)).stall_timeout,
+            Duration::from_millis(3500)
+        );
+        let long = DeadlineInputs {
+            audio_ms: 9000,
+            ..inputs(1810)
+        };
+        assert_eq!(
+            segment_deadlines(&long).stall_timeout,
+            Duration::from_millis(2713)
+        );
     }
 
     #[test]
     fn the_request_limit_is_the_rows_value_at_most_ten_seconds() {
-        let d = segment_deadlines(&DeadlineInputs { row_request_timeout_ms: Some(30_000), ..inputs(1810) });
+        let d = segment_deadlines(&DeadlineInputs {
+            row_request_timeout_ms: Some(30_000),
+            ..inputs(1810)
+        });
         assert_eq!(d.request_limit, Duration::from_secs(10));
-        let d = segment_deadlines(&DeadlineInputs { row_request_timeout_ms: Some(5000), ..inputs(1810) });
+        let d = segment_deadlines(&DeadlineInputs {
+            row_request_timeout_ms: Some(5000),
+            ..inputs(1810)
+        });
         assert_eq!(d.request_limit, Duration::from_secs(5));
     }
 
@@ -416,9 +443,16 @@ mod tests {
         let d = segment_deadlines(&inputs(1810));
         assert_eq!(d.second_request_room, Duration::from_millis(1005));
         assert_eq!(d.hedge_delay, None);
-        let d = segment_deadlines(&DeadlineInputs { low_latency: true, ..inputs(1810) });
+        let d = segment_deadlines(&DeadlineInputs {
+            low_latency: true,
+            ..inputs(1810)
+        });
         assert_eq!(d.hedge_delay, Some(Duration::from_millis(1357)));
-        let d = segment_deadlines(&DeadlineInputs { low_latency: true, round_trip_p95_ms: 100, ..inputs(400) });
+        let d = segment_deadlines(&DeadlineInputs {
+            low_latency: true,
+            round_trip_p95_ms: 100,
+            ..inputs(400)
+        });
         assert_eq!(d.hedge_delay, Some(Duration::from_millis(300)));
         assert_eq!(d.second_request_room, Duration::from_millis(500));
     }
@@ -445,7 +479,10 @@ mod tests {
         assert_eq!(rt.p99_ms, Some(1800));
         let d = store.deadlines("openai:gpt-transcribe", 3000, 6000, None, false);
         assert_eq!(d.stall_timeout, Duration::from_millis(2500));
-        assert_eq!(store.estimate("openai:gpt-transcribe").basis, LatencyBasis::None);
+        assert_eq!(
+            store.estimate("openai:gpt-transcribe").basis,
+            LatencyBasis::None
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -511,7 +548,10 @@ mod tests {
 
     #[test]
     fn latency_class_thresholds() {
-        assert_eq!(LatencyClass::of(Some(600), 600, 1200), LatencyClass::Realtime);
+        assert_eq!(
+            LatencyClass::of(Some(600), 600, 1200),
+            LatencyClass::Realtime
+        );
         assert_eq!(LatencyClass::of(Some(601), 600, 1200), LatencyClass::Fast);
         assert_eq!(LatencyClass::of(Some(2010), 600, 1200), LatencyClass::Slow);
         assert_eq!(LatencyClass::of(None, 600, 1200), LatencyClass::Unknown);

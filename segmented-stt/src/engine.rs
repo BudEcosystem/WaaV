@@ -30,7 +30,8 @@ use tokio_util::sync::CancellationToken;
 use crate::audio::{AudioError, Frame, FrontEnd, frame_to_f32};
 use crate::detector::{EnergyDetector, SpeechDetector};
 use crate::endpointer::{
-    EndOfTurnModel, EndOfTurnTextModel, LadderInput, LadderThresholds, Verdict, decide, wants_text_verdict,
+    EndOfTurnModel, EndOfTurnTextModel, LadderInput, LadderThresholds, Verdict, decide,
+    wants_text_verdict,
 };
 use crate::limits::resolution_deadline_ms;
 use crate::profile::{SegmentProfile, UploadPolicy};
@@ -42,10 +43,10 @@ use crate::transcriber::{SegmentAudio, SegmentContext};
 use crate::turn::{Part, TurnText};
 use crate::types::{
     CutReason, DetectorFallback, DetectorKind, EngineResult, ErrorClass, FRAME_MS, FRAME_SAMPLES,
-    FailureClass, FilteredBy, FlushOutcome, InterimMode, NoticeCallback, NoticeKind, SegmentAdmission,
-    SegmentAdmissionHook, SegmentMeta, SegmentOutcome, SegmentOutcomeSink, SegmentResultKind,
-    SegmentTimings, SpeechActivity, SpeechActivityCallback, SttLiveFacts, SttNotice, TurnCloseReason,
-    ms_to_samples, samples_to_ms,
+    FailureClass, FilteredBy, FlushOutcome, InterimMode, NoticeCallback, NoticeKind,
+    SegmentAdmission, SegmentAdmissionHook, SegmentMeta, SegmentOutcome, SegmentOutcomeSink,
+    SegmentResultKind, SegmentTimings, SpeechActivity, SpeechActivityCallback, SttLiveFacts,
+    SttNotice, TurnCloseReason, ms_to_samples, samples_to_ms,
 };
 
 /// The result callback: awaited on the result emitter only.
@@ -105,13 +106,17 @@ pub struct TokioClock {
 
 impl Default for TokioClock {
     fn default() -> Self {
-        Self { start: Instant::now() }
+        Self {
+            start: Instant::now(),
+        }
     }
 }
 
 impl Clock for TokioClock {
     fn now_ms(&self) -> u64 {
-        Instant::now().saturating_duration_since(self.start).as_millis() as u64
+        Instant::now()
+            .saturating_duration_since(self.start)
+            .as_millis() as u64
     }
 }
 
@@ -197,7 +202,11 @@ impl std::fmt::Debug for EngineHandle {
 
 impl EngineHandle {
     /// Start the engine and its two emitters.
-    pub fn spawn(cfg: EngineConfig, parts: EngineParts, callbacks: Arc<Callbacks>) -> Result<Self, AudioError> {
+    pub fn spawn(
+        cfg: EngineConfig,
+        parts: EngineParts,
+        callbacks: Arc<Callbacks>,
+    ) -> Result<Self, AudioError> {
         let frontend = FrontEnd::new(&cfg.encoding, cfg.sample_rate, cfg.channels)?;
         let facts = SttLiveFacts {
             detector: parts.detector.kind(),
@@ -209,7 +218,10 @@ impl EngineHandle {
             silence_ceiling_ms: cfg.profile.max_endpointing_ms,
             interims: cfg.profile.interims,
             final_deadline_ms: parts.upload.deadline_ms(),
-            resolution_deadline_ms: resolution_deadline_ms(cfg.profile.cut_silence_ms, parts.upload.deadline_ms()),
+            resolution_deadline_ms: resolution_deadline_ms(
+                cfg.profile.cut_silence_ms,
+                parts.upload.deadline_ms(),
+            ),
         };
         let (tx, rx) = mpsc::unbounded_channel();
         let (results_tx, mut results_rx) = mpsc::unbounded_channel::<EngineResult>();
@@ -296,11 +308,15 @@ impl EngineHandle {
         let charge = bytes.len().max(64);
         let queued = self.queued_bytes.load(Ordering::Acquire);
         if queued > 0 && queued + charge > self.budget {
-            let dropped = self.dropped_since_notice.fetch_add(bytes.len() as u64, Ordering::AcqRel) + bytes.len() as u64;
+            let dropped = self
+                .dropped_since_notice
+                .fetch_add(bytes.len() as u64, Ordering::AcqRel)
+                + bytes.len() as u64;
             let now = self.clock.now_ms();
             let last = self.last_drop_notice_ms.load(Ordering::Acquire);
             if last == 0 || now.saturating_sub(last) >= 1000 {
-                self.last_drop_notice_ms.store(now.max(1), Ordering::Release);
+                self.last_drop_notice_ms
+                    .store(now.max(1), Ordering::Release);
                 self.dropped_since_notice.store(0, Ordering::Release);
                 if let Some(n) = self.callbacks.notice.read().clone() {
                     n(SttNotice {
@@ -390,7 +406,10 @@ struct Unit {
 impl Unit {
     fn audio_samples(&self) -> usize {
         let pcm: usize = self.segments.iter().map(|s| s.pcm.len()).sum();
-        pcm + self.segments.last().map_or(0, |s| s.trailing_zero_samples as usize)
+        pcm + self
+            .segments
+            .last()
+            .map_or(0, |s| s.trailing_zero_samples as usize)
     }
 }
 
@@ -425,9 +444,19 @@ struct Turn {
 }
 
 enum Done {
-    Upload { seq: u32, resolution: UploadResolution },
-    AudioVerdict { turn_id: u64, pause: usize, verdict: Verdict },
-    TextVerdict { turn_id: u64, complete: Option<bool> },
+    Upload {
+        seq: u32,
+        resolution: UploadResolution,
+    },
+    AudioVerdict {
+        turn_id: u64,
+        pause: usize,
+        verdict: Verdict,
+    },
+    TextVerdict {
+        turn_id: u64,
+        complete: Option<bool>,
+    },
 }
 
 struct Engine {
@@ -559,7 +588,13 @@ impl Engine {
                     a.abort();
                 }
                 u.pre_resolved = Some(SegmentResultKind::Failed(FailureClass::Cancelled));
-                let outcome = self.outcome_of(seq, SegmentResultKind::Failed(FailureClass::Cancelled), 0, None, false);
+                let outcome = self.outcome_of(
+                    seq,
+                    SegmentResultKind::Failed(FailureClass::Cancelled),
+                    0,
+                    None,
+                    false,
+                );
                 if let Some(sink) = self.callbacks.outcome.read().clone() {
                     sink.record(&outcome);
                 }
@@ -641,10 +676,15 @@ impl Engine {
         }
         // The longest turn.
         if let Some(t) = self.current_turn()
-            && samples_to_ms(self.segmenter.now_sample().saturating_sub(t.first_speech_sample)) >= self.p.max_turn_ms as u64
+            && samples_to_ms(
+                self.segmenter
+                    .now_sample()
+                    .saturating_sub(t.first_speech_sample),
+            ) >= self.p.max_turn_ms as u64
         {
             let mut events = Vec::new();
-            self.segmenter.flush(CutReason::MaxTurnDuration, &mut events);
+            self.segmenter
+                .flush(CutReason::MaxTurnDuration, &mut events);
             for e in events {
                 self.on_segmenter_event(e);
             }
@@ -747,7 +787,9 @@ impl Engine {
                 });
             }
             SegmenterEvent::Split(segment) => {
-                let Some(turn_id) = self.current_turn().map(|t| t.id) else { return };
+                let Some(turn_id) = self.current_turn().map(|t| t.id) else {
+                    return;
+                };
                 self.add_segment(turn_id, segment, None);
                 let now = self.now_ms();
                 if let Some(t) = self.current_turn_mut() {
@@ -762,20 +804,34 @@ impl Engine {
                 voiced_ms,
                 outcome,
             } => {
-                let Some(turn_id) = self.current_turn().map(|t| t.id) else { return };
+                let Some(turn_id) = self.current_turn().map(|t| t.id) else {
+                    return;
+                };
                 let at_mono = self.mono_at(last_speech_end_sample.saturating_sub(1));
                 let now = self.now_ms();
                 let (unit, will_upload) = match outcome {
                     CutOutcome::Ready(segment) => {
                         let seq = self.add_segment(turn_id, segment, Some(reason));
-                        let will = self.units.get(&seq).is_some_and(|u| u.pre_resolved.is_none());
+                        let will = self
+                            .units
+                            .get(&seq)
+                            .is_some_and(|u| u.pre_resolved.is_none());
                         (Some(seq), will)
                     }
                     CutOutcome::TooShort => {
-                        let seq = self.pre_resolved_unit(turn_id, reason, voiced_ms, SegmentResultKind::Filtered(FilteredBy::TooShort), last_speech_end_sample);
+                        let seq = self.pre_resolved_unit(
+                            turn_id,
+                            reason,
+                            voiced_ms,
+                            SegmentResultKind::Filtered(FilteredBy::TooShort),
+                            last_speech_end_sample,
+                        );
                         (Some(seq), false)
                     }
-                    CutOutcome::Nothing => (self.turns.back().and_then(|t| t.units.last().copied()), false),
+                    CutOutcome::Nothing => (
+                        self.turns.back().and_then(|t| t.units.last().copied()),
+                        false,
+                    ),
                 };
                 if let Some(t) = self.turns.back_mut().filter(|t| t.id == turn_id) {
                     t.newest_cut_ms = now;
@@ -817,28 +873,47 @@ impl Engine {
         let from = t
             .first_speech_sample
             .saturating_sub(ms_to_samples(500))
-            .max(self.segmenter.now_sample().saturating_sub(ms_to_samples(8000)));
-        let audio: Vec<f32> = self.segmenter.tail(from).iter().map(|s| *s as f32 / 32768.0).collect();
+            .max(
+                self.segmenter
+                    .now_sample()
+                    .saturating_sub(ms_to_samples(8000)),
+            );
+        let audio: Vec<f32> = self
+            .segmenter
+            .tail(from)
+            .iter()
+            .map(|s| *s as f32 / 32768.0)
+            .collect();
         let tx = self.done_tx.clone();
         let timeout = Duration::from_millis(self.p.verdict_timeout_ms as u64);
         tokio::spawn(async move {
-            let verdict = match tokio::time::timeout(timeout, model.completion_probability(audio)).await {
-                Ok(Ok(p)) => Verdict::Probability(p),
-                _ => Verdict::Failed,
-            };
-            let _ = tx.send(Done::AudioVerdict { turn_id, pause, verdict });
+            let verdict =
+                match tokio::time::timeout(timeout, model.completion_probability(audio)).await {
+                    Ok(Ok(p)) => Verdict::Probability(p),
+                    _ => Verdict::Failed,
+                };
+            let _ = tx.send(Done::AudioVerdict {
+                turn_id,
+                pause,
+                verdict,
+            });
         });
     }
 
     fn add_segment(&mut self, turn_id: u64, segment: Segment, cut: Option<CutReason>) -> u32 {
         // A segment of the same turn joins a held unit when the result stays within the maximum.
         let max_samples = ms_to_samples(self.p.max_segment_ms as u64) as usize;
-        let join_into = self.units.values().rev().find(|u| {
-            u.turn_id == turn_id
-                && matches!(u.state, UnitState::Held)
-                && u.pre_resolved.is_none()
-                && u.audio_samples() + segment.pcm.len() <= max_samples
-        }).map(|u| u.seq);
+        let join_into = self
+            .units
+            .values()
+            .rev()
+            .find(|u| {
+                u.turn_id == turn_id
+                    && matches!(u.state, UnitState::Held)
+                    && u.pre_resolved.is_none()
+                    && u.audio_samples() + segment.pcm.len() <= max_samples
+            })
+            .map(|u| u.seq);
         let cut_reason = cut.unwrap_or(segment.cut);
         let meta = SegmentMeta {
             turn_id,
@@ -868,11 +943,15 @@ impl Engine {
         }
         let seq = self.next_seq;
         self.next_seq += 1;
-        let index = self.turns.back_mut().map(|t| {
-            t.units.push(seq);
-            t.next_index += 1;
-            t.next_index - 1
-        }).unwrap_or(0);
+        let index = self
+            .turns
+            .back_mut()
+            .map(|t| {
+                t.units.push(seq);
+                t.next_index += 1;
+                t.next_index - 1
+            })
+            .unwrap_or(0);
         let speech_end_ms = self.mono_at(segment.last_speech_end_sample.saturating_sub(1));
         let unit = Unit {
             seq,
@@ -887,46 +966,69 @@ impl Engine {
                 ..Default::default()
             },
             turn_final: false,
-            pre_resolved: (!admission.is_input).then_some(SegmentResultKind::Filtered(FilteredBy::NotInput)),
+            pre_resolved: (!admission.is_input)
+                .then_some(SegmentResultKind::Filtered(FilteredBy::NotInput)),
             resolution: None,
             abort: None,
             last_speech_end_sample: segment.last_speech_end_sample,
             mean_probability: segment.mean_probability,
             short: segment.short,
-            state: if admission.is_input { UnitState::Held } else { UnitState::Returned },
+            state: if admission.is_input {
+                UnitState::Held
+            } else {
+                UnitState::Returned
+            },
             segments: vec![segment],
         };
         self.units.insert(seq, unit);
         seq
     }
 
-    fn pre_resolved_unit(&mut self, turn_id: u64, cut: CutReason, voiced_ms: u32, kind: SegmentResultKind, last_end: u64) -> u32 {
+    fn pre_resolved_unit(
+        &mut self,
+        turn_id: u64,
+        cut: CutReason,
+        voiced_ms: u32,
+        kind: SegmentResultKind,
+        last_end: u64,
+    ) -> u32 {
         let seq = self.next_seq;
         self.next_seq += 1;
-        let index = self.turns.back_mut().map(|t| {
-            t.units.push(seq);
-            t.next_index += 1;
-            t.next_index - 1
-        }).unwrap_or(0);
+        let index = self
+            .turns
+            .back_mut()
+            .map(|t| {
+                t.units.push(seq);
+                t.next_index += 1;
+                t.next_index - 1
+            })
+            .unwrap_or(0);
         let now = self.now_ms();
-        self.units.insert(seq, Unit {
+        self.units.insert(
             seq,
-            turn_id,
-            index_in_turn: index,
-            segments: Vec::new(),
-            state: UnitState::Returned,
-            voiced_ms,
-            cut,
-            admission: SegmentAdmission::ADMIT,
-            timings: SegmentTimings { speech_end_ms: self.mono_at(last_end.saturating_sub(1)), cut_ms: now, ..Default::default() },
-            turn_final: false,
-            pre_resolved: Some(kind),
-            resolution: None,
-            abort: None,
-            last_speech_end_sample: last_end,
-            mean_probability: 0.0,
-            short: true,
-        });
+            Unit {
+                seq,
+                turn_id,
+                index_in_turn: index,
+                segments: Vec::new(),
+                state: UnitState::Returned,
+                voiced_ms,
+                cut,
+                admission: SegmentAdmission::ADMIT,
+                timings: SegmentTimings {
+                    speech_end_ms: self.mono_at(last_end.saturating_sub(1)),
+                    cut_ms: now,
+                    ..Default::default()
+                },
+                turn_final: false,
+                pre_resolved: Some(kind),
+                resolution: None,
+                abort: None,
+                last_speech_end_sample: last_end,
+                mean_probability: 0.0,
+                short: true,
+            },
+        );
         seq
     }
 
@@ -939,7 +1041,10 @@ impl Engine {
         }
         let before = self.next_seq;
         let mut events = Vec::new();
-        self.segmenter.commit(self.upload.min_audio_ms().max(self.p.min_commit_audio_ms), &mut events);
+        self.segmenter.commit(
+            self.upload.min_audio_ms().max(self.p.min_commit_audio_ms),
+            &mut events,
+        );
         for e in events {
             self.on_segmenter_event(e);
         }
@@ -970,8 +1075,12 @@ impl Engine {
     fn on_tick(&mut self) {
         // The input-stall rule: a client that stopped sending audio cuts the open segment.
         if let Some(stall) = self.p.input_stall_ms
-            && Instant::now().saturating_duration_since(self.last_audio_at) >= Duration::from_millis(stall as u64)
-            && matches!(self.segmenter.phase(), SegPhase::Speech | SegPhase::Hangover | SegPhase::Onset)
+            && Instant::now().saturating_duration_since(self.last_audio_at)
+                >= Duration::from_millis(stall as u64)
+            && matches!(
+                self.segmenter.phase(),
+                SegPhase::Speech | SegPhase::Hangover | SegPhase::Onset
+            )
         {
             let mut frames = Vec::new();
             self.frontend.flush(&mut frames);
@@ -991,7 +1100,10 @@ impl Engine {
             .collect();
         for seq in overdue {
             if let Some(u) = self.units.get_mut(&seq) {
-                tracing::warn!(seq, "segment upload overran its deadline; released as timed out");
+                tracing::warn!(
+                    seq,
+                    "segment upload overran its deadline; released as timed out"
+                );
                 u.pre_resolved = Some(SegmentResultKind::TimedOut);
                 u.state = UnitState::Returned;
                 u.timings.response_ms = Some(self.clock.now_ms());
@@ -1013,7 +1125,11 @@ impl Engine {
                     u.abort = None;
                 }
             }
-            Done::AudioVerdict { turn_id, pause, verdict } => {
+            Done::AudioVerdict {
+                turn_id,
+                pause,
+                verdict,
+            } => {
                 if let Some(t) = self.turns.iter_mut().find(|t| t.id == turn_id)
                     && let Some(p) = t.pauses.get_mut(pause)
                 {
@@ -1032,7 +1148,10 @@ impl Engine {
 
     fn drive(&mut self) {
         for _ in 0..6 {
-            let changed = self.start_units() | self.release_units() | self.evaluate_endpoints() | self.close_turns();
+            let changed = self.start_units()
+                | self.release_units()
+                | self.evaluate_endpoints()
+                | self.close_turns();
             if !changed {
                 break;
             }
@@ -1053,8 +1172,12 @@ impl Engine {
             .map(|(s, _)| *s)
             .collect();
         for seq in held {
-            let Some(u) = self.units.get(&seq) else { continue };
-            let Some(turn) = self.turn_of(u.turn_id) else { continue };
+            let Some(u) = self.units.get(&seq) else {
+                continue;
+            };
+            let Some(turn) = self.turn_of(u.turn_id) else {
+                continue;
+            };
             let decided = turn.endpoint.is_some() || turn.sealed.is_some();
             let full = u.audio_samples() >= ms_to_samples(self.p.max_segment_ms as u64) as usize;
             let in_flight_speculative = self
@@ -1090,12 +1213,19 @@ impl Engine {
             omit_fields: Vec::new(),
             minimal: false,
         };
-        let Some(u) = self.units.get(&seq) else { return };
-        let Some(turn) = self.turn_of(u.turn_id) else { return };
+        let Some(u) = self.units.get(&seq) else {
+            return;
+        };
+        let Some(turn) = self.turn_of(u.turn_id) else {
+            return;
+        };
         let deadline_at = turn.newest_cut_at + deadline;
         let now_ms = self.now_ms();
         let audio = SegmentAudio::new(join_segments(&u.segments, gap_cap));
-        let ctx = SegmentContext { turn_id: u.turn_id, ..ctx };
+        let ctx = SegmentContext {
+            turn_id: u.turn_id,
+            ..ctx
+        };
         let upload = Arc::clone(&self.upload);
         let tx = self.done_tx.clone();
         let req = UnitUpload {
@@ -1119,7 +1249,14 @@ impl Engine {
         }
     }
 
-    fn outcome_of(&self, seq: u32, kind: SegmentResultKind, offset: u32, transcript_request_id: Option<String>, suspect: bool) -> SegmentOutcome {
+    fn outcome_of(
+        &self,
+        seq: u32,
+        kind: SegmentResultKind,
+        offset: u32,
+        transcript_request_id: Option<String>,
+        suspect: bool,
+    ) -> SegmentOutcome {
         let u = &self.units[&seq];
         let ledger = u.resolution.as_ref().map(|r| r.ledger).unwrap_or_default();
         let audio_ms = samples_to_ms(u.audio_samples() as u64) as u32;
@@ -1169,18 +1306,29 @@ impl Engine {
             let u = &self.units[&seq];
             let turn_id = u.turn_id;
             if let Some(k) = u.pre_resolved.clone() {
-                let part = matches!(k, SegmentResultKind::TimedOut | SegmentResultKind::Failed(_))
-                    .then(|| Part::Gap { seq, voiced_ms: u.voiced_ms });
+                let part = matches!(
+                    k,
+                    SegmentResultKind::TimedOut | SegmentResultKind::Failed(_)
+                )
+                .then(|| Part::Gap {
+                    seq,
+                    voiced_ms: u.voiced_ms,
+                });
                 (turn_id, k, part, None, false)
             } else {
-                let r = u.resolution.as_ref().expect("returned unit has a resolution");
+                let r = u
+                    .resolution
+                    .as_ref()
+                    .expect("returned unit has a resolution");
                 match &r.result {
                     Ok(t) => {
                         let ev = SegmentEvidence {
                             voiced_ms: u.voiced_ms,
                             mean_speech_probability: Some(u.mean_probability),
                             overlapped_agent_speech: u.admission.overlapped_agent_speech,
-                            agent_spoke_since_previous_segment: u.admission.agent_spoke_since_previous_segment,
+                            agent_spoke_since_previous_segment: u
+                                .admission
+                                .agent_spoke_since_previous_segment,
                         };
                         match evaluate(t, &ev, &self.cfg.quality) {
                             QualityVerdict::Keep { text, suspect, .. } => (
@@ -1198,10 +1346,18 @@ impl Engine {
                                 t.vendor_request_id.clone(),
                                 suspect,
                             ),
-                            QualityVerdict::Empty => (turn_id, SegmentResultKind::Empty, None, t.vendor_request_id.clone(), false),
+                            QualityVerdict::Empty => (
+                                turn_id,
+                                SegmentResultKind::Empty,
+                                None,
+                                t.vendor_request_id.clone(),
+                                false,
+                            ),
                             QualityVerdict::Filtered(r) => (
                                 turn_id,
-                                SegmentResultKind::Filtered(FilteredBy::Quality(r.as_str().to_string())),
+                                SegmentResultKind::Filtered(FilteredBy::Quality(
+                                    r.as_str().to_string(),
+                                )),
                                 None,
                                 t.vendor_request_id.clone(),
                                 false,
@@ -1211,13 +1367,32 @@ impl Engine {
                     Err(f) => {
                         let kind = match f {
                             UnitFailure::TimedOut => SegmentResultKind::TimedOut,
-                            UnitFailure::BreakerOpen => SegmentResultKind::Failed(FailureClass::BreakerOpen),
-                            UnitFailure::LimiterRefused => SegmentResultKind::Failed(FailureClass::LimiterRefused),
-                            UnitFailure::SessionFatal(_) => SegmentResultKind::Failed(FailureClass::SessionFatal),
-                            UnitFailure::Local(_) => SegmentResultKind::Failed(FailureClass::Vendor(ErrorClass::BadRequest)),
-                            UnitFailure::Vendor(e) => SegmentResultKind::Failed(FailureClass::Vendor(e.class)),
+                            UnitFailure::BreakerOpen => {
+                                SegmentResultKind::Failed(FailureClass::BreakerOpen)
+                            }
+                            UnitFailure::LimiterRefused => {
+                                SegmentResultKind::Failed(FailureClass::LimiterRefused)
+                            }
+                            UnitFailure::SessionFatal(_) => {
+                                SegmentResultKind::Failed(FailureClass::SessionFatal)
+                            }
+                            UnitFailure::Local(_) => SegmentResultKind::Failed(
+                                FailureClass::Vendor(ErrorClass::BadRequest),
+                            ),
+                            UnitFailure::Vendor(e) => {
+                                SegmentResultKind::Failed(FailureClass::Vendor(e.class))
+                            }
                         };
-                        (turn_id, kind, Some(Part::Gap { seq, voiced_ms: u.voiced_ms }), None, false)
+                        (
+                            turn_id,
+                            kind,
+                            Some(Part::Gap {
+                                seq,
+                                voiced_ms: u.voiced_ms,
+                            }),
+                            None,
+                            false,
+                        )
                     }
                 }
             }
@@ -1243,26 +1418,49 @@ impl Engine {
             }
         };
         for (code, msg) in warnings {
-            self.notice(NoticeKind::Transcriber { code, message: msg }, Some(turn_id), Some(seq));
+            self.notice(
+                NoticeKind::Transcriber { code, message: msg },
+                Some(turn_id),
+                Some(seq),
+            );
         }
         if let Some(class) = fatal {
             self.raise_fatal(EngineFatal::from_class(class, message));
         }
         if kind == SegmentResultKind::Text {
             let end = self.units[&seq].timings.speech_end_ms;
-            self.upload.record_end_to_final(self.now_ms().saturating_sub(end) as u32);
+            self.upload
+                .record_end_to_final(self.now_ms().saturating_sub(end) as u32);
         }
         // Noise escalation: a split segment that came back with no text.
         let cut = self.units[&seq].cut;
         if cut.is_split()
-            && matches!(kind, SegmentResultKind::Empty | SegmentResultKind::Filtered(_))
-            && matches!(self.segmenter.phase(), SegPhase::Speech | SegPhase::Hangover)
+            && matches!(
+                kind,
+                SegmentResultKind::Empty | SegmentResultKind::Filtered(_)
+            )
+            && matches!(
+                self.segmenter.phase(),
+                SegPhase::Speech | SegPhase::Hangover
+            )
         {
             let dropped = self.segmenter.abandon_open_segment();
-            let to = self.segmenter.raise_thresholds(self.p.noise_step, self.p.noise_ceiling);
+            let to = self
+                .segmenter
+                .raise_thresholds(self.p.noise_step, self.p.noise_ceiling);
             tracing::info!(to, dropped, "noise suspected: segment thresholds raised");
-            self.notice(NoticeKind::NoiseThresholdRaised { to }, Some(turn_id), Some(seq));
-            let noise = self.pre_resolved_unit(turn_id, CutReason::SoftSplit, dropped, SegmentResultKind::Filtered(FilteredBy::NoiseSuspected), self.segmenter.now_sample());
+            self.notice(
+                NoticeKind::NoiseThresholdRaised { to },
+                Some(turn_id),
+                Some(seq),
+            );
+            let noise = self.pre_resolved_unit(
+                turn_id,
+                CutReason::SoftSplit,
+                dropped,
+                SegmentResultKind::Filtered(FilteredBy::NoiseSuspected),
+                self.segmenter.now_sample(),
+            );
             let _ = noise;
         }
         if let Some(t) = self.turns.iter_mut().find(|t| t.id == turn_id) {
@@ -1289,13 +1487,20 @@ impl Engine {
             return None;
         }
         let t = self.turn_of(u.turn_id)?;
-        Some(t.text.parts.iter().any(|p| matches!(p, Part::Text { seq: s, .. } if *s == seq)))
+        Some(
+            t.text
+                .parts
+                .iter()
+                .any(|p| matches!(p, Part::Text { seq: s, .. } if *s == seq)),
+        )
     }
 
     fn turn_all_released(&self, t: &Turn) -> bool {
-        t.units
-            .iter()
-            .all(|s| self.units.get(s).is_some_and(|u| matches!(u.state, UnitState::Released)))
+        t.units.iter().all(|s| {
+            self.units
+                .get(s)
+                .is_some_and(|u| matches!(u.state, UnitState::Released))
+        })
     }
 
     /// The deciding pause's verdict: the latest pause that follows a unit with text; while the
@@ -1337,7 +1542,11 @@ impl Engine {
                     if !self.turns[i].decided_emitted {
                         self.turns[i].decided_emitted = true;
                         let at = self.now_ms();
-                        self.activity(SpeechActivity::EndpointDecided { turn_id: id, reason: s, at_mono_ms: at });
+                        self.activity(SpeechActivity::EndpointDecided {
+                            turn_id: id,
+                            reason: s,
+                            at_mono_ms: at,
+                        });
                     }
                     changed = true;
                 }
@@ -1372,10 +1581,11 @@ impl Engine {
                 let timeout = Duration::from_millis(self.p.text_verdict_timeout_ms as u64);
                 self.turns[i].text_verdict = TextVerdict::Pending;
                 tokio::spawn(async move {
-                    let complete = match tokio::time::timeout(timeout, model.is_complete(&text)).await {
-                        Ok(Ok(c)) => Some(c),
-                        _ => None,
-                    };
+                    let complete =
+                        match tokio::time::timeout(timeout, model.is_complete(&text)).await {
+                            Ok(Ok(c)) => Some(c),
+                            _ => None,
+                        };
                     let _ = tx.send(Done::TextVerdict { turn_id, complete });
                 });
                 changed = true;
@@ -1391,7 +1601,11 @@ impl Engine {
                     t.decided_emitted = true;
                     let id = t.id;
                     let at = self.clock.now_ms();
-                    self.activity(SpeechActivity::EndpointDecided { turn_id: id, reason, at_mono_ms: at });
+                    self.activity(SpeechActivity::EndpointDecided {
+                        turn_id: id,
+                        reason,
+                        at_mono_ms: at,
+                    });
                 }
             }
         }
@@ -1411,7 +1625,11 @@ impl Engine {
                 && (t.sealed.is_some()
                     || (idle && silence >= self.thresholds.min_endpoint_silence_ms)
                     || !is_current);
-            let no_text = t.sealed.is_none() && all_released && has_units && !t.text.has_text() && (idle || !is_current);
+            let no_text = t.sealed.is_none()
+                && all_released
+                && has_units
+                && !t.text.has_text()
+                && (idle || !is_current);
             if !(ordinary || no_text) {
                 break;
             }
@@ -1460,7 +1678,9 @@ impl Engine {
         if self.p.interims != InterimMode::PerSegment {
             return;
         }
-        let Some(front) = self.turns.front_mut() else { return };
+        let Some(front) = self.turns.front_mut() else {
+            return;
+        };
         if !front.interim_pending {
             return;
         }

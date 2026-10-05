@@ -1598,9 +1598,25 @@ mod tests {
             .unwrap();
         assert_eq!(probe.verified_by, Some(VerifiedBy::LiveProbe));
         assert!(probe.probe_ref.is_some());
+        // The routing map keeps only the probe evidence the resolver reads.
+        let kept = map()
+            .row("nectec:partii5")
+            .unwrap()
+            .provenance
+            .as_ref()
+            .unwrap();
+        assert_eq!(kept.verified_by, Some(VerifiedBy::LiveProbe));
+        assert!(kept.probe_ref.is_some());
         assert!(
-            map().rows().iter().all(|r| r.provenance.is_none()),
-            "the routing map strips provenance"
+            map()
+                .rows()
+                .iter()
+                .filter(|r| r.provenance.is_some())
+                .all(|r| r
+                    .provenance
+                    .as_ref()
+                    .is_some_and(|p| p.verified_by.is_some() || p.probe_ref.is_some())),
+            "nothing else of provenance is kept"
         );
     }
 

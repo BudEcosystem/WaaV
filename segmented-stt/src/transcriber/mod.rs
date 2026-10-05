@@ -256,21 +256,30 @@ impl RequestProgress {
     fn now_ns() -> u64 {
         static START: std::sync::OnceLock<tokio::time::Instant> = std::sync::OnceLock::new();
         let start = *START.get_or_init(tokio::time::Instant::now);
-        tokio::time::Instant::now().saturating_duration_since(start).as_nanos() as u64 + 1
+        tokio::time::Instant::now()
+            .saturating_duration_since(start)
+            .as_nanos() as u64
+            + 1
     }
 
     /// The first byte was written.
     pub fn mark_sent(&self) {
-        let _ = self
-            .started_ns
-            .compare_exchange(0, Self::now_ns(), Ordering::AcqRel, Ordering::Acquire);
+        let _ = self.started_ns.compare_exchange(
+            0,
+            Self::now_ns(),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
     }
 
     /// Response headers arrived.
     pub fn mark_headers(&self) {
-        let _ = self
-            .headers_ns
-            .compare_exchange(0, Self::now_ns(), Ordering::AcqRel, Ordering::Acquire);
+        let _ = self.headers_ns.compare_exchange(
+            0,
+            Self::now_ns(),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
     }
 
     pub fn headers_received(&self) -> bool {
@@ -312,9 +321,18 @@ mod tests {
     fn http_statuses_are_classified_once() {
         assert_eq!(SegmentError::from_status(401, "").class, ErrorClass::Auth);
         assert_eq!(SegmentError::from_status(403, "").class, ErrorClass::Auth);
-        assert_eq!(SegmentError::from_status(404, "").class, ErrorClass::ModelNotServed);
-        assert_eq!(SegmentError::from_status(429, "").class, ErrorClass::RateLimited);
-        assert_eq!(SegmentError::from_status(422, "").class, ErrorClass::BadRequest);
+        assert_eq!(
+            SegmentError::from_status(404, "").class,
+            ErrorClass::ModelNotServed
+        );
+        assert_eq!(
+            SegmentError::from_status(429, "").class,
+            ErrorClass::RateLimited
+        );
+        assert_eq!(
+            SegmentError::from_status(422, "").class,
+            ErrorClass::BadRequest
+        );
         assert_eq!(SegmentError::from_status(503, "").class, ErrorClass::Vendor);
     }
 
@@ -344,12 +362,23 @@ mod tests {
 
     #[test]
     fn a_commit_socket_never_gets_a_second_request() {
-        let mut info = TranscriberInfo::file("openai_realtime_transcription", "wss://api.openai.com", "gpt-live-transcribe");
+        let mut info = TranscriberInfo::file(
+            "openai_realtime_transcription",
+            "wss://api.openai.com",
+            "gpt-live-transcribe",
+        );
         info.kind = TranscriberKind::Commit;
         assert!(!info.allows_second_request());
-        let file = TranscriberInfo::file("openai_transcriptions", "https://api.openai.com", "gpt-transcribe");
+        let file = TranscriberInfo::file(
+            "openai_transcriptions",
+            "https://api.openai.com",
+            "gpt-transcribe",
+        );
         assert!(file.allows_second_request());
-        let single = TranscriberInfo { single_process_server: true, ..file };
+        let single = TranscriberInfo {
+            single_process_server: true,
+            ..file
+        };
         assert!(!single.allows_second_request());
     }
 

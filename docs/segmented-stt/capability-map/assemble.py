@@ -69,9 +69,20 @@ PROSE_KEYS = {"provenance", "notes", "description", "rationale", "conditions", "
               "code_ref", "code_refs"}
 
 
+# The resolver reads these two provenance facts when evidence comes from the map (a recorded live
+# probe enables a transport that requires one), so the routing map keeps them.
+PROVENANCE_KEPT = ("verified_by", "probe_ref")
+
+
 def strip_prose(node):
     if isinstance(node, dict):
-        return {k: strip_prose(v) for k, v in node.items() if k not in PROSE_KEYS}
+        out = {k: strip_prose(v) for k, v in node.items() if k not in PROSE_KEYS}
+        prov = node.get("provenance")
+        if isinstance(prov, dict):
+            kept = {k: prov[k] for k in PROVENANCE_KEPT if k in prov}
+            if kept:
+                out["provenance"] = kept
+        return out
     if isinstance(node, list):
         return [strip_prose(v) for v in node]
     return node

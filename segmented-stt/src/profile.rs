@@ -156,7 +156,9 @@ impl Default for SegmentProfile {
 impl SegmentProfile {
     /// The soft split limit: the smaller of 20 s and the maximum segment less 5 s (decision 15).
     pub fn soft_max_segment_ms(&self) -> u32 {
-        20_000.min(self.max_segment_ms.saturating_sub(5000)).max(1000)
+        20_000
+            .min(self.max_segment_ms.saturating_sub(5000))
+            .max(1000)
     }
 
     /// Apply a session's endpoint tuning (W1 section 2.7).
@@ -192,9 +194,15 @@ mod tests {
     fn the_soft_split_is_twenty_seconds_or_five_under_the_row_maximum() {
         let p = SegmentProfile::default();
         assert_eq!(p.soft_max_segment_ms(), 20_000);
-        let amivoice = SegmentProfile { max_segment_ms: 14_000, ..p.clone() };
+        let amivoice = SegmentProfile {
+            max_segment_ms: 14_000,
+            ..p.clone()
+        };
         assert_eq!(amivoice.soft_max_segment_ms(), 9_000);
-        let fpt = SegmentProfile { max_segment_ms: 15_000, ..p };
+        let fpt = SegmentProfile {
+            max_segment_ms: 15_000,
+            ..p
+        };
         assert_eq!(fpt.soft_max_segment_ms(), 10_000);
     }
 
@@ -218,7 +226,10 @@ mod tests {
             min_end_silence_ms: Some(10),
             ..EndpointTuning::default()
         });
-        assert_eq!(p.cut_silence_ms, 224, "a small endpointing_ms cannot multiply uploads");
+        assert_eq!(
+            p.cut_silence_ms, 224,
+            "a small endpointing_ms cannot multiply uploads"
+        );
         assert_eq!(p.min_endpoint_silence_ms, 224);
         assert_eq!(p.endpoint_silence_ms, 224);
         let p = SegmentProfile::default().with_tuning(&EndpointTuning {
@@ -232,7 +243,10 @@ mod tests {
     #[test]
     fn upload_policy_names() {
         assert_eq!(UploadPolicy::parse("per_turn"), Some(UploadPolicy::PerTurn));
-        assert_eq!(UploadPolicy::parse("PER_PAUSE"), Some(UploadPolicy::PerPause));
+        assert_eq!(
+            UploadPolicy::parse("PER_PAUSE"),
+            Some(UploadPolicy::PerPause)
+        );
         assert_eq!(UploadPolicy::parse("x"), None);
     }
 }

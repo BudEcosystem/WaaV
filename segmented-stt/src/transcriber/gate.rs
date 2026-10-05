@@ -102,7 +102,9 @@ impl Limiter {
         let now = Instant::now();
         let mut b = self.bucket.lock();
         self.refill(&mut b, now);
-        b.paused_until.is_none_or(|t| t <= now) && b.tokens >= 1.0 && self.slots.available_permits() > 0
+        b.paused_until.is_none_or(|t| t <= now)
+            && b.tokens >= 1.0
+            && self.slots.available_permits() > 0
     }
 
     /// Wait for a token and a slot, no later than `latest`.
@@ -121,7 +123,9 @@ impl Limiter {
                             None
                         } else {
                             let rate = self.spec.lock().requests_per_minute / 60.0;
-                            Some(Duration::from_secs_f64(((1.0 - b.tokens) / rate.max(1e-6)).max(0.001)))
+                            Some(Duration::from_secs_f64(
+                                ((1.0 - b.tokens) / rate.max(1e-6)).max(0.001),
+                            ))
                         }
                     }
                 }
@@ -138,14 +142,15 @@ impl Limiter {
                 }
             }
         }
-        let slot = match tokio::time::timeout_at(latest, Arc::clone(&self.slots).acquire_owned()).await {
-            Ok(Ok(slot)) => slot,
-            _ => {
-                // Return the token we took: nothing was sent.
-                self.bucket.lock().tokens += 1.0;
-                return Err(GateRefusal::QueueTimeout);
-            }
-        };
+        let slot =
+            match tokio::time::timeout_at(latest, Arc::clone(&self.slots).acquire_owned()).await {
+                Ok(Ok(slot)) => slot,
+                _ => {
+                    // Return the token we took: nothing was sent.
+                    self.bucket.lock().tokens += 1.0;
+                    return Err(GateRefusal::QueueTimeout);
+                }
+            };
         Ok(GatePass {
             _slot: slot,
             waited: Instant::now().saturating_duration_since(start),
@@ -157,7 +162,9 @@ impl Limiter {
     pub fn observe_rate_limited(&self, retry_after: Option<Duration>) {
         let now = Instant::now();
         let mut b = self.bucket.lock();
-        let pause = retry_after.unwrap_or(Duration::from_millis(1000)).min(Duration::from_secs(60));
+        let pause = retry_after
+            .unwrap_or(Duration::from_millis(1000))
+            .min(Duration::from_secs(60));
         b.paused_until = Some(b.paused_until.map_or(now + pause, |t| t.max(now + pause)));
         b.tokens = b.tokens.min(0.0);
         b.pressure += 1;
@@ -277,7 +284,10 @@ mod tests {
         let soon = Instant::now() + Duration::from_millis(1500);
         let _a = l.acquire(soon).await.unwrap();
         assert!(!l.has_headroom());
-        assert_eq!(l.acquire(soon).await.unwrap_err(), GateRefusal::QueueTimeout);
+        assert_eq!(
+            l.acquire(soon).await.unwrap_err(),
+            GateRefusal::QueueTimeout
+        );
         assert!(l.take_pressure() >= 1);
         assert_eq!(l.take_pressure(), 0);
     }
@@ -293,7 +303,11 @@ mod tests {
         let a = l.acquire(soon).await.unwrap();
         assert!(l.acquire(soon).await.is_err());
         drop(a);
-        assert!(l.acquire(Instant::now() + Duration::from_millis(100)).await.is_ok());
+        assert!(
+            l.acquire(Instant::now() + Duration::from_millis(100))
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -301,7 +315,10 @@ mod tests {
         let l = Limiter::new(LimitSpec::from_rpm(400, 10));
         l.observe_rate_limited(Some(Duration::from_secs(2)));
         assert!(!l.has_headroom());
-        let pass = l.acquire(Instant::now() + Duration::from_secs(10)).await.unwrap();
+        let pass = l
+            .acquire(Instant::now() + Duration::from_secs(10))
+            .await
+            .unwrap();
         assert!(pass.waited >= Duration::from_secs(2));
     }
 

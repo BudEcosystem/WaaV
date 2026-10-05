@@ -34,8 +34,15 @@ pub struct TurnText {
 /// Languages written without spaces between words.
 pub fn writes_without_spaces(language: Option<&str>) -> bool {
     let Some(lang) = language else { return false };
-    let primary = lang.split(['-', '_']).next().unwrap_or("").to_ascii_lowercase();
-    matches!(primary.as_str(), "zh" | "ja" | "th" | "lo" | "km" | "my" | "yue" | "cmn" | "wuu")
+    let primary = lang
+        .split(['-', '_'])
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(
+        primary.as_str(),
+        "zh" | "ja" | "th" | "lo" | "km" | "my" | "yue" | "cmn" | "wuu"
+    )
 }
 
 fn norm_word(w: &str) -> String {
@@ -120,11 +127,17 @@ impl TurnText {
     pub fn offset(&self) -> u32 {
         let j = self.joined();
         let n = j.chars().count();
-        if n == 0 { 0 } else { n as u32 + u32::from(!self.no_space) }
+        if n == 0 {
+            0
+        } else {
+            n as u32 + u32::from(!self.no_space)
+        }
     }
 
     pub fn has_text(&self) -> bool {
-        self.parts.iter().any(|p| matches!(p, Part::Text { text, .. } if !text.trim().is_empty()))
+        self.parts
+            .iter()
+            .any(|p| matches!(p, Part::Text { text, .. } if !text.trim().is_empty()))
     }
 
     pub fn gaps(&self) -> (u16, u32) {
@@ -135,7 +148,10 @@ impl TurnText {
     }
 
     pub fn text_parts(&self) -> u16 {
-        self.parts.iter().filter(|p| matches!(p, Part::Text { .. })).count() as u16
+        self.parts
+            .iter()
+            .filter(|p| matches!(p, Part::Text { .. }))
+            .count() as u16
     }
 
     fn confidence(&self) -> (f32, Option<f32>) {
@@ -143,31 +159,44 @@ impl TurnText {
             .parts
             .iter()
             .filter_map(|p| match p {
-                Part::Text { vendor_confidence, .. } => *vendor_confidence,
+                Part::Text {
+                    vendor_confidence, ..
+                } => *vendor_confidence,
                 _ => None,
             })
-            .fold(None, |acc: Option<f32>, v| Some(acc.map_or(v, |a| a.min(v))));
+            .fold(None, |acc: Option<f32>, v| {
+                Some(acc.map_or(v, |a| a.min(v)))
+            });
         let derived = self
             .parts
             .iter()
             .filter_map(|p| match p {
-                Part::Text { derived_confidence, .. } => *derived_confidence,
+                Part::Text {
+                    derived_confidence, ..
+                } => *derived_confidence,
                 _ => None,
             })
-            .fold(None, |acc: Option<f32>, v| Some(acc.map_or(v, |a| a.min(v))));
+            .fold(None, |acc: Option<f32>, v| {
+                Some(acc.map_or(v, |a| a.min(v)))
+            });
         (vendor.or(derived).unwrap_or(1.0), vendor)
     }
 
     fn language(&self) -> Option<String> {
         self.parts.iter().rev().find_map(|p| match p {
-            Part::Text { language: Some(l), .. } => Some(l.clone()),
+            Part::Text {
+                language: Some(l), ..
+            } => Some(l.clone()),
             _ => None,
         })
     }
 
     fn request_id(&self) -> Option<String> {
         self.parts.iter().rev().find_map(|p| match p {
-            Part::Text { request_id: Some(r), .. } => Some(r.clone()),
+            Part::Text {
+                request_id: Some(r),
+                ..
+            } => Some(r.clone()),
             _ => None,
         })
     }
@@ -263,7 +292,10 @@ mod tests {
         let mut t = TurnText::new(None);
         t.push(text(1, "my account number is", CutReason::Pause));
         let off = t.offset();
-        t.push(Part::Gap { seq: 2, voiced_ms: 1200 });
+        t.push(Part::Gap {
+            seq: 2,
+            voiced_ms: 1200,
+        });
         t.push(text(3, "thanks", CutReason::Pause));
         assert_eq!(t.joined(), "my account number is thanks");
         assert_eq!(off, 21);

@@ -191,7 +191,9 @@ impl RepairMemory {
     }
 
     fn remember(&self, info: &TranscriberInfo, repair: Repair) {
-        self.map.lock().insert(Self::key(info), (Instant::now(), repair));
+        self.map
+            .lock()
+            .insert(Self::key(info), (Instant::now(), repair));
     }
 }
 
@@ -207,7 +209,18 @@ pub struct SegmentAttempts {
     pub observer: Option<Arc<dyn AttemptObserver>>,
 }
 
-type ReqFuture = Pin<Box<dyn std::future::Future<Output = (u8, Result<SegmentTranscript, SegmentError>, Arc<RequestProgress>, Instant)> + Send>>;
+type ReqFuture = Pin<
+    Box<
+        dyn std::future::Future<
+                Output = (
+                    u8,
+                    Result<SegmentTranscript, SegmentError>,
+                    Arc<RequestProgress>,
+                    Instant,
+                ),
+            > + Send,
+    >,
+>;
 
 /// Records `None` on the breaker if the unit is dropped before its outcome is known.
 struct PermitGuard<'a> {
@@ -233,11 +246,12 @@ impl Drop for PermitGuard<'_> {
 
 fn retry_wait(retry_after: Option<Duration>) -> Duration {
     // The larger of the vendor's Retry-After (honoured up to one second) and 100 to 400 ms.
-    let jitter = 100 + (std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0)
-        % 300) as u64;
+    let jitter = 100
+        + (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0)
+            % 300) as u64;
     retry_after
         .unwrap_or(Duration::ZERO)
         .min(Duration::from_secs(1))
@@ -262,11 +276,19 @@ impl SegmentAttempts {
         let ctx = ctx.clone();
         Box::pin(async move {
             let started = Instant::now();
-            let r = match tokio::time::timeout(limit, t.transcribe(&audio, &ctx, limit, &progress)).await {
+            let r = match tokio::time::timeout(limit, t.transcribe(&audio, &ctx, limit, &progress))
+                .await
+            {
                 Ok(r) => r,
-                Err(_) => Err(SegmentError::new(ErrorClass::Timeout, "request limit reached").with_phase(
-                    if progress.headers_received() { RequestPhase::Headers } else { RequestPhase::Sent },
-                )),
+                Err(_) => Err(
+                    SegmentError::new(ErrorClass::Timeout, "request limit reached").with_phase(
+                        if progress.headers_received() {
+                            RequestPhase::Headers
+                        } else {
+                            RequestPhase::Sent
+                        },
+                    ),
+                ),
             };
             (n, r, progress, started)
         })
@@ -276,16 +298,24 @@ impl SegmentAttempts {
     pub async fn run(&self, audio: SegmentAudio, req: UploadRequest) -> UploadResolution {
         let mut ledger = Ledger::default();
         let mut warnings = Vec::new();
-        let resolution = |result, ledger, queue_wait, round_trip, fatal, warnings| UploadResolution {
-            result,
-            ledger,
-            queue_wait,
-            round_trip,
-            fatal,
-            warnings,
-        };
+        let resolution =
+            |result, ledger, queue_wait, round_trip, fatal, warnings| UploadResolution {
+                result,
+                ledger,
+                queue_wait,
+                round_trip,
+                fatal,
+                warnings,
+            };
         if let Some(c) = self.health.fatal() {
-            return resolution(Err(UnitFailure::SessionFatal(c)), ledger, Duration::ZERO, None, None, warnings);
+            return resolution(
+                Err(UnitFailure::SessionFatal(c)),
+                ledger,
+                Duration::ZERO,
+                None,
+                None,
+                warnings,
+            );
         }
         let info = self.transcriber.info().clone();
         let audio_ms = audio.audio_ms();
@@ -293,24 +323,50 @@ impl SegmentAttempts {
             && audio_ms > max
         {
             return resolution(
-                Err(UnitFailure::Local(format!("{audio_ms} ms is over the vendor's {max} ms"))),
-                ledger, Duration::ZERO, None, None, warnings,
+                Err(UnitFailure::Local(format!(
+                    "{audio_ms} ms is over the vendor's {max} ms"
+                ))),
+                ledger,
+                Duration::ZERO,
+                None,
+                None,
+                warnings,
             );
         }
         if let Some(max) = info.max_upload_bytes
             && (audio.pcm.len() as u64 * 2 + 44) > max
         {
             return resolution(
-                Err(UnitFailure::Local("the upload is over the vendor's size limit".into())),
-                ledger, Duration::ZERO, None, None, warnings,
+                Err(UnitFailure::Local(
+                    "the upload is over the vendor's size limit".into(),
+                )),
+                ledger,
+                Duration::ZERO,
+                None,
+                None,
+                warnings,
             );
         }
         if Instant::now() >= req.deadline_at {
-            return resolution(Err(UnitFailure::TimedOut), ledger, Duration::ZERO, None, None, warnings);
+            return resolution(
+                Err(UnitFailure::TimedOut),
+                ledger,
+                Duration::ZERO,
+                None,
+                None,
+                warnings,
+            );
         }
         let admission = self.breaker.try_acquire(true);
         if admission == Admission::Denied {
-            return resolution(Err(UnitFailure::BreakerOpen), ledger, Duration::ZERO, None, None, warnings);
+            return resolution(
+                Err(UnitFailure::BreakerOpen),
+                ledger,
+                Duration::ZERO,
+                None,
+                None,
+                warnings,
+            );
         }
         let mut permit = PermitGuard {
             breaker: &self.breaker,
@@ -326,7 +382,11 @@ impl SegmentAttempts {
                 permit.resolve(None);
                 return resolution(
                     Err(UnitFailure::LimiterRefused),
-                    ledger, gate_start.elapsed(), None, None, warnings,
+                    ledger,
+                    gate_start.elapsed(),
+                    None,
+                    None,
+                    warnings,
                 );
             }
         };
@@ -353,7 +413,11 @@ impl SegmentAttempts {
         };
 
         let e = loop {
-            let timer_at = if second_sent || stall_checked || !can_second || self.policy == SecondRequestPolicy::Never {
+            let timer_at = if second_sent
+                || stall_checked
+                || !can_second
+                || self.policy == SecondRequestPolicy::Never
+            {
                 None
             } else {
                 Some(hedge_at.map_or(stall_at, |h| h.min(stall_at)))
@@ -446,22 +510,43 @@ impl SegmentAttempts {
         drop(passes);
         permit.resolve(e.counts_for_breaker().then_some(false));
         if e.class == ErrorClass::Timeout {
-            return resolution(Err(UnitFailure::TimedOut), ledger, queue_wait, None, None, warnings);
+            return resolution(
+                Err(UnitFailure::TimedOut),
+                ledger,
+                queue_wait,
+                None,
+                None,
+                warnings,
+            );
         }
         let fatal = self.health.failure(&e);
-        resolution(Err(UnitFailure::Vendor(e)), ledger, queue_wait, None, fatal, warnings)
+        resolution(
+            Err(UnitFailure::Vendor(e)),
+            ledger,
+            queue_wait,
+            None,
+            fatal,
+            warnings,
+        )
     }
 }
 
 /// A refused request that leaving out optional fields can repair: the field the vendor named, if
 /// the target may drop it; otherwise, when the refusal names no field and optional fields were
 /// sent, only the file and the model.
-fn repair_for(info: &TranscriberInfo, ctx: &SegmentContext, e: &SegmentError) -> Option<(SegmentContext, Repair)> {
+fn repair_for(
+    info: &TranscriberInfo,
+    ctx: &SegmentContext,
+    e: &SegmentError,
+) -> Option<(SegmentContext, Repair)> {
     if e.class != ErrorClass::BadRequest || ctx.minimal {
         return None;
     }
     match &e.refused_field {
-        Some(field) if info.droppable_fields.iter().any(|f| f == field) && !ctx.omit_fields.contains(field) => {
+        Some(field)
+            if info.droppable_fields.iter().any(|f| f == field)
+                && !ctx.omit_fields.contains(field) =>
+        {
             let mut c = ctx.clone();
             c.omit_fields.push(field.clone());
             let fields = c.omit_fields.clone();
@@ -480,10 +565,10 @@ fn repair_for(info: &TranscriberInfo, ctx: &SegmentContext, e: &SegmentError) ->
 mod tests {
     use super::*;
     use crate::limits::{DeadlineInputs, segment_deadlines};
+    use crate::transcriber::TranscriberKind;
     use crate::transcriber::breaker::{BreakerConfig, BreakerState};
     use crate::transcriber::gate::LimitSpec;
     use crate::transcriber::testing::{FakeStep, FakeTranscriber};
-    use crate::transcriber::TranscriberKind;
 
     fn ms(v: u64) -> Duration {
         Duration::from_millis(v)
@@ -538,7 +623,13 @@ mod tests {
         let a = attempts(Arc::clone(&t));
         let r = a.run(audio(), request(deadlines())).await;
         assert_eq!(r.result.unwrap().text, "hello");
-        assert_eq!(r.ledger, Ledger { requests: 1, uploaded_ms: 1000 });
+        assert_eq!(
+            r.ledger,
+            Ledger {
+                requests: 1,
+                uploaded_ms: 1000
+            }
+        );
         assert_eq!(r.round_trip, Some(ms(800)));
         assert_eq!(t.calls(), 1);
     }
@@ -585,9 +676,19 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_commit_socket_never_gets_a_second_request_even_when_stalled() {
-        let mut info = TranscriberInfo::file("openai_realtime_transcription", "wss://api.openai.com:443", "gpt-live-transcribe");
+        let mut info = TranscriberInfo::file(
+            "openai_realtime_transcription",
+            "wss://api.openai.com:443",
+            "gpt-live-transcribe",
+        );
         info.kind = TranscriberKind::Commit;
-        let t = FakeTranscriber::new(info, [FakeStep::stall(), FakeStep::text("would be a second commit", ms(10))]);
+        let t = FakeTranscriber::new(
+            info,
+            [
+                FakeStep::stall(),
+                FakeStep::text("would be a second commit", ms(10)),
+            ],
+        );
         let a = attempts(Arc::clone(&t));
         let r = a.run(audio(), request(deadlines())).await;
         assert_eq!(r.result.unwrap_err(), UnitFailure::TimedOut);
@@ -596,9 +697,19 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_commit_socket_that_fails_fast_is_not_retried() {
-        let mut info = TranscriberInfo::file("openai_realtime_transcription", "wss://api.openai.com:443", "gpt-live-transcribe");
+        let mut info = TranscriberInfo::file(
+            "openai_realtime_transcription",
+            "wss://api.openai.com:443",
+            "gpt-live-transcribe",
+        );
         info.kind = TranscriberKind::Commit;
-        let t = FakeTranscriber::new(info, [FakeStep::error(SegmentError::new(ErrorClass::Network, "socket dropped"), ms(10))]);
+        let t = FakeTranscriber::new(
+            info,
+            [FakeStep::error(
+                SegmentError::new(ErrorClass::Network, "socket dropped"),
+                ms(10),
+            )],
+        );
         let a = attempts(Arc::clone(&t));
         let r = a.run(audio(), request(deadlines())).await;
         assert!(matches!(r.result, Err(UnitFailure::Vendor(_))));
@@ -640,7 +751,13 @@ mod tests {
         refused.refused_field = Some("prompt".into());
         let mut info = TranscriberInfo::file("openai_transcriptions", "https://x:443", "m");
         info.droppable_fields = vec!["prompt".into(), "language".into()];
-        let t = FakeTranscriber::new(info, [FakeStep::error(refused, ms(50)), FakeStep::text("ok", ms(50))]);
+        let t = FakeTranscriber::new(
+            info,
+            [
+                FakeStep::error(refused, ms(50)),
+                FakeStep::text("ok", ms(50)),
+            ],
+        );
         let a = attempts(Arc::clone(&t));
         let r = a.run(audio(), request(deadlines())).await;
         assert_eq!(r.result.unwrap().text, "ok");
@@ -667,12 +784,18 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_refused_credential_on_the_first_request_ends_the_session() {
-        let t = FakeTranscriber::file([FakeStep::error(SegmentError::from_status(401, "bad key"), ms(50))]);
+        let t = FakeTranscriber::file([FakeStep::error(
+            SegmentError::from_status(401, "bad key"),
+            ms(50),
+        )]);
         let a = attempts(Arc::clone(&t));
         let r = a.run(audio(), request(deadlines())).await;
         assert_eq!(r.fatal, Some(ErrorClass::Auth));
         let r = a.run(audio(), request(deadlines())).await;
-        assert_eq!(r.result.unwrap_err(), UnitFailure::SessionFatal(ErrorClass::Auth));
+        assert_eq!(
+            r.result.unwrap_err(),
+            UnitFailure::SessionFatal(ErrorClass::Auth)
+        );
         assert_eq!(t.calls(), 1, "nothing more is sent");
     }
 
@@ -686,14 +809,23 @@ mod tests {
         let a = attempts(Arc::clone(&t));
         assert!(a.run(audio(), request(deadlines())).await.result.is_ok());
         assert_eq!(a.run(audio(), request(deadlines())).await.fatal, None);
-        assert_eq!(a.run(audio(), request(deadlines())).await.fatal, Some(ErrorClass::Auth));
+        assert_eq!(
+            a.run(audio(), request(deadlines())).await.fatal,
+            Some(ErrorClass::Auth)
+        );
     }
 
     #[tokio::test(start_paused = true)]
     async fn a_model_that_is_not_served_ends_the_session_at_once() {
-        let t = FakeTranscriber::file([FakeStep::error(SegmentError::from_status(404, "model"), ms(50))]);
+        let t = FakeTranscriber::file([FakeStep::error(
+            SegmentError::from_status(404, "model"),
+            ms(50),
+        )]);
         let a = attempts(t);
-        assert_eq!(a.run(audio(), request(deadlines())).await.fatal, Some(ErrorClass::ModelNotServed));
+        assert_eq!(
+            a.run(audio(), request(deadlines())).await.fatal,
+            Some(ErrorClass::ModelNotServed)
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -707,13 +839,19 @@ mod tests {
         let a = attempts(FakeTranscriber::file(steps));
         assert_eq!(a.run(audio(), request(deadlines())).await.fatal, None);
         assert_eq!(a.run(audio(), request(deadlines())).await.fatal, None);
-        assert_eq!(a.run(audio(), request(deadlines())).await.fatal, Some(ErrorClass::BadRequest));
+        assert_eq!(
+            a.run(audio(), request(deadlines())).await.fatal,
+            Some(ErrorClass::BadRequest)
+        );
     }
 
     #[tokio::test(start_paused = true)]
     async fn a_rate_limit_slows_the_limiter_and_never_opens_the_breaker() {
         let t = FakeTranscriber::file([
-            FakeStep::error(SegmentError::from_status(429, "slow down").with_retry_after(Some(ms(500))), ms(10)),
+            FakeStep::error(
+                SegmentError::from_status(429, "slow down").with_retry_after(Some(ms(500))),
+                ms(10),
+            ),
             FakeStep::text("ok", ms(10)),
         ]);
         let a = attempts(Arc::clone(&t));
@@ -726,7 +864,11 @@ mod tests {
     async fn the_limiter_refuses_after_the_queue_allowance() {
         let t = FakeTranscriber::file([]);
         let mut a = attempts(Arc::clone(&t));
-        a.limiter = Arc::new(Limiter::new(LimitSpec { requests_per_minute: 1.0, burst: 1.0, max_concurrent: 4 }));
+        a.limiter = Arc::new(Limiter::new(LimitSpec {
+            requests_per_minute: 1.0,
+            burst: 1.0,
+            max_concurrent: 4,
+        }));
         let _ = a.run(audio(), request(deadlines())).await;
         let start = Instant::now();
         let r = a.run(audio(), request(deadlines())).await;
@@ -749,7 +891,10 @@ mod tests {
     async fn the_low_latency_tier_hedges_at_the_p95() {
         let mut d = deadlines();
         d.hedge_delay = Some(ms(1200));
-        let t = FakeTranscriber::file([FakeStep::text("slow", ms(5000)), FakeStep::text("hedged", ms(500))]);
+        let t = FakeTranscriber::file([
+            FakeStep::text("slow", ms(5000)),
+            FakeStep::text("hedged", ms(500)),
+        ]);
         let mut a = attempts(Arc::clone(&t));
         a.policy = SecondRequestPolicy::Hedge;
         let start = Instant::now();
@@ -760,7 +905,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn the_policy_never_sends_no_retry() {
-        let t = FakeTranscriber::file([FakeStep::error(SegmentError::from_status(503, ""), ms(10))]);
+        let t =
+            FakeTranscriber::file([FakeStep::error(SegmentError::from_status(503, ""), ms(10))]);
         let mut a = attempts(Arc::clone(&t));
         a.policy = SecondRequestPolicy::Never;
         assert!(a.run(audio(), request(deadlines())).await.result.is_err());
@@ -773,7 +919,10 @@ mod tests {
         info.max_audio_ms = Some(500);
         let t = FakeTranscriber::new(info, []);
         let a = attempts(Arc::clone(&t));
-        assert!(matches!(a.run(audio(), request(deadlines())).await.result, Err(UnitFailure::Local(_))));
+        assert!(matches!(
+            a.run(audio(), request(deadlines())).await.result,
+            Err(UnitFailure::Local(_))
+        ));
         assert_eq!(t.calls(), 0);
     }
 }

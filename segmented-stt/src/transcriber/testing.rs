@@ -47,16 +47,21 @@ impl FakeStep {
         Self {
             headers_after: None,
             answer_after: Duration::from_secs(3600),
-            result: Err(SegmentError::new(crate::types::ErrorClass::Timeout, "stalled")),
+            result: Err(SegmentError::new(
+                crate::types::ErrorClass::Timeout,
+                "stalled",
+            )),
         }
     }
 }
+
+type Fallback = Arc<dyn Fn(&SegmentAudio, &SegmentContext) -> FakeStep + Send + Sync>;
 
 /// A transcriber that answers from a script. Calls past the end of the script get `fallback`.
 pub struct FakeTranscriber {
     info: TranscriberInfo,
     script: Mutex<VecDeque<FakeStep>>,
-    fallback: Mutex<Option<Arc<dyn Fn(&SegmentAudio, &SegmentContext) -> FakeStep + Send + Sync>>>,
+    fallback: Mutex<Option<Fallback>>,
     calls: AtomicUsize,
     in_flight: AtomicUsize,
     max_in_flight: AtomicUsize,
@@ -79,11 +84,17 @@ impl FakeTranscriber {
     }
 
     pub fn file(steps: impl IntoIterator<Item = FakeStep>) -> Arc<Self> {
-        Self::new(TranscriberInfo::file("fake", "https://fake.example:443", "fake-model"), steps)
+        Self::new(
+            TranscriberInfo::file("fake", "https://fake.example:443", "fake-model"),
+            steps,
+        )
     }
 
     /// Answer every unscripted call with this function.
-    pub fn set_fallback(&self, f: impl Fn(&SegmentAudio, &SegmentContext) -> FakeStep + Send + Sync + 'static) {
+    pub fn set_fallback(
+        &self,
+        f: impl Fn(&SegmentAudio, &SegmentContext) -> FakeStep + Send + Sync + 'static,
+    ) {
         *self.fallback.lock() = Some(Arc::new(f));
     }
 
@@ -158,12 +169,15 @@ impl SegmentTranscriber for FakeTranscriber {
         };
         match tokio::time::timeout(timeout, run).await {
             Ok(r) => r,
-            Err(_) => Err(SegmentError::new(crate::types::ErrorClass::Timeout, "request limit")
-                .with_phase(if progress.headers_received() {
-                    super::RequestPhase::Headers
-                } else {
-                    super::RequestPhase::Sent
-                })),
+            Err(_) => Err(
+                SegmentError::new(crate::types::ErrorClass::Timeout, "request limit").with_phase(
+                    if progress.headers_received() {
+                        super::RequestPhase::Headers
+                    } else {
+                        super::RequestPhase::Sent
+                    },
+                ),
+            ),
         }
     }
 }

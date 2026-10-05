@@ -40,10 +40,34 @@ pub struct EncodingInfo {
 pub struct UndecodableEncoding(pub String);
 
 /// Compressed formats: a detector needs raw samples.
-pub const UNDECODABLE: &[&str] = &["flac", "opus", "ogg_opus", "webm_opus", "amr", "amr_wb", "mp3"];
+pub const UNDECODABLE: &[&str] = &[
+    "flac",
+    "opus",
+    "ogg_opus",
+    "webm_opus",
+    "amr",
+    "amr_wb",
+    "mp3",
+];
 
-const PCM_NAMES: &[&str] = &["linear16", "pcm", "pcm16", "pcm_s16le", "lpcm", "raw", "s16le"];
-const MULAW_NAMES: &[&str] = &["mulaw", "ulaw", "pcm_mulaw", "pcmu", "g711u", "mu-law", "g711_ulaw"];
+const PCM_NAMES: &[&str] = &[
+    "linear16",
+    "pcm",
+    "pcm16",
+    "pcm_s16le",
+    "lpcm",
+    "raw",
+    "s16le",
+];
+const MULAW_NAMES: &[&str] = &[
+    "mulaw",
+    "ulaw",
+    "pcm_mulaw",
+    "pcmu",
+    "g711u",
+    "mu-law",
+    "g711_ulaw",
+];
 const ALAW_NAMES: &[&str] = &["alaw", "pcm_alaw", "pcma", "g711a", "a-law", "g711_alaw"];
 
 /// Read a wire `encoding` name, case-insensitively. An empty or unknown name is 16-bit PCM.
@@ -316,7 +340,13 @@ impl FrontEnd {
         if whole == 0 {
             return;
         }
-        frames.extend(self.pending.drain(..whole).collect::<Vec<_>>().chunks_exact(FRAME_SAMPLES).map(<[i16]>::to_vec));
+        frames.extend(
+            self.pending
+                .drain(..whole)
+                .collect::<Vec<_>>()
+                .chunks_exact(FRAME_SAMPLES)
+                .map(<[i16]>::to_vec),
+        );
     }
 }
 
@@ -324,7 +354,9 @@ fn f32_to_i16(s: f32) -> i16 {
     if !s.is_finite() {
         return 0;
     }
-    (s * 32768.0).round().clamp(i16::MIN as f32, i16::MAX as f32) as i16
+    (s * 32768.0)
+        .round()
+        .clamp(i16::MIN as f32, i16::MAX as f32) as i16
 }
 
 /// A frame as the detector wants it: f32 in [-1, 1].
@@ -382,19 +414,43 @@ mod tests {
     fn tone(rate: u32, hz: f32, ms: u32, amp: f32) -> Vec<i16> {
         let n = (rate as u64 * ms as u64 / 1000) as usize;
         (0..n)
-            .map(|i| ((2.0 * std::f32::consts::PI * hz * i as f32 / rate as f32).sin() * amp * 32767.0) as i16)
+            .map(|i| {
+                ((2.0 * std::f32::consts::PI * hz * i as f32 / rate as f32).sin() * amp * 32767.0)
+                    as i16
+            })
             .collect()
     }
 
     #[test]
     fn encoding_names_decode_pcm_and_g711_and_refuse_compressed_formats() {
-        assert_eq!(parse_encoding("linear16").unwrap().encoding, WireEncoding::Pcm16);
-        assert_eq!(parse_encoding("PCM_S16LE").unwrap().encoding, WireEncoding::Pcm16);
-        assert_eq!(parse_encoding("").unwrap(), EncodingInfo { encoding: WireEncoding::Pcm16, assumed_pcm: None });
-        assert_eq!(parse_encoding("mulaw").unwrap().encoding, WireEncoding::MuLaw);
-        assert_eq!(parse_encoding("pcmu").unwrap().encoding, WireEncoding::MuLaw);
+        assert_eq!(
+            parse_encoding("linear16").unwrap().encoding,
+            WireEncoding::Pcm16
+        );
+        assert_eq!(
+            parse_encoding("PCM_S16LE").unwrap().encoding,
+            WireEncoding::Pcm16
+        );
+        assert_eq!(
+            parse_encoding("").unwrap(),
+            EncodingInfo {
+                encoding: WireEncoding::Pcm16,
+                assumed_pcm: None
+            }
+        );
+        assert_eq!(
+            parse_encoding("mulaw").unwrap().encoding,
+            WireEncoding::MuLaw
+        );
+        assert_eq!(
+            parse_encoding("pcmu").unwrap().encoding,
+            WireEncoding::MuLaw
+        );
         assert_eq!(parse_encoding("alaw").unwrap().encoding, WireEncoding::ALaw);
-        assert_eq!(parse_encoding("g711a").unwrap().encoding, WireEncoding::ALaw);
+        assert_eq!(
+            parse_encoding("g711a").unwrap().encoding,
+            WireEncoding::ALaw
+        );
         for compressed in UNDECODABLE {
             assert!(!can_decode_encoding(compressed), "{compressed}");
         }
@@ -452,7 +508,9 @@ mod tests {
     #[test]
     fn stereo_is_averaged_to_mono_across_chunk_boundaries() {
         let mut fe = FrontEnd::new("linear16", 16_000, 2).unwrap();
-        let interleaved: Vec<i16> = (0..1024).map(|i| if i % 2 == 0 { 100 } else { 300 }).collect();
+        let interleaved: Vec<i16> = (0..1024)
+            .map(|i| if i % 2 == 0 { 100 } else { 300 })
+            .collect();
         let bytes = pcm_bytes(&interleaved);
         let mut frames = Vec::new();
         fe.push(&bytes[..6], &mut frames); // a sample and a half of a group
@@ -484,7 +542,10 @@ mod tests {
         let out: Vec<i16> = frames.concat();
         // Skip the filter's warm-up, then count zero crossings over 0.5 s: about 440.
         let window = &out[1600..9600];
-        let crossings = window.windows(2).filter(|w| (w[0] < 0) != (w[1] < 0)).count();
+        let crossings = window
+            .windows(2)
+            .filter(|w| (w[0] < 0) != (w[1] < 0))
+            .count();
         assert!((430..=450).contains(&crossings), "{crossings}");
         let level = rms(window);
         assert!((0.32..0.39).contains(&level), "{level}");
@@ -514,7 +575,10 @@ mod tests {
 
     #[test]
     fn rejects_formats_it_cannot_frame() {
-        assert!(matches!(FrontEnd::new("opus", 48_000, 1), Err(AudioError::Undecodable(_))));
+        assert!(matches!(
+            FrontEnd::new("opus", 48_000, 1),
+            Err(AudioError::Undecodable(_))
+        ));
         assert!(FrontEnd::new("linear16", 0, 1).is_err());
         assert!(FrontEnd::new("linear16", 16_000, 0).is_err());
     }

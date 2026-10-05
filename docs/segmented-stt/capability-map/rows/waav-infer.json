@@ -81,7 +81,7 @@
         "refusal": {
           "code": "stt_live_unsupported",
           "reason": "client_not_implemented",
-          "text": "WaaV Infer transcribes one uploaded audio clip per request and has no live streaming interface for transcription. This gateway does not yet serve a WaaV Infer model on a live call for this session. Ask the operator to enable segmented speech-to-text, which uploads each utterance to the engine, or choose a streaming transcription model."
+          "text": "WaaV Infer transcribes one uploaded audio clip per request and has no live streaming interface for transcription. This gateway does not yet serve a WaaV Infer model on a live call for this session. Choose a streaming transcription model, or ask the operator to enable segmented speech-to-text for this deployment."
         }
       },
       "billing": {
@@ -249,7 +249,7 @@
         "refusal": {
           "code": "stt_live_unsupported",
           "reason": "client_not_implemented",
-          "text": "WaaV Infer transcribes one uploaded audio clip per request and has no live streaming interface for transcription. This gateway does not yet serve a WaaV Infer model on a live call for this session. Ask the operator to enable segmented speech-to-text, which uploads each utterance to the engine, or choose a streaming transcription model."
+          "text": "WaaV Infer transcribes one uploaded audio clip per request and has no live streaming interface for transcription. This gateway does not yet serve a WaaV Infer model on a live call for this session. Choose a streaming transcription model, or ask the operator to enable segmented speech-to-text for this deployment."
         }
       },
       "billing": {
@@ -418,7 +418,7 @@
         "refusal": {
           "code": "stt_live_unsupported",
           "reason": "client_not_implemented",
-          "text": "WaaV Infer transcribes one uploaded audio clip per request and has no live streaming interface for transcription. This gateway does not yet serve a WaaV Infer model on a live call for this session. Ask the operator to enable segmented speech-to-text, which uploads each utterance to the engine, or choose a streaming transcription model."
+          "text": "WaaV Infer transcribes one uploaded audio clip per request and has no live streaming interface for transcription. This gateway does not yet serve a WaaV Infer model on a live call for this session. Choose a streaming transcription model, or ask the operator to enable segmented speech-to-text for this deployment."
         }
       },
       "billing": {
@@ -577,7 +577,7 @@
         "refusal": {
           "code": "stt_live_unsupported",
           "reason": "client_not_implemented",
-          "text": "WaaV Infer transcribes one uploaded audio clip per request and has no live streaming interface for transcription. This gateway does not yet serve a WaaV Infer model on a live call for this session. Ask the operator to enable segmented speech-to-text, which uploads each utterance to the engine, or choose a streaming transcription model."
+          "text": "WaaV Infer transcribes one uploaded audio clip per request and has no live streaming interface for transcription. This gateway does not yet serve a WaaV Infer model on a live call for this session. Choose a streaming transcription model, or ask the operator to enable segmented speech-to-text for this deployment."
         }
       },
       "billing": {

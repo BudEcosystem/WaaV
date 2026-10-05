@@ -126,7 +126,17 @@ const HALLUCINATIONS: &[&str] = &[
 ];
 
 /// Short polite words that are often invented, but often said. Counted, never dropped in Release 1.
-const SUSPECTS: &[&str] = &["thank you", "thanks", "you", "bye", "okay", "ok", "yeah", "so", "oh"];
+const SUSPECTS: &[&str] = &[
+    "thank you",
+    "thanks",
+    "you",
+    "bye",
+    "okay",
+    "ok",
+    "yeah",
+    "so",
+    "oh",
+];
 
 const NUMBER_WORDS: &[&str] = &[
     "zero", "oh", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
@@ -136,7 +146,13 @@ const NUMBER_WORDS: &[&str] = &[
 /// Case-folded words with punctuation removed (apostrophes kept), for whole-text comparisons.
 fn normalise(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_alphanumeric() || c == '\'' { c } else { ' ' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '\'' {
+                c
+            } else {
+                ' '
+            }
+        })
         .collect::<String>()
         .to_lowercase()
         .split_whitespace()
@@ -177,8 +193,12 @@ fn strip_tags(s: &str) -> (String, bool) {
 }
 
 fn is_number_or_letter(w: &str) -> bool {
-    let w = w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
-    w.chars().all(|c| c.is_ascii_digit()) || w.chars().count() == 1 || NUMBER_WORDS.contains(&w.as_str())
+    let w = w
+        .trim_matches(|c: char| !c.is_alphanumeric())
+        .to_lowercase();
+    w.chars().all(|c| c.is_ascii_digit())
+        || w.chars().count() == 1
+        || NUMBER_WORDS.contains(&w.as_str())
 }
 
 /// Collapse a run of two or more words repeated four or more times in a row, never on digits,
@@ -230,13 +250,20 @@ pub fn evaluate(t: &SegmentTranscript, ev: &SegmentEvidence, p: &QualityPolicy) 
     if had_tags && !stripped.chars().any(|c| c.is_alphanumeric()) {
         return QualityVerdict::Filtered(FilterReason::NonLexical);
     }
-    let mut text = if had_tags { stripped } else { t.text.trim().to_string() };
+    let mut text = if had_tags {
+        stripped
+    } else {
+        t.text.trim().to_string()
+    };
     let mut rewritten = had_tags.then_some(Rewrite::TagsStripped);
     // 4 and 5. Whisper's no-speech signal, where the row trusts it.
     if p.no_speech_signal
         && let Some(ns) = t.no_speech_prob
     {
-        if ns > p.no_speech_with_logprob.0 && t.avg_logprob.is_some_and(|l| l < p.no_speech_with_logprob.1) {
+        if ns > p.no_speech_with_logprob.0
+            && t.avg_logprob
+                .is_some_and(|l| l < p.no_speech_with_logprob.1)
+        {
             return QualityVerdict::Filtered(FilterReason::NoSpeech);
         }
         if ns > p.no_speech_alone {
@@ -266,7 +293,11 @@ pub fn evaluate(t: &SegmentTranscript, ev: &SegmentEvidence, p: &QualityPolicy) 
         shadow.push(FilterReason::LowConfidence);
     }
     let suspect = SUSPECTS.contains(&norm.as_str()) || is_bare_web_address(&text);
-    if suspect && (ev.voiced_ms < 400 || ev.overlapped_agent_speech || ev.mean_speech_probability.is_some_and(|m| m < 0.6)) {
+    if suspect
+        && (ev.voiced_ms < 400
+            || ev.overlapped_agent_speech
+            || ev.mean_speech_probability.is_some_and(|m| m < 0.6))
+    {
         shadow.push(FilterReason::SuspectCorroborated);
     }
     QualityVerdict::Keep {
@@ -303,30 +334,67 @@ mod tests {
     #[test]
     fn empty_and_punctuation_only_text_is_empty() {
         let p = QualityPolicy::default();
-        assert_eq!(evaluate(&t(""), &SegmentEvidence::default(), &p), QualityVerdict::Empty);
-        assert_eq!(evaluate(&t(" ... "), &SegmentEvidence::default(), &p), QualityVerdict::Empty);
+        assert_eq!(
+            evaluate(&t(""), &SegmentEvidence::default(), &p),
+            QualityVerdict::Empty
+        );
+        assert_eq!(
+            evaluate(&t(" ... "), &SegmentEvidence::default(), &p),
+            QualityVerdict::Empty
+        );
         let mut ns = t("hello");
         ns.vendor_said_no_speech = true;
-        assert_eq!(evaluate(&ns, &SegmentEvidence::default(), &p), QualityVerdict::Empty);
+        assert_eq!(
+            evaluate(&ns, &SegmentEvidence::default(), &p),
+            QualityVerdict::Empty
+        );
     }
 
     #[test]
     fn tag_only_text_is_filtered_and_tags_are_stripped_from_real_text() {
         let p = QualityPolicy::default();
-        assert_eq!(evaluate(&t("[MUSIC]"), &SegmentEvidence::default(), &p), QualityVerdict::Filtered(FilterReason::NonLexical));
-        assert_eq!(evaluate(&t("(laughter) ♪"), &SegmentEvidence::default(), &p), QualityVerdict::Filtered(FilterReason::NonLexical));
-        let v = evaluate(&t("(laughs) I want a refund"), &SegmentEvidence::default(), &p);
+        assert_eq!(
+            evaluate(&t("[MUSIC]"), &SegmentEvidence::default(), &p),
+            QualityVerdict::Filtered(FilterReason::NonLexical)
+        );
+        assert_eq!(
+            evaluate(&t("(laughter) ♪"), &SegmentEvidence::default(), &p),
+            QualityVerdict::Filtered(FilterReason::NonLexical)
+        );
+        let v = evaluate(
+            &t("(laughs) I want a refund"),
+            &SegmentEvidence::default(),
+            &p,
+        );
         assert_eq!(keep(&v), "I want a refund");
     }
 
     #[test]
     fn credit_lines_and_outros_are_dropped() {
         let p = QualityPolicy::default();
-        for s in ["Thank you for watching!", "Subtitles by the Amara.org community", "ご視聴ありがとうございました"] {
-            assert_eq!(evaluate(&t(s), &SegmentEvidence::default(), &p), QualityVerdict::Filtered(FilterReason::HallucinationPhrase), "{s}");
+        for s in [
+            "Thank you for watching!",
+            "Subtitles by the Amara.org community",
+            "ご視聴ありがとうございました",
+        ] {
+            assert_eq!(
+                evaluate(&t(s), &SegmentEvidence::default(), &p),
+                QualityVerdict::Filtered(FilterReason::HallucinationPhrase),
+                "{s}"
+            );
         }
-        let video = QualityPolicy { video_outros: false, ..QualityPolicy::default() };
-        assert!(matches!(evaluate(&t("Thanks for watching"), &SegmentEvidence::default(), &video), QualityVerdict::Keep { .. }));
+        let video = QualityPolicy {
+            video_outros: false,
+            ..QualityPolicy::default()
+        };
+        assert!(matches!(
+            evaluate(
+                &t("Thanks for watching"),
+                &SegmentEvidence::default(),
+                &video
+            ),
+            QualityVerdict::Keep { .. }
+        ));
     }
 
     #[test]
@@ -334,43 +402,97 @@ mod tests {
         let mut x = t("Bye.");
         x.no_speech_prob = Some(0.9);
         let untrusted = QualityPolicy::default();
-        assert!(matches!(evaluate(&x, &SegmentEvidence::default(), &untrusted), QualityVerdict::Keep { .. }));
-        let trusted = QualityPolicy { no_speech_signal: true, ..QualityPolicy::default() };
-        assert_eq!(evaluate(&x, &SegmentEvidence::default(), &trusted), QualityVerdict::Filtered(FilterReason::NoSpeech));
+        assert!(matches!(
+            evaluate(&x, &SegmentEvidence::default(), &untrusted),
+            QualityVerdict::Keep { .. }
+        ));
+        let trusted = QualityPolicy {
+            no_speech_signal: true,
+            ..QualityPolicy::default()
+        };
+        assert_eq!(
+            evaluate(&x, &SegmentEvidence::default(), &trusted),
+            QualityVerdict::Filtered(FilterReason::NoSpeech)
+        );
         x.no_speech_prob = Some(0.7);
         x.avg_logprob = Some(-1.2);
-        assert_eq!(evaluate(&x, &SegmentEvidence::default(), &trusted), QualityVerdict::Filtered(FilterReason::NoSpeech));
+        assert_eq!(
+            evaluate(&x, &SegmentEvidence::default(), &trusted),
+            QualityVerdict::Filtered(FilterReason::NoSpeech)
+        );
         x.avg_logprob = Some(-0.3);
-        assert!(matches!(evaluate(&x, &SegmentEvidence::default(), &trusted), QualityVerdict::Keep { .. }));
+        assert!(matches!(
+            evaluate(&x, &SegmentEvidence::default(), &trusted),
+            QualityVerdict::Keep { .. }
+        ));
     }
 
     #[test]
     fn a_prompt_echo_of_three_or_more_words_is_dropped() {
-        let p = QualityPolicy { sent_prompt: Some("Acme order status refund".into()), ..QualityPolicy::default() };
-        assert_eq!(evaluate(&t("Acme, order status, refund."), &SegmentEvidence::default(), &p), QualityVerdict::Filtered(FilterReason::PromptEcho));
-        let short = QualityPolicy { sent_prompt: Some("Acme".into()), ..QualityPolicy::default() };
-        assert!(matches!(evaluate(&t("Acme"), &SegmentEvidence::default(), &short), QualityVerdict::Keep { .. }));
+        let p = QualityPolicy {
+            sent_prompt: Some("Acme order status refund".into()),
+            ..QualityPolicy::default()
+        };
+        assert_eq!(
+            evaluate(
+                &t("Acme, order status, refund."),
+                &SegmentEvidence::default(),
+                &p
+            ),
+            QualityVerdict::Filtered(FilterReason::PromptEcho)
+        );
+        let short = QualityPolicy {
+            sent_prompt: Some("Acme".into()),
+            ..QualityPolicy::default()
+        };
+        assert!(matches!(
+            evaluate(&t("Acme"), &SegmentEvidence::default(), &short),
+            QualityVerdict::Keep { .. }
+        ));
     }
 
     #[test]
     fn loops_are_collapsed_but_numbers_never_are() {
         let p = QualityPolicy::default();
-        let v = evaluate(&t("I want to I want to I want to I want to cancel"), &SegmentEvidence::default(), &p);
+        let v = evaluate(
+            &t("I want to I want to I want to I want to cancel"),
+            &SegmentEvidence::default(),
+            &p,
+        );
         assert_eq!(keep(&v), "I want to cancel");
-        assert!(matches!(v, QualityVerdict::Keep { rewritten: Some(Rewrite::LoopCollapsed), .. }));
-        let digits = evaluate(&t("zero zero zero zero zero zero zero zero one"), &SegmentEvidence::default(), &p);
+        assert!(matches!(
+            v,
+            QualityVerdict::Keep {
+                rewritten: Some(Rewrite::LoopCollapsed),
+                ..
+            }
+        ));
+        let digits = evaluate(
+            &t("zero zero zero zero zero zero zero zero one"),
+            &SegmentEvidence::default(),
+            &p,
+        );
         assert_eq!(keep(&digits), "zero zero zero zero zero zero zero zero one");
-        let account = evaluate(&t("one two one two one two one two"), &SegmentEvidence::default(), &p);
+        let account = evaluate(
+            &t("one two one two one two one two"),
+            &SegmentEvidence::default(),
+            &p,
+        );
         assert_eq!(keep(&account), "one two one two one two one two");
     }
 
     #[test]
     fn a_short_okay_is_kept_and_only_counted_as_a_suspect() {
         let p = QualityPolicy::default();
-        let ev = SegmentEvidence { voiced_ms: 320, ..Default::default() };
+        let ev = SegmentEvidence {
+            voiced_ms: 320,
+            ..Default::default()
+        };
         let v = evaluate(&t("Okay."), &ev, &p);
         assert_eq!(keep(&v), "Okay.");
-        assert!(matches!(&v, QualityVerdict::Keep { suspect: true, shadow, .. } if shadow.contains(&FilterReason::SuspectCorroborated)));
+        assert!(
+            matches!(&v, QualityVerdict::Keep { suspect: true, shadow, .. } if shadow.contains(&FilterReason::SuspectCorroborated))
+        );
     }
 
     #[test]
@@ -378,6 +500,8 @@ mod tests {
         let mut x = t("I need a refund");
         x.avg_logprob = Some(-1.5);
         let v = evaluate(&x, &SegmentEvidence::default(), &QualityPolicy::default());
-        assert!(matches!(&v, QualityVerdict::Keep { shadow, .. } if shadow == &vec![FilterReason::LowConfidence]));
+        assert!(
+            matches!(&v, QualityVerdict::Keep { shadow, .. } if shadow == &vec![FilterReason::LowConfidence])
+        );
     }
 }

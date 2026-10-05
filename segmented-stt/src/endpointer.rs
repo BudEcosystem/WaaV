@@ -75,7 +75,11 @@ impl LadderThresholds {
 
 /// Whether the text rung should be asked now.
 pub fn wants_text_verdict(i: &LadderInput, t: &LadderThresholds, text_model: bool) -> bool {
-    if !text_model || i.policy != EndpointPolicy::Auto || !i.all_released || i.text_complete.is_some() {
+    if !text_model
+        || i.policy != EndpointPolicy::Auto
+        || !i.all_released
+        || i.text_complete.is_some()
+    {
         return false;
     }
     match i.verdict {
@@ -88,7 +92,8 @@ pub fn wants_text_verdict(i: &LadderInput, t: &LadderThresholds, text_model: boo
 
 /// The endpoint in force, if any.
 pub fn decide(i: &LadderInput, t: &LadderThresholds) -> Option<TurnCloseReason> {
-    if i.policy == EndpointPolicy::Auto && i.audio_model
+    if i.policy == EndpointPolicy::Auto
+        && i.audio_model
         && let Some(Verdict::Probability(p)) = i.verdict
         && p >= t.end_of_turn_threshold
     {
@@ -142,29 +147,61 @@ mod tests {
 
     #[test]
     fn a_finished_audio_verdict_decides_at_once() {
-        let i = LadderInput { verdict: Some(Verdict::Probability(0.8)), ..input() };
+        let i = LadderInput {
+            verdict: Some(Verdict::Probability(0.8)),
+            ..input()
+        };
         assert_eq!(decide(&i, &t()), Some(TurnCloseReason::EndOfTurnModel));
-        let i = LadderInput { verdict: Some(Verdict::Probability(0.69)), ..input() };
+        let i = LadderInput {
+            verdict: Some(Verdict::Probability(0.69)),
+            ..input()
+        };
         assert_eq!(decide(&i, &t()), None);
     }
 
     #[test]
     fn the_text_model_is_asked_only_after_every_unit_is_released_and_the_audio_said_no() {
-        let i = LadderInput { verdict: Some(Verdict::Probability(0.66)), all_released: true, ..input() };
+        let i = LadderInput {
+            verdict: Some(Verdict::Probability(0.66)),
+            all_released: true,
+            ..input()
+        };
         assert!(wants_text_verdict(&i, &t(), true));
         assert!(!wants_text_verdict(&i, &t(), false));
-        assert!(!wants_text_verdict(&LadderInput { all_released: false, ..i }, &t(), true));
-        let done = LadderInput { text_complete: Some(true), ..i };
+        assert!(!wants_text_verdict(
+            &LadderInput {
+                all_released: false,
+                ..i
+            },
+            &t(),
+            true
+        ));
+        let done = LadderInput {
+            text_complete: Some(true),
+            ..i
+        };
         assert_eq!(decide(&done, &t()), Some(TurnCloseReason::TextModel));
-        let failed = LadderInput { verdict: Some(Verdict::Failed), all_released: true, ..input() };
+        let failed = LadderInput {
+            verdict: Some(Verdict::Failed),
+            all_released: true,
+            ..input()
+        };
         assert!(wants_text_verdict(&failed, &t(), true));
     }
 
     #[test]
     fn without_an_audio_model_the_silence_rule_applies() {
-        let i = LadderInput { audio_model: false, verdict: None, effective_silence_ms: 480, ..input() };
+        let i = LadderInput {
+            audio_model: false,
+            verdict: None,
+            effective_silence_ms: 480,
+            ..input()
+        };
         assert_eq!(decide(&i, &t()), None);
-        let i = LadderInput { effective_silence_ms: 512, ..i };
+        let i = LadderInput {
+            effective_silence_ms: 512,
+            ..i
+        };
         assert_eq!(decide(&i, &t()), Some(TurnCloseReason::SilenceThreshold));
     }
 
@@ -177,15 +214,25 @@ mod tests {
             ..input()
         };
         assert_eq!(decide(&i, &t()), None);
-        let i = LadderInput { effective_silence_ms: 512, ..i };
+        let i = LadderInput {
+            effective_silence_ms: 512,
+            ..i
+        };
         assert_eq!(decide(&i, &t()), Some(TurnCloseReason::SilenceThreshold));
     }
 
     #[test]
     fn the_ceiling_ends_every_turn() {
-        let i = LadderInput { verdict: Some(Verdict::Probability(0.1)), effective_silence_ms: 1504, ..input() };
+        let i = LadderInput {
+            verdict: Some(Verdict::Probability(0.1)),
+            effective_silence_ms: 1504,
+            ..input()
+        };
         assert_eq!(decide(&i, &t()), Some(TurnCloseReason::MaxEndpointing));
-        let idle = LadderInput { input_idle: true, ..i };
+        let idle = LadderInput {
+            input_idle: true,
+            ..i
+        };
         assert_eq!(decide(&idle, &t()), Some(TurnCloseReason::InputIdle));
     }
 }

@@ -2853,10 +2853,11 @@ mod tests {
         );
         let res = resolve(&m, &r(3999));
         assert_eq!(reason(&res), Some("client_not_implemented"));
-        // The reference's clause removal does not know this row's wording, so the text still
-        // sends the customer to the operator; kept to match resolve.py.
-        assert!(res.refusal.unwrap().text.ends_with(
-            "or ask the operator whether segmented speech-to-text is available for this model."
+        // Addendum B10: a covered session waiting for its vendor is never sent to the operator.
+        let text = res.refusal.unwrap().text;
+        assert!(!text.contains("operator"), "{text}");
+        assert!(text.ends_with(
+            "Segmented speech-to-text for this provider is not available in this release."
         ));
     }
 

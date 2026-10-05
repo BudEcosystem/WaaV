@@ -298,12 +298,16 @@ impl Segmenter {
     /// Drop the open segment without uploading it (noise escalation) and return to Idle.
     /// Returns the voiced time that was dropped.
     pub fn abandon_open_segment(&mut self) -> u32 {
-        let dropped = self.seg.take().map(|s| s.voiced_frames() * FRAME_MS).unwrap_or(0);
+        let dropped = self
+            .seg
+            .take()
+            .map(|s| s.voiced_frames() * FRAME_MS)
+            .unwrap_or(0);
         if let Some(end) = self.last_voiced_end {
             self.prev_segment_speech_end = end;
         }
         self.last_cut_sample = self.now_sample();
-        self.to_idle();
+        self.enter_idle();
         dropped
     }
 
@@ -566,8 +570,7 @@ impl Segmenter {
             None => CutOutcome::Nothing,
             Some(seg)
                 if min_rule
-                    && seg.speech_span_ms
-                        < ms_to_frames_ceil(self.p.min_voiced_ms) * FRAME_MS =>
+                    && seg.speech_span_ms < ms_to_frames_ceil(self.p.min_voiced_ms) * FRAME_MS =>
             {
                 CutOutcome::TooShort
             }
@@ -582,10 +585,10 @@ impl Segmenter {
             voiced_ms,
             outcome,
         });
-        self.to_idle();
+        self.enter_idle();
     }
 
-    fn to_idle(&mut self) {
+    fn enter_idle(&mut self) {
         self.seg = None;
         self.phase = SegPhase::Idle;
         self.silence_frames = 0;
@@ -602,10 +605,9 @@ impl Segmenter {
         let audio_ms = seg.audio_ms();
         if audio_ms >= self.p.soft_max_segment_ms()
             && self.silence_frames >= ms_to_frames_ceil(self.p.split_pause_ms)
-            && seg.last_speech_end.is_some()
+            && let Some(split_at) = seg.last_speech_end
         {
             // Split at the micro-pause: the pause audio goes to both sides.
-            let split_at = seg.last_speech_end.expect("checked");
             let first = seg.head_until(now);
             let rest = seg.tail_from(split_at);
             if let Some(done) = self.finish(&first, now, CutReason::SoftSplit) {
@@ -653,7 +655,11 @@ impl Segmenter {
                     .unwrap_or(seg.frames.last().map(|f| f.index).unwrap_or(0));
                 let end = (lowest + 1) * FRAME_SAMPLES as u64;
                 let overlap = ms_to_samples(self.p.hard_split_overlap_ms as u64);
-                (end, end.saturating_sub(overlap).max(seg.audio_start), CutReason::HardSplit)
+                (
+                    end,
+                    end.saturating_sub(overlap).max(seg.audio_start),
+                    CutReason::HardSplit,
+                )
             }
         };
         let first = seg.head_until(first_end);
@@ -792,7 +798,11 @@ mod tests {
         assert_eq!(segs.len(), 1);
         let s = &segs[0];
         assert_eq!(s.first_speech_sample, 30 * 512);
-        assert_eq!(s.audio_start_sample, 30 * 512 - 6400, "400 ms before the first speech frame");
+        assert_eq!(
+            s.audio_start_sample,
+            30 * 512 - 6400,
+            "400 ms before the first speech frame"
+        );
     }
 
     #[test]
@@ -823,8 +833,14 @@ mod tests {
         r.q(30).v(20).q(7);
         let s = &r.segments()[0];
         assert_eq!(s.audio_end_sample, 57 * 512, "real audio runs to the cut");
-        assert_eq!(s.pcm.len() as u64, s.audio_end_sample - s.audio_start_sample);
-        assert!(s.pcm[s.pcm.len() - 7 * 512..].iter().all(|x| *x == 0), "the hangover is real audio");
+        assert_eq!(
+            s.pcm.len() as u64,
+            s.audio_end_sample - s.audio_start_sample
+        );
+        assert!(
+            s.pcm[s.pcm.len() - 7 * 512..].iter().all(|x| *x == 0),
+            "the hangover is real audio"
+        );
         assert_eq!(s.trailing_zero_samples, 8000, "500 ms of zeros");
         let padded = s.padded_pcm();
         assert_eq!(padded.len(), s.pcm.len() + 8000);
@@ -845,10 +861,17 @@ mod tests {
     fn a_segment_under_the_minimum_speech_span_is_discarded() {
         let mut r = Run::new();
         r.q(10).v(7).q(7);
-        assert_eq!(r.cuts()[0].2, CutOutcome::TooShort, "224 ms is under 256 ms");
+        assert_eq!(
+            r.cuts()[0].2,
+            CutOutcome::TooShort,
+            "224 ms is under 256 ms"
+        );
         let mut r = Run::new();
         r.q(10).v(8).q(7);
-        assert!(matches!(r.cuts()[0].2, CutOutcome::Ready(_)), "256 ms is enough");
+        assert!(
+            matches!(r.cuts()[0].2, CutOutcome::Ready(_)),
+            "256 ms is enough"
+        );
     }
 
     #[test]
@@ -915,7 +938,11 @@ mod tests {
         r.q(7);
         let segs = r.segments();
         assert_eq!(segs.len(), 2);
-        assert_eq!(segs[0].audio_end_sample - segs[1].audio_start_sample, 5120, "320 ms overlap");
+        assert_eq!(
+            segs[0].audio_end_sample - segs[1].audio_start_sample,
+            5120,
+            "320 ms overlap"
+        );
     }
 
     #[test]
@@ -956,7 +983,10 @@ mod tests {
         assert!((r.seg.raise_thresholds(0.1, 0.8) - 0.7).abs() < 1e-6);
         r.q(5).frames(20, 0.65);
         assert!(r.starts().is_empty());
-        assert!((r.seg.raise_thresholds(0.5, 0.8) - 0.8).abs() < 1e-6, "capped at the ceiling");
+        assert!(
+            (r.seg.raise_thresholds(0.5, 0.8) - 0.8).abs() < 1e-6,
+            "capped at the ceiling"
+        );
     }
 
     #[test]

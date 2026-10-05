@@ -799,7 +799,7 @@
         "refusal": {
           "code": "stt_live_unsupported",
           "reason": "client_not_implemented",
-          "text": "Melia 1 is Speechmatics' multilingual model and is offered only for transcription of uploaded files. This gateway does not yet serve it on a live call. Choose the Speechmatics standard or enhanced model, or ask the operator whether segmented speech-to-text is available for this model."
+          "text": "Melia 1 is Speechmatics' multilingual model and is offered only for transcription of uploaded files. This gateway does not yet serve it on a live call. Choose the Speechmatics standard or enhanced model, or ask the operator to enable segmented speech-to-text for this deployment."
         }
       },
       "billing": {
@@ -978,7 +978,7 @@
         "refusal": {
           "code": "stt_live_unsupported",
           "reason": "client_not_implemented",
-          "text": "Oak 1 is Speechmatics' multilingual healthcare model and is offered only for transcription of uploaded files. This gateway does not yet serve it on a live call. Choose the Speechmatics enhanced model, or ask the operator whether segmented speech-to-text is available for this model."
+          "text": "Oak 1 is Speechmatics' multilingual healthcare model and is offered only for transcription of uploaded files. This gateway does not yet serve it on a live call. Choose the Speechmatics enhanced model, or ask the operator to enable segmented speech-to-text for this deployment."
         }
       },
       "billing": {

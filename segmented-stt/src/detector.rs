@@ -128,9 +128,7 @@ impl SpeechDetector for ScriptedDetector {
 
 /// A factory that always builds the energy detector.
 pub fn energy_factory() -> DetectorFactory {
-    Arc::new(|| {
-        Box::pin(async { Ok(Box::new(EnergyDetector::new()) as Box<dyn SpeechDetector>) })
-    })
+    Arc::new(|| Box::pin(async { Ok(Box::new(EnergyDetector::new()) as Box<dyn SpeechDetector>) }))
 }
 
 #[cfg(test)]
@@ -138,7 +136,9 @@ mod tests {
     use super::*;
 
     fn frame(level: f32) -> Vec<f32> {
-        (0..512).map(|i| if i % 2 == 0 { level } else { -level }).collect()
+        (0..512)
+            .map(|i| if i % 2 == 0 { level } else { -level })
+            .collect()
     }
 
     #[test]
@@ -159,7 +159,10 @@ mod tests {
         for _ in 0..200 {
             let _ = d.probability(&frame(0.009));
         }
-        assert!(d.probability(&frame(0.02)).unwrap() < 0.5, "under 3x the learned floor");
+        assert!(
+            d.probability(&frame(0.02)).unwrap() < 0.5,
+            "under 3x the learned floor"
+        );
         assert!(d.probability(&frame(0.2)).unwrap() > 0.5);
     }
 

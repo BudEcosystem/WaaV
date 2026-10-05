@@ -49,9 +49,13 @@ pub enum BreakerState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Admission {
     Denied,
-    Normal { generation: u64 },
+    Normal {
+        generation: u64,
+    },
     /// The single half-open probe: one request, no second.
-    Probe { generation: u64 },
+    Probe {
+        generation: u64,
+    },
 }
 
 #[derive(Debug)]
@@ -237,7 +241,11 @@ mod tests {
         assert_eq!(b.state(), BreakerState::Open);
         assert_eq!(b.try_acquire(true), Admission::Denied);
         tokio::time::advance(Duration::from_secs(11)).await;
-        assert_eq!(b.try_acquire(false), Admission::Denied, "a second request never takes the probe");
+        assert_eq!(
+            b.try_acquire(false),
+            Admission::Denied,
+            "a second request never takes the probe"
+        );
         let probe = b.try_acquire(true);
         assert!(matches!(probe, Admission::Probe { .. }));
         assert_eq!(b.try_acquire(true), Admission::Denied, "only one probe");
@@ -253,7 +261,10 @@ mod tests {
         let probe = b.try_acquire(true);
         b.record(probe, None);
         let next = b.try_acquire(true);
-        assert!(matches!(next, Admission::Probe { .. }), "the next caller becomes the probe at once");
+        assert!(
+            matches!(next, Admission::Probe { .. }),
+            "the next caller becomes the probe at once"
+        );
     }
 
     #[tokio::test(start_paused = true)]

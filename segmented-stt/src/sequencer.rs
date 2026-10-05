@@ -10,8 +10,8 @@ use tokio::time::Instant;
 
 use crate::limits::LatencyStore;
 use crate::segmenter::Segment;
-use crate::transcriber::SegmentContext;
 use crate::transcriber::SegmentAudio;
+use crate::transcriber::SegmentContext;
 use crate::transcriber::attempts::{SegmentAttempts, UploadRequest, UploadResolution};
 use crate::transcriber::gate::Limiter;
 use crate::types::ms_to_samples;
@@ -76,9 +76,13 @@ impl SegmentUpload for AttemptsUpload {
             )
             .await;
         if let Some(rt) = r.round_trip {
-            self.store.record_round_trip(&self.key, rt.as_millis() as u32);
+            self.store
+                .record_round_trip(&self.key, rt.as_millis() as u32);
         }
-        if matches!(r.result, Err(crate::transcriber::attempts::UnitFailure::TimedOut)) {
+        if matches!(
+            r.result,
+            Err(crate::transcriber::attempts::UnitFailure::TimedOut)
+        ) {
             self.store.record_timeout(&self.key);
         }
         r
@@ -115,7 +119,8 @@ pub fn join_segments(segments: &[Segment], gap_cap_ms: u32) -> Vec<i16> {
             None => out.extend_from_slice(&s.pcm),
             Some(prev_end) => {
                 if s.audio_start_sample > prev_end {
-                    let gap = (s.audio_start_sample - prev_end).min(ms_to_samples(gap_cap_ms as u64));
+                    let gap =
+                        (s.audio_start_sample - prev_end).min(ms_to_samples(gap_cap_ms as u64));
                     out.resize(out.len() + gap as usize, 0);
                     out.extend_from_slice(&s.pcm);
                 } else {
