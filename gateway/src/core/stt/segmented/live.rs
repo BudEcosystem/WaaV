@@ -42,6 +42,10 @@ pub struct SttLiveShared {
     /// `WAAV_STT_FILE_ONLY_REFUSAL=off` withdraws the refusals of voice agents on a buffering
     /// model (the warning stays).
     pub file_only_refusal: bool,
+    /// `WAAV_STT_COMMIT_TRANSPORT=1` builds the commit transport (OpenAI's realtime transcription
+    /// socket, Release 4) once a live probe has passed for the deployment's vendor; off, the
+    /// live-only models stay refused by name and `gpt-transcribe` uploads files.
+    pub commit_transport: bool,
     pub latency: Arc<LatencyStore>,
     pub limiters: LimiterRegistry,
     pub breakers: BreakerRegistry,
@@ -103,6 +107,11 @@ impl SttLiveShared {
                 "WAAV_STT_FILE_ONLY_REFUSAL",
                 get("WAAV_STT_FILE_ONLY_REFUSAL"),
                 true,
+            )?,
+            commit_transport: parse_flag(
+                "WAAV_STT_COMMIT_TRANSPORT",
+                get("WAAV_STT_COMMIT_TRANSPORT"),
+                false,
             )?,
             latency: Arc::new(LatencyStore::new()),
             limiters: LimiterRegistry::new(),
@@ -282,11 +291,19 @@ fn target_spec(req: &LiveRequest, provider: &str, model: &str) -> TargetSpec {
     };
     match &req.leg {
         Some(leg) => {
+            // Every address of a Bud deployment comes from its record, never from a client.
             spec.api_base = leg.api_base.clone();
-            spec.trusted = leg.api_base.is_some();
+            spec.trusted = true;
             spec.region = leg.provider_params.get("region").cloned();
             spec.api_version = leg.provider_params.get("api_version").cloned();
             spec.extras = leg.provider_params.clone();
+            if let Some(url) = leg
+                .capability_override
+                .as_ref()
+                .and_then(|o| o.realtime_url.clone())
+            {
+                spec.extras.insert("realtime_url".into(), url);
+            }
         }
         None => {
             // A base the client named is checked before any upload; the operator's
@@ -384,7 +401,10 @@ pub fn resolve_session(shared: &SttLiveShared, req: &LiveRequest) -> LiveResolut
 
     // The resolver, with this build's adapters.
     let probe_spec = target_spec(req, &req.provider, &req.model);
-    let built = |adapter: &str| adapter_built(adapter, &probe_spec);
+    let built = |adapter: &str| {
+        (adapter != "openai_realtime_transcription" || shared.commit_transport)
+            && adapter_built(adapter, &probe_spec)
+    };
     let mut rreq = ResolveRequest::new(&req.provider, &req.model);
     rreq.release = shared.rollout.release;
     rreq.session = req.kind.resolver_kind();
@@ -418,15 +438,12 @@ pub fn resolve_session(shared: &SttLiveShared, req: &LiveRequest) -> LiveResolut
     let mut decision = match resolution.outcome {
         Outcome::Native => LiveDecision::Native,
         Outcome::Segmented => LiveDecision::Segmented,
-        // No commit transport is built in this gateway; the adapter filter keeps the resolver from
-        // choosing one, and this arm is defensive.
-        Outcome::Commit => LiveDecision::Refused(Refusal {
-            code: "stt_live_unsupported".into(),
-            reason: Some("client_not_implemented".into()),
-            text: "This model needs a vendor socket the gateway commits on, which this gateway does not build.".into(),
-            details: Default::default(),
-        }),
-        Outcome::Refused => LiveDecision::Refused(resolution.refusal.clone().expect("refused has a refusal")),
+        // The commit transport is the engine with a vendor socket for its transcriber: the same
+        // turns and results, text after each pause (`segmented` to the client).
+        Outcome::Commit => LiveDecision::Segmented,
+        Outcome::Refused => {
+            LiveDecision::Refused(resolution.refusal.clone().expect("refused has a refusal"))
+        }
     };
 
     // The withdrawal switch: a voice agent on a buffering model keeps today's client, warned.
@@ -737,6 +754,47 @@ pub fn is_file_only(shared: &SttLiveShared, provider: &str, model: &str) -> bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Release 4: OpenAI's live-only models on its realtime socket, once the operator turns the
+    /// commit transport on after a live probe.
+    #[test]
+    fn a_live_only_model_is_served_on_the_vendor_socket_only_when_the_transport_is_on() {
+        let off = shared(&[("WAAV_SEGMENTED_STT", "on")]);
+        let r = resolve_session(&off, &req("openai", "gpt-live-transcribe", AGENT));
+        assert!(
+            matches!(&r.decision, LiveDecision::Refused(x) if x.code == "stt_live_unsupported"),
+            "{:?}",
+            r.decision
+        );
+        let on = shared(&[
+            ("WAAV_SEGMENTED_STT", "on"),
+            ("WAAV_STT_COMMIT_TRANSPORT", "1"),
+        ]);
+        let r = resolve_session(&on, &req("openai", "gpt-live-transcribe", AGENT));
+        assert_eq!(
+            r.decision,
+            LiveDecision::Segmented,
+            "{:?}",
+            r.resolution.notes
+        );
+        assert_eq!(
+            r.transport().unwrap().adapter.as_str(),
+            "openai_realtime_transcription"
+        );
+        let plan = build_plan(
+            &on,
+            &r,
+            &req("openai", "gpt-live-transcribe", AGENT),
+            "sk-test".into(),
+        );
+        assert!(plan.is_ok(), "{:?}", plan.err());
+        // gpt-transcribe keeps uploading files unless the deployment asks for the low-latency tier.
+        let r = resolve_session(&on, &req("openai", "gpt-transcribe", AGENT));
+        assert_eq!(
+            r.transport().unwrap().adapter.as_str(),
+            "openai_transcriptions"
+        );
+    }
 
     #[test]
     fn the_control_record_switches_a_row_or_deployment_off_at_session_start() {

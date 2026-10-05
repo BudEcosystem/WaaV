@@ -209,6 +209,69 @@ fn openai_compat(
     Ok(Arc::new(tr))
 }
 
+/// The realtime transcription socket's address: the deployment's declared `realtime_url`, or the
+/// vendor's from the base address (`https` becomes `wss`).
+fn realtime_url(spec: &TargetSpec) -> Result<String, String> {
+    if let Some(u) = spec
+        .extras
+        .get("realtime_url")
+        .filter(|u| !u.trim().is_empty())
+    {
+        return Ok(u.trim().to_string());
+    }
+    let to_ws = |b: &str| {
+        b.trim_end_matches('/')
+            .replacen("https://", "wss://", 1)
+            .replacen("http://", "ws://", 1)
+    };
+    match spec.provider.as_str() {
+        "azure_openai" => {
+            let base = spec
+                .api_base
+                .as_deref()
+                .ok_or("an Azure OpenAI deployment needs its resource endpoint")?;
+            Ok(format!(
+                "{}/openai/v1/realtime?intent=transcription",
+                to_ws(base)
+            ))
+        }
+        "openai" => Ok(join(
+            &to_ws(spec.api_base.as_deref().unwrap_or("https://api.openai.com")),
+            "/v1/realtime?intent=transcription",
+        )),
+        _ => Err("a self-hosted realtime transcription server needs its realtime_url".into()),
+    }
+}
+
+fn openai_realtime(
+    t: &Transport,
+    spec: &TargetSpec,
+) -> Result<Arc<dyn SegmentTranscriber>, String> {
+    // A socket bypasses the upload pool's address rules, so it is opened only to the vendor's own
+    // host, a Bud deployment's address or the operator's: never to an address a client named.
+    if !spec.trusted && (spec.api_base.is_some() || spec.extras.contains_key("realtime_url")) {
+        return Err(
+            "a realtime transcription socket is opened only to a deployment's or the operator's address"
+                .into(),
+        );
+    }
+    let url = realtime_url(spec)?;
+    let auth = if spec.provider == "azure_openai" {
+        Auth::AzureApiKey(spec.api_key.clone())
+    } else {
+        Auth::Bearer(spec.api_key.clone())
+    };
+    let mut cfg = wire::OpenAiRealtimeConfig::new(&url, auth, spec.model.trim());
+    cfg.language = match (&t.dialect.language_param, t.dialect.language_shape) {
+        (Some(p), Some(LanguageShape::List)) => wire::openai_compat::LanguageDialect::list(p),
+        (Some(p), _) => wire::openai_compat::LanguageDialect::single(p),
+        (None, _) => wire::openai_compat::LanguageDialect::single("language"),
+    };
+    cfg.send_prompt = context_param(t, &[ContextKind::Prompt]).is_some();
+    cfg.send_keywords = context_param(t, &[ContextKind::Keywords, ContextKind::Keyterms]).is_some();
+    Ok(Arc::new(wire::OpenAiRealtimeTranscriber::new(cfg)?))
+}
+
 /// Build the transcriber for one resolved file transport.
 pub fn build_transcriber(
     t: &Transport,
@@ -226,6 +289,7 @@ pub fn build_transcriber(
         "openai_transcriptions" | "groq_transcriptions" | "azure_openai_transcriptions" => {
             openai_compat(t, adapter, spec, clients)
         }
+        "openai_realtime_transcription" => openai_realtime(t, spec),
         "elevenlabs_batch" => {
             let mut c = wire::elevenlabs::ElevenLabsConfig::new(
                 Auth::elevenlabs(spec.api_key.clone()),
@@ -539,6 +603,72 @@ mod tests {
                 "{p}"
             );
         }
+    }
+
+    /// The commit transport (Release 4): OpenAI's live-only models on its realtime socket.
+    #[test]
+    fn a_live_only_model_builds_a_commit_transcriber_on_the_vendor_socket() {
+        let map = CapabilityMap::embedded();
+        let row = map.row("openai:gpt-live-transcribe").expect("row");
+        let t = row
+            .transports
+            .iter()
+            .find_map(|e| match e {
+                crate::map::TransportEntry::Inline(t)
+                    if t.adapter.as_str() == "openai_realtime_transcription" =>
+                {
+                    Some((**t).clone())
+                }
+                _ => None,
+            })
+            .expect("commit transport");
+        let tr = build_transcriber(&t, &spec("openai", "gpt-live-transcribe"), &clients()).unwrap();
+        assert_eq!(tr.info().kind, crate::transcriber::TranscriberKind::Commit);
+        assert_eq!(tr.info().host_key, "https://api.openai.com:443");
+        // A client-named base never gets a socket; the operator's does.
+        let named = TargetSpec {
+            api_base: Some("https://asr.example.com".into()),
+            ..spec("openai", "gpt-live-transcribe")
+        };
+        assert!(build_transcriber(&t, &named, &clients()).is_err());
+        let operator = TargetSpec {
+            trusted: true,
+            ..named
+        };
+        assert_eq!(
+            build_transcriber(&t, &operator, &clients())
+                .unwrap()
+                .info()
+                .host_key,
+            "https://asr.example.com:443"
+        );
+    }
+
+    #[test]
+    fn realtime_addresses_follow_the_vendor() {
+        let mut s = spec("openai", "gpt-live-transcribe");
+        assert_eq!(
+            realtime_url(&s).unwrap(),
+            "wss://api.openai.com/v1/realtime?intent=transcription"
+        );
+        s.api_base = Some("https://proxy.example.com/v1".into());
+        assert_eq!(
+            realtime_url(&s).unwrap(),
+            "wss://proxy.example.com/v1/realtime?intent=transcription"
+        );
+        let mut a = spec("azure_openai", "my-live");
+        a.api_base = Some("https://res.openai.azure.com/".into());
+        assert_eq!(
+            realtime_url(&a).unwrap(),
+            "wss://res.openai.azure.com/openai/v1/realtime?intent=transcription"
+        );
+        let mut h = spec("self_hosted", "whisper");
+        assert!(realtime_url(&h).is_err());
+        h.extras.insert(
+            "realtime_url".into(),
+            "ws://asr.svc:8000/v1/realtime".into(),
+        );
+        assert_eq!(realtime_url(&h).unwrap(), "ws://asr.svc:8000/v1/realtime");
     }
 
     #[test]

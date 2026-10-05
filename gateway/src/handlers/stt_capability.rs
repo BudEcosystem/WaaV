@@ -75,7 +75,12 @@ pub struct SttCapability {
     pub streaming_alternatives: Vec<String>,
 }
 
-fn request(provider: &str, model: &str, kind: LiveSessionKind, leg: Option<LiveLeg>) -> LiveRequest {
+fn request(
+    provider: &str,
+    model: &str,
+    kind: LiveSessionKind,
+    leg: Option<LiveLeg>,
+) -> LiveRequest {
     LiveRequest {
         provider: provider.to_string(),
         model: model.to_string(),
@@ -129,7 +134,11 @@ pub fn capability_for(
     let alternatives = ready
         .get("streaming_alternatives")
         .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
         .unwrap_or_default();
     SttCapability {
         endpoint_id: leg.as_ref().map(|l| l.id.clone()),
@@ -164,10 +173,17 @@ pub async fn stt_capabilities(
     Query(q): Query<CapabilityQuery>,
 ) -> impl IntoResponse {
     let shared = &state.core_state.stt_live;
-    match q.provider.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+    match q
+        .provider
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
         Some(provider) => {
             let model = q.model.as_deref().map(str::trim).unwrap_or_default();
-            Json(serde_json::json!(capability_for(shared, provider, model, None)))
+            Json(serde_json::json!(capability_for(
+                shared, provider, model, None
+            )))
         }
         None => Json(serde_json::json!({
             "map_version": shared.map.map_version(),
@@ -277,7 +293,9 @@ pub fn spawn(state: Arc<AppState>) -> Option<tokio::task::JoinHandle<()>> {
                         debug!(endpoint_id = %id, agent = record.voice_agent.transcription_mode, "published speech-to-text capability");
                         published.insert(id.to_string(), (fp, Instant::now()));
                     }
-                    Err(e) => warn!(endpoint_id = %id, error = %e, "could not publish speech-to-text capability"),
+                    Err(e) => {
+                        warn!(endpoint_id = %id, error = %e, "could not publish speech-to-text capability")
+                    }
                 }
             }
         }
@@ -305,7 +323,11 @@ mod tests {
         assert_eq!(c.voice_agent.transcription_mode, "segmented");
         assert_eq!(c.push_to_talk.transcription_mode, "segmented");
         assert!(c.slower_on_calls);
-        assert!(c.streaming_alternatives.contains(&"scribe_v2_realtime".to_string()), "{c:?}");
+        assert!(
+            c.streaming_alternatives
+                .contains(&"scribe_v2_realtime".to_string()),
+            "{c:?}"
+        );
         let json = serde_json::to_value(&c).unwrap();
         assert!(json.get("endpoint_id").is_none());
     }

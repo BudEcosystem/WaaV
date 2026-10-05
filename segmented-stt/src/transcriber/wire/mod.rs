@@ -13,6 +13,7 @@
 //! | [`assemblyai`] | `assemblyai_sync` |
 //! | [`azure_fast`] | `azure_fast_transcription` |
 //! | [`google_recognize`] | `google_recognize` |
+//! | [`openai_realtime`] | `openai_realtime_transcription` (the commit transport, on a socket) |
 //!
 //! Shared rules, applied by every family through this module:
 //!
@@ -32,6 +33,7 @@ pub mod deepgram;
 pub mod elevenlabs;
 pub mod google_recognize;
 pub mod openai_compat;
+pub mod openai_realtime;
 #[cfg(test)]
 pub(crate) mod testkit;
 
@@ -47,6 +49,7 @@ pub use deepgram::{DeepgramPrerecordedConfig, DeepgramPrerecordedTranscriber};
 pub use elevenlabs::{ElevenLabsConfig, ElevenLabsTranscriber};
 pub use google_recognize::{GoogleRecognizeConfig, GoogleRecognizeTranscriber};
 pub use openai_compat::{LanguageDialect, OpenAiCompatConfig, OpenAiCompatTranscriber};
+pub use openai_realtime::{OpenAiRealtimeConfig, OpenAiRealtimeTranscriber};
 
 use super::{
     RequestPhase, RequestProgress, SegmentAudio, SegmentContext, SegmentError, TranscriberInfo,
@@ -65,6 +68,7 @@ pub fn built_adapters() -> &'static [&'static str] {
         "assemblyai_sync",
         "azure_fast_transcription",
         "google_recognize",
+        "openai_realtime_transcription",
     ]
 }
 
