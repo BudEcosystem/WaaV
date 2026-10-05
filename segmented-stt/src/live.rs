@@ -290,6 +290,25 @@ pub fn build_transcriber(
             openai_compat(t, adapter, spec, clients)
         }
         "openai_realtime_transcription" => openai_realtime(t, spec),
+        "cartesia_manual_finalize" => {
+            if !spec.trusted && spec.api_base.is_some() {
+                return Err(
+                    "a Cartesia socket is opened only to a deployment's or the operator's address"
+                        .into(),
+                );
+            }
+            let mut c =
+                wire::cartesia_finalize::CartesiaFinalizeConfig::new(&spec.api_key, &spec.model);
+            if let Some(b) = spec.api_base.as_deref() {
+                c.base = b
+                    .trim_end_matches('/')
+                    .replacen("https://", "wss://", 1)
+                    .replacen("http://", "ws://", 1);
+            }
+            Ok(Arc::new(
+                wire::cartesia_finalize::CartesiaFinalizeTranscriber::new(c)?,
+            ))
+        }
         "elevenlabs_batch" => {
             let mut c = wire::elevenlabs::ElevenLabsConfig::new(
                 Auth::elevenlabs(spec.api_key.clone()),
@@ -642,6 +661,27 @@ mod tests {
                 .host_key,
             "https://asr.example.com:443"
         );
+    }
+
+    #[test]
+    fn cartesia_builds_its_finalize_transport() {
+        let map = CapabilityMap::embedded();
+        let row = map.row("cartesia:ink-whisper").expect("row");
+        let t = row
+            .transports
+            .iter()
+            .find_map(|e| match e {
+                crate::map::TransportEntry::Inline(t)
+                    if t.adapter.as_str() == "cartesia_manual_finalize" =>
+                {
+                    Some((**t).clone())
+                }
+                _ => None,
+            })
+            .expect("finalize transport");
+        let tr = build_transcriber(&t, &spec("cartesia", "ink-whisper"), &clients()).unwrap();
+        assert_eq!(tr.info().kind, crate::transcriber::TranscriberKind::Commit);
+        assert_eq!(tr.info().host_key, "https://api.cartesia.ai:443");
     }
 
     #[test]

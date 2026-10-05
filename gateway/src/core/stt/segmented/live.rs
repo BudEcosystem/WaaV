@@ -46,6 +46,10 @@ pub struct SttLiveShared {
     /// socket, Release 4) once a live probe has passed for the deployment's vendor; off, the
     /// live-only models stay refused by name and `gpt-transcribe` uploads files.
     pub commit_transport: bool,
+    /// `WAAV_STT_CARTESIA_MANUAL_FINALIZE=1`: covered Cartesia sessions end utterances on the
+    /// gateway's detector (`finalize`) instead of Cartesia's own, a deliberate change to a
+    /// streaming session (addendum B8), off until a live probe passes.
+    pub cartesia_finalize: bool,
     pub latency: Arc<LatencyStore>,
     pub limiters: LimiterRegistry,
     pub breakers: BreakerRegistry,
@@ -111,6 +115,11 @@ impl SttLiveShared {
             commit_transport: parse_flag(
                 "WAAV_STT_COMMIT_TRANSPORT",
                 get("WAAV_STT_COMMIT_TRANSPORT"),
+                false,
+            )?,
+            cartesia_finalize: parse_flag(
+                "WAAV_STT_CARTESIA_MANUAL_FINALIZE",
+                get("WAAV_STT_CARTESIA_MANUAL_FINALIZE"),
                 false,
             )?,
             latency: Arc::new(LatencyStore::new()),
@@ -402,8 +411,12 @@ pub fn resolve_session(shared: &SttLiveShared, req: &LiveRequest) -> LiveResolut
     // The resolver, with this build's adapters.
     let probe_spec = target_spec(req, &req.provider, &req.model);
     let built = |adapter: &str| {
-        (adapter != "openai_realtime_transcription" || shared.commit_transport)
-            && adapter_built(adapter, &probe_spec)
+        let switched_on = match adapter {
+            "openai_realtime_transcription" => shared.commit_transport,
+            "cartesia_manual_finalize" => shared.cartesia_finalize,
+            _ => true,
+        };
+        switched_on && adapter_built(adapter, &probe_spec)
     };
     let mut rreq = ResolveRequest::new(&req.provider, &req.model);
     rreq.release = shared.rollout.release;
@@ -794,6 +807,29 @@ mod tests {
             r.transport().unwrap().adapter.as_str(),
             "openai_transcriptions"
         );
+    }
+
+    #[test]
+    fn cartesia_ends_utterances_on_the_gateway_detector_only_after_its_probe_and_flag() {
+        // Two gates (addendum B8): the map records the live probe, and the operator sets the flag.
+        // This map records no probe yet, so even with the flag the session keeps today's client.
+        let off = shared(&[("WAAV_SEGMENTED_STT", "on")]);
+        assert_eq!(
+            resolve_session(&off, &req("cartesia", "ink-whisper", AGENT)).decision,
+            LiveDecision::Native
+        );
+        let on = shared(&[
+            ("WAAV_SEGMENTED_STT", "on"),
+            ("WAAV_STT_CARTESIA_MANUAL_FINALIZE", "1"),
+        ]);
+        let r = resolve_session(&on, &req("cartesia", "ink-whisper", AGENT));
+        assert_eq!(
+            r.decision,
+            LiveDecision::Native,
+            "no recorded probe: {:?}",
+            r.resolution.notes
+        );
+        assert!(on.cartesia_finalize);
     }
 
     #[test]

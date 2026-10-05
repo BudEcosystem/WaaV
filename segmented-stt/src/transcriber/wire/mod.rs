@@ -14,6 +14,7 @@
 //! | [`azure_fast`] | `azure_fast_transcription` |
 //! | [`google_recognize`] | `google_recognize` |
 //! | [`openai_realtime`] | `openai_realtime_transcription` (the commit transport, on a socket) |
+//! | [`cartesia_finalize`] | `cartesia_manual_finalize` (the commit transport for Cartesia) |
 //!
 //! Shared rules, applied by every family through this module:
 //!
@@ -29,6 +30,7 @@
 
 pub mod assemblyai;
 pub mod azure_fast;
+pub mod cartesia_finalize;
 pub mod deepgram;
 pub mod elevenlabs;
 pub mod google_recognize;
@@ -69,6 +71,7 @@ pub fn built_adapters() -> &'static [&'static str] {
         "azure_fast_transcription",
         "google_recognize",
         "openai_realtime_transcription",
+        "cartesia_manual_finalize",
     ]
 }
 
