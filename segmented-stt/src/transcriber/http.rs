@@ -264,8 +264,8 @@ impl reqwest::dns::Resolve for PublicOnlyResolver {
 pub use crate::net::is_public_ip;
 
 /// A base address a client named (not one from a Bud deployment record): `http` or `https`, and
-/// not a private address or `localhost`. Names are checked again at connect time by the public
-/// pool's resolver. `allow_private` is the operator's escape hatch.
+/// a host the gateway's SSRF rule accepts ([`crate::net::check_host`]). Names are checked again at
+/// connect time by the public pool's resolver. `allow_private` is the operator's escape hatch.
 pub fn check_untrusted_base(base: &str, allow_private: bool) -> Result<(), String> {
     let u = url::Url::parse(base.trim())
         .map_err(|e| format!("'{base}' is not a valid address: {e}"))?;
@@ -277,22 +277,12 @@ pub fn check_untrusted_base(base: &str, allow_private: bool) -> Result<(), Strin
     if allow_private {
         return Ok(());
     }
-    match u.host() {
-        Some(url::Host::Ipv4(ip)) if !is_public_ip(&ip.into()) => Err(format!(
-            "'{base}' is a private or loopback address (SSRF protection)"
-        )),
-        Some(url::Host::Ipv6(ip)) if !is_public_ip(&ip.into()) => Err(format!(
-            "'{base}' is a private or loopback address (SSRF protection)"
-        )),
-        Some(url::Host::Domain(d))
-            if d.eq_ignore_ascii_case("localhost")
-                || d.to_ascii_lowercase().ends_with(".localhost") =>
-        {
-            Err(format!("'{base}' is a loopback address (SSRF protection)"))
-        }
-        None => Err(format!("'{base}' has no host")),
-        _ => Ok(()),
-    }
+    let host = u
+        .host_str()
+        .ok_or_else(|| format!("'{base}' has no host"))?;
+    crate::net::check_host(host)
+        .map(|_| ())
+        .map_err(|e| format!("'{base}': {e}"))
 }
 
 /// The limiter, breaker and pool key of a URL: `scheme://host:port`, lower case, with the port
@@ -523,6 +513,7 @@ mod tests {
             "http://127.0.0.1:9/v1",
             "http://localhost/v1",
             "https://169.254.169.254/latest",
+            "http://metadata.google.internal/computeMetadata",
             "http://[::1]/v1",
             "http://10.0.0.5:8000",
             "ftp://files.example.com",

@@ -36,7 +36,7 @@ while the REST route still forwards files and returns the vendor's body.
 | Vendor hosts and keep-no-audio switches, Azure OpenAI URLs, request ids, rate-limit waits, error bodies | `segmented-stt/src/vendor/mod.rs` | both, plus the gateway's TTS error rendering |
 | OpenAI-format response types, URL join, Whisper prompt, upload file names | `segmented-stt/src/vendor/openai.rs` | segmented sessions, the OpenAI and Groq clients, the batch API |
 | Deepgram and ElevenLabs response readers, Deepgram key-terms parameter | `segmented-stt/src/vendor/{deepgram,elevenlabs}.rs` | segmented sessions, the prerecorded client, the batch API |
-| Public-address rule (SSRF) | `segmented-stt/src/net.rs` | upload pools, `core::net`, `utils::url_validation` |
+| Public-address rule and blocked hosts (SSRF) | `segmented-stt/src/net.rs` | upload pools and client-named bases, `core::net`, `utils::url_validation` |
 | Circuit-breaker state machine | `segmented-stt/src/breaker.rs` | upload breakers; the gateway's `CircuitBreaker` (streaming reconnects, the HTTP upload clients) |
 | Streaming resampler core | `segmented-stt/src/resample.rs` | the front end; the gateway's `StreamResampler` |
 

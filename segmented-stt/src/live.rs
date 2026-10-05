@@ -744,10 +744,7 @@ mod tests {
             let err = build_transcriber(&t, &named, &clients())
                 .err()
                 .unwrap_or_else(|| panic!("{p}: a loopback base was accepted"));
-            assert!(
-                err.contains("private") || err.contains("loopback"),
-                "{p}: {err}"
-            );
+            assert!(err.contains("SSRF protection"), "{p}: {err}");
             let deployment = TargetSpec {
                 trusted: true,
                 ..named.clone()
