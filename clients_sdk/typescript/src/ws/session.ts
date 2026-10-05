@@ -18,6 +18,7 @@ import type {
 } from '../types/messages.js';
 import type { ConfigWarningEvent, SttWarningEvent } from '../types/warnings.js';
 import { PROTOCOL_VERSION } from '../types/messages.js';
+import { toVoiceAgentConfig, type VoiceAgentConfig } from '../types/agent.js';
 import type { MetricsSummary } from '../types/metrics.js';
 import { getMetricsCollector, MetricsCollector } from '../metrics/collector.js';
 import { WebSocketConnection, DEFAULT_CONNECT_TIMEOUT_MS, type ConnectionState } from './connection.js';
@@ -81,6 +82,11 @@ export interface SessionConfig {
    * providers come back on `ready` as `resolvedAlias`.
    */
   alias?: string;
+  /**
+   * A Bud voice agent (spec 025), by name or config. It decides both speech legs, so `stt`/`tts`
+   * then carry only the audio format (the gateway refuses a `model` on them).
+   */
+  agent?: VoiceAgentConfig | string;
   /** Stream identifier to request (wire: stream_id). */
   streamId?: string;
   /** Enable audio processing (STT/TTS). Defaults to true (gateway default). */
@@ -808,6 +814,7 @@ export class WebSocketSession {
       this.turnDetectionConfig ||
       this.featuresConfig ||
       this.config.alias !== undefined ||
+      this.config.agent !== undefined ||
       this.config.audio !== undefined ||
       this.config.streamId !== undefined;
     if (hasConfig) {
@@ -821,6 +828,7 @@ export class WebSocketSession {
           conversation: this.conversationConfig,
           turnDetection: this.turnDetectionConfig,
           alias: this.config.alias,
+          agent: this.config.agent !== undefined ? toVoiceAgentConfig(this.config.agent) : undefined,
           streamId: this.config.streamId,
           audio: this.config.audio,
         }

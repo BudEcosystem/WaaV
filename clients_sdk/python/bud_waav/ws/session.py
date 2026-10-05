@@ -15,7 +15,7 @@ import websockets
 from websockets.asyncio.client import ClientConnection
 
 from ..types import (
-    STTConfig, TTSConfig, STTResult, TranscriptEvent, AudioEvent,
+    VoiceAgentConfig, STTConfig, TTSConfig, STTResult, TranscriptEvent, AudioEvent,
     AudioFeatures, DAGConfig, ConversationConfig, intensity_to_number,
     Translation,
     ReadySTT,
@@ -245,6 +245,7 @@ class WebSocketSession:
         reconnect: Optional[ReconnectConfig] = None,
         audio: bool = True,
         alias: Optional[str] = None,
+        agent: Optional[Union[VoiceAgentConfig, str]] = None,
         ping_interval: float = 5.0,
         ping_timeout: float = 3.0,
         stale_inbound_timeout: float = 12.0,
@@ -319,6 +320,10 @@ class WebSocketSession:
         # field above always wins. The resolved concrete providers come back on the
         # `ready` ack as `resolved_alias` (see `resolved_alias` property).
         self.alias = alias
+        # A Bud voice agent (spec 025): it decides both speech legs, so the session invents none.
+        self.agent: Optional[VoiceAgentConfig] = (
+            VoiceAgentConfig(id=agent) if isinstance(agent, str) else agent
+        )
         self.requested_stream_id = stream_id
         self.reconnect_config = reconnect or ReconnectConfig()
 
@@ -943,6 +948,12 @@ class WebSocketSession:
         if self.alias:
             config["alias"] = self.alias
 
+        # A voice agent (spec 025) owns both speech legs: no default leg is invented below and
+        # no model is sent on them (the gateway refuses one with `agent_owns_legs`).
+        if self.agent is not None:
+            config["agent"] = self.agent.to_wire()
+        agent_session = self.agent is not None
+
         # Include stream_id if requested
         if self.requested_stream_id:
             config["stream_id"] = self.requested_stream_id
@@ -955,8 +966,9 @@ class WebSocketSession:
                 "channels": self.stt_config.channels,
                 "punctuation": self.stt_config.punctuate,
                 "encoding": self.stt_config.encoding,
-                "model": self.stt_config.model or "nova-3",
             }
+            if not agent_session or self.stt_config.model:
+                stt_dict["model"] = self.stt_config.model or "nova-3"
             # D8 uplink transport codec (linear16|opus); only set when requested. The gateway echoes
             # the effective codec on `ready` and degrades to linear16 if its build lacks opus.
             if getattr(self.stt_config, "audio_in_codec", None):
@@ -1025,7 +1037,7 @@ class WebSocketSession:
                 stt_dict["turn_detection"] = td_wire
 
             config["stt_config"] = stt_dict
-        elif self.audio:
+        elif self.audio and not agent_session:
             # Gateway requires stt_config when audio=true - provide minimal default.
             # Skipped for audio=false (config-only) sessions.
             config["stt_config"] = {
@@ -1042,8 +1054,9 @@ class WebSocketSession:
             tts_dict: dict[str, Any] = {
                 "provider": self.tts_config.provider,
                 "voice_id": self.tts_config.voice_id or self.tts_config.voice,
-                "model": self.tts_config.model or "aura-asteria-en",
             }
+            if not agent_session or self.tts_config.model:
+                tts_dict["model"] = self.tts_config.model or "aura-asteria-en"
             # Abstract voice selection (P4): the gateway resolves a VoiceDescriptor
             # to a concrete provider voice_id server-side. Sent under
             # `tts_config.voice_descriptor` (snake_case object); a raw voice_id
@@ -1116,7 +1129,7 @@ class WebSocketSession:
                 tts_dict["extras"] = tts_extras
 
             config["tts_config"] = tts_dict
-        elif self.audio:
+        elif self.audio and not agent_session:
             # Gateway requires tts_config when audio=true - provide minimal default.
             # Skipped for audio=false (config-only) sessions.
             config["tts_config"] = {
@@ -1146,11 +1159,11 @@ class WebSocketSession:
         # The entire LLM loop + reasoning stack was 0% reachable before this.
         if self.conversation_config is not None:
             conv = self.conversation_config
-            conv_dict: dict[str, Any] = {
-                # base_url + model are required by the gateway.
-                "base_url": conv.base_url,
-                "model": conv.model,
-            }
+            # `model` is the one required field; `base_url` is left out when unset (under the Bud
+            # control plane the LLM is a Bud deployment and the gateway refuses one).
+            conv_dict: dict[str, Any] = {"model": conv.model}
+            if conv.base_url:
+                conv_dict["base_url"] = conv.base_url
             # Emit every OTHER field only when explicitly set (None = let the
             # gateway apply its own default). Pydantic enum values are already
             # coerced to str via use_enum_values=True on the model.

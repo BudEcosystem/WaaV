@@ -5,7 +5,7 @@ Type definitions for bud-waav SDK
 import copy
 from enum import Enum
 from typing import Any, Callable, Literal, Optional, TypeVar, Union
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, ValidationError, field_validator
 
 
 # =============================================================================
@@ -753,8 +753,9 @@ class ConversationConfig(BaseModel):
 
     model_config = ConfigDict(use_enum_values=True)
 
-    base_url: str
-    """OpenAI-compatible base URL for the LLM (e.g. 'https://api.openai.com/v1')."""
+    base_url: Optional[str] = None
+    """OpenAI-compatible base URL for the LLM (e.g. 'https://api.openai.com/v1'). Leave it out under
+    the Bud control plane, where the LLM is a Bud chat deployment and the gateway refuses one."""
 
     model: str
     """Model identifier (e.g. 'gpt-4o-mini', 'llama3.2:1b')."""
@@ -839,6 +840,40 @@ class ConversationConfig(BaseModel):
 
     max_reasoning_tokens: Optional[int] = None
     """Hard ceiling on the reasoning tier's output tokens."""
+
+
+class VoiceAgentConfig(BaseModel):
+    """A Bud voice agent for the session (spec 025), sent as the config envelope's ``agent``.
+
+    The agent decides both speech legs (its STT and TTS deployments), the voice and how turns
+    are taken; budprompt answers one turn per utterance. A session with an agent sends no
+    conversation or DAG block, and its ``stt_config``/``tts_config`` carry only the audio
+    format: the gateway refuses a model on them (``agent_owns_legs``).
+    """
+
+    id: str
+    """The agent's name (what ``prompt:<name>`` names on ``/v1/responses``), optionally pinned
+    as ``name:v<n>``. A ``prompt:`` prefix is accepted."""
+
+    version: Optional[int] = None
+    """Pin a version; otherwise the agent's default version, pinned for the session."""
+
+    text_only: Optional[bool] = None
+    """Text replies only: answers arrive as ``assistant_transcript`` and nothing is spoken."""
+
+    variables: Optional[dict[str, Any]] = None
+    """The agent's structured input, once per session."""
+
+    @field_validator("id")
+    @classmethod
+    def _named(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("an agent needs its name")
+        return v
+
+    def to_wire(self) -> dict[str, Any]:
+        """The ``agent`` block, with only the fields set."""
+        return self.model_dump(exclude_none=True)
 
 
 class TranslationConfig(BaseModel):

@@ -82,6 +82,7 @@ from .types import (
     VoiceGender,
     VoiceAge,
     # Conversation / agent-loop types (built-in LLM loop + reasoning)
+    VoiceAgentConfig,
     ConversationConfig,
     ReasoningEffort,
     LatencyFiller,
@@ -232,6 +233,7 @@ __all__ = [
     "VoiceGender",
     "VoiceAge",
     # Conversation / agent-loop types (built-in LLM loop + reasoning)
+    "VoiceAgentConfig",
     "ConversationConfig",
     "ReasoningEffort",
     "LatencyFiller",

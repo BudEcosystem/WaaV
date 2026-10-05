@@ -25,6 +25,7 @@ import type {
 } from '../types/messages.js';
 import type { STTConfig, TTSConfig, LiveKitConfig, DAGConfig, ConversationConfig, TurnDetectionConfig } from '../types/config.js';
 import { conversationConfigToWire } from '../types/conversation.js';
+import { voiceAgentConfigToWire, type VoiceAgentConfig } from '../types/agent.js';
 import { serializeDAGConfig } from '../types/dag.js';
 import type { FeatureFlags } from '../types/features.js';
 
@@ -134,6 +135,8 @@ export interface SDKConfigMessage {
    * The resolved concrete providers come back on `ready` as `resolved_alias`.
    */
   alias?: string;
+  /** A Bud voice agent (spec 025, wire `agent`): it decides both speech legs. */
+  agent?: VoiceAgentConfig;
   /**
    * Legacy client feature flags. These are folded into the nested
    * `stt_config.features{}` block (NOT emitted as a top-level `features` key,
@@ -227,6 +230,10 @@ function configToWire(message: SDKConfigMessage): Record<string, unknown> {
   // {stt,tts,llm,dag} bundle server-side (an explicit config below overrides it).
   if (message.alias) {
     wire.alias = message.alias;
+  }
+
+  if (message.agent) {
+    wire.agent = voiceAgentConfigToWire(message.agent);
   }
 
   if (message.audio !== undefined) {
@@ -760,6 +767,7 @@ export function createConfigMessage(
     conversation?: ConversationConfig;
     turnDetection?: TurnDetectionConfig;
     alias?: string;
+    agent?: VoiceAgentConfig;
     streamId?: string;
     audio?: boolean;
   }
@@ -775,6 +783,7 @@ export function createConfigMessage(
   if (extra?.conversation !== undefined) msg.conversation = extra.conversation;
   if (extra?.turnDetection !== undefined) msg.turnDetection = extra.turnDetection;
   if (extra?.alias !== undefined) msg.alias = extra.alias;
+  if (extra?.agent !== undefined) msg.agent = extra.agent;
   if (extra?.streamId !== undefined) msg.streamId = extra.streamId;
   if (extra?.audio !== undefined) msg.audio = extra.audio;
   return msg;

@@ -233,8 +233,11 @@ export type TranscriptionMode = 'auto' | 'streaming' | 'segmented';
  * Maps to the gateway STTWebSocketConfig in src/handlers/ws/config.rs
  */
 export interface STTConfig {
-  /** Provider name (e.g., "deepgram", "google", "elevenlabs", "microsoft-azure", "cartesia") */
-  provider: string;
+  /**
+   * Provider name (e.g., "deepgram", "google", "elevenlabs", "microsoft-azure", "cartesia").
+   * May be omitted when `model` names a Bud deployment: the deployment decides the vendor.
+   */
+  provider?: string;
   /** Language code for transcription (e.g., "en-US", "es-ES") */
   language?: string;
   /** Sample rate of the audio in Hz (default: 16000) */
@@ -335,8 +338,11 @@ export interface STTConfig {
  * Maps to the gateway TTSWebSocketConfig in src/handlers/ws/config.rs
  */
 export interface TTSConfig {
-  /** Provider name (e.g., "deepgram", "elevenlabs", "google", "azure", "cartesia") */
-  provider: string;
+  /**
+   * Provider name (e.g., "deepgram", "elevenlabs", "google", "azure", "cartesia").
+   * May be omitted when `model` names a Bud deployment: the deployment decides the vendor.
+   */
+  provider?: string;
   /** Voice name */
   voice?: string;
   /** Voice ID or name to use for synthesis */

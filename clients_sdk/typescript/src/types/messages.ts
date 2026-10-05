@@ -35,7 +35,7 @@ export interface ConfigMessage {
   audio?: boolean;
   /** STT configuration */
   stt_config?: {
-    provider: string;
+    provider?: string;
     language: string;
     sample_rate: number;
     channels: number;
@@ -45,7 +45,7 @@ export interface ConfigMessage {
   };
   /** TTS configuration */
   tts_config?: {
-    provider: string;
+    provider?: string;
     voice_id?: string;
     speaking_rate?: number;
     audio_format?: string;

@@ -58,14 +58,17 @@ export type MuteStrategy =
  * Built-in conversation-loop configuration for the gateway
  * (`ConversationWebSocketConfig`, config.rs:53-217).
  *
- * `baseUrl` and `model` are the only required fields (mirrors the gateway);
+ * `model` is the only required field (mirrors the gateway);
  * every other field is optional and only sent when set, so the gateway applies
  * its own documented defaults.
  */
 export interface ConversationConfig {
   // --- Core LLM ---
-  /** OpenAI-compatible base URL for the LLM (e.g. 'https://api.openai.com/v1'). */
-  baseUrl: string;
+  /**
+   * OpenAI-compatible base URL for the LLM (e.g. 'https://api.openai.com/v1'). Leave it out under
+   * the Bud control plane, where the LLM is a Bud chat deployment and the gateway refuses one.
+   */
+  baseUrl?: string;
   /** Model identifier — keep this a FAST model (e.g. 'gpt-4o-mini', 'llama3.2:1b'). */
   model: string;
   /** Optional system prompt seeding the conversation. */
@@ -132,15 +135,13 @@ export interface ConversationConfig {
 
 /**
  * Map a {@link ConversationConfig} (camelCase, SDK-facing) to the gateway
- * `conversation_config` wire block (snake_case). `base_url` + `model` are
- * always emitted; every other field is sent ONLY when explicitly set so the
+ * `conversation_config` wire block (snake_case). `model` is always emitted;
+ * `base_url` and every other field are sent ONLY when explicitly set so the
  * gateway applies its own defaults (a literal `undefined` is never serialized).
  */
 export function conversationConfigToWire(config: ConversationConfig): Record<string, unknown> {
-  const wire: Record<string, unknown> = {
-    base_url: config.baseUrl,
-    model: config.model,
-  };
+  const wire: Record<string, unknown> = { model: config.model };
+  if (config.baseUrl) wire.base_url = config.baseUrl;
 
   // [camelCase SDK field, snake_case wire key] pairs for the optional surface.
   const optional: Array<[keyof ConversationConfig, string]> = [

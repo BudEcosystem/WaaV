@@ -69,6 +69,14 @@ SDK_CONFIG_REACH: dict[str, set[str]] = {
         "dag_config",
         "conversation_config",
         "alias",  # P3 server-side alias name (ws/session.py::_send_config)
+        "agent",  # spec 025 voice agent (VoiceAgentConfig; ws/session.py::_send_config)
+    },
+    # ---- AgentWebSocketConfig (spec 025 voice agent) --------------------------
+    "AgentWebSocketConfig": {
+        "id",  # VoiceAgentConfig.id
+        "version",  # VoiceAgentConfig.version
+        "text_only",  # VoiceAgentConfig.text_only
+        "variables",  # VoiceAgentConfig.variables
     },
     # ---- STTWebSocketConfig (config.rs:296) -----------------------------------
     "STTWebSocketConfig": {

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 from ..types import (
     STTConfig, TTSConfig, STTResult, AudioEvent, FeatureFlags, AudioFeatures,
-    DAGConfig, ConversationConfig, ReadySTT, SttWarning, VadEvent,
+    DAGConfig, ConversationConfig, ReadySTT, SttWarning, VadEvent, VoiceAgentConfig,
 )
 from ..ws.session import (
     WebSocketSession,
@@ -130,6 +130,7 @@ class BudTalk:
         conversation_config: Optional[ConversationConfig] = None,
         stream_id: Optional[str] = None,
         alias: Optional[str] = None,
+        agent: Optional[Union[VoiceAgentConfig, str]] = None,
     ) -> "TalkSession":
         """
         Create a Talk session.
@@ -143,6 +144,8 @@ class BudTalk:
             audio_features: Audio features (turn detection, noise filter, VAD)
             dag_config: DAG routing configuration
             stream_id: Optional stream ID for session tracking
+            agent: A Bud voice agent (spec 025), by name or ``VoiceAgentConfig``. It decides both
+                speech legs; ``stt``/``tts`` then carry only the audio format.
 
         Returns:
             Talk session
@@ -202,6 +205,7 @@ class BudTalk:
             conversation_config=conversation_config,
             stream_id=stream_id,
             alias=alias,
+            agent=agent,
         )
 
     async def connect(
@@ -216,6 +220,7 @@ class BudTalk:
         conversation_config: Optional[ConversationConfig] = None,
         stream_id: Optional[str] = None,
         alias: Optional[str] = None,
+        agent: Optional[Union[VoiceAgentConfig, str]] = None,
     ) -> "TalkSession":
         """
         Create and connect a Talk session.
@@ -244,6 +249,7 @@ class BudTalk:
             conversation_config=conversation_config,
             stream_id=stream_id,
             alias=alias,
+            agent=agent,
         )
         await session.connect()
         return session
@@ -266,6 +272,7 @@ class TalkSession:
         conversation_config: Optional[ConversationConfig] = None,
         stream_id: Optional[str] = None,
         alias: Optional[str] = None,
+        agent: Optional[Union[VoiceAgentConfig, str]] = None,
     ):
         """
         Initialize Talk session.
@@ -299,6 +306,7 @@ class TalkSession:
             conversation_config=conversation_config,
             stream_id=stream_id,
             alias=alias,
+            agent=agent,
         )
 
         self._event_handlers: dict[str, list[Callable[..., Any]]] = {}

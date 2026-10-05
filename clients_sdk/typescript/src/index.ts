@@ -70,6 +70,9 @@ export type {
   LanguageCapabilitiesResponse,
 } from './types/canonical-languages.js';
 
+// Bud voice agents on /ws (spec 025).
+export type { VoiceAgentConfig } from './types/agent.js';
+
 // Conversation / agent-loop config (the flagship LLM + reasoning surface).
 export type {
   ConversationConfig,
