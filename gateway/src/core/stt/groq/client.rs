@@ -266,6 +266,10 @@ pub struct GroqSTT {
     /// Last request ID from Groq API (for debugging/support).
     pub last_request_id: Option<String>,
 
+    /// The HTTP status of the last failed attempt, when Groq answered one: whether to try again
+    /// is decided by it, not by the error's text.
+    last_error_status: Option<u16>,
+
     // ==========================================================================
     // Silence Detection State
     // ==========================================================================
@@ -332,6 +336,7 @@ impl GroqSTT {
             total_bytes_received: 0,
             rate_limit_info: RateLimitInfo::default(),
             last_request_id: None,
+            last_error_status: None,
             first_audio_time: None,
             silence_start_time: None,
             last_was_silent: false,
@@ -599,8 +604,9 @@ impl GroqSTT {
                     return Ok(());
                 }
                 Err(e) => {
-                    // Check if error is retryable
-                    if Self::is_retryable_error(&e) && attempt < MAX_RETRIES - 1 {
+                    // Transient by the status Groq answered, or a network failure.
+                    let status = self.last_error_status.take();
+                    if Self::is_retryable(&e, status) && attempt < MAX_RETRIES - 1 {
                         warn!("Retryable error on attempt {}: {}", attempt + 1, e);
                         last_error = Some(e);
                         continue;
@@ -620,19 +626,19 @@ impl GroqSTT {
         }))
     }
 
-    /// Check if an error is retryable (transient).
-    pub(crate) fn is_retryable_error(error: &STTError) -> bool {
-        match error {
-            STTError::NetworkError(_) => true,
-            STTError::ProviderError(msg) => {
-                msg.contains("429")
-                    || msg.contains("rate limit")
-                    || msg.contains("500")
-                    || msg.contains("502")
-                    || msg.contains("503")
-                    || msg.contains("Service Unavailable")
-            }
-            _ => false,
+    /// Whether an HTTP status from Groq is transient: a timeout, a rate limit (429), flex-tier
+    /// capacity (498) or a server error.
+    pub(crate) fn retryable_status(status: u16) -> bool {
+        matches!(status, 408 | 429 | 498) || (500..=599).contains(&status)
+    }
+
+    /// Whether a failed attempt is tried again: by the HTTP status when Groq answered, else only a
+    /// network failure. Not by the error's text: this client's own messages ("Rate limit
+    /// exceeded", "Server error") never matched the words the text test looked for.
+    pub(crate) fn is_retryable(error: &STTError, status: Option<u16>) -> bool {
+        match status {
+            Some(s) => Self::retryable_status(s),
+            None => matches!(error, STTError::NetworkError(_)),
         }
     }
 
@@ -645,6 +651,7 @@ impl GroqSTT {
         wav_data: Vec<u8>,
         config: &GroqSTTConfig,
     ) -> Result<TranscriptionResult, STTError> {
+        self.last_error_status = None;
         let http_client = self.http_client.as_ref().ok_or_else(|| {
             STTError::ConfigurationError(
                 "Groq STT default HTTP client is unavailable; construct with GroqSTT::new, new_standard, or with_config".to_string(),
@@ -775,6 +782,7 @@ impl GroqSTT {
                 .map(|id| format!(" [request_id: {}]", id))
                 .unwrap_or_default();
 
+            self.last_error_status = Some(status.as_u16());
             let stt_error = match status.as_u16() {
                 400 => STTError::ConfigurationError(format!("{}{}", error_msg, request_id_suffix)),
                 401 => {
@@ -1007,6 +1015,7 @@ impl Default for GroqSTT {
             total_bytes_received: 0,
             rate_limit_info: RateLimitInfo::default(),
             last_request_id: None,
+            last_error_status: None,
             first_audio_time: None,
             silence_start_time: None,
             last_was_silent: false,
@@ -1582,23 +1591,36 @@ mod tests {
         assert!(!GroqSTT::is_audio_silent(&loud_audio, 0.01));
     }
 
+    /// Retries follow the status Groq answered. The messages this client builds for a 429
+    /// ("Rate limit exceeded: ...") and a 5xx ("Server error: ...") were never retried by the old
+    /// text test, which looked for "rate limit" and the bare status numbers.
     #[test]
     fn test_is_retryable_error() {
-        assert!(GroqSTT::is_retryable_error(&STTError::NetworkError(
-            "Connection reset".to_string()
-        )));
-        assert!(GroqSTT::is_retryable_error(&STTError::ProviderError(
-            "429 rate limit exceeded".to_string()
-        )));
-        assert!(GroqSTT::is_retryable_error(&STTError::ProviderError(
-            "503 Service Unavailable".to_string()
-        )));
-        assert!(!GroqSTT::is_retryable_error(
-            &STTError::AuthenticationFailed("Invalid API key".to_string())
+        let rate_limited = STTError::ProviderError("Rate limit exceeded: busy".to_string());
+        let server = STTError::ProviderError("Server error: Groq API error: down".to_string());
+        assert!(GroqSTT::is_retryable(&rate_limited, Some(429)));
+        assert!(GroqSTT::is_retryable(&server, Some(503)));
+        assert!(GroqSTT::is_retryable(&server, Some(504)));
+        assert!(
+            GroqSTT::is_retryable(&rate_limited, Some(498)),
+            "flex-tier capacity"
+        );
+        assert!(GroqSTT::is_retryable(
+            &STTError::NetworkError("Connection reset".to_string()),
+            None
         ));
-        assert!(!GroqSTT::is_retryable_error(&STTError::ConfigurationError(
-            "Invalid config".to_string()
-        )));
+        assert!(!GroqSTT::is_retryable(
+            &STTError::AuthenticationFailed("Invalid API key".to_string()),
+            Some(401)
+        ));
+        assert!(!GroqSTT::is_retryable(
+            &STTError::ConfigurationError("Invalid config".to_string()),
+            Some(400)
+        ));
+        assert!(!GroqSTT::is_retryable(
+            &STTError::ProviderError("Failed to parse response: x".to_string()),
+            None
+        ));
     }
 
     #[test]

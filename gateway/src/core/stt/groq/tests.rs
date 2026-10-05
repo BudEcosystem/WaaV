@@ -823,24 +823,19 @@ mod client_tests {
 
     #[test]
     fn test_client_is_retryable_error() {
-        // Retryable errors
-        assert!(GroqSTT::is_retryable_error(&STTError::NetworkError(
-            "timeout".to_string()
-        )));
-        assert!(GroqSTT::is_retryable_error(&STTError::ProviderError(
-            "429 rate limit".to_string()
-        )));
-        assert!(GroqSTT::is_retryable_error(&STTError::ProviderError(
-            "503 Service Unavailable".to_string()
-        )));
-
-        // Non-retryable errors
-        assert!(!GroqSTT::is_retryable_error(
-            &STTError::AuthenticationFailed("invalid key".to_string())
+        // Retryable: a network failure, and transient statuses.
+        assert!(GroqSTT::is_retryable(
+            &STTError::NetworkError("timeout".to_string()),
+            None
         ));
-        assert!(!GroqSTT::is_retryable_error(&STTError::ConfigurationError(
-            "invalid config".to_string()
-        )));
+        for status in [408, 429, 498, 500, 502, 503, 504] {
+            assert!(GroqSTT::retryable_status(status), "{status}");
+        }
+
+        // Not retryable: the caller's or the account's to fix.
+        for status in [400, 401, 403, 404, 413, 422] {
+            assert!(!GroqSTT::retryable_status(status), "{status}");
+        }
     }
 
     #[test]
@@ -1793,7 +1788,7 @@ mod resilience_tests {
             other => panic!("expected typed ConnectionFailed refusal, got {other:?}"),
         }
         assert!(
-            !GroqSTT::is_retryable_error(&STTError::ConnectionFailed("x".into())),
+            !GroqSTT::is_retryable(&STTError::ConnectionFailed("x".into()), None),
             "the refusal must not feed Groq's retry loop"
         );
         mock.assert_async().await; // zero upstream hits
