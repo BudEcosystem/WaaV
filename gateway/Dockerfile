@@ -170,7 +170,7 @@ COPY --from=builder /app/gateway/onnxruntime/lib/*.so* /app/
 # Cached models from init stage
 COPY --from=init /app/cache /app/cache
 
-ENV RUST_LOG=info \
+ENV RUST_LOG=info,ort=warn \
     PORT=3001 \
     CACHE_PATH=/app/cache
 
