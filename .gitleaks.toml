@@ -96,6 +96,11 @@ regexes = [
   '''(?i)(os\.environ|process\.env|getenv|env\[|secrets\.)''',
   # All-zero / repeated-char obvious non-secrets.
   '''\b(0{20,}|a{20,}|x{20,})\b''',
+  # A sequential hex run: the body of a made-up test key (`sk-live-0123456789abcdef`).
+  '''0123456789abcdef''',
+  # Deepgram model ids (`nova-2-medical`), which the capability map writes as pricing keys
+  # (`pricing_key deepgram:nova-2-medical`): a public model name, not a credential.
+  '''^nova-[0-9](-[a-z]+)*$''',
 ]
 # Never flag git commit SHAs by themselves (the 40-hex Deepgram rule is keyword-anchored,
 # so a bare SHA in a doc/lockfile is not a finding).

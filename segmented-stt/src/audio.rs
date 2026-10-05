@@ -268,9 +268,9 @@ impl FrontEnd {
                         return out;
                     }
                 }
-                let mut pairs = rest.chunks_exact(2);
-                out.extend(pairs.by_ref().map(|p| i16::from_le_bytes([p[0], p[1]])));
-                if let [odd] = pairs.remainder() {
+                let (pairs, odd) = rest.as_chunks::<2>();
+                out.extend(pairs.iter().map(|&p| i16::from_le_bytes(p)));
+                if let [odd] = odd {
                     self.byte_carry = Some(*odd);
                 }
                 out
@@ -315,8 +315,10 @@ impl FrontEnd {
             self.pending
                 .drain(..whole)
                 .collect::<Vec<_>>()
-                .chunks_exact(FRAME_SAMPLES)
-                .map(<[i16]>::to_vec),
+                .as_chunks::<FRAME_SAMPLES>()
+                .0
+                .iter()
+                .map(|frame| frame.to_vec()),
         );
     }
 }

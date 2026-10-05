@@ -569,15 +569,19 @@ mod tests {
         };
         let bytes = std::fs::read(path).expect("read the recording");
         let samples: Vec<f32> = bytes[44..]
-            .chunks_exact(2)
-            .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&b| i16::from_le_bytes(b) as f32 / 32768.0)
             .collect();
         let mut vad = SileroVAD::new(SileroVADConfig::default())
             .await
             .expect("load Silero");
         let probs: Vec<f32> = samples
-            .chunks_exact(512)
-            .map(|c| vad.process(c).expect("process").probability)
+            .as_chunks::<512>()
+            .0
+            .iter()
+            .map(|c| vad.process(c.as_slice()).expect("process").probability)
             .collect();
         let speech = probs.iter().filter(|p| **p > 0.5).count();
         assert!(

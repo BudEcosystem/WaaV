@@ -51,6 +51,7 @@ thr = "thr"          # threshold in formulas
 mis = "mis"          # mis- prefix (mis-routed, mis-detected)
 formant = "formant"  # acoustic resonance
 lasr = "lasr"        # Google lasr_ctc architecture
+speaches = "speaches"  # speaches, an open-source OpenAI-compatible Whisper server
 criticals = "criticals"
 datas = "datas"
 # Language codes (ISO 639), phonemes and non-English voice names.
