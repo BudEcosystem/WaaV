@@ -132,7 +132,9 @@ impl HttpBreaker {
         } else if matches!(status.as_u16(), 400 | 404 | 413 | 422) {
             // The CALLER's malformed request (FRD-022 §6.5): it describes the request, not the
             // provider. Counting it let one tenant's bad payloads open a breaker every other
-            // tenant of the vendor shares.
+            // tenant of the vendor shares. Not counted; a half-open probe that got it is abandoned
+            // so the next call probes (it used to strand the breaker half-open).
+            b.record_neutral();
         } else {
             // 5xx, 429, unexpected 3xx: a plain breaker failure. 429 lands here deliberately —
             // rate-limiting may rate-trip the breaker but must never arm the credentials-FATAL
@@ -161,6 +163,37 @@ mod tests {
         let mut hb = HttpBreaker::new(provider);
         hb.set_handles(reg.handles_for(provider));
         hb
+    }
+
+    /// The audit's defect: a half-open probe answered with the caller's own 4xx was never recorded,
+    /// so the breaker stayed half-open and refused every later call until restart. The probe is now
+    /// abandoned and the next call probes.
+    #[test]
+    fn a_probe_answered_with_a_caller_error_does_not_strand_the_breaker() {
+        use crate::core::resilience::{CircuitBreaker, CircuitBreakerConfig, ResilienceHandles};
+        let breaker = Arc::new(CircuitBreaker::new(CircuitBreakerConfig {
+            min_request_volume: 2,
+            cooldown: Duration::from_millis(20),
+            ..Default::default()
+        }));
+        let mut hb = HttpBreaker::new("http-stranded");
+        hb.set_handles(ResilienceHandles {
+            governor: ResilienceRegistry::new(4).governor().clone(),
+            breaker: Arc::clone(&breaker),
+        });
+        hb.record_status(StatusCode::INTERNAL_SERVER_ERROR);
+        hb.record_status(StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(hb.check().is_err(), "open");
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(hb.check().is_ok(), "the cooldown admits the probe");
+        hb.record_status(StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            hb.check().is_ok(),
+            "the next call probes instead of being refused: {:?}",
+            breaker.state()
+        );
+        hb.record_status(StatusCode::OK);
+        assert_eq!(breaker.state(), CircuitState::Closed);
     }
 
     #[test]

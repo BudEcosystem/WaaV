@@ -15,6 +15,7 @@
 //! | [`resolve`] | The resolver: reads the map once per session and picks a transport or a named refusal |
 //! | [`rollout`] | The rollout switch, the allow-list and the effective release |
 //! | [`control`] | The control record: deployments and rows switched off on a running gateway |
+//! | [`breaker`] | The circuit-breaker state machine, shared with the gateway's breakers |
 //! | [`audio`] | Wire bytes to 16 kHz mono frames, and WAV encoding |
 //! | [`profile`] | Every engine threshold, merged from defaults, the capability row and the session |
 //! | [`detector`] | The speech detector trait, the energy detector and a scripted detector for tests |
@@ -32,6 +33,7 @@
 //! | [`wav`] | The one WAV writer, shared with the gateway's file-upload clients |
 
 pub mod audio;
+pub mod breaker;
 pub mod control;
 pub mod detector;
 pub mod endpointer;

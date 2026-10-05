@@ -27,12 +27,19 @@
 //! - **HalfOpen**: a single probe is allowed. If it succeeds the breaker closes and the
 //!   window resets; if it fails the breaker re-opens and the cooldown restarts.
 //!
-//! The breaker is `Send + Sync` and lock-free on the hot path (atomics only), so it can
-//! be shared across the reconnect supervisor, the metrics exporter (W-C1), and the
-//! readiness probe.
+//! The Closed/Open/HalfOpen state machine is the shared one in
+//! [`waav_segmented_stt::breaker`], the same that guards segmented sessions' uploads: a half-open
+//! probe that reports nothing (cancelled, or an answer that says nothing about the vendor) is
+//! replaced after a lease instead of denying every caller until restart. This type adds the
+//! credentials-FATAL state, the per-provider gauge and the presets on top.
+//!
+//! The breaker is `Send + Sync` and shared across the reconnect supervisor, the metrics exporter
+//! (W-C1), and the readiness probe.
 
-use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+use waav_segmented_stt::breaker::{Breaker, BreakerConfig, BreakerState};
 
 /// Observable state of a [`CircuitBreaker`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,9 +74,8 @@ impl CircuitState {
 }
 
 // Internal numeric encoding of the state for the atomic.
-const STATE_CLOSED: u8 = 0;
-const STATE_OPEN: u8 = 1;
-const STATE_HALF_OPEN: u8 = 2;
+/// The shortest a half-open probe may stay outstanding before the next caller probes instead.
+const MIN_PROBE_LEASE: Duration = Duration::from_secs(15);
 
 /// Configuration for a [`CircuitBreaker`].
 #[derive(Debug, Clone)]
@@ -150,12 +156,9 @@ pub struct CircuitBreakerSnapshot {
     pub error_rate: f64,
 }
 
-/// A lock-free, thread-safe circuit breaker.
+/// A thread-safe circuit breaker.
 ///
-/// Counters use a fixed sliding window of the most recent `window_size` outcomes. The
-/// window is approximated by halving both counters whenever their sum reaches
-/// `window_size` — this keeps the rate responsive to recent behaviour without storing a
-/// per-sample ring buffer, and keeps every operation O(1) and allocation-free.
+/// The window holds the most recent `window_size` outcomes exactly.
 ///
 /// If the breaker carries a `label` (set by [`CircuitBreaker::with_label`], which the
 /// [`crate::core::resilience::ResilienceRegistry`] uses to stamp the provider name on each
@@ -166,21 +169,15 @@ pub struct CircuitBreakerSnapshot {
 /// to emit the gauge: it is now a property of tripping the breaker itself.
 pub struct CircuitBreaker {
     config: CircuitBreakerConfig,
-    /// Encoded [`CircuitState`] (`STATE_*`).
-    state: AtomicU8,
-    successes: AtomicU32,
-    failures: AtomicU32,
-    /// Monotonic nanos at which the breaker last opened (start of cooldown).
-    opened_at_ns: AtomicU64,
-    /// Total number of times the breaker has tripped to Open (cumulative).
-    total_trips: AtomicU64,
+    /// The shared Closed/Open/HalfOpen state machine.
+    core: Breaker,
     /// D-G2: consecutive connections that died before `min_stable_duration`.
     quick_failures: AtomicU32,
     /// D-G2: monotonic nanos at which the FATAL state was last (re)entered —
     /// the start of the `fatal_cooldown` before a recovery probe is allowed.
     fatal_opened_at_ns: AtomicU64,
-    /// D-G2: sticky credentials-fatal flag — once set, `allow_request` is
-    /// false FOREVER (no half-open probe; backoff cannot fix bad creds).
+    /// D-G2: the credentials-fatal flag — while set, `allow_request` admits one recovery probe
+    /// per `fatal_cooldown` (backoff cannot fix bad creds).
     permanently_failed: std::sync::atomic::AtomicBool,
     /// Optional metrics label (the provider name). When set, every state transition publishes
     /// `waav_circuit_breaker_state{provider=<label>}` so the gauge tracks the breaker in
@@ -191,13 +188,16 @@ pub struct CircuitBreaker {
 impl CircuitBreaker {
     /// Create a breaker in the Closed state (no metrics label — stays silent on the gauge).
     pub fn new(config: CircuitBreakerConfig) -> Self {
+        let core = Breaker::new(BreakerConfig {
+            window: config.window_size.max(1) as usize,
+            min_requests: config.min_request_volume as usize,
+            failure_ratio: config.error_rate_threshold,
+            cooldown: config.cooldown,
+            probe_lease: config.cooldown.max(MIN_PROBE_LEASE),
+        });
         Self {
             config,
-            state: AtomicU8::new(STATE_CLOSED),
-            successes: AtomicU32::new(0),
-            failures: AtomicU32::new(0),
-            opened_at_ns: AtomicU64::new(0),
-            total_trips: AtomicU64::new(0),
+            core,
             quick_failures: AtomicU32::new(0),
             fatal_opened_at_ns: AtomicU64::new(0),
             permanently_failed: std::sync::atomic::AtomicBool::new(false),
@@ -230,10 +230,10 @@ impl CircuitBreaker {
     /// is the gate the supervisor actually consults. (Otherwise a metrics scrape could
     /// "use up" the half-open probe.)
     pub fn state(&self) -> CircuitState {
-        match self.state.load(Ordering::Acquire) {
-            STATE_OPEN => CircuitState::Open,
-            STATE_HALF_OPEN => CircuitState::HalfOpen,
-            _ => CircuitState::Closed,
+        match self.core.state() {
+            BreakerState::Open => CircuitState::Open,
+            BreakerState::HalfOpen => CircuitState::HalfOpen,
+            BreakerState::Closed => CircuitState::Closed,
         }
     }
 
@@ -242,8 +242,9 @@ impl CircuitBreaker {
     /// - Closed → always `true`.
     /// - Open → `false` until the cooldown elapses, then transitions to HalfOpen and
     ///   returns `true` exactly once (the probe). Concurrent callers race for the single
-    ///   probe via a CAS; losers see HalfOpen and are denied.
-    /// - HalfOpen → `false` (the single probe is already outstanding).
+    ///   probe; losers see HalfOpen and are denied.
+    /// - HalfOpen → `false` while the probe is outstanding; a probe that has reported nothing
+    ///   for its lease is replaced, so a lost probe cannot deny every caller until restart.
     pub fn allow_request(&self) -> bool {
         // D-G2 (review wc71hewlx #1): the FATAL state is RECOVERABLE, not
         // restart-only. It denies requests until `fatal_cooldown` elapses,
@@ -265,33 +266,7 @@ impl CircuitBreaker {
                 .compare_exchange(opened, now_ns(), Ordering::AcqRel, Ordering::Acquire)
                 .is_ok();
         }
-        match self.state.load(Ordering::Acquire) {
-            STATE_CLOSED => true,
-            STATE_HALF_OPEN => false,
-            _ /* STATE_OPEN */ => {
-                let opened = self.opened_at_ns.load(Ordering::Acquire);
-                let elapsed = now_ns().saturating_sub(opened);
-                if elapsed >= self.config.cooldown.as_nanos() as u64 {
-                    // Cooldown elapsed: try to claim the single probe slot.
-                    let claimed = self
-                        .state
-                        .compare_exchange(
-                            STATE_OPEN,
-                            STATE_HALF_OPEN,
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        )
-                        .is_ok();
-                    if claimed {
-                        // We transitioned Open → HalfOpen (probing): reflect it on the gauge.
-                        self.publish_state();
-                    }
-                    claimed
-                } else {
-                    false
-                }
-            }
-        }
+        self.observed(|core| core.allow())
     }
 
     /// Record a successful outcome.
@@ -299,12 +274,7 @@ impl CircuitBreaker {
     /// - HalfOpen → close the breaker and reset the window (recovery confirmed).
     /// - Closed → tally toward the window.
     pub fn record_success(&self) {
-        if self.state.load(Ordering::Acquire) == STATE_HALF_OPEN {
-            self.close_and_reset();
-            return;
-        }
-        self.successes.fetch_add(1, Ordering::AcqRel);
-        self.maybe_decay_window();
+        self.observed(|core| core.record_unscoped(Some(true)));
     }
 
     /// Record a failed outcome.
@@ -312,13 +282,14 @@ impl CircuitBreaker {
     /// - HalfOpen → re-open and restart the cooldown (probe failed).
     /// - Closed → tally toward the window and trip if the rate crosses the threshold.
     pub fn record_failure(&self) {
-        if self.state.load(Ordering::Acquire) == STATE_HALF_OPEN {
-            self.trip();
-            return;
-        }
-        self.failures.fetch_add(1, Ordering::AcqRel);
-        self.maybe_decay_window();
-        self.maybe_trip();
+        self.observed(|core| core.record_unscoped(Some(false)));
+    }
+
+    /// Record an outcome that says nothing about the upstream (the caller's own malformed
+    /// request): it is not counted, and a half-open probe that got it is abandoned so the next
+    /// caller probes, instead of the breaker staying half-open.
+    pub fn record_neutral(&self) {
+        self.observed(|core| core.record_unscoped(None));
     }
 
     /// D-G2: record a connection's lifetime at close. Sub-stable, NON-clean
@@ -362,7 +333,7 @@ impl CircuitBreaker {
                     self.config.min_stable_duration.as_secs(),
                 );
             }
-            self.trip();
+            self.observed(|core| core.force_open());
         }
     }
 
@@ -373,90 +344,53 @@ impl CircuitBreaker {
 
     /// Current failure rate over the window, `0.0` if there are no samples.
     pub fn error_rate(&self) -> f64 {
-        let s = self.successes.load(Ordering::Acquire) as f64;
-        let f = self.failures.load(Ordering::Acquire) as f64;
-        let total = s + f;
-        if total == 0.0 { 0.0 } else { f / total }
+        let (s, f) = self.core.counts();
+        if s + f == 0 {
+            0.0
+        } else {
+            f as f64 / (s + f) as f64
+        }
     }
 
     /// Total number of times the breaker has tripped to Open.
     pub fn total_trips(&self) -> u64 {
-        self.total_trips.load(Ordering::Relaxed)
+        self.core.total_trips()
     }
 
     /// A snapshot of the current counters.
     pub fn snapshot(&self) -> CircuitBreakerSnapshot {
+        let (successes, failures) = self.core.counts();
         CircuitBreakerSnapshot {
             state: self.state(),
-            successes: self.successes.load(Ordering::Relaxed),
-            failures: self.failures.load(Ordering::Relaxed),
-            total_trips: self.total_trips.load(Ordering::Relaxed),
+            successes: successes as u32,
+            failures: failures as u32,
+            total_trips: self.total_trips(),
             error_rate: self.error_rate(),
         }
     }
 
     /// Force the breaker back to Closed and clear the window (administrative reset).
     pub fn reset(&self) {
-        self.close_and_reset();
+        self.observed(|core| core.reset());
     }
 
     // --- internals -----------------------------------------------------------------
 
+    /// Run `op` on the state machine and publish the gauge if it changed the state.
+    fn observed<T>(&self, op: impl FnOnce(&Breaker) -> T) -> T {
+        let before = self.core.state();
+        let out = op(&self.core);
+        if self.core.state() != before {
+            self.publish_state();
+        }
+        out
+    }
+
     /// Publish this breaker's current state on the `waav_circuit_breaker_state{provider}` gauge,
-    /// if it carries a label. A no-op for anonymous breakers. Cheap and lock-free (one atomic
-    /// load + a gauge set); safe to call on every transition.
+    /// if it carries a label. A no-op for anonymous breakers.
     fn publish_state(&self) {
         if let Some(label) = self.label.as_deref() {
             crate::core::metrics::bridge::set_circuit_breaker_state(label, self.state().as_code());
-        }
-    }
-
-    fn close_and_reset(&self) {
-        self.successes.store(0, Ordering::Release);
-        self.failures.store(0, Ordering::Release);
-        let prev = self.state.swap(STATE_CLOSED, Ordering::AcqRel);
-        // Only re-publish on an actual transition into Closed (avoid spamming the gauge on every
-        // healthy success, which calls record_success → maybe_decay but not close_and_reset).
-        if prev != STATE_CLOSED {
-            self.publish_state();
-        }
-    }
-
-    fn trip(&self) {
-        let prev = self.state.swap(STATE_OPEN, Ordering::AcqRel);
-        self.opened_at_ns.store(now_ns(), Ordering::Release);
-        // Only count a trip / re-publish the gauge when we actually transition into Open from a
-        // non-Open state.
-        if prev != STATE_OPEN {
-            self.total_trips.fetch_add(1, Ordering::Relaxed);
-            self.publish_state();
-        }
-    }
-
-    fn maybe_trip(&self) {
-        let s = self.successes.load(Ordering::Acquire);
-        let f = self.failures.load(Ordering::Acquire);
-        let total = s + f;
-        if total < self.config.min_request_volume {
-            return;
-        }
-        let rate = f as f64 / total as f64;
-        if rate >= self.config.error_rate_threshold
-            && self.state.load(Ordering::Acquire) == STATE_CLOSED
-        {
-            self.trip();
-        }
-    }
-
-    /// Keep the counters bounded to roughly `window_size` recent samples by halving both
-    /// when their sum reaches the window size (exponential decay of old samples).
-    fn maybe_decay_window(&self) {
-        let s = self.successes.load(Ordering::Acquire);
-        let f = self.failures.load(Ordering::Acquire);
-        if s + f >= self.config.window_size {
-            // Halve both, preserving the ratio. Round so a lone failure isn't erased.
-            self.successes.store(s / 2, Ordering::Release);
-            self.failures.store(f.div_ceil(2), Ordering::Release);
         }
     }
 }
