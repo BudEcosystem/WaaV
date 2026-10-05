@@ -271,6 +271,8 @@ const TONE_AFTER: Duration = Duration::from_millis(1_200);
 /// How long the tone waits for a phrase's audio to start arriving before it stops waiting on it
 /// (synthesis failed, or produced nothing).
 const TONE_PHRASE_GRACE: Duration = Duration::from_millis(1_500);
+/// How long the output is quiet before a pulse, so the tone is heard apart from the phrase.
+const TONE_GAP: Duration = Duration::from_millis(400);
 
 /// The tool-call tone of one turn (D-16): a pulse every [`tone::PERIOD_MS`] while a tool runs,
 /// once the tool's phrase has played.
@@ -281,6 +283,8 @@ struct ToneCursor {
     spoke: Option<(Instant, u64)>,
     /// The audio-out counter at the previous check: audio still arriving holds the pulse back.
     last_out: u64,
+    /// Since when nothing has been arriving or playing.
+    quiet_since: Option<Instant>,
 }
 
 impl ToneCursor {
@@ -295,6 +299,7 @@ impl ToneCursor {
             next_at: None,
             spoke: None,
             last_out: speech.audio_out_ms(),
+            quiet_since: None,
         })
     }
 
@@ -303,12 +308,17 @@ impl ToneCursor {
         self.spoke = Some((Instant::now(), mark));
     }
 
-    /// Whether a pulse is due: its period has come round and the output is quiet, with what was
-    /// last said heard first (its audio arrived and played out, or never came).
+    /// Whether a pulse is due: its period has come round and the output has been quiet for
+    /// [`TONE_GAP`], with what was last said heard first (its audio arrived and played out, or
+    /// never came).
     fn due(&mut self, audio_out_ms: u64, playout_remaining_ms: u64) -> bool {
         let arriving = audio_out_ms != self.last_out;
         self.last_out = audio_out_ms;
         if arriving || playout_remaining_ms > 0 {
+            self.quiet_since = None;
+            return false;
+        }
+        if self.quiet_since.get_or_insert_with(Instant::now).elapsed() < TONE_GAP {
             return false;
         }
         if self.next_at.is_some_and(|at| Instant::now() < at) {
@@ -320,6 +330,7 @@ impl ToneCursor {
     fn played(&mut self, audio_out_ms: u64) {
         self.next_at = Some(Instant::now() + Duration::from_millis(tone::PERIOD_MS));
         self.last_out = audio_out_ms;
+        self.quiet_since = None;
     }
 }
 

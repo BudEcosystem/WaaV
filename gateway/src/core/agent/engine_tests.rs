@@ -890,8 +890,8 @@ async fn the_tone_follows_the_tool_phrase_until_the_tool_finishes() {
         "a pulse every period while the tool runs: {pulses:?}"
     );
     assert!(
-        pulses[0] >= Duration::from_millis(1_400),
-        "after the phrase: {pulses:?}"
+        pulses[0] >= Duration::from_millis(1_400) + super::TONE_GAP,
+        "after the phrase, and a pause: {pulses:?}"
     );
     assert!(
         pulses[2] < Duration::from_millis(5_500),
