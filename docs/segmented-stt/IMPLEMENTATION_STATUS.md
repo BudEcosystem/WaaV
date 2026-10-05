@@ -22,6 +22,36 @@ Branch `feat/segmented-stt` (WaaV) and the Bud-side commits on `claude/streaming
 | Bud: capability record and `GET /capabilities/stt` | `gateway/src/handlers/stt_capability.rs` |
 | budapp, budadmin, budplayground, chart | `services/budapp/budapp/endpoint_ops/{audio_config,voice_publisher,services,endpoint_routes}.py`, `services/budapp/budapp/prompt_ops/voice_agent.py`, `services/budadmin/src/pages/home/deployments/[slug]/settings/AudioSettings.tsx`, `services/budplayground/app/lib/realtime/client.ts`, `infra/charts/bud/values.yaml` |
 
+## Shared with the gateway
+
+The gateway already had file-upload code for `/v1/audio/transcriptions`, the batch API and the
+OpenAI, Groq and prerecorded clients. Where segmented sessions need the same thing, there is one copy
+in the `segmented-stt` crate, which the gateway depends on. Each caller keeps its own request fields
+and rules on top: live segments send minimal fields that can be dropped when a vendor refuses one,
+while the REST route still forwards files and returns the vendor's body.
+
+| Shared | Module | Used by |
+| --- | --- | --- |
+| WAV writer | `segmented-stt/src/wav.rs` | utterance uploads; the prerecorded, OpenAI, Groq and regional upload clients; the REST route |
+| Vendor hosts and keep-no-audio switches, Azure OpenAI URLs, request ids, rate-limit waits, error bodies | `segmented-stt/src/vendor/mod.rs` | both, plus the gateway's TTS error rendering |
+| OpenAI-format response types, URL join, Whisper prompt, upload file names | `segmented-stt/src/vendor/openai.rs` | segmented sessions, the OpenAI and Groq clients, the batch API |
+| Deepgram and ElevenLabs response readers, Deepgram key-terms parameter | `segmented-stt/src/vendor/{deepgram,elevenlabs}.rs` | segmented sessions, the prerecorded client, the batch API |
+| Public-address rule (SSRF) | `segmented-stt/src/net.rs` | upload pools, `core::net`, `utils::url_validation` |
+| Circuit-breaker state machine | `segmented-stt/src/breaker.rs` | upload breakers; the gateway's `CircuitBreaker` (streaming reconnects, the HTTP upload clients) |
+| Streaming resampler core | `segmented-stt/src/resample.rs` | the front end; the gateway's `StreamResampler` |
+
+Defects fixed while consolidating:
+- **AssemblyAI EU host:** an AssemblyAI deployment set to `stt.data_region: eu` sent segmented audio to the US host.
+- **Self-hosted redirects:** a self-hosted deployment's REST upload followed redirects with no address check.
+- **Stranded half-open probe:** a probe answered with the caller's 4xx, or never reported, left the gateway breaker half-open until restart.
+- **Groq retries:** Groq retried by matching text that its own messages never contained, so most 429s and 5xx were not retried.
+- **Deepgram key terms:** the batch API sent `keyterm` to every Deepgram model, but only Nova-3 reads it.
+- **OpenAI URL:** the OpenAI client posted to `/v1/v1` when its base ended in `/v1`; the batch API did the same.
+- **Batch upload label and language:** the batch API labelled every OpenAI upload `audio.wav`, and sent a source language to the translations route.
+- **Groq durations:** Groq's rate-limit durations (`2m59.56s`) were not parsed.
+- **Empty request-id header:** an empty request-id header stopped the lookup.
+- **Azure OpenAI URLs:** live calls built Azure OpenAI URLs with the deployment unencoded and an older default api-version than REST.
+
 ## Switches
 
 | Variable | Default | Effect |
