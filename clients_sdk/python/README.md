@@ -527,6 +527,21 @@ async with bud.talk.connect(
             player.play(event.audio)
 ```
 
+### Voice agents (Bud control plane)
+
+Name a Bud voice agent and it decides both speech legs, the voice and turn-taking. `stt`/`tts`
+may carry only the audio format; the gateway refuses a model on them.
+
+```python
+from bud_waav import VoiceAgentConfig
+
+async with bud.talk.connect(agent="support") as session:  # or VoiceAgentConfig(id="support", version=2)
+    ...
+```
+
+Under the Bud control plane, a conversation loop's `ConversationConfig` needs only `model` (a Bud
+chat deployment); leave `base_url` unset, since the gateway refuses one there.
+
 ---
 
 ## OpenAI Provider

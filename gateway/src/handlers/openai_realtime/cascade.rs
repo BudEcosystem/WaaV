@@ -144,6 +144,10 @@ pub enum ClientAct {
 struct UserItem {
     id: Option<String>,
     started_ms: u64,
+    /// `speech_stopped` and `committed` were sent (a segmented turn's detector ended it).
+    stopped: bool,
+    /// The transcript already sent as deltas (a segmented turn's text grows per segment).
+    shown: String,
 }
 
 #[derive(Debug)]
@@ -191,7 +195,32 @@ pub struct CascadeGa {
     items: HashMap<u64, String>,
     last_item_id: Option<String>,
     clock: std::time::Instant,
+    /// `ready.stt.transcription_mode` of the inner session, once it is ready.
+    stt_mode: Option<String>,
+    /// `bud.session.stt` and `bud.session.warning` (`WAAV_REALTIME_BUD_SESSION_EVENTS`, default on).
+    bud_events: bool,
+    stt_announced: bool,
 }
+
+/// `WAAV_REALTIME_BUD_SESSION_EVENTS`: anything but `off`, `false` or `0` keeps the Bud events on.
+fn bud_session_events_enabled() -> bool {
+    std::env::var("WAAV_REALTIME_BUD_SESSION_EVENTS")
+        .map(|v| {
+            !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "off" | "false" | "0"
+            )
+        })
+        .unwrap_or(true)
+}
+
+/// The `/ws` codes the gateway, not the caller, is responsible for.
+const SERVER_SIDE_STT_CODES: [&str; 4] = [
+    "stt_segmentation_unavailable",
+    "stt_overloaded",
+    "stt_unavailable",
+    "deployment_changed",
+];
 
 fn new_id(prefix: &str) -> String {
     format!("{prefix}_bud_{}", uuid::Uuid::new_v4().simple())
@@ -205,6 +234,15 @@ fn event(kind: &str, body: Value) -> String {
     m.insert("type".into(), Value::from(kind));
     m.insert("event_id".into(), Value::from(next_event_id()));
     Value::Object(m).to_string()
+}
+
+/// A `bud.*` event: `event_id` is `evt_bud_…`.
+fn bud_event(kind: &str, body: Value) -> String {
+    let mut v = json!({"type": kind, "event_id": next_event_id()});
+    if let (Some(o), Some(b)) = (v.as_object_mut(), body.as_object()) {
+        o.extend(b.clone());
+    }
+    v.to_string()
 }
 
 fn refuse(param: &str, message: &str, event_id: Option<&str>) -> String {
@@ -243,6 +281,7 @@ fn error_kind(code: &str) -> &'static str {
         | "server_shutdown"
         | "session_limit"
         | "idle_timeout" => "server_error",
+        c if SERVER_SIDE_STT_CODES.contains(&c) => "server_error",
         _ => "invalid_request_error",
     }
 }
@@ -275,7 +314,29 @@ impl CascadeGa {
             items: HashMap::new(),
             last_item_id: None,
             clock: std::time::Instant::now(),
+            stt_mode: None,
+            bud_events: bud_session_events_enabled(),
+            stt_announced: false,
         }
+    }
+
+    pub fn set_bud_session_events(&mut self, on: bool) {
+        self.bud_events = on;
+    }
+
+    pub fn is_manual(&self) -> bool {
+        self.manual
+    }
+
+    /// The inner session's turns are the gateway's: its detector times speech and its text grows
+    /// per uploaded segment.
+    fn segmented(&self) -> bool {
+        self.stt_mode.as_deref() == Some("segmented")
+    }
+
+    /// A model whose client buffers until the client commits: only a manual turn can end.
+    fn buffered(&self) -> bool {
+        self.stt_mode.as_deref() == Some("buffered")
     }
 
     pub fn is_started(&self) -> bool {
@@ -619,7 +680,14 @@ impl CascadeGa {
             if let Some(input) = audio.get("input").and_then(Value::as_object) {
                 if let Some(td) = input.get("turn_detection") {
                     let manual = td.is_null();
-                    if manual != self.manual {
+                    if self.manual && !manual && self.buffered() {
+                        out.push(gateway_error(
+                            "stt_live_unsupported",
+                            "This agent's speech-to-text model returns text only when the audio buffer is committed, so the gateway cannot detect turns on it. The session stays in manual mode.",
+                            Some("session.audio.input.turn_detection"),
+                            eid,
+                        ));
+                    } else if manual != self.manual {
                         self.manual = manual;
                         acts.push(ClientAct::Manual(manual));
                     }
@@ -774,11 +842,17 @@ impl CascadeGa {
     // ---------------------------------------------------------------------------------------
 
     fn user_item(&mut self, out: &mut Vec<String>) -> String {
+        let now = self.clock.elapsed().as_millis() as u64;
+        self.user_item_at(now, out)
+    }
+
+    fn user_item_at(&mut self, audio_start_ms: u64, out: &mut Vec<String>) -> String {
         if let Some(id) = &self.user.id {
             return id.clone();
         }
         let id = new_id("item");
-        self.user.started_ms = self.clock.elapsed().as_millis() as u64;
+        self.user = UserItem::default();
+        self.user.started_ms = audio_start_ms;
         let item = json!({"id": id, "object": "realtime.item", "type": "message", "role": "user",
                           "status": "in_progress", "content": [{"type": "input_audio", "transcript": Value::Null}]});
         out.push(event(
@@ -794,19 +868,72 @@ impl CascadeGa {
         id
     }
 
-    fn close_user(&mut self, transcript: &str, out: &mut Vec<String>) {
-        let Some(id) = self.user.id.take() else {
+    /// `speech_stopped` and `committed` for the open user item, once.
+    fn stop_user(&mut self, audio_end_ms: Option<u64>, out: &mut Vec<String>) {
+        let Some(id) = self.user.id.clone().filter(|_| !self.user.stopped) else {
             return;
         };
-        let now = self.clock.elapsed().as_millis() as u64;
+        self.user.stopped = true;
+        let end = audio_end_ms.unwrap_or_else(|| self.clock.elapsed().as_millis() as u64);
         out.push(event(
             "input_audio_buffer.speech_stopped",
-            json!({"audio_end_ms": now, "item_id": id}),
+            json!({"audio_end_ms": end, "item_id": id}),
         ));
         out.push(event(
             "input_audio_buffer.committed",
             json!({"previous_item_id": Value::Null, "item_id": id}),
         ));
+    }
+
+    /// A segmented turn's text so far: the part not yet shown, when the text only grew.
+    fn grow_user(&mut self, text: &str, out: &mut Vec<String>) {
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        let item = self.user_item(out);
+        if let Some(delta) = text
+            .strip_prefix(self.user.shown.as_str())
+            .filter(|d| !d.is_empty())
+        {
+            out.push(event(
+                "conversation.item.input_audio_transcription.delta",
+                json!({"item_id": item, "content_index": 0, "delta": delta}),
+            ));
+            self.user.shown = text.to_string();
+        }
+    }
+
+    /// The open user item's transcription failed: `…transcription.failed` (the item stays open
+    /// unless `close`).
+    fn fail_user(&mut self, code: &str, message: &str, close: bool, out: &mut Vec<String>) {
+        let Some(id) = self.user.id.clone() else {
+            return;
+        };
+        if close {
+            self.stop_user(None, out);
+        }
+        out.push(event(
+            "conversation.item.input_audio_transcription.failed",
+            json!({"item_id": id, "content_index": 0,
+                   "error": {"type": "transcription_error", "code": code, "message": message, "param": Value::Null}}),
+        ));
+        if close {
+            self.user.id = None;
+            let item = json!({"id": id, "object": "realtime.item", "type": "message", "role": "user",
+                              "status": "incomplete", "content": [{"type": "input_audio", "transcript": Value::Null}]});
+            out.push(event("conversation.item.done", json!({"item": item})));
+        }
+    }
+
+    fn close_user(&mut self, transcript: &str, out: &mut Vec<String>) {
+        if self.user.id.is_none() {
+            return;
+        }
+        self.stop_user(None, out);
+        let Some(id) = self.user.id.take() else {
+            return;
+        };
         out.push(event(
             "conversation.item.input_audio_transcription.completed",
             json!({"item_id": id, "content_index": 0, "transcript": transcript}),
@@ -960,6 +1087,9 @@ impl CascadeGa {
     pub fn core(&mut self, msg: &OutgoingMessage) -> Vec<String> {
         let mut out = Vec::new();
         match msg {
+            OutgoingMessage::STTResult { transcript, .. } if self.segmented() => {
+                self.grow_user(transcript, &mut out);
+            }
             OutgoingMessage::STTResult {
                 transcript,
                 is_final,
@@ -1128,6 +1258,86 @@ impl CascadeGa {
                     None,
                 ));
             }
+            OutgoingMessage::CodedError { message, code, .. } => {
+                let text = message
+                    .strip_prefix(code.as_str())
+                    .and_then(|t| t.strip_prefix(": "))
+                    .unwrap_or(message);
+                out.push(super::policy::error_event(
+                    &next_event_id(),
+                    error_kind(code),
+                    code,
+                    text,
+                    None,
+                    None,
+                ));
+            }
+            OutgoingMessage::Ready { stt: Some(stt), .. } => {
+                self.stt_mode = stt
+                    .get("transcription_mode")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                if self.segmented() && self.bud_events && !self.stt_announced {
+                    self.stt_announced = true;
+                    out.push(bud_event("bud.session.stt", json!({"stt": stt})));
+                }
+            }
+            OutgoingMessage::SttWarning {
+                code,
+                message,
+                detail,
+            } if code == "stt_segment_failed" && self.segmented() && self.user.id.is_some() => {
+                let _ = detail;
+                self.fail_user(code, message, false, &mut out);
+            }
+            OutgoingMessage::SttWarning {
+                code,
+                message,
+                detail,
+            }
+            | OutgoingMessage::ConfigWarning {
+                code,
+                message,
+                detail,
+            } => {
+                if code.starts_with("stt_")
+                    && code != "stt_buffered_until_commit"
+                    && self.bud_events
+                {
+                    out.push(bud_event(
+                        "bud.session.warning",
+                        json!({"code": code, "message": message, "detail": detail.clone().unwrap_or_else(|| json!({}))}),
+                    ));
+                } else if code == "stt_buffered_until_commit" {
+                    debug!(session = %self.session_id, "speech-to-text text arrives at each commit");
+                }
+            }
+            OutgoingMessage::VadEvent {
+                event: kind,
+                audio_ms,
+                had_transcript,
+                reason,
+                ..
+            } if self.segmented() => match kind.as_str() {
+                "turn_start" => {
+                    let at = audio_ms.unwrap_or_else(|| self.clock.elapsed().as_millis() as u64);
+                    self.user_item_at(at, &mut out);
+                }
+                "turn_end" => self.stop_user(*audio_ms, &mut out),
+                "turn_closed" if *had_transcript == Some(false) && self.user.id.is_some() => {
+                    if reason.as_deref() == Some("transcription_failed") {
+                        self.fail_user(
+                            "transcription_failed",
+                            "The caller's speech in this turn could not be transcribed.",
+                            true,
+                            &mut out,
+                        );
+                    } else {
+                        self.close_user("", &mut out);
+                    }
+                }
+                _ => {}
+            },
             OutgoingMessage::Authenticated { .. } => {
                 out.push(event("bud.session.authenticated", json!({})));
             }
@@ -1304,6 +1514,8 @@ async fn start_core(
 ) -> bool {
     ga.mark_started();
     let (agent, stt, tts) = ga.core_config();
+    // The resolver judges the session by the turn mode the client chose, not the agent's default.
+    conn.write().await.agent_manual = Some(ga.manual);
     let keep = crate::handlers::ws::config_handler::handle_config_message(
         Some(ga.session_id.clone()),
         Some(true),
@@ -1351,13 +1563,7 @@ async fn apply(
             crate::handlers::ws::audio_handler::handle_audio_message(pcm, conn, core_tx).await;
         }
         ClientAct::Commit => {
-            let _ = crate::handlers::ws::audio_handler::handle_audio_end(conn, core_tx).await;
-            if let Some(engine) = engine {
-                tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_millis(300)).await;
-                    engine.commit_input().await;
-                });
-            }
+            crate::handlers::ws::processor::commit_client_audio(conn, core_tx, true).await;
         }
         ClientAct::Clear => {
             if let Some(engine) = engine {

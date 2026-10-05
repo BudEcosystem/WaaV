@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 from ..types import (
     STTConfig, TTSConfig, STTResult, AudioEvent, FeatureFlags, AudioFeatures,
-    DAGConfig, ConversationConfig,
+    DAGConfig, ConversationConfig, ReadySTT, SttWarning, VadEvent, VoiceAgentConfig,
 )
 from ..ws.session import (
     WebSocketSession,
@@ -64,8 +64,8 @@ class TalkEvent:
     """
 
     type: str
-    """Event type: transcript, bot_text, audio, warning, message, error,
-    playback_complete, turn_completed, vad_event, audio_end."""
+    """Event type: transcript, bot_text, audio, warning, stt_warning, message,
+    error, playback_complete, turn_completed, vad_event, audio_end."""
 
     transcript: Optional[STTResult] = None
     """Transcript result (if type is 'transcript' or 'bot_text')."""
@@ -83,7 +83,16 @@ class TalkEvent:
     """Typed gateway advisory (if type is 'warning')."""
 
     data: Optional[dict[str, Any]] = None
-    """Raw data payload (for turn_completed, vad_event, audio_end, warning)."""
+    """Raw data payload (for turn_completed, vad_event, audio_end, warning,
+    stt_warning)."""
+
+    stt_warning: Optional[SttWarning] = None
+    """Typed mid-call speech-to-text warning (if type is 'stt_warning'). Never an
+    error: the call goes on."""
+
+    vad: Optional[VadEvent] = None
+    """Typed gateway speech event (if type is 'vad_event'); ``data`` keeps the raw
+    frame."""
 
     @property
     def text(self) -> Optional[str]:
@@ -121,6 +130,7 @@ class BudTalk:
         conversation_config: Optional[ConversationConfig] = None,
         stream_id: Optional[str] = None,
         alias: Optional[str] = None,
+        agent: Optional[Union[VoiceAgentConfig, str]] = None,
     ) -> "TalkSession":
         """
         Create a Talk session.
@@ -134,6 +144,8 @@ class BudTalk:
             audio_features: Audio features (turn detection, noise filter, VAD)
             dag_config: DAG routing configuration
             stream_id: Optional stream ID for session tracking
+            agent: A Bud voice agent (spec 025), by name or ``VoiceAgentConfig``. It decides both
+                speech legs; ``stt``/``tts`` then carry only the audio format.
 
         Returns:
             Talk session
@@ -193,6 +205,7 @@ class BudTalk:
             conversation_config=conversation_config,
             stream_id=stream_id,
             alias=alias,
+            agent=agent,
         )
 
     async def connect(
@@ -207,6 +220,7 @@ class BudTalk:
         conversation_config: Optional[ConversationConfig] = None,
         stream_id: Optional[str] = None,
         alias: Optional[str] = None,
+        agent: Optional[Union[VoiceAgentConfig, str]] = None,
     ) -> "TalkSession":
         """
         Create and connect a Talk session.
@@ -235,6 +249,7 @@ class BudTalk:
             conversation_config=conversation_config,
             stream_id=stream_id,
             alias=alias,
+            agent=agent,
         )
         await session.connect()
         return session
@@ -257,6 +272,7 @@ class TalkSession:
         conversation_config: Optional[ConversationConfig] = None,
         stream_id: Optional[str] = None,
         alias: Optional[str] = None,
+        agent: Optional[Union[VoiceAgentConfig, str]] = None,
     ):
         """
         Initialize Talk session.
@@ -290,6 +306,7 @@ class TalkSession:
             conversation_config=conversation_config,
             stream_id=stream_id,
             alias=alias,
+            agent=agent,
         )
 
         self._event_handlers: dict[str, list[Callable[..., Any]]] = {}
@@ -304,6 +321,7 @@ class TalkSession:
         self._session.on("vad_event", self._on_vad_event)
         self._session.on("audio_end", self._on_audio_end)
         self._session.on("config_warning", self._on_config_warning)
+        self._session.on("stt_warning", self._on_stt_warning)
 
     def _on_transcript(self, result: STTResult) -> None:
         """Handle transcript events (the user's speech)."""
@@ -321,6 +339,17 @@ class TalkSession:
         warning = ConfigWarning.from_wire(data)
         event = TalkEvent(type="warning", warning=warning, data=data)
         self._emit("warning", warning)
+        self._emit("event", event)
+
+    def _on_stt_warning(self, data: dict[str, Any]) -> None:
+        """Surface a gateway ``stt_warning`` as a typed :class:`SttWarning`.
+
+        A speech-to-text problem in the middle of a call (a lost segment, dropped
+        audio, rate limiting). Never routed to ``error``: the call goes on.
+        """
+        warning = SttWarning.from_wire(data)
+        event = TalkEvent(type="stt_warning", stt_warning=warning, data=data)
+        self._emit("stt_warning", warning)
         self._emit("event", event)
 
     def _on_audio(self, audio: AudioEvent) -> None:
@@ -354,8 +383,13 @@ class TalkSession:
         self._emit("event", event)
 
     def _on_vad_event(self, data: dict[str, Any]) -> None:
-        """Handle VAD events (speech_start/speech_end)."""
-        event = TalkEvent(type="vad_event", data=data)
+        """Handle gateway speech events (speech_start/speech_end, turn_start/turn_end/turn_closed).
+
+        The ``vad_event`` callback keeps its raw-dict payload; the unified ``event``
+        carries the typed :class:`VadEvent` too.
+        """
+        vad = VadEvent.from_wire(data) if isinstance(data, dict) else None
+        event = TalkEvent(type="vad_event", data=data, vad=vad)
         self._emit("vad_event", data)
         self._emit("event", event)
 
@@ -383,6 +417,11 @@ class TalkSession:
     def stream_id(self) -> Optional[str]:
         """Get the stream ID."""
         return self._session.stream_id
+
+    @property
+    def stt(self) -> Optional[ReadySTT]:
+        """What speech-to-text this session got (``ready.stt``); ``None`` when not reported."""
+        return self._session.stt
 
     def on(self, event: str, handler: Callable[..., Any]) -> None:
         """
@@ -514,7 +553,15 @@ class TalkSession:
             elif msg_type == "turn_completed":
                 yield TalkEvent(type="turn_completed", data=message.get("data"))
             elif msg_type == "vad_event":
-                yield TalkEvent(type="vad_event", data=message.get("data"))
+                data = message.get("data")
+                yield TalkEvent(
+                    type="vad_event",
+                    data=data,
+                    vad=VadEvent.from_wire(data) if isinstance(data, dict) else None,
+                )
+            elif msg_type == "stt_warning":
+                data = message.get("data") or {}
+                yield TalkEvent(type="stt_warning", stt_warning=SttWarning.from_wire(data), data=data)
             elif msg_type == "audio_end":
                 yield TalkEvent(type="audio_end", data=message.get("data"))
 

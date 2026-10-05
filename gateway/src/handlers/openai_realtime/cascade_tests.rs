@@ -540,3 +540,375 @@ fn only_prompt_models_are_agents() {
     assert!(is_agent_model("prompt:support"));
     assert!(!is_agent_model("gpt-realtime"));
 }
+
+// ---------------------------------------------------------------------------------------------
+// Segmented speech-to-text on the Realtime surface (customer contract §3)
+// ---------------------------------------------------------------------------------------------
+
+fn ready(stt: Option<Value>) -> OutgoingMessage {
+    OutgoingMessage::Ready {
+        protocol_version: crate::handlers::ws::messages::PROTOCOL_VERSION.to_string(),
+        stt: stt.map(Box::new),
+        stream_id: "s".into(),
+        livekit_room_name: None,
+        livekit_url: None,
+        waav_participant_identity: None,
+        waav_participant_name: None,
+        resolved_alias: None,
+        audio_in_codec: None,
+        audio_out_codec: None,
+    }
+}
+
+fn segmented_ready() -> OutgoingMessage {
+    ready(Some(json!({"provider": "elevenlabs", "model": "scribe_v2",
+        "transcription_mode": "segmented", "interim_results": "per_segment"})))
+}
+
+fn vad(event: &str, turn: u64) -> OutgoingMessage {
+    OutgoingMessage::VadEvent {
+        event: event.into(),
+        turn_id: turn,
+        audio_ms: Some(1_200),
+        sustained_ms: None,
+        discarded: None,
+        had_transcript: None,
+        reason: None,
+    }
+}
+
+fn closed(turn: u64, reason: &str) -> OutgoingMessage {
+    OutgoingMessage::VadEvent {
+        event: "turn_closed".into(),
+        turn_id: turn,
+        audio_ms: None,
+        sustained_ms: None,
+        discarded: None,
+        had_transcript: Some(false),
+        reason: Some(reason.into()),
+    }
+}
+
+fn stt(text: &str, fin: bool) -> OutgoingMessage {
+    OutgoingMessage::STTResult {
+        transcript: text.into(),
+        is_final: fin,
+        is_speech_final: fin,
+        confidence: 0.9,
+        segment_transcript: None,
+        translations: vec![],
+    }
+}
+
+#[test]
+fn ready_stt_becomes_one_bud_session_stt_event_on_a_gateway_endpointed_session() {
+    let mut s = ga(json!({}));
+    let evs = parse(&s.core(&segmented_ready()));
+    assert_eq!(evs.len(), 1);
+    assert_eq!(evs[0]["type"], "bud.session.stt");
+    assert_eq!(evs[0]["stt"]["transcription_mode"], "segmented");
+    assert!(evs[0]["event_id"].as_str().unwrap().starts_with("evt_bud_"));
+    assert!(s.core(&segmented_ready()).is_empty(), "sent once");
+
+    for other in [
+        None,
+        Some(json!({"provider": "deepgram", "transcription_mode": "streaming"})),
+        Some(json!({"provider": "openai", "transcription_mode": "buffered"})),
+    ] {
+        let mut s = ga(json!({}));
+        assert!(
+            s.core(&ready(other)).is_empty(),
+            "a streaming or buffered session gets no new event"
+        );
+    }
+}
+
+#[test]
+fn bud_session_events_can_be_switched_off() {
+    let mut s = ga(json!({}));
+    s.set_bud_session_events(false);
+    assert!(s.core(&segmented_ready()).is_empty());
+    assert!(
+        s.core(&OutgoingMessage::SttWarning {
+            code: "stt_language_unset".into(),
+            message: "m".into(),
+            detail: None,
+        })
+        .is_empty()
+    );
+}
+
+#[test]
+fn stt_warnings_become_bud_session_warnings_except_buffered_until_commit() {
+    let mut s = ga(json!({}));
+    let evs = parse(&s.core(&OutgoingMessage::ConfigWarning {
+        code: "stt_segmented_mode".into(),
+        message: "segmented".into(),
+        detail: Some(json!({"model": "scribe_v2"})),
+    }));
+    assert_eq!(
+        evs[0],
+        json!({"type": "bud.session.warning", "event_id": evs[0]["event_id"], "code": "stt_segmented_mode",
+               "message": "segmented", "detail": {"model": "scribe_v2"}})
+    );
+    let evs = parse(&s.core(&OutgoingMessage::SttWarning {
+        code: "stt_language_unset".into(),
+        message: "no language".into(),
+        detail: None,
+    }));
+    assert_eq!(evs[0]["code"], "stt_language_unset");
+    assert_eq!(evs[0]["detail"], json!({}));
+    assert!(
+        s.core(&OutgoingMessage::ConfigWarning {
+            code: "stt_buffered_until_commit".into(),
+            message: "m".into(),
+            detail: None,
+        })
+        .is_empty(),
+        "logged only"
+    );
+    assert!(
+        s.core(&OutgoingMessage::ConfigWarning {
+            code: "reasoning_model_on_voice_path".into(),
+            message: "m".into(),
+            detail: None,
+        })
+        .is_empty(),
+        "not a speech-to-text warning"
+    );
+}
+
+/// Finding 4: the turn's text arrives per returned segment, as deltas that add up to the transcript;
+/// speech start and stop are the detector's, not the transcript's.
+#[test]
+fn a_segmented_turn_is_timed_by_the_detector_and_streams_its_text_as_deltas() {
+    let mut s = ga(json!({}));
+    s.core(&segmented_ready());
+    let mut all = Vec::new();
+    let opened = s.core(&vad("turn_start", 1));
+    assert_eq!(
+        types(&opened),
+        vec![
+            "conversation.item.added",
+            "input_audio_buffer.speech_started"
+        ]
+    );
+    assert_eq!(parse(&opened)[1]["audio_start_ms"], 1_200);
+    all.extend(opened);
+    all.extend(s.core(&vad("speech_end", 1)));
+    all.extend(s.core(&stt("where is", false)));
+    all.extend(s.core(&stt("where is my order", false)));
+    let ended = s.core(&vad("turn_end", 1));
+    assert_eq!(
+        types(&ended),
+        vec![
+            "input_audio_buffer.speech_stopped",
+            "input_audio_buffer.committed"
+        ]
+    );
+    all.extend(ended);
+    all.extend(s.core(&stt("where is my order today", true)));
+    all.extend(s.core(&OutgoingMessage::AgentResponseStarted {
+        turn_index: 0,
+        kind: "agent".into(),
+        input: Some("where is my order today".into()),
+    }));
+    let evs = parse(&all);
+    let deltas: Vec<&str> = evs
+        .iter()
+        .filter(|e| e["type"] == "conversation.item.input_audio_transcription.delta")
+        .map(|e| e["delta"].as_str().unwrap())
+        .collect();
+    assert_eq!(deltas, vec!["where is", " my order", " today"]);
+    assert_eq!(deltas.concat(), "where is my order today");
+    for kind in [
+        "input_audio_buffer.speech_started",
+        "input_audio_buffer.speech_stopped",
+        "input_audio_buffer.committed",
+        "conversation.item.input_audio_transcription.completed",
+        "conversation.item.done",
+    ] {
+        assert_eq!(
+            evs.iter().filter(|e| e["type"] == kind).count(),
+            1,
+            "{kind} once"
+        );
+    }
+    let ids: std::collections::HashSet<_> = evs
+        .iter()
+        .filter_map(|e| e.get("item_id").and_then(Value::as_str))
+        .collect();
+    assert_eq!(ids.len(), 1, "one user item");
+    assert_eq!(*types(&all).last().unwrap(), "response.created");
+}
+
+/// A rewritten interim (a seam repaired) cannot be a delta; the completed transcript stays whole.
+#[test]
+fn a_rewritten_turn_text_sends_no_wrong_delta() {
+    let mut s = ga(json!({}));
+    s.core(&segmented_ready());
+    s.core(&vad("turn_start", 1));
+    s.core(&stt("for the the", false));
+    let evs = parse(&s.core(&stt("for the order", true)));
+    assert!(
+        evs.iter()
+            .all(|e| e["type"] != "conversation.item.input_audio_transcription.delta")
+    );
+    let evs = parse(&s.core(&OutgoingMessage::AgentResponseStarted {
+        turn_index: 0,
+        kind: "agent".into(),
+        input: Some("for the order".into()),
+    }));
+    let done = evs
+        .iter()
+        .find(|e| e["type"] == "conversation.item.input_audio_transcription.completed")
+        .unwrap();
+    assert_eq!(done["transcript"], "for the order");
+}
+
+#[test]
+fn a_turn_closed_without_text_closes_the_open_item() {
+    let mut s = ga(json!({}));
+    s.core(&segmented_ready());
+    s.core(&vad("turn_start", 1));
+    let evs = parse(&s.core(&closed(1, "transcription_failed")));
+    let kinds: Vec<_> = evs.iter().map(|e| e["type"].as_str().unwrap()).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            "input_audio_buffer.speech_stopped",
+            "input_audio_buffer.committed",
+            "conversation.item.input_audio_transcription.failed",
+            "conversation.item.done",
+        ]
+    );
+    assert_eq!(evs[2]["error"]["code"], "transcription_failed");
+    assert_eq!(evs[2]["error"]["type"], "transcription_error");
+
+    s.core(&vad("turn_start", 2));
+    s.core(&vad("turn_end", 2));
+    let evs = parse(&s.core(&closed(2, "no_speech")));
+    let kinds: Vec<_> = evs.iter().map(|e| e["type"].as_str().unwrap()).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            "conversation.item.input_audio_transcription.completed",
+            "conversation.item.done",
+        ]
+    );
+    assert_eq!(evs[0]["transcript"], "");
+    assert!(s.core(&closed(3, "no_speech")).is_empty(), "no item open");
+}
+
+#[test]
+fn a_lost_segment_fails_the_open_item_else_warns() {
+    let mut s = ga(json!({}));
+    s.core(&segmented_ready());
+    let lost = OutgoingMessage::SttWarning {
+        code: "stt_segment_failed".into(),
+        message: "a segment was lost".into(),
+        detail: Some(json!({"class": "timeout"})),
+    };
+    let evs = parse(&s.core(&lost));
+    assert_eq!(evs[0]["type"], "bud.session.warning");
+    s.core(&vad("turn_start", 1));
+    let evs = parse(&s.core(&lost));
+    assert_eq!(
+        evs[0]["type"],
+        "conversation.item.input_audio_transcription.failed"
+    );
+    assert_eq!(evs[0]["error"]["code"], "stt_segment_failed");
+    assert_eq!(evs[0]["error"]["message"], "a segment was lost");
+}
+
+#[test]
+fn a_streaming_session_keeps_todays_events() {
+    let mut s = ga(json!({}));
+    s.core(&ready(Some(
+        json!({"provider": "deepgram", "transcription_mode": "streaming"}),
+    )));
+    assert!(s.core(&vad("turn_start", 1)).is_empty());
+    let evs = parse(&s.core(&stt("hello", false)));
+    assert_eq!(
+        evs.iter()
+            .map(|e| e["type"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec![
+            "conversation.item.added",
+            "input_audio_buffer.speech_started"
+        ]
+    );
+    let evs = parse(&s.core(&stt("hello there", true)));
+    assert_eq!(evs[0]["delta"], "hello there ");
+}
+
+#[test]
+fn server_side_speech_codes_are_server_errors() {
+    let mut s = ga(json!({}));
+    for code in [
+        "stt_segmentation_unavailable",
+        "stt_overloaded",
+        "stt_unavailable",
+        "deployment_changed",
+    ] {
+        let e = parse(&s.core(&OutgoingMessage::CodedError {
+            message: format!("{code}: gone"),
+            code: code.into(),
+            recoverable: false,
+            details: None,
+        }));
+        assert_eq!(e[0]["error"]["code"], code);
+        assert_eq!(e[0]["error"]["type"], "server_error");
+        assert_eq!(e[0]["error"]["message"], "gone");
+    }
+    let e = parse(&s.core(&OutgoingMessage::CodedError {
+        message: "stt_live_unsupported: no".into(),
+        code: "stt_live_unsupported".into(),
+        recoverable: true,
+        details: None,
+    }));
+    assert_eq!(e[0]["error"]["type"], "invalid_request_error");
+}
+
+#[test]
+fn turning_turn_detection_on_is_refused_on_a_buffering_model() {
+    let mut s = ga(json!({"turn_detection": {"type": "manual"}}));
+    s.mark_started();
+    s.core(&ready(Some(
+        json!({"provider": "openai", "transcription_mode": "buffered"}),
+    )));
+    let update = json!({"type": "session.update", "event_id": "e9", "session": {"type": "realtime",
+        "audio": {"input": {"turn_detection": {"type": "server_vad"}}}}})
+    .to_string();
+    let (events, acts) = s.client(&update);
+    let evs = parse(&events);
+    let refusal = evs.iter().find(|e| e["type"] == "error").unwrap();
+    assert_eq!(refusal["error"]["code"], "stt_live_unsupported");
+    assert_eq!(
+        refusal["error"]["param"],
+        "session.audio.input.turn_detection"
+    );
+    assert!(
+        !acts.iter().any(|a| matches!(a, ClientAct::Manual(false))),
+        "the session stays manual"
+    );
+    assert!(reported_turn_detection(&s).is_null());
+
+    let mut s = ga(json!({"turn_detection": {"type": "manual"}}));
+    s.mark_started();
+    s.core(&segmented_ready());
+    let (_, acts) = s.client(&update);
+    assert!(acts.iter().any(|a| matches!(a, ClientAct::Manual(false))));
+}
+
+#[test]
+fn the_manual_flag_reaches_the_session_before_it_starts() {
+    let mut s = ga(json!({}));
+    let (_, acts) = s.client(
+        &json!({"type": "session.update", "session": {"type": "realtime",
+            "audio": {"input": {"turn_detection": null}}}})
+        .to_string(),
+    );
+    assert!(acts.iter().any(|a| matches!(a, ClientAct::Manual(true))));
+    assert!(s.is_manual());
+}

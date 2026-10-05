@@ -1,0 +1,2550 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:waav:schema:stt-capabilities:v2",
+  "title": "WaaV STT live capability map (schema v2)",
+  "description": "The table, keyed by provider and model, that says how the gateway can reach a speech-to-text model during a live call. This document describes the assembled map. The source files are one $defs/provider_file per provider under rows/ and one $defs/profiles object in profiles.json; validate_rows.py checks them and the rules that span files.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "map_version",
+    "map_revision",
+    "release",
+    "latency_classes",
+    "providers",
+    "rows"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 2,
+      "description": "Version of this schema."
+    },
+    "map_version": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}(\\.[0-9]+)?$",
+      "description": "Display string of the map's content: a date and an optional counter."
+    },
+    "map_revision": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Increases with every change to any map file. Revisions are compared as integers; map_version is for people."
+    },
+    "release": {
+      "$ref": "#/$defs/release_number",
+      "description": "The release this copy of the map ships with (0 Groundwork and honest refusal, 1 First working calls, 2 Dark launch complete, 3 Default on, 4 Live-only models and low latency, 5 Wider vendor coverage and hardening, 6 Interruption recovery and interim text). A transport is enabled when its enabled_from_release is not null and is at most this value. The expected resolution table of a release is computed by setting this value."
+    },
+    "latency_classes": {
+      "description": "Upper bounds (ms, inclusive) on the seed 99th percentile for each class. 'slow' is everything above 'fast'.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "realtime_max_ms",
+        "fast_max_ms"
+      ],
+      "properties": {
+        "realtime_max_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Largest 99th percentile, end of speech to final transcript, that is still labelled realtime (600)."
+        },
+        "fast_max_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Largest 99th percentile that is still labelled fast (1200)."
+        }
+      }
+    },
+    "sdk_placeholder_models": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true,
+      "description": "Model strings a software development kit sends for every provider when the customer named no model (the Python kit sends nova-3). Used only by providers that set key_normalisation.placeholder_as_unset."
+    },
+    "profiles": {
+      "$ref": "#/$defs/profiles"
+    },
+    "providers": {
+      "type": "object",
+      "propertyNames": {
+        "pattern": "^[a-z0-9][a-z0-9_-]*$"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/provider"
+      },
+      "description": "One entry per canonical provider id. Every row's provider must exist here, except the '*' of the one global default row."
+    },
+    "rows": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/row"
+      },
+      "description": "Every row of every provider, plus the one global default row."
+    }
+  },
+  "$defs": {
+    "date": {
+      "description": "Calendar date, YYYY-MM-DD.",
+      "type": "string",
+      "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$"
+    },
+    "release_number": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 6,
+      "description": "One of the seven releases of the plan, 0 to 6."
+    },
+    "provider_id": {
+      "description": "Canonical provider id, lowercase. '*' stands for the global default.",
+      "type": "string",
+      "pattern": "^(\\*|[a-z0-9][a-z0-9_-]*)$"
+    },
+    "profile_name": {
+      "description": "Name of a profile: lowercase words joined by hyphens.",
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]*$"
+    },
+    "row_id": {
+      "description": "'<provider>:<key>'. The provider part is the canonical provider id ('global' for the global default row). The key is at most 64 characters of lowercase letters, digits, '.', '_' and '-'. CONVERSION_RULES.md gives the rule that derives the first value from match.",
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_-]*:[a-z0-9][a-z0-9._-]{0,63}$"
+    },
+    "adapter_id": {
+      "description": "The closed list of adapter ids. native: today's client, built by create_stt_standard, unchanged. The next twelve are transcribers and commit-socket clients the plan builds. planned_stream, planned_commit and planned_file mark a vendor interface that no release builds a client for; such a transport is never enabled and dialect.wire names the interface.",
+      "enum": [
+        "native",
+        "openai_transcriptions",
+        "groq_transcriptions",
+        "azure_openai_transcriptions",
+        "elevenlabs_batch",
+        "assemblyai_sync",
+        "deepgram_prerecorded",
+        "openai_realtime_transcription",
+        "cartesia_manual_finalize",
+        "azure_fast_transcription",
+        "google_recognize",
+        "speechmatics_batch",
+        "regional_rest",
+        "planned_stream",
+        "planned_commit",
+        "planned_file"
+      ]
+    },
+    "provider_file": {
+      "description": "The shape of one source file under rows/: one provider and its rows.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provider_id",
+        "provider",
+        "rows"
+      ],
+      "properties": {
+        "provider_id": {
+          "$ref": "#/$defs/provider_id",
+          "description": "Canonical provider id; every row's match.provider must equal it. '*' only in the global default file."
+        },
+        "provider": {
+          "$ref": "#/$defs/provider"
+        },
+        "rows": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/row"
+          },
+          "description": "The provider's rows. One of them must be the provider default (model_glob '*')."
+        }
+      }
+    },
+    "profiles": {
+      "description": "Named transports, keyed by profile name. This is also the shape of profiles.json.",
+      "type": "object",
+      "propertyNames": {
+        "$ref": "#/$defs/profile_name"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/profile"
+      }
+    },
+    "profile": {
+      "description": "A named transport that a row may reference and a deployment override may select (self-hosted and OpenAI-compatible servers).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "transport",
+        "allowed_providers",
+        "provenance"
+      ],
+      "properties": {
+        "transport": {
+          "$ref": "#/$defs/transport"
+        },
+        "allowed_providers": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/provider_id"
+          },
+          "description": "Canonical provider ids whose deployments may select this profile."
+        },
+        "fallback_profile": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/profile_name"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The file profile used when this profile's client is not built. Required, possibly null, on a socket profile; null means the model has no file endpoint and the session is refused instead."
+        },
+        "requires": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "underlying_model",
+              "realtime_url"
+            ]
+          },
+          "description": "Deployment override fields that must be present for the profile to apply."
+        },
+        "provenance": {
+          "$ref": "#/$defs/provenance"
+        }
+      },
+      "if": {
+        "properties": {
+          "transport": {
+            "properties": {
+              "input_mode": {
+                "enum": [
+                  "live_stream",
+                  "vendor_segmented"
+                ]
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "fallback_profile"
+        ]
+      }
+    },
+    "profile_ref": {
+      "description": "A transport written as a reference to a named profile. The profile's transport is used whole; nothing is merged.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "profile"
+      ],
+      "properties": {
+        "profile": {
+          "$ref": "#/$defs/profile_name",
+          "description": "Name of an entry in profiles."
+        }
+      }
+    },
+    "transport_entry": {
+      "description": "An entry of a row's transports: an inline transport, or a reference to a profile.",
+      "if": {
+        "type": "object",
+        "required": [
+          "profile"
+        ]
+      },
+      "then": {
+        "$ref": "#/$defs/profile_ref"
+      },
+      "else": {
+        "$ref": "#/$defs/transport"
+      }
+    },
+    "provider": {
+      "description": "Provider-level facts the resolver needs before it can look a model up.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "aliases",
+        "default_model",
+        "model_string",
+        "registered_in_gateway"
+      ],
+      "properties": {
+        "aliases": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true,
+          "description": "Every other spelling the gateway accepts for this provider. An alias belongs to exactly one provider."
+        },
+        "default_model": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "description": "The id whose exact row answers a session that names no model. It is a vendor model id, or, when model_string is gateway_alias, an identifier the gateway defines. null: there is no such row and the provider default row answers (a vendor with no model parameter and no gateway identifier, or a provider whose model always comes from the deployment)."
+        },
+        "model_string": {
+          "enum": [
+            "wire_model",
+            "gateway_alias",
+            "deployment_name",
+            "absent",
+            "sensitive"
+          ],
+          "description": "What the session's model string is for this provider. wire_model: a vendor model id, sent as written. gateway_alias: a name the gateway defines to pick a product or a default; it is looked up and never sent. deployment_name: the customer's own deployment name, sent as written; the row is found through the override's underlying_model first (Azure OpenAI). absent: the vendor has no model parameter and the gateway has no identifier; the string is ignored and the provider default row is the declared answer, not a guess. sensitive: the field holds something that is not a model and may be a credential; it is never looked up, logged, counted, put in a metric label or published, and the provider default row is the declared answer (Reverie stores the customer's application id there)."
+        },
+        "key_normalisation": {
+          "description": "Exceptions to the plain lookup rule (trim, compare without case). Each one changes the lookup and the string that is sent together.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "strip_provider_prefix": {
+              "type": "boolean",
+              "default": false,
+              "description": "true: a leading '<provider>/' is removed before lookup. Stays false for providers whose model ids themselves begin with the provider name or an alias (Bhashini) and for self-hosted servers, whose ids are repository names."
+            },
+            "placeholder_as_unset": {
+              "type": "boolean",
+              "default": false,
+              "description": "true: on a standalone session, a model listed in sdk_placeholder_models that has no row under this provider is treated as no model named."
+            },
+            "region_suffix_separator": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 1,
+              "description": "A character after which the model string carries a region (Huawei: model@region). The suffix is removed before lookup and used as the session's region."
+            }
+          }
+        },
+        "registered_in_gateway": {
+          "type": "boolean",
+          "description": "Whether the gateway can build a client for this provider today through the standard factory or the plugin registry."
+        },
+        "native_model_handling": {
+          "enum": [
+            "verbatim",
+            "substituted",
+            "ignored"
+          ],
+          "default": "verbatim",
+          "description": "What today's client does with a model string. verbatim: sends it as written. substituted: replaces an id it does not know with its own default. ignored: never reads it. For the last two, a session that named a model and resolved to the native adapter through a pattern or default row gets the warning stt_model_substituted, naming default_model as the model that runs."
+        },
+        "deployment_model_source": {
+          "enum": [
+            "settings_then_table",
+            "table_only"
+          ],
+          "default": "settings_then_table",
+          "description": "On a Bud deployment, where the model that is sent comes from. settings_then_table: config.stt.model when set, else voice_table.model. table_only: voice_table.model only (self-hosted servers, Azure OpenAI)."
+        },
+        "egress": {
+          "enum": [
+            "public_only",
+            "in_cluster"
+          ],
+          "default": "public_only",
+          "description": "Which addresses an upload for this provider may reach. in_cluster allows private addresses, for servers the operator runs."
+        },
+        "deployment_base": {
+          "enum": [
+            "required",
+            "ignored"
+          ],
+          "default": "ignored",
+          "description": "Whether the deployment's base address is used. required: there is no vendor host to fall back to."
+        },
+        "production_base": {
+          "type": "string",
+          "pattern": "^https://",
+          "description": "The vendor's production base address, used when the session has no other base."
+        },
+        "base_url_convention": {
+          "enum": [
+            "origin",
+            "versioned"
+          ],
+          "description": "origin: the gateway appends the versioned path. versioned: the base already ends in the version segment."
+        },
+        "regions": {
+          "type": "object",
+          "propertyNames": {
+            "pattern": "^[a-z][a-z0-9-]*$"
+          },
+          "additionalProperties": {
+            "type": "string",
+            "pattern": "^(https|wss)://"
+          },
+          "description": "Base address per canonical region (us, eu, in, sg, au). First read by the canonical region option of Release 5."
+        },
+        "setup_probe": {
+          "enum": [
+            "in_cluster_and_assumed",
+            "none"
+          ],
+          "default": "in_cluster_and_assumed",
+          "description": "When the setup probe runs for this provider: for in-cluster deployments and assumed rows, or never."
+        },
+        "prerequisites": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "detail"
+            ],
+            "properties": {
+              "kind": {
+                "enum": [
+                  "trust_root",
+                  "token_scope",
+                  "workspace_id",
+                  "configuration_call",
+                  "account_feature",
+                  "private_address",
+                  "other"
+                ],
+                "description": "What must be in place: an extra certificate authority, a scope on the token, a workspace id, a configuration call before the first request, a feature switched on for the account, a trusted way to configure a private server address."
+              },
+              "detail": {
+                "type": "string",
+                "minLength": 1,
+                "description": "What exactly, in one sentence."
+              },
+              "wire": {
+                "type": "string",
+                "pattern": "^[a-z0-9_]+$",
+                "description": "When the prerequisite applies to one vendor interface only: its dialect.wire value."
+              }
+            }
+          },
+          "description": "Things that must be true before any transport of this provider can connect. Reported by the live probe job and printed in the generated capability page."
+        },
+        "availability": {
+          "description": "Whether the vendor can be used at all, beyond technical capability.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "status"
+          ],
+          "properties": {
+            "status": {
+              "enum": [
+                "open",
+                "closed_to_new_customers",
+                "evaluation_only",
+                "unknown"
+              ],
+              "description": "evaluation_only: the vendor's terms bar production or commercial use."
+            },
+            "since": {
+              "$ref": "#/$defs/date",
+              "description": "Date the status took effect."
+            },
+            "note": {
+              "type": "string",
+              "description": "The vendor's wording, briefly."
+            }
+          }
+        },
+        "notes": {
+          "type": "string",
+          "description": "Context for the next reader. Facts another field can hold do not belong here."
+        }
+      }
+    },
+    "row": {
+      "description": "One entry of the map: a provider and one model id, or a pattern of model ids.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "match",
+        "lifecycle",
+        "transports",
+        "billing",
+        "provenance"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/row_id",
+          "description": "Stable identifier, unique in the whole map. Assigned once and never changed, even when match changes. Used in the breaker key, as the model label of metrics, in the rollout allow-list and in the rollback list."
+        },
+        "match": {
+          "description": "Which sessions the row answers.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "provider"
+          ],
+          "properties": {
+            "provider": {
+              "$ref": "#/$defs/provider_id",
+              "description": "Canonical provider id, or '*' for the one global default row."
+            },
+            "model": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^[^*\\s]+$",
+              "description": "Exact model id in the vendor's own spelling. Compared without case after trimming. When the row matches, this spelling is what a non-native adapter sends."
+            },
+            "model_glob": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^[^\\s]*\\*[^\\s]*$",
+              "description": "Anchored, case-insensitive glob. '*' is the only metacharacter. A bare '*' is the provider default. When several globs match, the one with the most literal characters wins."
+            },
+            "model_aliases": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": "^[^*\\s]+$"
+              },
+              "description": "Other exact spellings that select this row: strings today's client rewrites to this model (whisper1, gpt4o-transcribe) and gateway shorthand. Only with model, never with model_glob."
+            }
+          },
+          "oneOf": [
+            {
+              "required": [
+                "model"
+              ]
+            },
+            {
+              "required": [
+                "model_glob"
+              ]
+            }
+          ],
+          "dependentRequired": {
+            "model_aliases": [
+              "model"
+            ]
+          }
+        },
+        "passthrough": {
+          "type": "boolean",
+          "default": false,
+          "description": "true: the row is unclassified. The resolver calls today's factory unchanged, reports nothing new and refuses nothing. transports must be empty."
+        },
+        "applies_to_all_models": {
+          "type": "boolean",
+          "default": false,
+          "description": "Only on a provider default row: true when the provider's transport does not depend on the model id, so a match on this row is the declared answer and not a guess (self-hosted servers)."
+        },
+        "lifecycle": {
+          "$ref": "#/$defs/lifecycle"
+        },
+        "transports": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/transport_entry"
+          },
+          "description": "Ordered. The first entry that is enabled in the current release, built, allowed by the rollout switch and whose constraints the session meets is what transcription_mode=auto uses. Empty = no live path, or a passthrough row."
+        },
+        "when_unusable": {
+          "$ref": "#/$defs/when_unusable"
+        },
+        "billing": {
+          "$ref": "#/$defs/billing"
+        },
+        "provenance": {
+          "$ref": "#/$defs/provenance"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "passthrough": {
+                "const": true
+              }
+            },
+            "required": [
+              "passthrough"
+            ]
+          },
+          "then": {
+            "properties": {
+              "transports": {
+                "maxItems": 0
+              },
+              "when_unusable": false
+            }
+          },
+          "else": {
+            "if": {
+              "properties": {
+                "transports": {
+                  "maxItems": 0
+                }
+              }
+            },
+            "then": {
+              "required": [
+                "when_unusable"
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "lifecycle": {
+                "properties": {
+                  "status": {
+                    "const": "retired"
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "when_unusable"
+            ],
+            "properties": {
+              "when_unusable": {
+                "required": [
+                  "refusal",
+                  "refuse_from_release"
+                ],
+                "properties": {
+                  "refuse_from_release": {
+                    "description": "A retired model is refused from Release 0, except where today's client silently serves another model (today = streams_substituted_model): then the refusal may start at Release 3 at the latest, and the session is warned with stt_model_substituted until then (integration decision 12).",
+                    "enum": [
+                      0,
+                      1,
+                      2,
+                      3
+                    ]
+                  },
+                  "refusal": {
+                    "properties": {
+                      "code": {
+                        "const": "stt_model_retired"
+                      }
+                    }
+                  }
+                },
+                "if": {
+                  "properties": {
+                    "today": {
+                      "const": "streams_substituted_model"
+                    }
+                  },
+                  "required": [
+                    "today"
+                  ]
+                },
+                "else": {
+                  "properties": {
+                    "refuse_from_release": {
+                      "const": 0
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "when_unusable": {
+                "properties": {
+                  "refusal": {
+                    "properties": {
+                      "code": {
+                        "const": "stt_live_unsupported"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "applies_to_all_models": {
+                "const": true
+              }
+            },
+            "required": [
+              "applies_to_all_models"
+            ]
+          },
+          "then": {
+            "properties": {
+              "match": {
+                "properties": {
+                  "model_glob": {
+                    "const": "*"
+                  }
+                },
+                "required": [
+                  "model_glob"
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    "lifecycle": {
+      "description": "Where the model is in the vendor's life cycle. Dates drive warnings; only the status 'retired' refuses.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "ga",
+            "preview",
+            "legacy",
+            "retiring",
+            "deprecated",
+            "retired",
+            "unknown",
+            "invalid"
+          ],
+          "description": "ga: generally available. preview: offered before general availability. legacy: still served, no longer recommended, no deprecation notice (also a rolling 'previous version' tag). retiring: generally available with a published or planned retirement. deprecated: the vendor announced deprecation. retired: no longer served; the resolver refuses it. unknown: not classified. invalid: an id the gateway accepts or emits that the vendor does not have."
+        },
+        "deprecated_on": {
+          "$ref": "#/$defs/date",
+          "description": "Date the vendor deprecated the model. Omit when the vendor gives none."
+        },
+        "shutdown_on": {
+          "$ref": "#/$defs/date",
+          "description": "Date the vendor stops serving the model. Omit when the vendor gives none."
+        },
+        "dates_basis": {
+          "enum": [
+            "announced",
+            "inferred"
+          ],
+          "default": "announced",
+          "description": "announced: the dates are the vendor's own. inferred: they were derived (from an alias's notice, a page stamp or a changelog entry) and must be shown as expected, not as fact."
+        },
+        "replacement": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "description": "Model ids on the same provider to use instead on a live call. Each must resolve to a row that is not retired; a pattern with '*' is allowed where the vendor replaces a family."
+        }
+      },
+      "if": {
+        "properties": {
+          "status": {
+            "enum": [
+              "deprecated",
+              "retired"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "replacement"
+        ]
+      }
+    },
+    "when_unusable": {
+      "description": "What happens when no transport of the row is usable for the session: none is enabled in the current release, the session is outside the allow-list, the session's language or region is excluded, or the transports list is empty.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "today"
+      ],
+      "properties": {
+        "today": {
+          "enum": [
+            "streams",
+            "streams_substituted_model",
+            "buffers_until_hangup",
+            "blind_timed_uploads",
+            "refused_at_setup",
+            "fails",
+            "unknown"
+          ],
+          "description": "What a live session naming this model gets from today's gateway code. streams: today's client streams it. streams_substituted_model: today's client streams, but with a different model than the one named. buffers_until_hangup: the session starts and no transcript arrives until hang-up or a client commit. blind_timed_uploads: audio is uploaded on a wall-clock timer and every piece is marked as the end of a turn. refused_at_setup: a named refusal. fails: the session cannot be set up, or starts and is rejected by the vendor. unknown: not established. The resolver keeps today's client for streams, streams_substituted_model (with the warning stt_model_substituted), blind_timed_uploads (reported as known broken in ready.stt) and unknown; for buffers_until_hangup it refuses a voice-agent session whose turn detection is not manual (nothing on such a session can end a turn) and keeps today's client, with the warning stt_buffered_until_commit, for every other session (integration decisions, addendum A1); an OpenAI live-only model whose today value is fails is refused on every session; for refused_at_setup and fails it refuses."
+        },
+        "substituted_model": {
+          "type": "string",
+          "minLength": 1,
+          "description": "For streams_substituted_model: the model that actually transcribes, named in the warning."
+        },
+        "code_ref": {
+          "type": "string",
+          "description": "Repository path and line of the code that produces today's behaviour."
+        },
+        "refuse_from_release": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 6,
+          "description": "The first release in which a session with no usable transport is refused whatever 'today' says. null: never; 'today' decides in every release."
+        },
+        "refusal": {
+          "$ref": "#/$defs/refusal"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "today": {
+                "const": "streams_substituted_model"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "substituted_model"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "today": {
+                "enum": [
+                  "buffers_until_hangup",
+                  "refused_at_setup",
+                  "fails"
+                ]
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "refusal"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "refuse_from_release": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "refuse_from_release"
+            ]
+          },
+          "then": {
+            "required": [
+              "refusal"
+            ]
+          }
+        }
+      ]
+    },
+    "refusal": {
+      "description": "What the client is told when the session is refused at setup.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "text"
+      ],
+      "properties": {
+        "code": {
+          "enum": [
+            "stt_live_unsupported",
+            "stt_model_retired"
+          ],
+          "description": "The error code on the wire. stt_live_unsupported: no usable live path for this model. stt_model_retired: the row's lifecycle status is retired."
+        },
+        "reason": {
+          "enum": [
+            "async_only",
+            "client_not_implemented",
+            "disabled",
+            "provider_not_built",
+            "model_not_served"
+          ],
+          "description": "Machine-readable reason sent with stt_live_unsupported. async_only: the vendor's only file interface is a job answered in tens of seconds. client_not_implemented: the gateway code that would serve this model on a call is not built, or is not enabled in this release. disabled: the model exists but is deliberately not offered on calls (a translate-only model, a human transcription product, vendor terms). provider_not_built: the gateway cannot build this vendor at all. model_not_served: the id is known not to exist at the vendor."
+        },
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Plain words for the customer: why, and what to do instead. The resolver adds the model and deployment names. Never a URL, a credential or an internal identifier."
+        }
+      },
+      "if": {
+        "properties": {
+          "code": {
+            "const": "stt_live_unsupported"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "reason"
+        ]
+      }
+    },
+    "transport": {
+      "description": "One way the gateway can reach the model during a call.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "input_mode",
+        "adapter",
+        "enabled_from_release",
+        "interim_results",
+        "endpointing_owner",
+        "vendor_turn_signal",
+        "latency",
+        "limits",
+        "quality_signals",
+        "dialect",
+        "gateway_client"
+      ],
+      "properties": {
+        "input_mode": {
+          "enum": [
+            "live_stream",
+            "vendor_segmented",
+            "file_upload"
+          ],
+          "description": "live_stream: vendor transcribes audio as it arrives on a socket. vendor_segmented: audio is appended to a vendor-held buffer and transcribed after a commit (vendor VAD or caller). file_upload: one complete file per request."
+        },
+        "adapter": {
+          "$ref": "#/$defs/adapter_id",
+          "description": "Id of the gateway code path that speaks this transport. The closed list and what each id means are in CONVERSION_RULES.md."
+        },
+        "enabled_from_release": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 6,
+          "description": "The first release in which the resolver may choose this transport. 0: usable with today's code. 1 to 6: turned on in that release, which must not be earlier than the release the adapter ships in. null: no release turns it on; disabled_reason says why. The transport is enabled in a shipped map when this value is not null and is at most the map's release."
+        },
+        "disabled_reason": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Why the transport is not usable before its enabling release, or at all when enabled_from_release is null. Required when it is null."
+        },
+        "enable_requires": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "live_probe",
+              "latency_within_deadline"
+            ]
+          },
+          "description": "Evidence that must exist before the transport is turned on in its release. live_probe: one successful request with a real key. latency_within_deadline: a measurement showing the transport answers inside the segment deadline. A release ships the transport enabled only when the row's provenance and latency carry that evidence."
+        },
+        "interim_results": {
+          "enum": [
+            "live",
+            "post_commit",
+            "none",
+            "unknown"
+          ],
+          "description": "What the gateway's adapter delivers, not what the vendor could. live: hypotheses while the caller is still speaking. post_commit: text deltas only after the segment is complete. none: one final per segment. unknown: not established; treated as none."
+        },
+        "endpointing_owner": {
+          "enum": [
+            "gateway",
+            "vendor",
+            "either"
+          ],
+          "description": "Who decides that a segment has ended. either = selectable per session."
+        },
+        "vendor_turn_signal": {
+          "enum": [
+            "none",
+            "silence",
+            "semantic",
+            "unknown"
+          ],
+          "description": "The strongest end-of-speech signal the vendor emits on this transport. unknown: the vendor emits one and its kind is not documented; treated as silence."
+        },
+        "constraints": {
+          "$ref": "#/$defs/constraints"
+        },
+        "latency": {
+          "$ref": "#/$defs/latency"
+        },
+        "limits": {
+          "$ref": "#/$defs/limits"
+        },
+        "upload": {
+          "$ref": "#/$defs/upload"
+        },
+        "stream_audio": {
+          "$ref": "#/$defs/stream_audio"
+        },
+        "commit": {
+          "description": "Socket transports on which the gateway's detector sends the commit.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "audio_gating"
+          ],
+          "properties": {
+            "audio_gating": {
+              "enum": [
+                "speech_only",
+                "continuous"
+              ],
+              "description": "speech_only: the gateway sends audio only while its detector hears speech, starting with the pre-roll in one burst. continuous: every frame is sent and the commit only marks the boundary."
+            }
+          }
+        },
+        "warm": {
+          "description": "A cheap request that opens and keeps a connection ready before the first upload.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "method",
+            "path"
+          ],
+          "properties": {
+            "method": {
+              "enum": [
+                "GET",
+                "HEAD",
+                "OPTIONS"
+              ],
+              "description": "HTTP method of the warm-up request."
+            },
+            "path": {
+              "type": "string",
+              "pattern": "^/",
+              "description": "Path of the warm-up request, relative to the base address."
+            }
+          }
+        },
+        "quality_signals": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "segment_no_speech_prob",
+              "segment_avg_logprob",
+              "segment_compression_ratio",
+              "token_logprobs",
+              "word_logprob",
+              "word_confidence",
+              "utterance_confidence",
+              "language_probability",
+              "detected_languages",
+              "audio_event_tags",
+              "no_speech_flag"
+            ]
+          },
+          "description": "Signals the vendor returns on this transport that the gateway may use to drop or down-weight a transcript. no_speech_flag is a yes-or-no statement from the vendor that the audio held no speech. A value the vendor returns but documents as not meaningful is left out."
+        },
+        "quality_signals_require": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Request settings needed to receive the signals, as key=value."
+        },
+        "dialect": {
+          "$ref": "#/$defs/dialect"
+        },
+        "gateway_client": {
+          "$ref": "#/$defs/gateway_client"
+        },
+        "file_request_mode": {
+          "enum": [
+            "sync",
+            "sync_wait",
+            "async_poll"
+          ],
+          "description": "file_upload only. sync: one request, one response. sync_wait: a job API with a blocking wait parameter. async_poll: submit then poll (usable on a call only when the vendor answers within the segment deadline)."
+        },
+        "segment_profile": {
+          "$ref": "#/$defs/segment_profile"
+        },
+        "billing": {
+          "$ref": "#/$defs/billing",
+          "description": "Billing of this transport when it differs from the row's. Replaces the row's block whole."
+        },
+        "privacy": {
+          "$ref": "#/$defs/privacy"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "input_mode": {
+                "const": "file_upload"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "upload",
+              "file_request_mode"
+            ],
+            "properties": {
+              "interim_results": {
+                "enum": [
+                  "none",
+                  "post_commit"
+                ]
+              },
+              "endpointing_owner": {
+                "const": "gateway"
+              },
+              "vendor_turn_signal": {
+                "const": "none"
+              },
+              "stream_audio": false,
+              "commit": false
+            }
+          },
+          "else": {
+            "properties": {
+              "upload": false,
+              "file_request_mode": false
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "input_mode": {
+                "const": "vendor_segmented"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "interim_results": {
+                "enum": [
+                  "none",
+                  "post_commit",
+                  "unknown"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "enabled_from_release": {
+                "type": "null"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "disabled_reason"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "gateway_client": {
+                "properties": {
+                  "status": {
+                    "const": "not_implemented"
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "enabled_from_release": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "minimum": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "gateway_client": {
+                "properties": {
+                  "status": {
+                    "const": "known_broken"
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "adapter": {
+                "const": "native"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "adapter": {
+                "const": "native"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "input_mode": {
+                "enum": [
+                  "live_stream",
+                  "vendor_segmented"
+                ]
+              },
+              "enabled_from_release": {
+                "enum": [
+                  0,
+                  null
+                ]
+              },
+              "gateway_client": {
+                "properties": {
+                  "status": {
+                    "enum": [
+                      "verified_live",
+                      "wire_tested",
+                      "unverified",
+                      "known_broken"
+                    ]
+                  }
+                }
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "gateway_client": {
+                "properties": {
+                  "status": {
+                    "enum": [
+                      "verified_live",
+                      "wire_tested",
+                      "unverified",
+                      "not_implemented"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "adapter": {
+                "enum": [
+                  "planned_stream",
+                  "planned_commit",
+                  "planned_file"
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "enabled_from_release": {
+                "type": "null"
+              },
+              "dialect": {
+                "required": [
+                  "wire"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "adapter": {
+                "const": "regional_rest"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "dialect": {
+                "required": [
+                  "wire"
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    "constraints": {
+      "description": "Conditions under which this transport can serve a session. A transport whose constraints the session does not meet is skipped, exactly as a disabled one is.",
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "languages": {
+          "description": "Which session languages the transport serves.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "mode",
+            "codes"
+          ],
+          "properties": {
+            "mode": {
+              "enum": [
+                "only",
+                "except"
+              ],
+              "description": "only: the transport serves the listed languages and no others. except: it serves every language but the listed ones."
+            },
+            "codes": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 2
+              },
+              "description": "BCP-47 tags. A bare language (en) covers every region of it. The word 'auto' stands for a session that asks the vendor to detect the language."
+            },
+            "note": {
+              "type": "string",
+              "description": "Source or caveat for the list."
+            }
+          }
+        },
+        "regions": {
+          "description": "Which vendor regions, sites or hosts offer the transport.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "mode",
+            "values"
+          ],
+          "properties": {
+            "mode": {
+              "enum": [
+                "only",
+                "except"
+              ],
+              "description": "only: offered in the listed regions and nowhere else. except: offered everywhere but there."
+            },
+            "values": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              },
+              "description": "Region names. Where the provider entry has a regions table, its keys (the canonical names us, eu, in, sg, au); otherwise the vendor's own names as the provider's configuration carries them (an Azure region, a Google location, 'china' or 'international' for Tencent)."
+            },
+            "note": {
+              "type": "string",
+              "description": "Source or caveat for the list."
+            }
+          }
+        }
+      }
+    },
+    "latency": {
+      "description": "How long this transport takes from end of speech to final transcript, as a class label and the measurements behind it.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "class",
+        "measurements"
+      ],
+      "properties": {
+        "class": {
+          "enum": [
+            "realtime",
+            "fast",
+            "slow",
+            "unknown"
+          ],
+          "description": "Label shown to customers. When a p99 end_of_speech_to_final measurement exists the label must equal the class computed from it and latency_classes. Without one the label is 'unknown', or 'slow' when some other measurement is already above fast_max_ms."
+        },
+        "measurements": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/latency_measurement"
+          },
+          "description": "Zero or more figures. The first p99 end_of_speech_to_final entry is the seed 99th percentile and the first p50 entry of that quantity is the seed median; both are replaced by the latency store once it has data."
+        },
+        "notes": {
+          "type": "string",
+          "description": "Free text: why no figure exists, or what must be measured before the transport is enabled. Never the only place a number lives."
+        }
+      },
+      "if": {
+        "properties": {
+          "measurements": {
+            "maxItems": 0
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "class": {
+            "const": "unknown"
+          }
+        }
+      }
+    },
+    "latency_measurement": {
+      "description": "One latency figure with where it came from. A transport may carry several (a vendor median and a third-party 99th percentile, for example).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "percentile",
+        "quantity",
+        "value_ms",
+        "basis",
+        "source"
+      ],
+      "properties": {
+        "percentile": {
+          "enum": [
+            "p50",
+            "p90",
+            "p95",
+            "p99",
+            "mean",
+            "typical",
+            "single_sample"
+          ],
+          "description": "Which statistic the value is. 'typical' is a vendor figure published without a percentile; 'single_sample' is one observed request."
+        },
+        "quantity": {
+          "enum": [
+            "end_of_speech_to_final",
+            "request_round_trip",
+            "inference_only"
+          ],
+          "description": "What was timed. end_of_speech_to_final: from the caller's last word to the final transcript, the figure the engine's time limits are seeded from. request_round_trip: one upload request, send to response. inference_only: time inside the model server, without network or detection."
+        },
+        "value_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "The figure, in milliseconds."
+        },
+        "basis": {
+          "enum": [
+            "own_probe",
+            "third_party_benchmark",
+            "vendor_claim"
+          ],
+          "description": "Who measured it: the gateway's own probe, a third party's published benchmark, or the vendor's own statement."
+        },
+        "source": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Where the figure can be read: an https URL, a repository path with a line number, or the name of a probe result file."
+        },
+        "measured_on": {
+          "$ref": "#/$defs/date",
+          "description": "Date of the measurement or of the published figure. Omit when the source gives none."
+        },
+        "conditions": {
+          "type": "string",
+          "description": "What the measurement assumed: clip length, the model actually measured when it is not this row's model, region, plan."
+        },
+        "pause_ms_assumed": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "For end_of_speech_to_final only: the silence the detector waited before cutting, which is included in the figure. The latency store subtracts it when the session uses a different pause."
+        },
+        "sample_count": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Number of samples behind the figure, when known."
+        }
+      }
+    },
+    "limits": {
+      "description": "Size, duration and rate limits of this transport.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_upload_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1,
+          "description": "Largest request body the vendor accepts. null when unpublished."
+        },
+        "max_audio_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1,
+          "description": "Longest audio in one request, in milliseconds. null when unpublished. The engine's hard split limit and its soft split limit (the smaller of 20 s and this value minus 5 s) are derived from it."
+        },
+        "min_audio_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "Shortest audio the vendor accepts in one request. null when unpublished."
+        },
+        "vendor_timeout_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1,
+          "description": "How long the vendor keeps one request open before it gives up. This is the vendor's limit, not the gateway's request deadline."
+        },
+        "max_session_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1,
+          "description": "Socket transports: the longest one connection may live. The client must redial before it."
+        },
+        "idle_timeout_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1,
+          "description": "Socket transports: how long the vendor keeps a silent connection open. The client must send keep-alives or redial."
+        },
+        "context_window_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1,
+          "description": "The model's own window. Audio beyond it in one request is cut or split by the model, so a segment with its padding must fit inside."
+        },
+        "rates": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/rate_limit"
+          },
+          "description": "Every rate and concurrency limit the vendor publishes for this transport, one entry per metric, window and plan."
+        },
+        "assumed_plan": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[a-z0-9][a-z0-9_.-]*$",
+          "description": "The plan the gateway assumes when the deployment declares none. The limiter is seeded from the entries of rates whose plan is this value or null. A deployment override may name another plan."
+        },
+        "ramp": {
+          "type": "boolean",
+          "default": false,
+          "description": "true when the vendor refuses traffic that rises too fast even inside the limit (OpenAI's slow_down). The limiter then starts a cold key at a quarter of the ceiling and raises it."
+        },
+        "single_process": {
+          "type": "boolean",
+          "default": false,
+          "description": "true when the server handles one request at a time (the whisper.cpp example server). One upload in flight, and no second request while the first runs."
+        }
+      }
+    },
+    "rate_limit": {
+      "description": "One vendor rate or concurrency limit.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "metric",
+        "per",
+        "value",
+        "plan",
+        "scope"
+      ],
+      "properties": {
+        "metric": {
+          "enum": [
+            "requests",
+            "concurrent_requests",
+            "concurrent_sessions",
+            "audio_seconds",
+            "tokens"
+          ],
+          "description": "What is counted. concurrent_requests: uploads in flight. concurrent_sessions: open sockets or streams."
+        },
+        "per": {
+          "enum": [
+            "second",
+            "minute",
+            "hour",
+            "day",
+            "month",
+            "none"
+          ],
+          "description": "The window the vendor publishes. Keep the vendor's own window: a per-second limit is not rewritten as a per-minute one, because the limiter must hold the short window. 'none' is used for the two concurrency metrics and only for them."
+        },
+        "value": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "The limit."
+        },
+        "plan": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[a-z0-9][a-z0-9_.-]*$",
+          "description": "The vendor plan or usage tier the figure belongs to, in lowercase (for example free, developer, tier_1). null when the vendor publishes one figure for every plan."
+        },
+        "scope": {
+          "enum": [
+            "credential",
+            "account",
+            "organisation",
+            "project",
+            "application",
+            "resource",
+            "deployment",
+            "region",
+            "unknown"
+          ],
+          "description": "What the vendor counts against: one key, the whole vendor account, an organisation, a project, an application id, one vendor resource or service instance, one server the operator runs, or an account within one region."
+        },
+        "note": {
+          "type": "string",
+          "description": "Anything that changes how the figure is applied, for example that the window is shared between the socket and the file endpoint."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "metric": {
+                "enum": [
+                  "concurrent_requests",
+                  "concurrent_sessions"
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "per": {
+                "const": "none"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "per": {
+                "enum": [
+                  "second",
+                  "minute",
+                  "hour",
+                  "day",
+                  "month"
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    "upload": {
+      "description": "file_upload transports only: what the request body looks like.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "accepted",
+        "preferred",
+        "envelope"
+      ],
+      "properties": {
+        "accepted": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "wav",
+              "raw_pcm",
+              "flac",
+              "mp3",
+              "mp4",
+              "mpeg",
+              "mpga",
+              "m4a",
+              "ogg",
+              "opus",
+              "webm",
+              "aac",
+              "aiff"
+            ]
+          },
+          "description": "Containers the endpoint accepts, limited to the ones the gateway could produce or forward. Formats the gateway never sends are not listed."
+        },
+        "preferred": {
+          "description": "The one format the gateway sends.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "container",
+            "encoding",
+            "sample_rate_hz",
+            "channels"
+          ],
+          "properties": {
+            "container": {
+              "enum": [
+                "wav",
+                "raw_pcm",
+                "flac",
+                "ogg",
+                "mp3"
+              ],
+              "description": "File container. raw_pcm means no header at all."
+            },
+            "encoding": {
+              "enum": [
+                "pcm_s16le",
+                "flac",
+                "opus",
+                "mp3"
+              ],
+              "description": "Sample encoding inside the container."
+            },
+            "sample_rate_hz": {
+              "enum": [
+                8000,
+                16000,
+                24000,
+                48000
+              ],
+              "description": "Sample rate of the upload. The engine resamples to it unless prefer_call_rate applies."
+            },
+            "channels": {
+              "enum": [
+                1,
+                2
+              ],
+              "description": "Channel count of the upload."
+            }
+          }
+        },
+        "sample_rates_hz": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "integer",
+            "minimum": 8000
+          },
+          "description": "Every sample rate the endpoint accepts for the preferred container. Omit when only the preferred rate is known."
+        },
+        "prefer_call_rate": {
+          "type": "boolean",
+          "default": false,
+          "description": "true when the vendor advises against resampling: the gateway then uploads at the call's own rate whenever that rate is in sample_rates_hz, and at preferred.sample_rate_hz otherwise."
+        },
+        "envelope": {
+          "enum": [
+            "multipart",
+            "raw_body",
+            "json_base64"
+          ],
+          "description": "How the audio travels. multipart: one part of a multipart form. raw_body: the request body is the audio. json_base64: a JSON document with the audio as a base64 string."
+        },
+        "content_type": {
+          "type": "string",
+          "description": "Content-Type of the body (raw_body) or of the audio part (multipart) when the vendor demands a value other than the container's usual one. '{sample_rate_hz}' is replaced by the upload rate."
+        },
+        "headers": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "name",
+              "value"
+            ],
+            "properties": {
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Header name as the vendor spells it."
+              },
+              "value": {
+                "type": "string",
+                "description": "Header value. '{sample_rate_hz}' is replaced by the upload rate. Never a credential."
+              }
+            }
+          },
+          "description": "Request headers the vendor requires for this format, other than authentication and Content-Type."
+        },
+        "vendor_params": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "name",
+              "value",
+              "in"
+            ],
+            "properties": {
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Parameter name as the vendor spells it."
+              },
+              "value": {
+                "type": "string",
+                "description": "Value to send. '{sample_rate_hz}' is replaced by the upload rate."
+              },
+              "in": {
+                "enum": [
+                  "form",
+                  "query",
+                  "json"
+                ],
+                "description": "Where the parameter goes: a multipart form field, the URL query, or a field of the JSON body."
+              }
+            }
+          },
+          "description": "Fixed parameters the vendor needs for this format. Replaces the single key=value string of version 1."
+        }
+      }
+    },
+    "stream_audio": {
+      "description": "live_stream and vendor_segmented transports only: the audio the socket accepts. The speech-to-text leg receives audio at the caller's own rate, so the resolver uses this to decide whether the client must resample or convert, or whether the transport cannot serve the session.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "encodings",
+        "sample_rates_hz"
+      ],
+      "properties": {
+        "encodings": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "pcm_s16le",
+              "mulaw",
+              "alaw",
+              "opus",
+              "flac"
+            ]
+          },
+          "description": "Encodings the socket accepts."
+        },
+        "sample_rates_hz": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "integer",
+            "minimum": 8000
+          },
+          "description": "Sample rates the socket accepts for linear PCM."
+        },
+        "channels": {
+          "enum": [
+            1,
+            2
+          ],
+          "description": "Channel count the socket expects. Omit when the vendor does not say."
+        }
+      }
+    },
+    "dialect": {
+      "description": "How the request for this transport is worded.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "language_param",
+        "context_params"
+      ],
+      "properties": {
+        "language_param": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "description": "The language field exactly as the vendor spells it on this transport (language, languages, language_code, language_codes, locales, language_hints, src_lang, sourceLanguage and so on). null when the transport takes no language."
+        },
+        "language_shape": {
+          "enum": [
+            "single",
+            "list"
+          ],
+          "default": "single",
+          "description": "Whether the field holds one code or a list of codes."
+        },
+        "language_format": {
+          "enum": [
+            "iso639_1",
+            "iso639_3",
+            "bcp47",
+            "vendor"
+          ],
+          "description": "The code system the vendor expects: a two-letter code, a three-letter code, a region-qualified tag, or the vendor's own list (engine ids, or tags that differ from BCP-47 such as od-IN)."
+        },
+        "language_required": {
+          "type": "boolean",
+          "default": false,
+          "description": "true when the vendor does not detect the language and assumes one when the field is absent. The transcriber then always sends a language and the session is warned when it had to assume one."
+        },
+        "context_params": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/context_param"
+          },
+          "description": "The context fields this transport accepts. Empty when it accepts none."
+        },
+        "response_formats": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "uniqueItems": true,
+          "description": "Response formats the transport accepts, in order of preference. The gateway requests the first."
+        },
+        "wire": {
+          "type": "string",
+          "pattern": "^[a-z0-9_]+$",
+          "description": "Name of the vendor interface this transport speaks. Required for the regional_rest adapter, which serves several vendors and several interfaces of one vendor and chooses its code path by this value, and for the three planned_ adapters, where it is the only record of which interface is meant."
+        },
+        "auth": {
+          "enum": [
+            "bearer",
+            "bearer_optional",
+            "api_key_header",
+            "token",
+            "vendor"
+          ],
+          "description": "How the request is authenticated. bearer: Authorization: Bearer. bearer_optional: the same, omitted for an empty key (self-hosted servers). api_key_header: an api-key header and never Authorization (Azure OpenAI). token: Authorization: Token (Deepgram). vendor: a scheme the adapter implements itself."
+        },
+        "path": {
+          "type": "string",
+          "pattern": "^/",
+          "description": "Request path relative to the base address, for adapters shared by several servers."
+        },
+        "droppable_params": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "uniqueItems": true,
+          "description": "Fields the transcriber may leave out and retry once when the server rejects them by name. A profile that is the default for an in-cluster provider must list every optional field it sends."
+        },
+        "usage_reported": {
+          "enum": [
+            "seconds",
+            "tokens",
+            "none"
+          ],
+          "description": "What the response says about billed usage."
+        },
+        "limit_headers": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "limit_requests": {
+              "type": "string",
+              "description": "Response header carrying the request limit of the current window."
+            },
+            "remaining_requests": {
+              "type": "string",
+              "description": "Response header carrying the requests left in the window."
+            },
+            "reset_requests": {
+              "type": "string",
+              "description": "Response header carrying when the window resets."
+            },
+            "retry_after": {
+              "type": "string",
+              "description": "Response header carrying how long to wait after a refusal."
+            },
+            "concurrency_current": {
+              "type": "string",
+              "description": "Response header carrying the requests in flight as the vendor counts them."
+            },
+            "concurrency_limit": {
+              "type": "string",
+              "description": "Response header carrying the vendor's concurrency ceiling."
+            }
+          },
+          "description": "Names of the vendor's rate-limit response headers, which the upload limiter reads as feedback."
+        }
+      }
+    },
+    "context_param": {
+      "description": "One way to pass vocabulary or context to the vendor.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "wire_name"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "prompt",
+            "keywords",
+            "keyterms",
+            "previous_text",
+            "vocabulary_id"
+          ],
+          "description": "The canonical meaning. prompt: free text. keywords and keyterms: a list of words to favour. previous_text: the transcript so far. vocabulary_id: the id of a vocabulary registered with the vendor beforehand."
+        },
+        "wire_name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The field name exactly as the vendor spells it (for example bias_list, keyterms_prompt, hotword_list)."
+        },
+        "max_items": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Most list entries the gateway sends. Set it below the vendor's hard limit where a larger list changes the bill."
+        },
+        "max_tokens": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Longest text in model tokens (224 for Whisper prompts)."
+        },
+        "max_chars": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Longest text in characters, when the vendor states the limit that way."
+        },
+        "note": {
+          "type": "string",
+          "description": "Restrictions that do not fit a number, for example that the field works for one language only."
+        }
+      }
+    },
+    "gateway_client": {
+      "description": "The truthful state, today, of the gateway code that speaks this transport. It is separate from enabled_from_release, which says when the plan turns the transport on.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "verified_live",
+            "wire_tested",
+            "unverified",
+            "known_broken",
+            "not_implemented"
+          ],
+          "description": "verified_live: exercised against the vendor. wire_tested: tested against a mock only. unverified: exists, never tested for this model. known_broken: exists and a defect was found; allowed only on the native adapter, where the session still starts and the defect is reported in ready.stt. not_implemented: the code does not exist."
+        },
+        "last_verified_on": {
+          "$ref": "#/$defs/date",
+          "description": "For verified_live: the date of the live run, so a stale claim can be flagged."
+        },
+        "defect": {
+          "type": "string",
+          "minLength": 1,
+          "description": "For known_broken, and for any client with a defect found by reading: what is wrong, in one or two sentences. Listed as a separate defect in the plan."
+        },
+        "code_ref": {
+          "type": "string",
+          "description": "Repository path and line of the client, or of the code a new client would be extracted from."
+        },
+        "notes": {
+          "type": "string",
+          "description": "What an implementer needs to know."
+        }
+      },
+      "if": {
+        "properties": {
+          "status": {
+            "const": "known_broken"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "required": [
+          "defect"
+        ]
+      }
+    },
+    "segment_profile": {
+      "description": "Per-model deviations from the gateway segmenter defaults. Omitted fields take the gateway default. Only meaningful when endpointing_owner is gateway.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "pre_roll_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Audio kept from before the first speech frame."
+        },
+        "trailing_silence_ms": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Silence appended after the last speech frame."
+        },
+        "max_segment_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Longest segment before the engine splits it."
+        },
+        "max_in_flight": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Uploads one session may have in flight."
+        },
+        "request_timeout_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "A ceiling on one request. The live deadline comes from the latency store."
+        },
+        "upload_policy": {
+          "enum": [
+            "per_pause",
+            "per_turn"
+          ],
+          "description": "per_pause: upload each segment at the short pause. per_turn: hold the turn's audio and upload once, for vendors whose per-request minimum or rate limit makes per-pause uploads costly."
+        },
+        "rationale": {
+          "type": "string",
+          "description": "Why the values differ from the defaults."
+        }
+      }
+    },
+    "billing": {
+      "description": "How the vendor bills. The row's block is the default for every transport of the row; a transport may carry its own block, which then replaces the row's whole (no field-by-field merge).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "unit",
+        "min_billed_ms",
+        "bills_silence"
+      ],
+      "properties": {
+        "unit": {
+          "enum": [
+            "audio_second",
+            "audio_minute",
+            "audio_hour",
+            "audio_token",
+            "request",
+            "none",
+            "unknown"
+          ],
+          "description": "What the vendor meters. 'none' is an operator-owned server with no vendor meter. 'unknown' means the unit could not be established."
+        },
+        "min_billed_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "The least audio one request is billed for, whatever its length. 0 when the vendor states there is none; null when unknown."
+        },
+        "increment_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1,
+          "description": "The rounding unit: each request is billed in whole multiples of this, rounded up (15000 for Yandex and NAVER CSR). null or absent when the vendor bills the exact duration or does not say."
+        },
+        "conditional_minimums": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "feature",
+              "min_billed_ms"
+            ],
+            "properties": {
+              "feature": {
+                "type": "string",
+                "pattern": "^[a-z0-9_]+$",
+                "description": "The canonical session setting that triggers the minimum (keyterms, transcript_edit)."
+              },
+              "above": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "For list settings: the minimum applies when more than this many entries are sent. Omit when any use triggers it."
+              },
+              "min_billed_ms": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "The minimum billed per request while the condition holds."
+              },
+              "note": {
+                "type": "string",
+                "description": "Source or caveat."
+              }
+            }
+          },
+          "description": "Minimums that apply only when a setting is used."
+        },
+        "surcharges": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "feature",
+              "percent"
+            ],
+            "properties": {
+              "feature": {
+                "type": "string",
+                "pattern": "^[a-z0-9_]+$",
+                "description": "The canonical session setting that carries the surcharge."
+              },
+              "percent": {
+                "type": "number",
+                "exclusiveMinimum": 0,
+                "description": "Extra cost as a percentage of the base price."
+              },
+              "note": {
+                "type": "string",
+                "description": "Source or caveat."
+              }
+            }
+          },
+          "description": "Per-setting price increases, so the settings report can say a setting was applied and surcharged."
+        },
+        "bills_silence": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "true when a live call is billed for all audio sent (speech and silence); false when only uploaded speech segments are billed. null = unknown."
+        },
+        "bills_failed_requests": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Whether a request that fails or is abandoned is still billed. null = unknown."
+        },
+        "pricing_key": {
+          "type": "string",
+          "description": "Key into config/pricing.rs; prices are not duplicated here."
+        },
+        "notes": {
+          "type": "string",
+          "description": "Anything that does not fit the fields above. Facts another field can hold do not belong here."
+        }
+      }
+    },
+    "privacy": {
+      "description": "What the gateway can ask of the vendor about keeping audio. First read by the canonical retention option of Release 5.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "retention"
+      ],
+      "properties": {
+        "retention": {
+          "description": "How zero retention is requested on this transport.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "enum": [
+                "per_request",
+                "account_setting",
+                "not_applicable",
+                "unknown"
+              ],
+              "description": "per_request: a parameter on each request. account_setting: only the vendor account can switch it, so the gateway cannot assert it. not_applicable: the operator's own server."
+            },
+            "param": {
+              "description": "For per_request: the parameter that asks the vendor not to retain.",
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "name",
+                "value",
+                "in"
+              ],
+              "properties": {
+                "name": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "Parameter name as the vendor spells it."
+                },
+                "value": {
+                  "type": "string",
+                  "description": "Value that requests no retention."
+                },
+                "in": {
+                  "enum": [
+                    "form",
+                    "query",
+                    "json",
+                    "header"
+                  ],
+                  "description": "Where the parameter goes."
+                }
+              }
+            }
+          },
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "per_request"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "param"
+            ]
+          }
+        }
+      }
+    },
+    "provenance": {
+      "description": "Who established the facts of this row or profile, when, and from what.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "confidence",
+        "verified_on",
+        "verified_by",
+        "owner",
+        "sources"
+      ],
+      "properties": {
+        "confidence": {
+          "enum": [
+            "probed",
+            "documented",
+            "assumed"
+          ],
+          "description": "probed: confirmed by a request to the vendor or the server. documented: read in vendor documentation or in first-party source code. assumed: inferred."
+        },
+        "verified_on": {
+          "$ref": "#/$defs/date",
+          "description": "Date the facts were last checked."
+        },
+        "verified_by": {
+          "enum": [
+            "live_probe",
+            "docs",
+            "code_reading",
+            "vendor_statement",
+            "none"
+          ],
+          "description": "How they were checked. code_reading is for first-party evidence: the gateway's or the inference engine's own source."
+        },
+        "owner": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Team that keeps the entry correct."
+        },
+        "sources": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^https://"
+          },
+          "uniqueItems": true,
+          "description": "Web pages the facts were read from. May be empty when code_refs carries the evidence."
+        },
+        "code_refs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "uniqueItems": true,
+          "description": "First-party evidence as repository paths with line numbers (gateway code, WaaV Infer source). Counts towards the minimum evidence of a documented or probed entry."
+        },
+        "probe_ref": {
+          "type": "string",
+          "minLength": 1,
+          "description": "For live_probe: the dated probe result file."
+        },
+        "recheck_on": {
+          "$ref": "#/$defs/date",
+          "description": "Date by which a volatile entry must be read again (a retirement a few days away, a vendor statement that says 'for now')."
+        },
+        "unverified": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Fields of this entry that nobody has confirmed, each with a few words on why."
+        },
+        "notes": {
+          "type": "string",
+          "description": "Context for the next reader. Facts another field can hold do not belong here."
+        }
+      },
+      "if": {
+        "properties": {
+          "confidence": {
+            "enum": [
+              "probed",
+              "documented"
+            ]
+          }
+        }
+      },
+      "then": {
+        "anyOf": [
+          {
+            "properties": {
+              "sources": {
+                "minItems": 1
+              }
+            }
+          },
+          {
+            "required": [
+              "code_refs"
+            ],
+            "properties": {
+              "code_refs": {
+                "minItems": 1
+              }
+            }
+          }
+        ]
+      }
+    },
+    "deployment_override": {
+      "description": "The block a deployment may carry at voice_table.config.stt.capability_override. It never edits a row: profile replaces the row's transports whole, latency and limits overlay numbers, and nothing else in a row can be overridden. The gateway parses it tolerantly (an unknown or wrong-typed field is dropped and logged); this definition is the contract budapp validates against.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "profile": {
+          "$ref": "#/$defs/profile_name",
+          "description": "Name of a profile. It must list the deployment's provider in allowed_providers; otherwise it is ignored with an advisory."
+        },
+        "underlying_model": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The real model behind a deployment name or a proxy (required for Azure OpenAI, whose wire id is a deployment name). Used for the row lookup only; the model that is sent stays the deployment's."
+        },
+        "realtime_url": {
+          "type": "string",
+          "pattern": "^wss?://",
+          "description": "Socket address for a socket profile. Checked under the same egress rule as the base address."
+        },
+        "latency": {
+          "description": "The operator's own measurement, which replaces the row's seed.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "ttfs_p50_ms": {
+              "type": "integer",
+              "minimum": 50,
+              "maximum": 60000,
+              "description": "Median, end of speech to final transcript."
+            },
+            "ttfs_p99_ms": {
+              "type": "integer",
+              "minimum": 50,
+              "maximum": 60000,
+              "description": "99th percentile, end of speech to final transcript."
+            }
+          }
+        },
+        "limits": {
+          "description": "What this server or this vendor account accepts, which replaces the row's figures.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "plan": {
+              "type": "string",
+              "pattern": "^[a-z0-9][a-z0-9_.-]*$",
+              "description": "The vendor plan of this deployment's account. Selects the entries of the row's rates with that plan in place of assumed_plan."
+            },
+            "max_audio_ms": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Longest audio in one request."
+            },
+            "max_upload_bytes": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Largest request body."
+            },
+            "max_concurrent_requests": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Uploads in flight across all sessions of the deployment."
+            },
+            "requests_per_minute": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Request ceiling per minute."
+            }
+          }
+        },
+        "deadline_ms": {
+          "type": "integer",
+          "minimum": 3000,
+          "maximum": 10000,
+          "description": "Replaces the gateway's default deadline (6000 ms) for one caller turn on this deployment."
+        },
+        "latency_tier": {
+          "enum": [
+            "standard",
+            "low_latency"
+          ],
+          "default": "standard",
+          "description": "Read from Release 4 (addendum B9). low_latency prefers a usable commit transport over a file transport when a row has both, keeping the file transport as fallback, and enables the early hedged request. Chosen by the deployment owner, who pays for hedged requests."
+        }
+      }
+    }
+  }
+}

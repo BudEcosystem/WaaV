@@ -184,20 +184,7 @@ pub async fn handle_incoming_message(
             message_type,
             payload,
         } => handle_custom_message(message_type, payload, state, message_tx, app_state).await,
-        IncomingMessage::AudioEnd => {
-            let keep = handle_audio_end(state, message_tx).await;
-            // Spec 025 manual turn detection: the end of the client's audio commits its turn. The
-            // provider's last final lands within the finalize; give it a moment before committing.
-            if let Some(engine) = state.read().await.agent.clone()
-                && engine.is_manual()
-            {
-                tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                    engine.commit_input().await;
-                });
-            }
-            keep
-        }
+        IncomingMessage::AudioEnd => commit_client_audio(state, message_tx, false).await,
     }
 }
 
@@ -535,6 +522,52 @@ async fn handle_custom_message(
     }
 
     true
+}
+
+/// The client ended its audio (`/ws` `audio_end`, `/v1/realtime` `input_audio_buffer.commit`).
+///
+/// A segmented session flushes its engine and, for an agent in manual mode, waits for the final of
+/// the turn the commit sealed (it always comes, empty if nothing was recognised) before committing
+/// the turn; a fixed sleep would commit before the upload returned. Any other session keeps
+/// today's path: the provider's last final lands within the finalize, so the commit waits 300 ms.
+/// `always_commit`: the Realtime surface commits even where `/ws` would (manual mode is its only
+/// way to end a turn there).
+pub async fn commit_client_audio(
+    state: &Arc<RwLock<ConnectionState>>,
+    message_tx: &mpsc::Sender<MessageRoute>,
+    always_commit: bool,
+) -> bool {
+    let (agent, vm) = {
+        let g = state.read().await;
+        (g.agent.clone(), g.voice_manager.clone())
+    };
+    if let Some(vm) = vm.filter(|vm| vm.is_gateway_endpointed()) {
+        tokio::spawn(async move {
+            let outcome = vm.flush_stt().await;
+            let Some(engine) = agent.filter(|e| always_commit || e.is_manual()) else {
+                return;
+            };
+            if let Some(turn) = outcome.and_then(|o| o.turn_id.filter(|_| o.result_follows)) {
+                let bound = vm
+                    .live_facts()
+                    .await
+                    .map_or(7_000, |f| u64::from(f.resolution_deadline_ms) + 1_000);
+                engine
+                    .wait_final_turn(turn, std::time::Duration::from_millis(bound))
+                    .await;
+            }
+            engine.commit_input().await;
+        });
+        return true;
+    }
+    let keep = handle_audio_end(state, message_tx).await;
+    if let Some(engine) = agent.filter(|e| always_commit || e.is_manual()) {
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            engine.commit_input().await;
+        });
+    }
+    keep
 }
 
 #[cfg(test)]

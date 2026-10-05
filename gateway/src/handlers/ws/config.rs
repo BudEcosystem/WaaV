@@ -94,6 +94,7 @@ pub fn default_agent_stt_config() -> STTWebSocketConfig {
         extras: Default::default(),
         translation: None,
         turn_detection: None,
+        transcription_mode: None,
     }
 }
 
@@ -446,6 +447,13 @@ pub struct STTWebSocketConfig {
     /// degrades LOUDLY (warn + waav_degraded_total) to timer fallback.
     #[serde(default)]
     pub turn_detection: Option<TurnDetectionWsConfig>,
+    /// The kind of speech-to-text the client wants: `auto` (the default: whatever the model
+    /// supports), `streaming` (refuse a model that cannot stream) or `segmented` (the gateway cuts
+    /// the audio at pauses and uploads each utterance, even for a model that streams). A plain
+    /// session on a model whose today client buffers until `audio_end` moves to the segmented
+    /// engine only when it asks for `segmented`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcription_mode: Option<String>,
 }
 
 /// Per-session ML turn-detection knobs (provider-agnostic).
@@ -1128,6 +1136,7 @@ mod config_tests {
             features: Default::default(),
             extras: Default::default(),
             turn_detection: None,
+            transcription_mode: None,
             translation: None,
             audio_in_codec: None,
         }

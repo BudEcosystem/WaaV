@@ -39,33 +39,12 @@
 //!
 //! This module is feature-free: it must be available to non-DAG builds.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::IpAddr;
 
 use crate::config::utils::parse_bool;
 
 pub(crate) const HTTP_URL_SCHEMES: &[&str] = &["http", "https"];
 pub(crate) const HTTP_WS_URL_SCHEMES: &[&str] = &["http", "https", "ws", "wss"];
-
-/// Hostnames rejected outright (case-insensitive), before any IP parsing or
-/// DNS resolution. Union of the lists the three former copies carried, plus
-/// `metadata.azure.com`.
-const BLOCKED_HOSTNAMES: &[&str] = &[
-    "localhost",
-    "localhost.localdomain",
-    "127.0.0.1",
-    "::1",
-    "0.0.0.0",
-    "[::1]",
-    "[::ffff:127.0.0.1]",
-    // Cloud metadata endpoints (AWS/Azure/GCP share the link-local IP).
-    "169.254.169.254",
-    "metadata.google.internal",
-    "metadata.gcp.internal",
-    "metadata.azure.com",
-    // Common internal hostnames.
-    "internal",
-    "intranet",
-];
 
 /// Whether loopback/private endpoint targets are explicitly permitted.
 ///
@@ -234,56 +213,8 @@ fn ssrf_dns_host(
         .host_str()
         .ok_or_else(|| format!("URL '{}' has no host", url))?;
 
-    // Blocked hostnames (case-insensitive).
-    let host_lower = host.to_lowercase();
-    if BLOCKED_HOSTNAMES.contains(&host_lower.as_str()) {
-        return Err(format!("URL host '{}' is blocked (SSRF protection)", host));
-    }
-
-    // Plain IP literal (the `url` crate normalizes IPv4 forms for http/ws
-    // schemes, so decimal/octal/hex literals usually surface here already).
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        if is_private_ip(&ip) {
-            return Err(format!(
-                "URL points to private IP '{}' (SSRF protection)",
-                ip
-            ));
-        }
-        return Ok(None);
-    }
-
-    // Bracketed IPv6 literal.
-    if host.starts_with('[') && host.ends_with(']') {
-        if let Ok(ip) = host[1..host.len() - 1].parse::<Ipv6Addr>()
-            && is_private_ipv6(&ip)
-        {
-            return Err(format!(
-                "URL points to private IPv6 '{}' (SSRF protection)",
-                ip
-            ));
-        }
-        // An IP literal — never DNS-resolved.
-        return Ok(None);
-    }
-
-    // DECIMAL/integer IPv4 literal (e.g. `http://3232235777` == 192.168.1.1).
-    // Defense-in-depth for url-crate versions / entry points that do not
-    // normalize this form; an all-digits host is an address, not a DNS name.
-    if !host.is_empty()
-        && host.bytes().all(|b| b.is_ascii_digit())
-        && let Ok(n) = host.parse::<u32>()
-    {
-        let ip = Ipv4Addr::from(n);
-        if is_private_ipv4(&ip) {
-            return Err(format!(
-                "URL host '{}' is a decimal IPv4 literal for private IP '{}' (SSRF protection)",
-                host, ip
-            ));
-        }
-        return Ok(None);
-    }
-
-    Ok(Some(host.to_string()))
+    // Blocked hostnames and every IP-literal spelling: the rule segmented sessions apply too.
+    waav_segmented_stt::net::check_host(host)
 }
 
 /// Resolve a DNS hostname and reject if any resolved IP is private/internal.
@@ -315,97 +246,12 @@ pub fn validate_resolved_host_for_ssrf(host: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Check if an IP address is private/internal.
+/// Check if an IP address is private/internal: not on the public internet by the rule segmented
+/// sessions' upload pools use (loopback, private, link-local and cloud metadata, CGNAT, current
+/// network, documentation, benchmarking, reserved, multicast, broadcast; IPv4-mapped addresses
+/// judged as IPv4).
 fn is_private_ip(ip: &IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => is_private_ipv4(v4),
-        IpAddr::V6(v6) => is_private_ipv6(v6),
-    }
-}
-
-/// Check if an IPv4 address is private/internal.
-///
-/// Blocked ranges (union of the former copies):
-/// - Loopback `127.0.0.0/8`
-/// - Link-local `169.254.0.0/16` (includes cloud metadata)
-/// - Private RFC1918 (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`)
-/// - Current network `0.0.0.0/8` (includes unspecified)
-/// - Broadcast `255.255.255.255`
-/// - Shared/CGNAT `100.64.0.0/10`
-/// - Documentation TEST-NETs (`192.0.2.0/24`, `198.51.100.0/24`,
-///   `203.0.113.0/24`)
-/// - Benchmarking `198.18.0.0/15`
-fn is_private_ipv4(ip: &Ipv4Addr) -> bool {
-    if ip.is_loopback() || ip.is_link_local() || ip.is_private() || ip.is_broadcast() {
-        return true;
-    }
-
-    let octets = ip.octets();
-
-    // 0.0.0.0/8 (current network, includes the unspecified address)
-    if octets[0] == 0 {
-        return true;
-    }
-
-    // Shared address space (CGNAT) 100.64.0.0/10
-    if octets[0] == 100 && (octets[1] & 0xC0) == 64 {
-        return true;
-    }
-
-    // Documentation (TEST-NET-1/2/3)
-    if ip.is_documentation() {
-        return true;
-    }
-
-    // Reserved for benchmarking 198.18.0.0/15
-    if octets[0] == 198 && (octets[1] == 18 || octets[1] == 19) {
-        return true;
-    }
-
-    false
-}
-
-/// Check if an IPv6 address is private/internal.
-///
-/// Blocked (union of the former copies, plus multicast):
-/// - Loopback `::1`, unspecified `::`
-/// - IPv4-MAPPED addresses (verdict delegated to the IPv4 rules)
-/// - Link-local `fe80::/10`, unique-local `fc00::/7`
-/// - Documentation `2001:db8::/32`
-/// - Multicast `ff00::/8` (audit gap: includes all-nodes/all-routers groups)
-fn is_private_ipv6(ip: &Ipv6Addr) -> bool {
-    if ip.is_loopback() || ip.is_unspecified() {
-        return true;
-    }
-
-    // IPv4-mapped addresses (::ffff:0:0/96): check the embedded IPv4.
-    if let Some(v4) = ip.to_ipv4_mapped() {
-        return is_private_ipv4(&v4);
-    }
-
-    let segments = ip.segments();
-
-    // Link-local fe80::/10
-    if segments[0] & 0xFFC0 == 0xFE80 {
-        return true;
-    }
-
-    // Unique local fc00::/7
-    if segments[0] & 0xFE00 == 0xFC00 {
-        return true;
-    }
-
-    // Documentation 2001:db8::/32
-    if segments[0] == 0x2001 && segments[1] == 0x0DB8 {
-        return true;
-    }
-
-    // Multicast ff00::/8
-    if segments[0] & 0xFF00 == 0xFF00 {
-        return true;
-    }
-
-    false
+    !waav_segmented_stt::net::is_public_ip(ip)
 }
 
 /// Process-global lock for tests that touch `WAAV_ALLOW_LOOPBACK_ENDPOINTS`.
@@ -569,7 +415,9 @@ mod tests {
         // 134744072 == 8.8.8.8 (public) passes.
         assert!(validate_url_for_ssrf("http://134744072/x", HTTP_SCHEMES).is_ok());
         // The raw-host check catches the same form on the resolve entry point.
-        assert!(is_private_ipv4(&Ipv4Addr::from(2130706433u32)));
+        assert!(is_private_ip(&IpAddr::V4(std::net::Ipv4Addr::from(
+            2130706433u32
+        ))));
     }
 
     #[test]

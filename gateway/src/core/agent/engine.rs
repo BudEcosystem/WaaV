@@ -37,6 +37,7 @@ use super::spoken::{SpeechRate, SpokenLedger};
 use super::text::{
     CodeFenceFilter, SpeakFieldExtractor, SpeechChunker, chunk_separator, transform_for_speech,
 };
+use super::tone;
 use crate::core::text::ThinkStripper;
 
 // =============================================================================================
@@ -58,6 +59,16 @@ pub trait SpeechOut: Send + Sync + 'static {
     fn audio_out_ms(&self) -> u64;
     /// Delivered audio not played yet, in ms.
     fn playout_remaining_ms(&self) -> u64;
+    /// One pulse of the tool-call tone, encoded for this output, or `None` when this output cannot
+    /// carry one (a compressed TTS format): the agent keeps its phrases instead.
+    fn tone_pulse(&self) -> Option<Arc<crate::core::tts::AudioData>> {
+        None
+    }
+    /// Play a generated sound the way speech is played: after what is queued, cut by a barge-in.
+    /// `false` when a clear happened since `epoch`.
+    async fn play_sound(&self, _sound: &crate::core::tts::AudioData, _epoch: usize) -> bool {
+        false
+    }
 }
 
 #[async_trait]
@@ -87,6 +98,12 @@ impl SpeechOut for crate::core::voice_manager::VoiceManager {
     }
     fn playout_remaining_ms(&self) -> u64 {
         crate::core::voice_manager::VoiceManager::playout_remaining_ms(self)
+    }
+    fn tone_pulse(&self) -> Option<Arc<crate::core::tts::AudioData>> {
+        crate::core::voice_manager::VoiceManager::tone_pulse(self)
+    }
+    async fn play_sound(&self, sound: &crate::core::tts::AudioData, epoch: usize) -> bool {
+        self.play_if_epoch(sound.clone(), epoch).await
     }
 }
 
@@ -152,6 +169,9 @@ pub enum TurnKind {
     Agent,
     /// The static greeting: spoken by WaaV, never part of the agent's history.
     Greeting,
+    /// Something the gateway says itself (a lost turn on a segmented session): never part of the
+    /// agent's history, always interruptible.
+    Notice,
 }
 
 /// Everything a front-end shows, in the order it happened.
@@ -230,6 +250,87 @@ const MAX_DRAIN: Duration = Duration::from_secs(30);
 const DRAIN_QUIET: Duration = Duration::from_millis(600);
 /// How often fillers and the drain are checked.
 const TICK: Duration = Duration::from_millis(100);
+
+/// When a tool's tone starts if the agent has no tool phrase (`tool_call_after_ms` 0).
+const TONE_AFTER: Duration = Duration::from_millis(1_200);
+/// How long the tone waits for a phrase's audio to start arriving before it stops waiting on it
+/// (synthesis failed, or produced nothing).
+const TONE_PHRASE_GRACE: Duration = Duration::from_millis(1_500);
+/// How long the output is quiet before a pulse, so the tone is heard apart from the phrase.
+const TONE_GAP: Duration = Duration::from_millis(400);
+
+/// The tool-call tone of one turn (D-16): a pulse every [`tone::PERIOD_MS`] while a tool runs,
+/// once the tool's phrase has played.
+struct ToneCursor {
+    pulse: Arc<crate::core::tts::AudioData>,
+    next_at: Option<Instant>,
+    /// The last thing this turn sent to TTS: when, and the audio-out counter before it.
+    spoke: Option<(Instant, u64)>,
+    /// The audio-out counter at the previous check: audio still arriving holds the pulse back.
+    last_out: u64,
+    /// Since when nothing has been arriving or playing.
+    quiet_since: Option<Instant>,
+}
+
+impl ToneCursor {
+    /// `None` when the agent turned the tone off or the session's output cannot carry it.
+    fn new(fillers: &bud_auth::voice_agent::AgentFillers, speech: &dyn SpeechOut) -> Option<Self> {
+        if !fillers.tool_call_sound {
+            return None;
+        }
+        Some(Self {
+            pulse: speech.tone_pulse()?,
+            next_at: None,
+            spoke: None,
+            last_out: speech.audio_out_ms(),
+            quiet_since: None,
+        })
+    }
+
+    /// Text was just sent to TTS; `mark` is the audio-out counter from before.
+    fn spoke(&mut self, mark: u64) {
+        self.spoke = Some((Instant::now(), mark));
+    }
+
+    /// Whether a pulse is due: its period has come round and the output has been quiet for
+    /// [`TONE_GAP`], with what was last said heard first (its audio arrived and played out, or
+    /// never came).
+    fn due(&mut self, audio_out_ms: u64, playout_remaining_ms: u64) -> bool {
+        let arriving = audio_out_ms != self.last_out;
+        self.last_out = audio_out_ms;
+        if arriving || playout_remaining_ms > 0 {
+            self.quiet_since = None;
+            return false;
+        }
+        if self.quiet_since.get_or_insert_with(Instant::now).elapsed() < TONE_GAP {
+            return false;
+        }
+        if self.next_at.is_some_and(|at| Instant::now() < at) {
+            return false;
+        }
+        !matches!(self.spoke, Some((at, mark)) if audio_out_ms <= mark && at.elapsed() < TONE_PHRASE_GRACE)
+    }
+
+    fn played(&mut self, audio_out_ms: u64) {
+        self.next_at = Some(Instant::now() + Duration::from_millis(tone::PERIOD_MS));
+        self.last_out = audio_out_ms;
+        self.quiet_since = None;
+    }
+}
+
+/// The agent at work on a tool call: from the call until the agent speaks again. A tool often
+/// returns in well under a second while the model thinks for seconds before and after it; to the
+/// caller, all of it is the wait. The tool-call phrase and tone cover this span, not only the time
+/// the tool itself runs.
+struct ToolWork {
+    since: Instant,
+    /// The first tool of the span, for its own phrase.
+    tool: String,
+    /// The span's phrase has been said (or its slot taken).
+    phrased: bool,
+    /// [`Pump::spoken`] when the span began: a chunk spoken after it, with no tool running, ends it.
+    spoken: u64,
+}
 
 /// Where a turn is in its filler list (D-16). Each turn starts from the first phrase.
 #[derive(Debug, Default)]
@@ -325,6 +426,9 @@ pub struct AgentEngine {
     manual_input: Mutex<String>,
     /// The client's choice of manual turns (GA `turn_detection: null`), over the agent's.
     manual_override: Mutex<Option<bool>>,
+    /// Segmented sessions: the latest caller turn whose final transcript was handled, so a client
+    /// commit waits for the transcript of the turn it sealed instead of a fixed sleep.
+    final_turn: tokio::sync::watch::Sender<u64>,
 }
 
 impl std::fmt::Debug for AgentEngine {
@@ -380,7 +484,111 @@ impl AgentEngine {
             closed: AtomicBool::new(false),
             manual_input: Mutex::new(String::new()),
             manual_override: Mutex::new(None),
+            final_turn: tokio::sync::watch::channel(0).0,
         })
+    }
+
+    /// A segmented session handled the final transcript of caller turn `turn_id`.
+    pub fn note_final_turn(&self, turn_id: u64) {
+        self.final_turn.send_if_modified(|t| {
+            let newer = turn_id > *t;
+            if newer {
+                *t = turn_id;
+            }
+            newer
+        });
+    }
+
+    /// Wait, at most `timeout`, until the final transcript of caller turn `turn_id` was handled.
+    pub async fn wait_final_turn(&self, turn_id: u64, timeout: std::time::Duration) -> bool {
+        let mut rx = self.final_turn.subscribe();
+        tokio::time::timeout(timeout, rx.wait_for(|t| *t >= turn_id))
+            .await
+            .is_ok_and(|r| r.is_ok())
+    }
+
+    /// Whether `text` is probably the agent's own words coming back (no echo cancellation on the
+    /// caller's side): the whole of it appears in what the agent is saying or just said.
+    pub fn is_probable_echo(&self, text: &str) -> bool {
+        let norm = |s: &str| -> String {
+            s.chars()
+                .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+                .collect::<String>()
+                .to_lowercase()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let t = norm(text);
+        if t.split_whitespace().count() < 2 {
+            return false;
+        }
+        let spoken = {
+            let active = self
+                .turn
+                .lock()
+                .as_ref()
+                .map(|a| a.shared.lock().generated.clone());
+            let last = self
+                .last
+                .lock()
+                .as_ref()
+                .map(|(_, s)| s.lock().generated.clone());
+            format!(
+                "{} {}",
+                active.unwrap_or_default(),
+                last.unwrap_or_default()
+            )
+        };
+        norm(&spoken).contains(&t)
+    }
+
+    /// Say `text` as the gateway's own notice: not part of the agent's history, interruptible.
+    pub async fn speak_notice(self: &Arc<Self>, text: &str) {
+        let text = text.trim().to_string();
+        if text.is_empty() || self.is_closed() {
+            return;
+        }
+        let id = self.next_turn.fetch_add(1, Ordering::AcqRel);
+        let token = CancellationToken::new();
+        let shared = Arc::new(Mutex::new(TurnShared::new(TurnKind::Notice)));
+        *self.turn.lock() = Some(ActiveTurn {
+            id,
+            token: token.clone(),
+            shared: Arc::clone(&shared),
+        });
+        self.signal(AgentSignal::ResponseStarted {
+            turn: id,
+            kind: TurnKind::Notice,
+            input: None,
+        });
+        let text_only = self.cfg.lock().text_only;
+        let epoch = self.speech.clear_epoch();
+        let mut spoke = true;
+        if !text_only {
+            let speech = transform_for_speech(&text, &self.entry.text_transforms);
+            let mark = self.speech.audio_out_ms();
+            spoke = self.speech.speak(&speech, epoch, true).await;
+            if spoke {
+                shared.lock().ledger.push(&text, &speech, false, mark);
+            }
+        }
+        if spoke {
+            shared.lock().transcript = text.clone();
+            self.signal(AgentSignal::Transcript {
+                turn: id,
+                delta: text,
+            });
+        }
+        if !text_only {
+            self.drain(&token, &shared).await;
+        }
+        let status = if token.is_cancelled() {
+            TurnStatus::Cancelled
+        } else {
+            TurnStatus::Completed
+        };
+        self.finish(id, &shared, status, None);
     }
 
     pub fn entry(&self) -> &Arc<VoiceAgentEntry> {
@@ -480,7 +688,7 @@ impl AgentEngine {
         match kind {
             Some(TurnKind::Greeting) => self.entry.greeting.interruptible,
             Some(TurnKind::Agent) => self.entry.interruption.enabled,
-            None => true,
+            Some(TurnKind::Notice) | None => true,
         }
     }
 
@@ -653,12 +861,14 @@ impl AgentEngine {
         if s.kind != TurnKind::Agent || (s.truncated_exact && exact_ms.is_none()) {
             return;
         }
-        let played = exact_ms.unwrap_or_else(|| {
-            s.ledger.played_ms(
-                self.speech.audio_out_ms(),
-                self.speech.playout_remaining_ms(),
-            )
-        });
+        let played = exact_ms
+            .map(|ms| s.ledger.speech_ms(ms))
+            .unwrap_or_else(|| {
+                s.ledger.played_ms(
+                    self.speech.audio_out_ms(),
+                    self.speech.playout_remaining_ms(),
+                )
+            });
         let prefix = s
             .ledger
             .spoken_prefix(played, self.rate.lock().chars_per_ms());
@@ -877,10 +1087,19 @@ impl AgentEngine {
             think: ThinkStripper::default(),
             extractor: speak_field.map(SpeakFieldExtractor::new),
             spoke_reply: false,
+            spoken: 0,
             first_audio_at: None,
             first_token_at: None,
         };
         let mut tools: HashMap<String, (String, Instant, bool)> = HashMap::new();
+        let mut work: Option<ToolWork> = None;
+        let mut tone = (!text_only)
+            .then(|| ToneCursor::new(&self.entry.fillers, self.speech.as_ref()))
+            .flatten();
+        let tone_after = match self.entry.fillers.tool_call_after_ms {
+            0 => TONE_AFTER,
+            ms => Duration::from_millis(ms),
+        };
         let mut status = TurnStatus::Completed;
         let mut usage: Option<Value> = None;
         let mut failure: Option<TurnFailure> = None;
@@ -915,18 +1134,27 @@ impl AgentEngine {
                             status = TurnStatus::Cancelled;
                             break;
                         }
+                        if tools.is_empty() && work.as_ref().is_some_and(|w| pump.spoken > w.spoken) {
+                            work = None;
+                        }
                     }
                     Some(Ok(AgentEvent::ToolStarted { item_id, name, .. })) => {
                         // The text before a tool call is a finished thought ("Let me check."): say it
                         // now. Held, it would be heard after the tool's fillers, run into the answer.
-                        if !text_only
-                            && let Some(held) = pump.chunker.flush()
-                            && !self.speak_chunk(id, &shared, &mut pump, &held, epoch, &token).await
-                        {
-                            status = TurnStatus::Cancelled;
-                            break;
+                        let mark = self.speech.audio_out_ms();
+                        if !text_only && let Some(held) = pump.chunker.flush() {
+                            if !self.speak_chunk(id, &shared, &mut pump, &held, epoch, &token).await {
+                                status = TurnStatus::Cancelled;
+                                break;
+                            }
+                            if let Some(t) = tone.as_mut() {
+                                t.spoke(mark);
+                            }
                         }
                         self.signal(AgentSignal::Tool { turn: id, item_id: item_id.clone(), name: name.clone(), status: "in_progress" });
+                        if work.is_none() {
+                            work = Some(ToolWork { since: Instant::now(), tool: name.clone(), phrased: false, spoken: pump.spoken });
+                        }
                         tools.insert(item_id, (name, Instant::now(), false));
                     }
                     Some(Ok(AgentEvent::ToolFinished { item_id, name, ok })) => {
@@ -957,12 +1185,18 @@ impl AgentEngine {
                     }
                     // Fillers (D-16): a running tool's own phrase, or the list in order while the wait lasts.
                     let fillers = &self.entry.fillers;
-                    if fillers.tool_call_after_ms > 0 {
+                    // With the tone, a span's first phrase is its only one: a later tool in the
+                    // span is covered by the pulse.
+                    let toned = tone.is_some() && work.as_ref().is_some_and(|w| w.phrased);
+                    if fillers.tool_call_after_ms > 0 && !toned {
                         let due: Option<String> = tools
                             .values_mut()
                             .find(|(_, since, done)| !*done && since.elapsed() >= Duration::from_millis(fillers.tool_call_after_ms))
                             .map(|(name, _, done)| { *done = true; name.clone() });
                         if let Some(name) = due {
+                            if let Some(w) = work.as_mut() {
+                                w.phrased = true;
+                            }
                             let own = fillers
                                 .use_tool_status_messages
                                 .then(|| self.entry.tool_phrase(&name).map(str::to_string))
@@ -974,11 +1208,50 @@ impl AgentEngine {
                                 // Timed from when it was due, like the list's phrases: speaking
                                 // waits on synthesis, which would stretch the next gap.
                                 filler.last_at = Some(Instant::now());
+                                let mark = self.speech.audio_out_ms();
                                 self.speak_aside(id, &shared, &phrase, epoch).await;
+                                if let Some(t) = tone.as_mut() {
+                                    t.spoke(mark);
+                                }
                             }
                         }
                     }
-                    if list_filler_due(fillers, filler.last_at, started, pump.spoke_reply, !tools.is_empty()) {
+                    // With the tone, the phrase comes once per span of tool work even when the tool
+                    // itself returned before it was due: the agent is still at work on it.
+                    if tone.is_some()
+                        && fillers.tool_call_after_ms > 0
+                        && let Some(w) = work.as_mut()
+                        && !w.phrased
+                        && w.since.elapsed() >= Duration::from_millis(fillers.tool_call_after_ms)
+                    {
+                        w.phrased = true;
+                        let own = fillers
+                            .use_tool_status_messages
+                            .then(|| self.entry.tool_phrase(&w.tool).map(str::to_string))
+                            .flatten();
+                        let listed = filler.take(&fillers.messages);
+                        if let Some(phrase) = own.or(listed) {
+                            filler.last_at = Some(Instant::now());
+                            let mark = self.speech.audio_out_ms();
+                            self.speak_aside(id, &shared, &phrase, epoch).await;
+                            if let Some(t) = tone.as_mut() {
+                                t.spoke(mark);
+                            }
+                        }
+                    }
+                    // The tone fills the tool work once its phrase is said: no list phrase over it,
+                    // and the list resumes a full gap after it ends.
+                    if let Some(t) = tone.as_mut()
+                        && work.as_ref().is_some_and(|w| w.since.elapsed() >= tone_after)
+                    {
+                        filler.last_at = Some(Instant::now());
+                        if t.due(self.speech.audio_out_ms(), self.speech.playout_remaining_ms()) {
+                            if self.speech.play_sound(&t.pulse, epoch).await {
+                                shared.lock().ledger.push_sound(u64::from(tone::PULSE_MS));
+                            }
+                            t.played(self.speech.audio_out_ms());
+                        }
+                    } else if list_filler_due(fillers, filler.last_at, started, pump.spoke_reply, !tools.is_empty()) {
                         filler.last_at = Some(Instant::now());
                         if let Some(phrase) = filler.take(&fillers.messages) {
                             self.speak_aside(id, &shared, &phrase, epoch).await;
@@ -1166,6 +1439,7 @@ impl AgentEngine {
             pump.first_audio_at = Some(pump.started.elapsed());
         }
         pump.spoke_reply = true;
+        pump.spoken += 1;
         let delta = {
             let mut s = shared.lock();
             s.ledger.push(chunk, &speech, true, mark);
@@ -1363,6 +1637,8 @@ struct Pump {
     think: ThinkStripper,
     extractor: Option<SpeakFieldExtractor>,
     spoke_reply: bool,
+    /// Reply chunks sent to TTS so far.
+    spoken: u64,
     first_audio_at: Option<Duration>,
     first_token_at: Option<Duration>,
 }

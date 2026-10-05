@@ -210,6 +210,12 @@ mod config_tests {
             config.try_api_url().unwrap(),
             "https://openai-compatible.invalid/v1/audio/transcriptions"
         );
+        // SDK-style bases end in `/v1` already: never `/v1/v1`.
+        unsafe { std::env::set_var("OPENAI_BASE_URL", "https://openai-compatible.invalid/v1") };
+        assert_eq!(
+            config.try_api_url().unwrap(),
+            "https://openai-compatible.invalid/v1/audio/transcriptions"
+        );
 
         unsafe { std::env::remove_var("OPENAI_BASE_URL") };
         assert_eq!(
@@ -309,6 +315,7 @@ mod message_tests {
     fn test_transcription_result_text_access() {
         let simple = TranscriptionResult::Simple(TranscriptionResponse {
             text: "Simple text".to_string(),
+            ..Default::default()
         });
         assert_eq!(simple.text(), "Simple text");
 
@@ -318,6 +325,7 @@ mod message_tests {
             duration: None,
             segments: vec![],
             words: vec![],
+            ..Default::default()
         });
         assert_eq!(verbose.text(), "Verbose text");
 
@@ -345,6 +353,7 @@ mod message_tests {
                 seek: None,
             }],
             words: vec![],
+            ..Default::default()
         });
 
         let confidence = verbose.confidence();
@@ -353,6 +362,7 @@ mod message_tests {
         // Test without segments (default confidence)
         let simple = TranscriptionResult::Simple(TranscriptionResponse {
             text: "Test".to_string(),
+            ..Default::default()
         });
         assert_eq!(simple.confidence(), 1.0);
     }
@@ -376,6 +386,7 @@ mod message_tests {
                     end: 1.0,
                 },
             ],
+            ..Default::default()
         });
 
         let words = verbose.words().unwrap();
@@ -386,72 +397,9 @@ mod message_tests {
         // Test without words
         let simple = TranscriptionResult::Simple(TranscriptionResponse {
             text: "Test".to_string(),
+            ..Default::default()
         });
         assert!(simple.words().is_none());
-    }
-}
-
-// =============================================================================
-// WAV Header Tests
-// =============================================================================
-
-mod wav_tests {
-    use super::*;
-
-    #[test]
-    fn test_wav_header_structure() {
-        let header = wav::create_header(1000, 16000, 1, 16);
-
-        // Check RIFF header
-        assert_eq!(&header[0..4], b"RIFF");
-        assert_eq!(&header[8..12], b"WAVE");
-
-        // Check fmt chunk
-        assert_eq!(&header[12..16], b"fmt ");
-
-        // Check data chunk
-        assert_eq!(&header[36..40], b"data");
-    }
-
-    #[test]
-    fn test_wav_header_sample_rate() {
-        let header = wav::create_header(1000, 44100, 2, 16);
-
-        // Sample rate at bytes 24-28 (little-endian)
-        let sample_rate = u32::from_le_bytes([header[24], header[25], header[26], header[27]]);
-        assert_eq!(sample_rate, 44100);
-    }
-
-    #[test]
-    fn test_wav_header_channels() {
-        let header = wav::create_header(1000, 16000, 2, 16);
-
-        // Channels at bytes 22-24 (little-endian)
-        let channels = u16::from_le_bytes([header[22], header[23]]);
-        assert_eq!(channels, 2);
-    }
-
-    #[test]
-    fn test_wav_creation() {
-        let pcm_data = vec![0u8; 160]; // 5ms at 16kHz 16-bit mono
-        let wav = wav::create_wav(&pcm_data, 16000, 1);
-
-        // Total size should be header (44) + data
-        assert_eq!(wav.len(), 44 + 160);
-
-        // Check that header is correct
-        assert_eq!(&wav[0..4], b"RIFF");
-        assert_eq!(&wav[8..12], b"WAVE");
-    }
-
-    #[test]
-    fn test_wav_file_size_field() {
-        let _pcm_data = vec![0u8; 1000];
-        let header = wav::create_header(1000, 16000, 1, 16);
-
-        // File size at bytes 4-8 (should be 36 + data_size)
-        let file_size = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
-        assert_eq!(file_size, 36 + 1000);
     }
 }
 

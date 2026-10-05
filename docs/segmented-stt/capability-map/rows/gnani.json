@@ -1,0 +1,699 @@
+{
+  "provider_id": "gnani",
+  "provider": {
+    "aliases": [
+      "gnani-ai",
+      "gnani.ai",
+      "vachana"
+    ],
+    "default_model": "gnani-prisma-v2.5",
+    "model_string": "wire_model",
+    "registered_in_gateway": true,
+    "native_model_handling": "ignored",
+    "prerequisites": [
+      {
+        "kind": "trust_root",
+        "detail": "The legacy gRPC service needs the vendor's CA certificate, which today's client reads only from the process environment (GNANI_CERTIFICATE_PATH or GNANI_CERTIFICATE_CONTENT).",
+        "wire": "gnani_legacy_grpc"
+      }
+    ],
+    "notes": "Registered in the plugin registry as gnani with the aliases gnani-ai, gnani.ai and vachana (gateway/src/plugin/builtin/mod.rs:1708-1711). The standard factory matches only the exact string gnani (gateway/src/core/stt/standard.rs:427), and gnani is missing from get_supported_stt_providers (gateway/src/core/stt/mod.rs:549-581). The vendor sells one current model, Gnani Prisma v2.5, on its Vachana platform (api.vachana.ai): a synchronous file endpoint, a realtime WebSocket that cuts utterances itself and returns final text only, and an asynchronous batch API. The gateway speaks to none of them. Its only Gnani client is gRPC to the older asr.gnani.ai service, with different credentials, and that client never validates or sends the model, so today every model string is routed to the legacy service. default_model is set to the vendor's only current model as a planning choice: today's code has no default beyond the placeholder string 'default' (gateway/src/core/stt/gnani/config.rs:100), which has its own row describing the legacy service. The Vachana endpoints need a Vachana API key sent as X-API-Key-ID; the gateway's server configuration only knows the legacy token (gateway/src/config/mod.rs:672-677). The vendor's own Pipecat and LiveKit integrations upload one utterance per request to the same file endpoint, so the segmented pattern is the vendor's documented usage. The only live contact with the vendor during the research was one unauthenticated request to the file endpoint, which returned HTTP 401; that confirms the endpoint exists and shows one of its two error shapes. Nothing was transcribed, which is why every row says it was verified from documentation."
+  },
+  "rows": [
+    {
+      "id": "gnani:gnani-prisma-v2.5",
+      "match": {
+        "provider": "gnani",
+        "model": "gnani-prisma-v2.5"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "regional_rest",
+          "enabled_from_release": 5,
+          "disabled_reason": "The file-upload adapter for live calls does not exist yet. The gateway has no request code for the vendor's synchronous endpoint (POST https://api.vachana.ai/stt/v3) and no configuration field for the Vachana API key that endpoint needs.",
+          "enable_requires": [
+            "live_probe"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "constraints": {
+            "languages": {
+              "mode": "only",
+              "codes": [
+                "bn",
+                "en",
+                "gu",
+                "hi",
+                "kn",
+                "ml",
+                "mr",
+                "pa",
+                "ta",
+                "te"
+              ],
+              "note": "The vendor's ten languages. On the wire each is the -IN form (bn-IN, en-IN, gu-IN, hi-IN, kn-IN, ml-IN, mr-IN, pa-IN, ta-IN, te-IN); bare codes are recorded so that a session naming hi or hi-IN matches. The vendor does not detect the language."
+            }
+          },
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "Not measured. The vendor publishes no latency for this REST endpoint. Its P95 of about 200 ms is a streaming figure and must not be used as a budget here."
+          },
+          "limits": {
+            "max_upload_bytes": null,
+            "max_audio_ms": 60000,
+            "min_audio_ms": null,
+            "vendor_timeout_ms": null,
+            "rates": []
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "mp3",
+              "ogg",
+              "flac",
+              "aac",
+              "m4a"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "multipart"
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language_code",
+            "language_shape": "single",
+            "language_format": "bcp47",
+            "language_required": true,
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "bias_list",
+                "max_items": 100,
+                "note": "Single words of letters only, with bias_score. The vendor ignores an invalid list and still answers 200, so the gateway must validate it. Boosting applies only to a specific language code such as hi-IN."
+              }
+            ],
+            "wire": "gnani_vachana_multipart"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/batch.rs:839-844; gateway/src/core/stt/prerecorded.rs:116-123",
+            "notes": "No code exists for this transport. The shared file-request helpers at the cited lines cover only Deepgram, AssemblyAI, OpenAI and ElevenLabs. The request is multipart form data with the fields audio_file and language_code and the header X-API-Key-ID. The audio must be a real audio file such as WAV, because the endpoint rejects headerless PCM. The response is JSON with success, request_id, timestamp and transcript, and carries no confidence value. Errors arrive in two different JSON shapes and both must be parsed. The vendor silently ignores an invalid word-boosting list (bias_list) and still answers 200, so the gateway must validate the list itself. The OpenAPI schema of this endpoint has no model property and the WebSocket takes no model at all; the vendor's prose mentions an optional model form field whose default is vachana-audio-intelligence-v2, and the response example in the vendor's quick start reports gnani-prisma-v2.5. No other accepted value is documented, so the adapter should leave the model off the wire. The canonical keyterms setting maps to the vendor's bias_list field."
+          },
+          "file_request_mode": "sync"
+        },
+        {
+          "input_mode": "vendor_segmented",
+          "adapter": "planned_stream",
+          "enabled_from_release": null,
+          "disabled_reason": "No gateway client exists for the vendor's realtime WebSocket (wss://api.vachana.ai/stt/v3/stream). The gateway's only Gnani client speaks gRPC to the older asr.gnani.ai service, which is a different service with different credentials.",
+          "interim_results": "none",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": [
+              {
+                "percentile": "typical",
+                "quantity": "end_of_speech_to_final",
+                "value_ms": 500,
+                "basis": "vendor_claim",
+                "source": "https://docs.gnani.ai/api/use-cases/real-time-compliance.md",
+                "conditions": "The vendor's '300 to 500 ms' from end of speech to transcript on the WebSocket; no method, percentile or region is given."
+              }
+            ],
+            "notes": "Not measured. The vendor states about 300 to 500 ms from end of speech to transcript on this socket, without a method or a percentile; the upper figure is recorded as a typical vendor figure. The model card's streaming P95 under 200 ms does not say what it times and is not recorded."
+          },
+          "limits": {
+            "max_session_ms": 900000,
+            "rates": []
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le"
+            ],
+            "sample_rates_hz": [
+              8000,
+              16000,
+              44100,
+              48000
+            ],
+            "channels": 1
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "lang_code",
+            "language_shape": "single",
+            "language_format": "bcp47",
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "x-bias-list",
+                "max_items": 100,
+                "note": "An upgrade header, with x-bias-score; same rules as bias_list on the file endpoint."
+              }
+            ],
+            "wire": "gnani_vachana_ws"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "notes": "A client for this socket would have to be written. No gateway code speaks this transport, so no code reference is given; the only Gnani client in the gateway (gateway/src/core/stt/gnani/grpc.rs:30-33) is gRPC to a different service. Requirements read from the vendor documentation: all settings travel in the WebSocket upgrade headers (x-api-key-id, lang_code, x-sample-rate and the voice-activity headers); audio is 16-bit mono PCM in binary frames of exactly 1,024 bytes sent at real-time pace; the vendor's own voice-activity detector cuts the audio into segments and returns one final transcript per segment, with no interim text on the documented route; and every session ends after 15 minutes, so long calls need a planned reconnect."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "unknown",
+        "refuse_from_release": null
+      },
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "The vendor publishes no rate card for speech-to-text. Its batch page says billing is per audio duration; nothing is stated for the synchronous REST endpoint or the WebSocket. There is no Gnani entry in gateway/src/config/pricing.rs, so no pricing_key is given."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://docs.gnani.ai/api/STT/speech-to-text.md",
+          "https://docs.gnani.ai/api/STT/stt-websocket.md",
+          "https://docs.gnani.ai/api/STTBatch/Introduction.md",
+          "https://docs.gnani.ai/api/introduction/introduction.md",
+          "https://docs.gnani.ai/api/introduction/quick-start.md",
+          "https://docs.gnani.ai/python-sdk/speech-to-text.md",
+          "https://docs.gnani.ai/pipecat/introduction.md",
+          "https://docs.gnani.ai/api/use-cases/real-time-compliance.md",
+          "https://huggingface.co/gnani-ai/gnani/raw/main/README.md"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/batch.rs:839-844",
+          "gateway/src/core/stt/prerecorded.rs:116-123",
+          "gateway/src/core/stt/gnani/grpc.rs:30-33",
+          "gateway/src/core/stt/gnani/config.rs:100"
+        ],
+        "unverified": [
+          "billing.unit, billing.min_billed_ms and billing.bills_silence (no public rate card)",
+          "transports[0].limits.max_upload_bytes (not published for the REST endpoint)",
+          "transports[0].limits.min_audio_ms (not published for the REST endpoint)",
+          "transports[0].limits.rates (requests and concurrent_requests) (only a 429 RATE_LIMIT_ERROR code is documented, with no numbers)",
+          "transports[0].limits.max_audio_ms (60 s in the field description and in the 400 error example; one paragraph of the vendor's OpenAPI text says 30 s)",
+          "transports[0].limits.vendor_timeout_ms (the vendor publishes no server-side request timeout; 60 s is only the default of the vendor's own Python client)",
+          "transports[0].latency (no REST figure is published; the endpoint's behaviour on silent audio is also unknown)",
+          "transports[1].interim_results (the documented v3 route sends final transcripts only; the same page mentions an x-partials header and a /stt/v4/stream route that have no reference page)",
+          "transports[1].latency (the vendor's 300 to 500 ms claim has no percentile and no method)",
+          "transports[1].limits.rates (requests and concurrent_sessions) (no connection or rate limit is published for the WebSocket)",
+          "transports[1].stream_audio.sample_rates_hz (the x-sample-rate values 8000, 16000, 44100 and 48000 are read from the vendor page; never exercised)"
+        ],
+        "notes": "The vendor documents one model, Gnani Prisma v2.5, on its Vachana platform, and exposes endpoints rather than a model catalogue. This id is the value the vendor's batch API requires in config.model and the value the REST response reports. Neither the synchronous REST endpoint nor the WebSocket takes a model field, so the gateway uses this id only to select the row. The vendor does accept a live stream for this model, but the gateway has no client for that socket, so uploading each utterance as a file is the only way to serve a current Gnani key until one is written. The file upload is listed first for that reason; when a WebSocket client ships and its latency has been measured the order should be reviewed, because the fact-check expects the socket to become the primary transport. The vendor's asynchronous batch API (create a job, start it, poll no faster than every 10 s) is not listed because it cannot serve a call. A segment must never exceed 60 s; the gateway default of 25 s is inside that and inside the 30 s the vendor calls ideal, so no segment profile is given. The audit suggests an 8 s request timeout with at most one retry until a P99 has been measured; that figure is the auditor's estimate, not a vendor fact. The language is required and must be one of bn-IN, en-IN, gu-IN, hi-IN, kn-IN, ml-IN, mr-IN, pa-IN, ta-IN, te-IN; there is no automatic detection. What happens today is different from what this row will route to: the existing client never reads the model field, so a session that names this id, or names no model and so resolves to it, is not refused. It is handed to the legacy gRPC client described in the 'default' row, which dials a different service with different credentials, so the call starts and very probably never produces a transcript."
+      }
+    },
+    {
+      "id": "gnani:vachana-audio-intelligence-v2",
+      "match": {
+        "provider": "gnani",
+        "model": "vachana-audio-intelligence-v2"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "regional_rest",
+          "enabled_from_release": 5,
+          "disabled_reason": "The file-upload adapter for live calls does not exist yet. The gateway has no request code for the vendor's synchronous endpoint (POST https://api.vachana.ai/stt/v3) and no configuration field for the Vachana API key that endpoint needs.",
+          "enable_requires": [
+            "live_probe"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "constraints": {
+            "languages": {
+              "mode": "only",
+              "codes": [
+                "bn",
+                "en",
+                "gu",
+                "hi",
+                "kn",
+                "ml",
+                "mr",
+                "pa",
+                "ta",
+                "te"
+              ],
+              "note": "The vendor's ten languages. On the wire each is the -IN form (bn-IN, en-IN, gu-IN, hi-IN, kn-IN, ml-IN, mr-IN, pa-IN, ta-IN, te-IN); bare codes are recorded so that a session naming hi or hi-IN matches. The vendor does not detect the language."
+            }
+          },
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "Not measured. The vendor publishes no latency for this REST endpoint. Its P95 of about 200 ms is a streaming figure and must not be used as a budget here."
+          },
+          "limits": {
+            "max_upload_bytes": null,
+            "max_audio_ms": 60000,
+            "min_audio_ms": null,
+            "vendor_timeout_ms": null,
+            "rates": []
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "mp3",
+              "ogg",
+              "flac",
+              "aac",
+              "m4a"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "multipart"
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language_code",
+            "language_shape": "single",
+            "language_format": "bcp47",
+            "language_required": true,
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "bias_list",
+                "max_items": 100,
+                "note": "Single words of letters only, with bias_score. The vendor ignores an invalid list and still answers 200, so the gateway must validate it. Boosting applies only to a specific language code such as hi-IN."
+              }
+            ],
+            "wire": "gnani_vachana_multipart"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/batch.rs:839-844; gateway/src/core/stt/prerecorded.rs:116-123",
+            "notes": "No code exists for this transport. The shared file-request helpers at the cited lines cover only Deepgram, AssemblyAI, OpenAI and ElevenLabs. The request is multipart form data with the fields audio_file and language_code and the header X-API-Key-ID. The audio must be a real audio file such as WAV, because the endpoint rejects headerless PCM. The response is JSON with success, request_id, timestamp and transcript, and carries no confidence value. Errors arrive in two different JSON shapes and both must be parsed. The vendor silently ignores an invalid word-boosting list (bias_list) and still answers 200, so the gateway must validate the list itself. The OpenAPI schema of this endpoint has no model property and the WebSocket takes no model at all; the vendor's prose mentions an optional model form field whose default is vachana-audio-intelligence-v2, and the response example in the vendor's quick start reports gnani-prisma-v2.5. No other accepted value is documented, so the adapter should leave the model off the wire. The canonical keyterms setting maps to the vendor's bias_list field."
+          },
+          "file_request_mode": "sync"
+        },
+        {
+          "input_mode": "vendor_segmented",
+          "adapter": "planned_stream",
+          "enabled_from_release": null,
+          "disabled_reason": "No gateway client exists for the vendor's realtime WebSocket (wss://api.vachana.ai/stt/v3/stream). The gateway's only Gnani client speaks gRPC to the older asr.gnani.ai service, which is a different service with different credentials.",
+          "interim_results": "none",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": [
+              {
+                "percentile": "typical",
+                "quantity": "end_of_speech_to_final",
+                "value_ms": 500,
+                "basis": "vendor_claim",
+                "source": "https://docs.gnani.ai/api/use-cases/real-time-compliance.md",
+                "conditions": "The vendor's '300 to 500 ms' from end of speech to transcript on the WebSocket; no method, percentile or region is given."
+              }
+            ],
+            "notes": "Not measured. The vendor states about 300 to 500 ms from end of speech to transcript on this socket, without a method or a percentile; the upper figure is recorded as a typical vendor figure. The model card's streaming P95 under 200 ms does not say what it times and is not recorded."
+          },
+          "limits": {
+            "max_session_ms": 900000,
+            "rates": []
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le"
+            ],
+            "sample_rates_hz": [
+              8000,
+              16000,
+              44100,
+              48000
+            ],
+            "channels": 1
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "lang_code",
+            "language_shape": "single",
+            "language_format": "bcp47",
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "x-bias-list",
+                "max_items": 100,
+                "note": "An upgrade header, with x-bias-score; same rules as bias_list on the file endpoint."
+              }
+            ],
+            "wire": "gnani_vachana_ws"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "notes": "A client for this socket would have to be written. No gateway code speaks this transport, so no code reference is given; the only Gnani client in the gateway (gateway/src/core/stt/gnani/grpc.rs:30-33) is gRPC to a different service. Requirements read from the vendor documentation: all settings travel in the WebSocket upgrade headers (x-api-key-id, lang_code, x-sample-rate and the voice-activity headers); audio is 16-bit mono PCM in binary frames of exactly 1,024 bytes sent at real-time pace; the vendor's own voice-activity detector cuts the audio into segments and returns one final transcript per segment, with no interim text on the documented route; and every session ends after 15 minutes, so long calls need a planned reconnect."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "unknown",
+        "refuse_from_release": null
+      },
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "The vendor publishes no rate card for speech-to-text. Its batch page says billing is per audio duration; nothing is stated for the synchronous REST endpoint or the WebSocket. There is no Gnani entry in gateway/src/config/pricing.rs, so no pricing_key is given."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://docs.gnani.ai/api/STT/speech-to-text.md",
+          "https://docs.gnani.ai/api/STT/stt-websocket.md"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/batch.rs:839-844",
+          "gateway/src/core/stt/prerecorded.rs:116-123",
+          "gateway/src/core/stt/gnani/grpc.rs:30-33",
+          "gateway/src/core/stt/gnani/config.rs:100"
+        ],
+        "unverified": [
+          "match.model (whether this id names the same model as gnani-prisma-v2.5; the vendor mentions it only as the default of the optional REST model field, in its word-boosting text)",
+          "transports[1] as a whole (whether the WebSocket, which takes no model field, serves this id)",
+          "billing.unit, billing.min_billed_ms and billing.bills_silence (no public rate card)",
+          "transports[0].limits.max_upload_bytes (not published for the REST endpoint)",
+          "transports[0].limits.min_audio_ms (not published for the REST endpoint)",
+          "transports[0].limits.rates (requests and concurrent_requests) (only a 429 RATE_LIMIT_ERROR code is documented, with no numbers)",
+          "transports[0].limits.max_audio_ms (60 s in the field description and in the 400 error example; one paragraph of the vendor's OpenAPI text says 30 s)",
+          "transports[0].limits.vendor_timeout_ms (the vendor publishes no server-side request timeout; 60 s is only the default of the vendor's own Python client)",
+          "transports[0].latency (no REST figure is published; the endpoint's behaviour on silent audio is also unknown)",
+          "transports[1].interim_results (the documented v3 route sends final transcripts only; the same page mentions an x-partials header and a /stt/v4/stream route that have no reference page)",
+          "transports[1].latency (the vendor's 300 to 500 ms claim has no percentile and no method)",
+          "transports[1].limits.rates (requests and concurrent_sessions) (no connection or rate limit is published for the WebSocket)",
+          "transports[1].stream_audio.sample_rates_hz (the x-sample-rate values 8000, 16000, 44100 and 48000 are read from the vendor page; never exercised)"
+        ],
+        "notes": "This id is the documented default of the optional model form field on the synchronous REST endpoint. The vendor names it only in the word-boosting section and it is absent from the OpenAPI schema. The row treats it as another name for the vendor's single current model and copies the transports of gnani-prisma-v2.5. It should not be offered to customers as a separate model until the vendor confirms what it is. What happens today is different from what this row will route to: the existing client never reads the model field, so a session that names this id is not refused. It is handed to the legacy gRPC client described in the 'default' row, which dials a different service with different credentials, so the call starts and very probably never produces a transcript."
+      }
+    },
+    {
+      "id": "gnani:default",
+      "match": {
+        "provider": "gnani",
+        "model": "default"
+      },
+      "lifecycle": {
+        "status": "legacy"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "unknown",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": null,
+            "rates": []
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "lang",
+            "language_shape": "single",
+            "context_params": [],
+            "wire": "gnani_legacy_grpc"
+          },
+          "gateway_client": {
+            "status": "known_broken",
+            "defect": "The existing gRPC client calls the method path /Listener/DoSpeechToText, while the vendor's published client stub calls /SpeechToText.Listener/DoSpeechToText, so the vendor server is expected to reject the call as unimplemented. This was read from the vendor's stub and was not tested against the live service. The service itself is absent from the vendor's current documentation. The id 'default' selects the older asr.gnani.ai gRPC service. The gateway's client for it calls a method path the vendor's own stub does not define, and that service has no file endpoint open to ordinary customers. Use gnani-prisma-v2.5, which will be served by file upload once that adapter exists.",
+            "code_ref": "gateway/src/core/stt/gnani/grpc.rs:30-33; gateway/src/core/stt/gnani/client.rs:73-81, 99, 305, 400-415, 539; gateway/src/core/stt/gnani/config.rs:133-138, 159-164, 359-381; gateway/src/config/mod.rs:672-677; gateway/tests/mock_endpoint_e2e.rs:1937, 1991-1992",
+            "notes": "This is the client every Gnani session gets today, whatever model is named, because the client never validates or sends the model. It dials https://asr.gnani.ai:443 and authenticates with a token, an access key and a certificate. The token and the access key can come from process environment variables or from per-session provider settings (config.rs:133-138, 159-160); the certificate can only come from process environment variables (config.rs:161-164), and a token set only in the server's configuration file is not used, because the client ignores the api_key field in which the server delivers it (gateway/src/config/mod.rs:672-677). Further defects found by reading the code: a final result whose text equals the previous interim result is dropped, so turn-taking never sees the end of that utterance (client.rs:400-415); connect() reports success before any stream is opened (client.rs:73-81); and the language list is the legacy one, which rejects the vendor's current Punjabi code pa-IN (config.rs:359-381). When the transport is stuck, audio ingest for the session blocks once two chained queues of 100 frames each are full, about 4 s of 20 ms frames, or about 2 s between reconnect attempts when only one queue exists (client.rs:99, 305, 539). The only test is a mock server that registers the same short service name, so it cannot catch the path mismatch."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "No pricing is published for the legacy service."
+      },
+      "provenance": {
+        "confidence": "assumed",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://gnani-ai.github.io/API-service/",
+          "https://raw.githubusercontent.com/gnani-ai/API-service/master/grpc-codes/Python3-Client/proto/stt.proto",
+          "https://raw.githubusercontent.com/gnani-ai/API-service/master/grpc-codes/Python3-Client/proto/stt_pb2_grpc.py",
+          "https://docs.gnani.ai/llms.txt"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/gnani/grpc.rs:30-33",
+          "gateway/src/core/stt/gnani/client.rs:73-81",
+          "gateway/src/core/stt/gnani/client.rs:400-415",
+          "gateway/src/core/stt/gnani/config.rs:100",
+          "gateway/src/core/stt/gnani/config.rs:133-138",
+          "gateway/src/core/stt/gnani/config.rs:159-164",
+          "gateway/src/core/stt/gnani/config.rs:359-381",
+          "gateway/src/core/stt/gnani/messages.rs:105-115",
+          "gateway/src/core/stt/gnani/messages.rs:131-133",
+          "gateway/src/config/mod.rs:672-677",
+          "gateway/tests/mock_endpoint_e2e.rs:1937"
+        ],
+        "unverified": [
+          "lifecycle.status (the legacy service is absent from the vendor's current documentation; no deprecation notice or date was found and it is unknown whether it is still served, so 'legacy' records only that it is undocumented and carries no deprecation notice)",
+          "transports[0] as a whole (whether the service still accepts a live stream: an unauthenticated probe returned an HTML 403 from Cloudflare, which is inconclusive)",
+          "transports[0].vendor_turn_signal (recorded as unknown: the vendor marks results as final; how it decides is not documented)",
+          "transports[0].quality_signals (the client decodes a confidence field from the response at gateway/src/core/stt/gnani/messages.rs:131-133; this was not confirmed against the vendor)",
+          "transports[0].gateway_client.status (the path mismatch is read from the vendor's published stub; the failure itself was not tested live)",
+          "billing (nothing published)",
+          "transports[0].interim_results and endpointing_owner (taken from the gateway's copy of the legacy service definition at gateway/src/core/stt/gnani/messages.rs:105-115, in which each result carries a final flag; not confirmed against a running service)",
+          "transports[0].limits (the 2023 documentation of the legacy service says a registered user may send 250 requests of 15 s of audio each and 'only 5 concurrent requests per second'; the wording is ambiguous and the service is absent from the current documentation, so no number is recorded)",
+          "transports[0].latency (never measured and nothing is published)"
+        ],
+        "notes": "'default' is not a vendor model id. It is the placeholder the gateway's Gnani configuration carries (gateway/src/core/stt/gnani/config.rs:100) for the older gRPC service, which takes no model. The row exists so that the state of the existing client is recorded in one place and so that a session naming 'default' is answered by that client, reported as known broken, instead of being guessed. The older REST interface of that service is documented as being for restricted users only, so no file transport is listed. Its confidence is 'assumed' although it is an exact row, because the fact-check found that nothing current establishes that the legacy service still accepts a live stream: the only description of it is a definition file last changed in 2023, the service is absent from the vendor's current documentation, and two probes were inconclusive. The word 'default' is also what a customer might send to mean 'the provider's default model'; such a session lands here and gets the legacy client, while an empty model resolves to gnani-prisma-v2.5. The capability-map design should decide whether to keep that difference. Keep this row only if the legacy client is repaired; otherwise retire it together with the client."
+      }
+    },
+    {
+      "id": "gnani:any",
+      "match": {
+        "provider": "gnani",
+        "model_glob": "*"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "regional_rest",
+          "enabled_from_release": 5,
+          "disabled_reason": "The file-upload adapter for live calls does not exist yet. The gateway has no request code for the vendor's synchronous endpoint (POST https://api.vachana.ai/stt/v3) and no configuration field for the Vachana API key that endpoint needs.",
+          "enable_requires": [
+            "live_probe"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "constraints": {
+            "languages": {
+              "mode": "only",
+              "codes": [
+                "bn",
+                "en",
+                "gu",
+                "hi",
+                "kn",
+                "ml",
+                "mr",
+                "pa",
+                "ta",
+                "te"
+              ],
+              "note": "The vendor's ten languages. On the wire each is the -IN form (bn-IN, en-IN, gu-IN, hi-IN, kn-IN, ml-IN, mr-IN, pa-IN, ta-IN, te-IN); bare codes are recorded so that a session naming hi or hi-IN matches. The vendor does not detect the language."
+            }
+          },
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "Not measured. The vendor publishes no latency for this REST endpoint. Its P95 of about 200 ms is a streaming figure and must not be used as a budget here."
+          },
+          "limits": {
+            "max_upload_bytes": null,
+            "max_audio_ms": 60000,
+            "min_audio_ms": null,
+            "vendor_timeout_ms": null,
+            "rates": []
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "mp3",
+              "ogg",
+              "flac",
+              "aac",
+              "m4a"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "multipart"
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language_code",
+            "language_shape": "single",
+            "language_format": "bcp47",
+            "language_required": true,
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "bias_list",
+                "max_items": 100,
+                "note": "Single words of letters only, with bias_score. The vendor ignores an invalid list and still answers 200, so the gateway must validate it. Boosting applies only to a specific language code such as hi-IN."
+              }
+            ],
+            "wire": "gnani_vachana_multipart"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/batch.rs:839-844; gateway/src/core/stt/prerecorded.rs:116-123",
+            "notes": "No code exists for this transport. The shared file-request helpers at the cited lines cover only Deepgram, AssemblyAI, OpenAI and ElevenLabs. The request is multipart form data with the fields audio_file and language_code and the header X-API-Key-ID. The audio must be a real audio file such as WAV, because the endpoint rejects headerless PCM. The response is JSON with success, request_id, timestamp and transcript, and carries no confidence value. Errors arrive in two different JSON shapes and both must be parsed. The vendor silently ignores an invalid word-boosting list (bias_list) and still answers 200, so the gateway must validate the list itself. The OpenAPI schema of this endpoint has no model property and the WebSocket takes no model at all; the vendor's prose mentions an optional model form field whose default is vachana-audio-intelligence-v2, and the response example in the vendor's quick start reports gnani-prisma-v2.5. No other accepted value is documented, so the adapter should leave the model off the wire. The canonical keyterms setting maps to the vendor's bias_list field."
+          },
+          "file_request_mode": "sync"
+        },
+        {
+          "input_mode": "vendor_segmented",
+          "adapter": "planned_stream",
+          "enabled_from_release": null,
+          "disabled_reason": "No gateway client exists for the vendor's realtime WebSocket (wss://api.vachana.ai/stt/v3/stream). The gateway's only Gnani client speaks gRPC to the older asr.gnani.ai service, which is a different service with different credentials.",
+          "interim_results": "none",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": [
+              {
+                "percentile": "typical",
+                "quantity": "end_of_speech_to_final",
+                "value_ms": 500,
+                "basis": "vendor_claim",
+                "source": "https://docs.gnani.ai/api/use-cases/real-time-compliance.md",
+                "conditions": "The vendor's '300 to 500 ms' from end of speech to transcript on the WebSocket; no method, percentile or region is given."
+              }
+            ],
+            "notes": "Not measured. The vendor states about 300 to 500 ms from end of speech to transcript on this socket, without a method or a percentile; the upper figure is recorded as a typical vendor figure. The model card's streaming P95 under 200 ms does not say what it times and is not recorded."
+          },
+          "limits": {
+            "max_session_ms": 900000,
+            "rates": []
+          },
+          "stream_audio": {
+            "encodings": [
+              "pcm_s16le"
+            ],
+            "sample_rates_hz": [
+              8000,
+              16000,
+              44100,
+              48000
+            ],
+            "channels": 1
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "lang_code",
+            "language_shape": "single",
+            "language_format": "bcp47",
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "x-bias-list",
+                "max_items": 100,
+                "note": "An upgrade header, with x-bias-score; same rules as bias_list on the file endpoint."
+              }
+            ],
+            "wire": "gnani_vachana_ws"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "notes": "A client for this socket would have to be written. No gateway code speaks this transport, so no code reference is given; the only Gnani client in the gateway (gateway/src/core/stt/gnani/grpc.rs:30-33) is gRPC to a different service. Requirements read from the vendor documentation: all settings travel in the WebSocket upgrade headers (x-api-key-id, lang_code, x-sample-rate and the voice-activity headers); audio is 16-bit mono PCM in binary frames of exactly 1,024 bytes sent at real-time pace; the vendor's own voice-activity detector cuts the audio into segments and returns one final transcript per segment, with no interim text on the documented route; and every session ends after 15 minutes, so long calls need a planned reconnect."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "unknown",
+        "refuse_from_release": null
+      },
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "The vendor publishes no rate card for speech-to-text. Its batch page says billing is per audio duration; nothing is stated for the synchronous REST endpoint or the WebSocket. There is no Gnani entry in gateway/src/config/pricing.rs, so no pricing_key is given."
+      },
+      "provenance": {
+        "confidence": "assumed",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://docs.gnani.ai/api/STT/speech-to-text.md",
+          "https://docs.gnani.ai/api/STT/stt-websocket.md",
+          "https://docs.gnani.ai/api/STTBatch/Introduction.md",
+          "https://docs.gnani.ai/api/introduction/introduction.md",
+          "https://docs.gnani.ai/api/introduction/quick-start.md",
+          "https://docs.gnani.ai/python-sdk/speech-to-text.md",
+          "https://docs.gnani.ai/pipecat/introduction.md",
+          "https://docs.gnani.ai/api/use-cases/real-time-compliance.md",
+          "https://huggingface.co/gnani-ai/gnani/raw/main/README.md"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/batch.rs:839-844",
+          "gateway/src/core/stt/prerecorded.rs:116-123",
+          "gateway/src/core/stt/gnani/grpc.rs:30-33",
+          "gateway/src/core/stt/gnani/config.rs:100"
+        ],
+        "unverified": [
+          "everything in this row when applied to a model id the map has not seen",
+          "whether the REST model form field accepts any value other than its documented default",
+          "billing.unit, billing.min_billed_ms and billing.bills_silence (no public rate card)",
+          "transports[0].limits.max_upload_bytes (not published for the REST endpoint)",
+          "transports[0].limits.min_audio_ms (not published for the REST endpoint)",
+          "transports[0].limits.rates (requests and concurrent_requests) (only a 429 RATE_LIMIT_ERROR code is documented, with no numbers)",
+          "transports[0].limits.max_audio_ms (60 s in the field description and in the 400 error example; one paragraph of the vendor's OpenAPI text says 30 s)",
+          "transports[0].limits.vendor_timeout_ms (the vendor publishes no server-side request timeout; 60 s is only the default of the vendor's own Python client)",
+          "transports[0].latency (no REST figure is published; the endpoint's behaviour on silent audio is also unknown)",
+          "transports[1].interim_results (the documented v3 route sends final transcripts only; the same page mentions an x-partials header and a /stt/v4/stream route that have no reference page)",
+          "transports[1].latency (the vendor's 300 to 500 ms claim has no percentile and no method)",
+          "transports[1].limits.rates (requests and concurrent_sessions) (no connection or rate limit is published for the WebSocket)",
+          "transports[1].stream_audio.sample_rates_hz (the x-sample-rate values 8000, 16000, 44100 and 48000 are read from the vendor page; never exercised)"
+        ],
+        "notes": "Provider default for any Gnani model id that has no exact row. It assumes the id is another name for the vendor's current Vachana model and therefore chooses file upload, the slower but safer guess: a wrong file guess costs latency, a wrong streaming guess costs the call. The adapter should leave an unknown id off the wire, because the vendor documents no accepted values beyond the default. What happens today is different from what this row will route to: the existing client never reads the model field, so a session that names an id the map has not seen is not refused. It is handed to the legacy gRPC client described in the 'default' row, which dials a different service with different credentials, so the call starts and very probably never produces a transcript."
+      }
+    }
+  ]
+}

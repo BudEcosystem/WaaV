@@ -106,10 +106,10 @@ mod tests;
 // Re-export public types
 pub use client::OpenAISTT;
 pub use config::{
-    AudioInputFormat, FlushStrategy, OpenAISTTConfig, OpenAISTTModel, ResponseFormat,
-    TimestampGranularity,
+    AudioInputFormat, DEFAULT_OPENAI_STT_MODEL, FlushStrategy, OpenAISTTConfig, OpenAISTTModel,
+    ResponseFormat, TimestampGranularity, candidate_language, takes_candidate_lists,
 };
 pub use messages::{
     OpenAIError, OpenAIErrorResponse, TranscriptionResponse, TranscriptionResult,
-    TranscriptionSegment, TranscriptionWord, VerboseTranscriptionResponse, wav,
+    TranscriptionSegment, TranscriptionWord, VerboseTranscriptionResponse,
 };

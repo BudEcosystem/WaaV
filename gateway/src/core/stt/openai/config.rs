@@ -10,7 +10,7 @@ use super::super::base::STTConfig;
 use serde::{Deserialize, Serialize};
 
 const OPENAI_BASE_URL_ENV: &str = "OPENAI_BASE_URL";
-const OPENAI_API_BASE_URL: &str = "https://api.openai.com";
+const OPENAI_API_BASE_URL: &str = waav_segmented_stt::vendor::hosts::OPENAI;
 
 fn openai_audio_url_from_base(
     source: &str,
@@ -23,7 +23,9 @@ fn openai_audio_url_from_base(
     }
     crate::core::net::validate_url_for_ssrf(base, &["http", "https"])
         .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))?;
-    Ok(Some(format!("{base}{path}")))
+    Ok(Some(waav_segmented_stt::vendor::openai::join_api_path(
+        base, path,
+    )))
 }
 
 fn resolve_openai_audio_url(endpoint_override: Option<&str>, path: &str) -> Result<String, String> {
@@ -51,6 +53,10 @@ fn resolve_openai_audio_url(endpoint_override: Option<&str>, path: &str) -> Resu
 // =============================================================================
 // OpenAI STT Models
 // =============================================================================
+
+/// The model an OpenAI session sends when none is configured (addendum B6). `whisper-1`, the old
+/// default, is retired on 2027-02-26; every path that fills an empty model uses this id.
+pub const DEFAULT_OPENAI_STT_MODEL: &str = "gpt-transcribe";
 
 /// Supported OpenAI STT models.
 ///
@@ -556,6 +562,12 @@ pub struct OpenAISTTConfig {
     /// The gateway will package PCM audio into this format before sending.
     pub audio_input_format: AudioInputFormat,
 
+    /// Key terms, for a model that takes them as `keywords[]` ([`takes_candidate_lists`]); other
+    /// models fold them into [`prompt`](Self::prompt).
+    ///
+    /// [`takes_candidate_lists`]: OpenAISTTConfig::takes_candidate_lists
+    pub keywords: Vec<String>,
+
     /// Optional text prompt to guide the transcription.
     ///
     /// Useful for providing context about the audio content,
@@ -639,6 +651,7 @@ impl Default for OpenAISTTConfig {
             base: STTConfig::default(),
             model: OpenAISTTModel::default(),
             model_id: None,
+            keywords: Vec::new(),
             // WaaV's own choice, not a vendor knob: `verbose_json` is the whisper-1 body that
             // carries the detected `language` and the `duration` the result is built from.
             response_format: ResponseFormat::VerboseJson,
@@ -664,14 +677,17 @@ impl OpenAISTTConfig {
     /// Create a new configuration from base STTConfig.
     ///
     /// Vendor contract: `model` is REQUIRED on `POST /v1/audio/transcriptions`, so an unset model
-    /// becomes `whisper-1` — the one default here. A configured model is sent as configured: a
+    /// becomes [`DEFAULT_OPENAI_STT_MODEL`] — the one default here. A configured model is sent as configured: a
     /// known id (or a WaaV alias for one) in its canonical spelling, and anything else verbatim
     /// through [`model_id`](Self::model_id), for OpenAI to accept or name in its error. It used
     /// to become `whisper-1` too, silently transcribing with a model nobody chose.
     pub fn from_base(base: STTConfig) -> Self {
         let requested = base.model.trim();
         let (model, model_id) = if requested.is_empty() {
-            (OpenAISTTModel::default(), None)
+            (
+                OpenAISTTModel::family_of(DEFAULT_OPENAI_STT_MODEL),
+                Some(DEFAULT_OPENAI_STT_MODEL.to_string()),
+            )
         } else {
             match OpenAISTTModel::parse_known(requested) {
                 Some(known) => (known, None),
@@ -707,6 +723,13 @@ impl OpenAISTTConfig {
     /// Every model-dependent decision — which response formats are allowed, whether timestamp
     /// granularities apply, whether `stream` and diarization are available — reads this, i.e. the
     /// id actually sent, and never the enum's fallback.
+    /// `gpt-transcribe` takes candidate lists: `languages[]` and `keywords[]` instead of the
+    /// single `language` and a `prompt` of key terms (the vendor says not to send both language
+    /// fields).
+    pub fn takes_candidate_lists(&self) -> bool {
+        takes_candidate_lists(self.wire_model())
+    }
+
     pub fn is_whisper_model(&self) -> bool {
         self.wire_model()
             .to_ascii_lowercase()
@@ -773,7 +796,11 @@ impl OpenAISTTConfig {
         if let Some(k) = &f.keyterms
             && !k.is_empty()
         {
-            cfg.prompt = Some(k.join(", "));
+            if cfg.takes_candidate_lists() {
+                cfg.keywords = k.clone();
+            } else {
+                cfg.prompt = waav_segmented_stt::vendor::openai::prompt_with_terms(None, k);
+            }
         }
         // interim_results → stream (typed).
         if let Some(s) = f.interim_results {
@@ -787,10 +814,8 @@ impl OpenAISTTConfig {
         if let Some(p) = e.get("prompt").and_then(|v| v.as_str()).map(str::trim)
             && !p.is_empty()
         {
-            cfg.prompt = Some(match cfg.prompt.take() {
-                Some(terms) => format!("{p} {terms}"),
-                None => p.to_string(),
-            });
+            let terms: Vec<String> = cfg.prompt.take().into_iter().collect();
+            cfg.prompt = waav_segmented_stt::vendor::openai::prompt_with_terms(Some(p), &terms);
         }
         if let Some(t) = e.get("temperature").and_then(|v| v.as_f64()) {
             cfg.temperature = Some(t as f32);
@@ -853,7 +878,11 @@ impl OpenAISTTConfig {
             self.response_format.as_str().to_string(),
         ));
 
-        if !self.base.language.is_empty() {
+        if self.takes_candidate_lists() {
+            if let Some(lang) = candidate_language(&self.base.language) {
+                fields.push(("languages[]".into(), lang));
+            }
+        } else if !self.base.language.is_empty() {
             fields.push(("language".into(), self.base.language.clone()));
         }
         if let Some(temp) = self.temperature {
@@ -861,6 +890,9 @@ impl OpenAISTTConfig {
         }
         if let Some(ref prompt) = self.prompt {
             fields.push(("prompt".into(), prompt.clone()));
+        }
+        for k in &self.keywords {
+            fields.push(("keywords[]".into(), k.clone()));
         }
 
         // Timestamp granularities only apply to verbose_json.
@@ -990,6 +1022,21 @@ impl OpenAISTTConfig {
     pub fn is_diarization_enabled(&self) -> bool {
         self.response_format == ResponseFormat::DiarizedJson && self.supports_diarization()
     }
+}
+
+/// Whether a model id takes `languages[]` and `keywords[]` (`gpt-transcribe` and its snapshots).
+pub fn takes_candidate_lists(model: &str) -> bool {
+    let m = model.trim().to_ascii_lowercase();
+    m == "gpt-transcribe" || m.starts_with("gpt-transcribe-")
+}
+
+/// A session language as one `languages[]` entry: the ISO 639-1 part; `None` for unset or `auto`.
+pub fn candidate_language(language: &str) -> Option<String> {
+    let l = language.trim();
+    if l.is_empty() || l.eq_ignore_ascii_case("auto") {
+        return None;
+    }
+    Some(l.split(['-', '_']).next().unwrap_or(l).to_ascii_lowercase())
 }
 
 #[cfg(test)]
@@ -1321,8 +1368,12 @@ mod tests {
 
     #[test]
     fn only_an_unset_model_gets_the_required_default() {
-        // `model` is required by OpenAI, so empty is the one case with a default.
-        assert_eq!(field(&fields_for("", "en"), "model"), Some("whisper-1"));
+        // `model` is required by OpenAI, so empty is the one case with a default: `gpt-transcribe`
+        // (addendum B6; `whisper-1` is retired on 2027-02-26).
+        assert_eq!(
+            field(&fields_for("", "en"), "model"),
+            Some(DEFAULT_OPENAI_STT_MODEL)
+        );
         // WaaV's own aliases still resolve to the canonical id.
         assert_eq!(
             field(&fields_for("whisper", "en"), "model"),
@@ -1343,6 +1394,67 @@ mod tests {
         });
         assert!(!cfg.is_whisper_model());
         assert!(cfg.supports_diarization());
+    }
+
+    /// Addendum B6: `whisper-1` is retired on 2027-02-26, so an unset model is `gpt-transcribe`,
+    /// which gets `languages[]` (never also `language`).
+    #[test]
+    fn an_unset_model_is_gpt_transcribe_with_a_language_list() {
+        let fields = fields_for("", "en-US");
+        assert_eq!(field(&fields, "model"), Some(DEFAULT_OPENAI_STT_MODEL));
+        assert_eq!(DEFAULT_OPENAI_STT_MODEL, "gpt-transcribe");
+        assert_eq!(field(&fields, "languages[]"), Some("en"), "{fields:?}");
+        assert_eq!(field(&fields, "language"), None, "{fields:?}");
+        assert_eq!(field(&fields, "response_format"), Some("json"));
+        for unset in ["", "auto"] {
+            let fields = fields_for("", unset);
+            assert_eq!(field(&fields, "languages[]"), None, "{unset:?}: {fields:?}");
+            assert_eq!(field(&fields, "language"), None);
+        }
+        // A model the caller chose keeps its own field.
+        assert_eq!(
+            field(&fields_for("whisper-1", "de"), "language"),
+            Some("de")
+        );
+        assert_eq!(
+            field(&fields_for("gpt-4o-transcribe", "de"), "language"),
+            Some("de")
+        );
+        assert_eq!(
+            field(
+                &fields_for("gpt-transcribe-2026-11-01", "de"),
+                "languages[]"
+            ),
+            Some("de")
+        );
+    }
+
+    #[test]
+    fn gpt_transcribe_takes_key_terms_as_keywords_not_a_prompt() {
+        use crate::core::stt::standard::{StandardSTTConfig, SttFeatures};
+        let with_terms = |model: &str| {
+            let mut std = StandardSTTConfig::from_base(STTConfig {
+                api_key: "k".to_string(),
+                model: model.to_string(),
+                ..Default::default()
+            });
+            std.features = SttFeatures {
+                keyterms: Some(vec!["Acme".into(), "Zedcorp".into()]),
+                ..Default::default()
+            };
+            OpenAISTTConfig::from_standard(&std).transcription_text_fields()
+        };
+        let fields = with_terms("");
+        let keywords: Vec<_> = fields
+            .iter()
+            .filter(|(k, _)| k == "keywords[]")
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(keywords, vec!["Acme", "Zedcorp"]);
+        assert_eq!(field(&fields, "prompt"), None, "{fields:?}");
+        let fields = with_terms("whisper-1");
+        assert_eq!(field(&fields, "prompt"), Some("Acme, Zedcorp"));
+        assert_eq!(field(&fields, "keywords[]"), None);
     }
 
     #[test]

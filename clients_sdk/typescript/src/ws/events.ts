@@ -3,12 +3,21 @@
  * Type-safe event definitions for session callbacks
  */
 
-import type { STTResultMessage, ErrorMessage, TTSAudioMessage, ReadyMessage, ResolvedAlias, ConfigWarningMessage } from '../types/messages.js';
+import type {
+  STTResultMessage,
+  ErrorMessage,
+  TTSAudioMessage,
+  ReadyMessage,
+  ReadyStt,
+  ResolvedAlias,
+  VadEventKind,
+  VadEventMessage,
+} from '../types/messages.js';
 import type { MetricsSummary } from '../types/metrics.js';
 import type { ReconnectState } from './reconnect.js';
 
-export type { ConfigWarningEvent, ConfigWarningCode } from '../types/warnings.js';
-import type { ConfigWarningEvent } from '../types/warnings.js';
+export type { ConfigWarningEvent, ConfigWarningCode, SttWarningEvent, SttWarningCode } from '../types/warnings.js';
+import type { ConfigWarningEvent, SttWarningEvent } from '../types/warnings.js';
 
 /**
  * STT transcript event
@@ -113,21 +122,55 @@ export interface ReadyEvent {
    * {@link audioInCodec} — decode opus only when this is `'opus'`.
    */
   audioOutCodec?: string;
+  /**
+   * What speech-to-text this session got (segmented STT): `transcription_mode`
+   * (`streaming` | `segmented` | `buffered`), `interim_results`, `endpointing`, `speech_events`,
+   * latency figures, `notices`, ... Kept as the gateway sent it (snake_case keys, like
+   * {@link resolvedAlias}). Present only on sessions the gateway's rollout covers.
+   */
+  stt?: ReadyStt;
   /** Original message for advanced use */
   raw: ReadyMessage;
+}
+
+/**
+ * Gateway speech event (wire `vad_event`, segmented STT): detector-timed speech start/end and the
+ * gateway's turn decisions. Which ones arrive is given by `ready.stt.speech_events`; match them by
+ * {@link turnId}.
+ */
+export interface SessionVadEvent {
+  /** `speech_start`, `speech_end`, `turn_start`, `turn_end` or `turn_closed`. */
+  event: VadEventKind | (string & {});
+  /** The turn this event belongs to (gateway `turn_id`). */
+  turnId: number;
+  /** Position in the received audio, in ms (gateway `audio_ms`). */
+  audioMs?: number;
+  /** Sustained speech before the gateway took the turn (`turn_start`; gateway `sustained_ms`). */
+  sustainedMs?: number;
+  /** The cut segment was discarded rather than uploaded (`speech_end`). */
+  discarded?: boolean;
+  /** Whether the turn produced text (`turn_closed`; gateway `had_transcript`). */
+  hadTranscript?: boolean;
+  /** Why a turn closed without text (`turn_closed`): `no_speech`, `transcription_failed`, `ignored`. */
+  reason?: string;
+  /** Original message for advanced use */
+  raw: VadEventMessage;
 }
 
 /**
  * Error event
  */
 export interface SessionErrorEvent {
-  /** Error code */
+  /** Error code: the gateway's `code` on a coded error (e.g. `stt_live_unsupported`), else `UNKNOWN` or an SDK code */
   code: string;
   /** Error message */
   message: string;
-  /** Additional error details */
+  /** Additional error details (the gateway's `details` on a coded error) */
   details?: Record<string, unknown>;
-  /** Whether the error is recoverable */
+  /**
+   * Whether the error is recoverable. For a gateway setup refusal, `true` means the socket is
+   * still open and a corrected `config` may be sent.
+   */
   recoverable: boolean;
   /** Original message for advanced use */
   raw: ErrorMessage;
@@ -220,6 +263,16 @@ export interface SessionEventMap {
    * developer can see and fix it.
    */
   configWarning: ConfigWarningEvent;
+  /**
+   * Gateway speech event (wire `vad_event`, segmented STT): speech start/end and turn
+   * start/end/closed, matched by `turnId`.
+   */
+  vadEvent: SessionVadEvent;
+  /**
+   * Non-fatal speech-to-text problem in the middle of a call (wire `stt_warning`): a lost
+   * segment, dropped audio, rate limiting. The session keeps running; never routed to `error`.
+   */
+  sttWarning: SttWarningEvent;
   /** Connection state changed */
   connectionState: ConnectionStateEvent;
   /** Metrics updated */

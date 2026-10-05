@@ -12,6 +12,7 @@ import { AudioRecorder, type RecorderConfig } from '../audio/recorder.js';
 import { PCMPlayer, type PlayerConfig } from '../audio/player.js';
 import { VAD, type VADConfig } from '../audio/vad.js';
 import { getMetricsCollector } from '../metrics/collector.js';
+import type { VoiceAgentConfig } from '../types/agent.js';
 
 /**
  * BudTalk configuration
@@ -35,6 +36,11 @@ export interface BudTalkConfig extends BasePipelineConfig {
   autoRecord?: boolean;
   /** Interrupt TTS when user starts speaking (default: true) */
   bargeIn?: boolean;
+  /**
+   * A Bud voice agent (spec 025), by name or config. It decides both speech legs; `stt`/`tts`
+   * then carry only the audio format (the gateway refuses a `model` on them).
+   */
+  agent?: VoiceAgentConfig | string;
 }
 
 /**
@@ -115,6 +121,7 @@ export class BudTalk extends BasePipeline {
         stt: sttConfig,
         tts: ttsConfig,
         livekit: config.livekit,
+        ...(config.agent !== undefined ? { agent: config.agent } : {}),
       },
     });
 

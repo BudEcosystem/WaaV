@@ -1184,3 +1184,531 @@ async fn test_hard_timeout_observability() {
     // The implementation emits: tracing::warn!("Hard timeout fired after {}ms - forcing speech_final...")
     // This allows SREs to create alerts on fallback frequency.
 }
+
+// ---------------------------------------------------------------------------------------------
+// Segmented sessions: the engine behind a real VoiceManager
+// ---------------------------------------------------------------------------------------------
+
+mod segmented_chain {
+    use super::*;
+    use crate::core::stt::segmented::SegmentedPlan;
+    use crate::core::stt::speech_activity::SpeechActivity;
+    use waav_segmented_stt::detector::{DetectorError, SpeechDetector};
+    use waav_segmented_stt::engine::{EngineConfig, TokioClock};
+    use waav_segmented_stt::profile::SegmentProfile;
+    use waav_segmented_stt::sequencer::{SegmentUpload, UnitUpload};
+    use waav_segmented_stt::transcriber::attempts::{Ledger, UploadResolution};
+    use waav_segmented_stt::transcriber::{SegmentAudio, SegmentTranscript};
+    use waav_segmented_stt::types::DetectorKind;
+
+    struct Level;
+    impl SpeechDetector for Level {
+        fn probability(&mut self, f: &[f32]) -> Result<f32, DetectorError> {
+            let rms = (f.iter().map(|s| s * s).sum::<f32>() / f.len() as f32).sqrt();
+            Ok(if rms > 0.02 { 0.9 } else { 0.02 })
+        }
+        fn reset(&mut self) {}
+        fn kind(&self) -> DetectorKind {
+            DetectorKind::Scripted
+        }
+    }
+
+    struct Vendor {
+        calls: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl SegmentUpload for Vendor {
+        async fn run(&self, audio: SegmentAudio, _req: UnitUpload) -> UploadResolution {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            UploadResolution {
+                result: Ok(SegmentTranscript {
+                    text: format!("segment {}", n + 1),
+                    ..Default::default()
+                }),
+                ledger: Ledger {
+                    requests: 1,
+                    uploaded_ms: audio.audio_ms(),
+                },
+                queue_wait: std::time::Duration::ZERO,
+                round_trip: None,
+                fatal: None,
+                warnings: Vec::new(),
+                served_by: None,
+            }
+        }
+        fn deadline_ms(&self) -> u32 {
+            6000
+        }
+        fn try_speculative(&self) -> bool {
+            true
+        }
+        async fn prewarm(&self, _n: usize) {}
+        fn min_audio_ms(&self) -> u32 {
+            0
+        }
+    }
+
+    fn manager(vendor: Arc<Vendor>) -> VoiceManager {
+        let stt_config = STTConfig {
+            provider: "elevenlabs".to_string(),
+            model: "scribe_v2".into(),
+            api_key: "k".to_string(),
+            ..Default::default()
+        };
+        let tts_config = TTSConfig {
+            provider: "deepgram".to_string(),
+            api_key: "test_key".to_string(),
+            ..Default::default()
+        };
+        let plan = SegmentedPlan {
+            engine: EngineConfig::new(SegmentProfile::for_tests()),
+            detector: Arc::new(|| {
+                Box::pin(async { Ok(Box::new(Level) as Box<dyn SpeechDetector>) })
+            }),
+            upload: vendor,
+            audio_model: None,
+            text_model: None,
+            clock: Arc::new(TokioClock::default()),
+            provider_info: "segmented:elevenlabs_batch",
+        };
+        VoiceManager::new(
+            VoiceManagerConfig::new(stt_config, tts_config).with_segmented(plan),
+            None,
+        )
+        .unwrap()
+    }
+
+    async fn feed(vm: &VoiceManager, ms: u64, loud: bool) {
+        for _ in 0..ms / 20 {
+            let level: i16 = if loud { 4000 } else { 0 };
+            let bytes: Vec<u8> = (0..320)
+                .flat_map(|i| (if i % 2 == 0 { level } else { -level }).to_le_bytes())
+                .collect();
+            vm.receive_audio(bytes::Bytes::from(bytes)).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transcripts_reach_the_session_callback_with_their_turn_and_speech_events_come_first() {
+        let vendor = Arc::new(Vendor {
+            calls: AtomicUsize::new(0),
+        });
+        let vm = manager(Arc::clone(&vendor));
+        assert!(vm.is_gateway_endpointed());
+        let results = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let r = Arc::clone(&results);
+        vm.on_stt_result(move |res| {
+            r.lock().push(res);
+            Box::pin(async {})
+        })
+        .await
+        .unwrap();
+        let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let e = Arc::clone(&events);
+        vm.segmented()
+            .unwrap()
+            .add_speech_listener(Arc::new(move |a| e.lock().push(a)));
+        vm.test_connect_stt().await.unwrap();
+        feed(&vm, 200, false).await;
+        feed(&vm, 1000, true).await;
+        assert!(results.lock().is_empty());
+        assert!(
+            events
+                .lock()
+                .iter()
+                .any(|a| matches!(a, SpeechActivity::Started { .. }))
+        );
+        feed(&vm, 1500, false).await;
+        // The upload can return just before the silence rule closes the turn, so an interim with
+        // the same text may come first; exactly one final, always end of turn.
+        let got = results.lock().clone();
+        let finals: Vec<_> = got.iter().filter(|r| r.is_final).collect();
+        assert_eq!(finals.len(), 1, "{got:?}");
+        assert!(got.iter().all(|r| r.is_final == r.is_speech_final));
+        assert!(finals[0].is_finalized);
+        assert_eq!(finals[0].transcript, "segment 1");
+        assert!(got.iter().all(|r| r.speech_turn_id == Some(1)));
+        let facts = vm.live_facts().await.expect("facts");
+        assert_eq!(facts.final_deadline_ms, 6000);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn speech_over_a_protected_utterance_is_not_input_and_is_never_uploaded() {
+        let vendor = Arc::new(Vendor {
+            calls: AtomicUsize::new(0),
+        });
+        let vm = manager(Arc::clone(&vendor));
+        let results = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let r = Arc::clone(&results);
+        vm.on_stt_result(move |res| {
+            r.lock().push(res);
+            Box::pin(async {})
+        })
+        .await
+        .unwrap();
+        vm.segmented().unwrap().set_gate(Arc::new(|| false));
+        vm.test_connect_stt().await.unwrap();
+        feed(&vm, 200, false).await;
+        feed(&vm, 1000, true).await;
+        feed(&vm, 1500, false).await;
+        assert!(results.lock().is_empty());
+        assert_eq!(vendor.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn finalize_stt_flushes_without_a_reconnect_and_the_commit_is_answered() {
+        let vendor = Arc::new(Vendor {
+            calls: AtomicUsize::new(0),
+        });
+        let vm = manager(Arc::clone(&vendor));
+        let results = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let r = Arc::clone(&results);
+        vm.on_stt_result(move |res| {
+            r.lock().push(res);
+            Box::pin(async {})
+        })
+        .await
+        .unwrap();
+        vm.test_connect_stt().await.unwrap();
+        feed(&vm, 200, false).await;
+        feed(&vm, 400, true).await;
+        let out = vm.flush_stt().await.expect("the engine flushes");
+        assert!(out.result_follows && out.will_upload);
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let got = results.lock().clone();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].transcript, "segment 1");
+        // finalize_stt on the same session: a flush, never a disconnect.
+        vm.finalize_stt().await.unwrap();
+    }
+}
+
+/// Addendum B5: a buffering client (OpenAI, Groq) clears its callbacks in `disconnect`, which
+/// `finalize_stt` uses to flush at every `audio_end`; and Groq's failed flush used to stop the
+/// finalize before its reconnect.
+mod buffering_audio_end {
+    use super::*;
+    use crate::core::stt::{BaseSTT, STTError, STTErrorCallback, STTResultCallback};
+
+    /// A client that behaves as OpenAI's and Groq's do: text only at `disconnect`, which clears
+    /// both callbacks; optionally a flush that fails.
+    struct Buffering {
+        config: STTConfig,
+        connected: bool,
+        buffered: usize,
+        result: Option<STTResultCallback>,
+        error: Option<STTErrorCallback>,
+        fail_next_flush: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl BaseSTT for Buffering {
+        fn new(config: STTConfig) -> Result<Self, STTError> {
+            Ok(Self {
+                config,
+                connected: false,
+                buffered: 0,
+                result: None,
+                error: None,
+                fail_next_flush: Arc::new(AtomicBool::new(false)),
+            })
+        }
+        async fn connect(&mut self) -> Result<(), STTError> {
+            self.connected = true;
+            Ok(())
+        }
+        async fn disconnect(&mut self) -> Result<(), STTError> {
+            let failed = self.fail_next_flush.swap(false, Ordering::SeqCst);
+            let outcome = if failed {
+                Err(STTError::NetworkError("flush upload failed".into()))
+            } else {
+                if self.buffered > 0
+                    && let Some(cb) = &self.result
+                {
+                    cb(STTResult::new(
+                        format!("{} bytes", self.buffered),
+                        true,
+                        true,
+                        0.9,
+                    ))
+                    .await;
+                }
+                Ok(())
+            };
+            self.buffered = 0;
+            self.connected = false;
+            self.result = None;
+            self.error = None;
+            outcome
+        }
+        fn is_ready(&self) -> bool {
+            self.connected
+        }
+        async fn send_audio(&mut self, audio: bytes::Bytes) -> Result<(), STTError> {
+            if !self.connected {
+                return Err(STTError::ConnectionFailed("not connected".into()));
+            }
+            self.buffered += audio.len();
+            Ok(())
+        }
+        async fn on_result(&mut self, cb: STTResultCallback) -> Result<(), STTError> {
+            self.result = Some(cb);
+            Ok(())
+        }
+        async fn on_error(&mut self, cb: STTErrorCallback) -> Result<(), STTError> {
+            self.error = Some(cb);
+            Ok(())
+        }
+        fn get_config(&self) -> Option<&STTConfig> {
+            Some(&self.config)
+        }
+        async fn update_config(&mut self, config: STTConfig) -> Result<(), STTError> {
+            self.config = config;
+            Ok(())
+        }
+        fn get_provider_info(&self) -> &'static str {
+            "buffering-test"
+        }
+    }
+
+    async fn session(
+        fail: Arc<AtomicBool>,
+    ) -> (VoiceManager, Arc<parking_lot::Mutex<Vec<String>>>) {
+        let vm = ag6_voice_manager();
+        let mut stt = Buffering::new(STTConfig::default()).unwrap();
+        stt.fail_next_flush = fail;
+        vm.test_replace_stt(Box::new(stt)).await;
+        vm.test_connect_stt().await.unwrap();
+        let got = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let g = Arc::clone(&got);
+        vm.on_stt_result(move |r| {
+            let g = Arc::clone(&g);
+            Box::pin(async move { g.lock().push(r.transcript) })
+        })
+        .await
+        .unwrap();
+        vm.on_stt_error(|_| Box::pin(async {})).await.unwrap();
+        (vm, got)
+    }
+
+    async fn turn(vm: &VoiceManager, bytes: usize) {
+        vm.test_send_stt(bytes::Bytes::from(vec![1u8; bytes]))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_session_on_a_buffering_model_gets_a_transcript_at_every_audio_end() {
+        let (vm, got) = session(Arc::new(AtomicBool::new(false))).await;
+        for (i, n) in [320usize, 640, 960].into_iter().enumerate() {
+            turn(&vm, n).await;
+            vm.finalize_stt().await.unwrap();
+            let seen = got.lock().clone();
+            assert_eq!(
+                seen.len(),
+                i + 1,
+                "audio_end {} delivered nothing: {seen:?}",
+                i + 1
+            );
+        }
+        let seen = got.lock().clone();
+        assert_eq!(seen, vec!["320 bytes", "640 bytes", "960 bytes"]);
+    }
+
+    #[tokio::test]
+    async fn a_failed_flush_does_not_leave_the_session_disconnected() {
+        let fail = Arc::new(AtomicBool::new(true));
+        let (vm, got) = session(Arc::clone(&fail)).await;
+        turn(&vm, 320).await;
+        assert!(
+            vm.finalize_stt().await.is_err(),
+            "the failure is still reported"
+        );
+        turn(&vm, 640).await;
+        vm.finalize_stt().await.unwrap();
+        let seen = got.lock().clone();
+        assert_eq!(
+            seen,
+            vec!["640 bytes"],
+            "the next turn still gets its transcript"
+        );
+    }
+}
+
+/// The greeting fix (plan chapter 4, addendum A6): each utterance carries its own "may be cut".
+mod greeting_fix {
+    use crate::core::voice_manager::manager::per_utterance_interruptibility;
+    use crate::core::voice_manager::state::{InterruptionState, now_monotonic_ms};
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    fn state() -> InterruptionState {
+        InterruptionState {
+            allow_interruption: AtomicBool::new(true),
+            non_interruptible_until_ms: AtomicUsize::new(0),
+            current_sample_rate: AtomicU32::new(24_000),
+            is_completed: AtomicBool::new(true),
+            playout_end_ms: AtomicUsize::new(0),
+            audio_out_ms_total: AtomicU64::new(0),
+            protected_tail_until_ms: AtomicUsize::new(0),
+        }
+    }
+
+    /// As `speak_with_interruption(.., false)` and the egress leave it: a protected greeting of
+    /// `ms` whose audio has all arrived.
+    fn protected_greeting(s: &InterruptionState, ms: usize) {
+        s.allow_interruption.store(false, Ordering::Release);
+        s.non_interruptible_until_ms
+            .store(now_monotonic_ms(), Ordering::Release);
+        s.note_protected_chunk(ms);
+        s.is_completed.store(true, Ordering::Release);
+    }
+
+    #[test]
+    fn today_a_reply_after_a_non_interruptible_greeting_cannot_be_cleared() {
+        let s = state();
+        protected_greeting(&s, 50);
+        s.begin_interruptible_utterance(false);
+        s.note_protected_chunk(5_000); // the reply's audio
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(
+            !s.can_interrupt(),
+            "the reply's audio extended the greeting's window: barge-in cannot cut it"
+        );
+    }
+
+    #[test]
+    fn the_reply_can_be_cut_once_the_protected_greeting_has_played() {
+        let s = state();
+        protected_greeting(&s, 100);
+        s.begin_interruptible_utterance(true);
+        s.note_protected_chunk(5_000);
+        assert!(!s.can_interrupt(), "the greeting is still playing");
+        std::thread::sleep(Duration::from_millis(160));
+        assert!(s.can_interrupt(), "the reply may be cut");
+        // Nothing protected is left once a clear has happened.
+        s.reset();
+        assert!(s.can_interrupt());
+        assert_eq!(s.protected_tail_until_ms.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn an_interruptible_utterance_after_another_changes_nothing() {
+        let s = state();
+        s.begin_interruptible_utterance(true);
+        assert!(s.can_interrupt());
+        assert_eq!(s.protected_tail_until_ms.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn the_setting_covers_segmented_sessions_by_default() {
+        assert!(per_utterance_interruptibility(None, true));
+        assert!(!per_utterance_interruptibility(None, false));
+        assert!(per_utterance_interruptibility(Some("all"), false));
+        assert!(!per_utterance_interruptibility(Some("off"), true));
+        assert!(per_utterance_interruptibility(Some("segmented"), true));
+        assert!(!per_utterance_interruptibility(Some("segmented"), false));
+    }
+}
+
+/// A voice agent's tool-call tone reaches the caller like TTS audio, in the session's format, and
+/// never after a barge-in: a clear since the turn's epoch drops it.
+#[tokio::test]
+#[serial]
+async fn a_generated_sound_goes_out_like_speech_and_a_clear_stops_it() {
+    use crate::core::agent::SpeechOut;
+    let vm = ag6_voice_manager();
+    let got: Arc<parking_lot::Mutex<Vec<crate::core::tts::AudioData>>> = Arc::default();
+    let sink = Arc::clone(&got);
+    vm.on_tts_audio(move |a| {
+        let sink = Arc::clone(&sink);
+        Box::pin(async move { sink.lock().push(a) })
+    })
+    .await
+    .unwrap();
+
+    let pulse = SpeechOut::tone_pulse(&vm).expect("the default output carries the tone");
+    assert_eq!(
+        (pulse.sample_rate, pulse.format.as_str()),
+        (24_000, "linear16"),
+        "the default output is 24 kHz PCM16"
+    );
+    assert!(
+        Arc::ptr_eq(&pulse, &SpeechOut::tone_pulse(&vm).unwrap()),
+        "made once per session"
+    );
+    let before = vm.audio_out_ms();
+    let epoch = SpeechOut::clear_epoch(&vm);
+    assert!(vm.play_sound(&pulse, epoch).await);
+    {
+        let got = got.lock();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].format, "linear16");
+        assert_eq!(got[0].sample_rate, 24_000);
+        assert_eq!(got[0].data.len(), 24_000 * 360 / 1000 * 2);
+        assert_eq!(got[0].duration_ms, Some(crate::core::agent::tone::PULSE_MS));
+    }
+    assert_eq!(
+        vm.audio_out_ms() - before,
+        u64::from(crate::core::agent::tone::PULSE_MS),
+        "counted in the playout estimate"
+    );
+    assert!(vm.playout_remaining_ms() > 0);
+    assert!(
+        vm.get_config().tts_config.audio_format.is_some(),
+        "the default config names its format"
+    );
+
+    vm.clear_tts().await.unwrap();
+    assert!(
+        !vm.play_sound(&pulse, epoch).await,
+        "a stale epoch plays nothing"
+    );
+    assert_eq!(got.lock().len(), 1);
+}
+
+#[tokio::test]
+#[serial]
+async fn a_compressed_output_carries_no_generated_sound() {
+    use crate::core::agent::SpeechOut;
+    let tts_config = TTSConfig {
+        provider: "deepgram".to_string(),
+        api_key: "test_key".to_string(),
+        audio_format: Some("mp3".to_string()),
+        ..Default::default()
+    };
+    let stt_config = STTConfig {
+        provider: "deepgram".to_string(),
+        api_key: "test_key".to_string(),
+        ..Default::default()
+    };
+    let vm = VoiceManager::new(VoiceManagerConfig::new(stt_config, tts_config), None).unwrap();
+    assert!(SpeechOut::tone_pulse(&vm).is_none());
+    let mulaw = TTSConfig {
+        provider: "deepgram".to_string(),
+        api_key: "test_key".to_string(),
+        audio_format: Some("mulaw".to_string()),
+        sample_rate: None,
+        ..Default::default()
+    };
+    let vm = VoiceManager::new(
+        VoiceManagerConfig::new(
+            STTConfig {
+                provider: "deepgram".to_string(),
+                api_key: "test_key".to_string(),
+                ..Default::default()
+            },
+            mulaw,
+        ),
+        None,
+    )
+    .unwrap();
+    let pulse = SpeechOut::tone_pulse(&vm).expect("telephony mu-law can carry it");
+    assert_eq!(
+        (pulse.sample_rate, pulse.format.as_str()),
+        (8_000, "mulaw"),
+        "made at 8 kHz though the session names no rate"
+    );
+}

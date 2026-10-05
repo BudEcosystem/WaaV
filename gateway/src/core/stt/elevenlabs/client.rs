@@ -430,8 +430,10 @@ impl ElevenLabsSTT {
             url.push_str(&duration.to_string());
         }
 
-        // Enable logging (safe: boolean literal)
-        if config.enable_logging {
+        // Logging (safe: boolean literals): zero retention asks for none.
+        if config.zero_retention {
+            url.push_str("&enable_logging=false");
+        } else if config.enable_logging {
             url.push_str("&enable_logging=true");
         }
 
@@ -988,6 +990,7 @@ impl BaseSTT for ElevenLabsSTT {
             min_speech_duration_ms: existing.as_ref().and_then(|c| c.min_speech_duration_ms),
             min_silence_duration_ms: existing.as_ref().and_then(|c| c.min_silence_duration_ms),
             enable_logging: existing.as_ref().is_some_and(|c| c.enable_logging),
+            zero_retention: existing.as_ref().is_some_and(|c| c.zero_retention),
             region: existing
                 .as_ref()
                 .map(|c| c.region)

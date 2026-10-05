@@ -1,0 +1,622 @@
+{
+  "provider_id": "waav-infer",
+  "provider": {
+    "aliases": [
+      "infer",
+      "waav_infer",
+      "waavinfer"
+    ],
+    "default_model": null,
+    "model_string": "wire_model",
+    "registered_in_gateway": false,
+    "deployment_model_source": "table_only",
+    "egress": "in_cluster",
+    "deployment_base": "required",
+    "base_url_convention": "versioned",
+    "prerequisites": [
+      {
+        "kind": "private_address",
+        "detail": "The engine binds loopback with no authentication by default (port 8080), so the gateway reaches it only through a trusted, operator-configured private base address from the deployment record."
+      }
+    ],
+    "notes": "WaaV Infer is the operator's own inference engine. The gateway has a distinct id for it: INFER_STT_PROVIDER_ID = \"waav-infer\" (gateway/src/core/stt/infer.rs:23), which is also the id the speech-to-speech realtime adapter reports (gateway/src/core/realtime/infer/protocol.rs:130-132). For speech-to-text the adapter is a stub whose connect always fails (infer.rs:59-65) and it is deliberately left out of the plugin registry (gateway/src/plugin/builtin/mod.rs:2096-2130), so a session that names this provider gets the registry's unknown-provider error today. The aliases are those at infer.rs:24 without self-hosted, which that line still lists but which now names the self_hosted provider. Through Bud a WaaV Infer engine is expected to be published as vendor self_hosted with a base address ending in /v1 (an inference; the publishing route is an open decision), and then the self_hosted rows apply, with the profile waav-infer-file when the operator declares it; these rows exist so that a session naming waav-infer directly resolves to a stated answer instead of the global default. default_model is null: the engine hosts one speech-to-text model per process and an empty model means that model. The speech-to-speech realtime provider is a separate path that these rows do not touch."
+  },
+  "rows": [
+    {
+      "id": "waav-infer:any",
+      "match": {
+        "provider": "waav-infer",
+        "model_glob": "*"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "profile": "waav-infer-file"
+        },
+        {
+          "input_mode": "vendor_segmented",
+          "adapter": "planned_commit",
+          "enabled_from_release": null,
+          "disabled_reason": "Not implemented and not recommended. The engine's socket only buffers audio until a finalize frame and then runs the same one-shot transcription as the upload route, so it gives no interim text and no accuracy or compute gain; the gateway adapter is a stub whose connect always fails.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_upload_bytes": 104857600,
+            "idle_timeout_ms": 30000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 64,
+                "plan": null,
+                "scope": "deployment",
+                "note": "Engine default for open sockets (waav-infer-server/src/lib.rs:158)."
+              }
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": null,
+            "context_params": [],
+            "wire": "waav_infer_ws_v1"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "stub: gateway/src/core/stt/infer.rs:59-65 (connect always errors), :38 (default address ws://127.0.0.1:8123/v1/realtime); engine socket: waav-infer/crates/waav-infer-server/src/ws.rs:644-851, :1324-1372",
+            "notes": "The engine serves GET /v1/ws on port 8080; the stub's default address names port 8123 and path /v1/realtime, which the engine does not serve. Binary frames are appended to a buffer (ws.rs:837); on a finalize frame the whole buffer is decoded, resampled and transcribed in one call (ws.rs:1338) and exactly one final transcript is sent. A per-session language or key terms are rejected at the handshake (ws.rs:373-401). The socket closes after 30 seconds idle, at most 64 sessions are open at once, and a session may hold at most 100 MiB of audio (lib.rs:157-160); the 100 MiB figure is recorded here as the upload limit. The adapter is deliberately absent from the plugin registry (gateway/src/plugin/builtin/mod.rs:2096-2130)."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "fails",
+        "code_ref": "gateway/src/plugin/builtin/mod.rs:2096-2130 (the speech-to-text stub is deliberately not registered, so the registry answers with its unknown-provider error); gateway/src/core/stt/infer.rs:59-65 (the stub's connect always fails)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "WaaV Infer transcribes one uploaded audio clip per request and has no live streaming interface for transcription. This gateway does not yet serve a WaaV Infer model on a live call for this session. Choose a streaming transcription model, or ask the operator to enable segmented speech-to-text for this deployment."
+        }
+      },
+      "billing": {
+        "unit": "none",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "notes": "Operator-owned engine; no vendor meter. Only uploaded segments reach it."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "code_reading",
+        "owner": "waav-gateway",
+        "sources": [],
+        "code_refs": [
+          "gateway/src/core/stt/infer.rs:59-65",
+          "gateway/src/plugin/builtin/mod.rs:2096-2130",
+          "waav-infer/crates/waav-infer-server/src/lib.rs:48",
+          "waav-infer/crates/waav-infer-server/src/lib.rs:144-166",
+          "waav-infer/crates/waav-infer-server/src/lib.rs:1564-1596",
+          "waav-infer/crates/waav-infer-server/src/lib.rs:1647-1662",
+          "waav-infer/crates/waav-infer-server/src/lib.rs:1704-1715",
+          "waav-infer/crates/waav-infer-server/src/engine.rs:2750-2764",
+          "waav-infer/crates/waav-infer-server/src/ws.rs:373-401",
+          "waav-infer/crates/waav-infer-server/src/ws.rs:837",
+          "waav-infer/crates/waav-infer-server/src/ws.rs:1338",
+          "waav-infer/crates/waav-infer-core/src/model.rs:676-687",
+          "waav-infer/perf/COVERAGE.md:28-29"
+        ],
+        "unverified": [
+          "transports[0].latency (no end-of-speech-to-final measurement; engine inference time is measured for whisper-base and nemotron-asr only)",
+          "transports[0].limits.max_audio_ms",
+          "transports[0].limits.min_audio_ms",
+          "transports[0].upload.accepted (the engine decodes any container its decoder library supports; only WAV is relied on)",
+          "billing.min_billed_ms (no vendor meters the engine; Bud's own price for the deployment decides what the customer pays)"
+        ],
+        "notes": "Verified by reading the engine and gateway source on 2026-10-03. Every speech-to-text model WaaV Infer hosts is file-only at the serving interface today, whatever its architecture: the engine's model contract is one call that takes a whole clip and returns text (waav-infer-core/src/model.rs:676-687), and no production code emits a partial transcript. The engine accepts as model the loaded family id, any string that starts with it, the generic names stt and asr, and an empty string (engine.rs:2750-2764; lib.rs:1647-1662), so this default row is the normal match, not an exception. Whether a model streams is recorded nowhere the gateway could read it (not in the model manifest, not in /capabilities, not in /v1/models), which is why it is declared here."
+      }
+    },
+    {
+      "id": "waav-infer:whisper-any",
+      "match": {
+        "provider": "waav-infer",
+        "model_glob": "whisper*"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "openai_transcriptions",
+          "enabled_from_release": 1,
+          "disabled_reason": "Not implemented. The gateway has no per-utterance upload adapter, and it cannot reach WaaV Infer for speech-to-text at all today: the only adapter is a stub whose connect always fails (gateway/src/core/stt/infer.rs:59-65).",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [
+              {
+                "percentile": "p50",
+                "quantity": "inference_only",
+                "value_ms": 123,
+                "basis": "own_probe",
+                "source": "waav-infer/perf/COVERAGE.md:29",
+                "conditions": "Median engine-side model wall time for one transcription by whisper-base, on a GB10 GPU with ONNX Runtime, one model on the GPU, no batching. No network, detection or queueing is included. Larger Whisper models are unmeasured, and the whisper-base figure must not be assumed for them."
+              }
+            ],
+            "notes": "No end-of-speech-to-final figure exists; the entry is engine-side inference time only."
+          },
+          "limits": {
+            "max_upload_bytes": 104857600,
+            "max_audio_ms": null,
+            "min_audio_ms": null,
+            "vendor_timeout_ms": 30000,
+            "context_window_ms": 30000,
+            "rates": [
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 64,
+                "plan": null,
+                "scope": "deployment",
+                "note": "Engine default (waav-infer-server/src/lib.rs:48, :151); the operator may change it. A request that waits more than 2 seconds for admission is answered with HTTP 429 admission_rejected, which is load shedding and must not open the breaker."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "upload": {
+            "accepted": [
+              "wav"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "multipart"
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": null,
+            "language_format": "iso639_1",
+            "context_params": [],
+            "response_formats": [
+              "json",
+              "text"
+            ],
+            "wire": "openai_multipart",
+            "auth": "bearer_optional",
+            "path": "/audio/transcriptions"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "engine route: waav-infer/crates/waav-infer-server/src/lib.rs:1598-1765 (POST /v1/audio/transcriptions); gateway request code to extract: gateway/src/handlers/transcribe.rs:769-814 and :947-1027",
+            "notes": "Request restrictions enforced by the engine, each answered with HTTP 400 (unsupported_param): a non-empty language or prompt (lib.rs:1564-1574, :1663-1676); any response_format other than json or text, so verbose_json fails (lib.rs:1704-1715); any temperature other than 0 (lib.rs:1576-1596). The model field must be empty or name the loaded family, otherwise model_not_found (lib.rs:1647-1662; engine.rs:2750-2764). Unknown fields such as stream are read and ignored. The response is {\"text\": ...} only: no timestamps, no confidence, no detected language. Send 16 kHz audio, because the engine otherwise resamples linearly. Limits are the engine defaults (lib.rs:144-166, :48): 100 MiB upload, 64 concurrent requests, a 2 second wait for admission and then HTTP 429 with code admission_rejected, a 30 second deadline per request. A 429 from the engine is load shedding and must not count as a failure for the circuit breaker (gateway/src/core/resilience/infer_reject.rs). Concurrent uploads are folded into one batched forward pass of up to 24 clips with no added delay (waav-infer-server/src/stt_coalescer.rs:26-33, :142-145). The engine binds loopback with no authentication by default and serves one speech-to-text model per process."
+          },
+          "file_request_mode": "sync"
+        },
+        {
+          "input_mode": "vendor_segmented",
+          "adapter": "planned_commit",
+          "enabled_from_release": null,
+          "disabled_reason": "Not implemented and not recommended. The engine's socket only buffers audio until a finalize frame and then runs the same one-shot transcription as the upload route, so it gives no interim text and no accuracy or compute gain; the gateway adapter is a stub whose connect always fails.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_upload_bytes": 104857600,
+            "idle_timeout_ms": 30000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 64,
+                "plan": null,
+                "scope": "deployment",
+                "note": "Engine default for open sockets (waav-infer-server/src/lib.rs:158)."
+              }
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": null,
+            "context_params": [],
+            "wire": "waav_infer_ws_v1"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "stub: gateway/src/core/stt/infer.rs:59-65 (connect always errors), :38 (default address ws://127.0.0.1:8123/v1/realtime); engine socket: waav-infer/crates/waav-infer-server/src/ws.rs:644-851, :1324-1372",
+            "notes": "The engine serves GET /v1/ws on port 8080; the stub's default address names port 8123 and path /v1/realtime, which the engine does not serve. Binary frames are appended to a buffer (ws.rs:837); on a finalize frame the whole buffer is decoded, resampled and transcribed in one call (ws.rs:1338) and exactly one final transcript is sent. A per-session language or key terms are rejected at the handshake (ws.rs:373-401). The socket closes after 30 seconds idle, at most 64 sessions are open at once, and a session may hold at most 100 MiB of audio (lib.rs:157-160); the 100 MiB figure is recorded here as the upload limit. The adapter is deliberately absent from the plugin registry (gateway/src/plugin/builtin/mod.rs:2096-2130)."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "fails",
+        "code_ref": "gateway/src/plugin/builtin/mod.rs:2096-2130 (the speech-to-text stub is deliberately not registered, so the registry answers with its unknown-provider error); gateway/src/core/stt/infer.rs:59-65 (the stub's connect always fails)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "WaaV Infer transcribes one uploaded audio clip per request and has no live streaming interface for transcription. This gateway does not yet serve a WaaV Infer model on a live call for this session. Choose a streaming transcription model, or ask the operator to enable segmented speech-to-text for this deployment."
+        }
+      },
+      "billing": {
+        "unit": "none",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "notes": "Operator-owned engine; no vendor meter. Only uploaded segments reach it."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "code_reading",
+        "owner": "waav-gateway",
+        "sources": [],
+        "code_refs": [
+          "gateway/src/core/stt/infer.rs:59-65",
+          "gateway/src/plugin/builtin/mod.rs:2096-2130",
+          "waav-infer/crates/waav-infer-server/src/lib.rs:48",
+          "waav-infer/crates/waav-infer-server/src/lib.rs:144-166",
+          "waav-infer/crates/waav-infer-server/src/lib.rs:1564-1596",
+          "waav-infer/crates/waav-infer-server/src/lib.rs:1647-1662",
+          "waav-infer/crates/waav-infer-server/src/lib.rs:1704-1715",
+          "waav-infer/crates/waav-infer-server/src/engine.rs:2750-2764",
+          "waav-infer/crates/waav-infer-server/src/ws.rs:373-401",
+          "waav-infer/crates/waav-infer-server/src/ws.rs:837",
+          "waav-infer/crates/waav-infer-server/src/ws.rs:1338",
+          "waav-infer/crates/waav-infer-core/src/model.rs:676-687",
+          "waav-infer/crates/waav-infer-core/src/stt/whisper.rs:277-291",
+          "waav-infer/crates/waav-infer-components/src/mel.rs:79-82",
+          "waav-infer/perf/COVERAGE.md:29"
+        ],
+        "unverified": [
+          "transports[0].latency (no end-of-speech-to-final measurement; engine inference time is measured for whisper-base and nemotron-asr only)",
+          "transports[0].limits.max_audio_ms",
+          "transports[0].limits.min_audio_ms",
+          "transports[0].upload.accepted (the engine decodes any container its decoder library supports; only WAV is relied on)",
+          "billing.min_billed_ms (no vendor meters the engine; Bud's own price for the deployment decides what the customer pays)"
+        ],
+        "notes": "Verified by reading the engine and gateway source on 2026-10-03. Whisper family: the family id whisper, and any id starting with whisper (such as whisper-1 or whisper-large-v3) when a Whisper model is loaded (engine.rs:2750-2764). The engine pads every clip to a 30 second window (waav-infer-components/src/mel.rs:79-82) and cuts longer audio at hard 30 second boundaries (waav-infer-core/src/stt/whisper.rs:277-291), so the gateway must split at a pause and must not raise its 25 second segment cap. Each call costs a full 30 second encoder pass whatever the clip length. The language comes from the model directory only; it cannot be set per request."
+      }
+    },
+    {
+      "id": "waav-infer:nemotron-any",
+      "match": {
+        "provider": "waav-infer",
+        "model_glob": "nemotron*"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "openai_transcriptions",
+          "enabled_from_release": 1,
+          "disabled_reason": "Not implemented. The gateway has no per-utterance upload adapter, and it cannot reach WaaV Infer for speech-to-text at all today: the only adapter is a stub whose connect always fails (gateway/src/core/stt/infer.rs:59-65).",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [
+              {
+                "percentile": "p50",
+                "quantity": "inference_only",
+                "value_ms": 439,
+                "basis": "own_probe",
+                "source": "waav-infer/perf/COVERAGE.md:28",
+                "conditions": "Median engine-side model wall time for one transcription by nemotron-asr, on a GB10 GPU with ONNX Runtime, one model on the GPU, no batching. No network, detection or queueing is included."
+              }
+            ],
+            "notes": "No end-of-speech-to-final figure exists; the entry is engine-side inference time only."
+          },
+          "limits": {
+            "max_upload_bytes": 104857600,
+            "max_audio_ms": null,
+            "min_audio_ms": null,
+            "vendor_timeout_ms": 30000,
+            "rates": [
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 64,
+                "plan": null,
+                "scope": "deployment",
+                "note": "Engine default (waav-infer-server/src/lib.rs:48, :151); the operator may change it. A request that waits more than 2 seconds for admission is answered with HTTP 429 admission_rejected, which is load shedding and must not open the breaker."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "upload": {
+            "accepted": [
+              "wav"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "multipart"
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": null,
+            "language_format": "iso639_1",
+            "context_params": [],
+            "response_formats": [
+              "json",
+              "text"
+            ],
+            "wire": "openai_multipart",
+            "auth": "bearer_optional",
+            "path": "/audio/transcriptions"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "engine route: waav-infer/crates/waav-infer-server/src/lib.rs:1598-1765 (POST /v1/audio/transcriptions); gateway request code to extract: gateway/src/handlers/transcribe.rs:769-814 and :947-1027",
+            "notes": "Request restrictions enforced by the engine, each answered with HTTP 400 (unsupported_param): a non-empty language or prompt (lib.rs:1564-1574, :1663-1676); any response_format other than json or text, so verbose_json fails (lib.rs:1704-1715); any temperature other than 0 (lib.rs:1576-1596). The model field must be empty or name the loaded family, otherwise model_not_found (lib.rs:1647-1662; engine.rs:2750-2764). Unknown fields such as stream are read and ignored. The response is {\"text\": ...} only: no timestamps, no confidence, no detected language. Send 16 kHz audio, because the engine otherwise resamples linearly. Limits are the engine defaults (lib.rs:144-166, :48): 100 MiB upload, 64 concurrent requests, a 2 second wait for admission and then HTTP 429 with code admission_rejected, a 30 second deadline per request. A 429 from the engine is load shedding and must not count as a failure for the circuit breaker (gateway/src/core/resilience/infer_reject.rs). Concurrent uploads are folded into one batched forward pass of up to 24 clips with no added delay (waav-infer-server/src/stt_coalescer.rs:26-33, :142-145). The engine binds loopback with no authentication by default and serves one speech-to-text model per process."
+          },
+          "file_request_mode": "sync"
+        },
+        {
+          "input_mode": "vendor_segmented",
+          "adapter": "planned_commit",
+          "enabled_from_release": null,
+          "disabled_reason": "Not implemented and not recommended. The engine's socket only buffers audio until a finalize frame and then runs the same one-shot transcription as the upload route, so it gives no interim text and no accuracy or compute gain; the gateway adapter is a stub whose connect always fails.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_upload_bytes": 104857600,
+            "idle_timeout_ms": 30000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 64,
+                "plan": null,
+                "scope": "deployment",
+                "note": "Engine default for open sockets (waav-infer-server/src/lib.rs:158)."
+              }
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": null,
+            "context_params": [],
+            "wire": "waav_infer_ws_v1"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "stub: gateway/src/core/stt/infer.rs:59-65 (connect always errors), :38 (default address ws://127.0.0.1:8123/v1/realtime); engine socket: waav-infer/crates/waav-infer-server/src/ws.rs:644-851, :1324-1372",
+            "notes": "The engine serves GET /v1/ws on port 8080; the stub's default address names port 8123 and path /v1/realtime, which the engine does not serve. Binary frames are appended to a buffer (ws.rs:837); on a finalize frame the whole buffer is decoded, resampled and transcribed in one call (ws.rs:1338) and exactly one final transcript is sent. A per-session language or key terms are rejected at the handshake (ws.rs:373-401). The socket closes after 30 seconds idle, at most 64 sessions are open at once, and a session may hold at most 100 MiB of audio (lib.rs:157-160); the 100 MiB figure is recorded here as the upload limit. The adapter is deliberately absent from the plugin registry (gateway/src/plugin/builtin/mod.rs:2096-2130)."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "fails",
+        "code_ref": "gateway/src/plugin/builtin/mod.rs:2096-2130 (the speech-to-text stub is deliberately not registered, so the registry answers with its unknown-provider error); gateway/src/core/stt/infer.rs:59-65 (the stub's connect always fails)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "WaaV Infer transcribes one uploaded audio clip per request and has no live streaming interface for transcription. This gateway does not yet serve a WaaV Infer model on a live call for this session. Choose a streaming transcription model, or ask the operator to enable segmented speech-to-text for this deployment."
+        }
+      },
+      "billing": {
+        "unit": "none",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "notes": "Operator-owned engine; no vendor meter. Only uploaded segments reach it."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "code_reading",
+        "owner": "waav-gateway",
+        "sources": [],
+        "code_refs": [
+          "gateway/src/core/stt/infer.rs:59-65",
+          "gateway/src/plugin/builtin/mod.rs:2096-2130",
+          "waav-infer/crates/waav-infer-server/src/lib.rs:48",
+          "waav-infer/crates/waav-infer-server/src/lib.rs:144-166",
+          "waav-infer/crates/waav-infer-server/src/lib.rs:1564-1596",
+          "waav-infer/crates/waav-infer-server/src/lib.rs:1647-1662",
+          "waav-infer/crates/waav-infer-server/src/lib.rs:1704-1715",
+          "waav-infer/crates/waav-infer-server/src/engine.rs:2750-2764",
+          "waav-infer/crates/waav-infer-server/src/ws.rs:373-401",
+          "waav-infer/crates/waav-infer-server/src/ws.rs:837",
+          "waav-infer/crates/waav-infer-server/src/ws.rs:1338",
+          "waav-infer/crates/waav-infer-core/src/model.rs:676-687",
+          "waav-infer/crates/waav-infer-core/src/stt/nemotron.rs:131-152",
+          "waav-infer/perf/COVERAGE.md:28"
+        ],
+        "unverified": [
+          "transports[0].latency (no end-of-speech-to-final measurement; engine inference time is measured for whisper-base and nemotron-asr only)",
+          "transports[0].limits.max_audio_ms",
+          "transports[0].limits.min_audio_ms",
+          "transports[0].upload.accepted (the engine decodes any container its decoder library supports; only WAV is relied on)",
+          "billing.min_billed_ms (no vendor meters the engine; Bud's own price for the deployment decides what the customer pays)"
+        ],
+        "notes": "Verified by reading the engine and gateway source on 2026-10-03. Nemotron family (ids nemotron_speech and nemotron_rnnt, engine.rs:1617-1632; waav-infer-core/src/model.rs:957). The architecture is a cache-aware streaming transducer, but the engine creates fresh caches inside each call and runs the chunk loop to the end before it returns (waav-infer-core/src/stt/nemotron.rs:131-152). It is therefore file-only through WaaV Infer today. When the engine gains an incremental speech-to-text session that keeps caches across calls and emits partial transcripts, this row gains a live_stream transport ahead of the upload."
+      }
+    },
+    {
+      "id": "waav-infer:voxtral-any-realtime-any",
+      "match": {
+        "provider": "waav-infer",
+        "model_glob": "voxtral*realtime*"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "openai_transcriptions",
+          "enabled_from_release": 1,
+          "disabled_reason": "Not implemented. The gateway has no per-utterance upload adapter, and it cannot reach WaaV Infer for speech-to-text at all today: the only adapter is a stub whose connect always fails (gateway/src/core/stt/infer.rs:59-65).",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "No end-of-speech-to-final figure exists for this family on the upload route."
+          },
+          "limits": {
+            "max_upload_bytes": 104857600,
+            "max_audio_ms": null,
+            "min_audio_ms": null,
+            "vendor_timeout_ms": 30000,
+            "rates": [
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 64,
+                "plan": null,
+                "scope": "deployment",
+                "note": "Engine default (waav-infer-server/src/lib.rs:48, :151); the operator may change it. A request that waits more than 2 seconds for admission is answered with HTTP 429 admission_rejected, which is load shedding and must not open the breaker."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "upload": {
+            "accepted": [
+              "wav"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "multipart"
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": null,
+            "language_format": "iso639_1",
+            "context_params": [],
+            "response_formats": [
+              "json",
+              "text"
+            ],
+            "wire": "openai_multipart",
+            "auth": "bearer_optional",
+            "path": "/audio/transcriptions"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "engine route: waav-infer/crates/waav-infer-server/src/lib.rs:1598-1765 (POST /v1/audio/transcriptions); gateway request code to extract: gateway/src/handlers/transcribe.rs:769-814 and :947-1027",
+            "notes": "Request restrictions enforced by the engine, each answered with HTTP 400 (unsupported_param): a non-empty language or prompt (lib.rs:1564-1574, :1663-1676); any response_format other than json or text, so verbose_json fails (lib.rs:1704-1715); any temperature other than 0 (lib.rs:1576-1596). The model field must be empty or name the loaded family, otherwise model_not_found (lib.rs:1647-1662; engine.rs:2750-2764). Unknown fields such as stream are read and ignored. The response is {\"text\": ...} only: no timestamps, no confidence, no detected language. Send 16 kHz audio, because the engine otherwise resamples linearly. Limits are the engine defaults (lib.rs:144-166, :48): 100 MiB upload, 64 concurrent requests, a 2 second wait for admission and then HTTP 429 with code admission_rejected, a 30 second deadline per request. A 429 from the engine is load shedding and must not count as a failure for the circuit breaker (gateway/src/core/resilience/infer_reject.rs). Concurrent uploads are folded into one batched forward pass of up to 24 clips with no added delay (waav-infer-server/src/stt_coalescer.rs:26-33, :142-145). The engine binds loopback with no authentication by default and serves one speech-to-text model per process."
+          },
+          "file_request_mode": "sync"
+        },
+        {
+          "input_mode": "vendor_segmented",
+          "adapter": "planned_commit",
+          "enabled_from_release": null,
+          "disabled_reason": "Not implemented and not recommended. The engine's socket only buffers audio until a finalize frame and then runs the same one-shot transcription as the upload route, so it gives no interim text and no accuracy or compute gain; the gateway adapter is a stub whose connect always fails.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_upload_bytes": 104857600,
+            "idle_timeout_ms": 30000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 64,
+                "plan": null,
+                "scope": "deployment",
+                "note": "Engine default for open sockets (waav-infer-server/src/lib.rs:158)."
+              }
+            ]
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": null,
+            "context_params": [],
+            "wire": "waav_infer_ws_v1"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "stub: gateway/src/core/stt/infer.rs:59-65 (connect always errors), :38 (default address ws://127.0.0.1:8123/v1/realtime); engine socket: waav-infer/crates/waav-infer-server/src/ws.rs:644-851, :1324-1372",
+            "notes": "The engine serves GET /v1/ws on port 8080; the stub's default address names port 8123 and path /v1/realtime, which the engine does not serve. Binary frames are appended to a buffer (ws.rs:837); on a finalize frame the whole buffer is decoded, resampled and transcribed in one call (ws.rs:1338) and exactly one final transcript is sent. A per-session language or key terms are rejected at the handshake (ws.rs:373-401). The socket closes after 30 seconds idle, at most 64 sessions are open at once, and a session may hold at most 100 MiB of audio (lib.rs:157-160); the 100 MiB figure is recorded here as the upload limit. The adapter is deliberately absent from the plugin registry (gateway/src/plugin/builtin/mod.rs:2096-2130)."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "fails",
+        "code_ref": "gateway/src/plugin/builtin/mod.rs:2096-2130 (the speech-to-text stub is deliberately not registered, so the registry answers with its unknown-provider error); gateway/src/core/stt/infer.rs:59-65 (the stub's connect always fails)",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "WaaV Infer transcribes one uploaded audio clip per request and has no live streaming interface for transcription. This gateway does not yet serve a WaaV Infer model on a live call for this session. Choose a streaming transcription model, or ask the operator to enable segmented speech-to-text for this deployment."
+        }
+      },
+      "billing": {
+        "unit": "none",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "notes": "Operator-owned engine; no vendor meter. Only uploaded segments reach it."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "code_reading",
+        "owner": "waav-gateway",
+        "sources": [],
+        "code_refs": [
+          "gateway/src/core/stt/infer.rs:59-65",
+          "gateway/src/plugin/builtin/mod.rs:2096-2130",
+          "waav-infer/crates/waav-infer-server/src/lib.rs:48",
+          "waav-infer/crates/waav-infer-server/src/lib.rs:144-166",
+          "waav-infer/crates/waav-infer-server/src/lib.rs:1564-1596",
+          "waav-infer/crates/waav-infer-server/src/lib.rs:1647-1662",
+          "waav-infer/crates/waav-infer-server/src/lib.rs:1704-1715",
+          "waav-infer/crates/waav-infer-server/src/engine.rs:2750-2764",
+          "waav-infer/crates/waav-infer-server/src/ws.rs:373-401",
+          "waav-infer/crates/waav-infer-server/src/ws.rs:837",
+          "waav-infer/crates/waav-infer-server/src/ws.rs:1338",
+          "waav-infer/crates/waav-infer-core/src/model.rs:676-687",
+          "waav-infer/crates/waav-infer-core/src/stt/voxtral.rs:1-12",
+          "waav-infer/crates/waav-infer-core/src/stt/voxtral.rs:248-262"
+        ],
+        "unverified": [
+          "transports[0].latency (no end-of-speech-to-final measurement; engine inference time is measured for whisper-base and nemotron-asr only)",
+          "transports[0].limits.max_audio_ms",
+          "transports[0].limits.min_audio_ms",
+          "transports[0].upload.accepted (the engine decodes any container its decoder library supports; only WAV is relied on)",
+          "billing.min_billed_ms (no vendor meters the engine; Bud's own price for the deployment decides what the customer pays)"
+        ],
+        "notes": "Verified by reading the engine and gateway source on 2026-10-03. Voxtral Realtime family (id voxtral_realtime, or the lower-cased architecture name voxtralrealtimeforconditionalgeneration; engine.rs:1617-1632; waav-infer-core/src/model.rs:985). The model is built for streaming with a 480 ms delay fixed in the export, but the engine runs the encoder once over the whole clip with empty caches (waav-infer-core/src/stt/voxtral.rs:1-12, :248-262). It is therefore file-only through WaaV Infer today, and flips to a live_stream transport only after the same engine work as the Nemotron family."
+      }
+    }
+  ]
+}

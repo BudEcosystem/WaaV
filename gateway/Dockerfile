@@ -14,8 +14,9 @@ ARG RUST_VERSION=1.96.0
 # Production feature set — must match CI's PROD_FEATURES (.github/workflows/ci.yml) so the shipped
 # binary is exactly what CI gates. Ships the DAG orchestration engine (dag-routing) and the full
 # neural turn-detection ensemble (turn-ensemble = smart-turn + turn-detect + silero-vad) — NOT just
-# basic turn-detect. smart-turn/silero ONNX models lazy-download on first use (cached thereafter);
-# turn-detect assets are pre-baked by the `init` stage below.
+# basic turn-detect. The `init` stage below bakes every model into /app/cache: the turn-detect assets,
+# and the Silero and SmartTurn models that segmented speech-to-text needs on every live call on a
+# file-only model (a replica without them refuses those calls or falls back to a cruder detector).
 ARG CARGO_BUILD_FEATURES="--no-default-features --features dag-routing,turn-ensemble,noise-filter,openapi"
 ARG ONNX_VERSION=1.23.2
 
@@ -42,6 +43,7 @@ FROM chef AS planner
 COPY bud-auth /app/bud-auth
 COPY waav-openai-audio /app/waav-openai-audio
 COPY plugin-api /app/plugin-api
+COPY segmented-stt /app/segmented-stt
 COPY gateway/Cargo.toml gateway/Cargo.lock ./
 # cargo-chef needs a target file for cargo metadata; stub keeps cache stable. The declared
 # [[bench]] targets need one too, or `cargo metadata` refuses to parse the manifest.
@@ -96,6 +98,7 @@ COPY --from=planner /app/gateway/recipe.json recipe.json
 COPY bud-auth /app/bud-auth
 COPY waav-openai-audio /app/waav-openai-audio
 COPY plugin-api /app/plugin-api
+COPY segmented-stt /app/segmented-stt
 COPY gateway/.cargo/config.toml .cargo/config.toml
 # cargo-chef rebuilds the crate skeleton from the recipe but creates no bench sources, and
 # Cargo refuses to parse a manifest whose declared [[bench]] targets are absent. Stubbing
@@ -167,7 +170,7 @@ COPY --from=builder /app/gateway/onnxruntime/lib/*.so* /app/
 # Cached models from init stage
 COPY --from=init /app/cache /app/cache
 
-ENV RUST_LOG=info \
+ENV RUST_LOG=info,ort=warn \
     PORT=3001 \
     CACHE_PATH=/app/cache
 

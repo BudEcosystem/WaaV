@@ -2,9 +2,10 @@
 Type definitions for bud-waav SDK
 """
 
+import copy
 from enum import Enum
-from typing import Any, Callable, Literal, Optional, Union
-from pydantic import BaseModel, ConfigDict, Field
+from typing import Any, Callable, Literal, Optional, TypeVar, Union
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, ValidationError, field_validator
 
 
 # =============================================================================
@@ -752,8 +753,9 @@ class ConversationConfig(BaseModel):
 
     model_config = ConfigDict(use_enum_values=True)
 
-    base_url: str
-    """OpenAI-compatible base URL for the LLM (e.g. 'https://api.openai.com/v1')."""
+    base_url: Optional[str] = None
+    """OpenAI-compatible base URL for the LLM (e.g. 'https://api.openai.com/v1'). Leave it out under
+    the Bud control plane, where the LLM is a Bud chat deployment and the gateway refuses one."""
 
     model: str
     """Model identifier (e.g. 'gpt-4o-mini', 'llama3.2:1b')."""
@@ -840,6 +842,40 @@ class ConversationConfig(BaseModel):
     """Hard ceiling on the reasoning tier's output tokens."""
 
 
+class VoiceAgentConfig(BaseModel):
+    """A Bud voice agent for the session (spec 025), sent as the config envelope's ``agent``.
+
+    The agent decides both speech legs (its STT and TTS deployments), the voice and how turns
+    are taken; budprompt answers one turn per utterance. A session with an agent sends no
+    conversation or DAG block, and its ``stt_config``/``tts_config`` carry only the audio
+    format: the gateway refuses a model on them (``agent_owns_legs``).
+    """
+
+    id: str
+    """The agent's name (what ``prompt:<name>`` names on ``/v1/responses``), optionally pinned
+    as ``name:v<n>``. A ``prompt:`` prefix is accepted."""
+
+    version: Optional[int] = None
+    """Pin a version; otherwise the agent's default version, pinned for the session."""
+
+    text_only: Optional[bool] = None
+    """Text replies only: answers arrive as ``assistant_transcript`` and nothing is spoken."""
+
+    variables: Optional[dict[str, Any]] = None
+    """The agent's structured input, once per session."""
+
+    @field_validator("id")
+    @classmethod
+    def _named(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("an agent needs its name")
+        return v
+
+    def to_wire(self) -> dict[str, Any]:
+        """The ``agent`` block, with only the fields set."""
+        return self.model_dump(exclude_none=True)
+
+
 class TranslationConfig(BaseModel):
     """Canonical, provider-agnostic in-stream/batch translation request (P5).
 
@@ -885,6 +921,17 @@ class TranslationConfig(BaseModel):
         return wire
 
 
+TranscriptionMode = Literal["auto", "streaming", "segmented"]
+"""The kind of speech-to-text a client asks for (gateway ``stt_config.transcription_mode``).
+
+* ``"auto"`` (the default when omitted): whatever the model supports;
+* ``"streaming"``: text while the caller speaks; the gateway refuses a model that cannot stream;
+* ``"segmented"``: the gateway cuts the audio at pauses and uploads each utterance, even for a
+  model that streams. A plain session on a file-only model needs this to get text at each pause.
+
+What the session actually got comes back on ``ready.stt`` (see :class:`ReadySTT`)."""
+
+
 class STTConfig(BaseModel):
     """STT (Speech-to-Text) configuration."""
 
@@ -908,6 +955,11 @@ class STTConfig(BaseModel):
     Distinct from :attr:`encoding`. Opt-in (the Python SDK does not yet opus-encode, so set this only
     if you encode opus yourself); the gateway echoes the effective codec on ``ready`` and degrades to
     linear16 if its build lacks opus."""
+
+    transcription_mode: Optional[TranscriptionMode] = None
+    """The kind of speech-to-text wanted: ``"auto"`` | ``"streaming"`` | ``"segmented"``
+    (see :data:`TranscriptionMode`). ``None`` (the default) omits the wire field, which the
+    gateway reads as ``"auto"``. The mode the session got is reported on ``session.stt``."""
 
     channels: int = 1
     """Number of audio channels"""
@@ -1199,6 +1251,211 @@ class AudioEvent(BaseModel):
 
     sequence: Optional[int] = None
     """Sequence number for ordering"""
+
+
+# =============================================================================
+# Segmented speech-to-text: ready.stt, vad_event, stt_warning
+# (gateway docs/segmented-stt/customer-contract-reference.md)
+# =============================================================================
+
+_WireModel = TypeVar("_WireModel", bound=BaseModel)
+
+
+def _lenient_validate(cls: type[_WireModel], data: dict[str, Any]) -> _WireModel:
+    """Validate a gateway frame without ever raising.
+
+    A field whose value does not fit its declared type (e.g. a newer gateway changed it) is left at
+    its default instead of failing the whole frame, so one odd value never stops the receive loop.
+    """
+    try:
+        return cls.model_validate(data)
+    except ValidationError as exc:
+        bad = {err["loc"][0] for err in exc.errors() if err.get("loc")}
+        return cls.model_validate({k: v for k, v in data.items() if k not in bad})
+
+
+class SttNotice(BaseModel):
+    """A fact about the session reported on ``ready.stt.notices`` instead of a message."""
+
+    model_config = ConfigDict(extra="allow")
+
+    code: str = ""
+    """Stable machine code, e.g. ``stt_language_unset``, ``stt_capability_assumed``."""
+
+    message: str = ""
+    """Human-readable explanation."""
+
+    detail: Optional[dict[str, Any]] = None
+    """Optional structured detail."""
+
+
+class ReadySTT(BaseModel):
+    """What speech-to-text a session got: the gateway's ``ready.stt`` object.
+
+    Present only on sessions the gateway's segmented-STT rollout covers. Every known key is
+    optional and typed; the object is open, so keys a newer gateway adds are kept (see
+    :meth:`to_wire`, which returns the object exactly as the gateway sent it). String fields stay
+    plain ``str`` so a value a newer gateway adds still parses; the known values are listed on each
+    field.
+    """
+
+    model_config = ConfigDict(extra="allow", protected_namespaces=())
+
+    provider: Optional[str] = None
+    """Canonical provider id after alias or deployment resolution."""
+
+    model: Optional[str] = None
+    """The model that runs (absent when the gateway does not know it)."""
+
+    model_source: Optional[str] = None
+    """Where ``model`` came from: ``request``, ``deployment``, ``provider_default``, ``substituted``."""
+
+    deployment: Optional[str] = None
+    """The Bud deployment name the client used (named-deployment sessions only)."""
+
+    transcription_mode: Optional[str] = None
+    """``streaming`` (text while the caller speaks), ``segmented`` (text after each pause) or
+    ``buffered`` (text only at ``audio_end`` or hang-up)."""
+
+    requested_mode: Optional[str] = None
+    """The preference that applied: ``auto``, ``streaming``, ``segmented``. Differs from
+    ``transcription_mode`` when it was not met."""
+
+    requested_mode_source: Optional[str] = None
+    """Where the preference came from: ``request``, ``deployment``, ``default``."""
+
+    interim_results: Optional[str] = None
+    """``live`` (revisable interims during speech), ``per_segment`` (the whole turn so far, after a
+    pause) or ``none``."""
+
+    endpointing: Optional[str] = None
+    """Who ends utterances: ``vendor``, ``gateway``, ``client``."""
+
+    speech_events: Optional[str] = None
+    """Which ``vad_event`` messages arrive: ``detector``, ``transcript``, ``none``."""
+
+    barge_in_ms: Optional[int] = None
+    """Sustained speech needed for ``turn_start`` while audio plays."""
+
+    detector: Optional[str] = None
+    """The voice detector in use: ``silero``, ``energy``, ``scripted``."""
+
+    confidence_source: Optional[str] = None
+    """``vendor``, ``derived``, ``none`` (``confidence`` is exactly 1.0; do not filter on it) or
+    ``unknown``."""
+
+    latency_class: Optional[str] = None
+    """``realtime``, ``fast``, ``slow`` or ``unknown``."""
+
+    final_latency_typical_ms: Optional[int] = None
+    """50th-percentile end-of-speech to text, in ms."""
+
+    final_latency_slow_ms: Optional[int] = None
+    """Slow-percentile end-of-speech to text, in ms."""
+
+    final_latency_slow_percentile: Optional[int] = None
+    """Which percentile the slow figure is (95 or 99)."""
+
+    latency_basis: Optional[str] = None
+    """How the figures were obtained: ``measured``, ``provisional``, ``seed``, ``none``."""
+
+    final_deadline_ms: Optional[int] = None
+    """How long the gateway waits for a segment's text before reporting it lost, in ms."""
+
+    lifecycle: Optional[str] = None
+    """Vendor lifecycle: ``ga``, ``preview``, ``deprecated``."""
+
+    shutdown_on: Optional[str] = None
+    """Shutdown date (``YYYY-MM-DD``) of a deprecated model."""
+
+    capability_source: Optional[str] = None
+    """The capability-map layer that matched: ``deployment_override``, ``exact``, ``glob``,
+    ``model_unset``, ``provider_default``, ``global_default``."""
+
+    streaming_alternatives: list[str] = Field(default_factory=list)
+    """Same-provider models that stream."""
+
+    notices: list[SttNotice] = Field(default_factory=list)
+    """Facts reported without a message."""
+
+    map_version: Optional[str] = None
+    """Capability map version."""
+
+    _raw: dict[str, Any] = PrivateAttr(default_factory=dict)
+
+    @classmethod
+    def from_wire(cls, data: dict[str, Any]) -> "ReadySTT":
+        """Parse the ``ready.stt`` object. Never raises on an unexpected value."""
+        model = _lenient_validate(cls, data)
+        model._raw = copy.deepcopy(data)
+        return model
+
+    def to_wire(self) -> dict[str, Any]:
+        """The object as the gateway sent it (snake_case keys, nulls and unknown keys included)."""
+        if self._raw:
+            return copy.deepcopy(self._raw)
+        return self.model_dump(exclude_unset=True)
+
+
+class VadEvent(BaseModel):
+    """A gateway speech event (wire ``vad_event``, segmented STT).
+
+    Detector-timed speech start/end and the gateway's turn decisions. Which ones arrive is given by
+    ``ready.stt.speech_events``; match them by ``turn_id``.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    event: str = ""
+    """``speech_start``, ``speech_end``, ``turn_start``, ``turn_end`` or ``turn_closed``."""
+
+    turn_id: int = 0
+    """The turn this event belongs to."""
+
+    audio_ms: Optional[int] = None
+    """Position in the received audio, in ms (first speech sample for starts, last for ends)."""
+
+    sustained_ms: Optional[int] = None
+    """Sustained speech before the gateway took the turn (``turn_start``)."""
+
+    discarded: Optional[bool] = None
+    """The cut segment was discarded rather than uploaded (``speech_end``)."""
+
+    had_transcript: Optional[bool] = None
+    """Whether the turn produced text (``turn_closed``)."""
+
+    reason: Optional[str] = None
+    """Why a turn closed without text (``turn_closed``): ``no_speech``, ``transcription_failed``,
+    ``ignored``."""
+
+    @classmethod
+    def from_wire(cls, data: dict[str, Any]) -> "VadEvent":
+        """Parse a raw ``{type: vad_event, event, turn_id, ...}`` frame. Never raises."""
+        return _lenient_validate(cls, {k: v for k, v in data.items() if k != "type"})
+
+
+class SttWarning(BaseModel):
+    """A speech-to-text problem in the middle of a call that does not end it (wire ``stt_warning``).
+
+    For example a lost segment (``stt_segment_failed``), dropped audio (``stt_audio_dropped``) or
+    rate limiting (``stt_rate_limited``). The gateway never sends these as ``error``, and the SDK
+    never reports them as errors either.
+    """
+
+    code: str = ""
+    """Stable machine code, e.g. ``stt_segment_failed``, ``stt_degraded``, ``stt_rate_limited``,
+    ``stt_audio_dropped``, ``stt_fields_reduced``, ``stt_detector_fallback``."""
+
+    message: str = ""
+    """Human-readable explanation."""
+
+    detail: Optional[dict[str, Any]] = None
+    """Optional structured detail (e.g. ``{"turn_id": 4, "segment_seq": 2, ...}``)."""
+
+    @classmethod
+    def from_wire(cls, data: dict[str, Any]) -> "SttWarning":
+        """Parse a raw ``{type: stt_warning, code, message, detail?}`` frame. Never raises."""
+        return _lenient_validate(cls, {k: v for k, v in data.items() if k != "type"})
 
 
 class Voice(BaseModel):

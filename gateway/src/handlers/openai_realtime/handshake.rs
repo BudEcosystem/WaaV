@@ -98,6 +98,8 @@ pub struct HandshakeError {
     pub message: String,
     pub param: Option<&'static str>,
     pub retry_after: Option<u64>,
+    /// Bud's structured detail (`stt_live_unsupported`'s `reason`, …); absent from OpenAI's errors.
+    pub details: Option<serde_json::Value>,
 }
 
 impl HandshakeError {
@@ -115,7 +117,13 @@ impl HandshakeError {
             message: message.into(),
             param: None,
             retry_after: None,
+            details: None,
         }
+    }
+
+    pub fn details(mut self, details: serde_json::Value) -> Self {
+        self.details = Some(details);
+        self
     }
 
     pub fn param(mut self, param: &'static str) -> Self {
@@ -131,7 +139,7 @@ impl HandshakeError {
 
 impl IntoResponse for HandshakeError {
     fn into_response(self) -> Response {
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "error": {
                 "message": self.message,
                 "type": self.kind,
@@ -139,6 +147,9 @@ impl IntoResponse for HandshakeError {
                 "code": self.code,
             }
         });
+        if let Some(d) = self.details {
+            body["error"]["details"] = d;
+        }
         let mut resp = (self.status, axum::Json(body)).into_response();
         if let Some(secs) = self.retry_after
             && let Ok(v) = axum::http::HeaderValue::from_str(&secs.to_string())

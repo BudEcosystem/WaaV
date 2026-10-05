@@ -328,6 +328,11 @@ pub struct STTResult {
 
     /// The vendor's own id for the request that produced this result, when it returned one.
     pub vendor_request_id: Option<String>,
+
+    /// The caller turn a gateway-endpointed provider (the segmented engine) emitted this result
+    /// for. Consumers match a result to its `SpeechActivity::TurnClosed` by this id, because the
+    /// two travel on different tasks. `None` for every other provider; never serialized.
+    pub speech_turn_id: Option<u64>,
 }
 
 impl STTResult {
@@ -369,6 +374,7 @@ impl STTResult {
             translations: Vec::new(),
             vendor_confidence: None,
             vendor_request_id: None,
+            speech_turn_id: None,
         }
     }
 
@@ -435,6 +441,7 @@ impl STTResult {
             translations: Vec::new(),
             vendor_confidence: None,
             vendor_request_id: None,
+            speech_turn_id: None,
         }
     }
 
@@ -816,6 +823,42 @@ pub trait BaseSTT: Send + Sync {
     /// collects these and the handler puts them on `x-bud-config-warning`.
     fn config_warnings(&self) -> Vec<String> {
         Vec::new()
+    }
+
+    /// Register for detector-timed speech events. A provider that runs a gateway-side detector
+    /// (the segmented engine) overrides this and returns true. The callback must return at once.
+    fn on_speech_activity(
+        &mut self,
+        _callback: super::speech_activity::SpeechActivityCallback,
+    ) -> bool {
+        false
+    }
+
+    /// The function that says, per segment, whether the speech is input. Unset means "admit".
+    fn set_segment_admission(&mut self, _hook: super::speech_activity::SegmentAdmissionHook) {}
+
+    /// Cut the open segment and close the turn as soon as its uploads resolve. The receiver
+    /// resolves when the provider has reached the request, behind any audio sent before it.
+    /// `None`: not supported, and the caller keeps today's disconnect-and-reconnect.
+    fn request_flush(
+        &mut self,
+    ) -> Option<tokio::sync::oneshot::Receiver<super::speech_activity::FlushOutcome>> {
+        None
+    }
+
+    /// Register for conditions that arise during the call and do not end it.
+    fn on_notice(&mut self, _callback: super::speech_activity::NoticeCallback) {}
+
+    /// Receive one outcome per upload unit, in sequence order.
+    fn set_outcome_sink(
+        &mut self,
+        _sink: std::sync::Arc<dyn super::speech_activity::SegmentOutcomeSink>,
+    ) {
+    }
+
+    /// What a gateway-endpointed provider knows about itself. `None` for every other provider.
+    fn live_facts(&self) -> Option<super::speech_activity::SttLiveFacts> {
+        None
     }
 }
 

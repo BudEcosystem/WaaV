@@ -23,8 +23,8 @@
 
 use std::time::Instant;
 
-use rubato::{FftFixedIn, Resampler};
 use tracing::{debug, warn};
+use waav_segmented_stt::resample::MonoResampler;
 
 /// Drop stale filter state when this much wall time passed since the last
 /// chunk (Pipecat `CLEAR_STREAM_AFTER_SECS` parity).
@@ -34,18 +34,15 @@ const CLEAR_AFTER: std::time::Duration = std::time::Duration::from_millis(200);
 /// rate (review wf_85659e16 #9 — a fixed 1024 frames meant 8 kHz telephony
 /// ingress gathered 128ms before the VAD/smart-turn models saw ANY of it;
 /// 20ms keeps decision latency in line with the 12ms inference budget).
-fn chunk_frames_for(in_rate: u32) -> usize {
-    ((in_rate as usize) / 50).clamp(64, 1024)
-}
+/// The largest chunk the resampler processes at once (about 20 ms at 51.2 kHz).
+const MAX_CHUNK_FRAMES: usize = 1024;
 
 /// Streaming mono f32 resampler. See the module docs for the contract.
 pub struct StreamResampler {
-    inner: Option<FftFixedIn<f32>>,
+    inner: Option<MonoResampler>,
     in_rate: u32,
     out_rate: u32,
     last_call: Option<Instant>,
-    /// Tail (< one chunk) carried between calls — continuous filter state.
-    pending_in: Vec<f32>,
 }
 
 impl std::fmt::Debug for StreamResampler {
@@ -53,7 +50,7 @@ impl std::fmt::Debug for StreamResampler {
         f.debug_struct("StreamResampler")
             .field("in_rate", &self.in_rate)
             .field("out_rate", &self.out_rate)
-            .field("pending", &self.pending_in.len())
+            .field("pending", &self.pending())
             .finish()
     }
 }
@@ -71,7 +68,6 @@ impl StreamResampler {
             in_rate: 0,
             out_rate: 0,
             last_call: None,
-            pending_in: Vec::new(),
         }
     }
 
@@ -93,24 +89,11 @@ impl StreamResampler {
             // passthrough instead of panicking — never drop audio.
             return Some(input.to_vec());
         };
-        self.pending_in.extend_from_slice(input);
-
         let mut out: Vec<f32> = Vec::new();
-        let chunk = resampler.input_frames_next().max(1);
-        while self.pending_in.len() >= chunk {
-            let take: Vec<f32> = self.pending_in.drain(..chunk).collect();
-            match resampler.process(&[take], None) {
-                Ok(mut resampled) => {
-                    if let Some(channel) = resampled.pop() {
-                        out.extend_from_slice(&channel);
-                    }
-                }
-                Err(e) => {
-                    warn!(error = %e, "stream resample failed; passing chunk through unresampled");
-                    // Conservative degradation: never drop audio silently.
-                    return Some(input.to_vec());
-                }
-            }
+        if let Err(e) = resampler.push(input, &mut out) {
+            warn!(error = %e, "stream resample failed; passing chunk through unresampled");
+            // Conservative degradation: never drop audio silently.
+            return Some(input.to_vec());
         }
         Some(out)
     }
@@ -123,22 +106,18 @@ impl StreamResampler {
     /// delay line), resets, and returns the emitted samples. `None` when
     /// nothing is pending.
     pub fn flush(&mut self) -> Option<Vec<f32>> {
-        let resampler = self.inner.as_mut()?;
-        if self.pending_in.is_empty() {
+        // Nothing held: the filter was not reset, so `last_call` stays and the stale-clear still
+        // starts the next utterance fresh.
+        if self.pending() == 0 {
             return None;
         }
-        let chunk = resampler.input_frames_next().max(1);
-        let mut tail = std::mem::take(&mut self.pending_in);
-        tail.resize(chunk, 0.0);
-        let out = match resampler.process(&[tail], None) {
-            Ok(mut resampled) => resampled.pop().unwrap_or_default(),
-            Err(e) => {
-                warn!(error = %e, "stream resampler flush failed; tail dropped");
-                Vec::new()
-            }
-        };
+        let resampler = self.inner.as_mut()?;
+        let mut out = Vec::new();
+        if let Err(e) = resampler.flush(&mut out) {
+            warn!(error = %e, "stream resampler flush failed; tail dropped");
+            out.clear();
+        }
         // The utterance is over: a fresh start for the next one.
-        resampler.reset();
         self.last_call = None;
         if out.is_empty() { None } else { Some(out) }
     }
@@ -149,8 +128,12 @@ impl StreamResampler {
         if let Some(r) = self.inner.as_mut() {
             r.reset();
         }
-        self.pending_in.clear();
         self.last_call = None;
+    }
+
+    /// Samples held until the next whole chunk.
+    fn pending(&self) -> usize {
+        self.inner.as_ref().map_or(0, MonoResampler::pending)
     }
 
     fn ensure(&mut self, in_rate: u32, out_rate: u32) {
@@ -169,18 +152,11 @@ impl StreamResampler {
         // FftFixedIn: FFT-based polyphase — the same engine the smart-turn
         // mel extractor uses (Send-friendly, unlike SincFixedIn's boxed
         // interpolator), with quality well above voice requirements.
-        match FftFixedIn::<f32>::new(
-            in_rate as usize,
-            out_rate as usize,
-            chunk_frames_for(in_rate),
-            2,
-            1,
-        ) {
+        match MonoResampler::new(in_rate, out_rate, MAX_CHUNK_FRAMES) {
             Ok(r) => {
                 self.inner = Some(r);
                 self.in_rate = in_rate;
                 self.out_rate = out_rate;
-                self.pending_in.clear();
             }
             Err(e) => {
                 warn!(error = %e, in_rate, out_rate, "failed to build sinc resampler");
@@ -194,7 +170,6 @@ impl StreamResampler {
             && last.elapsed() > CLEAR_AFTER
         {
             r.reset();
-            self.pending_in.clear();
         }
     }
 }
@@ -357,9 +332,9 @@ mod tests {
     fn explicit_reset_drops_pending() {
         let mut r = StreamResampler::new();
         let _ = r.resample(&sine(100, 0.05), 48000, 16000); // < chunk → all pending
-        assert!(!r.pending_in.is_empty());
+        assert!(r.pending() > 0);
         r.reset();
-        assert!(r.pending_in.is_empty());
+        assert!(r.pending() == 0);
     }
 
     #[test]
@@ -391,14 +366,14 @@ mod tests {
     fn pcm16_resampler_rejects_odd_length_without_truncating_or_passthrough() {
         let mut r = StreamResampler::new();
         let _ = r.resample(&sine(10, 0.05), 24_000, 48_000);
-        assert!(!r.pending_in.is_empty(), "test must seed pending state");
+        assert!(r.pending() > 0, "test must seed pending state");
 
         let malformed = vec![0x01, 0x02, 0x03];
         let out = resample_pcm16(&mut r, &malformed, 24_000, 48_000)
             .expect("malformed PCM16 must not use None passthrough");
         assert!(out.is_empty(), "malformed chunk is dropped as a unit");
         assert!(
-            r.pending_in.is_empty(),
+            r.pending() == 0,
             "malformed chunk must reset stale resampler state"
         );
 
@@ -468,13 +443,32 @@ mod tests {
     }
 
     #[test]
+    fn a_flush_with_nothing_held_keeps_the_stale_clear() {
+        // 4800 frames at 48 kHz is five whole chunks: nothing is held when the utterance ends.
+        let mut r = StreamResampler::new();
+        let _ = r.resample(&sine(4800, 0.3), 48000, 16000);
+        assert!(r.flush().is_none());
+        // The inter-utterance gap, aged on the stamp the flush left.
+        r.last_call = r
+            .last_call
+            .map(|t| t - std::time::Duration::from_millis(400));
+        let out = r.resample(&vec![0.0f32; 4800], 48000, 16000).unwrap();
+        let max_abs = out.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(
+            max_abs < 1e-3,
+            "filter tail leaked into the next utterance: {max_abs}"
+        );
+    }
+
+    #[test]
     fn chunk_size_tracks_input_rate() {
+        use waav_segmented_stt::resample::chunk_frames;
         // ~20ms gather at every rate (8k telephony must not wait 128ms).
-        assert_eq!(chunk_frames_for(8_000), 160);
-        assert_eq!(chunk_frames_for(16_000), 320);
-        assert_eq!(chunk_frames_for(48_000), 960);
-        assert_eq!(chunk_frames_for(1_000), 64, "floor");
-        assert_eq!(chunk_frames_for(96_000), 1024, "cap");
+        assert_eq!(chunk_frames(8_000, MAX_CHUNK_FRAMES), 160);
+        assert_eq!(chunk_frames(16_000, MAX_CHUNK_FRAMES), 320);
+        assert_eq!(chunk_frames(48_000, MAX_CHUNK_FRAMES), 960);
+        assert_eq!(chunk_frames(1_000, MAX_CHUNK_FRAMES), 64, "floor");
+        assert_eq!(chunk_frames(96_000, MAX_CHUNK_FRAMES), 1024, "cap");
     }
 
     #[test]

@@ -327,6 +327,82 @@ impl ResolvedAudio {
     }
 }
 
+/// A built request as reqwest sends it: the one place a [`BatchHttpRequest`] becomes HTTP, for the
+/// batch API and the prerecorded client alike.
+///
+/// Content-Type is reqwest's for the two body shapes that decide it: multipart needs the boundary
+/// appended (a builder-supplied value would have none, and the vendor could not parse the body), and
+/// for JSON `.json()` sets it anyway, so a second one would be a duplicate header. The raw shape
+/// keeps the builder's value: it is the only source of truth for `audio/wav` vs `audio/mpeg`.
+pub(crate) fn http_request(
+    http: &reqwest::Client,
+    r: &BatchHttpRequest,
+) -> Result<reqwest::RequestBuilder, String> {
+    let mut builder = match r.method.as_str() {
+        "POST" => http.post(&r.url),
+        "PUT" => http.put(&r.url),
+        m => return Err(format!("unsupported method {m}")),
+    };
+    for (k, v) in &r.headers {
+        if k.eq_ignore_ascii_case("content-type")
+            && matches!(
+                r.body,
+                BatchHttpBody::Multipart { .. } | BatchHttpBody::Json(_)
+            )
+        {
+            continue;
+        }
+        builder = builder.header(k, v);
+    }
+    Ok(match &r.body {
+        BatchHttpBody::Empty => builder,
+        BatchHttpBody::Json(v) => builder.json(v),
+        BatchHttpBody::Raw { bytes, .. } => builder.body(bytes.clone()),
+        BatchHttpBody::Multipart { fields, file } => {
+            let mut form = reqwest::multipart::Form::new();
+            for (name, value) in fields {
+                form = form.text(name.clone(), value.clone());
+            }
+            if let Some((field, filename, ct, bytes)) = file {
+                let part = |ct: &str| {
+                    reqwest::multipart::Part::bytes(bytes.clone())
+                        .file_name(filename.clone())
+                        .mime_str(ct)
+                };
+                // A caller's type that is not a media type (`mp3`) goes as `audio/wav`, as these
+                // uploads always did before the type was forwarded: the vendor reads the bytes.
+                let part = part(ct)
+                    .or_else(|_| part("audio/wav"))
+                    .map_err(|e| format!("bad multipart mime: {e}"))?;
+                form = form.part(field.clone(), part);
+            }
+            builder.multipart(form)
+        }
+    })
+}
+
+/// AssemblyAI's `POST /v2/upload`: it transcribes URLs, not uploads, so bytes become a URL first.
+pub(crate) fn assemblyai_upload_request(
+    http: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+    bytes: Vec<u8>,
+) -> reqwest::RequestBuilder {
+    http.post(format!("{}/v2/upload", base_url.trim_end_matches('/')))
+        .header("Authorization", api_key)
+        .header("Content-Type", "application/octet-stream")
+        .body(bytes)
+}
+
+/// The `upload_url` an AssemblyAI upload answered with.
+pub(crate) fn assemblyai_upload_url(body: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()?
+        .get("upload_url")?
+        .as_str()
+        .map(str::to_string)
+}
+
 /// Build the Deepgram prerecorded submission (`POST /v1/listen`). Enables the streaming-gap
 /// features (`alternatives`, `detect_language`) plus the batch-exclusive ones on the query string —
 /// the wire-level proof that batch unlocks what streaming drops.
@@ -418,9 +494,13 @@ pub fn build_deepgram_prerecorded_with(
             qs.push(("redact".into(), r.clone()));
         }
     }
-    if let Some(kw) = &f.keyterms {
-        for k in kw {
-            qs.push(("keyterm".into(), k.clone()));
+    // The parameter the model reads key terms in: `keyterm` on Nova-3, `keywords` on older models,
+    // none on Whisper.
+    if let Some(kw) = &f.keyterms
+        && let Some(param) = waav_segmented_stt::vendor::deepgram::key_terms_param(model)
+    {
+        for k in kw.iter().map(|k| k.trim()).filter(|k| !k.is_empty()) {
+            qs.push((param.into(), k.to_string()));
         }
     }
     // Async callback.
@@ -659,24 +739,32 @@ pub fn build_openai_transcription(
     let b = &req.batch;
     let mut warnings = Vec::new();
 
-    let (audio_b64, _ct) = req
+    let (audio_b64, content_type) = req
         .audio
         .bytes()
         .ok_or_else(|| "openai batch requires inline audio bytes (no URL source)".to_string())?;
     let bytes = b64_decode(audio_b64)?;
 
-    let model = if std.base.model.is_empty() {
-        "whisper-1".to_string()
+    let model = if std.base.model.trim().is_empty() {
+        crate::core::stt::openai::DEFAULT_OPENAI_STT_MODEL.to_string()
     } else {
         std.base.model.clone()
     };
+    let whisper = model.trim().to_ascii_lowercase().starts_with("whisper");
+    let lists = crate::core::stt::openai::takes_candidate_lists(&model);
 
-    let mut fields: Vec<(String, String)> = vec![("model".into(), model)];
-    // detect_language / word+segment timestamps → verbose_json.
-    let want_verbose = b.detect_language == Some(true)
-        || std.features.word_timestamps == Some(true)
+    let mut fields: Vec<(String, String)> = vec![("model".into(), model.clone())];
+    // detect_language / word+segment timestamps → verbose_json, which only Whisper models return;
+    // a GPT transcription model's `json` carries the detected language, and has no timestamps.
+    let want_timestamps = std.features.word_timestamps == Some(true)
         || b.paragraphs == Some(true)
         || b.utterances == Some(true);
+    let want_verbose = whisper && (b.detect_language == Some(true) || want_timestamps);
+    if !whisper && want_timestamps {
+        warnings.push(format!(
+            "timestamps not supported by openai model {model}; omitted"
+        ));
+    }
     fields.push((
         "response_format".into(),
         if want_verbose { "verbose_json" } else { "json" }.into(),
@@ -688,9 +776,15 @@ pub fn build_openai_transcription(
             fields.push(("timestamp_granularities[]".into(), "word".into()));
         }
     }
-    if !std.base.language.is_empty() && std.base.language != "auto" {
-        // Manual language hint (ISO-639-1). Not allowed on the translations endpoint, but this is
-        // the transcriptions endpoint.
+    // Translation EN fast-path flips the endpoint.
+    let translate = std
+        .translation
+        .as_ref()
+        .map(|t| !t.is_noop())
+        .unwrap_or(false);
+    // A manual language hint (ISO-639-1), on the transcriptions route only: the translations route
+    // takes no source language.
+    if !translate && !std.base.language.is_empty() && std.base.language != "auto" {
         let lang = std
             .base
             .language
@@ -698,7 +792,11 @@ pub fn build_openai_transcription(
             .next()
             .unwrap_or(&std.base.language)
             .to_string();
-        fields.push(("language".into(), lang));
+        let key = if lists { "languages[]" } else { "language" };
+        fields.push((key.into(), lang));
+    }
+    if lists && let Some(terms) = std.features.keyterms.as_ref() {
+        fields.extend(terms.iter().map(|t| ("keywords[]".to_string(), t.clone())));
     }
     // Unsupported batch knobs → degrade.
     for (on, name) in [
@@ -715,26 +813,23 @@ pub fn build_openai_transcription(
         warnings.extend(t.warnings_for("openai", false));
     }
 
-    // Translation EN fast-path flips the endpoint.
-    let translate = std
-        .translation
-        .as_ref()
-        .map(|t| !t.is_noop())
-        .unwrap_or(false);
     let path = if translate {
         "/v1/audio/translations"
     } else {
         "/v1/audio/transcriptions"
     };
-    let host = base_url.trim_end_matches('/');
-
     let request = BatchHttpRequest {
         method: "POST".into(),
-        url: format!("{host}{path}"),
+        url: waav_segmented_stt::vendor::openai::join_api_path(base_url, path),
         headers: vec![("Authorization".into(), format!("Bearer {api_key}"))],
         body: BatchHttpBody::Multipart {
             fields,
-            file: Some(("file".into(), "audio.wav".into(), "audio/wav".into(), bytes)),
+            file: Some((
+                "file".into(),
+                waav_segmented_stt::vendor::openai::upload_file_name(content_type).into(),
+                content_type.into(),
+                bytes,
+            )),
         },
     };
     Ok(BatchSubmission {
@@ -813,7 +908,7 @@ pub fn build_elevenlabs_transcription_with(
             content_type,
         } => Some((
             "file".to_string(),
-            "audio.wav".to_string(),
+            waav_segmented_stt::vendor::openai::upload_file_name(&content_type).to_string(),
             content_type,
             bytes,
         )),
@@ -1451,9 +1546,142 @@ mod tests {
         assert!(err.contains("URL scheme"), "{err}");
     }
 
+    /// Key terms reach Deepgram in the parameter the model reads: `keyterm` on Nova-3 only, the
+    /// older `keywords` elsewhere, and nothing on its hosted Whisper.
+    #[test]
+    fn deepgram_key_terms_follow_the_model() {
+        let url_for = |model: &str| {
+            let mut r = req_with(
+                "deepgram",
+                BatchAudioSource::Bytes {
+                    audio_base64: "AAAA".into(),
+                    content_type: None,
+                },
+                SttFeatures {
+                    keyterms: Some(vec![" Acme ".into(), " ".into()]),
+                    ..Default::default()
+                },
+                BatchFeatures::default(),
+            );
+            r.config.base.model = model.into();
+            build_deepgram_prerecorded(&r, "k", "https://api.deepgram.com")
+                .unwrap()
+                .request
+                .url
+        };
+        let nova3 = url_for("nova-3");
+        assert!(
+            nova3.contains("keyterm=Acme") && !nova3.contains("keywords="),
+            "{nova3}"
+        );
+        let nova2 = url_for("nova-2");
+        assert!(
+            nova2.contains("keywords=Acme") && !nova2.contains("keyterm="),
+            "{nova2}"
+        );
+        let whisper = url_for("whisper-large");
+        assert!(
+            !whisper.contains("keyterm=") && !whisper.contains("keywords="),
+            "{whisper}"
+        );
+    }
+
+    /// The file part says what the audio is (OpenAI reads the format from its name), a `/v1` base
+    /// is not doubled, and a translation names no source language (the translations route takes
+    /// none).
+    #[test]
+    fn openai_batch_labels_the_file_and_translates_without_a_language() {
+        let mut r = req_with(
+            "openai",
+            BatchAudioSource::Bytes {
+                audio_base64: "AAAA".into(),
+                content_type: Some("audio/mpeg".into()),
+            },
+            SttFeatures::default(),
+            BatchFeatures::default(),
+        );
+        r.config.base.model = "whisper-1".into();
+        r.config.base.language = "de-DE".into();
+        let sub = build_openai_transcription(&r, "sk", "https://api.openai.com/v1").unwrap();
+        assert_eq!(
+            sub.request.url,
+            "https://api.openai.com/v1/audio/transcriptions"
+        );
+        let BatchHttpBody::Multipart { fields, file } = &sub.request.body else {
+            panic!("expected multipart body")
+        };
+        let (_, name, content_type, _) = file.as_ref().expect("a file part");
+        assert_eq!(
+            (name.as_str(), content_type.as_str()),
+            ("audio.mp3", "audio/mpeg")
+        );
+        assert!(
+            fields.iter().any(|(k, v)| k == "language" && v == "de"),
+            "{fields:?}"
+        );
+
+        r.config.translation = Some(crate::core::stt::standard::TranslationConfig {
+            translate_to_english: Some(true),
+            ..Default::default()
+        });
+        let sub = build_openai_transcription(&r, "sk", "https://api.openai.com").unwrap();
+        assert_eq!(
+            sub.request.url,
+            "https://api.openai.com/v1/audio/translations"
+        );
+        let BatchHttpBody::Multipart { fields, .. } = &sub.request.body else {
+            panic!("expected multipart body")
+        };
+        assert!(
+            !fields
+                .iter()
+                .any(|(k, _)| k == "language" || k == "languages[]"),
+            "{fields:?}"
+        );
+    }
+
+    #[test]
+    fn openai_builder_defaults_to_gpt_transcribe_with_a_language_list() {
+        let mut r = req_with(
+            "openai",
+            BatchAudioSource::Bytes {
+                audio_base64: "AAAA".into(),
+                content_type: None,
+            },
+            SttFeatures {
+                word_timestamps: Some(true),
+                keyterms: Some(vec!["Acme".into()]),
+                ..Default::default()
+            },
+            BatchFeatures {
+                detect_language: Some(true),
+                ..Default::default()
+            },
+        );
+        r.config.base.language = "de-DE".into();
+        let sub = build_openai_transcription(&r, "sk", "https://api.openai.com").unwrap();
+        let BatchHttpBody::Multipart { fields, .. } = &sub.request.body else {
+            panic!("expected multipart body")
+        };
+        let has = |k: &str, v: &str| fields.iter().any(|(a, b)| a == k && b == v);
+        assert!(has("model", "gpt-transcribe"), "{fields:?}");
+        assert!(has("languages[]", "de"), "{fields:?}");
+        assert!(has("keywords[]", "Acme"), "{fields:?}");
+        assert!(
+            has("response_format", "json"),
+            "verbose_json is Whisper's: {fields:?}"
+        );
+        assert!(
+            !fields
+                .iter()
+                .any(|(k, _)| k == "language" || k == "timestamp_granularities[]")
+        );
+        assert!(sub.config_warnings.iter().any(|w| w.contains("timestamps")));
+    }
+
     #[test]
     fn openai_builder_uses_verbose_json_for_detect_language_and_warns_unsupported() {
-        let r = req_with(
+        let mut r = req_with(
             "openai",
             BatchAudioSource::Bytes {
                 audio_base64: "AAAA".into(),
@@ -1467,6 +1695,7 @@ mod tests {
                 ..Default::default()
             },
         );
+        r.config.base.model = "whisper-1".into();
         let sub = build_openai_transcription(&r, "sk", "https://api.openai.com").unwrap();
         assert!(!sub.is_async, "OpenAI is synchronous");
         assert!(
@@ -1634,6 +1863,56 @@ mod tests {
             BatchHttpBody::Multipart { file, .. } => assert!(file.is_some()),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn elevenlabs_names_the_file_by_its_type() {
+        let sub = build_elevenlabs_transcription(
+            &eleven_req(
+                BatchAudioSource::Bytes {
+                    audio_base64: "AAAA".into(),
+                    content_type: Some("audio/mpeg".into()),
+                },
+                SttFeatures::default(),
+            ),
+            "xi-key",
+            "https://api.elevenlabs.io",
+        )
+        .unwrap();
+        let BatchHttpBody::Multipart { file, .. } = &sub.request.body else {
+            panic!("expected multipart body")
+        };
+        let (_, name, content_type, _) = file.as_ref().expect("a file part");
+        assert_eq!(
+            (name.as_str(), content_type.as_str()),
+            ("audio.mp3", "audio/mpeg")
+        );
+    }
+
+    #[test]
+    fn a_file_type_that_is_not_a_media_type_still_uploads() {
+        let request = BatchHttpRequest {
+            method: "POST".into(),
+            url: "https://api.openai.com/v1/audio/transcriptions".into(),
+            headers: vec![],
+            body: BatchHttpBody::Multipart {
+                fields: vec![("model".into(), "whisper-1".into())],
+                file: Some((
+                    "file".into(),
+                    "audio.wav".into(),
+                    "mp3".into(),
+                    vec![0u8; 4],
+                )),
+            },
+        };
+        let built = http_request(&reqwest::Client::new(), &request)
+            .expect("a bad media type falls back to audio/wav")
+            .build()
+            .unwrap();
+        let ct = built.headers()[reqwest::header::CONTENT_TYPE]
+            .to_str()
+            .unwrap();
+        assert!(ct.starts_with("multipart/form-data"), "{ct}");
     }
 
     #[test]

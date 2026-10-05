@@ -2,10 +2,12 @@
 //! behavior (the A-G0 wiring gate); MinWords (A-G3) and the TTFS-aware stop
 //! (A-G2) land as siblings.
 
+pub mod detector;
 pub mod legacy;
 pub mod min_words;
 pub mod mute;
 
+pub use detector::DetectorSpeechStart;
 pub use legacy::{AnySpeechStart, EagerSmartTurnSpeculate, LegacySpeechFinalStop};
 pub use min_words::MinWordsStart;
 pub use mute::{

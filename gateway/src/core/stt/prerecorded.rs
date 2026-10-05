@@ -47,6 +47,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
+use waav_segmented_stt::vendor::{hosts, retention};
 
 use super::base::{
     BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback, SpeakerInfo,
@@ -134,9 +135,18 @@ impl PrerecordedVendor {
     /// The vendor's production host, used when the deployment names no override.
     pub fn default_base_url(&self) -> &'static str {
         match self {
-            Self::Deepgram => "https://api.deepgram.com",
-            Self::AssemblyAI => "https://api.assemblyai.com",
-            Self::ElevenLabs => "https://api.elevenlabs.io",
+            Self::Deepgram => hosts::DEEPGRAM,
+            Self::AssemblyAI => hosts::ASSEMBLYAI,
+            Self::ElevenLabs => hosts::ELEVENLABS,
+        }
+    }
+
+    /// The vendor's EU host, for a deployment with `stt.data_region: eu`.
+    pub fn eu_base_url(&self) -> &'static str {
+        match self {
+            Self::Deepgram => hosts::DEEPGRAM_EU,
+            Self::AssemblyAI => hosts::ASSEMBLYAI_EU,
+            Self::ElevenLabs => hosts::ELEVENLABS_EU,
         }
     }
 
@@ -251,14 +261,38 @@ impl PrerecordedSTT {
         &self.warnings
     }
 
-    /// The base URL: the deployment's override, else the vendor's production host.
+    /// The base URL: the deployment's override, else the vendor's EU host for an EU deployment,
+    /// else its production host.
     fn base_url(&self) -> String {
+        let data = super::data_settings::DataSettings::from_extras(&self.config.extras.0);
         self.config
             .endpoint_override()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| self.vendor.default_base_url())
+            .unwrap_or_else(|| {
+                if data.eu {
+                    self.vendor.eu_base_url()
+                } else {
+                    self.vendor.default_base_url()
+                }
+            })
             .to_string()
+    }
+
+    /// The submit URL with the vendor's retention switch, for a deployment with
+    /// `stt.data_retention: none` (AssemblyAI has none; the gateway refuses that pairing first).
+    fn with_retention_switch(&self, url: String) -> String {
+        let data = super::data_settings::DataSettings::from_extras(&self.config.extras.0);
+        if !data.no_retention {
+            return url;
+        }
+        let (key, value) = match self.vendor {
+            PrerecordedVendor::Deepgram => retention::DEEPGRAM,
+            PrerecordedVendor::ElevenLabs => retention::ELEVENLABS,
+            PrerecordedVendor::AssemblyAI => return url,
+        };
+        let sep = if url.contains('?') { '&' } else { '?' };
+        format!("{url}{sep}{key}={value}")
     }
 
     /// The envelope the shared builders read features from.
@@ -398,6 +432,8 @@ impl PrerecordedSTT {
             }
         }
         .map_err(STTError::ConfigurationError)?;
+        let mut submission = submission;
+        submission.request.url = self.with_retention_switch(submission.request.url);
 
         self.warnings = submission.config_warnings.clone();
         for w in &self.warnings {
@@ -435,54 +471,7 @@ impl PrerecordedSTT {
         submission: &BatchSubmission,
     ) -> Result<serde_json::Value, STTError> {
         let r = &submission.request;
-        let mut builder = match r.method.as_str() {
-            "POST" => http.post(&r.url),
-            "PUT" => http.put(&r.url),
-            m => {
-                return Err(STTError::ConfigurationError(format!(
-                    "unsupported method {m}"
-                )));
-            }
-        };
-        for (k, v) in &r.headers {
-            // Let reqwest own Content-Type for the two body shapes that decide it: multipart
-            // needs the boundary appended (a builder-supplied value would have none, and the
-            // vendor could not parse the body), and for JSON `.json()` sets it anyway — passing
-            // a second one risks a duplicate header rather than an override.
-            //
-            // The raw shape keeps the builder's value: it is the only source of truth for
-            // `audio/wav` vs `audio/mpeg`, and reqwest will not guess it.
-            if k.eq_ignore_ascii_case("content-type")
-                && matches!(
-                    r.body,
-                    BatchHttpBody::Multipart { .. } | BatchHttpBody::Json(_)
-                )
-            {
-                continue;
-            }
-            builder = builder.header(k, v);
-        }
-        builder = match &r.body {
-            BatchHttpBody::Empty => builder,
-            BatchHttpBody::Json(v) => builder.json(v),
-            BatchHttpBody::Raw { bytes, .. } => builder.body(bytes.clone()),
-            BatchHttpBody::Multipart { fields, file } => {
-                let mut form = reqwest::multipart::Form::new();
-                for (name, value) in fields {
-                    form = form.text(name.clone(), value.clone());
-                }
-                if let Some((field, filename, ct, bytes)) = file {
-                    let part = reqwest::multipart::Part::bytes(bytes.clone())
-                        .file_name(filename.clone())
-                        .mime_str(ct)
-                        .map_err(|e| {
-                            STTError::ConfigurationError(format!("bad multipart mime: {e}"))
-                        })?;
-                    form = form.part(field.clone(), part);
-                }
-                builder.multipart(form)
-            }
-        };
+        let builder = super::batch::http_request(http, r).map_err(STTError::ConfigurationError)?;
 
         let call = self.vendor_call(&r.method, &r.url);
         if call.captures() {
@@ -565,11 +554,7 @@ impl PrerecordedSTT {
                     .render(),
             );
         }
-        let response = match http
-            .post(&url)
-            .header("Authorization", api_key)
-            .header("Content-Type", "application/octet-stream")
-            .body(wav)
+        let response = match super::batch::assemblyai_upload_request(http, base_url, api_key, wav)
             .send()
             .await
         {
@@ -600,16 +585,9 @@ impl PrerecordedSTT {
                 ),
             ));
         }
-        serde_json::from_str::<serde_json::Value>(&text)
-            .ok()
-            .and_then(|v| {
-                v.get("upload_url")
-                    .and_then(|u| u.as_str())
-                    .map(str::to_string)
-            })
-            .ok_or_else(|| {
-                STTError::ProviderError(format!("assemblyai upload returned no upload_url: {text}"))
-            })
+        super::batch::assemblyai_upload_url(&text).ok_or_else(|| {
+            STTError::ProviderError(format!("assemblyai upload returned no upload_url: {text}"))
+        })
     }
 
     /// Poll `GET /v2/transcript/{id}` until it completes, errors, or the deadline fires.
@@ -735,13 +713,7 @@ fn vendor_status_error(status: reqwest::StatusCode, message: String) -> STTError
 
 /// The vendor's id for a request, from the response headers the three vendors use.
 fn header_request_id(headers: &reqwest::header::HeaderMap) -> Option<String> {
-    ["dg-request-id", "request-id", "x-request-id"]
-        .iter()
-        .find_map(|name| headers.get(*name))
-        .and_then(|v| v.to_str().ok())
-        .map(str::trim)
-        .filter(|v| !v.is_empty() && v.len() <= 200)
-        .map(str::to_string)
+    crate::observability::vendor_span::request_id_from_headers(headers)
 }
 
 /// Render a vendor's error body as one line that names what was wrong.
@@ -818,106 +790,57 @@ pub fn parse_response(
     }
 }
 
-/// Deepgram prerecorded: `results.channels[].alternatives[0]`.
+/// Deepgram prerecorded: `results.channels[].alternatives[0]`, read by the shared parser.
 ///
 /// One result per channel rather than a concatenation, so a multi-channel response keeps each
 /// channel's own word timeline instead of merging two into one nonsensical sequence.
 fn parse_deepgram(body: &serde_json::Value) -> Result<Vec<STTResult>, String> {
-    let channels = body
-        .pointer("/results/channels")
-        .and_then(|c| c.as_array())
-        .ok_or("no results.channels in the response")?;
-    let duration = body
-        .pointer("/metadata/duration")
-        .and_then(serde_json::Value::as_f64);
-    let detected_language = body
-        .pointer("/results/channels/0/detected_language")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let request_id = body
-        .pointer("/metadata/request_id")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(str::to_string);
-
-    let mut out = Vec::with_capacity(channels.len());
-    for channel in channels {
-        let Some(alt) = channel.pointer("/alternatives/0") else {
+    let answer = waav_segmented_stt::vendor::deepgram::parse_prerecorded(body)?;
+    let detected_language = answer
+        .channels
+        .first()
+        .and_then(|c| c.detected_language.clone());
+    let mut out = Vec::with_capacity(answer.channels.len());
+    for channel in &answer.channels {
+        let Some(best) = channel.alternatives.first() else {
             continue;
         };
-        let transcript = alt
-            .get("transcript")
-            .and_then(|t| t.as_str())
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        let reported_confidence = alt
-            .get("confidence")
-            .and_then(serde_json::Value::as_f64)
-            .filter(|c| c.is_finite());
-        let confidence = reported_confidence.unwrap_or(1.0) as f32;
-
-        let words: Option<Vec<WordTiming>> =
-            alt.get("words").and_then(|w| w.as_array()).map(|ws| {
-                ws.iter()
-                    .map(|w| WordTiming {
-                        // `punctuated_word` is what `smart_format` produces; falling back to the
-                        // bare `word` means a punctuated transcript and unpunctuated word list,
-                        // which is the kind of mismatch nobody notices until they rebuild the
-                        // text from the words.
-                        word: w
-                            .get("punctuated_word")
-                            .or_else(|| w.get("word"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_default()
-                            .to_string(),
-                        start: w
-                            .get("start")
-                            .and_then(serde_json::Value::as_f64)
-                            .unwrap_or(0.0),
-                        end: w
-                            .get("end")
-                            .and_then(serde_json::Value::as_f64)
-                            .unwrap_or(0.0),
-                        confidence: w
-                            .get("confidence")
-                            .and_then(serde_json::Value::as_f64)
-                            .map(|c| c as f32),
-                        // Deepgram numbers its speakers; the canonical form is a label.
-                        speaker_id: w
-                            .get("speaker")
-                            .and_then(serde_json::Value::as_u64)
-                            .map(|n| format!("speaker_{n}")),
-                        logprob: None,
-                    })
-                    .collect()
-            });
-
-        let mut result = STTResult::new(transcript, true, true, confidence);
+        let words: Option<Vec<WordTiming>> = best.words.as_ref().map(|ws| {
+            ws.iter()
+                .map(|w| WordTiming {
+                    word: w.text.clone(),
+                    start: w.start,
+                    end: w.end,
+                    confidence: w.confidence.map(|c| c as f32),
+                    // Deepgram numbers its speakers; the canonical form is a label.
+                    speaker_id: w.speaker.map(|n| format!("speaker_{n}")),
+                    logprob: None,
+                })
+                .collect()
+        });
+        let mut result = STTResult::new(
+            best.transcript.clone(),
+            true,
+            true,
+            best.confidence.unwrap_or(1.0) as f32,
+        );
         // Only what Deepgram actually said: the 1.0 above is a default, and analytics must not
         // count "no confidence" as "fully confident" (FRD-021 DEG-5).
-        result.vendor_confidence = reported_confidence.map(|c| c as f32);
-        result.vendor_request_id = request_id.clone();
+        result.vendor_confidence = best.confidence.map(|c| c as f32);
+        result.vendor_request_id = answer.request_id.clone();
         result.speakers = speakers_from(words.as_deref());
         result.words = words;
         result.detected_language = detected_language.clone();
-        result.audio_duration = duration;
-        // The RUNNER-UP hypotheses. `alternatives=3` asked Deepgram for three, Deepgram returned
-        // three, and keeping only `[0]` meant the setting reached the vendor, was honoured, and
-        // could not be seen — the same defect as the word timings above it.
+        result.audio_duration = answer.duration_secs;
+        // The RUNNER-UP hypotheses (`alternatives=N`): kept, or the setting reaches the vendor,
+        // is honoured, and cannot be seen.
         let runners_up: Vec<String> = channel
-            .get("alternatives")
-            .and_then(|a| a.as_array())
-            .map(|alts| {
-                alts.iter()
-                    .skip(1)
-                    .filter_map(|a| a.get("transcript").and_then(|t| t.as_str()))
-                    .map(|t| t.trim().to_string())
-                    .filter(|t| !t.is_empty())
-                    .collect()
-            })
-            .unwrap_or_default();
+            .alternatives
+            .iter()
+            .skip(1)
+            .map(|a| a.transcript.clone())
+            .filter(|t| !t.is_empty())
+            .collect();
         if !runners_up.is_empty() {
             result.alternatives = Some(runners_up);
         }
@@ -984,52 +907,29 @@ fn parse_assemblyai(body: &serde_json::Value) -> Result<Vec<STTResult>, String> 
     Ok(vec![result])
 }
 
-/// ElevenLabs: `text` + `words`, or a `transcripts` array when multi-channel was requested.
+/// ElevenLabs: `text` + `words`, or a `transcripts` array when multi-channel was requested, read
+/// by the shared parser. The vendor's own `text` is returned, as the caller asked for it.
 fn parse_elevenlabs(body: &serde_json::Value) -> Result<Vec<STTResult>, String> {
-    let channels: Vec<&serde_json::Value> = match body.get("transcripts").and_then(|t| t.as_array())
-    {
-        Some(list) => list.iter().collect(),
-        None => vec![body],
-    };
-    let mut out = Vec::with_capacity(channels.len());
-    for channel in channels {
-        let transcript = channel
-            .get("text")
-            .and_then(|t| t.as_str())
-            .ok_or("no text in the response")?
-            .trim()
-            .to_string();
-
-        let words: Option<Vec<WordTiming>> =
-            channel.get("words").and_then(|w| w.as_array()).map(|ws| {
-                ws.iter()
-                    // `spacing` and `audio_event` tokens are not words; keeping them would put
-                    // bare whitespace entries in an array every consumer indexes by word.
-                    .filter(|w| w.get("type").and_then(|t| t.as_str()).unwrap_or("word") == "word")
-                    .map(|w| WordTiming {
-                        word: w
-                            .get("text")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_default()
-                            .to_string(),
-                        start: w
-                            .get("start")
-                            .and_then(serde_json::Value::as_f64)
-                            .unwrap_or(0.0),
-                        end: w
-                            .get("end")
-                            .and_then(serde_json::Value::as_f64)
-                            .unwrap_or(0.0),
-                        confidence: None,
-                        speaker_id: w
-                            .get("speaker_id")
-                            .and_then(|v| v.as_str())
-                            .map(str::to_string),
-                        logprob: w.get("logprob").and_then(serde_json::Value::as_f64),
-                    })
-                    .collect()
-            });
-
+    let answer = waav_segmented_stt::vendor::elevenlabs::parse(body);
+    let mut out = Vec::with_capacity(answer.channels.len());
+    for channel in &answer.channels {
+        let transcript = channel.text.clone().ok_or("no text in the response")?;
+        // `spacing` and `audio_event` tokens are not words; keeping them would put bare
+        // whitespace entries in an array every consumer indexes by word.
+        let words: Option<Vec<WordTiming>> = channel.tokens.as_ref().map(|tokens| {
+            tokens
+                .iter()
+                .filter(|t| t.is_word_or_untyped())
+                .map(|t| WordTiming {
+                    word: t.text.clone(),
+                    start: t.start,
+                    end: t.end,
+                    confidence: None,
+                    speaker_id: t.speaker_id.clone(),
+                    logprob: t.logprob,
+                })
+                .collect()
+        });
         let mut result = STTResult::new(
             transcript, true, true,
             // ElevenLabs reports a LANGUAGE probability, not a transcript confidence. Using it as
@@ -1038,13 +938,8 @@ fn parse_elevenlabs(body: &serde_json::Value) -> Result<Vec<STTResult>, String> 
         );
         result.speakers = speakers_from(words.as_deref());
         result.words = words;
-        result.detected_language = channel
-            .get("language_code")
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
-        result.audio_duration = channel
-            .get("audio_duration_secs")
-            .and_then(serde_json::Value::as_f64);
+        result.detected_language = channel.language_code.clone();
+        result.audio_duration = channel.audio_duration_secs;
         out.push(result);
     }
     Ok(out)
@@ -1218,6 +1113,52 @@ mod tests {
             encoding: "linear16".into(),
             model: model.into(),
         })
+    }
+
+    /// Release 5: a deployment's canonical data settings pick each vendor's EU host and reach
+    /// its retention switch; without them the host and the URL are today's.
+    #[test]
+    fn the_deployment_data_settings_pick_the_eu_host_and_the_retention_switch() {
+        let with = |vendor: PrerecordedVendor, extras: serde_json::Value| {
+            let mut c = cfg(vendor.id(), "m");
+            c.extras.0 = extras.as_object().unwrap().clone();
+            PrerecordedSTT::new_standard(vendor, &c).unwrap()
+        };
+        let both = serde_json::json!({"data_region": "eu", "data_retention": "none"});
+        for (vendor, eu) in [
+            (PrerecordedVendor::Deepgram, "https://api.eu.deepgram.com"),
+            (
+                PrerecordedVendor::AssemblyAI,
+                "https://api.eu.assemblyai.com",
+            ),
+            (
+                PrerecordedVendor::ElevenLabs,
+                "https://api.eu.residency.elevenlabs.io",
+            ),
+        ] {
+            assert_eq!(with(vendor, both.clone()).base_url(), eu);
+            assert_eq!(
+                with(vendor, serde_json::json!({})).base_url(),
+                vendor.default_base_url()
+            );
+        }
+        let dg = with(PrerecordedVendor::Deepgram, both.clone());
+        assert_eq!(
+            dg.with_retention_switch("https://api.eu.deepgram.com/v1/listen?model=nova-3".into()),
+            "https://api.eu.deepgram.com/v1/listen?model=nova-3&mip_opt_out=true"
+        );
+        let el = with(PrerecordedVendor::ElevenLabs, both);
+        assert_eq!(
+            el.with_retention_switch(
+                "https://api.eu.residency.elevenlabs.io/v1/speech-to-text".into()
+            ),
+            "https://api.eu.residency.elevenlabs.io/v1/speech-to-text?enable_logging=false"
+        );
+        let today = with(PrerecordedVendor::Deepgram, serde_json::json!({}));
+        assert_eq!(
+            today.with_retention_switch("https://api.deepgram.com/v1/listen?model=nova-3".into()),
+            "https://api.deepgram.com/v1/listen?model=nova-3"
+        );
     }
 
     // -------------------------------------------------------------------------------------

@@ -117,6 +117,7 @@ fn client_field_overrides_alias_default() {
         features: Default::default(),
         extras: Default::default(),
         turn_detection: None,
+        transcription_mode: None,
         translation: None,
         audio_in_codec: None,
     });

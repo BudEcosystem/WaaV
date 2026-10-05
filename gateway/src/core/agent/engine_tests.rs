@@ -29,11 +29,33 @@ struct FakeSpeech {
     clears: AtomicUsize,
     /// How long each speak takes to return (synthesis); 0 = at once.
     synth_ms: AtomicU64,
+    /// Queued audio plays out in (paused-clock) time: `playout_remaining_ms` drains.
+    paced: std::sync::atomic::AtomicBool,
+    queued_until: Mutex<Option<tokio::time::Instant>>,
+    /// The output cannot carry a sound (a compressed TTS format).
+    no_sound: std::sync::atomic::AtomicBool,
+    /// What reached the caller, in order: `say:<text>`, or `tone` for a run of pulses.
+    timeline: Mutex<Vec<String>>,
+    /// When each pulse of the tone was played.
+    pulses: Mutex<Vec<tokio::time::Instant>>,
 }
 
 impl FakeSpeech {
     fn spoken(&self) -> Vec<String> {
         self.spoken.lock().iter().map(|(t, _)| t.clone()).collect()
+    }
+
+    fn deliver(&self, ms: u64) {
+        self.audio_out.fetch_add(ms, Ordering::AcqRel);
+        self.remaining.fetch_add(ms, Ordering::AcqRel);
+        let now = tokio::time::Instant::now();
+        let mut q = self.queued_until.lock();
+        let from = q.filter(|t| *t > now).unwrap_or(now);
+        *q = Some(from + Duration::from_millis(ms));
+    }
+
+    fn timeline(&self) -> Vec<String> {
+        self.timeline.lock().clone()
     }
 }
 
@@ -51,14 +73,15 @@ impl SpeechOut for FakeSpeech {
             tokio::time::sleep(Duration::from_millis(synth)).await;
         }
         self.spoken.lock().push((text.to_string(), interruptible));
+        self.timeline.lock().push(format!("say:{text}"));
         let ms = (text.chars().count() as u64) * 20;
-        self.audio_out.fetch_add(ms, Ordering::AcqRel);
-        self.remaining.fetch_add(ms, Ordering::AcqRel);
+        self.deliver(ms);
         true
     }
     async fn clear(&self) {
         self.epoch.fetch_add(1, Ordering::AcqRel);
         self.remaining.store(0, Ordering::Release);
+        *self.queued_until.lock() = None;
         self.clears.fetch_add(1, Ordering::AcqRel);
     }
     fn is_audible(&self) -> bool {
@@ -68,7 +91,34 @@ impl SpeechOut for FakeSpeech {
         self.audio_out.load(Ordering::Acquire)
     }
     fn playout_remaining_ms(&self) -> u64 {
+        if self.paced.load(Ordering::Acquire) {
+            let now = tokio::time::Instant::now();
+            return self
+                .queued_until
+                .lock()
+                .map_or(0, |t| t.saturating_duration_since(now).as_millis() as u64);
+        }
         self.remaining.load(Ordering::Acquire)
+    }
+    fn tone_pulse(&self) -> Option<Arc<crate::core::tts::AudioData>> {
+        (!self.no_sound.load(Ordering::Acquire))
+            .then(|| super::tone::pulse_audio(Some("linear16"), Some(16_000)).map(Arc::new))
+            .flatten()
+    }
+    async fn play_sound(&self, sound: &crate::core::tts::AudioData, epoch: usize) -> bool {
+        if self.epoch.load(Ordering::Acquire) != epoch {
+            return false;
+        }
+        let ms = u64::from(sound.duration_ms.unwrap_or(0));
+        self.pulses.lock().push(tokio::time::Instant::now());
+        {
+            let mut t = self.timeline.lock();
+            if t.last().map(String::as_str) != Some("tone") {
+                t.push("tone".into());
+            }
+        }
+        self.deliver(ms);
+        true
     }
 }
 
@@ -782,12 +832,281 @@ async fn a_slow_first_answer_gets_a_filler_once() {
 }
 
 fn ordered_fillers(follow_up_after_ms: u64) -> Arc<VoiceAgentEntry> {
+    fillers_with_tone(follow_up_after_ms, false)
+}
+
+/// The phrase cases above describe an agent with the tool-call tone switched off.
+fn fillers_with_tone(follow_up_after_ms: u64, tone: bool) -> Arc<VoiceAgentEntry> {
     entry(json!({"fillers": {
         "tool_call_after_ms": 1000, "slow_response_after_ms": 1000,
         "follow_up_after_ms": follow_up_after_ms,
         "messages": ["Hmm.", "One moment.", "Still checking."],
         "use_tool_status_messages": true,
+        "tool_call_sound": tone,
     }, "tool_status_messages": {"orders__lookup_order": ["Let me look that up."]}}))
+}
+
+fn tool_run(run: Duration) -> Vec<Step> {
+    vec![
+        created("resp_1"),
+        Step::Ev(AgentEvent::ToolStarted {
+            item_id: "mcp_1".into(),
+            name: "lookup_order".into(),
+            kind: "mcp_call".into(),
+        }),
+        Step::Wait(run),
+        Step::Ev(AgentEvent::ToolFinished {
+            item_id: "mcp_1".into(),
+            name: "lookup_order".into(),
+            ok: true,
+        }),
+        delta("Found it."),
+        completed(),
+    ]
+}
+
+// ---------------------------------------------------------------------------------------------
+// The tool-call tone
+// ---------------------------------------------------------------------------------------------
+
+/// The tool's phrase first, then the tone until the tool finishes: no further phrase in between,
+/// and the tone starts only once the phrase has played out.
+#[tokio::test(start_paused = true)]
+async fn the_tone_follows_the_tool_phrase_until_the_tool_finishes() {
+    let mut h = harness(fillers_with_tone(2000, true), None, false);
+    h.speech.paced.store(true, Ordering::Release);
+    h.backend.push(Ok(tool_run(Duration::from_millis(5500))));
+    let start = tokio::time::Instant::now();
+    h.engine.start_turn("order?".into()).await;
+    let _ = until_done(&mut h, 0).await;
+    assert_eq!(h.speech.spoken(), vec!["Let me look that up.", "Found it."]);
+    assert_eq!(
+        h.speech.timeline(),
+        vec!["say:Let me look that up.", "tone", "say:Found it."]
+    );
+    // The phrase is due at 1 s and plays for 400 ms; the tool returns at 5.5 s.
+    let pulses: Vec<Duration> = h.speech.pulses.lock().iter().map(|t| *t - start).collect();
+    assert_eq!(
+        pulses.len(),
+        3,
+        "a pulse every period while the tool runs: {pulses:?}"
+    );
+    assert!(
+        pulses[0] >= Duration::from_millis(1_400) + super::TONE_GAP,
+        "after the phrase, and a pause: {pulses:?}"
+    );
+    assert!(
+        pulses[2] < Duration::from_millis(5_500),
+        "not after the tool: {pulses:?}"
+    );
+    for w in pulses.windows(2) {
+        assert!(
+            w[1] - w[0] >= Duration::from_millis(super::tone::PERIOD_MS),
+            "{pulses:?}"
+        );
+    }
+}
+
+/// Live, an agent's tools return in under a second while its model thinks for seconds before and
+/// after each one: the caller waits on the agent's work, not on the tool. The phrase and the tone
+/// cover that work, from the tool call until the agent speaks again.
+#[tokio::test(start_paused = true)]
+async fn the_tone_covers_the_agent_thinking_after_a_quick_tool() {
+    let mut h = harness(fillers_with_tone(2000, true), None, false);
+    h.speech.paced.store(true, Ordering::Release);
+    h.backend.push(Ok(vec![
+        created("resp_1"),
+        Step::Ev(AgentEvent::ToolStarted {
+            item_id: "mcp_1".into(),
+            name: "lookup_order".into(),
+            kind: "mcp_call".into(),
+        }),
+        Step::Wait(Duration::from_millis(300)),
+        Step::Ev(AgentEvent::ToolFinished {
+            item_id: "mcp_1".into(),
+            name: "lookup_order".into(),
+            ok: true,
+        }),
+        Step::Wait(Duration::from_millis(6_000)),
+        delta("Found it."),
+        completed(),
+    ]));
+    let start = tokio::time::Instant::now();
+    h.engine.start_turn("order?".into()).await;
+    let _ = until_done(&mut h, 0).await;
+    assert_eq!(h.speech.spoken(), vec!["Let me look that up.", "Found it."]);
+    assert_eq!(
+        h.speech.timeline(),
+        vec!["say:Let me look that up.", "tone", "say:Found it."]
+    );
+    let pulses: Vec<Duration> = h.speech.pulses.lock().iter().map(|t| *t - start).collect();
+    assert!(pulses.len() >= 3, "the tone fills the thinking: {pulses:?}");
+    assert!(
+        pulses.iter().all(|p| *p < Duration::from_millis(6_300)),
+        "{pulses:?}"
+    );
+}
+
+/// A second tool in the same span of tool work is covered by the tone: its phrase is not said
+/// over the pulses.
+#[tokio::test(start_paused = true)]
+async fn a_second_tool_in_the_span_gets_the_tone_not_a_phrase() {
+    let mut h = harness(fillers_with_tone(2000, true), None, false);
+    h.speech.paced.store(true, Ordering::Release);
+    let tool = |id: &str, run: u64| {
+        vec![
+            Step::Ev(AgentEvent::ToolStarted {
+                item_id: id.into(),
+                name: "lookup_order".into(),
+                kind: "mcp_call".into(),
+            }),
+            Step::Wait(Duration::from_millis(run)),
+            Step::Ev(AgentEvent::ToolFinished {
+                item_id: id.into(),
+                name: "lookup_order".into(),
+                ok: true,
+            }),
+        ]
+    };
+    let mut steps = vec![created("resp_1")];
+    steps.extend(tool("mcp_1", 3_000));
+    steps.extend(tool("mcp_2", 3_000));
+    steps.extend([delta("Found it."), completed()]);
+    h.backend.push(Ok(steps));
+    h.engine.start_turn("order?".into()).await;
+    let _ = until_done(&mut h, 0).await;
+    assert_eq!(h.speech.spoken(), vec!["Let me look that up.", "Found it."]);
+    assert_eq!(
+        h.speech.timeline(),
+        vec!["say:Let me look that up.", "tone", "say:Found it."]
+    );
+}
+
+/// Once the agent speaks again, the tone is over: a pause later in the answer is not tool work.
+#[tokio::test(start_paused = true)]
+async fn the_tone_ends_when_the_agent_speaks_again() {
+    let mut h = harness(fillers_with_tone(2000, true), None, false);
+    h.speech.paced.store(true, Ordering::Release);
+    h.backend.push(Ok(vec![
+        created("resp_1"),
+        Step::Ev(AgentEvent::ToolStarted {
+            item_id: "mcp_1".into(),
+            name: "lookup_order".into(),
+            kind: "mcp_call".into(),
+        }),
+        Step::Wait(Duration::from_millis(300)),
+        Step::Ev(AgentEvent::ToolFinished {
+            item_id: "mcp_1".into(),
+            name: "lookup_order".into(),
+            ok: true,
+        }),
+        Step::Wait(Duration::from_millis(4_000)),
+        delta("I found your order. "),
+        delta("It shipped on Monday"),
+        Step::Wait(Duration::from_millis(6_000)),
+        delta(", and it arrives on Friday."),
+        completed(),
+    ]));
+    h.engine.start_turn("order?".into()).await;
+    let _ = until_done(&mut h, 0).await;
+    let timeline = h.speech.timeline();
+    let said = timeline
+        .iter()
+        .position(|e| e == "say:I found your order.")
+        .expect("the answer was spoken");
+    assert!(
+        !timeline[said..].iter().any(|e| e == "tone"),
+        "no tone after the agent spoke again: {timeline:?}"
+    );
+    assert!(timeline[..said].iter().any(|e| e == "tone"), "{timeline:?}");
+}
+
+/// A caller who talks over the tone stops it at once; nothing more of it is played.
+#[tokio::test(start_paused = true)]
+async fn a_barge_in_stops_the_tone() {
+    let h = harness(fillers_with_tone(2000, true), None, false);
+    h.speech.paced.store(true, Ordering::Release);
+    h.backend.push(Ok(tool_run(Duration::from_millis(20_000))));
+    h.engine.start_turn("order?".into()).await;
+    tokio::time::sleep(Duration::from_millis(3_000)).await;
+    let before = h.speech.pulses.lock().len();
+    assert!(before > 0, "the tone was playing");
+    h.engine.barge_in().await;
+    tokio::time::sleep(Duration::from_millis(5_000)).await;
+    assert_eq!(h.speech.pulses.lock().len(), before);
+}
+
+/// With the tone off, the phrases keep coming while the tool runs, as before.
+#[tokio::test(start_paused = true)]
+async fn with_the_tone_off_the_phrases_keep_coming() {
+    let mut h = harness(fillers_with_tone(2000, false), None, false);
+    h.speech.paced.store(true, Ordering::Release);
+    h.backend.push(Ok(tool_run(Duration::from_millis(5500))));
+    h.engine.start_turn("order?".into()).await;
+    let _ = until_done(&mut h, 0).await;
+    assert_eq!(
+        h.speech.spoken(),
+        vec![
+            "Let me look that up.",
+            "One moment.",
+            "Still checking.",
+            "Found it."
+        ]
+    );
+    assert!(h.speech.pulses.lock().is_empty());
+}
+
+/// A session whose audio output cannot carry the tone (a compressed TTS format) keeps the phrases,
+/// so the caller is never left in silence.
+#[tokio::test(start_paused = true)]
+async fn an_output_that_cannot_carry_the_tone_keeps_the_phrases() {
+    let mut h = harness(fillers_with_tone(2000, true), None, false);
+    h.speech.paced.store(true, Ordering::Release);
+    h.speech.no_sound.store(true, Ordering::Release);
+    h.backend.push(Ok(tool_run(Duration::from_millis(5500))));
+    h.engine.start_turn("order?".into()).await;
+    let _ = until_done(&mut h, 0).await;
+    assert_eq!(
+        h.speech.spoken(),
+        vec![
+            "Let me look that up.",
+            "One moment.",
+            "Still checking.",
+            "Found it."
+        ]
+    );
+    assert!(h.speech.pulses.lock().is_empty());
+}
+
+/// The tone is for tools: a slow answer with no tool keeps its phrases and plays no tone.
+#[tokio::test(start_paused = true)]
+async fn a_slow_answer_without_a_tool_plays_no_tone() {
+    let mut h = harness(fillers_with_tone(2000, true), None, false);
+    h.speech.paced.store(true, Ordering::Release);
+    h.backend.push(Ok(vec![
+        created("resp_1"),
+        Step::Wait(Duration::from_millis(3500)),
+        delta("Here it is."),
+        completed(),
+    ]));
+    h.engine.start_turn("order?".into()).await;
+    let _ = until_done(&mut h, 0).await;
+    assert_eq!(
+        h.speech.spoken(),
+        vec!["Hmm.", "One moment.", "Here it is."]
+    );
+    assert!(h.speech.pulses.lock().is_empty());
+}
+
+/// A text-only session is never spoken to, tone included.
+#[tokio::test(start_paused = true)]
+async fn a_text_only_session_plays_no_tone() {
+    let mut h = harness(fillers_with_tone(2000, true), None, true);
+    h.speech.paced.store(true, Ordering::Release);
+    h.backend.push(Ok(tool_run(Duration::from_millis(5500))));
+    h.engine.start_turn("order?".into()).await;
+    let _ = until_done(&mut h, 0).await;
+    assert!(h.speech.pulses.lock().is_empty());
 }
 
 /// The list is a script for one wait: the phrase heard says how long the caller has waited.

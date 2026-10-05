@@ -111,18 +111,18 @@ pub fn response_format(audio_format: Option<&str>) -> &'static str {
 /// `core/tts/standard.rs`.
 pub const AZURE_OPENAI_NAMES: &[&str] = &["azure_openai", "azure-openai"];
 
-/// The `api-version` sent when a deployment does not name one.
-pub const AZURE_OPENAI_DEFAULT_API_VERSION: &str = "2025-04-01-preview";
+// Azure OpenAI's URL shape, default version and key header are shared with speech-to-text uploads.
+pub use waav_segmented_stt::vendor::azure_openai::{
+    API_KEY_HEADER as AZURE_OPENAI_API_KEY_HEADER, AudioRoute as AzureAudioRoute,
+    DEFAULT_API_VERSION as AZURE_OPENAI_DEFAULT_API_VERSION,
+    api_version as azure_openai_api_version, audio_url as azure_openai_audio_url,
+};
 
 /// The provider-extras key carrying a deployment's `api-version`.
 ///
 /// The handler copies `voice_table.provider_params.api_version` here; the flat registry path
 /// has no extras and always sends [`AZURE_OPENAI_DEFAULT_API_VERSION`].
 pub const AZURE_OPENAI_API_VERSION_EXTRA: &str = "api_version";
-
-/// The header Azure OpenAI reads its key from. It ignores `Authorization: Bearer`, and
-/// sending both would put the key on the wire twice for no benefit.
-pub const AZURE_OPENAI_API_KEY_HEADER: &str = "api-key";
 
 /// Schemes an Azure OpenAI URL may use in production: https only.
 const AZURE_OPENAI_URL_SCHEMES: &[&str] = &["https"];
@@ -131,72 +131,6 @@ const AZURE_OPENAI_URL_SCHEMES: &[&str] = &["https"];
 pub fn is_azure_openai(vendor: &str) -> bool {
     let v = vendor.trim().to_ascii_lowercase();
     AZURE_OPENAI_NAMES.iter().any(|n| *n == v)
-}
-
-/// Which Azure OpenAI audio operation a URL addresses.
-///
-/// Transcription and translation are separate ROUTES, as on every OpenAI-shaped server: a
-/// translation request sent to the transcription route returns source-language text with a 200.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AzureAudioRoute {
-    Speech,
-    Transcriptions,
-    Translations,
-}
-
-impl AzureAudioRoute {
-    fn segment(self) -> &'static str {
-        match self {
-            Self::Speech => "speech",
-            Self::Transcriptions => "transcriptions",
-            Self::Translations => "translations",
-        }
-    }
-}
-
-/// The `api-version` to send: the deployment's own when it names one, else the default.
-pub fn azure_openai_api_version(requested: Option<&str>) -> &str {
-    requested
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .unwrap_or(AZURE_OPENAI_DEFAULT_API_VERSION)
-}
-
-/// `{api_base}/openai/deployments/{deployment}/audio/{route}?api-version={api_version}`.
-///
-/// `api_base` is the resource endpoint (`https://<resource>.openai.azure.com`), with or without
-/// a trailing slash; a path on it (an API Management prefix) is kept. The deployment is ONE
-/// path segment and is percent-encoded as one, so a `/` in it cannot re-route the request; `.`
-/// and `..` are refused outright, because a URL builder silently drops them.
-pub fn azure_openai_audio_url(
-    api_base: &str,
-    deployment: &str,
-    route: AzureAudioRoute,
-    api_version: Option<&str>,
-) -> Result<String, String> {
-    let deployment = deployment.trim();
-    if deployment.is_empty() || deployment == "." || deployment == ".." {
-        return Err(format!(
-            "an azure_openai endpoint needs a deployment name (voice_table `model`: the \
-             credential's deployment_id, else the model name); got {deployment:?}"
-        ));
-    }
-    let base = api_base.trim().trim_end_matches('/');
-    let mut url = url::Url::parse(base)
-        .map_err(|e| format!("azure_openai api_base {base:?} is not a URL: {e}"))?;
-    url.path_segments_mut()
-        .map_err(|()| format!("azure_openai api_base {base:?} cannot carry a path"))?
-        .pop_if_empty()
-        .extend([
-            "openai",
-            "deployments",
-            deployment,
-            "audio",
-            route.segment(),
-        ]);
-    url.query_pairs_mut()
-        .append_pair("api-version", azure_openai_api_version(api_version));
-    Ok(url.into())
 }
 
 /// The schemes an Azure OpenAI URL (and every redirect from it) may use.

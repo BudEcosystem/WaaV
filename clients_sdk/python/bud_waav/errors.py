@@ -131,6 +131,47 @@ class ProtocolVersionError(BudError):
         self.sdk_version = sdk_version
 
 
+class GatewayError(BudError):
+    """An ``error`` frame the gateway sent on ``/ws``.
+
+    An uncoded gateway error is just ``{type, message}``: ``code`` is ``None``,
+    ``recoverable`` is ``False`` and ``details`` is ``None``. A coded one adds a
+    stable ``code`` (e.g. ``stt_live_unsupported``), ``recoverable`` and
+    ``details``; its ``message`` keeps the ``"{code}: "`` prefix.
+
+    ``recoverable=True`` on a setup refusal means the socket is still open and a
+    corrected ``config`` may be sent; ``False`` means the session is over or will
+    never transcribe.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        code: Optional[str] = None,
+        recoverable: bool = False,
+        details: Optional[dict[str, Any]] = None,
+    ):
+        super().__init__(
+            message,
+            code=code,
+            context={"recoverable": recoverable, "details": details},
+        )
+        self.recoverable = recoverable
+        self.details = details
+
+    @classmethod
+    def from_wire(cls, data: dict[str, Any]) -> "GatewayError":
+        """Build from a raw ``{type: error, message, code?, recoverable?, details?}`` frame."""
+        code = data.get("code")
+        details = data.get("details")
+        return cls(
+            message=str(data.get("message", "Unknown error")),
+            code=code if isinstance(code, str) else None,
+            recoverable=data.get("recoverable") is True,
+            details=details if isinstance(details, dict) else None,
+        )
+
+
 class APIError(BudError):
     """API request failed."""
 

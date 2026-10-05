@@ -40,6 +40,7 @@
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use waav_segmented_stt::vendor::hosts;
 
 use axum::{
     extract::{Path, State},
@@ -57,9 +58,9 @@ use crate::config::ServerConfig;
 #[cfg(test)]
 use crate::core::stt::batch::decode_inline_batch_audio_with_limit;
 use crate::core::stt::batch::{
-    BatchHttpBody, BatchJob, BatchStatus, BatchSubmission, BatchTranscribeRequest,
-    batch_provider_supported, build_assemblyai_transcript, build_deepgram_prerecorded,
-    build_openai_transcription, decode_inline_batch_audio, validate_batch_base_url,
+    BatchJob, BatchStatus, BatchSubmission, BatchTranscribeRequest, batch_provider_supported,
+    build_assemblyai_transcript, build_deepgram_prerecorded, build_openai_transcription,
+    decode_inline_batch_audio, validate_batch_base_url,
 };
 use crate::core::stt::{STTConfig, STTErrorCallback, STTResult, STTResultCallback};
 use crate::core::voice_error::{VoiceErrorType, VoiceFailure};
@@ -605,19 +606,15 @@ async fn build_submission(
     state: &AppState,
 ) -> Result<BatchSubmission, String> {
     match provider {
-        "deepgram" => {
-            build_deepgram_prerecorded(req, api_key, base_url.unwrap_or("https://api.deepgram.com"))
-        }
-        "openai" => {
-            build_openai_transcription(req, api_key, base_url.unwrap_or("https://api.openai.com"))
-        }
+        "deepgram" => build_deepgram_prerecorded(req, api_key, base_url.unwrap_or(hosts::DEEPGRAM)),
+        "openai" => build_openai_transcription(req, api_key, base_url.unwrap_or(hosts::OPENAI)),
         "elevenlabs" => crate::core::stt::batch::build_elevenlabs_transcription(
             req,
             api_key,
-            base_url.unwrap_or("https://api.elevenlabs.io"),
+            base_url.unwrap_or(hosts::ELEVENLABS),
         ),
         "assemblyai" => {
-            let host = base_url.unwrap_or("https://api.assemblyai.com");
+            let host = base_url.unwrap_or(hosts::ASSEMBLYAI);
             // URL source → pass through; bytes source → upload first to obtain an audio_url.
             let audio_url = if let Some(u) = req.audio.url() {
                 u.to_string()
@@ -641,25 +638,16 @@ async fn upload_assemblyai(
 ) -> Result<String, String> {
     let bytes = decode_assemblyai_upload_audio(audio_base64)?;
     let client = http_client()?;
-    let resp = client
-        .post(format!("{}/v2/upload", host.trim_end_matches('/')))
-        .header("Authorization", api_key)
-        .header("Content-Type", "application/octet-stream")
-        .body(bytes)
+    let resp = crate::core::stt::batch::assemblyai_upload_request(&client, host, api_key, bytes)
         .send()
         .await
         .map_err(|e| format!("assemblyai upload failed: {e}"))?;
     let status = resp.status();
-    let v: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("assemblyai upload response not JSON: {e}"))?;
+    let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        return Err(format!("assemblyai upload error ({status}): {v}"));
+        return Err(format!("assemblyai upload error ({status}): {text}"));
     }
-    v.get("upload_url")
-        .and_then(|u| u.as_str())
-        .map(str::to_string)
+    crate::core::stt::batch::assemblyai_upload_url(&text)
         .ok_or_else(|| "assemblyai upload returned no upload_url".to_string())
 }
 
@@ -679,34 +667,7 @@ fn decode_assemblyai_upload_audio_with_limit(
 /// wrapped as `{"raw": "<text>"}` so callers always get JSON.
 async fn execute(sub: &BatchSubmission) -> Result<(StatusCode, serde_json::Value), String> {
     let client = http_client()?;
-    let r = &sub.request;
-    let mut builder = match r.method.as_str() {
-        "POST" => client.post(&r.url),
-        "PUT" => client.put(&r.url),
-        m => return Err(format!("unsupported method {m}")),
-    };
-    for (k, v) in &r.headers {
-        builder = builder.header(k, v);
-    }
-    builder = match &r.body {
-        BatchHttpBody::Empty => builder,
-        BatchHttpBody::Json(v) => builder.json(v),
-        BatchHttpBody::Raw { bytes, .. } => builder.body(bytes.clone()),
-        BatchHttpBody::Multipart { fields, file } => {
-            let mut form = reqwest::multipart::Form::new();
-            for (name, value) in fields {
-                form = form.text(name.clone(), value.clone());
-            }
-            if let Some((field, filename, ct, bytes)) = file {
-                let part = reqwest::multipart::Part::bytes(bytes.clone())
-                    .file_name(filename.clone())
-                    .mime_str(ct)
-                    .map_err(|e| format!("bad multipart mime: {e}"))?;
-                form = form.part(field.clone(), part);
-            }
-            builder.multipart(form)
-        }
-    };
+    let builder = crate::core::stt::batch::http_request(&client, &sub.request)?;
     let resp = builder
         .send()
         .await
@@ -783,15 +744,7 @@ pub async fn transcribe_self_hosted(
         transcription_url(api_base)
     };
 
-    // One pooled client for every self-hosted backend: connections to each host are kept and
-    // reused instead of a new DNS + TCP + TLS per upload (`core::net::shared_http_client`).
-    let client = crate::core::net::shared_http_client("stt-self-hosted", || {
-        reqwest::Client::builder()
-            .timeout(OVERALL_DEADLINE)
-            .http1_only()
-            .build()
-    })
-    .map_err(|e| {
+    let client = self_hosted_http_client().map_err(|e| {
         VoiceFailure::new(
             VoiceErrorType::Internal,
             format!("could not build the http client: {e}"),
@@ -836,6 +789,22 @@ pub async fn transcribe_self_hosted(
 /// anything is sent (the shared SSRF rules), and never follows a redirect to one. A refusal
 /// before sending is a configuration failure: nothing reached the vendor, so no vendor span.
 #[allow(clippy::too_many_arguments)]
+/// One pooled client for every self-hosted backend: connections to each host are kept and reused
+/// instead of a new DNS + TCP + TLS per upload (`core::net::shared_http_client`).
+///
+/// It follows no redirect. The deployment's own address is trusted (an in-cluster server is the
+/// point of self-hosting), a host it points elsewhere is not, and the upload carries the
+/// deployment's credential. Segmented sessions' upload clients follow none either.
+fn self_hosted_http_client() -> Result<reqwest::Client, reqwest::Error> {
+    crate::core::net::shared_http_client("stt-self-hosted", || {
+        reqwest::Client::builder()
+            .timeout(OVERALL_DEADLINE)
+            .http1_only()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+    })
+}
+
 pub(crate) async fn transcribe_azure_openai(
     vendor: &str,
     api_base: &str,
@@ -1080,13 +1049,8 @@ async fn send_upstream_transcription(
 
     let status = resp.status();
     call.status(status.as_u16());
-    let vendor_request_id = ["x-request-id", "request-id"]
-        .iter()
-        .find_map(|name| resp.headers().get(*name))
-        .and_then(|v| v.to_str().ok())
-        .map(str::trim)
-        .filter(|v| !v.is_empty() && v.len() <= 200)
-        .map(str::to_string);
+    let vendor_request_id =
+        waav_segmented_stt::vendor::request_id(resp.headers(), &["x-request-id", "request-id"]);
     call.vendor_request_id(vendor_request_id.as_deref());
     let body = match resp.text().await {
         Ok(body) => body,
@@ -1330,6 +1294,53 @@ mod tests {
         let none = endpoint_override(&req_with_endpoint("  "), "openai")
             .expect("empty endpoint_override is ignored");
         assert!(none.is_none());
+    }
+
+    /// The upload carries the deployment's credential: a redirect from the server is not followed
+    /// anywhere, so the credential and the audio stay with the deployment's own address.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_self_hosted_upload_follows_no_redirect() {
+        let elsewhere = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind redirect target");
+        let target = elsewhere.local_addr().expect("target addr");
+        let reached = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&reached);
+        tokio::spawn(async move {
+            if elsewhere.accept().await.is_ok() {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        let server = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind self-hosted server");
+        let addr = server.local_addr().expect("server addr");
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = server.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 4096];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+            let response = format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{target}/steal\r\nContent-Length: 0\r\n\r\n"
+            );
+            let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await;
+        });
+
+        let resp = self_hosted_http_client()
+            .expect("self-hosted client")
+            .post(format!("http://{addr}/v1/audio/transcriptions"))
+            .bearer_auth("deployment-key")
+            .body("audio")
+            .send()
+            .await
+            .expect("the redirect itself is the answer");
+        assert_eq!(resp.status().as_u16(), 307);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !reached.load(std::sync::atomic::Ordering::SeqCst),
+            "the redirect target was contacted"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

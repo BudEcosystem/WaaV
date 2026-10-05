@@ -120,6 +120,9 @@ bud-auth = { path = "../bud-auth" }
 # OpenAI-compatible audio request translation (FRD-018). Separate crate for the same reason
 # as bud-auth: pure mapping logic that tests in milliseconds instead of minutes.
 waav-openai-audio = { path = "../waav-openai-audio" }
+# Segmented speech-to-text: the capability map, the resolver, the segmenting engine and the
+# transcriber layer. Kept out of this crate so its tests run in seconds.
+waav-segmented-stt = { path = "../segmented-stt" }
 # FRD-022: a Bud deployment's Rate limiting and Resilience settings — the local-first limiter
 # shared with budgateway, plus retry/breaker/fallback primitives. Pinned by rev; the Redis
 # adapter matches the `redis` 0.27 bud-auth already links.

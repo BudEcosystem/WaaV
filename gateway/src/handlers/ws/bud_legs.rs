@@ -23,7 +23,7 @@ use crate::core::voice_cost::voice_cost;
 use crate::handlers::advisories::Advisories;
 use crate::handlers::endpoint_settings;
 use crate::handlers::openai_realtime::session::{Caller, CallerCheck};
-use crate::observability::voice_attrs::{leg as leg_attr, turn};
+use crate::observability::voice_attrs::{leg as leg_attr, resilience, turn};
 use crate::state::AppState;
 
 use super::config::{STTWebSocketConfig, TTSWebSocketConfig};
@@ -119,19 +119,10 @@ pub async fn resolve_leg(
         ));
     };
     let vendor = resolved.endpoint.vendor.as_str();
-    if capability == STT_CAPABILITY
-        && (crate::core::tts::self_hosted::is_self_hosted(vendor)
-            || crate::core::tts::self_hosted::is_azure_openai(vendor))
-    {
-        // These answer one uploaded file over HTTP; there is no stream to hold open.
-        return Err(LegRefusal::new(
-            "unsupported_deployment",
-            format!(
-                "Deployment '{model}' ({vendor}) transcribes uploaded files and cannot stream; use \
-                 it through /v1/audio/transcriptions, or name a streaming transcription deployment."
-            ),
-        ));
-    }
+    // A self-hosted or Azure OpenAI transcription deployment answers one uploaded file per
+    // request. Whether a live call can use it is the capability map's decision (segmented
+    // speech-to-text), made once the session kind is known; uncovered, the session gets today's
+    // refusal, text included ([`todays_unsupported_deployment_text`]).
     let mut ignored = Advisories::new();
     if let Some(why) = crate::handlers::openai_audio::endpoint_misconfiguration_reason(
         &resolved.endpoint,
@@ -209,6 +200,76 @@ fn non_empty(v: &Option<String>) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Today's refusal of a self-hosted or Azure OpenAI deployment named on a `/ws` leg, kept byte for
+/// byte while segmented speech-to-text does not cover the session.
+pub fn todays_unsupported_deployment_text(model: &str, vendor: &str) -> String {
+    format!(
+        "Deployment '{model}' ({vendor}) transcribes uploaded files and cannot stream; use \
+                 it through /v1/audio/transcriptions, or name a streaming transcription deployment."
+    )
+}
+
+/// Today's refusal of a voice agent whose transcription deployment is self-hosted or Azure
+/// OpenAI, kept byte for byte while segmented speech-to-text does not cover the session.
+pub fn todays_stt_not_streaming_text(agent: &str, vendor: &str) -> String {
+    format!(
+        "Voice agent '{agent}': its transcription deployment ({vendor}) transcribes uploaded                  files and cannot stream. Choose a streaming transcription deployment for the agent."
+    )
+}
+
+/// The STT deployment's fallback deployments for segmented speech-to-text (Release 5): its
+/// `fallback_models` that exist and serve transcription, at most `MAX_FALLBACKS`. Each is admitted
+/// against its own limits when it first serves.
+pub fn stt_fallbacks(
+    state: &Arc<AppState>,
+    leg: &BudLeg,
+) -> Vec<crate::core::stt::segmented::live::LiveFallback> {
+    use crate::core::stt::segmented::live::{FallbackAdmit, LiveFallback};
+    leg.endpoint
+        .policy
+        .fallback_models
+        .iter()
+        .filter(|id| id.as_ref() != leg.endpoint_id.as_str())
+        .take(resil::policy::MAX_FALLBACKS)
+        .filter_map(|id| {
+            let endpoint = state.fallback_voice_endpoint(id, STT_CAPABILITY)?;
+            let st = Arc::clone(state);
+            let key = id.to_string();
+            let admit: FallbackAdmit = Arc::new(move || {
+                let st = Arc::clone(&st);
+                let key = key.clone();
+                Box::pin(async move { st.admit_deployment(&key).await.ok() })
+            });
+            Some(LiveFallback {
+                id: id.to_string(),
+                endpoint,
+                admit: Some(admit),
+            })
+        })
+        .collect()
+}
+
+/// What segmented speech-to-text needs to know about a resolved STT leg.
+pub fn live_leg(
+    leg: &BudLeg,
+    site: crate::core::stt::segmented::live::LegSite,
+) -> crate::core::stt::segmented::live::LiveLeg {
+    let ep = &leg.endpoint;
+    let stt = ep.config.stt();
+    crate::core::stt::segmented::live::LiveLeg {
+        name: leg.endpoint_name.clone(),
+        id: leg.endpoint_id.clone(),
+        site,
+        api_base: ep.api_base.clone(),
+        provider_params: ep.provider_params.clone(),
+        segmented: stt.segmented.clone(),
+        capability_override: stt.capability_override.clone(),
+        expected_languages: stt.expected_languages.clone().unwrap_or_default(),
+        data: crate::core::stt::data_settings::DataSettings::from_settings(&stt),
+        fallbacks: Vec::new(),
+    }
+}
+
 /// Point the STT leg at its deployment (FR-WS-1, FR-WS-4). Returns the vendor credential.
 ///
 /// The deployment's published transcription settings are the defaults and the client's explicit
@@ -247,6 +308,10 @@ pub fn apply_stt(
             endpoint_settings::translation_for(ep.config.translation.as_ref(), false, advisories);
     }
     replace_extras(&mut cfg.extras.0, ep);
+    // The deployment's data region and retention reach the vendor client (Release 5).
+    cfg.extras
+        .0
+        .extend(crate::core::stt::data_settings::DataSettings::from_settings(&settings).extras());
     cfg.api_key = None;
     ep.credential.clone().unwrap_or_default()
 }
@@ -402,6 +467,11 @@ pub struct LegMeter {
     held: parking_lot::Mutex<Vec<(String, &'static str)>>,
     /// Spec 025: a voice-agent session is authorized by the AGENT, not by its legs (D-6).
     agent: parking_lot::Mutex<Option<AgentGrant>>,
+    /// A segmented session bills the seconds it uploaded, not every inbound byte: silence between
+    /// utterances is never sent to the vendor.
+    segmented: std::sync::atomic::AtomicBool,
+    /// The STT deployment's fallbacks (Release 5): a unit one of them served is billed on it.
+    stt_fallbacks: parking_lot::Mutex<std::collections::HashMap<String, LegBilling>>,
 }
 
 /// What authorizes a voice-agent session, re-checked every revalidation (spec 025 S-8).
@@ -438,6 +508,8 @@ impl LegMeter {
             turn_index: AtomicU64::new(0),
             held: parking_lot::Mutex::new(Vec::new()),
             agent: parking_lot::Mutex::new(None),
+            segmented: std::sync::atomic::AtomicBool::new(false),
+            stt_fallbacks: parking_lot::Mutex::new(std::collections::HashMap::new()),
         };
         if let Some((_, rate, channels)) = stt {
             meter.set_stt_format(rate, channels);
@@ -453,7 +525,91 @@ impl LegMeter {
 
     /// Count audio streamed to the STT leg (after any codec decode). One atomic add: hot path.
     pub fn add_stt_audio(&self, bytes: usize) {
+        if self.segmented.load(Ordering::Relaxed) {
+            return;
+        }
         self.stt_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    /// The session is segmented: bill uploaded seconds per unit ([`Self::stt_uploaded`]).
+    pub fn set_segmented(&self) {
+        self.segmented.store(true, Ordering::Relaxed);
+        self.stt_bytes.store(0, Ordering::Relaxed);
+    }
+
+    /// One upload unit of a segmented session. `charged`: the vendor answered it. An upload still in
+    /// flight at hang-up, or one that failed, is not charged; its seconds are recorded.
+    pub fn stt_uploaded(&self, uploaded_seconds: f64, charged: bool, outcome: &str) {
+        self.stt_uploaded_by(None, uploaded_seconds, charged, outcome);
+    }
+
+    /// A fallback deployment the session may move to (Release 5), billed at its own price.
+    pub fn add_stt_fallback(&self, endpoint_id: &str, endpoint: &VoiceEndpoint) {
+        let billing = LegBilling {
+            capability: STT_CAPABILITY,
+            endpoint_id: endpoint_id.to_string(),
+            endpoint_name: endpoint_id.to_string(),
+            model_id: None,
+            project_id: self.caller.principal.project_id.clone(),
+            vendor: endpoint.vendor.clone(),
+            vendor_model: endpoint.model.clone(),
+            pricing: endpoint.pricing.clone(),
+        };
+        self.stt_fallbacks
+            .lock()
+            .insert(endpoint_id.to_string(), billing);
+    }
+
+    /// [`Self::stt_uploaded`], on the deployment that served the unit. The record keeps the
+    /// deployment the caller addressed as `endpoint_id`; a unit a fallback served names it in
+    /// `served_endpoint_id` and the primary in `fallback_from`, and is priced at the fallback's
+    /// price, as the file route records it.
+    pub fn stt_uploaded_by(
+        &self,
+        served_by: Option<&str>,
+        uploaded_seconds: f64,
+        charged: bool,
+        outcome: &str,
+    ) {
+        let Some(primary) = &self.stt else { return };
+        if uploaded_seconds <= 0.0 {
+            return;
+        }
+        let fallback = served_by.and_then(|id| self.stt_fallbacks.lock().get(id).cloned());
+        let billing = fallback.as_ref().unwrap_or(primary);
+        let span = self.open(primary);
+        record_text(&span, leg_attr::STT_VENDOR, Some(&billing.vendor));
+        record_text(&span, leg_attr::STT_MODEL, billing.vendor_model.as_deref());
+        record_text(
+            &span,
+            resilience::SERVED_ENDPOINT_ID,
+            Some(&billing.endpoint_id),
+        );
+        if fallback.is_some() {
+            record_text(&span, resilience::FALLBACK_FROM, Some(&primary.endpoint_id));
+        }
+        let seconds = if charged { uploaded_seconds } else { 0.0 };
+        span.record(turn::AUDIO_SECONDS, seconds);
+        if charged
+            && let Some((cost, unit)) = voice_cost(
+                billing.pricing.as_ref(),
+                STT_CAPABILITY,
+                None,
+                Some(seconds),
+                None,
+            )
+        {
+            span.record(turn::COST, cost);
+            span.record(turn::PRICING_UNIT, unit);
+        }
+        tracing::debug!(
+            endpoint = %primary.endpoint_id,
+            served = %billing.endpoint_id,
+            uploaded_seconds,
+            charged,
+            outcome,
+            "segmented speech-to-text upload metered"
+        );
     }
 
     fn open(&self, billing: &LegBilling) -> Span {
@@ -481,6 +637,9 @@ impl LegMeter {
     /// A final transcript: bill the audio streamed since the previous one.
     pub fn stt_final(&self, transcript: &str) {
         let Some(billing) = &self.stt else { return };
+        if self.segmented.load(Ordering::Relaxed) {
+            return;
+        }
         let bps = self.stt_bytes_per_second.load(Ordering::Relaxed);
         if bps == 0 {
             return;
@@ -654,6 +813,8 @@ async fn agent_still_allowed(
 pub struct PreparedLegs {
     pub stt_key: String,
     pub tts_key: String,
+    /// The STT leg as segmented speech-to-text sees it (address, vendor parameters, settings).
+    pub stt_leg: Option<crate::core::stt::segmented::live::LiveLeg>,
     /// The TTS deployment's own address (self-hosted, Azure OpenAI); never the client's (§5.9).
     pub tts_api_base: Option<String>,
     pub meter: Arc<LegMeter>,
@@ -753,8 +914,14 @@ pub async fn prepare(
         Some((&stt_leg, stt.sample_rate, stt.channels)),
         Some(&tts_leg),
     ));
+    let mut stt_live = live_leg(&stt_leg, crate::core::stt::segmented::live::LegSite::Named);
+    stt_live.fallbacks = stt_fallbacks(state, &stt_leg);
+    for fb in &stt_live.fallbacks {
+        meter.add_stt_fallback(&fb.id, &fb.endpoint);
+    }
     let tts_api_base = tts_leg.endpoint.api_base.clone();
     Ok(PreparedLegs {
+        stt_leg: Some(stt_live),
         stt_key,
         tts_key,
         tts_api_base,
@@ -812,18 +979,6 @@ async fn resolve_agent_leg(
         .filter(|e| e.serves(capability))
         .ok_or_else(unavailable)?;
     let vendor = endpoint.vendor.as_str();
-    if capability == STT_CAPABILITY
-        && (crate::core::tts::self_hosted::is_self_hosted(vendor)
-            || crate::core::tts::self_hosted::is_azure_openai(vendor))
-    {
-        return Err(LegRefusal::new(
-            "stt_not_streaming",
-            format!(
-                "Voice agent '{}': its transcription deployment ({vendor}) transcribes uploaded                  files and cannot stream. Choose a streaming transcription deployment for the agent.",
-                agent.prompt_name
-            ),
-        ));
-    }
     let mut ignored = Advisories::new();
     if let Some(why) =
         crate::handlers::openai_audio::endpoint_misconfiguration_reason(&endpoint, &mut ignored)
@@ -1062,9 +1217,15 @@ pub async fn prepare_agent(
         prompt_id: agent.prompt_id.clone(),
         version: agent.version,
     });
+    let mut stt_live = live_leg(&stt_leg, crate::core::stt::segmented::live::LegSite::Agent);
+    stt_live.fallbacks = stt_fallbacks(state, &stt_leg);
+    for fb in &stt_live.fallbacks {
+        meter.add_stt_fallback(&fb.id, &fb.endpoint);
+    }
     let tts_api_base = tts_leg.endpoint.api_base.clone();
     Ok(PreparedAgent {
         legs: PreparedLegs {
+            stt_leg: Some(stt_live),
             stt_key,
             tts_key,
             tts_api_base,
@@ -1555,9 +1716,11 @@ mod tests {
         assert_eq!(refusal.code, "model_not_found");
     }
 
-    /// A self-hosted or Azure OpenAI transcription deployment answers uploads, not streams.
+    /// A self-hosted or Azure OpenAI transcription deployment answers uploads, not streams: the
+    /// leg is prepared with its address, and the capability map decides at session setup
+    /// (segmented speech-to-text, or today's refusal while uncovered).
     #[tokio::test]
-    async fn an_upload_only_stt_deployment_is_refused_by_name() {
+    async fn an_upload_only_stt_deployment_reaches_the_resolver_with_its_address() {
         let (state, _) = plane(
             &[
                 (
@@ -1572,11 +1735,17 @@ mod tests {
         .await;
         let mut stt = stt_cfg(json!({"model": "whisper"}));
         let mut tts = tts_cfg(json!({"model": "tts-el"}));
-        let refusal = prepare(&state, Some(&cred(KEY)), &mut stt, &mut tts, "s-1")
+        let legs = prepare(&state, Some(&cred(KEY)), &mut stt, &mut tts, "s-1")
             .await
-            .unwrap_err();
-        assert_eq!(refusal.code, "unsupported_deployment");
-        assert!(refusal.message.contains("/v1/audio/transcriptions"));
+            .unwrap();
+        let leg = legs.stt_leg.as_ref().unwrap();
+        assert_eq!(leg.api_base.as_deref(), Some("http://whisper:8000"));
+        assert_eq!(leg.site, crate::core::stt::segmented::live::LegSite::Named);
+        assert_eq!(stt.provider, "self_hosted");
+        assert!(
+            todays_unsupported_deployment_text("whisper", "self_hosted")
+                .contains("/v1/audio/transcriptions")
+        );
     }
 
     /// 🔒 An AWS deployment without its key pair would authenticate as the GATEWAY's identity; it
@@ -1799,6 +1968,89 @@ mod tests {
         assert_ne!(
             stt_rec["bud.voice.turn_index"],
             tts_rec["bud.voice.turn_index"]
+        );
+    }
+
+    /// Release 5: the STT deployment's `fallback_models` reach the session's leg (one that is
+    /// gone or does not transcribe is dropped), its data settings reach the vendor config, and a
+    /// unit a fallback served is metered on the fallback at its own price.
+    #[tokio::test]
+    async fn the_stt_deployments_fallbacks_and_data_settings_reach_the_session() {
+        let (state, _) = plane(
+            &[
+                (
+                    "stt-dg",
+                    "ep-stt",
+                    stt_entry(json!({
+                        "fallback_models": ["ep-fb", "ep-missing", "ep-tts"],
+                        "config": {"stt": {"data_region": "eu", "data_retention": "none"}}
+                    })),
+                ),
+                (
+                    "stt-fb",
+                    "ep-fb",
+                    stt_entry(json!({
+                        "vendor": "elevenlabs",
+                        "model": "scribe_v2",
+                        "pricing": {"unit": "minute", "per_units": 1, "cost_per_unit": 0.006, "currency": "USD"}
+                    })),
+                ),
+                ("tts-el", "ep-tts", tts_entry(json!({}))),
+            ],
+            &[],
+        )
+        .await;
+        let mut stt = stt_cfg(json!({"model": "stt-dg"}));
+        let mut tts = tts_cfg(json!({"model": "tts-el"}));
+        let legs = prepare(&state, Some(&cred(KEY)), &mut stt, &mut tts, "s-fb")
+            .await
+            .unwrap();
+        let leg = legs.stt_leg.clone().unwrap();
+        assert_eq!(
+            leg.fallbacks
+                .iter()
+                .map(|f| f.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ep-fb"]
+        );
+        assert_eq!(leg.fallbacks[0].endpoint.vendor, "elevenlabs");
+        assert!(leg.fallbacks[0].admit.is_some());
+        assert!(leg.data.eu && leg.data.no_retention);
+        assert_eq!(stt.extras.0["data_region"], "eu");
+        assert_eq!(stt.extras.0["data_retention"], "none");
+
+        let meter = legs.meter.clone();
+        meter.set_segmented();
+        let spans = Spans::default();
+        let subscriber = tracing_subscriber::registry().with(Capture(spans.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            meter.stt_uploaded_by(None, 60.0, true, "text");
+            meter.stt_uploaded_by(Some("ep-fb"), 60.0, true, "text");
+            meter.stt_uploaded_by(Some("ep-unknown"), 60.0, true, "text");
+        });
+        let records = turns(&spans);
+        assert_eq!(records.len(), 3);
+        let primary = &records[0];
+        assert_eq!(primary["bud.endpoint_id"], "ep-stt");
+        assert_eq!(primary["bud.voice.served_endpoint_id"], "ep-stt");
+        assert!(!primary.contains_key("bud.voice.fallback_from"));
+        let served = &records[1];
+        assert_eq!(
+            served["bud.endpoint_id"], "ep-stt",
+            "the deployment the caller addressed"
+        );
+        assert_eq!(served["bud.voice.served_endpoint_id"], "ep-fb");
+        assert_eq!(served["bud.voice.fallback_from"], "ep-stt");
+        assert_eq!(served["bud.voice.stt.vendor"], "elevenlabs");
+        assert_eq!(served["bud.project_id"], PROJECT);
+        let cost: f64 = served["bud.voice.cost"].parse().unwrap();
+        assert!(
+            (cost - 0.006).abs() < 1e-12,
+            "the fallback's own price: {cost}"
+        );
+        assert_eq!(
+            records[2]["bud.voice.served_endpoint_id"], "ep-stt",
+            "an unknown name bills the session's"
         );
     }
 

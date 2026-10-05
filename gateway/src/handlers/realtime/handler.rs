@@ -1088,11 +1088,13 @@ pub fn build_realtime_config(api_key: String, config: &RealtimeSessionConfig) ->
 
     let input_audio_transcription = if config.transcribe_input.unwrap_or(true) {
         Some(InputTranscriptionConfig {
-            // Use configured model or default to whisper-1
+            // The configured model, or OpenAI's default for every path (addendum B6: `whisper-1`
+            // is retired on 2027-02-26).
             model: config
                 .transcription_model
                 .clone()
-                .unwrap_or_else(|| "whisper-1".to_string()),
+                .filter(|m| !m.trim().is_empty())
+                .unwrap_or_else(|| crate::core::stt::openai::DEFAULT_OPENAI_STT_MODEL.to_string()),
         })
     } else {
         None

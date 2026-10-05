@@ -6,9 +6,19 @@
 import { ConnectionError, RateLimitError } from '../errors/index.js';
 import type { STTConfig, TTSConfig, LiveKitConfig, DAGConfig, ConversationConfig, TurnDetectionConfig } from '../types/config.js';
 import type { FeatureFlags } from '../types/features.js';
-import type { IncomingMessage, STTResultMessage, TTSAudioMessage, ReadyMessage, ErrorMessage, ConfigWarningMessage } from '../types/messages.js';
-import type { ConfigWarningEvent } from '../types/warnings.js';
+import type {
+  IncomingMessage,
+  STTResultMessage,
+  TTSAudioMessage,
+  ReadyMessage,
+  ErrorMessage,
+  ConfigWarningMessage,
+  SttWarningMessage,
+  VadEventMessage,
+} from '../types/messages.js';
+import type { ConfigWarningEvent, SttWarningEvent } from '../types/warnings.js';
 import { PROTOCOL_VERSION } from '../types/messages.js';
+import { toVoiceAgentConfig, type VoiceAgentConfig } from '../types/agent.js';
 import type { MetricsSummary } from '../types/metrics.js';
 import { getMetricsCollector, MetricsCollector } from '../metrics/collector.js';
 import { WebSocketConnection, DEFAULT_CONNECT_TIMEOUT_MS, type ConnectionState } from './connection.js';
@@ -19,7 +29,7 @@ import { KeepaliveSilence, type KeepaliveConfig } from './keepalive.js';
 import type { ConnectGate } from './connect-gate.js';
 import { createConfigMessage, createSpeakMessage, createClearMessage, createAudioEndMessage, createSendMessageMessage, type SDKOutgoingMessage } from './messages.js';
 import { MessageQueue, type MessageQueueConfig } from './queue.js';
-import { SessionEventEmitter, type SessionEventMap, type SessionEventHandler, type TranscriptEvent, type AudioEvent, type ReadyEvent, type SessionErrorEvent } from './events.js';
+import { SessionEventEmitter, type SessionEventMap, type SessionEventHandler, type TranscriptEvent, type AudioEvent, type ReadyEvent, type SessionErrorEvent, type SessionVadEvent } from './events.js';
 
 /**
  * Extract the MAJOR component of a dotted protocol version string (e.g.
@@ -72,6 +82,11 @@ export interface SessionConfig {
    * providers come back on `ready` as `resolvedAlias`.
    */
   alias?: string;
+  /**
+   * A Bud voice agent (spec 025), by name or config. It decides both speech legs, so `stt`/`tts`
+   * then carry only the audio format (the gateway refuses a `model` on them).
+   */
+  agent?: VoiceAgentConfig | string;
   /** Stream identifier to request (wire: stream_id). */
   streamId?: string;
   /** Enable audio processing (STT/TTS). Defaults to true (gateway default). */
@@ -545,6 +560,14 @@ export class WebSocketSession {
       case 'config_warning':
         this.handleConfigWarning(message as ConfigWarningMessage);
         break;
+      case 'vad_event':
+        this.handleVadEvent(message as VadEventMessage);
+        break;
+      case 'stt_warning':
+        // Mid-call and non-fatal: a typed `sttWarning`, NEVER `error` (clients treat `error` as a
+        // disconnect).
+        this.handleSttWarning(message as SttWarningMessage);
+        break;
       // NOTE: the gateway never sends a JSON `pong` (verified: no JSON ping op).
       // Native WS pong control frames are handled out-of-band by the liveness
       // watchdog via the connection `onPong` hook — there is no JSON pong case.
@@ -566,6 +589,40 @@ export class WebSocketSession {
     };
     if (message.detail !== undefined) event.detail = message.detail;
     this.emitter.emit('configWarning', event);
+  }
+
+  /**
+   * Handle a gateway speech event (segmented STT): detector-timed speech start/end and the
+   * gateway's turn decisions, surfaced camelCased as a typed `vadEvent`.
+   */
+  private handleVadEvent(message: VadEventMessage): void {
+    this.metrics.increment('ws.vadEvents');
+    const event: SessionVadEvent = {
+      event: message.event,
+      turnId: message.turn_id,
+      raw: message,
+    };
+    if (message.audio_ms !== undefined) event.audioMs = message.audio_ms;
+    if (message.sustained_ms !== undefined) event.sustainedMs = message.sustained_ms;
+    if (message.discarded !== undefined) event.discarded = message.discarded;
+    if (message.had_transcript !== undefined) event.hadTranscript = message.had_transcript;
+    if (message.reason !== undefined) event.reason = message.reason;
+    this.emitter.emit('vadEvent', event);
+  }
+
+  /**
+   * Handle a non-fatal mid-call speech-to-text warning (a lost segment, dropped audio, rate
+   * limiting). The session keeps running; it surfaces as a typed `sttWarning` event.
+   */
+  private handleSttWarning(message: SttWarningMessage): void {
+    this.metrics.increment('ws.sttWarnings');
+    const event: SttWarningEvent = {
+      code: message.code,
+      message: message.message,
+      raw: message,
+    };
+    if (message.detail !== undefined) event.detail = message.detail;
+    this.emitter.emit('sttWarning', event);
   }
 
   /**
@@ -593,6 +650,8 @@ export class WebSocketSession {
     // downgrade — if `opus` was requested but the gateway echoes `linear16`, send/decode linear16.
     if (message.audio_in_codec !== undefined) event.audioInCodec = message.audio_in_codec;
     if (message.audio_out_codec !== undefined) event.audioOutCodec = message.audio_out_codec;
+    // Segmented STT: what speech-to-text the session got (absent when the rollout does not cover it).
+    if (message.stt !== undefined) event.stt = message.stt;
 
     // Store the event for later retrieval by waitForReady()
     this.lastReadyEvent = event;
@@ -755,6 +814,7 @@ export class WebSocketSession {
       this.turnDetectionConfig ||
       this.featuresConfig ||
       this.config.alias !== undefined ||
+      this.config.agent !== undefined ||
       this.config.audio !== undefined ||
       this.config.streamId !== undefined;
     if (hasConfig) {
@@ -768,6 +828,7 @@ export class WebSocketSession {
           conversation: this.conversationConfig,
           turnDetection: this.turnDetectionConfig,
           alias: this.config.alias,
+          agent: this.config.agent !== undefined ? toVoiceAgentConfig(this.config.agent) : undefined,
           streamId: this.config.streamId,
           audio: this.config.audio,
         }

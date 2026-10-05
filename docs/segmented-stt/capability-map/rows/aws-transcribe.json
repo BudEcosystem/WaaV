@@ -1,0 +1,524 @@
+{
+  "provider_id": "aws-transcribe",
+  "provider": {
+    "aliases": [
+      "aws_transcribe",
+      "amazon-transcribe",
+      "transcribe"
+    ],
+    "default_model": "standard",
+    "model_string": "gateway_alias",
+    "registered_in_gateway": true,
+    "native_model_handling": "ignored",
+    "notes": "Registered as aws-transcribe with aliases aws_transcribe, amazon-transcribe and transcribe (gateway/src/plugin/builtin/mod.rs:124-130, :1695-1698; gateway/src/core/stt/standard.rs:409-411). Only the spellings aws-transcribe and aws_transcribe reach the standardized factory; amazon-transcribe and transcribe are resolved by the plugin registry and take the flat factory, which drops the standardized features (standard.rs:476), so the resolver must normalise the provider id before lookup. Amazon Transcribe has no base-model parameter; 'standard' and 'medical' are the names gateway/src/config/pricing.rs:275 and :279 already use. 'call-analytics' and 'healthscribe' are labels the vendor audit proposed for two Amazon products the gateway does not implement; no gateway code or price table uses them, and they have rows so that a session naming them is reported as served by standard Amazon Transcribe. Today's client never reads the model id (gateway/src/core/stt/aws_transcribe/config.rs:594; client.rs:488-568). Segmented mode is not available: the only file interface is an asynchronous S3 job, so no file-upload transport is listed. The capability that matters for this provider is language and region: the 18 language codes that are batch-only everywhere are a language constraint on the streaming transports, and the 45 more that cannot be streamed in five regions are not written, because a constraint cannot combine a language with a region. Every final from this client is marked speech-final, so Amazon's own pause detection ends the utterance."
+  },
+  "rows": [
+    {
+      "id": "aws-transcribe:standard",
+      "match": {
+        "provider": "aws-transcribe",
+        "model": "standard"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "constraints": {
+            "languages": {
+              "mode": "except",
+              "codes": [
+                "ab-GE",
+                "ast-ES",
+                "az-AZ",
+                "ba-RU",
+                "cy-GB",
+                "et-EE",
+                "ga-IE",
+                "gd-GB",
+                "ha-NG",
+                "ky-KG",
+                "mhr-RU",
+                "mi-NZ",
+                "mn-MN",
+                "mt-MT",
+                "rw-RW",
+                "tt-RU",
+                "ug-CN",
+                "wo-SN"
+              ],
+              "note": "The 18 codes in the StartTranscriptionJob language list and absent from the StartStreamTranscription list (confirmed by the fact-check): batch only in every region. A further 45 languages cannot be streamed in af-south-1, ap-northeast-1, ap-southeast-5, ap-southeast-7 and cn-northwest-1; a constraint cannot combine a language with a region, so those stay in the provider notes."
+            }
+          },
+          "latency": {
+            "class": "slow",
+            "measurements": [
+              {
+                "percentile": "p99",
+                "quantity": "end_of_speech_to_final",
+                "value_ms": 1900,
+                "basis": "third_party_benchmark",
+                "source": "https://raw.githubusercontent.com/pipecat-ai/pipecat/main/src/pipecat/services/stt_latency.py",
+                "conditions": "Pipecat AWS_TRANSCRIBE_TTFS_P99 (1.90 s): end of speech to final transcript on Amazon Transcribe streaming, measured with a voice-activity stop time of 200 ms. Amazon finalizes a segment on its own pause detection, which cannot be tuned. Read on 2026-10-03; no measurement date is published.",
+                "pause_ms_assumed": 200
+              }
+            ]
+          },
+          "limits": {
+            "max_session_ms": 28800000,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "second",
+                "value": 25,
+                "plan": null,
+                "scope": "region",
+                "note": "StartStreamTranscription requests per AWS account and region; adjustable."
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 25,
+                "plan": null,
+                "scope": "region",
+                "note": "Concurrent streams per AWS account and region; adjustable."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "quality_signals": [
+            "word_confidence"
+          ],
+          "dialect": {
+            "language_param": "LanguageCode",
+            "language_shape": "single",
+            "language_format": "bcp47",
+            "context_params": [],
+            "wire": "aws_transcribe_streaming"
+          },
+          "gateway_client": {
+            "status": "wire_tested",
+            "defect": "Audio is dropped silently when the 32-slot send channel is full (gateway/src/core/stt/aws_transcribe/client.rs:137, :993-995). A language Amazon cannot stream is passed through and rejected by Amazon at stream start, and the reconnect supervisor then retries up to ten times against the provider-wide breaker instead of failing once (inferred from reading, not run).",
+            "code_ref": "gateway/src/core/stt/aws_transcribe/client.rs:685-715 (one HTTP/2 StartStreamTranscription request through the AWS SDK), :208-213 (a non-partial result sets is_final and is_speech_final together), :488-568 (every request parameter that is sent; the model is not among them); gateway/src/core/stt/aws_transcribe/config.rs:594 (model left empty); gateway/tests/mock_endpoint_e2e.rs:2336 (mock end-to-end test)",
+            "notes": "Exercised only against an in-process mock connector. The client never reads the model id. Audio is dropped silently when its 32-slot channel is full (client.rs:137, :993-1003). A language Amazon cannot stream is passed through (client.rs:453-461) and rejected by Amazon at stream start; the reconnect supervisor then retries up to ten times, each attempt recorded against the provider-wide circuit breaker (gateway/src/core/websocket/reconnection.rs:99-108, reconnectable_stream.rs:297-315; inferred from reading, not run). The client's own comment still says sessions last 4 hours (gateway/src/core/stt/aws_transcribe/mod.rs:78); Amazon's FAQ says eight. The session's interim_results flag is mapped to Amazon's partial-results stabilization, not to whether partial results are forwarded (config.rs:651-653); partial results are always forwarded."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "audio_minute",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "pricing_key": "aws_transcribe:standard",
+        "notes": "Quoted per minute and billed in one-second increments. The pricing.rs key is spelled aws_transcribe while the provider id is aws-transcribe, and its rate is older than the examples on Amazon's pricing page; streaming and batch are priced differently."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://docs.aws.amazon.com/transcribe/latest/APIReference/API_streaming_StartStreamTranscription.html",
+          "https://docs.aws.amazon.com/transcribe/latest/dg/streaming.html",
+          "https://docs.aws.amazon.com/transcribe/latest/dg/streaming-partial-results.html",
+          "https://docs.aws.amazon.com/general/latest/gr/transcribe.html",
+          "https://docs.aws.amazon.com/transcribe/latest/dg/supported-languages.html",
+          "https://docs.aws.amazon.com/transcribe/latest/APIReference/API_Operations_Amazon_Transcribe_Service.html",
+          "https://docs.aws.amazon.com/transcribe/latest/APIReference/API_StartTranscriptionJob.html",
+          "https://aws.amazon.com/transcribe/faqs/",
+          "https://aws.amazon.com/transcribe/pricing/",
+          "https://raw.githubusercontent.com/pipecat-ai/pipecat/main/src/pipecat/services/stt_latency.py"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/aws_transcribe/client.rs:685-715",
+          "gateway/src/core/stt/aws_transcribe/client.rs:208-213",
+          "gateway/src/core/stt/aws_transcribe/client.rs:488-568",
+          "gateway/src/core/stt/aws_transcribe/client.rs:137",
+          "gateway/src/core/stt/aws_transcribe/client.rs:993-995",
+          "gateway/src/core/stt/aws_transcribe/client.rs:453-461",
+          "gateway/src/core/stt/aws_transcribe/config.rs:594",
+          "gateway/src/core/stt/aws_transcribe/config.rs:651-653",
+          "gateway/src/core/stt/aws_transcribe/mod.rs:78",
+          "gateway/src/core/websocket/reconnection.rs:99-108",
+          "gateway/src/core/websocket/reconnectable_stream.rs:297-315",
+          "gateway/tests/mock_endpoint_e2e.rs:2336",
+          "gateway/src/config/pricing.rs:274-281"
+        ],
+        "unverified": [
+          "transports[0].latency (the model and settings behind Pipecat's figure are not stated)",
+          "transports[0].limits.max_session_ms (Amazon's FAQ says a streaming connection lasts up to eight hours; older sources and the gateway's own comment say four, and the quotas table has no row for it)",
+          "transports[0].limits.rates (requests) (Amazon states 25 StartStreamTranscription requests per second and that window is recorded; version 1 of the map stored it converted to 1,500 per minute)",
+          "billing.min_billed_ms (the pricing page carries both 'no minimum applied' and 'a minimum per request charge of 15 seconds'; the fact-check could not tie either sentence to a product)",
+          "billing.bills_silence (Amazon requires silence to be streamed; whether it is billed was not confirmed)",
+          "price tiers and regional prices (only example rates were readable)",
+          "whether Amazon sends transcript events during silence, which decides whether the client's 60-second idle reconnect fires on a quiet caller"
+        ],
+        "notes": "The model id 'standard' is a gateway identifier, not a string Amazon accepts: Amazon Transcribe has no base-model parameter and products are chosen by API operation. 'standard' is the name the gateway's price table already uses, and an empty model resolves to this row. The only model-like vendor field is a customer-trained custom language model name, which the gateway holds in its configuration and never sends. Amazon Transcribe has no request-and-response file call: the only file interface is StartTranscriptionJob, an asynchronous job that reads the audio from an S3 bucket in the same region and writes the transcript to S3. It is deliberately not listed as a transport, so segmented mode is not available for this provider. Language and region decide whether a call can be served, not the model. Eighteen language codes exist only in the batch API and can never be streamed; they are the language constraint of the streaming transport. A further 45 languages cannot be streamed in af-south-1, ap-northeast-1, ap-southeast-5, ap-southeast-7 and cn-northwest-1, which a constraint cannot express because it cannot combine a language with a region. Decisions section 12 refuses a batch-only language at setup; addendum A7 places that refusal in Release 3."
+      }
+    },
+    {
+      "id": "aws-transcribe:medical",
+      "match": {
+        "provider": "aws-transcribe",
+        "model": "medical"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "planned_stream",
+          "enabled_from_release": null,
+          "disabled_reason": "Amazon Transcribe Medical is a separate streaming operation, StartMedicalStreamTranscription, which the gateway client does not implement. Naming 'medical' today silently runs standard Amazon Transcribe, so until the operation is added the session keeps that path and is reported with the warning stt_model_substituted.",
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "constraints": {
+            "languages": {
+              "mode": "only",
+              "codes": [
+                "en-US"
+              ],
+              "note": "Amazon Transcribe Medical streams US English only (confirmed by the fact-check)."
+            }
+          },
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": null,
+            "rates": []
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "LanguageCode",
+            "language_shape": "single",
+            "context_params": [],
+            "wire": "aws_transcribe_streaming"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/aws_transcribe/client.rs:488-568 and :708-715 (only StartStreamTranscription is built and sent)",
+            "notes": "The medical operation is close to the existing client but requires a Specialty and a Type and accepts only en-US."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "streams_substituted_model",
+        "substituted_model": "standard",
+        "code_ref": "gateway/src/core/stt/aws_transcribe/config.rs:594 (the model is left empty) and client.rs:488-568 (no request parameter carries a model)",
+        "refuse_from_release": null
+      },
+      "billing": {
+        "unit": "audio_minute",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "pricing_key": "aws_transcribe:medical"
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://docs.aws.amazon.com/transcribe/latest/APIReference/API_streaming_StartMedicalStreamTranscription.html",
+          "https://docs.aws.amazon.com/transcribe/latest/dg/transcribe-medical.html",
+          "https://docs.aws.amazon.com/transcribe/latest/APIReference/API_Operations_Amazon_Transcribe_Streaming_Service.html",
+          "https://docs.aws.amazon.com/general/latest/gr/transcribe.html",
+          "https://aws.amazon.com/transcribe/pricing/"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/aws_transcribe/client.rs:488-568",
+          "gateway/src/core/stt/aws_transcribe/client.rs:708-715",
+          "gateway/src/core/stt/aws_transcribe/config.rs:594",
+          "gateway/src/config/pricing.rs:279"
+        ],
+        "unverified": [
+          "transports[0].endpointing_owner, vendor_turn_signal, quality_signals and limits (assumed to match standard streaming; the medical operation's details were not audited)",
+          "billing.min_billed_ms and billing.bills_silence"
+        ],
+        "notes": "The model id 'medical' is a gateway identifier taken from the gateway's price table, not a string Amazon accepts. Amazon Transcribe Medical streams and its file interface is an asynchronous S3 job, so segmentation does not apply; what is missing is a streaming operation in the gateway client. Two further products, Call Analytics and HealthScribe, have their own streaming operations and their own rows. Today the client ignores the model id, so a session naming this product is served by standard Amazon Transcribe; the map keeps that path with the warning stt_model_substituted (conversion rules section 10) rather than refusing on documentation alone. Its interface is recorded under the planned streaming adapter, whose dialect.wire names the standard streaming interface as version 1 did, although Amazon serves this product through its own streaming operation (named in the transport's disabled_reason)."
+      }
+    },
+    {
+      "id": "aws-transcribe:call-analytics",
+      "match": {
+        "provider": "aws-transcribe",
+        "model": "call-analytics"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "planned_stream",
+          "enabled_from_release": null,
+          "disabled_reason": "Amazon Transcribe Call Analytics is a separate streaming operation, StartCallAnalyticsStreamTranscription, which the gateway client does not implement. The client ignores the model id, so naming this product today silently runs standard Amazon Transcribe; until the operation is added the session keeps that path and is reported with the warning stt_model_substituted.",
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": null,
+            "rates": []
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "LanguageCode",
+            "language_shape": "single",
+            "context_params": [],
+            "wire": "aws_transcribe_streaming"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/aws_transcribe/client.rs:488-568 and :708-715 (only StartStreamTranscription is built and sent)",
+            "notes": "Only the operation name, its quotas and its region table were read; the request details were not audited. The product supports fewer languages and regions than standard streaming."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "streams_substituted_model",
+        "substituted_model": "standard",
+        "code_ref": "gateway/src/core/stt/aws_transcribe/config.rs:594 (the model is left empty) and client.rs:488-568 (no request parameter carries a model)",
+        "refuse_from_release": null
+      },
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "No pricing key exists in pricing.rs for this product. Amazon's pricing page carries the sentence 'a minimum per request charge of 15 seconds'; two readings attributed it to real-time Call Analytics and to generative call summarization, and neither was confirmed, so the minimum is left unset."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://docs.aws.amazon.com/transcribe/latest/APIReference/API_Operations_Amazon_Transcribe_Streaming_Service.html",
+          "https://docs.aws.amazon.com/transcribe/latest/APIReference/API_Operations_Amazon_Transcribe_Service.html",
+          "https://docs.aws.amazon.com/general/latest/gr/transcribe.html",
+          "https://aws.amazon.com/transcribe/pricing/"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/aws_transcribe/client.rs:488-568",
+          "gateway/src/core/stt/aws_transcribe/client.rs:708-715",
+          "gateway/src/core/stt/aws_transcribe/config.rs:594"
+        ],
+        "unverified": [
+          "match.model ('call-analytics' is a label proposed by the vendor audit; it is not a string Amazon accepts and no gateway code or price table uses it, so the capability-map workstream must confirm the name and decide which spellings to accept)",
+          "transports[0].endpointing_owner, vendor_turn_signal, quality_signals, dialect and limits (assumed to match standard streaming; the operation's request details were not audited)",
+          "billing.unit, billing.min_billed_ms and billing.bills_silence"
+        ],
+        "notes": "Amazon selects Amazon Transcribe Call Analytics by API operation, not by a model string. It streams, and its file interface is an asynchronous S3 job (StartCallAnalyticsJob), so segmentation does not apply; what is missing is a streaming operation in the gateway client. Today the client ignores the model id, so a session naming this product is served by standard Amazon Transcribe; the map keeps that path with the warning stt_model_substituted (conversion rules section 10) rather than refusing on documentation alone. Its interface is recorded under the planned streaming adapter, whose dialect.wire names the standard streaming interface as version 1 did, although Amazon serves this product through its own streaming operation (named in the transport's disabled_reason)."
+      }
+    },
+    {
+      "id": "aws-transcribe:healthscribe",
+      "match": {
+        "provider": "aws-transcribe",
+        "model": "healthscribe"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "planned_stream",
+          "enabled_from_release": null,
+          "disabled_reason": "AWS HealthScribe is a separate streaming operation, StartMedicalScribeStream, which the gateway client does not implement. The client ignores the model id, so naming this product today silently runs standard Amazon Transcribe; until the operation is added the session keeps that path and is reported with the warning stt_model_substituted.",
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": null,
+            "rates": []
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "LanguageCode",
+            "language_shape": "single",
+            "context_params": [],
+            "wire": "aws_transcribe_streaming"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/aws_transcribe/client.rs:488-568 and :708-715 (only StartStreamTranscription is built and sent)",
+            "notes": "Only the operation name and its quotas were read; the request details are unverified."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "streams_substituted_model",
+        "substituted_model": "standard",
+        "code_ref": "gateway/src/core/stt/aws_transcribe/config.rs:594 (the model is left empty) and client.rs:488-568 (no request parameter carries a model)",
+        "refuse_from_release": null
+      },
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "No pricing key exists in pricing.rs for this product and its price was not read."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://docs.aws.amazon.com/transcribe/latest/APIReference/API_Operations_Amazon_Transcribe_Streaming_Service.html",
+          "https://docs.aws.amazon.com/transcribe/latest/APIReference/API_Operations_Amazon_Transcribe_Service.html",
+          "https://docs.aws.amazon.com/transcribe/latest/dg/doc-history.html",
+          "https://docs.aws.amazon.com/general/latest/gr/transcribe.html"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/aws_transcribe/client.rs:488-568",
+          "gateway/src/core/stt/aws_transcribe/client.rs:708-715",
+          "gateway/src/core/stt/aws_transcribe/config.rs:594"
+        ],
+        "unverified": [
+          "match.model ('healthscribe' is a label proposed by the vendor audit; it is not a string Amazon accepts and no gateway code or price table uses it, so the capability-map workstream must confirm the name and decide which spellings to accept)",
+          "transports[0].endpointing_owner, vendor_turn_signal, quality_signals, dialect and limits (assumed to match standard streaming; the operation's request details were not audited)",
+          "billing.unit, billing.min_billed_ms and billing.bills_silence"
+        ],
+        "notes": "Amazon selects AWS HealthScribe by API operation, not by a model string. It streams, and its file interface is an asynchronous S3 job (StartMedicalScribeJob), so segmentation does not apply; what is missing is a streaming operation in the gateway client. Amazon's documentation history dates its streaming interface to 2025-01-29. Today the client ignores the model id, so a session naming this product is served by standard Amazon Transcribe; the map keeps that path with the warning stt_model_substituted (conversion rules section 10) rather than refusing on documentation alone. Its interface is recorded under the planned streaming adapter, whose dialect.wire names the standard streaming interface as version 1 did, although Amazon serves this product through its own streaming operation (named in the transport's disabled_reason)."
+      }
+    },
+    {
+      "id": "aws-transcribe:any",
+      "match": {
+        "provider": "aws-transcribe",
+        "model_glob": "*"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "silence",
+          "constraints": {
+            "languages": {
+              "mode": "except",
+              "codes": [
+                "ab-GE",
+                "ast-ES",
+                "az-AZ",
+                "ba-RU",
+                "cy-GB",
+                "et-EE",
+                "ga-IE",
+                "gd-GB",
+                "ha-NG",
+                "ky-KG",
+                "mhr-RU",
+                "mi-NZ",
+                "mn-MN",
+                "mt-MT",
+                "rw-RW",
+                "tt-RU",
+                "ug-CN",
+                "wo-SN"
+              ],
+              "note": "The 18 codes in the StartTranscriptionJob language list and absent from the StartStreamTranscription list (confirmed by the fact-check): batch only in every region. A further 45 languages cannot be streamed in af-south-1, ap-northeast-1, ap-southeast-5, ap-southeast-7 and cn-northwest-1; a constraint cannot combine a language with a region, so those stay in the provider notes."
+            }
+          },
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": 28800000,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "second",
+                "value": 25,
+                "plan": null,
+                "scope": "region",
+                "note": "StartStreamTranscription requests per AWS account and region; adjustable."
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 25,
+                "plan": null,
+                "scope": "region",
+                "note": "Concurrent streams per AWS account and region; adjustable."
+              }
+            ],
+            "assumed_plan": null
+          },
+          "quality_signals": [
+            "word_confidence"
+          ],
+          "dialect": {
+            "language_param": "LanguageCode",
+            "language_shape": "single",
+            "language_format": "bcp47",
+            "context_params": [],
+            "wire": "aws_transcribe_streaming"
+          },
+          "gateway_client": {
+            "status": "wire_tested",
+            "defect": "Audio is dropped silently when the 32-slot send channel is full (gateway/src/core/stt/aws_transcribe/client.rs:137, :993-995). A language Amazon cannot stream is passed through and rejected by Amazon at stream start, and the reconnect supervisor then retries up to ten times against the provider-wide breaker instead of failing once (inferred from reading, not run).",
+            "code_ref": "gateway/src/core/stt/aws_transcribe/client.rs:685-715 (one HTTP/2 StartStreamTranscription request through the AWS SDK), :208-213 (a non-partial result sets is_final and is_speech_final together), :488-568 (every request parameter that is sent; the model is not among them); gateway/src/core/stt/aws_transcribe/config.rs:594 (model left empty); gateway/tests/mock_endpoint_e2e.rs:2336 (mock end-to-end test)",
+            "notes": "Exercised only against an in-process mock connector. The client never reads the model id, so any id that reaches this row is served by standard Amazon Transcribe."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null
+      },
+      "provenance": {
+        "confidence": "assumed",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://docs.aws.amazon.com/transcribe/latest/APIReference/API_streaming_StartStreamTranscription.html",
+          "https://docs.aws.amazon.com/transcribe/latest/APIReference/API_Operations_Amazon_Transcribe_Service.html"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/aws_transcribe/client.rs:685-715",
+          "gateway/src/core/stt/aws_transcribe/client.rs:208-213",
+          "gateway/src/core/stt/aws_transcribe/client.rs:488-568",
+          "gateway/src/core/stt/aws_transcribe/client.rs:137",
+          "gateway/src/core/stt/aws_transcribe/client.rs:993-995",
+          "gateway/src/core/stt/aws_transcribe/client.rs:453-461",
+          "gateway/src/core/stt/aws_transcribe/config.rs:594",
+          "gateway/src/core/stt/aws_transcribe/config.rs:651-653",
+          "gateway/src/core/stt/aws_transcribe/mod.rs:78",
+          "gateway/src/core/websocket/reconnection.rs:99-108",
+          "gateway/src/core/websocket/reconnectable_stream.rs:297-315",
+          "gateway/tests/mock_endpoint_e2e.rs:2336"
+        ],
+        "unverified": [
+          "every field: this row describes a model id the map does not know"
+        ],
+        "notes": "Default for an unknown model id. It is a live stream, not a file upload, because Amazon Transcribe has no synchronous file call and no planned file-upload adapter, and the streaming client serves every request the same way. This reproduces today's behaviour, where the model id is ignored. The labels medical, call-analytics and healthscribe have their own rows, which keep today's path with a warning until a client for their streaming operations exists. Any other spelling of those product names still lands here and is served by standard Amazon Transcribe; the plan should decide which spellings to refuse."
+      }
+    }
+  ]
+}

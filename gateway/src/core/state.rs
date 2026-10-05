@@ -59,6 +59,9 @@ pub struct CoreState {
     pub profiler: Arc<LatencyProfiler>,
     /// Profiling runtime config (env-driven gates for the system + the `/debug/profile*` routes).
     pub profiling: ProfilingConfig,
+    /// Segmented speech-to-text: the capability map, the rollout switch, the latency store, the
+    /// limiters, breakers and upload clients every segmented session shares.
+    pub stt_live: Arc<crate::core::stt::segmented::live::SttLiveShared>,
 }
 
 impl CoreState {
@@ -164,6 +167,31 @@ impl CoreState {
         let profiling = ProfilingConfig::try_from_env()?;
         let profiler = Arc::new(LatencyProfiler::from_config(&profiling));
 
+        // Segmented speech-to-text: read and checked at start-up, so a malformed switch fails the
+        // process instead of the first call. The detector and end-of-turn models load in the
+        // background; a session reads their state at admission.
+        let stt_live = Arc::new(crate::core::stt::segmented::live::SttLiveShared::from_env(
+            turn_detector.clone(),
+        )?);
+        crate::core::stt::segmented::models::warm_up();
+        // Under the Bud control plane the control record can switch a row or deployment off on
+        // a running gateway; a standalone gateway has only the process switch.
+        if let Some(url) = std::env::var("WAAV_REDIS_URL")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+        {
+            let db = std::env::var("WAAV_REDIS_DB")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0);
+            crate::core::stt::segmented::live::spawn_control_refresh(
+                Arc::clone(&stt_live),
+                url,
+                db,
+            );
+        }
+        tracing::info!(stt_live = ?stt_live, "segmented speech-to-text configured");
+
         Ok(Arc::new(Self {
             tts_req_managers: Arc::new(RwLock::new(tts_req_managers)),
             deployment_tts_req_managers: Arc::new(DeploymentReqManagers::new()),
@@ -174,6 +202,7 @@ impl CoreState {
             resilience: Arc::new(ResilienceRegistry::new(reconnect_cap)),
             profiler,
             profiling,
+            stt_live,
         }))
     }
 

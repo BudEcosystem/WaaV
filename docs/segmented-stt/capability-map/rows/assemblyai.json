@@ -1,0 +1,1265 @@
+{
+  "provider_id": "assemblyai",
+  "provider": {
+    "aliases": [],
+    "default_model": "universal-streaming-english",
+    "model_string": "wire_model",
+    "key_normalisation": {
+      "placeholder_as_unset": true
+    },
+    "registered_in_gateway": true,
+    "native_model_handling": "substituted",
+    "notes": "Registered under the single id 'assemblyai' (gateway/src/plugin/builtin/mod.rs:1691; gateway/src/core/stt/standard.rs:406-408); no aliases. default_model records what happens today for an English or empty language: the gateway picks universal-streaming-english; for any other language it picks universal-streaming-multilingual (gateway/src/core/stt/assemblyai/config.rs:450-456). The field can hold only one id, so the resolver must apply the same language rule before the lookup, also when placeholder_as_unset turns the placeholder 'nova-3' into no model named: the client on its own serves the English model for 'nova-3' whatever the language (config.rs:118-125, 456-459), so the resolver must hand the resolved id to the client. AssemblyAI has three interfaces on three hosts: the streaming socket (streaming.assemblyai.com), the synchronous Sync API (sync.assemblyai.com, which serves universal-3-5-pro only) and the asynchronous job API (api.assemblyai.com). The gateway has one endpoint override shared by all of them and knows only the default and Europe streaming hosts (config.rs:137-153). The streaming client replaces every model id it does not know, including universal-3-6-pro, universal-3-5-pro and universal-2, with universal-streaming-english (config.rs:118-125). The rows for those ids therefore list no streaming transport, and when_unusable records the substitution: such a session keeps today's stream with the warning stt_model_substituted, universal-3-5-pro moves to the Sync API in Release 3, default on, and universal-2 is refused from that release. Fixing the client (send the id, refuse unknown ids) would let those rows list the streaming socket again. The client has a method that sends a forced end-of-turn message (gateway/src/core/stt/assemblyai/client.rs:1084-1106) with no caller; no gateway-driven commit transport is listed because the vendor's current support for that message is not in the fetched evidence. The client's own short name 'multilingual' is a model alias on the universal-streaming-multilingual row."
+  },
+  "rows": [
+    {
+      "id": "assemblyai:universal-3-6-pro",
+      "match": {
+        "provider": "assemblyai",
+        "model": "universal-3-6-pro"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [],
+      "when_unusable": {
+        "today": "streams_substituted_model",
+        "substituted_model": "universal-streaming-english",
+        "code_ref": "gateway/src/core/stt/assemblyai/config.rs:118-125,456-459 (any id other than the two Universal Streaming ids is parsed as universal-streaming-english)",
+        "refuse_from_release": null
+      },
+      "billing": {
+        "unit": "audio_hour",
+        "min_billed_ms": null,
+        "bills_silence": true,
+        "notes": "AssemblyAI bills streaming on the time the socket stays open, not on the audio sent, at 0.45 US dollars per hour of session, so silence during a call is billed. Until the streaming client can select this model, a session naming it is streamed with universal-streaming-english and billed as that model, 0.15 per hour. A session is closed by the vendor after 3 hours. gateway/src/config/pricing.rs has no entry for this id; its only AssemblyAI entries are assemblyai:best and assemblyai:nano, ids that are absent from the vendor's current documentation, so no pricing_key is given and metering reports no price until one is added."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://www.assemblyai.com/docs/streaming/api-spec/streaming-websocket",
+          "https://www.assemblyai.com/docs/streaming/select-the-speech-model",
+          "https://www.assemblyai.com/docs/streaming/message-sequence",
+          "https://www.assemblyai.com/docs/streaming/rate-limits",
+          "https://www.assemblyai.com/docs/streaming/migration-guides/universal-to-universal-3-5-pro-streaming",
+          "https://www.assemblyai.com/docs/pre-recorded-audio/api-reference/transcripts/submit",
+          "https://www.assemblyai.com/docs/api-reference/sync-api/transcribe",
+          "https://www.assemblyai.com/docs/billing-and-pricing",
+          "https://www.assemblyai.com/pricing",
+          "https://raw.githubusercontent.com/pipecat-ai/pipecat/main/src/pipecat/services/stt_latency.py",
+          "https://www.assemblyai.com/docs/streaming/benchmarks"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/assemblyai/config.rs:85-125,283-284,313-352,450-460",
+          "gateway/src/core/stt/assemblyai/client.rs:180-191,506-529",
+          "gateway/src/core/stt/assemblyai/messages.rs:56-76",
+          "gateway/tests/mock_endpoint_e2e.rs:1310-1337",
+          "gateway/tests/chaos_reconnect.rs:810",
+          "gateway/src/core/stt/assemblyai/config.rs:118-125,456-459"
+        ],
+        "unverified": [
+          "the removed streaming transport (today's client, see when_unusable): latency (which model and which end-of-turn settings Pipecat measured are not recorded; the vendor's own benchmark reports a 90th percentile of 829 to 990 ms for time to complete a turn, which is above the 600 ms bound of the 'realtime' class)",
+          "the removed streaming transport (today's client, see when_unusable): vendor_turn_signal (classified as semantic because the vendor ends turns with an end-of-turn confidence threshold on the Universal Streaming models and punctuation-based turn detection on the Pro models, not a plain silence timer; the evidence does not use that word)",
+          "the removed streaming transport (today's client, see when_unusable): limits.rates (requests) (the vendor limits new sessions per minute: 100 is where paid plans start, and they scale up automatically; the free plan allows 5)",
+          "the removed streaming transport (today's client, see when_unusable): limits.rates (concurrency) (no concurrency figure for streaming is in the evidence)",
+          "the removed streaming transport (today's client, see when_unusable): dialect.context_params (the gateway's capability table lists keyterms for this provider; the vendor's streaming support for it was not re-checked)",
+          "billing.min_billed_ms (no minimum is documented)",
+          "the removed streaming transport (today's client, see when_unusable): dialect.language_param (how a language is selected for this model on the socket is not in the evidence)"
+        ],
+        "notes": "AssemblyAI's default streaming model, 32 languages. It is streaming-only: it is in neither the pre-recorded model list nor the Sync API's model list, so no file transport exists and cutting the call into uploaded utterances cannot serve it. The vendor serves it, but the gateway cannot select it, so this model has no working live path until the streaming client is fixed. The row lists no transport: today's client is not one for this id, because it substitutes universal-streaming-english (when_unusable). No release builds the client fix, so a session naming this id keeps today's stream with the warning stt_model_substituted and is not refused."
+      }
+    },
+    {
+      "id": "assemblyai:universal-3-5-pro",
+      "match": {
+        "provider": "assemblyai",
+        "model": "universal-3-5-pro"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "assemblyai_sync",
+          "enabled_from_release": 3,
+          "disabled_reason": "Not implemented. The gateway has no request builder, response parser or host setting for AssemblyAI's Sync API.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "fast",
+            "measurements": [
+              {
+                "percentile": "p99",
+                "quantity": "end_of_speech_to_final",
+                "value_ms": 650,
+                "basis": "third_party_benchmark",
+                "source": "https://raw.githubusercontent.com/pipecat-ai/pipecat/main/src/pipecat/services/stt_latency.py",
+                "conditions": "Pipecat's shipped constant ASSEMBLYAI_SYNC_TTFS_P99 = 0.65 s: one HTTP request per utterance against the Sync API, time from end of speech to final transcript, voice detector hangover 0.2 s. AssemblyAI's pricing page separately claims results in about 134 ms at the median; that is request time, a different measure, so it is recorded as a separate request round-trip entry. Not measured by WaaV on this network.",
+                "pause_ms_assumed": 200
+              },
+              {
+                "percentile": "p50",
+                "quantity": "request_round_trip",
+                "value_ms": 134,
+                "basis": "vendor_claim",
+                "source": "https://www.assemblyai.com/pricing",
+                "conditions": "AssemblyAI's pricing page: results 'in ~134 ms (p50)'. Request time only, without the detector's pause; a vendor marketing figure."
+              }
+            ]
+          },
+          "limits": {
+            "max_upload_bytes": 40000000,
+            "max_audio_ms": 120000,
+            "min_audio_ms": 80,
+            "vendor_timeout_ms": 30000,
+            "rates": []
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "raw_pcm"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "sample_rates_hz": [
+              8000,
+              16000,
+              22050,
+              24000,
+              32000,
+              44100,
+              48000
+            ],
+            "envelope": "multipart"
+          },
+          "warm": {
+            "method": "GET",
+            "path": "/v1/warm"
+          },
+          "quality_signals": [
+            "utterance_confidence",
+            "word_confidence"
+          ],
+          "dialect": {
+            "language_param": "language_codes",
+            "language_shape": "list",
+            "language_format": "iso639_1",
+            "language_required": true,
+            "context_params": [
+              {
+                "kind": "prompt",
+                "wire_name": "prompt",
+                "max_chars": 6000,
+                "note": "When prompt is sent the vendor ignores language_codes. Using it adds 0.05 US dollars per hour to the price."
+              },
+              {
+                "kind": "keyterms",
+                "wire_name": "keyterms_prompt",
+                "max_items": 100,
+                "note": "At most 8000 characters in all."
+              },
+              {
+                "kind": "previous_text",
+                "wire_name": "conversation_context",
+                "max_items": 500,
+                "max_chars": 16000,
+                "note": "Prior turns of the conversation; the vendor trims a longer context instead of rejecting it."
+              }
+            ],
+            "wire": "assemblyai_sync",
+            "limit_headers": {
+              "retry_after": "Retry-After"
+            }
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/batch.rs:839-844; gateway/src/core/stt/prerecorded.rs:102-123",
+            "notes": "Nothing under gateway/src names the Sync host or its path; the file-upload code for this vendor speaks only the asynchronous job API. The Sync request is POST /v1/transcribe on sync.assemblyai.com (also sync.us and sync.eu): multipart, an audio part and a JSON config part, with the model named in the required header X-AAI-Model. One request returns one JSON body; there is no job and no polling. The vendor documents it for exactly this use: one utterance cut by a voice detector per request, padded with half a second of trailing silence. In the config part the language field is language_codes (one code or a list, default en, no automatic detection, ignored when prompt is set); prior turns go in conversation_context and vocabulary in keyterms_prompt. A no-operation request, GET /v1/warm, exists to open the connection when speech starts. Rate-limit and capacity responses carry Retry-After; a server error or server timeout is safe to retry once."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "max_segment_ms": 60000,
+            "request_timeout_ms": 4000,
+            "rationale": "Maximum segment 60 s instead of 25 s: the 25 s default protects Whisper's 30 s window, which does not apply here. The Sync API accepts up to 120 s and the vendor says audio under about a minute is handled as one internal segment. 60 s is a judgement from the vendor audit, not a vendor number; the hard ceiling is 120 s including pre-roll and padding, and the floor is 80 ms. Request timeout 4 s with one retry: about six times the published 0.65 s 99th percentile and far below the vendor's 30 s server deadline; replace it with a deadline from measurement."
+          }
+        },
+        {
+          "input_mode": "file_upload",
+          "adapter": "planned_file",
+          "enabled_from_release": null,
+          "disabled_reason": "Not implemented for live sessions, and this is an asynchronous job API: upload the audio, submit a job, then poll for the result. AssemblyAI publishes no latency for short clips, only that most files finish in under 45 seconds. Keep it disabled unless a measurement shows a final transcript within about two seconds.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [
+              {
+                "percentile": "typical",
+                "quantity": "request_round_trip",
+                "value_ms": 45000,
+                "basis": "vendor_claim",
+                "source": "https://www.assemblyai.com/docs/faq/how-long-does-it-take-to-transcribe-a-file",
+                "conditions": "The vendor says the vast majority of files complete in under 45 seconds. Stated for whole files, not for clips of a few seconds."
+              }
+            ],
+            "notes": "No figure for a clip of a few seconds. The vendor says most files finish in under 45 seconds. Each utterance costs three HTTP calls (upload, submit, at least one poll)."
+          },
+          "limits": {
+            "max_upload_bytes": 2200000000,
+            "max_audio_ms": 36000000,
+            "min_audio_ms": 160,
+            "vendor_timeout_ms": null,
+            "rates": [
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 200,
+                "plan": "paid",
+                "scope": "account",
+                "note": "Transcription jobs processing at once; paid plans start here. Extra jobs are queued by the vendor, not rejected; the limit drops to 1 while the account balance is negative."
+              },
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 5,
+                "plan": "free",
+                "scope": "account"
+              },
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 4000,
+                "plan": null,
+                "scope": "account",
+                "note": "Derived from the vendor's limit of 20,000 requests per five minutes across all endpoints, polls included; the vendor answers HTTP 403 beyond it."
+              }
+            ],
+            "assumed_plan": "paid"
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "mp3",
+              "flac",
+              "ogg",
+              "opus",
+              "m4a",
+              "aac",
+              "webm",
+              "mp4"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "raw_body"
+          },
+          "quality_signals": [
+            "utterance_confidence",
+            "word_confidence"
+          ],
+          "dialect": {
+            "language_param": "language_code",
+            "context_params": [
+              {
+                "kind": "prompt",
+                "wire_name": "prompt",
+                "note": "Up to 1,500 words; Universal-3.5 Pro only."
+              },
+              {
+                "kind": "keyterms",
+                "wire_name": "keyterms_prompt",
+                "max_items": 1000
+              }
+            ],
+            "wire": "assemblyai_transcript_job"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/batch.rs:496-518,640-644; gateway/src/core/stt/prerecorded.rs:72-94,102-123,1098-1112; gateway/src/handlers/transcribe.rs:600-631,636-663",
+            "notes": "The pieces exist for the file-upload routes only, and neither is reachable from a live session. There is a builder for the job submission, which is always asynchronous (batch.rs:512-518, 640-644), and there are two separate drivers. The upload-route driver uploads, submits and polls; it sends once, when the session disconnects (prerecorded.rs:1098-1112); its first poll is at 500 ms, polls back off to 3 s and its deadline and HTTP timeout are both 300 s (prerecorded.rs:72-94). The batch route has its own upload and submit code (gateway/src/handlers/transcribe.rs:600-631, 636-663). A per-utterance adapter has two drivers to reconcile, not one. A live turn would need its own short deadline and a faster first poll, and polls count against the vendor's request limit."
+          },
+          "file_request_mode": "async_poll",
+          "billing": {
+            "unit": "audio_second",
+            "min_billed_ms": null,
+            "bills_silence": false,
+            "bills_failed_requests": false,
+            "notes": "Asynchronous job: 0.21 US dollars per hour of audio for this model, pro-rated to the second; failed transcripts are not charged. No per-request minimum is documented."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "streams_substituted_model",
+        "substituted_model": "universal-streaming-english",
+        "code_ref": "gateway/src/core/stt/assemblyai/config.rs:118-125,456-459 (any id other than the two Universal Streaming ids is parsed as universal-streaming-english)",
+        "refuse_from_release": null
+      },
+      "billing": {
+        "unit": "audio_hour",
+        "min_billed_ms": null,
+        "surcharges": [
+          {
+            "feature": "prompt",
+            "percent": 11.11,
+            "note": "0.05 US dollars per hour on top of the 0.45 Sync price."
+          }
+        ],
+        "bills_silence": false,
+        "notes": "Sync API: 0.45 US dollars per hour of uploaded audio; the prompt field adds 0.05 per hour (surcharges). Granularity and any minimum are not documented. Only uploaded utterances are billed. Until the Sync transport is enabled, a session naming this id is streamed with universal-streaming-english and billed as that model: 0.15 per hour of open socket, silence included. gateway/src/config/pricing.rs has no entry for this id; its only AssemblyAI entries are assemblyai:best and assemblyai:nano, ids that are absent from the vendor's current documentation, so no pricing_key is given and metering reports no price until one is added."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://www.assemblyai.com/docs/streaming/api-spec/streaming-websocket",
+          "https://www.assemblyai.com/docs/streaming/select-the-speech-model",
+          "https://www.assemblyai.com/docs/streaming/message-sequence",
+          "https://www.assemblyai.com/docs/streaming/rate-limits",
+          "https://www.assemblyai.com/docs/api-reference/sync-api/transcribe",
+          "https://www.assemblyai.com/docs/sync-stt/audio-requirements",
+          "https://www.assemblyai.com/docs/sync-stt/error-handling",
+          "https://www.assemblyai.com/docs/sync-stt/pipecat",
+          "https://www.assemblyai.com/docs/sync-stt/language-selection",
+          "https://www.assemblyai.com/docs/sync-stt/connection-pre-warming",
+          "https://www.assemblyai.com/docs/pre-recorded-audio/api-reference/transcripts/submit",
+          "https://www.assemblyai.com/docs/pre-recorded-audio/select-the-speech-model",
+          "https://www.assemblyai.com/docs/pre-recorded-audio/rate-limits",
+          "https://www.assemblyai.com/docs/billing-and-pricing",
+          "https://www.assemblyai.com/pricing",
+          "https://www.assemblyai.com/docs/faq/how-long-does-it-take-to-transcribe-a-file",
+          "https://www.assemblyai.com/docs/faq/are-there-any-limits-on-file-size-or-file-duration-for-files-submitted-to-the-api",
+          "https://www.assemblyai.com/docs/faq/what-is-the-minimum-audio-duration-that-the-api-can-transcribe",
+          "https://www.assemblyai.com/docs/faq/what-audio-and-video-file-types-are-supported-by-your-api",
+          "https://raw.githubusercontent.com/pipecat-ai/pipecat/main/src/pipecat/services/stt_latency.py",
+          "https://www.assemblyai.com/docs/streaming/benchmarks"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/assemblyai/config.rs:85-125,283-284,313-352,450-460",
+          "gateway/src/core/stt/assemblyai/client.rs:180-191,506-529",
+          "gateway/src/core/stt/assemblyai/messages.rs:56-76",
+          "gateway/tests/mock_endpoint_e2e.rs:1310-1337",
+          "gateway/tests/chaos_reconnect.rs:810",
+          "gateway/src/core/stt/batch.rs:839-844",
+          "gateway/src/core/stt/prerecorded.rs:102-123",
+          "gateway/src/core/stt/batch.rs:496-518,640-644",
+          "gateway/src/core/stt/prerecorded.rs:72-94,102-123,1098-1112",
+          "gateway/src/handlers/transcribe.rs:600-631,636-663",
+          "gateway/src/core/stt/assemblyai/config.rs:118-125,456-459"
+        ],
+        "unverified": [
+          "the removed streaming transport (today's client, see when_unusable): latency (which model and which end-of-turn settings Pipecat measured are not recorded; the vendor's own benchmark reports a 90th percentile of 829 to 990 ms for time to complete a turn, which is above the 600 ms bound of the 'realtime' class)",
+          "the removed streaming transport (today's client, see when_unusable): vendor_turn_signal (classified as semantic because the vendor ends turns with an end-of-turn confidence threshold on the Universal Streaming models and punctuation-based turn detection on the Pro models, not a plain silence timer; the evidence does not use that word)",
+          "the removed streaming transport (today's client, see when_unusable): limits.rates (requests) (the vendor limits new sessions per minute: 100 is where paid plans start, and they scale up automatically; the free plan allows 5)",
+          "the removed streaming transport (today's client, see when_unusable): limits.rates (concurrency) (no concurrency figure for streaming is in the evidence)",
+          "the removed streaming transport (today's client, see when_unusable): dialect.context_params (the gateway's capability table lists keyterms for this provider; the vendor's streaming support for it was not re-checked)",
+          "limits.rates (requests and concurrency) on the Sync transport (the vendor confirms a concurrency cap exists and signals it with a 'capacity exceeded' response, but publishes no number)",
+          "billing.min_billed_ms for the Sync transport (the billing page does not mention the Sync API; no minimum and no granularity are documented)",
+          "dialect.language_param on the Sync transport (language_codes is the name in the vendor's specification; not exercised against the vendor)",
+          "how the Sync API answers a silent or noise-only clip (empty text or an error)",
+          "Sync language coverage (18 languages on the pricing page, 32 codes in the specification)",
+          "latency of the asynchronous job on clips of 1 to 10 seconds (unpublished and unmeasured)",
+          "limits.rates (concurrency) on the asynchronous transport (200 parallel jobs is where paid plans start; the free plan allows 5; extra jobs are queued by the vendor, not rejected)",
+          "limits.rates (requests) on the asynchronous transport (derived from the vendor's limit of 20,000 requests per five minutes, polls included; exceeding it returns HTTP 403)",
+          "limits.rates[].scope on the asynchronous transport (the vendor audit reads the limits as account-wide; recorded as account)",
+          "the removed streaming transport (today's client, see when_unusable): dialect.language_param (how a language is selected for this model on the socket is not in the evidence)"
+        ],
+        "notes": "The same id is valid on three AssemblyAI interfaces: the streaming socket, the synchronous Sync API and the asynchronous job API. The transport must therefore be chosen by the kind of session, never by the id alone. The vendor describes this model as its previous flagship streaming model, still fully supported. None of the three is usable from the gateway today: the streaming client substitutes another model, and neither file adapter is built. The Sync API is the transport the segmented design should build first for this vendor: it is one request per utterance with a published 99th percentile of 0.65 s, about 0.2 s slower than the same vendor's socket. The Sync transport is enabled from Release 3, default on (integration decisions, sections 6 and 12); until then a session naming this model keeps today's substituted stream with the warning stt_model_substituted (when_unusable). The streaming socket is not listed, because today's client cannot select this model."
+      }
+    },
+    {
+      "id": "assemblyai:universal-streaming-english",
+      "match": {
+        "provider": "assemblyai",
+        "model": "universal-streaming-english"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "semantic",
+          "latency": {
+            "class": "realtime",
+            "measurements": [
+              {
+                "percentile": "p99",
+                "quantity": "end_of_speech_to_final",
+                "value_ms": 420,
+                "basis": "third_party_benchmark",
+                "source": "https://raw.githubusercontent.com/pipecat-ai/pipecat/main/src/pipecat/services/stt_latency.py",
+                "conditions": "Pipecat's shipped constant ASSEMBLYAI_TTFS_P99 = 0.42 s (time from end of speech to final transcript, voice detector hangover 0.2 s). The evidence does not say which AssemblyAI streaming model Pipecat measured, so this is a provider-level seed, not a measurement of this model. Not measured by WaaV on this network. AssemblyAI's own benchmark page gives a different measure, time to complete a turn: a median of 649 ms and a 90th percentile of 990 ms on Universal Streaming English, and 568 ms and 829 ms on Universal-3.5 Pro streaming (May 2026). On a live call the gateway waits for AssemblyAI to end the turn, so the vendor's figures may describe today's path better than Pipecat's (inferred); if they do, this transport belongs in the 'fast' class, not 'realtime'. Measure before showing this class to customers.",
+                "pause_ms_assumed": 200
+              }
+            ]
+          },
+          "limits": {
+            "max_session_ms": 10800000,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 100,
+                "plan": "paid",
+                "scope": "unknown",
+                "note": "New streaming sessions per minute. Paid plans start here and scale up automatically; over the limit the vendor closes the socket with code 1008."
+              },
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 5,
+                "plan": "free",
+                "scope": "unknown",
+                "note": "New streaming sessions per minute."
+              }
+            ],
+            "assumed_plan": "paid"
+          },
+          "quality_signals": [
+            "word_confidence"
+          ],
+          "dialect": {
+            "language_param": null,
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "keyterms_prompt",
+                "max_items": 100,
+                "note": "Each term at most 50 characters; today's client enforces both limits (gateway/src/core/stt/assemblyai/config.rs:12-15)."
+              }
+            ],
+            "wire": "assemblyai_streaming_v3_websocket"
+          },
+          "gateway_client": {
+            "status": "wire_tested",
+            "defect": "With formatted turns requested by default, AssemblyAI sends two end-of-turn messages per turn and the message type cannot tell them apart, so a turn can be delivered twice; the detected language is read from a field named language although the vendor sends language_code; a full result channel drops a final. Found by reading, not reproduced on a live call.",
+            "code_ref": "gateway/src/core/stt/assemblyai/config.rs:85-125,283-284,313-352,450-460; gateway/src/core/stt/assemblyai/client.rs:180-191,506-529; gateway/src/core/stt/assemblyai/messages.rs:56-76; gateway/tests/mock_endpoint_e2e.rs:1310-1337; gateway/tests/chaos_reconnect.rs:810",
+            "notes": "Exercised only against in-repo mock sockets (a mock end-to-end test and a reconnect test); the evidence records no run against AssemblyAI. Each caller chunk is written at once as one binary frame (client.rs:180-191). Every vendor Turn message becomes a result whose is_final and is_speech_final both equal the vendor's end_of_turn flag (client.rs:520-525), so AssemblyAI alone decides where the caller's turn ends. Defects found by reading, not reproduced on a live call: the client asks for formatted turns by default (config.rs:283), for which AssemblyAI documents two end-of-turn messages per turn, and the message type has no field to tell them apart (messages.rs:56-76), so each turn can be delivered twice; the detected language is read from a field named language while the vendor sends language_code (messages.rs:70-72); a full result channel drops a final and logs it as a closed channel (client.rs:527-529)."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "audio_hour",
+        "min_billed_ms": null,
+        "bills_silence": true,
+        "notes": "AssemblyAI bills streaming on the time the socket stays open, not on the audio sent, at 0.15 US dollars per hour of session, so silence during a call is billed. A session is closed by the vendor after 3 hours. gateway/src/config/pricing.rs has no entry for this id; its only AssemblyAI entries are assemblyai:best and assemblyai:nano, ids that are absent from the vendor's current documentation, so no pricing_key is given and metering reports no price until one is added."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://www.assemblyai.com/docs/streaming/api-spec/streaming-websocket",
+          "https://www.assemblyai.com/docs/streaming/select-the-speech-model",
+          "https://www.assemblyai.com/docs/streaming/message-sequence",
+          "https://www.assemblyai.com/docs/streaming/rate-limits",
+          "https://www.assemblyai.com/docs/streaming/migration-guides/universal-to-universal-3-5-pro-streaming",
+          "https://www.assemblyai.com/docs/billing-and-pricing",
+          "https://www.assemblyai.com/pricing",
+          "https://raw.githubusercontent.com/pipecat-ai/pipecat/main/src/pipecat/services/stt_latency.py",
+          "https://www.assemblyai.com/docs/streaming/benchmarks"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/assemblyai/config.rs:85-125,283-284,313-352,450-460",
+          "gateway/src/core/stt/assemblyai/client.rs:180-191,506-529",
+          "gateway/src/core/stt/assemblyai/messages.rs:56-76",
+          "gateway/tests/mock_endpoint_e2e.rs:1310-1337",
+          "gateway/tests/chaos_reconnect.rs:810",
+          "gateway/src/core/stt/assemblyai/config.rs:12-15"
+        ],
+        "unverified": [
+          "transports[0].latency (which model and which end-of-turn settings Pipecat measured are not recorded; the vendor's own benchmark reports a 90th percentile of 829 to 990 ms for time to complete a turn, which is above the 600 ms bound of the 'realtime' class)",
+          "transports[0].vendor_turn_signal (classified as semantic because the vendor ends turns with an end-of-turn confidence threshold on the Universal Streaming models and punctuation-based turn detection on the Pro models, not a plain silence timer; the evidence does not use that word)",
+          "transports[0].limits.rates (requests) (the vendor limits new sessions per minute: 100 is where paid plans start, and they scale up automatically; the free plan allows 5)",
+          "transports[0].limits.rates (concurrency) (no concurrency figure for streaming is in the evidence)",
+          "transports[0].dialect.context_params (the gateway's capability table lists keyterms for this provider; the vendor's streaming support for it was not re-checked)",
+          "billing.min_billed_ms (no minimum is documented)"
+        ],
+        "notes": "English only. This is the model the gateway picks when a session names no model and the language is English or empty (gateway/src/core/stt/assemblyai/config.rs:450-456). Streaming-only: the model has no file interface, so the existing streaming client is the only transport and a live call keeps today's path."
+      }
+    },
+    {
+      "id": "assemblyai:universal-streaming-multilingual",
+      "match": {
+        "provider": "assemblyai",
+        "model": "universal-streaming-multilingual",
+        "model_aliases": [
+          "multilingual"
+        ]
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "vendor",
+          "vendor_turn_signal": "semantic",
+          "latency": {
+            "class": "realtime",
+            "measurements": [
+              {
+                "percentile": "p99",
+                "quantity": "end_of_speech_to_final",
+                "value_ms": 420,
+                "basis": "third_party_benchmark",
+                "source": "https://raw.githubusercontent.com/pipecat-ai/pipecat/main/src/pipecat/services/stt_latency.py",
+                "conditions": "Pipecat's shipped constant ASSEMBLYAI_TTFS_P99 = 0.42 s (time from end of speech to final transcript, voice detector hangover 0.2 s). The evidence does not say which AssemblyAI streaming model Pipecat measured, so this is a provider-level seed, not a measurement of this model. Not measured by WaaV on this network. AssemblyAI's own benchmark page gives a different measure, time to complete a turn: a median of 649 ms and a 90th percentile of 990 ms on Universal Streaming English, and 568 ms and 829 ms on Universal-3.5 Pro streaming (May 2026). On a live call the gateway waits for AssemblyAI to end the turn, so the vendor's figures may describe today's path better than Pipecat's (inferred); if they do, this transport belongs in the 'fast' class, not 'realtime'. Measure before showing this class to customers.",
+                "pause_ms_assumed": 200
+              }
+            ]
+          },
+          "limits": {
+            "max_session_ms": 10800000,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 100,
+                "plan": "paid",
+                "scope": "unknown",
+                "note": "New streaming sessions per minute. Paid plans start here and scale up automatically; over the limit the vendor closes the socket with code 1008."
+              },
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 5,
+                "plan": "free",
+                "scope": "unknown",
+                "note": "New streaming sessions per minute."
+              }
+            ],
+            "assumed_plan": "paid"
+          },
+          "quality_signals": [
+            "word_confidence"
+          ],
+          "dialect": {
+            "language_param": null,
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "keyterms_prompt",
+                "max_items": 100,
+                "note": "Each term at most 50 characters; today's client enforces both limits (gateway/src/core/stt/assemblyai/config.rs:12-15)."
+              }
+            ],
+            "wire": "assemblyai_streaming_v3_websocket"
+          },
+          "gateway_client": {
+            "status": "wire_tested",
+            "defect": "With formatted turns requested by default, AssemblyAI sends two end-of-turn messages per turn and the message type cannot tell them apart, so a turn can be delivered twice; the detected language is read from a field named language although the vendor sends language_code; a full result channel drops a final. Found by reading, not reproduced on a live call.",
+            "code_ref": "gateway/src/core/stt/assemblyai/config.rs:85-125,283-284,313-352,450-460; gateway/src/core/stt/assemblyai/client.rs:180-191,506-529; gateway/src/core/stt/assemblyai/messages.rs:56-76; gateway/tests/mock_endpoint_e2e.rs:1310-1337; gateway/tests/chaos_reconnect.rs:810",
+            "notes": "Exercised only against in-repo mock sockets (a mock end-to-end test and a reconnect test); the evidence records no run against AssemblyAI. Each caller chunk is written at once as one binary frame (client.rs:180-191). Every vendor Turn message becomes a result whose is_final and is_speech_final both equal the vendor's end_of_turn flag (client.rs:520-525), so AssemblyAI alone decides where the caller's turn ends. Defects found by reading, not reproduced on a live call: the client asks for formatted turns by default (config.rs:283), for which AssemblyAI documents two end-of-turn messages per turn, and the message type has no field to tell them apart (messages.rs:56-76), so each turn can be delivered twice; the detected language is read from a field named language while the vendor sends language_code (messages.rs:70-72); a full result channel drops a final and logs it as a closed channel (client.rs:527-529)."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "audio_hour",
+        "min_billed_ms": null,
+        "bills_silence": true,
+        "notes": "AssemblyAI bills streaming on the time the socket stays open, not on the audio sent, at 0.15 US dollars per hour of session, so silence during a call is billed. A session is closed by the vendor after 3 hours. gateway/src/config/pricing.rs has no entry for this id; its only AssemblyAI entries are assemblyai:best and assemblyai:nano, ids that are absent from the vendor's current documentation, so no pricing_key is given and metering reports no price until one is added."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://www.assemblyai.com/docs/streaming/api-spec/streaming-websocket",
+          "https://www.assemblyai.com/docs/streaming/select-the-speech-model",
+          "https://www.assemblyai.com/docs/streaming/message-sequence",
+          "https://www.assemblyai.com/docs/streaming/rate-limits",
+          "https://www.assemblyai.com/docs/streaming/migration-guides/universal-to-universal-3-5-pro-streaming",
+          "https://www.assemblyai.com/docs/billing-and-pricing",
+          "https://www.assemblyai.com/pricing",
+          "https://raw.githubusercontent.com/pipecat-ai/pipecat/main/src/pipecat/services/stt_latency.py",
+          "https://www.assemblyai.com/docs/streaming/benchmarks"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/assemblyai/config.rs:85-125,283-284,313-352,450-460",
+          "gateway/src/core/stt/assemblyai/client.rs:180-191,506-529",
+          "gateway/src/core/stt/assemblyai/messages.rs:56-76",
+          "gateway/tests/mock_endpoint_e2e.rs:1310-1337",
+          "gateway/tests/chaos_reconnect.rs:810",
+          "gateway/src/core/stt/assemblyai/config.rs:118-125",
+          "gateway/src/core/stt/assemblyai/config.rs:12-15"
+        ],
+        "unverified": [
+          "transports[0].latency (which model and which end-of-turn settings Pipecat measured are not recorded; the vendor's own benchmark reports a 90th percentile of 829 to 990 ms for time to complete a turn, which is above the 600 ms bound of the 'realtime' class)",
+          "transports[0].vendor_turn_signal (classified as semantic because the vendor ends turns with an end-of-turn confidence threshold on the Universal Streaming models and punctuation-based turn detection on the Pro models, not a plain silence timer; the evidence does not use that word)",
+          "transports[0].limits.rates (requests) (the vendor limits new sessions per minute: 100 is where paid plans start, and they scale up automatically; the free plan allows 5)",
+          "transports[0].limits.rates (concurrency) (no concurrency figure for streaming is in the evidence)",
+          "transports[0].dialect.context_params (the gateway's capability table lists keyterms for this provider; the vendor's streaming support for it was not re-checked)",
+          "billing.min_billed_ms (no minimum is documented)",
+          "match.model_aliases (a gateway short name established by reading the client code, not by vendor documentation)"
+        ],
+        "notes": "Six languages (English, Spanish, German, French, Portuguese, Italian), detected by the model. This is the model the gateway picks when a session names no model and the language is not English (gateway/src/core/stt/assemblyai/config.rs:450-456). Streaming-only: the model has no file interface, so the existing streaming client is the only transport and a live call keeps today's path. The gateway's own short name 'multilingual' selects this row (match.model_aliases): today's client maps it to this id (gateway/src/core/stt/assemblyai/config.rs:118-125). The vendor does not accept 'multilingual' on any interface. Version 1 of the map held it as a separate copy of this row."
+      }
+    },
+    {
+      "id": "assemblyai:universal-2",
+      "match": {
+        "provider": "assemblyai",
+        "model": "universal-2"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "planned_file",
+          "enabled_from_release": null,
+          "disabled_reason": "Not implemented for live sessions, and this is an asynchronous job API: upload the audio, submit a job, then poll for the result. AssemblyAI publishes no latency for short clips, only that most files finish in under 45 seconds. Keep it disabled unless a measurement shows a final transcript within about two seconds.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [
+              {
+                "percentile": "typical",
+                "quantity": "request_round_trip",
+                "value_ms": 45000,
+                "basis": "vendor_claim",
+                "source": "https://www.assemblyai.com/docs/faq/how-long-does-it-take-to-transcribe-a-file",
+                "conditions": "The vendor says the vast majority of files complete in under 45 seconds. Stated for whole files, not for clips of a few seconds."
+              }
+            ],
+            "notes": "No figure for a clip of a few seconds. The vendor says most files finish in under 45 seconds. Each utterance costs three HTTP calls (upload, submit, at least one poll)."
+          },
+          "limits": {
+            "max_upload_bytes": 2200000000,
+            "max_audio_ms": 36000000,
+            "min_audio_ms": 160,
+            "vendor_timeout_ms": null,
+            "rates": [
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 200,
+                "plan": "paid",
+                "scope": "account",
+                "note": "Transcription jobs processing at once; paid plans start here. Extra jobs are queued by the vendor, not rejected; the limit drops to 1 while the account balance is negative."
+              },
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 5,
+                "plan": "free",
+                "scope": "account"
+              },
+              {
+                "metric": "requests",
+                "per": "minute",
+                "value": 4000,
+                "plan": null,
+                "scope": "account",
+                "note": "Derived from the vendor's limit of 20,000 requests per five minutes across all endpoints, polls included; the vendor answers HTTP 403 beyond it."
+              }
+            ],
+            "assumed_plan": "paid"
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "mp3",
+              "flac",
+              "ogg",
+              "opus",
+              "m4a",
+              "aac",
+              "webm",
+              "mp4"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "raw_body"
+          },
+          "quality_signals": [
+            "utterance_confidence",
+            "word_confidence"
+          ],
+          "dialect": {
+            "language_param": "language_code",
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "keyterms_prompt",
+                "max_items": 200
+              }
+            ],
+            "wire": "assemblyai_transcript_job"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/batch.rs:496-518,640-644; gateway/src/core/stt/prerecorded.rs:72-94,102-123,1098-1112; gateway/src/handlers/transcribe.rs:600-631,636-663",
+            "notes": "The pieces exist for the file-upload routes only, and neither is reachable from a live session. There is a builder for the job submission, which is always asynchronous (batch.rs:512-518, 640-644), and there are two separate drivers. The upload-route driver uploads, submits and polls; it sends once, when the session disconnects (prerecorded.rs:1098-1112); its first poll is at 500 ms, polls back off to 3 s and its deadline and HTTP timeout are both 300 s (prerecorded.rs:72-94). The batch route has its own upload and submit code (gateway/src/handlers/transcribe.rs:600-631, 636-663). A per-utterance adapter has two drivers to reconcile, not one. A live turn would need its own short deadline and a faster first poll, and polls count against the vendor's request limit."
+          },
+          "file_request_mode": "async_poll"
+        }
+      ],
+      "when_unusable": {
+        "today": "streams_substituted_model",
+        "substituted_model": "universal-streaming-english",
+        "code_ref": "gateway/src/core/stt/assemblyai/config.rs:118-125,456-459 (any id other than the two Universal Streaming ids is parsed as universal-streaming-english)",
+        "refuse_from_release": 3,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "async_only",
+          "text": "This AssemblyAI model transcribes recorded files only, through a job that is queued and polled, so it cannot answer quickly enough for a live conversation. Choose an AssemblyAI streaming model such as universal-streaming-english or universal-streaming-multilingual for calls."
+        }
+      },
+      "billing": {
+        "unit": "audio_second",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "bills_failed_requests": false,
+        "notes": "0.15 US dollars per hour of audio. The vendor says pre-recorded audio is pro-rated to the exact second of audio processed and that failed transcripts are not charged; it documents no minimum billed duration per request, so the field is left unknown rather than set to zero. Only uploaded utterances are billed. gateway/src/config/pricing.rs has no entry for this id; its only AssemblyAI entries are assemblyai:best and assemblyai:nano, ids that are absent from the vendor's current documentation, so no pricing_key is given and metering reports no price until one is added."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://www.assemblyai.com/docs/pre-recorded-audio/api-reference/transcripts/submit",
+          "https://www.assemblyai.com/docs/pre-recorded-audio/select-the-speech-model",
+          "https://www.assemblyai.com/docs/pre-recorded-audio/rate-limits",
+          "https://www.assemblyai.com/docs/streaming/api-spec/streaming-websocket",
+          "https://www.assemblyai.com/docs/api-reference/sync-api/transcribe",
+          "https://www.assemblyai.com/docs/billing-and-pricing",
+          "https://www.assemblyai.com/pricing",
+          "https://www.assemblyai.com/docs/faq/how-long-does-it-take-to-transcribe-a-file",
+          "https://www.assemblyai.com/docs/faq/are-there-any-limits-on-file-size-or-file-duration-for-files-submitted-to-the-api",
+          "https://www.assemblyai.com/docs/faq/what-is-the-minimum-audio-duration-that-the-api-can-transcribe",
+          "https://www.assemblyai.com/docs/faq/what-audio-and-video-file-types-are-supported-by-your-api"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/batch.rs:496-518,640-644",
+          "gateway/src/core/stt/prerecorded.rs:72-94,102-123,1098-1112",
+          "gateway/src/handlers/transcribe.rs:600-631,636-663",
+          "gateway/src/core/stt/assemblyai/config.rs:118-125,456-459"
+        ],
+        "unverified": [
+          "latency of the asynchronous job on clips of 1 to 10 seconds (unpublished and unmeasured)",
+          "limits.rates (concurrency) on the asynchronous transport (200 parallel jobs is where paid plans start; the free plan allows 5; extra jobs are queued by the vendor, not rejected)",
+          "limits.rates (requests) on the asynchronous transport (derived from the vendor's limit of 20,000 requests per five minutes, polls included; exceeding it returns HTTP 403)",
+          "limits.rates[].scope on the asynchronous transport (the vendor audit reads the limits as account-wide; recorded as account)",
+          "billing.min_billed_ms (none is documented; the vendor says only that pre-recorded audio is pro-rated to the exact second)"
+        ],
+        "notes": "Pre-recorded only, 99 languages. It is the one current AssemblyAI model that cannot stream, and the Sync API does not serve it, so its only interface is the asynchronous job: upload, submit, poll. That makes a segmented path the only way to put it on a live call, and an unproven one: no latency for short clips is published. Until a measurement says otherwise the gateway should refuse this model on a live session and name the streaming alternatives. Today the gateway neither refuses nor serves it: the streaming client silently substitutes universal-streaming-english (gateway/src/core/stt/assemblyai/config.rs:118-125). Releases 1 and 2 keep today's substituted stream with the warning stt_model_substituted; from Release 3, default on, the session is refused (integration decisions, section 12)."
+      }
+    },
+    {
+      "id": "assemblyai:u3-sync-pro",
+      "match": {
+        "provider": "assemblyai",
+        "model": "u3-sync-pro"
+      },
+      "lifecycle": {
+        "status": "legacy"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "assemblyai_sync",
+          "enabled_from_release": 3,
+          "disabled_reason": "Not implemented. The gateway has no request builder, response parser or host setting for AssemblyAI's Sync API.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "fast",
+            "measurements": [
+              {
+                "percentile": "p99",
+                "quantity": "end_of_speech_to_final",
+                "value_ms": 650,
+                "basis": "third_party_benchmark",
+                "source": "https://raw.githubusercontent.com/pipecat-ai/pipecat/main/src/pipecat/services/stt_latency.py",
+                "conditions": "Pipecat's shipped constant ASSEMBLYAI_SYNC_TTFS_P99 = 0.65 s: one HTTP request per utterance against the Sync API, time from end of speech to final transcript, voice detector hangover 0.2 s. AssemblyAI's pricing page separately claims results in about 134 ms at the median; that is request time, a different measure, so it is recorded as a separate request round-trip entry. Not measured by WaaV on this network.",
+                "pause_ms_assumed": 200
+              },
+              {
+                "percentile": "p50",
+                "quantity": "request_round_trip",
+                "value_ms": 134,
+                "basis": "vendor_claim",
+                "source": "https://www.assemblyai.com/pricing",
+                "conditions": "AssemblyAI's pricing page: results 'in ~134 ms (p50)'. Request time only, without the detector's pause; a vendor marketing figure."
+              }
+            ]
+          },
+          "limits": {
+            "max_upload_bytes": 40000000,
+            "max_audio_ms": 120000,
+            "min_audio_ms": 80,
+            "vendor_timeout_ms": 30000,
+            "rates": []
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "raw_pcm"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "sample_rates_hz": [
+              8000,
+              16000,
+              22050,
+              24000,
+              32000,
+              44100,
+              48000
+            ],
+            "envelope": "multipart"
+          },
+          "warm": {
+            "method": "GET",
+            "path": "/v1/warm"
+          },
+          "quality_signals": [
+            "utterance_confidence",
+            "word_confidence"
+          ],
+          "dialect": {
+            "language_param": "language_codes",
+            "language_shape": "list",
+            "language_format": "iso639_1",
+            "language_required": true,
+            "context_params": [
+              {
+                "kind": "prompt",
+                "wire_name": "prompt",
+                "max_chars": 6000,
+                "note": "When prompt is sent the vendor ignores language_codes. Using it adds 0.05 US dollars per hour to the price."
+              },
+              {
+                "kind": "keyterms",
+                "wire_name": "keyterms_prompt",
+                "max_items": 100,
+                "note": "At most 8000 characters in all."
+              },
+              {
+                "kind": "previous_text",
+                "wire_name": "conversation_context",
+                "max_items": 500,
+                "max_chars": 16000,
+                "note": "Prior turns of the conversation; the vendor trims a longer context instead of rejecting it."
+              }
+            ],
+            "wire": "assemblyai_sync",
+            "limit_headers": {
+              "retry_after": "Retry-After"
+            }
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/batch.rs:839-844; gateway/src/core/stt/prerecorded.rs:102-123",
+            "notes": "Nothing under gateway/src names the Sync host or its path; the file-upload code for this vendor speaks only the asynchronous job API. The Sync request is POST /v1/transcribe on sync.assemblyai.com (also sync.us and sync.eu): multipart, an audio part and a JSON config part, with the model named in the required header X-AAI-Model. One request returns one JSON body; there is no job and no polling. The vendor documents it for exactly this use: one utterance cut by a voice detector per request, padded with half a second of trailing silence. In the config part the language field is language_codes (one code or a list, default en, no automatic detection, ignored when prompt is set); prior turns go in conversation_context and vocabulary in keyterms_prompt. A no-operation request, GET /v1/warm, exists to open the connection when speech starts. Rate-limit and capacity responses carry Retry-After; a server error or server timeout is safe to retry once."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "max_segment_ms": 60000,
+            "request_timeout_ms": 4000,
+            "rationale": "Maximum segment 60 s instead of 25 s: the 25 s default protects Whisper's 30 s window, which does not apply here. The Sync API accepts up to 120 s and the vendor says audio under about a minute is handled as one internal segment. 60 s is a judgement from the vendor audit, not a vendor number; the hard ceiling is 120 s including pre-roll and padding, and the floor is 80 ms. Request timeout 4 s with one retry: about six times the published 0.65 s 99th percentile and far below the vendor's 30 s server deadline; replace it with a deadline from measurement."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "streams_substituted_model",
+        "substituted_model": "universal-streaming-english",
+        "code_ref": "gateway/src/core/stt/assemblyai/config.rs:118-125,456-459 (any id other than the two Universal Streaming ids is parsed as universal-streaming-english)",
+        "refuse_from_release": null
+      },
+      "billing": {
+        "unit": "audio_hour",
+        "min_billed_ms": null,
+        "surcharges": [
+          {
+            "feature": "prompt",
+            "percent": 11.11,
+            "note": "0.05 US dollars per hour on top of the 0.45 Sync price."
+          }
+        ],
+        "bills_silence": false,
+        "notes": "Billed as the Sync API: 0.45 US dollars per hour of uploaded audio; the prompt field adds 0.05 per hour (surcharges). Granularity and any minimum are not documented. Only uploaded utterances are billed. Until the Sync transport is enabled, a session naming this id is streamed with universal-streaming-english and billed as that model: 0.15 per hour of open socket, silence included. gateway/src/config/pricing.rs has no entry for this id; its only AssemblyAI entries are assemblyai:best and assemblyai:nano, ids that are absent from the vendor's current documentation, so no pricing_key is given and metering reports no price until one is added."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://www.assemblyai.com/docs/api-reference/sync-api/transcribe",
+          "https://www.assemblyai.com/docs/sync-stt/audio-requirements",
+          "https://www.assemblyai.com/docs/sync-stt/error-handling",
+          "https://www.assemblyai.com/pricing",
+          "https://raw.githubusercontent.com/pipecat-ai/pipecat/main/src/pipecat/services/stt_latency.py",
+          "https://www.assemblyai.com/docs/sync-stt/connection-pre-warming"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/batch.rs:839-844",
+          "gateway/src/core/stt/prerecorded.rs:102-123",
+          "gateway/src/core/stt/assemblyai/config.rs:118-125,456-459"
+        ],
+        "unverified": [
+          "limits.rates (requests and concurrency) on the Sync transport (the vendor confirms a concurrency cap exists and signals it with a 'capacity exceeded' response, but publishes no number)",
+          "billing.min_billed_ms for the Sync transport (the billing page does not mention the Sync API; no minimum and no granularity are documented)",
+          "dialect.language_param on the Sync transport (language_codes is the name in the vendor's specification; not exercised against the vendor)",
+          "how the Sync API answers a silent or noise-only clip (empty text or an error)",
+          "Sync language coverage (18 languages on the pricing page, 32 codes in the specification)",
+          "lifecycle.status (the vendor calls this id a legacy alias and gives no retirement date)"
+        ],
+        "notes": "'u3-sync-pro' is a legacy alias of universal-3-5-pro that only the Sync API's X-AAI-Model header accepts; it is not a streaming or pre-recorded model id. New configurations should use universal-3-5-pro. The row exists so that a deployment already using the alias resolves to the Sync transport instead of the provider default. The Sync transport is enabled from Release 3, default on; until then today's client substitutes universal-streaming-english for this id (when_unusable)."
+      }
+    },
+    {
+      "id": "assemblyai:u3-pro",
+      "match": {
+        "provider": "assemblyai",
+        "model": "u3-pro"
+      },
+      "lifecycle": {
+        "status": "legacy"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "assemblyai_sync",
+          "enabled_from_release": 3,
+          "disabled_reason": "Not implemented. The gateway has no request builder, response parser or host setting for AssemblyAI's Sync API.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "fast",
+            "measurements": [
+              {
+                "percentile": "p99",
+                "quantity": "end_of_speech_to_final",
+                "value_ms": 650,
+                "basis": "third_party_benchmark",
+                "source": "https://raw.githubusercontent.com/pipecat-ai/pipecat/main/src/pipecat/services/stt_latency.py",
+                "conditions": "Pipecat's shipped constant ASSEMBLYAI_SYNC_TTFS_P99 = 0.65 s: one HTTP request per utterance against the Sync API, time from end of speech to final transcript, voice detector hangover 0.2 s. AssemblyAI's pricing page separately claims results in about 134 ms at the median; that is request time, a different measure, so it is recorded as a separate request round-trip entry. Not measured by WaaV on this network.",
+                "pause_ms_assumed": 200
+              },
+              {
+                "percentile": "p50",
+                "quantity": "request_round_trip",
+                "value_ms": 134,
+                "basis": "vendor_claim",
+                "source": "https://www.assemblyai.com/pricing",
+                "conditions": "AssemblyAI's pricing page: results 'in ~134 ms (p50)'. Request time only, without the detector's pause; a vendor marketing figure."
+              }
+            ]
+          },
+          "limits": {
+            "max_upload_bytes": 40000000,
+            "max_audio_ms": 120000,
+            "min_audio_ms": 80,
+            "vendor_timeout_ms": 30000,
+            "rates": []
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "raw_pcm"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "sample_rates_hz": [
+              8000,
+              16000,
+              22050,
+              24000,
+              32000,
+              44100,
+              48000
+            ],
+            "envelope": "multipart"
+          },
+          "warm": {
+            "method": "GET",
+            "path": "/v1/warm"
+          },
+          "quality_signals": [
+            "utterance_confidence",
+            "word_confidence"
+          ],
+          "dialect": {
+            "language_param": "language_codes",
+            "language_shape": "list",
+            "language_format": "iso639_1",
+            "language_required": true,
+            "context_params": [
+              {
+                "kind": "prompt",
+                "wire_name": "prompt",
+                "max_chars": 6000,
+                "note": "When prompt is sent the vendor ignores language_codes. Using it adds 0.05 US dollars per hour to the price."
+              },
+              {
+                "kind": "keyterms",
+                "wire_name": "keyterms_prompt",
+                "max_items": 100,
+                "note": "At most 8000 characters in all."
+              },
+              {
+                "kind": "previous_text",
+                "wire_name": "conversation_context",
+                "max_items": 500,
+                "max_chars": 16000,
+                "note": "Prior turns of the conversation; the vendor trims a longer context instead of rejecting it."
+              }
+            ],
+            "wire": "assemblyai_sync",
+            "limit_headers": {
+              "retry_after": "Retry-After"
+            }
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/batch.rs:839-844; gateway/src/core/stt/prerecorded.rs:102-123",
+            "notes": "Nothing under gateway/src names the Sync host or its path; the file-upload code for this vendor speaks only the asynchronous job API. The Sync request is POST /v1/transcribe on sync.assemblyai.com (also sync.us and sync.eu): multipart, an audio part and a JSON config part, with the model named in the required header X-AAI-Model. One request returns one JSON body; there is no job and no polling. The vendor documents it for exactly this use: one utterance cut by a voice detector per request, padded with half a second of trailing silence. In the config part the language field is language_codes (one code or a list, default en, no automatic detection, ignored when prompt is set); prior turns go in conversation_context and vocabulary in keyterms_prompt. A no-operation request, GET /v1/warm, exists to open the connection when speech starts. Rate-limit and capacity responses carry Retry-After; a server error or server timeout is safe to retry once."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "max_segment_ms": 60000,
+            "request_timeout_ms": 4000,
+            "rationale": "Maximum segment 60 s instead of 25 s: the 25 s default protects Whisper's 30 s window, which does not apply here. The Sync API accepts up to 120 s and the vendor says audio under about a minute is handled as one internal segment. 60 s is a judgement from the vendor audit, not a vendor number; the hard ceiling is 120 s including pre-roll and padding, and the floor is 80 ms. Request timeout 4 s with one retry: about six times the published 0.65 s 99th percentile and far below the vendor's 30 s server deadline; replace it with a deadline from measurement."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "streams_substituted_model",
+        "substituted_model": "universal-streaming-english",
+        "code_ref": "gateway/src/core/stt/assemblyai/config.rs:118-125,456-459 (any id other than the two Universal Streaming ids is parsed as universal-streaming-english)",
+        "refuse_from_release": null
+      },
+      "billing": {
+        "unit": "audio_hour",
+        "min_billed_ms": null,
+        "surcharges": [
+          {
+            "feature": "prompt",
+            "percent": 11.11,
+            "note": "0.05 US dollars per hour on top of the 0.45 Sync price."
+          }
+        ],
+        "bills_silence": false,
+        "notes": "Billed as the Sync API: 0.45 US dollars per hour of uploaded audio; the prompt field adds 0.05 per hour (surcharges). Granularity and any minimum are not documented. Only uploaded utterances are billed. Until the Sync transport is enabled, a session naming this id is streamed with universal-streaming-english and billed as that model: 0.15 per hour of open socket, silence included. gateway/src/config/pricing.rs has no entry for this id; its only AssemblyAI entries are assemblyai:best and assemblyai:nano, ids that are absent from the vendor's current documentation, so no pricing_key is given and metering reports no price until one is added."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://www.assemblyai.com/docs/api-reference/sync-api/transcribe",
+          "https://www.assemblyai.com/docs/sync-stt/audio-requirements",
+          "https://www.assemblyai.com/docs/sync-stt/error-handling",
+          "https://www.assemblyai.com/pricing",
+          "https://raw.githubusercontent.com/pipecat-ai/pipecat/main/src/pipecat/services/stt_latency.py",
+          "https://www.assemblyai.com/docs/sync-stt/connection-pre-warming"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/batch.rs:839-844",
+          "gateway/src/core/stt/prerecorded.rs:102-123",
+          "gateway/src/core/stt/assemblyai/config.rs:118-125,456-459"
+        ],
+        "unverified": [
+          "limits.rates (requests and concurrency) on the Sync transport (the vendor confirms a concurrency cap exists and signals it with a 'capacity exceeded' response, but publishes no number)",
+          "billing.min_billed_ms for the Sync transport (the billing page does not mention the Sync API; no minimum and no granularity are documented)",
+          "dialect.language_param on the Sync transport (language_codes is the name in the vendor's specification; not exercised against the vendor)",
+          "how the Sync API answers a silent or noise-only clip (empty text or an error)",
+          "Sync language coverage (18 languages on the pricing page, 32 codes in the specification)",
+          "lifecycle.status (the vendor calls this id a legacy alias and gives no retirement date)"
+        ],
+        "notes": "'u3-pro' is a legacy alias of universal-3-5-pro that only the Sync API's X-AAI-Model header accepts; it is not a streaming or pre-recorded model id. New configurations should use universal-3-5-pro. The row exists so that a deployment already using the alias resolves to the Sync transport instead of the provider default. The Sync transport is enabled from Release 3, default on; until then today's client substitutes universal-streaming-english for this id (when_unusable)."
+      }
+    },
+    {
+      "id": "assemblyai:any",
+      "match": {
+        "provider": "assemblyai",
+        "model_glob": "*"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "assemblyai_sync",
+          "enabled_from_release": null,
+          "disabled_reason": "Not implemented. The gateway has no request builder, response parser or host setting for AssemblyAI's Sync API. When that adapter exists, keep this transport disabled on this row unless AssemblyAI opens the Sync model list: today the Sync API accepts only universal-3-5-pro and its two legacy aliases, so an unknown id would pass session setup and then be rejected on the first upload, in the middle of the call. The integration decisions place the synchronous endpoint for universal-3-5-pro only (section 12), so no release turns it on for an unknown id.",
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "Unknown model id; nothing measured. The Sync API's published figure is for universal-3-5-pro."
+          },
+          "limits": {
+            "max_upload_bytes": 40000000,
+            "max_audio_ms": 120000,
+            "min_audio_ms": 80,
+            "vendor_timeout_ms": 30000,
+            "rates": []
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "raw_pcm"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "sample_rates_hz": [
+              8000,
+              16000,
+              22050,
+              24000,
+              32000,
+              44100,
+              48000
+            ],
+            "envelope": "multipart"
+          },
+          "warm": {
+            "method": "GET",
+            "path": "/v1/warm"
+          },
+          "quality_signals": [
+            "utterance_confidence",
+            "word_confidence"
+          ],
+          "dialect": {
+            "language_param": "language_codes",
+            "language_shape": "list",
+            "language_format": "iso639_1",
+            "language_required": true,
+            "context_params": [
+              {
+                "kind": "prompt",
+                "wire_name": "prompt",
+                "max_chars": 6000,
+                "note": "When prompt is sent the vendor ignores language_codes. Using it adds 0.05 US dollars per hour to the price."
+              },
+              {
+                "kind": "keyterms",
+                "wire_name": "keyterms_prompt",
+                "max_items": 100,
+                "note": "At most 8000 characters in all."
+              },
+              {
+                "kind": "previous_text",
+                "wire_name": "conversation_context",
+                "max_items": 500,
+                "max_chars": 16000,
+                "note": "Prior turns of the conversation; the vendor trims a longer context instead of rejecting it."
+              }
+            ],
+            "wire": "assemblyai_sync",
+            "limit_headers": {
+              "retry_after": "Retry-After"
+            }
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/batch.rs:839-844; gateway/src/core/stt/prerecorded.rs:102-123",
+            "notes": "Nothing under gateway/src names the Sync host or its path; the file-upload code for this vendor speaks only the asynchronous job API. The Sync request is POST /v1/transcribe on sync.assemblyai.com (also sync.us and sync.eu): multipart, an audio part and a JSON config part, with the model named in the required header X-AAI-Model. One request returns one JSON body; there is no job and no polling. The vendor documents it for exactly this use: one utterance cut by a voice detector per request, padded with half a second of trailing silence. In the config part the language field is language_codes (one code or a list, default en, no automatic detection, ignored when prompt is set); prior turns go in conversation_context and vocabulary in keyterms_prompt. A no-operation request, GET /v1/warm, exists to open the connection when speech starts. Rate-limit and capacity responses carry Retry-After; a server error or server timeout is safe to retry once."
+          },
+          "file_request_mode": "sync",
+          "segment_profile": {
+            "max_segment_ms": 60000,
+            "request_timeout_ms": 4000,
+            "rationale": "Maximum segment 60 s instead of 25 s: the 25 s default protects Whisper's 30 s window, which does not apply here. The Sync API accepts up to 120 s and the vendor says audio under about a minute is handled as one internal segment. 60 s is a judgement from the vendor audit, not a vendor number; the hard ceiling is 120 s including pre-roll and padding, and the floor is 80 ms. Request timeout 4 s with one retry: about six times the published 0.65 s 99th percentile and far below the vendor's 30 s server deadline; replace it with a deadline from measurement."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "streams_substituted_model",
+        "substituted_model": "universal-streaming-english",
+        "code_ref": "gateway/src/core/stt/assemblyai/config.rs:118-125,456-459 (any id other than the two Universal Streaming ids is parsed as universal-streaming-english)",
+        "refuse_from_release": null
+      },
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "Nothing is known about how an unrecognised AssemblyAI id is billed."
+      },
+      "provenance": {
+        "confidence": "assumed",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://www.assemblyai.com/docs/api-reference/sync-api/transcribe",
+          "https://www.assemblyai.com/docs/streaming/api-spec/streaming-websocket",
+          "https://www.assemblyai.com/docs/pre-recorded-audio/api-reference/transcripts/submit",
+          "https://www.assemblyai.com/docs/sync-stt/audio-requirements",
+          "https://www.assemblyai.com/docs/sync-stt/connection-pre-warming"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/batch.rs:839-844",
+          "gateway/src/core/stt/prerecorded.rs:102-123",
+          "gateway/src/core/stt/assemblyai/config.rs:85-125,283-284,313-352,450-460",
+          "gateway/src/core/stt/assemblyai/client.rs:180-191,506-529",
+          "gateway/src/core/stt/assemblyai/messages.rs:56-76",
+          "gateway/tests/mock_endpoint_e2e.rs:1310-1337",
+          "gateway/tests/chaos_reconnect.rs:810",
+          "gateway/src/core/stt/assemblyai/config.rs:118-125,456-459"
+        ],
+        "unverified": [
+          "everything in this row: it is the assumption for an AssemblyAI id that no exact row matches"
+        ],
+        "notes": "Provider default, used for an AssemblyAI id with no exact row, including the older ids best, nano and slam-1, which are absent from current vendor documentation. No transport is enabled in any release. Today's streaming client is not listed, because it would transcribe an unknown id with universal-streaming-english, and AssemblyAI ignores an unrecognised model parameter rather than rejecting it. The Sync transport stays off on this row because the Sync API accepts only universal-3-5-pro and its two legacy aliases, so an unknown id would pass session setup and then be rejected on the first upload, in the middle of the call. A session naming an unknown id therefore keeps today's behaviour, streaming with universal-streaming-english, with the warning stt_model_substituted; it is not refused (integration decisions, section 12, names only universal-2 for the refusal). Add an exact row when AssemblyAI adds a model. The placeholder 'nova-3' never reaches this row: the provider sets placeholder_as_unset, so the resolver reads it as no model named and applies the language rule in the provider notes."
+      }
+    }
+  ]
+}

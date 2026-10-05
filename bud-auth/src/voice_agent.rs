@@ -63,7 +63,18 @@ pub struct AgentTurnDetection {
     /// `low` | `medium` | `high` | `auto`.
     pub eagerness: String,
     pub silence_ms: u64,
-    pub max_endpointing_ms: u64,
+    /// The longest silence before the turn ends, when the agent chose one. Optional so a value
+    /// left out can be told from a chosen one; the gateway still reads exactly 3,000 (the default
+    /// Bud publishes) as unset until Bud stops publishing it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_endpointing_ms: Option<u64>,
+}
+
+impl AgentTurnDetection {
+    /// The ceiling the agent chose, or `None` when it left the default.
+    pub fn chosen_max_endpointing_ms(&self) -> Option<u64> {
+        self.max_endpointing_ms.filter(|v| *v != 3000)
+    }
 }
 
 impl Default for AgentTurnDetection {
@@ -72,7 +83,7 @@ impl Default for AgentTurnDetection {
             kind: "semantic".into(),
             eagerness: "auto".into(),
             silence_ms: 500,
-            max_endpointing_ms: 3000,
+            max_endpointing_ms: None,
         }
     }
 }
@@ -153,6 +164,10 @@ pub struct AgentFillers {
     pub follow_up_after_ms: u64,
     pub messages: Vec<String>,
     pub use_tool_status_messages: bool,
+    /// A gentle pulsing tone while the agent works on a tool call (from the call until it speaks
+    /// again), after the call's phrase, so the caller never hears dead air. On by default; while it
+    /// plays, no further phrase is said for that wait.
+    pub tool_call_sound: bool,
 }
 
 impl Default for AgentFillers {
@@ -165,6 +180,7 @@ impl Default for AgentFillers {
                 .map(String::from)
                 .to_vec(),
             use_tool_status_messages: true,
+            tool_call_sound: true,
         }
     }
 }
@@ -495,7 +511,28 @@ mod tests {
             "budapp's default filler script"
         );
         assert_eq!(e.fillers.messages, AgentFillers::default().messages);
+        assert!(
+            e.fillers.tool_call_sound,
+            "budapp publishes the tone on by default"
+        );
         assert_eq!(e.key(), "c0de0000-0000-4000-8000-000000000003:v3");
+    }
+
+    #[test]
+    fn the_tool_call_tone_is_on_unless_the_agent_turns_it_off() {
+        let base =
+            r#"{"prompt_id":"p","version":1,"stt":{"endpoint_id":"s"},"tts":{"endpoint_id":"t"}"#;
+        let older = parse_voice_agent_blob(&format!(
+            "{base},\"fillers\":{{\"tool_call_after_ms\":900}}}}"
+        ))
+        .expect("an entry published before the setting");
+        assert!(older.fillers.tool_call_sound);
+        assert_eq!(older.fillers.tool_call_after_ms, 900);
+        let off = parse_voice_agent_blob(&format!(
+            "{base},\"fillers\":{{\"tool_call_sound\":false}}}}"
+        ))
+        .expect("parses");
+        assert!(!off.fillers.tool_call_sound);
     }
 
     #[test]

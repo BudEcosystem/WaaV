@@ -36,6 +36,7 @@ export type {
   STTConfig,
   TTSConfig,
   TranslationConfig,
+  TranscriptionMode,
   Pronunciation,
   LiveKitConfig,
   SessionConfig,
@@ -69,6 +70,9 @@ export type {
   LanguageCapabilitiesResponse,
 } from './types/canonical-languages.js';
 
+// Bud voice agents on /ws (spec 025).
+export type { VoiceAgentConfig } from './types/agent.js';
+
 // Conversation / agent-loop config (the flagship LLM + reasoning surface).
 export type {
   ConversationConfig,
@@ -82,6 +86,8 @@ export { conversationConfigToWire } from './types/conversation.js';
 
 // config_warning typed advisory.
 export type { ConfigWarningEvent, ConfigWarningCode, ConfigWarningMessage } from './types/warnings.js';
+// stt_warning typed mid-call speech-to-text warning (segmented STT).
+export type { SttWarningEvent, SttWarningCode, SttWarningMessage } from './types/warnings.js';
 
 export type {
   ConfigMessage,
@@ -89,8 +95,12 @@ export type {
   IncomingMessage,
   ReadyMessage,
   ResolvedAlias,
+  ReadyStt,
+  SttNotice,
   STTResultMessage,
   ErrorMessage,
+  VadEventMessage,
+  VadEventKind,
   OutgoingMessage,
 } from './types/messages.js';
 
@@ -279,6 +289,7 @@ export type {
   ReadyEvent,
   SessionErrorEvent,
   ConfigWarningEvent as WSConfigWarningEvent,
+  SessionVadEvent,
   ConnectionStateEvent,
   MetricsEvent,
   ReconnectEvent,

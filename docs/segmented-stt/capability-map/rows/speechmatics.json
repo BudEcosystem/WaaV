@@ -1,0 +1,1296 @@
+{
+  "provider_id": "speechmatics",
+  "provider": {
+    "aliases": [
+      "speech-matics",
+      "speech_matics",
+      "speechmatics-stt"
+    ],
+    "default_model": "standard",
+    "model_string": "wire_model",
+    "key_normalisation": {
+      "placeholder_as_unset": true
+    },
+    "registered_in_gateway": true,
+    "notes": "Registered as speechmatics with aliases speech-matics and speech_matics (gateway/src/plugin/builtin/mod.rs:185-201, :1719), plus speechmatics-stt in the static dispatch table (gateway/src/plugin/dispatch.rs:294). Only the spelling speechmatics reaches the standardized factory (gateway/src/core/stt/standard.rs:461); the aliases take the flat factory, which drops the standardized features (standard.rs:476), so the resolver must normalise the provider id before lookup. default_model is standard because the vendor uses it when no model is sent, and the client sends none for an empty model (gateway/src/core/stt/speechmatics/config.rs:522-524). The client's model gate is a substring match (config.rs:526-531): any id containing 'standard' or 'enhanced' selects an operating point. The short aliases std, enh and high (config.rs:100-101) are model aliases of the standard and enhanced rows, and the placeholder nova-3, which the client reads as unset (config.rs:485, :522), is covered by key_normalisation; the substring rule has no field, so the resolver must apply it before lookup or those sessions fall to the provider default row. Every other id, including melia-1, oak-1 and linden-1, is refused by name at construction (config.rs:536-540). The melia-1 and oak-1 rows are the least stable facts in this file: the vendor planned a realtime release for October 2026, so they carry a re-check date and need a probe with a key. The batch hosts are eu1, us1 and au1 (eu2 and us2 also exist, for Enterprise failover only). Batch jobs are bound to the regional host that created them, melia-1 and oak-1 exist only on the EU1 and US1 hosts (a region constraint on their batch transports), and the client can only dial the EU realtime host (config.rs:652). The batch service stores audio and transcripts for 7 days unless the job is deleted; the realtime socket stores nothing."
+  },
+  "rows": [
+    {
+      "id": "speechmatics:standard",
+      "match": {
+        "provider": "speechmatics",
+        "model": "standard",
+        "model_aliases": [
+          "std"
+        ]
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "either",
+          "vendor_turn_signal": "silence",
+          "constraints": {
+            "languages": {
+              "mode": "except",
+              "codes": [
+                "auto"
+              ],
+              "note": "Speechmatics documents automatic language detection ('auto') for batch transcription only (confirmed by the fact-check). Today's client accepts 'auto' and sends it; how the socket reacts is not established."
+            }
+          },
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "Not measured for the gateway's client. Pipecat lists SPEECHMATICS_TTFS_P99 at 0.74 s (end of speech to final transcript, voice-activity stop time 200 ms, model and client settings not stated), but that figure does not describe this transport: the gateway's client always sets max_delay to 2 seconds, never sends ForceEndOfUtterance and leaves the vendor's silence trigger off by default, so its finals are released on the 2-second max_delay timer (gateway/src/core/stt/speechmatics/mod.rs:59, client.rs:418-420, :468-470), and they are not marked speech-final, so the gateway's transcript timers add their own wait before the turn ends. The real figure is expected to be near 2 seconds or more (inferred from the code and the vendor's definition of max_delay; not measured). Record a number here only from the gateway's own probe."
+          },
+          "limits": {
+            "max_session_ms": 172800000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 50,
+                "plan": "pro",
+                "scope": "unknown",
+                "note": "Realtime sessions on the Pro plan."
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 2,
+                "plan": "free",
+                "scope": "unknown",
+                "note": "Realtime sessions on the Free plan."
+              }
+            ],
+            "assumed_plan": "pro"
+          },
+          "quality_signals": [
+            "word_confidence"
+          ],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "language_format": "iso639_1",
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "additional_vocab"
+              }
+            ],
+            "wire": "speechmatics_realtime_v2"
+          },
+          "gateway_client": {
+            "status": "wire_tested",
+            "code_ref": "gateway/src/core/stt/speechmatics/client.rs:251-300 (partials, finals and the end-of-utterance message), :413-470 (the StartRecognition message: operating_point, max_delay, vocabulary, silence trigger); gateway/src/core/stt/speechmatics/config.rs:518-541 (model gate); gateway/tests/mock_endpoint_e2e.rs:635 (mock end-to-end test)",
+            "notes": "Exercised only against an in-repo mock server. Finals are word groups released on the vendor's max_delay timer, which the client always sets to 2 seconds (mod.rs:59, client.rs:420). They are marked final but not speech-final, so the gateway's transcript timers end the turn, unless the session sets utterance_end_ms, which turns on the vendor's silence trigger (config.rs:753-755, client.rs:468-470). The client sends the deprecated operating_point field, never model, always dials the EU host (config.rs:652), and accepts the language value 'auto', which the vendor documents as batch only. The 50 concurrent sessions limit is the Pro plan figure (2 on the Free plan)."
+          }
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "planned_commit",
+          "enabled_from_release": null,
+          "disabled_reason": "The client never sends ForceEndOfUtterance. Sending it when the gateway's own voice-activity detector reports end of speech needs that detector and a small addition to the existing socket client.",
+          "interim_results": "live",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [
+              {
+                "percentile": "typical",
+                "quantity": "request_round_trip",
+                "value_ms": 250,
+                "basis": "vendor_claim",
+                "source": "https://www.speechmatics.com/company/articles-and-news/you-cant-hurry-love-but-you-can-hurry-final-transcripts",
+                "measured_on": "2026-01-21",
+                "conditions": "From the client's ForceEndOfUtterance message to the final transcript, network dependent. Counted from the commit, not from the end of speech, so it is not a seed."
+              }
+            ]
+          },
+          "limits": {
+            "max_session_ms": 172800000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 50,
+                "plan": "pro",
+                "scope": "unknown",
+                "note": "Realtime sessions on the Pro plan."
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 2,
+                "plan": "free",
+                "scope": "unknown",
+                "note": "Realtime sessions on the Free plan."
+              }
+            ],
+            "assumed_plan": "pro"
+          },
+          "quality_signals": [
+            "word_confidence"
+          ],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "language_format": "iso639_1",
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "additional_vocab"
+              }
+            ],
+            "wire": "speechmatics_realtime_v2"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/speechmatics/client.rs:413-512 (the only control message built is StartRecognition; a search of the module finds no ForceEndOfUtterance)",
+            "notes": "Same socket and session as the streaming client; only the end-of-utterance trigger changes hands from transcript timers to the gateway's detector. This is the vendor's fastest route to a final transcript."
+          }
+        },
+        {
+          "input_mode": "file_upload",
+          "adapter": "speechmatics_batch",
+          "enabled_from_release": 5,
+          "disabled_reason": "No file-upload adapter for Speechmatics batch jobs exists yet. For this model it would only be a fallback: the vendor advises against chunks shorter than 25 seconds, the batch service keeps audio for 7 days while the realtime socket stores nothing, and batch is billed as a different product.",
+          "enable_requires": [
+            "live_probe",
+            "latency_within_deadline"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [
+              {
+                "percentile": "single_sample",
+                "quantity": "inference_only",
+                "value_ms": 650,
+                "basis": "vendor_claim",
+                "source": "https://docs.speechmatics.com/speech-to-text/batch/synchronous.md",
+                "conditions": "Documentation sample for a 10-second file on enhanced: from the job's created_at to the transcript's created_at, about 0.65 s; excludes the upload and is illustrative only."
+              }
+            ],
+            "notes": "No latency is published for short clips. The vendor's micro-batching guide classes the approach as 'a few seconds' and advises against chunks under 25 seconds; the one figure recorded is a documentation sample, not a commitment. A measurement within the deadline is required before this transport is enabled (enable_requires)."
+          },
+          "limits": {
+            "max_upload_bytes": 1000000000,
+            "max_audio_ms": null,
+            "min_audio_ms": null,
+            "vendor_timeout_ms": null,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "second",
+                "value": 10,
+                "plan": "self_serve",
+                "scope": "unknown",
+                "note": "New jobs (POST /v2/jobs) per second on the Self-serve plan; the pricing page says Enterprise is unlimited."
+              },
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 20000,
+                "plan": null,
+                "scope": "unknown",
+                "note": "Concurrent jobs."
+              }
+            ],
+            "assumed_plan": "self_serve"
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "mp3",
+              "aac",
+              "ogg",
+              "mpeg",
+              "m4a",
+              "mp4",
+              "flac"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "multipart"
+          },
+          "quality_signals": [
+            "word_confidence"
+          ],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "language_format": "iso639_1",
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "additional_vocab"
+              }
+            ],
+            "response_formats": [
+              "json-v2",
+              "txt",
+              "srt"
+            ],
+            "wire": "speechmatics_batch_jobs"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/batch.rs:839-844 and gateway/src/core/stt/prerecorded.rs:117-124 (no Speechmatics file builder exists)",
+            "notes": "Needs a multipart request with a 'config' part (JSON using model, not operating_point) and a 'data_file' part, bearer authentication, a per-region https base URL (the existing endpoint override accepts only ws and wss), handling of the job states created, done, rejected and deleted, and a best-effort delete of the job afterwards. The blocking wait parameter exists only on the hosted service; a self-hosted batch container needs submit and poll."
+          },
+          "file_request_mode": "sync_wait",
+          "segment_profile": {
+            "request_timeout_ms": 12000,
+            "rationale": "The request is POST /v2/jobs/?wait=10&format=json-v2, which blocks until the job finishes or the wait elapses, so each HTTP call gets 12 seconds, slightly longer than the wait. If the job is still running the adapter makes one GET of the transcript with a wait, then fails the segment. The server caps the wait at an unpublished value. The adapter should delete each job after reading it, because the batch service keeps audio for 7 days. All other defaults hold: the vendor names 16-bit 16 kHz mono WAV as the fastest format for very short files and bills to the second."
+          },
+          "billing": {
+            "unit": "audio_hour",
+            "min_billed_ms": null,
+            "bills_silence": false,
+            "notes": "Batch is a different product type from realtime, with its own rate, priced in credits per hour of audio and billed to the second. Only uploaded speech segments are billed. pricing.rs has no Speechmatics speech-to-text key."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "audio_hour",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "Realtime product type, priced in credits per hour of audio and billed to the second. pricing.rs has no Speechmatics speech-to-text key."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://docs.speechmatics.com/speech-to-text/models.md",
+          "https://docs.speechmatics.com/api-ref/realtime-transcription-websocket.md",
+          "https://docs.speechmatics.com/speech-to-text/realtime/output.md",
+          "https://docs.speechmatics.com/speech-to-text/realtime/limits.md",
+          "https://www.speechmatics.com/company/articles-and-news/you-cant-hurry-love-but-you-can-hurry-final-transcripts",
+          "https://docs.speechmatics.com/speech-to-text/batch/synchronous.md",
+          "https://docs.speechmatics.com/speech-to-text/batch/limits.md",
+          "https://docs.speechmatics.com/speech-to-text/batch/input.md",
+          "https://www.speechmatics.com/pricing",
+          "https://raw.githubusercontent.com/pipecat-ai/pipecat/main/src/pipecat/services/stt_latency.py"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/speechmatics/client.rs:251-300",
+          "gateway/src/core/stt/speechmatics/client.rs:413-470",
+          "gateway/src/core/stt/speechmatics/client.rs:418-420",
+          "gateway/src/core/stt/speechmatics/mod.rs:59",
+          "gateway/src/core/stt/speechmatics/config.rs:518-541",
+          "gateway/src/core/stt/speechmatics/config.rs:652",
+          "gateway/src/core/stt/speechmatics/config.rs:753-755",
+          "gateway/tests/mock_endpoint_e2e.rs:635",
+          "gateway/src/core/stt/speechmatics/config.rs:100-101",
+          "gateway/src/core/stt/speechmatics/config.rs:485",
+          "gateway/src/core/stt/speechmatics/config.rs:522",
+          "gateway/src/core/stt/speechmatics/client.rs:413-512",
+          "gateway/src/core/stt/batch.rs:839-844",
+          "gateway/src/core/stt/prerecorded.rs:117-124"
+        ],
+        "unverified": [
+          "transports[0].latency (unmeasured for the gateway's client; Pipecat's 0.74 s figure was taken with a different client and unstated settings and is not used as the seed)",
+          "limits.max_session_ms of the socket transports (48 hours comes from the audit's reading of the realtime limits page; the fact-check did not re-check it)",
+          "limits.rates[].scope of the socket transports (the plan-level session limit's counting scope is not stated)",
+          "billing.bills_silence of the row, which describes the socket (the gateway forwards every frame to the socket; whether silence is billed was not confirmed)",
+          "latency of the file transport (none published for 1 to 25 second clips)",
+          "limits.max_audio_ms and limits.min_audio_ms of the file transport (not documented)",
+          "limits.vendor_timeout_ms of the file transport (the wait parameter is capped server-side at an unpublished value)",
+          "limits.rates (requests) of the file transport (10 new jobs per second is the Self-serve plan figure; whether it is counted per key, project or workspace is unknown)",
+          "billing.min_billed_ms (none documented; billed to the second, but rounding of a part-second per job is not stated)",
+          "whether the realtime socket rejects the language value 'auto' or degrades silently"
+        ],
+        "notes": "Exact wire string; it is also what Speechmatics uses when no model is sent, and what an empty model resolves to in this map. Served by both the realtime socket and batch jobs, so it keeps the streaming client and needs no segmentation. The second transport is the same socket with the gateway deciding the end of each utterance, which is the route to low latency for this vendor."
+      }
+    },
+    {
+      "id": "speechmatics:enhanced",
+      "match": {
+        "provider": "speechmatics",
+        "model": "enhanced",
+        "model_aliases": [
+          "enh",
+          "high"
+        ]
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "either",
+          "vendor_turn_signal": "silence",
+          "constraints": {
+            "languages": {
+              "mode": "except",
+              "codes": [
+                "auto"
+              ],
+              "note": "Speechmatics documents automatic language detection ('auto') for batch transcription only (confirmed by the fact-check). Today's client accepts 'auto' and sends it; how the socket reacts is not established."
+            }
+          },
+          "latency": {
+            "class": "unknown",
+            "measurements": [],
+            "notes": "Not measured for the gateway's client. Pipecat lists SPEECHMATICS_TTFS_P99 at 0.74 s (end of speech to final transcript, voice-activity stop time 200 ms, model and client settings not stated), but that figure does not describe this transport: the gateway's client always sets max_delay to 2 seconds, never sends ForceEndOfUtterance and leaves the vendor's silence trigger off by default, so its finals are released on the 2-second max_delay timer (gateway/src/core/stt/speechmatics/mod.rs:59, client.rs:418-420, :468-470), and they are not marked speech-final, so the gateway's transcript timers add their own wait before the turn ends. The real figure is expected to be near 2 seconds or more (inferred from the code and the vendor's definition of max_delay; not measured). Record a number here only from the gateway's own probe."
+          },
+          "limits": {
+            "max_session_ms": 172800000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 50,
+                "plan": "pro",
+                "scope": "unknown",
+                "note": "Realtime sessions on the Pro plan."
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 2,
+                "plan": "free",
+                "scope": "unknown",
+                "note": "Realtime sessions on the Free plan."
+              }
+            ],
+            "assumed_plan": "pro"
+          },
+          "quality_signals": [
+            "word_confidence"
+          ],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "language_format": "iso639_1",
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "additional_vocab"
+              }
+            ],
+            "wire": "speechmatics_realtime_v2"
+          },
+          "gateway_client": {
+            "status": "wire_tested",
+            "code_ref": "gateway/src/core/stt/speechmatics/client.rs:251-300 (partials, finals and the end-of-utterance message), :413-470 (the StartRecognition message: operating_point, max_delay, vocabulary, silence trigger); gateway/src/core/stt/speechmatics/config.rs:518-541 (model gate); gateway/tests/mock_endpoint_e2e.rs:635 (mock end-to-end test)",
+            "notes": "Exercised only against an in-repo mock server. Finals are word groups released on the vendor's max_delay timer, which the client always sets to 2 seconds (mod.rs:59, client.rs:420). They are marked final but not speech-final, so the gateway's transcript timers end the turn, unless the session sets utterance_end_ms, which turns on the vendor's silence trigger (config.rs:753-755, client.rs:468-470). The client sends the deprecated operating_point field, never model, always dials the EU host (config.rs:652), and accepts the language value 'auto', which the vendor documents as batch only. The 50 concurrent sessions limit is the Pro plan figure (2 on the Free plan)."
+          }
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "planned_commit",
+          "enabled_from_release": null,
+          "disabled_reason": "The client never sends ForceEndOfUtterance. Sending it when the gateway's own voice-activity detector reports end of speech needs that detector and a small addition to the existing socket client.",
+          "interim_results": "live",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [
+              {
+                "percentile": "typical",
+                "quantity": "request_round_trip",
+                "value_ms": 250,
+                "basis": "vendor_claim",
+                "source": "https://www.speechmatics.com/company/articles-and-news/you-cant-hurry-love-but-you-can-hurry-final-transcripts",
+                "measured_on": "2026-01-21",
+                "conditions": "From the client's ForceEndOfUtterance message to the final transcript, network dependent. Counted from the commit, not from the end of speech, so it is not a seed."
+              }
+            ]
+          },
+          "limits": {
+            "max_session_ms": 172800000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 50,
+                "plan": "pro",
+                "scope": "unknown",
+                "note": "Realtime sessions on the Pro plan."
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 2,
+                "plan": "free",
+                "scope": "unknown",
+                "note": "Realtime sessions on the Free plan."
+              }
+            ],
+            "assumed_plan": "pro"
+          },
+          "quality_signals": [
+            "word_confidence"
+          ],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "language_format": "iso639_1",
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "additional_vocab"
+              }
+            ],
+            "wire": "speechmatics_realtime_v2"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/speechmatics/client.rs:413-512 (the only control message built is StartRecognition; a search of the module finds no ForceEndOfUtterance)",
+            "notes": "Same socket and session as the streaming client; only the end-of-utterance trigger changes hands from transcript timers to the gateway's detector. This is the vendor's fastest route to a final transcript."
+          }
+        },
+        {
+          "input_mode": "file_upload",
+          "adapter": "speechmatics_batch",
+          "enabled_from_release": 5,
+          "disabled_reason": "No file-upload adapter for Speechmatics batch jobs exists yet. For this model it would only be a fallback: the vendor advises against chunks shorter than 25 seconds, the batch service keeps audio for 7 days while the realtime socket stores nothing, and batch is billed as a different product.",
+          "enable_requires": [
+            "live_probe",
+            "latency_within_deadline"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [
+              {
+                "percentile": "single_sample",
+                "quantity": "inference_only",
+                "value_ms": 650,
+                "basis": "vendor_claim",
+                "source": "https://docs.speechmatics.com/speech-to-text/batch/synchronous.md",
+                "conditions": "Documentation sample for a 10-second file on enhanced: from the job's created_at to the transcript's created_at, about 0.65 s; excludes the upload and is illustrative only."
+              }
+            ],
+            "notes": "No latency is published for short clips. The vendor's micro-batching guide classes the approach as 'a few seconds' and advises against chunks under 25 seconds; the one figure recorded is a documentation sample, not a commitment. A measurement within the deadline is required before this transport is enabled (enable_requires)."
+          },
+          "limits": {
+            "max_upload_bytes": 1000000000,
+            "max_audio_ms": null,
+            "min_audio_ms": null,
+            "vendor_timeout_ms": null,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "second",
+                "value": 10,
+                "plan": "self_serve",
+                "scope": "unknown",
+                "note": "New jobs (POST /v2/jobs) per second on the Self-serve plan; the pricing page says Enterprise is unlimited."
+              },
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 20000,
+                "plan": null,
+                "scope": "unknown",
+                "note": "Concurrent jobs."
+              }
+            ],
+            "assumed_plan": "self_serve"
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "mp3",
+              "aac",
+              "ogg",
+              "mpeg",
+              "m4a",
+              "mp4",
+              "flac"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "multipart"
+          },
+          "quality_signals": [
+            "word_confidence"
+          ],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "language_format": "iso639_1",
+            "context_params": [
+              {
+                "kind": "keyterms",
+                "wire_name": "additional_vocab"
+              }
+            ],
+            "response_formats": [
+              "json-v2",
+              "txt",
+              "srt"
+            ],
+            "wire": "speechmatics_batch_jobs"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/batch.rs:839-844 and gateway/src/core/stt/prerecorded.rs:117-124 (no Speechmatics file builder exists)",
+            "notes": "Needs a multipart request with a 'config' part (JSON using model, not operating_point) and a 'data_file' part, bearer authentication, a per-region https base URL (the existing endpoint override accepts only ws and wss), handling of the job states created, done, rejected and deleted, and a best-effort delete of the job afterwards. The blocking wait parameter exists only on the hosted service; a self-hosted batch container needs submit and poll."
+          },
+          "file_request_mode": "sync_wait",
+          "segment_profile": {
+            "request_timeout_ms": 12000,
+            "rationale": "The request is POST /v2/jobs/?wait=10&format=json-v2, which blocks until the job finishes or the wait elapses, so each HTTP call gets 12 seconds, slightly longer than the wait. If the job is still running the adapter makes one GET of the transcript with a wait, then fails the segment. The server caps the wait at an unpublished value. The adapter should delete each job after reading it, because the batch service keeps audio for 7 days. All other defaults hold: the vendor names 16-bit 16 kHz mono WAV as the fastest format for very short files and bills to the second."
+          },
+          "billing": {
+            "unit": "audio_hour",
+            "min_billed_ms": null,
+            "bills_silence": false,
+            "notes": "Batch is a different product type from realtime, with its own rate, priced in credits per hour of audio and billed to the second. Only uploaded speech segments are billed. pricing.rs has no Speechmatics speech-to-text key."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "audio_hour",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "Realtime product type, priced in credits per hour of audio and billed to the second. pricing.rs has no Speechmatics speech-to-text key."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://docs.speechmatics.com/speech-to-text/models.md",
+          "https://docs.speechmatics.com/api-ref/realtime-transcription-websocket.md",
+          "https://docs.speechmatics.com/speech-to-text/realtime/output.md",
+          "https://docs.speechmatics.com/speech-to-text/realtime/limits.md",
+          "https://www.speechmatics.com/company/articles-and-news/you-cant-hurry-love-but-you-can-hurry-final-transcripts",
+          "https://docs.speechmatics.com/speech-to-text/batch/synchronous.md",
+          "https://docs.speechmatics.com/speech-to-text/batch/limits.md",
+          "https://docs.speechmatics.com/speech-to-text/batch/input.md",
+          "https://www.speechmatics.com/pricing",
+          "https://raw.githubusercontent.com/pipecat-ai/pipecat/main/src/pipecat/services/stt_latency.py"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/speechmatics/client.rs:251-300",
+          "gateway/src/core/stt/speechmatics/client.rs:413-470",
+          "gateway/src/core/stt/speechmatics/client.rs:418-420",
+          "gateway/src/core/stt/speechmatics/mod.rs:59",
+          "gateway/src/core/stt/speechmatics/config.rs:518-541",
+          "gateway/src/core/stt/speechmatics/config.rs:652",
+          "gateway/src/core/stt/speechmatics/config.rs:753-755",
+          "gateway/tests/mock_endpoint_e2e.rs:635",
+          "gateway/src/core/stt/speechmatics/config.rs:100-101",
+          "gateway/src/core/stt/speechmatics/config.rs:485",
+          "gateway/src/core/stt/speechmatics/config.rs:522",
+          "gateway/src/core/stt/speechmatics/client.rs:413-512",
+          "gateway/src/core/stt/batch.rs:839-844",
+          "gateway/src/core/stt/prerecorded.rs:117-124"
+        ],
+        "unverified": [
+          "transports[0].latency (unmeasured for the gateway's client; Pipecat's 0.74 s figure was taken with a different client and unstated settings and is not used as the seed)",
+          "limits.max_session_ms of the socket transports (48 hours comes from the audit's reading of the realtime limits page; the fact-check did not re-check it)",
+          "limits.rates[].scope of the socket transports (the plan-level session limit's counting scope is not stated)",
+          "billing.bills_silence of the row, which describes the socket (the gateway forwards every frame to the socket; whether silence is billed was not confirmed)",
+          "latency of the file transport (none published for 1 to 25 second clips)",
+          "limits.max_audio_ms and limits.min_audio_ms of the file transport (not documented)",
+          "limits.vendor_timeout_ms of the file transport (the wait parameter is capped server-side at an unpublished value)",
+          "limits.rates (requests) of the file transport (10 new jobs per second is the Self-serve plan figure; whether it is counted per key, project or workspace is unknown)",
+          "billing.min_billed_ms (none documented; billed to the second, but rounding of a part-second per job is not stated)",
+          "whether the realtime socket rejects the language value 'auto' or degrades silently"
+        ],
+        "notes": "Exact wire string for the highest-accuracy model. The medical variant is this model with domain set to medical, not a separate id. Served by both the realtime socket and batch jobs, so it keeps the streaming client and needs no segmentation. The second transport is the same socket with the gateway deciding the end of each utterance, which is the route to low latency for this vendor."
+      }
+    },
+    {
+      "id": "speechmatics:melia-1",
+      "match": {
+        "provider": "speechmatics",
+        "model": "melia-1"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "speechmatics_batch",
+          "enabled_from_release": 5,
+          "disabled_reason": "No file-upload adapter for Speechmatics batch jobs exists yet. This model is documented as batch only, so a live session naming it is refused (today the streaming client rejects the id by name) until the adapter ships.",
+          "enable_requires": [
+            "live_probe",
+            "latency_within_deadline"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "constraints": {
+            "regions": {
+              "mode": "only",
+              "values": [
+                "eu1",
+                "us1"
+              ],
+              "note": "Batch hosts. The models page says this model is available for batch in the EU and US regions only (confirmed by the fact-check)."
+            }
+          },
+          "latency": {
+            "class": "unknown",
+            "measurements": [
+              {
+                "percentile": "single_sample",
+                "quantity": "inference_only",
+                "value_ms": 650,
+                "basis": "vendor_claim",
+                "source": "https://docs.speechmatics.com/speech-to-text/batch/synchronous.md",
+                "conditions": "Documentation sample for a 10-second file on enhanced: from the job's created_at to the transcript's created_at, about 0.65 s; excludes the upload and is illustrative only."
+              }
+            ],
+            "notes": "No latency is published for short clips. The vendor's micro-batching guide classes the approach as 'a few seconds' and advises against chunks under 25 seconds; the one figure recorded is a documentation sample, not a commitment. A measurement within the deadline is required before this transport is enabled (enable_requires)."
+          },
+          "limits": {
+            "max_upload_bytes": 1000000000,
+            "max_audio_ms": null,
+            "min_audio_ms": null,
+            "vendor_timeout_ms": null,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "second",
+                "value": 10,
+                "plan": "self_serve",
+                "scope": "unknown",
+                "note": "New jobs (POST /v2/jobs) per second on the Self-serve plan; the pricing page says Enterprise is unlimited."
+              },
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 20000,
+                "plan": null,
+                "scope": "unknown",
+                "note": "Concurrent jobs."
+              }
+            ],
+            "assumed_plan": "self_serve"
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "mp3",
+              "aac",
+              "ogg",
+              "mpeg",
+              "m4a",
+              "mp4",
+              "flac"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "multipart",
+            "vendor_params": [
+              {
+                "name": "language",
+                "value": "multi",
+                "in": "json"
+              }
+            ]
+          },
+          "quality_signals": [
+            "detected_languages"
+          ],
+          "dialect": {
+            "language_param": "language_hints",
+            "language_shape": "list",
+            "language_format": "iso639_1",
+            "context_params": [],
+            "response_formats": [
+              "json-v2",
+              "txt",
+              "srt"
+            ],
+            "wire": "speechmatics_batch_jobs"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/batch.rs:839-844 and gateway/src/core/stt/prerecorded.rs:117-124 (no Speechmatics file builder exists)",
+            "notes": "Needs a multipart request with a 'config' part (JSON using model, not operating_point) and a 'data_file' part, bearer authentication, a per-region https base URL (the existing endpoint override accepts only ws and wss), handling of the job states created, done, rejected and deleted, and a best-effort delete of the job afterwards. The blocking wait parameter exists only on the hosted service; a self-hosted batch container needs submit and poll."
+          },
+          "file_request_mode": "sync_wait",
+          "segment_profile": {
+            "request_timeout_ms": 12000,
+            "rationale": "The request is POST /v2/jobs/?wait=10&format=json-v2, which blocks until the job finishes or the wait elapses, so each HTTP call gets 12 seconds, slightly longer than the wait. If the job is still running the adapter makes one GET of the transcript with a wait, then fails the segment. The server caps the wait at an unpublished value. The adapter should delete each job after reading it, because the batch service keeps audio for 7 days. All other defaults hold: the vendor names 16-bit 16 kHz mono WAV as the fastest format for very short files and bills to the second."
+          }
+        },
+        {
+          "input_mode": "live_stream",
+          "adapter": "planned_stream",
+          "enabled_from_release": null,
+          "disabled_reason": "The streaming client refuses this id and sends operating_point rather than model. Speechmatics sources disagree on whether the production realtime socket accepts it: the realtime reference and the published specification list melia-1, the models page says batch only, and a preview page planned a production release for October 2026. It needs a probe with an API key.",
+          "interim_results": "live",
+          "endpointing_owner": "either",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "slow",
+            "measurements": [
+              {
+                "percentile": "mean",
+                "quantity": "end_of_speech_to_final",
+                "value_ms": 4000,
+                "basis": "vendor_claim",
+                "source": "https://docs.speechmatics.com/private/melia-1-realtime.md",
+                "conditions": "Realtime preview, not for production use: the vendor says finals average about 4 seconds and vary."
+              }
+            ]
+          },
+          "limits": {
+            "max_session_ms": null,
+            "rates": []
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "context_params": [],
+            "wire": "speechmatics_realtime_v2"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/speechmatics/config.rs:536-540 (the id is refused by name); gateway/src/core/stt/speechmatics/client.rs:418-425 (max_delay is always sent and operating_point is sent instead of model)",
+            "notes": "The preview requires max_delay to be removed and model to be sent, neither of which the client can do today. Kept as a disabled transport so that moving this model to streaming is a change to this row only."
+          },
+          "billing": {
+            "unit": "audio_hour",
+            "min_billed_ms": null,
+            "bills_silence": null,
+            "notes": "The vendor's pricing page embeds a real-time rate of 0.40 USD per hour for Melia 1 (read 2026-10-03), although the models page says batch only. Whether silence on the socket is billed was not established."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "refused_at_setup",
+        "code_ref": "gateway/src/core/stt/speechmatics/config.rs:518-541 (any model other than standard, enhanced and their short aliases is refused by name with a configuration error), called at :702 when the client is built",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "Melia 1 is Speechmatics' multilingual model and is offered only for transcription of uploaded files. This gateway does not yet serve it on a live call. Choose the Speechmatics standard or enhanced model, or ask the operator to enable segmented speech-to-text for this deployment."
+        }
+      },
+      "billing": {
+        "unit": "audio_hour",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "notes": "Priced in credits per hour of audio and billed to the second; realtime and batch are different product types with different rates. pricing.rs has no Speechmatics speech-to-text key. Only uploaded speech segments would be billed, under the batch product type."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://docs.speechmatics.com/speech-to-text/models.md",
+          "https://docs.speechmatics.com/speech-to-text/batch/synchronous.md",
+          "https://docs.speechmatics.com/speech-to-text/batch/limits.md",
+          "https://docs.speechmatics.com/speech-to-text/batch/input.md",
+          "https://docs.speechmatics.com/speech-to-text/batch/output.md",
+          "https://docs.speechmatics.com/get-started/authentication.md",
+          "https://www.speechmatics.com/company/articles-and-news/how-to-build-a-microbatching-workflow-with-the-speechmatics-api",
+          "https://www.speechmatics.com/pricing",
+          "https://docs.speechmatics.com/api-ref/realtime-transcription-websocket.md",
+          "https://docs.speechmatics.com/private/melia-1-realtime.md"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/speechmatics/config.rs:518-541",
+          "gateway/src/core/stt/speechmatics/config.rs:702",
+          "gateway/src/core/stt/batch.rs:839-844",
+          "gateway/src/core/stt/prerecorded.rs:117-124",
+          "gateway/src/core/stt/speechmatics/client.rs:418-425"
+        ],
+        "recheck_on": "2026-11-03",
+        "unverified": [
+          "latency of the file transport (none published for 1 to 25 second clips)",
+          "limits.max_audio_ms and limits.min_audio_ms of the file transport (not documented)",
+          "limits.vendor_timeout_ms of the file transport (the wait parameter is capped server-side at an unpublished value)",
+          "limits.rates (requests) of the file transport (10 new jobs per second is the Self-serve plan figure; whether it is counted per key, project or workspace is unknown)",
+          "billing.min_billed_ms (none documented; billed to the second, but rounding of a part-second per job is not stated)",
+          "whether the blocking wait parameter behaves the same for this model as for standard and enhanced (no restriction is documented)",
+          "whether an API key is bound to one region (vendor pages disagree; only jobs are certainly bound to the host that created them)",
+          "transports[1] (whether the production realtime socket accepts this model today)",
+          "transports[1].endpointing_owner, vendor_turn_signal and limits (assumed to match the realtime socket; not stated for this model)"
+        ],
+        "notes": "Exact wire string for the multilingual, code-switching model. Batch only as documented on 2026-10-03, so it needs segmentation. The language is sent as 'multi' ('auto' returns an error), recorded as a fixed upload parameter, and the customer's language, if any, goes in language_hints. It returns no confidence scores and supports no custom dictionary, entities or translation, so quality filtering must rely on the gateway's detector and an empty-transcript check. The vendor advises against micro-batch chunks under 25 seconds and positions the approach for scribes and post-call work, not voice agents; latency must be measured before any target is promised. Today the streaming client refuses the id by name, so a live session is refused at setup until the batch transport is enabled; that transport needs a live probe and a latency measurement first (decisions section 12)."
+      }
+    },
+    {
+      "id": "speechmatics:oak-1",
+      "match": {
+        "provider": "speechmatics",
+        "model": "oak-1"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "file_upload",
+          "adapter": "speechmatics_batch",
+          "enabled_from_release": 5,
+          "disabled_reason": "No file-upload adapter for Speechmatics batch jobs exists yet. This model is documented as batch only, so a live session naming it is refused (today the streaming client rejects the id by name) until the adapter ships.",
+          "enable_requires": [
+            "live_probe",
+            "latency_within_deadline"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "constraints": {
+            "regions": {
+              "mode": "only",
+              "values": [
+                "eu1",
+                "us1"
+              ],
+              "note": "Batch hosts. The models page says this model is available for batch in the EU and US regions only (confirmed by the fact-check)."
+            }
+          },
+          "latency": {
+            "class": "unknown",
+            "measurements": [
+              {
+                "percentile": "single_sample",
+                "quantity": "inference_only",
+                "value_ms": 650,
+                "basis": "vendor_claim",
+                "source": "https://docs.speechmatics.com/speech-to-text/batch/synchronous.md",
+                "conditions": "Documentation sample for a 10-second file on enhanced: from the job's created_at to the transcript's created_at, about 0.65 s; excludes the upload and is illustrative only."
+              }
+            ],
+            "notes": "No latency is published for short clips. The vendor's micro-batching guide classes the approach as 'a few seconds' and advises against chunks under 25 seconds; the one figure recorded is a documentation sample, not a commitment. A measurement within the deadline is required before this transport is enabled (enable_requires)."
+          },
+          "limits": {
+            "max_upload_bytes": 1000000000,
+            "max_audio_ms": null,
+            "min_audio_ms": null,
+            "vendor_timeout_ms": null,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "second",
+                "value": 10,
+                "plan": "self_serve",
+                "scope": "unknown",
+                "note": "New jobs (POST /v2/jobs) per second on the Self-serve plan; the pricing page says Enterprise is unlimited."
+              },
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 20000,
+                "plan": null,
+                "scope": "unknown",
+                "note": "Concurrent jobs."
+              }
+            ],
+            "assumed_plan": "self_serve"
+          },
+          "upload": {
+            "accepted": [
+              "wav",
+              "mp3",
+              "aac",
+              "ogg",
+              "mpeg",
+              "m4a",
+              "mp4",
+              "flac"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "multipart",
+            "vendor_params": [
+              {
+                "name": "language",
+                "value": "multi",
+                "in": "json"
+              }
+            ]
+          },
+          "quality_signals": [
+            "detected_languages"
+          ],
+          "dialect": {
+            "language_param": "language_hints",
+            "language_shape": "list",
+            "language_format": "iso639_1",
+            "context_params": [],
+            "response_formats": [
+              "json-v2",
+              "txt",
+              "srt"
+            ],
+            "wire": "speechmatics_batch_jobs"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/batch.rs:839-844 and gateway/src/core/stt/prerecorded.rs:117-124 (no Speechmatics file builder exists)",
+            "notes": "Needs a multipart request with a 'config' part (JSON using model, not operating_point) and a 'data_file' part, bearer authentication, a per-region https base URL (the existing endpoint override accepts only ws and wss), handling of the job states created, done, rejected and deleted, and a best-effort delete of the job afterwards. The blocking wait parameter exists only on the hosted service; a self-hosted batch container needs submit and poll."
+          },
+          "file_request_mode": "sync_wait",
+          "segment_profile": {
+            "request_timeout_ms": 12000,
+            "rationale": "The request is POST /v2/jobs/?wait=10&format=json-v2, which blocks until the job finishes or the wait elapses, so each HTTP call gets 12 seconds, slightly longer than the wait. If the job is still running the adapter makes one GET of the transcript with a wait, then fails the segment. The server caps the wait at an unpublished value. The adapter should delete each job after reading it, because the batch service keeps audio for 7 days. All other defaults hold: the vendor names 16-bit 16 kHz mono WAV as the fastest format for very short files and bills to the second."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "refused_at_setup",
+        "code_ref": "gateway/src/core/stt/speechmatics/config.rs:518-541 (any model other than standard, enhanced and their short aliases is refused by name with a configuration error), called at :702 when the client is built",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "Oak 1 is Speechmatics' multilingual healthcare model and is offered only for transcription of uploaded files. This gateway does not yet serve it on a live call. Choose the Speechmatics enhanced model, or ask the operator to enable segmented speech-to-text for this deployment."
+        }
+      },
+      "billing": {
+        "unit": "audio_hour",
+        "min_billed_ms": null,
+        "bills_silence": false,
+        "notes": "Priced in credits per hour of audio and billed to the second; realtime and batch are different product types with different rates. pricing.rs has no Speechmatics speech-to-text key. Only uploaded speech segments would be billed, under the batch product type."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://docs.speechmatics.com/speech-to-text/models.md",
+          "https://docs.speechmatics.com/speech-to-text/batch/synchronous.md",
+          "https://docs.speechmatics.com/speech-to-text/batch/limits.md",
+          "https://docs.speechmatics.com/speech-to-text/batch/input.md",
+          "https://docs.speechmatics.com/speech-to-text/batch/output.md",
+          "https://docs.speechmatics.com/get-started/authentication.md",
+          "https://www.speechmatics.com/company/articles-and-news/how-to-build-a-microbatching-workflow-with-the-speechmatics-api",
+          "https://www.speechmatics.com/pricing"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/speechmatics/config.rs:518-541",
+          "gateway/src/core/stt/speechmatics/config.rs:702",
+          "gateway/src/core/stt/batch.rs:839-844",
+          "gateway/src/core/stt/prerecorded.rs:117-124"
+        ],
+        "recheck_on": "2026-11-03",
+        "unverified": [
+          "latency of the file transport (none published for 1 to 25 second clips)",
+          "limits.max_audio_ms and limits.min_audio_ms of the file transport (not documented)",
+          "limits.vendor_timeout_ms of the file transport (the wait parameter is capped server-side at an unpublished value)",
+          "limits.rates (requests) of the file transport (10 new jobs per second is the Self-serve plan figure; whether it is counted per key, project or workspace is unknown)",
+          "billing.min_billed_ms (none documented; billed to the second, but rounding of a part-second per job is not stated)",
+          "whether the blocking wait parameter behaves the same for this model as for standard and enhanced (no restriction is documented)",
+          "whether an API key is bound to one region (vendor pages disagree; only jobs are certainly bound to the host that created them)",
+          "match.model (oak-1 is absent from the batch input-page list of values and from the published batch specification, so the string has not been confirmed against the API)",
+          "whether a realtime interface is planned (the pricing page embeds a realtime rate for this model; no documentation mentions one)"
+        ],
+        "notes": "Wire string for the multilingual healthcare model as written on the vendor's models, usage and pricing pages. Batch only as documented on 2026-10-03, so it needs segmentation. The language is sent as 'multi' ('auto' returns an error), recorded as a fixed upload parameter, and the customer's language, if any, goes in language_hints. It returns no confidence scores and supports no custom dictionary, entities or translation, so quality filtering must rely on the gateway's detector and an empty-transcript check. The vendor advises against micro-batch chunks under 25 seconds and positions the approach for scribes and post-call work, not voice agents; latency must be measured before any target is promised. Today the streaming client refuses the id by name, so a live session is refused at setup until the batch transport is enabled; that transport needs a live probe and a latency measurement first (decisions section 12)."
+      }
+    },
+    {
+      "id": "speechmatics:linden-1",
+      "match": {
+        "provider": "speechmatics",
+        "model": "linden-1"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "planned_stream",
+          "enabled_from_release": null,
+          "disabled_reason": "No gateway client exists for the Speechmatics Agent speech-to-text socket (/v2/agent), which uses a different message set from the realtime socket and accepts only 16 kHz audio. The model has no file interface, so segmentation cannot serve it either.",
+          "interim_results": "live",
+          "endpointing_owner": "either",
+          "vendor_turn_signal": "silence",
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": null,
+            "rates": []
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "context_params": [],
+            "wire": "speechmatics_agent_v2"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/speechmatics/config.rs:536-540 (the id is refused by name); gateway/src/core/stt/speechmatics/mod.rs:47-50 (only the /v2 realtime hosts are known)",
+            "notes": "A second streaming adapter is needed. The socket's turn_detection_mode is 'vad' (the vendor ends the turn) or 'external' (the client does), which is why the endpointing owner is recorded as selectable."
+          }
+        }
+      ],
+      "when_unusable": {
+        "today": "refused_at_setup",
+        "code_ref": "gateway/src/core/stt/speechmatics/config.rs:518-541 (any model other than standard, enhanced and their short aliases is refused by name with a configuration error), called at :702 when the client is built",
+        "refuse_from_release": null,
+        "refusal": {
+          "code": "stt_live_unsupported",
+          "reason": "client_not_implemented",
+          "text": "Linden 1 streams only on Speechmatics' agent interface, which this gateway does not speak, and it has no file interface. Choose the Speechmatics standard or enhanced model for live calls."
+        }
+      },
+      "billing": {
+        "unit": "audio_hour",
+        "min_billed_ms": null,
+        "bills_silence": null,
+        "notes": "Priced in credits per hour of audio and billed to the second; realtime and batch are different product types with different rates. pricing.rs has no Speechmatics speech-to-text key."
+      },
+      "provenance": {
+        "confidence": "documented",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://docs.speechmatics.com/api-ref/agent-stt-websocket.md",
+          "https://docs.speechmatics.com/speech-to-text/models.md",
+          "https://www.speechmatics.com/pricing"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/speechmatics/config.rs:518-541",
+          "gateway/src/core/stt/speechmatics/config.rs:702",
+          "gateway/src/core/stt/speechmatics/mod.rs:47-50"
+        ],
+        "unverified": [
+          "transports[0].vendor_turn_signal (the vendor's own turn detection is called 'vad'; whether it is purely silence-based was not established)",
+          "transports[0].limits, quality_signals and dialect.context_params (not established for the Agent socket; recorded as empty or null)",
+          "billing.min_billed_ms and billing.bills_silence"
+        ],
+        "notes": "Exact wire string, required on the Agent speech-to-text socket and not available on batch or the realtime socket. It streams, so segmentation does not apply. Today the streaming client refuses the id by name; the map refuses it at setup with a named reason until a client for the Agent socket exists, which no release schedules."
+      }
+    },
+    {
+      "id": "speechmatics:any",
+      "match": {
+        "provider": "speechmatics",
+        "model_glob": "*"
+      },
+      "lifecycle": {
+        "status": "ga"
+      },
+      "transports": [
+        {
+          "input_mode": "live_stream",
+          "adapter": "native",
+          "enabled_from_release": 0,
+          "interim_results": "live",
+          "endpointing_owner": "either",
+          "vendor_turn_signal": "silence",
+          "constraints": {
+            "languages": {
+              "mode": "except",
+              "codes": [
+                "auto"
+              ],
+              "note": "Speechmatics documents automatic language detection ('auto') for batch transcription only (confirmed by the fact-check). Today's client accepts 'auto' and sends it; how the socket reacts is not established."
+            }
+          },
+          "latency": {
+            "class": "unknown",
+            "measurements": []
+          },
+          "limits": {
+            "max_session_ms": 172800000,
+            "rates": [
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 50,
+                "plan": "pro",
+                "scope": "unknown",
+                "note": "Realtime sessions on the Pro plan."
+              },
+              {
+                "metric": "concurrent_sessions",
+                "per": "none",
+                "value": 2,
+                "plan": "free",
+                "scope": "unknown",
+                "note": "Realtime sessions on the Free plan."
+              }
+            ],
+            "assumed_plan": "pro"
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "language_format": "iso639_1",
+            "context_params": [],
+            "wire": "speechmatics_realtime_v2"
+          },
+          "gateway_client": {
+            "status": "wire_tested",
+            "code_ref": "gateway/src/core/stt/speechmatics/client.rs:251-300 (partials, finals and the end-of-utterance message), :413-470 (the StartRecognition message: operating_point, max_delay, vocabulary, silence trigger); gateway/src/core/stt/speechmatics/config.rs:518-541 (model gate); gateway/tests/mock_endpoint_e2e.rs:635 (mock end-to-end test)",
+            "notes": "Exercised only against an in-repo mock server. On this row the client itself decides: an id containing 'standard' or 'enhanced', or one of the aliases std, enh and high, selects that operating point; any other id is refused at construction with a configuration error that names it (config.rs:526-540). This is exactly today's behaviour."
+          }
+        },
+        {
+          "input_mode": "file_upload",
+          "adapter": "speechmatics_batch",
+          "enabled_from_release": 5,
+          "disabled_reason": "No file-upload adapter for Speechmatics batch jobs exists yet. On this row the transport is reachable only when a session asks for segmented transcription, because the streaming client stays first. Ids the streaming client maps by substring (any id containing 'standard' or 'enhanced', gateway/src/core/stt/speechmatics/config.rs:526-531) reach this row and must be normalised to 'standard' or 'enhanced' before they are sent as the batch job's model; the vendor is expected to reject them otherwise (inferred). The short aliases std, enh and high are model aliases of the exact rows, and nova-3 is read as no model (key_normalisation).",
+          "enable_requires": [
+            "live_probe",
+            "latency_within_deadline"
+          ],
+          "interim_results": "none",
+          "endpointing_owner": "gateway",
+          "vendor_turn_signal": "none",
+          "latency": {
+            "class": "unknown",
+            "measurements": [
+              {
+                "percentile": "single_sample",
+                "quantity": "inference_only",
+                "value_ms": 650,
+                "basis": "vendor_claim",
+                "source": "https://docs.speechmatics.com/speech-to-text/batch/synchronous.md",
+                "conditions": "Documentation sample for a 10-second file on enhanced: from the job's created_at to the transcript's created_at, about 0.65 s; excludes the upload and is illustrative only."
+              }
+            ],
+            "notes": "No latency is published for short clips. The vendor's micro-batching guide classes the approach as 'a few seconds' and advises against chunks under 25 seconds; the one figure recorded is a documentation sample, not a commitment. A measurement within the deadline is required before this transport is enabled (enable_requires)."
+          },
+          "limits": {
+            "max_upload_bytes": 1000000000,
+            "max_audio_ms": null,
+            "min_audio_ms": null,
+            "vendor_timeout_ms": null,
+            "rates": [
+              {
+                "metric": "requests",
+                "per": "second",
+                "value": 10,
+                "plan": "self_serve",
+                "scope": "unknown",
+                "note": "New jobs (POST /v2/jobs) per second on the Self-serve plan; the pricing page says Enterprise is unlimited."
+              },
+              {
+                "metric": "concurrent_requests",
+                "per": "none",
+                "value": 20000,
+                "plan": null,
+                "scope": "unknown",
+                "note": "Concurrent jobs."
+              }
+            ],
+            "assumed_plan": "self_serve"
+          },
+          "upload": {
+            "accepted": [
+              "wav"
+            ],
+            "preferred": {
+              "container": "wav",
+              "encoding": "pcm_s16le",
+              "sample_rate_hz": 16000,
+              "channels": 1
+            },
+            "envelope": "multipart"
+          },
+          "quality_signals": [],
+          "dialect": {
+            "language_param": "language",
+            "language_shape": "single",
+            "language_format": "iso639_1",
+            "context_params": [],
+            "response_formats": [
+              "json-v2",
+              "txt",
+              "srt"
+            ],
+            "wire": "speechmatics_batch_jobs"
+          },
+          "gateway_client": {
+            "status": "not_implemented",
+            "code_ref": "gateway/src/core/stt/batch.rs:839-844 and gateway/src/core/stt/prerecorded.rs:117-124 (no Speechmatics file builder exists)",
+            "notes": "Needs a multipart request with a 'config' part (JSON using model, not operating_point) and a 'data_file' part, bearer authentication, a per-region https base URL (the existing endpoint override accepts only ws and wss), handling of the job states created, done, rejected and deleted, and a best-effort delete of the job afterwards. The blocking wait parameter exists only on the hosted service; a self-hosted batch container needs submit and poll."
+          },
+          "file_request_mode": "sync_wait",
+          "segment_profile": {
+            "request_timeout_ms": 12000,
+            "rationale": "The request is POST /v2/jobs/?wait=10&format=json-v2, which blocks until the job finishes or the wait elapses, so each HTTP call gets 12 seconds, slightly longer than the wait. If the job is still running the adapter makes one GET of the transcript with a wait, then fails the segment. The server caps the wait at an unpublished value. The adapter should delete each job after reading it, because the batch service keeps audio for 7 days. All other defaults hold: the vendor names 16-bit 16 kHz mono WAV as the fastest format for very short files and bills to the second."
+          }
+        }
+      ],
+      "billing": {
+        "unit": "unknown",
+        "min_billed_ms": null,
+        "bills_silence": null
+      },
+      "provenance": {
+        "confidence": "assumed",
+        "verified_on": "2026-10-03",
+        "verified_by": "docs",
+        "owner": "waav-gateway",
+        "sources": [
+          "https://docs.speechmatics.com/speech-to-text/models.md",
+          "https://docs.speechmatics.com/speech-to-text/batch/synchronous.md"
+        ],
+        "code_refs": [
+          "gateway/src/core/stt/speechmatics/client.rs:251-300",
+          "gateway/src/core/stt/speechmatics/client.rs:413-470",
+          "gateway/src/core/stt/speechmatics/client.rs:418-420",
+          "gateway/src/core/stt/speechmatics/mod.rs:59",
+          "gateway/src/core/stt/speechmatics/config.rs:518-541",
+          "gateway/src/core/stt/speechmatics/config.rs:652",
+          "gateway/src/core/stt/speechmatics/config.rs:753-755",
+          "gateway/tests/mock_endpoint_e2e.rs:635",
+          "gateway/src/core/stt/speechmatics/config.rs:100-101",
+          "gateway/src/core/stt/speechmatics/config.rs:485",
+          "gateway/src/core/stt/speechmatics/config.rs:522",
+          "gateway/src/core/stt/batch.rs:839-844",
+          "gateway/src/core/stt/prerecorded.rs:117-124",
+          "gateway/src/core/stt/speechmatics/config.rs:526-531"
+        ],
+        "unverified": [
+          "every field: this row describes a model id the map does not know"
+        ],
+        "notes": "Default for an unknown Speechmatics model id. The streaming client is listed first (conversion rules section 9), so today's behaviour is unchanged: it streams the ids its own substring rules accept and refuses every other id by name at construction. The batch transport behind it is reachable only when a session asks for segmented transcription, and only after the substring ids are normalised (see its disabled_reason)."
+      }
+    }
+  ]
+}

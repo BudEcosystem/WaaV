@@ -76,6 +76,11 @@ pub struct VoiceManagerConfig {
     /// to determine when the user has finished speaking.
     #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
     pub smart_turn_config: Option<SmartTurnProcessorConfig>,
+    /// Set when the capability map routed this session to the segmented engine: the model takes
+    /// only files, so the gateway cuts the caller's audio at pauses and uploads each utterance.
+    /// [`VoiceManager::new`](crate::core::voice_manager::VoiceManager::new) then builds the
+    /// engine instead of a streaming client (the live factory).
+    pub segmented: Option<crate::core::stt::segmented::SegmentedPlan>,
 }
 
 impl VoiceManagerConfig {
@@ -93,6 +98,7 @@ impl VoiceManagerConfig {
             resilience: None,
             #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
             smart_turn_config: None,
+            segmented: None,
         }
     }
 
@@ -112,6 +118,7 @@ impl VoiceManagerConfig {
             resilience: None,
             #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
             smart_turn_config: None,
+            segmented: None,
         }
     }
 
@@ -121,6 +128,12 @@ impl VoiceManagerConfig {
     /// the gateway-wide reconnect governor and this provider's circuit breaker.
     pub fn with_resilience(mut self, resilience: ResilienceHandles) -> Self {
         self.resilience = Some(resilience);
+        self
+    }
+
+    /// Route the session to the segmented engine.
+    pub fn with_segmented(mut self, plan: crate::core::stt::segmented::SegmentedPlan) -> Self {
+        self.segmented = Some(plan);
         self
     }
 
@@ -139,6 +152,7 @@ impl VoiceManagerConfig {
             resilience: None,
             #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
             smart_turn_config: None,
+            segmented: None,
         }
     }
 
@@ -161,6 +175,7 @@ impl VoiceManagerConfig {
             speech_final_config: SpeechFinalConfig::default(),
             resilience: None,
             smart_turn_config: Some(smart_turn_config),
+            segmented: None,
         }
     }
 
@@ -180,6 +195,7 @@ impl VoiceManagerConfig {
             speech_final_config,
             resilience: None,
             smart_turn_config,
+            segmented: None,
         }
     }
 }
