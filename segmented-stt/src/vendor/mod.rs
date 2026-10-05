@@ -154,11 +154,11 @@ pub fn retry_after(headers: &HeaderMap) -> Option<Duration> {
     if let Some(d) = get("retry-after").and_then(|v| parse_retry_after(v, SystemTime::now())) {
         return Some(d);
     }
-    if let Some(ms) = get("retry-after-ms")
+    if let Some(d) = get("retry-after-ms")
         .and_then(|v| v.parse::<f64>().ok())
-        .filter(|ms| ms.is_finite() && *ms >= 0.0)
+        .and_then(|ms| Duration::try_from_secs_f64(ms / 1000.0).ok())
     {
-        return Some(Duration::from_secs_f64(ms / 1000.0));
+        return Some(d);
     }
     get("x-ratelimit-reset-requests").and_then(parse_compound_duration)
 }
@@ -167,7 +167,7 @@ pub fn retry_after(headers: &HeaderMap) -> Option<Duration> {
 pub fn parse_retry_after(value: &str, now: SystemTime) -> Option<Duration> {
     let value = value.trim();
     if let Ok(secs) = value.parse::<f64>() {
-        return (secs.is_finite() && secs >= 0.0).then(|| Duration::from_secs_f64(secs));
+        return Duration::try_from_secs_f64(secs).ok();
     }
     let at = parse_http_date(value)?;
     Some(at.duration_since(now).unwrap_or(Duration::ZERO))
@@ -218,7 +218,7 @@ pub fn parse_compound_duration(value: &str) -> Option<Duration> {
         return None;
     }
     if let Ok(secs) = value.parse::<f64>() {
-        return (secs.is_finite() && secs >= 0.0).then(|| Duration::from_secs_f64(secs));
+        return Duration::try_from_secs_f64(secs).ok();
     }
     let mut total = 0.0f64;
     let mut rest = value;
@@ -242,7 +242,7 @@ pub fn parse_compound_duration(value: &str) -> Option<Duration> {
         total += n * scale;
         rest = &rest[unit_len..];
     }
-    Some(Duration::from_secs_f64(total))
+    Duration::try_from_secs_f64(total).ok()
 }
 
 /// What a vendor's error body says, from whichever envelope it uses.
@@ -463,6 +463,17 @@ mod tests {
         assert_eq!(parse_compound_duration("3"), Some(Duration::from_secs(3)));
         assert_eq!(parse_compound_duration("soon"), None);
         assert_eq!(parse_compound_duration(""), None);
+    }
+
+    #[test]
+    fn a_wait_too_long_for_a_duration_is_no_wait_not_a_panic() {
+        let now = SystemTime::now();
+        assert_eq!(parse_retry_after("1e30", now), None);
+        assert_eq!(parse_compound_duration("1e30"), None);
+        assert_eq!(parse_compound_duration("99999999999999999999h"), None);
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after-ms", HeaderValue::from_static("1e30"));
+        assert_eq!(retry_after(&headers), None);
     }
 
     #[test]

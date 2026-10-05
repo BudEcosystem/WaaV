@@ -61,6 +61,10 @@ const MAX_RETRIES: u32 = 3;
 /// Base delay for exponential backoff (milliseconds).
 const BASE_RETRY_DELAY_MS: u64 = 500;
 
+/// The longest a retry waits, whatever Groq's `Retry-After` asks (milliseconds): the limit the
+/// segmented sessions' rate gate puts on the same signal.
+const MAX_RETRY_DELAY_MS: u64 = 60_000;
+
 /// Default connect timeout in seconds.
 const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 30;
 
@@ -193,6 +197,23 @@ impl RateLimitInfo {
     }
 }
 
+/// A failed attempt, with the HTTP status Groq answered when it answered one: whether to try
+/// again is decided by the status, not by the error's text.
+#[derive(Debug)]
+struct SendFailure {
+    error: STTError,
+    status: Option<u16>,
+}
+
+impl From<STTError> for SendFailure {
+    fn from(error: STTError) -> Self {
+        Self {
+            error,
+            status: None,
+        }
+    }
+}
+
 /// Groq STT (Whisper) client implementing the BaseSTT trait.
 ///
 /// This client uses the Groq Audio Transcription API to convert speech to text.
@@ -266,10 +287,6 @@ pub struct GroqSTT {
     /// Last request ID from Groq API (for debugging/support).
     pub last_request_id: Option<String>,
 
-    /// The HTTP status of the last failed attempt, when Groq answered one: whether to try again
-    /// is decided by it, not by the error's text.
-    last_error_status: Option<u16>,
-
     // ==========================================================================
     // Silence Detection State
     // ==========================================================================
@@ -336,7 +353,6 @@ impl GroqSTT {
             total_bytes_received: 0,
             rate_limit_info: RateLimitInfo::default(),
             last_request_id: None,
-            last_error_status: None,
             first_audio_time: None,
             silence_start_time: None,
             last_was_silent: false,
@@ -521,10 +537,7 @@ impl GroqSTT {
         for attempt in 0..MAX_RETRIES {
             if attempt > 0 {
                 // Use Retry-After header if available, otherwise exponential backoff
-                let delay = self
-                    .rate_limit_info
-                    .retry_after_ms
-                    .unwrap_or_else(|| BASE_RETRY_DELAY_MS * 2u64.pow(attempt - 1));
+                let delay = Self::retry_delay_ms(self.rate_limit_info.retry_after_ms, attempt);
 
                 debug!(
                     "Retry attempt {} after {}ms delay{}",
@@ -603,9 +616,8 @@ impl GroqSTT {
                     self.audio_buffer.clear();
                     return Ok(());
                 }
-                Err(e) => {
+                Err(SendFailure { error: e, status }) => {
                     // Transient by the status Groq answered, or a network failure.
-                    let status = self.last_error_status.take();
                     if Self::is_retryable(&e, status) && attempt < MAX_RETRIES - 1 {
                         warn!("Retryable error on attempt {}: {}", attempt + 1, e);
                         last_error = Some(e);
@@ -624,6 +636,14 @@ impl GroqSTT {
         Err(last_error.unwrap_or_else(|| {
             STTError::ProviderError("Unknown error during transcription".to_string())
         }))
+    }
+
+    /// How long to wait before retry `attempt` (from 1): Groq's `Retry-After` when it sent one,
+    /// else exponential backoff; at most [`MAX_RETRY_DELAY_MS`] either way.
+    pub(crate) fn retry_delay_ms(retry_after_ms: Option<u64>, attempt: u32) -> u64 {
+        retry_after_ms
+            .unwrap_or_else(|| BASE_RETRY_DELAY_MS * 2u64.pow(attempt.saturating_sub(1)))
+            .min(MAX_RETRY_DELAY_MS)
     }
 
     /// Whether an HTTP status from Groq is transient: a timeout, a rate limit (429), flex-tier
@@ -650,8 +670,7 @@ impl GroqSTT {
         &mut self,
         wav_data: Vec<u8>,
         config: &GroqSTTConfig,
-    ) -> Result<TranscriptionResult, STTError> {
-        self.last_error_status = None;
+    ) -> Result<TranscriptionResult, SendFailure> {
         let http_client = self.http_client.as_ref().ok_or_else(|| {
             STTError::ConfigurationError(
                 "Groq STT default HTTP client is unavailable; construct with GroqSTT::new, new_standard, or with_config".to_string(),
@@ -723,7 +742,7 @@ impl GroqSTT {
             Err(e) => {
                 call.transport_error(&e);
                 self.resilience.record_send_error();
-                return Err(STTError::NetworkError(format!("Request failed: {e}")));
+                return Err(STTError::NetworkError(format!("Request failed: {e}")).into());
             }
         };
 
@@ -753,9 +772,7 @@ impl GroqSTT {
             Ok(text) => text,
             Err(e) => {
                 call.transport_error(&e);
-                return Err(STTError::NetworkError(format!(
-                    "Failed to read response: {e}"
-                )));
+                return Err(STTError::NetworkError(format!("Failed to read response: {e}")).into());
             }
         };
         // The vendor's raw answer: the transcript, or its error body.
@@ -782,7 +799,6 @@ impl GroqSTT {
                 .map(|id| format!(" [request_id: {}]", id))
                 .unwrap_or_default();
 
-            self.last_error_status = Some(status.as_u16());
             let stt_error = match status.as_u16() {
                 400 => STTError::ConfigurationError(format!("{}{}", error_msg, request_id_suffix)),
                 401 => {
@@ -815,11 +831,14 @@ impl GroqSTT {
                 _ => STTError::ProviderError(format!("{}{}", error_msg, request_id_suffix)),
             };
 
-            return Err(stt_error);
+            return Err(SendFailure {
+                error: stt_error,
+                status: Some(status.as_u16()),
+            });
         }
 
         // Parse response and extract request ID from response body if available
-        self.parse_response(&response_text, config)
+        Ok(self.parse_response(&response_text, config)?)
     }
 
     /// Parse API response based on configured format.
@@ -1015,7 +1034,6 @@ impl Default for GroqSTT {
             total_bytes_received: 0,
             rate_limit_info: RateLimitInfo::default(),
             last_request_id: None,
-            last_error_status: None,
             first_audio_time: None,
             silence_start_time: None,
             last_was_silent: false,
@@ -1498,7 +1516,8 @@ mod tests {
         let err = stt
             .send_request(vec![0u8; 44], &config)
             .await
-            .expect_err("inert default client must fail with a typed error");
+            .expect_err("inert default client must fail with a typed error")
+            .error;
 
         match err {
             STTError::ConfigurationError(msg) => {
@@ -1589,6 +1608,18 @@ mod tests {
             loud_audio.extend_from_slice(&10000i16.to_le_bytes());
         }
         assert!(!GroqSTT::is_audio_silent(&loud_audio, 0.01));
+    }
+
+    /// A `Retry-After` of an hour (or an HTTP date an hour out) is not an hour inside the session.
+    #[test]
+    fn a_retry_waits_at_most_a_minute() {
+        assert_eq!(
+            GroqSTT::retry_delay_ms(Some(3_600_000), 1),
+            MAX_RETRY_DELAY_MS
+        );
+        assert_eq!(GroqSTT::retry_delay_ms(Some(2_000), 1), 2_000);
+        assert_eq!(GroqSTT::retry_delay_ms(None, 1), BASE_RETRY_DELAY_MS);
+        assert_eq!(GroqSTT::retry_delay_ms(None, 2), BASE_RETRY_DELAY_MS * 2);
     }
 
     /// Retries follow the status Groq answered. The messages this client builds for a 429
