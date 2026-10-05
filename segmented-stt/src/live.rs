@@ -447,11 +447,7 @@ pub fn build_transcriber(
             }
             if let Some(b) = spec.api_base.clone() {
                 c.base_url = b;
-            } else if spec
-                .region
-                .as_deref()
-                .is_some_and(|r| r.eq_ignore_ascii_case("eu"))
-            {
+            } else if is_eu(spec) {
                 c.base_url = "https://sync.eu.assemblyai.com".into();
             }
             let row = limits_of(t);
@@ -812,6 +808,39 @@ mod tests {
         let tr = build_transcriber(&t, &spec("cartesia", "ink-whisper"), &clients()).unwrap();
         assert_eq!(tr.info().kind, crate::transcriber::TranscriberKind::Commit);
         assert_eq!(tr.info().host_key, "https://api.cartesia.ai:443");
+    }
+
+    /// The gateway puts a deployment's `stt.data_region: eu` in `data_region`, not `region`, and the
+    /// refusal check counts every upload family's EU address as applied: each must then use it.
+    #[test]
+    fn the_data_region_setting_reaches_every_vendors_eu_host() {
+        let eu = |p: &str, m: &str| TargetSpec {
+            data_region: Some("eu".into()),
+            ..spec(p, m)
+        };
+        let host = |p: &str, m: &str| {
+            build_transcriber(&transport(p, m), &eu(p, m), &clients())
+                .unwrap()
+                .info()
+                .host_key
+                .clone()
+        };
+        assert_eq!(
+            host("elevenlabs", "scribe_v2"),
+            "https://api.eu.residency.elevenlabs.io:443"
+        );
+        assert_eq!(
+            host("deepgram", "whisper-large"),
+            "https://api.eu.deepgram.com:443"
+        );
+        assert_eq!(
+            host("openai", "gpt-transcribe"),
+            "https://eu.api.openai.com:443"
+        );
+        assert_eq!(
+            host("assemblyai", "universal-3-5-pro"),
+            "https://sync.eu.assemblyai.com:443"
+        );
     }
 
     /// Release 5: the canonical region and retention options reach each vendor's own switch.
