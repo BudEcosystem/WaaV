@@ -644,6 +644,27 @@ impl MelExtractor {
 mod tests {
     use super::*;
 
+    /// Confirming test (plan Release 0): the continuous SmartTurn pipeline never runs its model on
+    /// live audio. The extractor keeps only about two FFT windows of audio and rebuilds its frames
+    /// from them on every call, so 20 ms packets never accumulate the 50 frames (500 ms) the
+    /// processor waits for before its first inference. Not fixed here: the fix changes streaming
+    /// sessions, and segmented sessions run SmartTurn on each finished segment instead.
+    #[test]
+    fn packets_of_20_ms_never_accumulate_a_model_window() {
+        let mut m = MelExtractor::new(MelExtractorConfig::default()).unwrap();
+        let packet: Vec<f32> = (0..320).map(|i| (i as f32 * 0.05).sin() * 0.3).collect();
+        let mut most = 0;
+        for _ in 0..500 {
+            m.process(&packet).unwrap();
+            most = most.max(m.num_frames());
+        }
+        assert!(most < 50, "{most} frames after 10 s of 20 ms packets");
+        // A whole utterance at once does reach the window.
+        let mut whole = MelExtractor::new(MelExtractorConfig::default()).unwrap();
+        whole.process(&packet.repeat(50)).unwrap();
+        assert!(whole.num_frames() >= 50, "{}", whole.num_frames());
+    }
+
     // -------------------------------------------------------------------------
     // Configuration tests
     // -------------------------------------------------------------------------

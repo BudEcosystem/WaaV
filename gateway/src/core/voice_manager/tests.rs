@@ -1535,3 +1535,79 @@ mod buffering_audio_end {
         );
     }
 }
+
+/// The greeting fix (plan chapter 4, addendum A6): each utterance carries its own "may be cut".
+mod greeting_fix {
+    use crate::core::voice_manager::manager::per_utterance_interruptibility;
+    use crate::core::voice_manager::state::{InterruptionState, now_monotonic_ms};
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    fn state() -> InterruptionState {
+        InterruptionState {
+            allow_interruption: AtomicBool::new(true),
+            non_interruptible_until_ms: AtomicUsize::new(0),
+            current_sample_rate: AtomicU32::new(24_000),
+            is_completed: AtomicBool::new(true),
+            playout_end_ms: AtomicUsize::new(0),
+            audio_out_ms_total: AtomicU64::new(0),
+            protected_tail_until_ms: AtomicUsize::new(0),
+        }
+    }
+
+    /// As `speak_with_interruption(.., false)` and the egress leave it: a protected greeting of
+    /// `ms` whose audio has all arrived.
+    fn protected_greeting(s: &InterruptionState, ms: usize) {
+        s.allow_interruption.store(false, Ordering::Release);
+        s.non_interruptible_until_ms
+            .store(now_monotonic_ms(), Ordering::Release);
+        s.note_protected_chunk(ms);
+        s.is_completed.store(true, Ordering::Release);
+    }
+
+    #[test]
+    fn today_a_reply_after_a_non_interruptible_greeting_cannot_be_cleared() {
+        let s = state();
+        protected_greeting(&s, 50);
+        s.begin_interruptible_utterance(false);
+        s.note_protected_chunk(5_000); // the reply's audio
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(
+            !s.can_interrupt(),
+            "the reply's audio extended the greeting's window: barge-in cannot cut it"
+        );
+    }
+
+    #[test]
+    fn the_reply_can_be_cut_once_the_protected_greeting_has_played() {
+        let s = state();
+        protected_greeting(&s, 100);
+        s.begin_interruptible_utterance(true);
+        s.note_protected_chunk(5_000);
+        assert!(!s.can_interrupt(), "the greeting is still playing");
+        std::thread::sleep(Duration::from_millis(160));
+        assert!(s.can_interrupt(), "the reply may be cut");
+        // Nothing protected is left once a clear has happened.
+        s.reset();
+        assert!(s.can_interrupt());
+        assert_eq!(s.protected_tail_until_ms.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn an_interruptible_utterance_after_another_changes_nothing() {
+        let s = state();
+        s.begin_interruptible_utterance(true);
+        assert!(s.can_interrupt());
+        assert_eq!(s.protected_tail_until_ms.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn the_setting_covers_segmented_sessions_by_default() {
+        assert!(per_utterance_interruptibility(None, true));
+        assert!(!per_utterance_interruptibility(None, false));
+        assert!(per_utterance_interruptibility(Some("all"), false));
+        assert!(!per_utterance_interruptibility(Some("off"), true));
+        assert!(per_utterance_interruptibility(Some("segmented"), true));
+        assert!(!per_utterance_interruptibility(Some("segmented"), false));
+    }
+}

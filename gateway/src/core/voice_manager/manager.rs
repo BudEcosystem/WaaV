@@ -149,6 +149,23 @@ pub struct VoiceManager {
     /// Set on a segmented session: the fan-out of the engine's speech events, outcomes and
     /// notices, and the speech-time admission of caller turns.
     segmented: Option<Arc<super::segmented::SegmentedDispatch>>,
+
+    /// Each utterance carries its own "may be cut" (the greeting fix):
+    /// `WAAV_PER_UTTERANCE_INTERRUPTIBILITY` = `segmented` (default: segmented sessions only, where
+    /// detector barge-in needs it), `all`, or `off`.
+    per_utterance_interruptibility: bool,
+}
+
+pub(crate) const WAAV_PER_UTTERANCE_INTERRUPTIBILITY_ENV: &str =
+    "WAAV_PER_UTTERANCE_INTERRUPTIBILITY";
+
+/// Whether a session gets per-utterance interruptibility.
+pub(crate) fn per_utterance_interruptibility(setting: Option<&str>, segmented: bool) -> bool {
+    match setting.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        Some("all") | Some("on") | Some("true") | Some("1") => true,
+        Some("off") | Some("false") | Some("0") | Some("none") => false,
+        _ => segmented,
+    }
 }
 
 impl VoiceManager {
@@ -231,6 +248,7 @@ impl VoiceManager {
         let interruption_state = Arc::new(InterruptionState {
             allow_interruption: AtomicBool::new(true),
             non_interruptible_until_ms: AtomicUsize::new(0),
+            protected_tail_until_ms: AtomicUsize::new(0),
             current_sample_rate: AtomicU32::new(24000),
             is_completed: AtomicBool::new(true), // Start as completed
             playout_end_ms: AtomicUsize::new(0), // Silent at start
@@ -300,6 +318,12 @@ impl VoiceManager {
             stt_final_observer: Arc::new(SyncRwLock::new(None)),
             playback_pump: Arc::new(SyncRwLock::new(None)),
             uninterruptible_playback: AtomicBool::new(uninterruptible_playback),
+            per_utterance_interruptibility: per_utterance_interruptibility(
+                std::env::var(WAAV_PER_UTTERANCE_INTERRUPTIBILITY_ENV)
+                    .ok()
+                    .as_deref(),
+                segmented.is_some(),
+            ),
             segmented,
         })
     }
@@ -793,6 +817,9 @@ impl VoiceManager {
             self.speak_with_interruption(text, flush, false).await?;
             return Ok(true);
         }
+        // The greeting fix: this utterance may be cut even after a protected one.
+        self.interruption_state
+            .begin_interruptible_utterance(self.per_utterance_interruptibility);
         if let Some(obs) = self.observers.read().clone() {
             obs.notify_tts_request(crate::core::observability::now_monotonic_ns());
         }
@@ -1357,15 +1384,7 @@ impl VoiceManager {
                 // only). CAS for the same reason as extend_playout (review
                 // wf_5772cd64 #3 / wf_85659e16 follow-up): a plain
                 // load→store racing a reset could resurrect a stale window.
-                if !int_state.allow_interruption.load(Ordering::Acquire) {
-                    // `fetch_update` is `try_update` from Rust 1.99; the image still builds on 1.96.
-                    #[allow(deprecated)]
-                    let _ = int_state.non_interruptible_until_ms.fetch_update(
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                        |cur| Some(cur + chunk_duration_ms),
-                    );
-                }
+                int_state.note_protected_chunk(chunk_duration_ms);
 
                 // Per-turn profiling anchors: TTS produced audio, and this
                 // delivery to the registered egress callback is the moment the
