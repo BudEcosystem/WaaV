@@ -713,15 +713,33 @@ mod tests {
         let p = STTResultProcessor::new(STTProcessingConfig::default());
         let state = empty_state();
         let interim = STTResult::new("I'd like to".into(), false, false, 1.0);
-        assert!(p.process_result(interim, state.clone(), None).await.is_some());
-        let final_ = STTResult::new("I'd like to change my booking.".into(), true, true, 1.0).finalized();
-        let out = p.process_result(final_, state.clone(), None).await.expect("delivered");
-        assert!(out.segment_transcript.is_none(), "the final already holds the whole turn");
+        assert!(
+            p.process_result(interim, state.clone(), None)
+                .await
+                .is_some()
+        );
+        let final_ =
+            STTResult::new("I'd like to change my booking.".into(), true, true, 1.0).finalized();
+        let out = p
+            .process_result(final_, state.clone(), None)
+            .await
+            .expect("delivered");
+        assert!(
+            out.segment_transcript.is_none(),
+            "the final already holds the whole turn"
+        );
         let s = state.read();
         assert!(s.turn_detection_handle.is_none());
         assert!(s.hard_timeout_handle.is_none());
-        assert!(!s.waiting_for_speech_final.load(std::sync::atomic::Ordering::Acquire));
-        assert_eq!(s.hard_timeout_deadline_ms.load(std::sync::atomic::Ordering::Acquire), 0);
+        assert!(
+            !s.waiting_for_speech_final
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        assert_eq!(
+            s.hard_timeout_deadline_ms
+                .load(std::sync::atomic::Ordering::Acquire),
+            0
+        );
     }
 
     #[tokio::test]

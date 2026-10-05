@@ -218,7 +218,10 @@ pub fn todays_stt_not_streaming_text(agent: &str, vendor: &str) -> String {
 }
 
 /// What segmented speech-to-text needs to know about a resolved STT leg.
-pub fn live_leg(leg: &BudLeg, site: crate::core::stt::segmented::live::LegSite) -> crate::core::stt::segmented::live::LiveLeg {
+pub fn live_leg(
+    leg: &BudLeg,
+    site: crate::core::stt::segmented::live::LegSite,
+) -> crate::core::stt::segmented::live::LiveLeg {
     let ep = &leg.endpoint;
     let stt = ep.config.stt();
     crate::core::stt::segmented::live::LiveLeg {
@@ -506,13 +509,23 @@ impl LegMeter {
         let seconds = if charged { uploaded_seconds } else { 0.0 };
         span.record(turn::AUDIO_SECONDS, seconds);
         if charged
-            && let Some((cost, unit)) =
-                voice_cost(billing.pricing.as_ref(), STT_CAPABILITY, None, Some(seconds), None)
+            && let Some((cost, unit)) = voice_cost(
+                billing.pricing.as_ref(),
+                STT_CAPABILITY,
+                None,
+                Some(seconds),
+                None,
+            )
         {
             span.record(turn::COST, cost);
             span.record(turn::PRICING_UNIT, unit);
         }
-        tracing::debug!(uploaded_seconds, charged, outcome, "segmented speech-to-text upload metered");
+        tracing::debug!(
+            uploaded_seconds,
+            charged,
+            outcome,
+            "segmented speech-to-text upload metered"
+        );
     }
 
     fn open(&self, billing: &LegBilling) -> Span {
@@ -819,7 +832,10 @@ pub async fn prepare(
     ));
     let tts_api_base = tts_leg.endpoint.api_base.clone();
     Ok(PreparedLegs {
-        stt_leg: Some(live_leg(&stt_leg, crate::core::stt::segmented::live::LegSite::Named)),
+        stt_leg: Some(live_leg(
+            &stt_leg,
+            crate::core::stt::segmented::live::LegSite::Named,
+        )),
         stt_key,
         tts_key,
         tts_api_base,
@@ -1118,7 +1134,10 @@ pub async fn prepare_agent(
     let tts_api_base = tts_leg.endpoint.api_base.clone();
     Ok(PreparedAgent {
         legs: PreparedLegs {
-            stt_leg: Some(live_leg(&stt_leg, crate::core::stt::segmented::live::LegSite::Agent)),
+            stt_leg: Some(live_leg(
+                &stt_leg,
+                crate::core::stt::segmented::live::LegSite::Agent,
+            )),
             stt_key,
             tts_key,
             tts_api_base,
@@ -1635,7 +1654,10 @@ mod tests {
         assert_eq!(leg.api_base.as_deref(), Some("http://whisper:8000"));
         assert_eq!(leg.site, crate::core::stt::segmented::live::LegSite::Named);
         assert_eq!(stt.provider, "self_hosted");
-        assert!(todays_unsupported_deployment_text("whisper", "self_hosted").contains("/v1/audio/transcriptions"));
+        assert!(
+            todays_unsupported_deployment_text("whisper", "self_hosted")
+                .contains("/v1/audio/transcriptions")
+        );
     }
 
     /// 🔒 An AWS deployment without its key pair would authenticate as the GATEWAY's identity; it

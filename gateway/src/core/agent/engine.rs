@@ -426,9 +426,21 @@ impl AgentEngine {
             return false;
         }
         let spoken = {
-            let active = self.turn.lock().as_ref().map(|a| a.shared.lock().generated.clone());
-            let last = self.last.lock().as_ref().map(|(_, s)| s.lock().generated.clone());
-            format!("{} {}", active.unwrap_or_default(), last.unwrap_or_default())
+            let active = self
+                .turn
+                .lock()
+                .as_ref()
+                .map(|a| a.shared.lock().generated.clone());
+            let last = self
+                .last
+                .lock()
+                .as_ref()
+                .map(|(_, s)| s.lock().generated.clone());
+            format!(
+                "{} {}",
+                active.unwrap_or_default(),
+                last.unwrap_or_default()
+            )
         };
         norm(&spoken).contains(&t)
     }
@@ -465,7 +477,10 @@ impl AgentEngine {
         }
         if spoke {
             shared.lock().transcript = text.clone();
-            self.signal(AgentSignal::Transcript { turn: id, delta: text });
+            self.signal(AgentSignal::Transcript {
+                turn: id,
+                delta: text,
+            });
         }
         if !text_only {
             self.drain(&token, &shared).await;

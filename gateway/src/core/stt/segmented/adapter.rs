@@ -21,7 +21,9 @@ use waav_segmented_stt::engine::{Callbacks, Clock, EngineConfig, EngineHandle, E
 use waav_segmented_stt::sequencer::SegmentUpload;
 use waav_segmented_stt::types::EngineResult;
 
-use crate::core::stt::base::{BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback};
+use crate::core::stt::base::{
+    BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback,
+};
 use crate::core::stt::speech_activity::{
     FlushOutcome, NoticeCallback, SegmentAdmissionHook, SegmentOutcomeSink, SpeechActivityCallback,
     SttLiveFacts,
@@ -70,7 +72,10 @@ impl std::fmt::Debug for SegmentedStt {
         f.debug_struct("SegmentedStt")
             .field("provider", &self.config.provider)
             .field("model", &self.config.model)
-            .field("running", &self.engine.as_ref().is_some_and(EngineHandle::is_alive))
+            .field(
+                "running",
+                &self.engine.as_ref().is_some_and(EngineHandle::is_alive),
+            )
             .finish()
     }
 }
@@ -117,9 +122,9 @@ impl BaseSTT for SegmentedStt {
         if self.running().is_some() {
             return Ok(());
         }
-        let detector: Box<dyn SpeechDetector> = (self.plan.detector)()
-            .await
-            .map_err(|e| STTError::ConfigurationError(format!("stt_segmentation_unavailable: {e}")))?;
+        let detector: Box<dyn SpeechDetector> = (self.plan.detector)().await.map_err(|e| {
+            STTError::ConfigurationError(format!("stt_segmentation_unavailable: {e}"))
+        })?;
         let handle = EngineHandle::spawn(
             self.plan.engine.clone(),
             EngineParts {
@@ -198,7 +203,8 @@ impl BaseSTT for SegmentedStt {
         if config.language != self.config.language
             && let Some(e) = self.running()
         {
-            let lang = Some(config.language.clone()).filter(|l| !l.trim().is_empty() && l != "auto");
+            let lang =
+                Some(config.language.clone()).filter(|l| !l.trim().is_empty() && l != "auto");
             e.set_language(lang);
         }
         self.config = config;

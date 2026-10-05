@@ -90,7 +90,10 @@ impl SegmentedDispatch {
             self.admitted.lock().remove(&turn);
         }
         if !admitted {
-            tracing::debug!(turn, "caller speech while the agent may not be cut: not input");
+            tracing::debug!(
+                turn,
+                "caller speech while the agent may not be cut: not input"
+            );
             return;
         }
         for cb in self.speech.read().iter() {
@@ -166,7 +169,10 @@ mod tests {
         d.on_activity(started(1)); // over a protected greeting: not input
         open.store(true, Ordering::SeqCst); // the greeting ends mid-utterance
         d.on_activity(started(1));
-        assert!(seen.lock().is_empty(), "the decision holds for the whole turn");
+        assert!(
+            seen.lock().is_empty(),
+            "the decision holds for the whole turn"
+        );
         assert!(!d.result_admitted(1, true));
         d.on_activity(started(2));
         assert_eq!(seen.lock().len(), 1);

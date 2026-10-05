@@ -54,7 +54,13 @@ impl UserTurnStartStrategy for DetectorSpeechStart {
                 if words >= self.min_words {
                     return StartVerdict::Start { interrupt: true };
                 }
-                if matches!(sig, ControllerSignal::SttFinal { is_speech_final: true, .. }) {
+                if matches!(
+                    sig,
+                    ControllerSignal::SttFinal {
+                        is_speech_final: true,
+                        ..
+                    }
+                ) {
                     StartVerdict::ResetAggregation
                 } else {
                     StartVerdict::Ignore
@@ -85,7 +91,15 @@ mod tests {
     fn sustained_speech_interrupts_only_after_the_threshold() {
         let mut s = DetectorSpeechStart::new(500, 1);
         for sustained in [224, 384] {
-            assert_eq!(s.on_signal(&ControllerSignal::Speech { sustained_ms: sustained }, &ctx(true)), StartVerdict::Ignore);
+            assert_eq!(
+                s.on_signal(
+                    &ControllerSignal::Speech {
+                        sustained_ms: sustained
+                    },
+                    &ctx(true)
+                ),
+                StartVerdict::Ignore
+            );
         }
         assert_eq!(
             s.on_signal(&ControllerSignal::Speech { sustained_ms: 512 }, &ctx(true)),
@@ -111,12 +125,28 @@ mod tests {
     #[test]
     fn a_short_overlap_interrupts_only_when_its_text_has_enough_words() {
         let mut s = DetectorSpeechStart::new(500, 2);
-        let one = ControllerSignal::SttInterim { text: "wait".into(), confidence: 1.0 };
+        let one = ControllerSignal::SttInterim {
+            text: "wait".into(),
+            confidence: 1.0,
+        };
         assert_eq!(s.on_signal(&one, &ctx(true)), StartVerdict::Ignore);
-        let two = ControllerSignal::SttInterim { text: "wait stop".into(), confidence: 1.0 };
-        assert_eq!(s.on_signal(&two, &ctx(true)), StartVerdict::Start { interrupt: true });
-        let final_one = ControllerSignal::SttFinal { text: "hm".into(), is_speech_final: true, is_finalized: true };
-        assert_eq!(s.on_signal(&final_one, &ctx(true)), StartVerdict::ResetAggregation);
+        let two = ControllerSignal::SttInterim {
+            text: "wait stop".into(),
+            confidence: 1.0,
+        };
+        assert_eq!(
+            s.on_signal(&two, &ctx(true)),
+            StartVerdict::Start { interrupt: true }
+        );
+        let final_one = ControllerSignal::SttFinal {
+            text: "hm".into(),
+            is_speech_final: true,
+            is_finalized: true,
+        };
+        assert_eq!(
+            s.on_signal(&final_one, &ctx(true)),
+            StartVerdict::ResetAggregation
+        );
     }
 
     #[test]
@@ -129,8 +159,14 @@ mod tests {
             vec![],
         )
         .with_bot_speaking_probe(move || probe.load(Ordering::SeqCst));
-        assert!(c.feed(&ControllerSignal::Speech { sustained_ms: 224 }).is_empty());
-        assert!(c.feed(&ControllerSignal::SpeechTurnClosed { had_text: false }).is_empty());
+        assert!(
+            c.feed(&ControllerSignal::Speech { sustained_ms: 224 })
+                .is_empty()
+        );
+        assert!(
+            c.feed(&ControllerSignal::SpeechTurnClosed { had_text: false })
+                .is_empty()
+        );
         assert!(!c.turn_active());
     }
 
@@ -143,10 +179,18 @@ mod tests {
         );
         let started = c.feed(&ControllerSignal::Speech { sustained_ms: 224 });
         let id = match started.as_slice() {
-            [TurnEvent::Started { turn_id, interrupt: false }] => *turn_id,
+            [
+                TurnEvent::Started {
+                    turn_id,
+                    interrupt: false,
+                },
+            ] => *turn_id,
             other => panic!("{other:?}"),
         };
-        assert_eq!(c.feed(&ControllerSignal::SpeechTurnClosed { had_text: false }), vec![TurnEvent::Aborted { turn_id: id }]);
+        assert_eq!(
+            c.feed(&ControllerSignal::SpeechTurnClosed { had_text: false }),
+            vec![TurnEvent::Aborted { turn_id: id }]
+        );
         assert!(!c.turn_active());
     }
 
@@ -159,17 +203,28 @@ mod tests {
         );
         let mut events = Vec::new();
         events.extend(c.feed(&ControllerSignal::Speech { sustained_ms: 224 }));
-        events.extend(c.feed(&ControllerSignal::SttInterim { text: "I'd like to".into(), confidence: 1.0 }));
+        events.extend(c.feed(&ControllerSignal::SttInterim {
+            text: "I'd like to".into(),
+            confidence: 1.0,
+        }));
         events.extend(c.feed(&ControllerSignal::Speech { sustained_ms: 224 }));
         events.extend(c.feed(&ControllerSignal::SttFinal {
             text: "I'd like to change my booking".into(),
             is_speech_final: true,
             is_finalized: true,
         }));
-        let starts = events.iter().filter(|e| matches!(e, TurnEvent::Started { .. })).count();
-        let stops: Vec<&TurnEvent> = events.iter().filter(|e| matches!(e, TurnEvent::Stopped { .. })).collect();
+        let starts = events
+            .iter()
+            .filter(|e| matches!(e, TurnEvent::Started { .. }))
+            .count();
+        let stops: Vec<&TurnEvent> = events
+            .iter()
+            .filter(|e| matches!(e, TurnEvent::Stopped { .. }))
+            .collect();
         assert_eq!(starts, 1);
         assert_eq!(stops.len(), 1);
-        assert!(matches!(stops[0], TurnEvent::Stopped { transcript, .. } if transcript == "I'd like to change my booking"));
+        assert!(
+            matches!(stops[0], TurnEvent::Stopped { transcript, .. } if transcript == "I'd like to change my booking")
+        );
     }
 }

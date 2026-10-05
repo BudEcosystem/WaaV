@@ -184,7 +184,9 @@ pub fn detector_factory(support: &DetectorSupport) -> DetectorFactory {
                 Ok(Box::new(SileroSpeechDetector(vad)) as Box<dyn SpeechDetector>)
             })
         }),
-        _ => Arc::new(|| Box::pin(async { Ok(Box::new(EnergyDetector::new()) as Box<dyn SpeechDetector>) })),
+        _ => Arc::new(|| {
+            Box::pin(async { Ok(Box::new(EnergyDetector::new()) as Box<dyn SpeechDetector>) })
+        }),
     }
 }
 
@@ -216,7 +218,9 @@ pub struct SmartTurnOnDemand {
 #[cfg(feature = "smart-turn")]
 impl std::fmt::Debug for SmartTurnOnDemand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SmartTurnOnDemand").field("pool", &self.pool.len()).finish()
+        f.debug_struct("SmartTurnOnDemand")
+            .field("pool", &self.pool.len())
+            .finish()
     }
 }
 

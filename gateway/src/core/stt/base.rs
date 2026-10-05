@@ -827,7 +827,10 @@ pub trait BaseSTT: Send + Sync {
 
     /// Register for detector-timed speech events. A provider that runs a gateway-side detector
     /// (the segmented engine) overrides this and returns true. The callback must return at once.
-    fn on_speech_activity(&mut self, _callback: super::speech_activity::SpeechActivityCallback) -> bool {
+    fn on_speech_activity(
+        &mut self,
+        _callback: super::speech_activity::SpeechActivityCallback,
+    ) -> bool {
         false
     }
 
@@ -847,7 +850,11 @@ pub trait BaseSTT: Send + Sync {
     fn on_notice(&mut self, _callback: super::speech_activity::NoticeCallback) {}
 
     /// Receive one outcome per upload unit, in sequence order.
-    fn set_outcome_sink(&mut self, _sink: std::sync::Arc<dyn super::speech_activity::SegmentOutcomeSink>) {}
+    fn set_outcome_sink(
+        &mut self,
+        _sink: std::sync::Arc<dyn super::speech_activity::SegmentOutcomeSink>,
+    ) {
+    }
 
     /// What a gateway-endpointed provider knows about itself. `None` for every other provider.
     fn live_facts(&self) -> Option<super::speech_activity::SttLiveFacts> {

@@ -32,10 +32,10 @@ pub mod revai;
 pub mod reverie;
 pub mod sarvam;
 pub mod sberdevices;
-/// Speech events, admission, flush outcomes and facts a gateway-endpointed provider reports.
-pub mod speech_activity;
 /// Segmented speech-to-text: live calls on models that accept only a finished file.
 pub mod segmented;
+/// Speech events, admission, flush outcomes and facts a gateway-endpointed provider reports.
+pub mod speech_activity;
 pub mod speechmatics;
 /// Standardized capability-rich STT config (W1 keystone, additive).
 pub mod standard;
