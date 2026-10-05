@@ -4042,6 +4042,16 @@ mod request_field_tests {
         c.extras
             .0
             .insert("prompt".into(), serde_json::json!("A platform talk."));
+        // The default model (`gpt-transcribe`, addendum B6) takes key terms as `keywords[]`, so the
+        // caller's prompt and the deployment's terms both reach it, separately.
+        let cfg = crate::core::stt::openai::OpenAISTTConfig::from_standard(&c);
+        assert_eq!(cfg.prompt.as_deref(), Some("A platform talk."));
+        assert_eq!(
+            cfg.keywords,
+            vec!["Kubernetes".to_string(), "Dapr".to_string()]
+        );
+        // Whisper has one prompt: the caller's text first, the key terms after it.
+        c.base.model = "whisper-1".into();
         let cfg = crate::core::stt::openai::OpenAISTTConfig::from_standard(&c);
         assert_eq!(
             cfg.prompt.as_deref(),

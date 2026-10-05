@@ -665,18 +665,26 @@ pub fn build_openai_transcription(
         .ok_or_else(|| "openai batch requires inline audio bytes (no URL source)".to_string())?;
     let bytes = b64_decode(audio_b64)?;
 
-    let model = if std.base.model.is_empty() {
-        "whisper-1".to_string()
+    let model = if std.base.model.trim().is_empty() {
+        crate::core::stt::openai::DEFAULT_OPENAI_STT_MODEL.to_string()
     } else {
         std.base.model.clone()
     };
+    let whisper = model.trim().to_ascii_lowercase().starts_with("whisper");
+    let lists = crate::core::stt::openai::takes_candidate_lists(&model);
 
-    let mut fields: Vec<(String, String)> = vec![("model".into(), model)];
-    // detect_language / word+segment timestamps → verbose_json.
-    let want_verbose = b.detect_language == Some(true)
-        || std.features.word_timestamps == Some(true)
+    let mut fields: Vec<(String, String)> = vec![("model".into(), model.clone())];
+    // detect_language / word+segment timestamps → verbose_json, which only Whisper models return;
+    // a GPT transcription model's `json` carries the detected language, and has no timestamps.
+    let want_timestamps = std.features.word_timestamps == Some(true)
         || b.paragraphs == Some(true)
         || b.utterances == Some(true);
+    let want_verbose = whisper && (b.detect_language == Some(true) || want_timestamps);
+    if !whisper && want_timestamps {
+        warnings.push(format!(
+            "timestamps not supported by openai model {model}; omitted"
+        ));
+    }
     fields.push((
         "response_format".into(),
         if want_verbose { "verbose_json" } else { "json" }.into(),
@@ -698,7 +706,11 @@ pub fn build_openai_transcription(
             .next()
             .unwrap_or(&std.base.language)
             .to_string();
-        fields.push(("language".into(), lang));
+        let key = if lists { "languages[]" } else { "language" };
+        fields.push((key.into(), lang));
+    }
+    if lists && let Some(terms) = std.features.keyterms.as_ref() {
+        fields.extend(terms.iter().map(|t| ("keywords[]".to_string(), t.clone())));
     }
     // Unsupported batch knobs → degrade.
     for (on, name) in [
@@ -1452,8 +1464,47 @@ mod tests {
     }
 
     #[test]
+    fn openai_builder_defaults_to_gpt_transcribe_with_a_language_list() {
+        let mut r = req_with(
+            "openai",
+            BatchAudioSource::Bytes {
+                audio_base64: "AAAA".into(),
+                content_type: None,
+            },
+            SttFeatures {
+                word_timestamps: Some(true),
+                keyterms: Some(vec!["Acme".into()]),
+                ..Default::default()
+            },
+            BatchFeatures {
+                detect_language: Some(true),
+                ..Default::default()
+            },
+        );
+        r.config.base.language = "de-DE".into();
+        let sub = build_openai_transcription(&r, "sk", "https://api.openai.com").unwrap();
+        let BatchHttpBody::Multipart { fields, .. } = &sub.request.body else {
+            panic!("expected multipart body")
+        };
+        let has = |k: &str, v: &str| fields.iter().any(|(a, b)| a == k && b == v);
+        assert!(has("model", "gpt-transcribe"), "{fields:?}");
+        assert!(has("languages[]", "de"), "{fields:?}");
+        assert!(has("keywords[]", "Acme"), "{fields:?}");
+        assert!(
+            has("response_format", "json"),
+            "verbose_json is Whisper's: {fields:?}"
+        );
+        assert!(
+            !fields
+                .iter()
+                .any(|(k, _)| k == "language" || k == "timestamp_granularities[]")
+        );
+        assert!(sub.config_warnings.iter().any(|w| w.contains("timestamps")));
+    }
+
+    #[test]
     fn openai_builder_uses_verbose_json_for_detect_language_and_warns_unsupported() {
-        let r = req_with(
+        let mut r = req_with(
             "openai",
             BatchAudioSource::Bytes {
                 audio_base64: "AAAA".into(),
@@ -1467,6 +1518,7 @@ mod tests {
                 ..Default::default()
             },
         );
+        r.config.base.model = "whisper-1".into();
         let sub = build_openai_transcription(&r, "sk", "https://api.openai.com").unwrap();
         assert!(!sub.is_async, "OpenAI is synchronous");
         assert!(
