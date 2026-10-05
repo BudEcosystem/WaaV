@@ -106,6 +106,11 @@ impl StreamResampler {
     /// delay line), resets, and returns the emitted samples. `None` when
     /// nothing is pending.
     pub fn flush(&mut self) -> Option<Vec<f32>> {
+        // Nothing held: the filter was not reset, so `last_call` stays and the stale-clear still
+        // starts the next utterance fresh.
+        if self.pending() == 0 {
+            return None;
+        }
         let resampler = self.inner.as_mut()?;
         let mut out = Vec::new();
         if let Err(e) = resampler.flush(&mut out) {
@@ -435,6 +440,24 @@ mod tests {
         );
         // Flushed and reset: nothing pending.
         assert!(r.flush().is_none());
+    }
+
+    #[test]
+    fn a_flush_with_nothing_held_keeps_the_stale_clear() {
+        // 4800 frames at 48 kHz is five whole chunks: nothing is held when the utterance ends.
+        let mut r = StreamResampler::new();
+        let _ = r.resample(&sine(4800, 0.3), 48000, 16000);
+        assert!(r.flush().is_none());
+        // The inter-utterance gap, aged on the stamp the flush left.
+        r.last_call = r
+            .last_call
+            .map(|t| t - std::time::Duration::from_millis(400));
+        let out = r.resample(&vec![0.0f32; 4800], 48000, 16000).unwrap();
+        let max_abs = out.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(
+            max_abs < 1e-3,
+            "filter tail leaked into the next utterance: {max_abs}"
+        );
     }
 
     #[test]
