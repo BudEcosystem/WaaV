@@ -327,6 +327,76 @@ impl ResolvedAudio {
     }
 }
 
+/// A built request as reqwest sends it: the one place a [`BatchHttpRequest`] becomes HTTP, for the
+/// batch API and the prerecorded client alike.
+///
+/// Content-Type is reqwest's for the two body shapes that decide it: multipart needs the boundary
+/// appended (a builder-supplied value would have none, and the vendor could not parse the body), and
+/// for JSON `.json()` sets it anyway, so a second one would be a duplicate header. The raw shape
+/// keeps the builder's value: it is the only source of truth for `audio/wav` vs `audio/mpeg`.
+pub(crate) fn http_request(
+    http: &reqwest::Client,
+    r: &BatchHttpRequest,
+) -> Result<reqwest::RequestBuilder, String> {
+    let mut builder = match r.method.as_str() {
+        "POST" => http.post(&r.url),
+        "PUT" => http.put(&r.url),
+        m => return Err(format!("unsupported method {m}")),
+    };
+    for (k, v) in &r.headers {
+        if k.eq_ignore_ascii_case("content-type")
+            && matches!(
+                r.body,
+                BatchHttpBody::Multipart { .. } | BatchHttpBody::Json(_)
+            )
+        {
+            continue;
+        }
+        builder = builder.header(k, v);
+    }
+    Ok(match &r.body {
+        BatchHttpBody::Empty => builder,
+        BatchHttpBody::Json(v) => builder.json(v),
+        BatchHttpBody::Raw { bytes, .. } => builder.body(bytes.clone()),
+        BatchHttpBody::Multipart { fields, file } => {
+            let mut form = reqwest::multipart::Form::new();
+            for (name, value) in fields {
+                form = form.text(name.clone(), value.clone());
+            }
+            if let Some((field, filename, ct, bytes)) = file {
+                let part = reqwest::multipart::Part::bytes(bytes.clone())
+                    .file_name(filename.clone())
+                    .mime_str(ct)
+                    .map_err(|e| format!("bad multipart mime: {e}"))?;
+                form = form.part(field.clone(), part);
+            }
+            builder.multipart(form)
+        }
+    })
+}
+
+/// AssemblyAI's `POST /v2/upload`: it transcribes URLs, not uploads, so bytes become a URL first.
+pub(crate) fn assemblyai_upload_request(
+    http: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+    bytes: Vec<u8>,
+) -> reqwest::RequestBuilder {
+    http.post(format!("{}/v2/upload", base_url.trim_end_matches('/')))
+        .header("Authorization", api_key)
+        .header("Content-Type", "application/octet-stream")
+        .body(bytes)
+}
+
+/// The `upload_url` an AssemblyAI upload answered with.
+pub(crate) fn assemblyai_upload_url(body: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()?
+        .get("upload_url")?
+        .as_str()
+        .map(str::to_string)
+}
+
 /// Build the Deepgram prerecorded submission (`POST /v1/listen`). Enables the streaming-gap
 /// features (`alternatives`, `detect_language`) plus the batch-exclusive ones on the query string —
 /// the wire-level proof that batch unlocks what streaming drops.

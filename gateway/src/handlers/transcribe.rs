@@ -58,9 +58,9 @@ use crate::config::ServerConfig;
 #[cfg(test)]
 use crate::core::stt::batch::decode_inline_batch_audio_with_limit;
 use crate::core::stt::batch::{
-    BatchHttpBody, BatchJob, BatchStatus, BatchSubmission, BatchTranscribeRequest,
-    batch_provider_supported, build_assemblyai_transcript, build_deepgram_prerecorded,
-    build_openai_transcription, decode_inline_batch_audio, validate_batch_base_url,
+    BatchJob, BatchStatus, BatchSubmission, BatchTranscribeRequest, batch_provider_supported,
+    build_assemblyai_transcript, build_deepgram_prerecorded, build_openai_transcription,
+    decode_inline_batch_audio, validate_batch_base_url,
 };
 use crate::core::stt::{STTConfig, STTErrorCallback, STTResult, STTResultCallback};
 use crate::core::voice_error::{VoiceErrorType, VoiceFailure};
@@ -638,25 +638,16 @@ async fn upload_assemblyai(
 ) -> Result<String, String> {
     let bytes = decode_assemblyai_upload_audio(audio_base64)?;
     let client = http_client()?;
-    let resp = client
-        .post(format!("{}/v2/upload", host.trim_end_matches('/')))
-        .header("Authorization", api_key)
-        .header("Content-Type", "application/octet-stream")
-        .body(bytes)
+    let resp = crate::core::stt::batch::assemblyai_upload_request(&client, host, api_key, bytes)
         .send()
         .await
         .map_err(|e| format!("assemblyai upload failed: {e}"))?;
     let status = resp.status();
-    let v: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("assemblyai upload response not JSON: {e}"))?;
+    let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        return Err(format!("assemblyai upload error ({status}): {v}"));
+        return Err(format!("assemblyai upload error ({status}): {text}"));
     }
-    v.get("upload_url")
-        .and_then(|u| u.as_str())
-        .map(str::to_string)
+    crate::core::stt::batch::assemblyai_upload_url(&text)
         .ok_or_else(|| "assemblyai upload returned no upload_url".to_string())
 }
 
@@ -676,34 +667,7 @@ fn decode_assemblyai_upload_audio_with_limit(
 /// wrapped as `{"raw": "<text>"}` so callers always get JSON.
 async fn execute(sub: &BatchSubmission) -> Result<(StatusCode, serde_json::Value), String> {
     let client = http_client()?;
-    let r = &sub.request;
-    let mut builder = match r.method.as_str() {
-        "POST" => client.post(&r.url),
-        "PUT" => client.put(&r.url),
-        m => return Err(format!("unsupported method {m}")),
-    };
-    for (k, v) in &r.headers {
-        builder = builder.header(k, v);
-    }
-    builder = match &r.body {
-        BatchHttpBody::Empty => builder,
-        BatchHttpBody::Json(v) => builder.json(v),
-        BatchHttpBody::Raw { bytes, .. } => builder.body(bytes.clone()),
-        BatchHttpBody::Multipart { fields, file } => {
-            let mut form = reqwest::multipart::Form::new();
-            for (name, value) in fields {
-                form = form.text(name.clone(), value.clone());
-            }
-            if let Some((field, filename, ct, bytes)) = file {
-                let part = reqwest::multipart::Part::bytes(bytes.clone())
-                    .file_name(filename.clone())
-                    .mime_str(ct)
-                    .map_err(|e| format!("bad multipart mime: {e}"))?;
-                form = form.part(field.clone(), part);
-            }
-            builder.multipart(form)
-        }
-    };
+    let builder = crate::core::stt::batch::http_request(&client, &sub.request)?;
     let resp = builder
         .send()
         .await

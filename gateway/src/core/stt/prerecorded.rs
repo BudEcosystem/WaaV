@@ -471,54 +471,7 @@ impl PrerecordedSTT {
         submission: &BatchSubmission,
     ) -> Result<serde_json::Value, STTError> {
         let r = &submission.request;
-        let mut builder = match r.method.as_str() {
-            "POST" => http.post(&r.url),
-            "PUT" => http.put(&r.url),
-            m => {
-                return Err(STTError::ConfigurationError(format!(
-                    "unsupported method {m}"
-                )));
-            }
-        };
-        for (k, v) in &r.headers {
-            // Let reqwest own Content-Type for the two body shapes that decide it: multipart
-            // needs the boundary appended (a builder-supplied value would have none, and the
-            // vendor could not parse the body), and for JSON `.json()` sets it anyway — passing
-            // a second one risks a duplicate header rather than an override.
-            //
-            // The raw shape keeps the builder's value: it is the only source of truth for
-            // `audio/wav` vs `audio/mpeg`, and reqwest will not guess it.
-            if k.eq_ignore_ascii_case("content-type")
-                && matches!(
-                    r.body,
-                    BatchHttpBody::Multipart { .. } | BatchHttpBody::Json(_)
-                )
-            {
-                continue;
-            }
-            builder = builder.header(k, v);
-        }
-        builder = match &r.body {
-            BatchHttpBody::Empty => builder,
-            BatchHttpBody::Json(v) => builder.json(v),
-            BatchHttpBody::Raw { bytes, .. } => builder.body(bytes.clone()),
-            BatchHttpBody::Multipart { fields, file } => {
-                let mut form = reqwest::multipart::Form::new();
-                for (name, value) in fields {
-                    form = form.text(name.clone(), value.clone());
-                }
-                if let Some((field, filename, ct, bytes)) = file {
-                    let part = reqwest::multipart::Part::bytes(bytes.clone())
-                        .file_name(filename.clone())
-                        .mime_str(ct)
-                        .map_err(|e| {
-                            STTError::ConfigurationError(format!("bad multipart mime: {e}"))
-                        })?;
-                    form = form.part(field.clone(), part);
-                }
-                builder.multipart(form)
-            }
-        };
+        let builder = super::batch::http_request(http, r).map_err(STTError::ConfigurationError)?;
 
         let call = self.vendor_call(&r.method, &r.url);
         if call.captures() {
@@ -601,11 +554,7 @@ impl PrerecordedSTT {
                     .render(),
             );
         }
-        let response = match http
-            .post(&url)
-            .header("Authorization", api_key)
-            .header("Content-Type", "application/octet-stream")
-            .body(wav)
+        let response = match super::batch::assemblyai_upload_request(http, base_url, api_key, wav)
             .send()
             .await
         {
@@ -636,16 +585,9 @@ impl PrerecordedSTT {
                 ),
             ));
         }
-        serde_json::from_str::<serde_json::Value>(&text)
-            .ok()
-            .and_then(|v| {
-                v.get("upload_url")
-                    .and_then(|u| u.as_str())
-                    .map(str::to_string)
-            })
-            .ok_or_else(|| {
-                STTError::ProviderError(format!("assemblyai upload returned no upload_url: {text}"))
-            })
+        super::batch::assemblyai_upload_url(&text).ok_or_else(|| {
+            STTError::ProviderError(format!("assemblyai upload returned no upload_url: {text}"))
+        })
     }
 
     /// Poll `GET /v2/transcript/{id}` until it completes, errors, or the deadline fires.
