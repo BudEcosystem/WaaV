@@ -261,40 +261,7 @@ impl reqwest::dns::Resolve for PublicOnlyResolver {
     }
 }
 
-/// Whether an address is on the public internet: not loopback, private, link-local (cloud
-/// metadata), carrier-grade NAT, unspecified, broadcast, documentation, benchmarking, reserved or
-/// multicast; an IPv4-mapped IPv6 address is judged as its IPv4 address.
-pub fn is_public_ip(ip: &std::net::IpAddr) -> bool {
-    use std::net::IpAddr;
-    match ip {
-        IpAddr::V4(v4) => {
-            let o = v4.octets();
-            !(v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.is_unspecified()
-                || v4.is_broadcast()
-                || v4.is_documentation()
-                || v4.is_multicast()
-                || o[0] == 0
-                || (o[0] == 100 && (64..128).contains(&o[1]))
-                || (o[0] == 198 && (o[1] == 18 || o[1] == 19))
-                || o[0] >= 240)
-        }
-        IpAddr::V6(v6) => {
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                return is_public_ip(&IpAddr::V4(v4));
-            }
-            let seg = v6.segments();
-            !(v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_multicast()
-                || (seg[0] & 0xfe00) == 0xfc00
-                || (seg[0] & 0xffc0) == 0xfe80
-                || seg[0] == 0x2001 && seg[1] == 0x0db8)
-        }
-    }
-}
+pub use crate::net::is_public_ip;
 
 /// A base address a client named (not one from a Bud deployment record): `http` or `https`, and
 /// not a private address or `localhost`. Names are checked again at connect time by the public

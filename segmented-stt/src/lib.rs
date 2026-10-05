@@ -27,6 +27,7 @@
 //! | [`transcriber`] | One interface for "transcribe this utterance", the attempt loop, limiter and breaker |
 //! | [`engine`] | The per-session task that owns all of the above |
 //! | [`types`] | The values the engine reports: speech activity, outcomes, facts, notices |
+//! | [`net`] | Whether an address is on the public internet, shared with the gateway's SSRF checks |
 //! | [`vendor`] | Vendor hosts, retention switches, request ids, rate-limit waits and error bodies, shared with the gateway |
 //! | [`wav`] | The one WAV writer, shared with the gateway's file-upload clients |
 
@@ -39,6 +40,7 @@ pub mod fallback;
 pub mod limits;
 pub mod live;
 pub mod map;
+pub mod net;
 pub mod profile;
 pub mod resolve;
 pub mod rollout;
