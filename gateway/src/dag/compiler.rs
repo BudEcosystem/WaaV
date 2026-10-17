@@ -117,10 +117,15 @@ impl std::fmt::Debug for CompiledNode {
 pub struct DAGCompiler {
     rhai_engine: Arc<Engine>,
     evaluator: Arc<ConditionEvaluator>,
+    /// Whether the definition is CLIENT input (an inline `dag_config.definition`,
+    /// `POST /dag/validate`) rather than an operator template. A client definition never makes
+    /// the gateway read its environment: credential references must name an operator
+    /// credential bound to the node's host (`core::credentials`).
+    client_supplied: bool,
 }
 
 impl DAGCompiler {
-    /// Create a new DAG compiler
+    /// A compiler for CLIENT-supplied definitions (the secure default).
     pub fn new() -> Self {
         let engine = Arc::new(create_rhai_engine());
         let evaluator = Arc::new(ConditionEvaluator::new(engine.clone()));
@@ -128,6 +133,16 @@ impl DAGCompiler {
         Self {
             rhai_engine: engine,
             evaluator,
+            client_supplied: true,
+        }
+    }
+
+    /// A compiler for an OPERATOR template (server config): `${VAR}` references resolve from the
+    /// process environment as before.
+    pub fn for_operator_template() -> Self {
+        Self {
+            client_supplied: false,
+            ..Self::new()
         }
     }
 
@@ -228,7 +243,13 @@ impl DAGCompiler {
 
     /// Compile a single node definition
     fn compile_node(&self, def: &NodeDefinition) -> DAGResult<CompiledNode> {
-        debug!(node_id = %def.id, node_type = ?def.node_type, "Compiling node");
+        // Name the node's type, never print the node: it carries client-supplied credentials
+        // (`api_key`, `headers`, `config.api_key`).
+        debug!(node_id = %def.id, node_type = %def.node_type.type_tag(), "Compiling node");
+
+        if self.client_supplied {
+            check_client_provider_credential(def)?;
+        }
 
         let node: Arc<dyn DAGNode> = match &def.node_type {
             NodeType::AudioInput => Arc::new(AudioInputNode::new(&def.id)),
@@ -359,7 +380,8 @@ impl DAGCompiler {
                 headers,
                 reasoning_effort,
             } => {
-                // Build LLM config from node definition
+                // Build LLM config from node definition. A node with no `timeout_ms` gets the operator's
+                // WAAV_LLM_TIMEOUT_MS default (else 60 s), the same knob the conversation path reads.
                 let mut llm_config = LlmEndpointConfig {
                     base_url: base_url.clone(),
                     model: model.clone(),
@@ -368,7 +390,7 @@ impl DAGCompiler {
                     temperature: *temperature,
                     max_tokens: *max_tokens,
                     streaming: *streaming,
-                    timeout_ms: timeout_ms.unwrap_or(60000),
+                    timeout_ms: timeout_ms.unwrap_or_else(crate::core::llm::default_timeout_ms),
                     headers: headers.clone(),
                     assistant_id: assistant_id.clone(),
                     reasoning_effort: *reasoning_effort,
@@ -384,7 +406,7 @@ impl DAGCompiler {
                     llm_config.tools = Some(parsed_tools);
                 }
 
-                bud_or_checked_llm_node(def, llm_config)?
+                bud_or_checked_llm_node(def, llm_config, self.client_supplied)?
             }
             NodeType::Translate {
                 target_language,
@@ -431,11 +453,11 @@ impl DAGCompiler {
                     temperature: Some(temperature.unwrap_or(0.1)),
                     max_tokens: Some(max_tokens.unwrap_or(4000)),
                     streaming: false,
-                    timeout_ms: timeout_ms.unwrap_or(60000),
+                    timeout_ms: timeout_ms.unwrap_or_else(crate::core::llm::default_timeout_ms),
                     headers: headers.clone(),
                     ..Default::default()
                 };
-                bud_or_checked_llm_node(def, llm_config)?
+                bud_or_checked_llm_node(def, llm_config, self.client_supplied)?
             }
             NodeType::WebhookOutput { url, headers } => {
                 // Use try_new() for SSRF protection (S6): webhook URLs are client-supplied.
@@ -549,19 +571,65 @@ impl Default for DAGCompiler {
 /// excludes reconvergence/join nodes, which have at least one predecessor from a
 /// different branch and therefore execute once in the main sweep rather than per
 /// branch. This is the data needed for single-execution split handling.
-/// An LLM node: SSRF-checked when its `base_url` came with the template, or pointed at the Bud
-/// gateway with the caller's credential when the server bound it (FRD-023 WP-RT6.3).
+/// An LLM node: pointed at the Bud gateway with the caller's credential when the server bound
+/// it (FRD-023 WP-RT6.3); otherwise SSRF-checked, and — for a CLIENT definition — keyed only by
+/// the client's own literal key or an operator credential bound to its `base_url`
+/// (`config.credential_ref`, or the legacy `api_key: "${NAME}"`).
 fn bud_or_checked_llm_node(
     def: &NodeDefinition,
     llm_config: LlmEndpointConfig,
+    client_supplied: bool,
 ) -> DAGResult<Arc<dyn DAGNode>> {
     match def.bud.as_ref().and_then(|b| b.session_credential.clone()) {
         Some(credential) => Ok(Arc::new(LlmEndpointNode::for_bud_gateway(
             &def.id, llm_config, credential,
         ))),
-        // Use try_new() for SSRF protection on the client-supplied base_url.
+        None if client_supplied => {
+            let credential_ref = def.config.get("credential_ref").and_then(|v| v.as_str());
+            Ok(Arc::new(LlmEndpointNode::try_new_for_client(
+                &def.id,
+                llm_config,
+                credential_ref,
+            )?))
+        }
+        // An operator template: SSRF-checked, `${VAR}` from the environment as before.
         None => Ok(Arc::new(LlmEndpointNode::try_new(&def.id, llm_config)?)),
     }
+}
+
+/// A CLIENT definition's STT/TTS/realtime node may not make the gateway read an arbitrary
+/// environment variable: `config.api_key: "${NAME}"` is accepted only when NAME is the
+/// provider's own key variable (`DEEPGRAM_API_KEY` for `deepgram` — the key the gateway uses
+/// anyway when the node names none). `${AWS_SECRET_ACCESS_KEY}` on a deepgram node used to send
+/// that secret to Deepgram (any `*_TOKEN` / `*_ACCESS_KEY` name passed the old suffix check).
+fn check_client_provider_credential(def: &NodeDefinition) -> DAGResult<()> {
+    let provider = match &def.node_type {
+        NodeType::SttProvider { provider, .. }
+        | NodeType::TtsProvider { provider, .. }
+        | NodeType::RealtimeProvider { provider, .. } => provider,
+        _ => return Ok(()),
+    };
+    let Some(name) = def
+        .config
+        .get("api_key")
+        .and_then(|v| v.as_str())
+        .and_then(crate::core::credentials::env_reference)
+    else {
+        return Ok(());
+    };
+    let own = format!(
+        "{}_API_KEY",
+        provider.to_ascii_uppercase().replace(['-', '.'], "_")
+    );
+    if name == own {
+        return Ok(());
+    }
+    Err(DAGError::ConfigError(format!(
+        "node '{}' ({provider}): config.api_key \"${{{name}}}\" is not accepted in a client \
+         DAG — this gateway does not read arbitrary environment variables for a client. Omit \
+         config.api_key to use the gateway's {provider} key, or send your own key",
+        def.id
+    )))
 }
 
 fn compute_split_plans(

@@ -69,6 +69,13 @@ pub struct ConnectionState {
     #[cfg(feature = "opus-codec")]
     pub opus_decoder: Option<tokio::sync::Mutex<crate::core::audio::opus_codec::OpusStreamDecoder>>,
 
+    /// RCA 2e: the uplink's denoiser (feature `noise-filter`): `Some` only when the session
+    /// asked for `stt_config.noise_suppression` and the server had a stream to give it. Each
+    /// client WS binary frame (after the opus decode) passes through it BEFORE the VoiceManager,
+    /// so the VAD / turn models and the STT provider all hear the filtered audio.
+    #[cfg(feature = "noise-filter")]
+    pub denoiser: Option<Arc<crate::utils::noise_filter::StreamDenoiser>>,
+
     // DAG routing state (feature-gated)
     /// Compiled DAG for this connection
     #[cfg(feature = "dag-routing")]
@@ -112,6 +119,8 @@ impl ConnectionState {
             agent_manual: None,
             #[cfg(feature = "opus-codec")]
             opus_decoder: None,
+            #[cfg(feature = "noise-filter")]
+            denoiser: None,
             #[cfg(feature = "dag-routing")]
             compiled_dag: None,
             #[cfg(feature = "dag-routing")]
@@ -145,6 +154,8 @@ impl ConnectionState {
             agent_manual: None,
             #[cfg(feature = "opus-codec")]
             opus_decoder: None,
+            #[cfg(feature = "noise-filter")]
+            denoiser: None,
             #[cfg(feature = "dag-routing")]
             compiled_dag: None,
             #[cfg(feature = "dag-routing")]

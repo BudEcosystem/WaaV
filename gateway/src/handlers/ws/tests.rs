@@ -24,6 +24,7 @@ fn test_ws_config_serialization() {
         transcription_mode: None,
         translation: None,
         audio_in_codec: None,
+        noise_suppression: None,
     };
 
     let json = serde_json::to_string(&stt_ws_config).unwrap();
@@ -83,6 +84,7 @@ fn test_incoming_message_serialization() {
             transcription_mode: None,
             translation: None,
             audio_in_codec: None,
+            noise_suppression: None,
         }),
         tts_config: Some(TTSWebSocketConfig {
             api_key: None,
@@ -422,6 +424,7 @@ fn test_stt_ws_config_conversion() {
         transcription_mode: None,
         translation: None,
         audio_in_codec: None,
+        noise_suppression: None,
     };
 
     let api_key = "test_api_key".to_string();
@@ -779,6 +782,7 @@ fn test_incoming_message_config_with_livekit() {
             transcription_mode: None,
             translation: None,
             audio_in_codec: None,
+            noise_suppression: None,
         }),
         tts_config: Some(TTSWebSocketConfig {
             api_key: None,
@@ -842,6 +846,7 @@ fn test_incoming_message_config_without_livekit() {
             transcription_mode: None,
             translation: None,
             audio_in_codec: None,
+            noise_suppression: None,
         }),
         tts_config: Some(TTSWebSocketConfig {
             api_key: None,
@@ -1174,6 +1179,7 @@ fn test_config_message_without_livekit_routing() {
             transcription_mode: None,
             translation: None,
             audio_in_codec: None,
+            noise_suppression: None,
         }),
         tts_config: Some(TTSWebSocketConfig {
             api_key: None,
@@ -1242,6 +1248,7 @@ fn test_config_message_with_livekit_routing() {
             transcription_mode: None,
             translation: None,
             audio_in_codec: None,
+            noise_suppression: None,
         }),
         tts_config: Some(TTSWebSocketConfig {
             api_key: None,
@@ -1521,6 +1528,7 @@ fn test_config_message_audio_default() {
             transcription_mode: None,
             translation: None,
             audio_in_codec: None,
+            noise_suppression: None,
         }),
         tts_config: Some(TTSWebSocketConfig {
             api_key: None,

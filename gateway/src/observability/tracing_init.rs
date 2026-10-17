@@ -56,6 +56,52 @@ fn resource_attributes(raw: &str) -> Vec<KeyValue> {
         .collect()
 }
 
+/// Fields that carry what a caller said or what was spoken back to them. The OTLP export keeps them
+/// under the platform's content switch (`BUD_TRACE_CAPTURE_CONTENT`, with its retention); the stdout
+/// log, which lands in ordinary log files, shows `<redacted>` instead unless `WAAV_LOG_CONTENT=1`.
+const CONTENT_FIELDS: &[&str] = &[
+    crate::observability::voice_attrs::turn::TRANSCRIPT,
+    crate::observability::voice_attrs::turn::SYNTHESIS_INPUT,
+    "transcript",
+];
+
+/// `WAAV_LOG_CONTENT`: `1`/`true`/`yes`/`on` puts conversation content back in the stdout log.
+fn log_content_from_env() -> bool {
+    std::env::var("WAAV_LOG_CONTENT").is_ok_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+/// The stdout log's field formatter: the default `name=value` layout, with [`CONTENT_FIELDS`] shown as
+/// `<redacted>` unless `log_content`.
+fn log_fields(
+    log_content: bool,
+) -> impl for<'w> tracing_subscriber::fmt::FormatFields<'w> + Send + Sync + 'static {
+    use tracing_subscriber::field::MakeExt as _;
+    tracing_subscriber::fmt::format::debug_fn(move |w, field, value| {
+        let name = field.name();
+        if name == "message" {
+            write!(w, "{value:?}")
+        } else if !log_content && CONTENT_FIELDS.contains(&name) {
+            write!(w, "{name}=<redacted>")
+        } else {
+            write!(w, "{name}={value:?}")
+        }
+    })
+    .delimited(" ")
+}
+
+/// The stdout log layer every subscriber below installs.
+fn log_layer<S>() -> impl tracing_subscriber::Layer<S>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    tracing_subscriber::fmt::layer().fmt_fields(log_fields(log_content_from_env()))
+}
+
 /// The filter when `RUST_LOG` is unset. ONNX Runtime logs every graph optimisation at INFO, about
 /// 500 lines each time a session loads its detector and end-of-turn models; its warnings stay.
 pub const DEFAULT_FILTER: &str = "info,ort=warn";
@@ -73,7 +119,7 @@ pub fn init() -> TracingGuard {
     let Some(endpoint) = endpoint else {
         tracing_subscriber::registry()
             .with(filter)
-            .with(tracing_subscriber::fmt::layer())
+            .with(log_layer())
             .init();
         tracing::info!("OTLP export not configured; tracing to stdout only");
         return TracingGuard { provider: None };
@@ -100,7 +146,7 @@ pub fn init() -> TracingGuard {
             // losing telemetry is bad, refusing calls because telemetry is unavailable is worse.
             tracing_subscriber::registry()
                 .with(filter)
-                .with(tracing_subscriber::fmt::layer())
+                .with(log_layer())
                 .init();
             tracing::error!(error = %e, endpoint = %endpoint, "OTLP exporter build failed; tracing to stdout only");
             return TracingGuard { provider: None };
@@ -117,7 +163,7 @@ pub fn init() -> TracingGuard {
 
     tracing_subscriber::registry()
         .with(filter)
-        .with(tracing_subscriber::fmt::layer())
+        .with(log_layer())
         .with(tracing_opentelemetry::layer().with_tracer(tracer))
         .init();
 
@@ -129,7 +175,46 @@ pub fn init() -> TracingGuard {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_FILTER, resource_attributes};
+    use super::{DEFAULT_FILTER, log_fields, resource_attributes};
+
+    /// Conversation content stays out of the stdout log unless asked for; other fields and the
+    /// message are formatted as before.
+    #[test]
+    fn the_stdout_log_redacts_conversation_content_unless_asked() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let render = |log_content: bool| {
+            let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+            let sink = buf.clone();
+            let layer = tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(move || SinkWriter(sink.clone()))
+                .fmt_fields(log_fields(log_content));
+            let subscriber = tracing_subscriber::registry().with(layer);
+            tracing::subscriber::with_default(subscriber, || {
+                let span = tracing::info_span!("voice.turn", bud.voice.transcript = "my card number is 4111");
+                let _e = span.enter();
+                tracing::warn!(transcript = %"call my sister", session = "s1", "turn done");
+            });
+            String::from_utf8(buf.lock().unwrap().clone()).unwrap()
+        };
+        let out = render(false);
+        assert!(!out.contains("4111") && !out.contains("call my sister"), "{out}");
+        assert!(out.contains("bud.voice.transcript=<redacted>") && out.contains("transcript=<redacted>"), "{out}");
+        assert!(out.contains("turn done") && out.contains("session=\"s1\""), "{out}");
+        let out = render(true);
+        assert!(out.contains("4111") && out.contains("call my sister"), "{out}");
+    }
+
+    struct SinkWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for SinkWriter {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn the_default_filter_keeps_onnx_runtime_warnings_only() {

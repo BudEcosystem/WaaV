@@ -36,27 +36,56 @@ const USER: &str = "5b0c7e1d-0000-4000-8000-00000000bb01";
 const API_KEY_ID: &str = "5b0c7e1d-0000-4000-8000-00000000cc01";
 const MODEL_ID: &str = "5b0c7e1d-0000-4000-8000-00000000dd01";
 
-/// bud-auth's fixture ciphertext; the plaintext is its `PLAIN`.
-const TEST_CREDENTIAL: &str = include_str!("../../bud-auth/tests/fixtures/test_cred_encrypted.hex");
+/// The vendor key every test credential decrypts to.
 const VENDOR_KEY: &str = "dg_vendor_key_abc123";
 
-const JWKS: &str = include_str!("../../bud-auth/tests/fixtures/test_jwks.json");
 const JWT_ISSUER: &str = "https://auth.test/realms/bud";
 
+/// Keys made once per test binary: the credential key pair (PKCS#8 PEM) with [`VENDOR_KEY`] encrypted to it the
+/// way budapp encrypts credentials (RSA-OAEP-SHA-256, hex), and the JWT signing key with its JWKS. bud-auth's
+/// `*.pem` fixtures are git-ignored, so a clean checkout (CI) has no key to read; this mirrors
+/// `src/test_support.rs`.
+struct TestKeys {
+    credential_pem: String,
+    credential: String,
+    jwt_pem: String,
+    jwks: String,
+}
+
+fn test_keys() -> &'static TestKeys {
+    static KEYS: std::sync::OnceLock<TestKeys> = std::sync::OnceLock::new();
+    KEYS.get_or_init(|| {
+        use base64::Engine as _;
+        use rsa::pkcs8::{EncodePrivateKey, LineEnding};
+        use rsa::traits::PublicKeyParts;
+        let mut rng = rsa::rand_core::OsRng;
+        let pem = |key: &rsa::RsaPrivateKey| key.to_pkcs8_pem(LineEnding::LF).expect("test key encodes").to_string();
+        let credential_key = rsa::RsaPrivateKey::new(&mut rng, 2048).expect("test key generates");
+        let ciphertext = credential_key
+            .to_public_key()
+            .encrypt(&mut rng, rsa::Oaep::new::<sha2::Sha256>(), VENDOR_KEY.as_bytes())
+            .expect("test credential encrypts");
+        let jwt_key = rsa::RsaPrivateKey::new(&mut rng, 2048).expect("test key generates");
+        let b64 = |bytes: Vec<u8>| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+        let jwks = json!({"keys": [{
+            "kty": "RSA", "use": "sig", "alg": "RS256", "kid": "test-key-1",
+            "n": b64(jwt_key.n().to_bytes_be()), "e": b64(jwt_key.e().to_bytes_be()),
+        }]});
+        TestKeys {
+            credential_pem: pem(&credential_key),
+            credential: hex::encode(ciphertext),
+            jwt_pem: pem(&jwt_key),
+            jwks: jwks.to_string(),
+        }
+    })
+}
+
 fn test_pem() -> String {
-    std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../bud-auth/tests/fixtures/test_cred_private.pem"
-    ))
-    .expect("bud-auth's fixture key (git-ignored *.pem) must be present locally")
+    test_keys().credential_pem.clone()
 }
 
 fn jwt_private_pem() -> String {
-    std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../bud-auth/tests/fixtures/test_rsa_private.pem"
-    ))
-    .expect("bud-auth's JWT fixture key must be present locally")
+    test_keys().jwt_pem.clone()
 }
 
 fn now() -> u64 {
@@ -520,7 +549,7 @@ fn rt_entry(vendor: &MockVendor, extra: Json) -> Json {
     let mut e = json!({
         "vendor": "openai",
         "api_base": vendor.base(),
-        "credential": TEST_CREDENTIAL.trim(),
+        "credential": test_keys().credential.as_str(),
         "endpoints": ["realtime_session"],
         "model": "gpt-realtime-2.1",
         "pricing": {"unit": "token", "per_units": 1000000, "currency": "USD",
@@ -569,7 +598,7 @@ struct StaticJwks;
 #[async_trait::async_trait]
 impl bud_auth::JwksSource for StaticJwks {
     async fn fetch(&self) -> Result<String, String> {
-        Ok(JWKS.to_string())
+        Ok(test_keys().jwks.clone())
     }
 }
 
@@ -1253,8 +1282,11 @@ async fn tc_evt_15_hold_timeout() {
 /// the close arrives in order.
 #[tokio::test]
 async fn tc_evt_16_slow_client_is_closed_without_silent_drops() {
+    // More output than the kernel can buffer for a reader that has stopped: Linux auto-tunes loopback
+    // sockets up to tcp_rmem + tcp_wmem (6 + 4 MiB by default) and the client queue holds ~1 MiB more, so
+    // 8 MiB of deltas fit entirely in buffers and the queue never fills. 8000 × 4 KiB ≈ 34 MiB cannot.
     let vendor = MockVendor::start(Behaviour {
-        audio_deltas: 2000,
+        audio_deltas: 8000,
         delta_bytes: 4096,
         ..Default::default()
     })
@@ -1265,6 +1297,12 @@ async fn tc_evt_16_slow_client_is_closed_without_silent_drops() {
             "a1a1a1a1-0000-4000-8000-0000000000e6",
             rt_entry(&vendor, json!({})),
         )],
+        // A reader that has stopped also stops answering pings; keep the liveness check out of the way so
+        // the slow-client path (not `client_timeout`) is what ends the session.
+        timings: Timings {
+            max_missed_pongs: 1000,
+            ..fast_timings()
+        },
         ..Default::default()
     })
     .await;
@@ -1276,7 +1314,11 @@ async fn tc_evt_16_slow_client_is_closed_without_silent_drops() {
     let mut last = -1i64;
     let mut close = None;
     let mut errors = Vec::new();
-    while let Ok(Some(Ok(msg))) = tokio::time::timeout(Duration::from_secs(10), c.next()).await {
+    let ended = loop {
+        let msg = match tokio::time::timeout(Duration::from_secs(10), c.next()).await {
+            Ok(Some(Ok(msg))) => msg,
+            other => break format!("{other:?}"),
+        };
         match msg {
             Message::Text(t) => {
                 let v: Json = serde_json::from_str(t.as_str()).unwrap();
@@ -1298,12 +1340,12 @@ async fn tc_evt_16_slow_client_is_closed_without_silent_drops() {
             }
             Message::Close(f) => {
                 close = f.map(|f| u16::from(f.code));
-                break;
+                break "close".to_string();
             }
             _ => {}
         }
-    }
-    assert_eq!(close, Some(1011));
+    };
+    assert_eq!(close, Some(1011), "the read ended with {ended} after delta {last}");
     assert_eq!(errors, vec!["client_too_slow"]);
     assert!(last >= 0, "some deltas were delivered in order");
 }

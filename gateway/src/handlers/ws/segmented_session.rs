@@ -105,11 +105,17 @@ pub fn resolve(
         Some(a) => agent_tuning(&a.entry),
         None => request_tuning(stt),
     };
+    // Strings, and whole numbers as their decimal text (`"segment_deadline_ms": 30000`).
     let extras: BTreeMap<String, String> = stt
         .extras
         .0
         .iter()
-        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+        .filter_map(|(k, v)| {
+            v.as_str()
+                .map(str::to_string)
+                .or_else(|| v.as_u64().map(|n| n.to_string()))
+                .map(|s| (k.clone(), s))
+        })
         .collect();
     let prompt = stt
         .extras

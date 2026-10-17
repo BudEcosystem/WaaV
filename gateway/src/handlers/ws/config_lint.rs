@@ -100,6 +100,21 @@ fn diff_object(raw: &Value, accepted: &Value, prefix: &mut String, out: &mut Vec
                     prefix.push_str(key);
                     diff_object(raw_val, accepted_val, prefix, out);
                     prefix.truncate(restore_len);
+                } else if let (Value::Array(r), Value::Array(a)) = (raw_val, accepted_val)
+                    && r.len() == a.len()
+                {
+                    // Element-wise for arrays of objects (a DAG's `nodes`), as `nodes[2].voice_ID`.
+                    // A length mismatch means the round-trip reshaped the array; nothing to
+                    // attribute then.
+                    for (i, (rv, av)) in r.iter().zip(a).enumerate() {
+                        let restore_len = prefix.len();
+                        if !prefix.is_empty() {
+                            prefix.push('.');
+                        }
+                        prefix.push_str(&format!("{key}[{i}]"));
+                        diff_object(rv, av, prefix, out);
+                        prefix.truncate(restore_len);
+                    }
                 }
             }
         }
@@ -160,6 +175,39 @@ fn nesting_hint(path: &str) -> Option<String> {
     Some(format!("Did you mean to nest `{path}` under `{home}`?"))
 }
 
+/// [`warn_unknown_config_keys`] for a block the config carries as raw JSON and parses later (an
+/// inline `dag_config.definition`): `raw` is what the client sent, `accepted` the parsed value
+/// re-serialized; paths are reported under `prefix`. Never closes the session.
+pub async fn warn_unknown_keys_under(
+    prefix: &str,
+    raw: &Value,
+    accepted: &Value,
+    message_tx: &mpsc::Sender<MessageRoute>,
+) {
+    let paths: Vec<String> = unknown_config_keys(raw, accepted)
+        .into_iter()
+        .map(|p| format!("{prefix}.{p}"))
+        .collect();
+    if paths.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        ignored_keys = ?paths,
+        "client config contained unknown/ignored keys (silently dropped by serde)"
+    );
+    crate::core::metrics::bridge::record_degraded(UNKNOWN_CONFIG_KEYS_CODE, "config_lint");
+    send_with_policy(
+        message_tx,
+        MessageRoute::Outgoing(OutgoingMessage::ConfigWarning {
+            code: UNKNOWN_CONFIG_KEYS_CODE.to_string(),
+            message: advisory_message(&paths),
+            detail: Some(serde_json::json!({ "ignored_keys": paths })),
+        }),
+        MessageClass::Critical,
+    )
+    .await;
+}
+
 /// Diff the raw client JSON against the typed-then-reserialized config and, if
 /// any keys were silently dropped, emit a single non-fatal
 /// [`OutgoingMessage::ConfigWarning`] naming them. No-op when everything was
@@ -218,6 +266,40 @@ pub async fn warn_unknown_config_keys(
 mod tests {
     use super::*;
     use crate::handlers::ws::messages::IncomingMessage;
+
+    /// A typo inside an array of objects is reported with its element index.
+    #[test]
+    fn unknown_keys_inside_array_elements_are_reported_with_their_index() {
+        let raw = serde_json::json!({ "nodes": [ { "id": "a" }, { "id": "b", "voice_ID": "x" } ] });
+        let accepted = serde_json::json!({ "nodes": [ { "id": "a" }, { "id": "b" } ] });
+        assert_eq!(unknown_config_keys(&raw, &accepted), vec!["nodes[1].voice_ID".to_string()]);
+    }
+
+    /// An inline DAG definition: a misspelled node key is found by diffing the client's JSON
+    /// against the parsed definition re-serialized, and a clean definition reports nothing.
+    #[cfg(feature = "dag-routing")]
+    #[test]
+    fn a_misspelled_dag_node_key_is_found() {
+        let def = serde_json::json!({
+            "id": "d", "name": "d", "version": "1.0.0",
+            "nodes": [
+                { "id": "in", "type": "audio_input" },
+                { "id": "tts", "type": "tts_provider", "provider": "openai", "voice_ID": "alloy" }
+            ],
+            "edges": [ { "from": "in", "to": "tts" } ],
+            "entry_node": "in", "exit_nodes": ["tts"]
+        });
+        let parsed: crate::dag::DAGDefinition = serde_json::from_value(def.clone()).unwrap();
+        let accepted = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(unknown_config_keys(&def, &accepted), vec!["nodes[1].voice_ID".to_string()]);
+
+        let mut clean = def.clone();
+        clean["nodes"][1].as_object_mut().unwrap().remove("voice_ID");
+        clean["nodes"][1]["voice_id"] = serde_json::json!("alloy");
+        let parsed: crate::dag::DAGDefinition = serde_json::from_value(clean.clone()).unwrap();
+        let accepted = serde_json::to_value(&parsed).unwrap();
+        assert!(unknown_config_keys(&clean, &accepted).is_empty(), "{:?}", unknown_config_keys(&clean, &accepted));
+    }
 
     /// Round-trip a config message exactly as the live handler does: parse the
     /// raw text into both an `IncomingMessage` and a `Value`, re-serialize the

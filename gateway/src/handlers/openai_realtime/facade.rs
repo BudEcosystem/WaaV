@@ -1821,7 +1821,16 @@ pub(super) async fn run(
     let Shell { meter, tr, .. } = shell;
     let mut meter = meter;
     meter.set_vendor_session_id(tr.vendor_session_id());
-    session::finish(meter, end, &client_tx, writer, Some(&session_id), &vendor).await;
+    session::finish(
+        meter,
+        end,
+        &client_tx,
+        writer,
+        client_rx,
+        Some(&session_id),
+        &vendor,
+    )
+    .await;
     drop(p);
 }
 

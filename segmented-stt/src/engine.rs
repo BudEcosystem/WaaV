@@ -1270,7 +1270,7 @@ impl Engine {
 
     fn start_unit(&mut self, seq: u32, turn_final: bool) {
         let gap_cap = self.p.join_gap_cap_ms;
-        let deadline = Duration::from_millis(self.upload.deadline_ms() as u64);
+        let deadline = Duration::from_millis(self.upload.unit_deadline_ms() as u64);
         let guard = Duration::from_millis(self.p.turn_guard_ms as u64);
         let ctx = SegmentContext {
             turn_id: 0,

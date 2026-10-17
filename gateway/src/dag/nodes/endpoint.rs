@@ -48,7 +48,8 @@ pub(super) fn validate_http_url_for_ssrf(url: &str) -> DAGResult<()> {
 }
 
 pub(super) fn ssrf_protected_http_client() -> DAGResult<reqwest::Client> {
-    crate::core::net::ssrf_protected_client(crate::core::net::HTTP_URL_SCHEMES)
+    // Connect-time guard too: the URL is client-supplied (DNS rebinding).
+    crate::core::net::guarded_client(crate::core::net::HTTP_URL_SCHEMES)
         .map_err(|e| DAGError::ConfigError(format!("failed to build DAG HTTP client: {e}")))
 }
 

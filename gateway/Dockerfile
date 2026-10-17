@@ -44,6 +44,8 @@ COPY bud-auth /app/bud-auth
 COPY waav-openai-audio /app/waav-openai-audio
 COPY plugin-api /app/plugin-api
 COPY segmented-stt /app/segmented-stt
+# [patch.crates-io] path dependency (patched livekit-api); metadata resolution needs it.
+COPY gateway/vendor ./vendor
 COPY gateway/Cargo.toml gateway/Cargo.lock ./
 # cargo-chef needs a target file for cargo metadata; stub keeps cache stable. The declared
 # [[bench]] targets need one too, or `cargo metadata` refuses to parse the manifest.
@@ -100,6 +102,7 @@ COPY waav-openai-audio /app/waav-openai-audio
 COPY plugin-api /app/plugin-api
 COPY segmented-stt /app/segmented-stt
 COPY gateway/.cargo/config.toml .cargo/config.toml
+COPY gateway/vendor ./vendor
 # cargo-chef rebuilds the crate skeleton from the recipe but creates no bench sources, and
 # Cargo refuses to parse a manifest whose declared [[bench]] targets are absent. Stubbing
 # them keeps the cook stage dependency-only (bench sources are never copied into the image)

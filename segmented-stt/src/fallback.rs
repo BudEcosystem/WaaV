@@ -131,6 +131,10 @@ impl SegmentUpload for FallbackUpload {
         self.targets[0].upload.deadline_ms()
     }
 
+    fn unit_deadline_ms(&self) -> u32 {
+        self.targets[0].upload.unit_deadline_ms()
+    }
+
     fn try_speculative(&self) -> bool {
         self.current().upload.try_speculative()
     }

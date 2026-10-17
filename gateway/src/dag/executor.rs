@@ -19,7 +19,7 @@ use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use super::compiler::CompiledDAG;
-use super::context::{DAGContext, DagOutput};
+use super::context::{DAGContext, DagOutput, STREAMING_DELIVERY_KEY};
 use super::error::{DAGError, DAGResult};
 use super::nodes::DAGData;
 use super::routing::create_rhai_engine;
@@ -158,6 +158,19 @@ impl DAGExecutor {
         Some(order)
     }
 
+    /// The number of nodes [`execute_streaming_from`](Self::execute_streaming_from) would run from
+    /// `start_node_id` in streaming mode, or `None` when the graph needs the batch executor (a join,
+    /// or an unknown start). The stream driver bounds a streamed turn by it.
+    pub fn streamable_node_count(&self, dag: &CompiledDAG, start_node_id: &str) -> Option<usize> {
+        let start = *dag.node_index.get(start_node_id)?;
+        self.streamable_tree(dag, start).map(|nodes| nodes.len())
+    }
+
+    /// The per-node timeout a node without its own `timeout_ms` gets.
+    pub fn default_node_timeout(&self) -> Duration {
+        self.default_timeout
+    }
+
     /// Run the subgraph from `start_node_id` in STREAMING mode (the streaming data-plane).
     ///
     /// EVERY reachable node runs concurrently, wired by bounded channels, so a downstream node
@@ -227,6 +240,10 @@ impl DAGExecutor {
             let mut node_ctx = ctx.clone_for_branch();
             node_ctx.output_tx = None;
             node_ctx.cancel_token = cancel.clone();
+            // Output nodes: the terminal forwarder delivers to the client here, not their own sink.
+            node_ctx
+                .metadata
+                .insert(STREAMING_DELIVERY_KEY.to_string(), "1".to_string());
             node_tasks.spawn(async move {
                 node.execute_streaming(rx, &mut node_ctx, out_tx)
                     .await
@@ -312,10 +329,23 @@ impl DAGExecutor {
         while let Some(res) = node_tasks.join_next().await {
             let err = match res {
                 Ok(Ok(())) => None,
-                Ok(Err((node_id, e))) => Some(DAGError::NodeExecutionError {
-                    node_id,
-                    error: e.to_string(),
-                }),
+                Ok(Err((node_id, e))) => {
+                    if !matches!(e, DAGError::Cancelled)
+                        && let Some(&idx) = dag.node_index.get(&node_id)
+                    {
+                        ctx.record_failed_node(&node_id, dag.graph[idx].node.node_type());
+                    }
+                    // A cancelled run stays `Cancelled` (a barge-in is not a failure to report) and a
+                    // timeout stays a timeout (the client is told `dag_node_timeout`).
+                    Some(match e {
+                        DAGError::Cancelled => DAGError::Cancelled,
+                        DAGError::ExecutionTimeout(ms) => DAGError::ExecutionTimeout(ms),
+                        e => DAGError::NodeExecutionError {
+                            node_id,
+                            error: e.to_string(),
+                        },
+                    })
+                }
                 Err(join) => Some(DAGError::NodeExecutionError {
                     node_id: "<join>".into(),
                     error: format!("streaming node task failed: {join}"),
@@ -871,17 +901,23 @@ impl DAGExecutor {
             .timeout_ms
             .map(Duration::from_millis)
             .unwrap_or(self.default_timeout);
-        let _ = node_type; // retained for tracing above
-        let result = match timeout(node_timeout, node.execute(input, ctx)).await {
-            Ok(result) => result,
-            Err(_) => {
-                warn!(
-                    node_id = %node_id,
-                    timeout_ms = %node_timeout.as_millis(),
-                    "Node execution timed out"
-                );
-                Err(DAGError::ExecutionTimeout(node_timeout.as_millis() as u64))
-            }
+        // Cancellation (barge-in, a superseding turn, teardown) drops the node's in-flight work at
+        // once instead of waiting for its LLM or TTS call to finish.
+        let cancel = ctx.cancel_token.clone();
+        let result = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(DAGError::Cancelled),
+            r = timeout(node_timeout, node.execute(input, ctx)) => match r {
+                Ok(result) => result,
+                Err(_) => {
+                    warn!(
+                        node_id = %node_id,
+                        timeout_ms = %node_timeout.as_millis(),
+                        "Node execution timed out"
+                    );
+                    Err(DAGError::ExecutionTimeout(node_timeout.as_millis() as u64))
+                }
+            },
         };
 
         let duration = start.elapsed();
@@ -912,6 +948,11 @@ impl DAGExecutor {
                     duration_ms = %duration.as_millis(),
                     "Node execution failed"
                 );
+                // A node's error rarely names the node: keep it for the caller (the session
+                // tells the client which node failed).
+                if !matches!(e, DAGError::Cancelled) {
+                    ctx.record_failed_node(node_id, node.node_type());
+                }
             }
         }
 
@@ -953,6 +994,12 @@ impl DAGExecutor {
         let permits = self.max_concurrent_branches.max(1);
         let semaphore = Arc::new(Semaphore::new(permits));
 
+        // A branch's outputs and context, or its error and the node that failed it.
+        type BranchResult = Result<
+            (HashMap<NodeIndex, DAGData>, DAGContext),
+            (DAGError, Option<super::context::FailedNode>),
+        >;
+
         // Build one future per branch. Each future executes that branch's
         // interior nodes in topological order in an isolated branch context and
         // returns the per-node outputs plus the branch's node-result map.
@@ -962,38 +1009,55 @@ impl DAGExecutor {
             let input_clone = input.clone();
             let sem = semaphore.clone();
             branch_futures.push(async move {
-                let _permit = sem
-                    .acquire_owned()
-                    .await
-                    .map_err(|e| DAGError::InternalError(e.to_string()))?;
+                let _permit = match sem.acquire_owned().await {
+                    Ok(permit) => permit,
+                    Err(e) => {
+                        let error = DAGError::InternalError(e.to_string());
+                        return BranchResult::Err((error, None));
+                    }
+                };
                 let mut branch_ctx = branch_ctx;
-                let outputs = self
+                let result: BranchResult = match self
                     .execute_branch_interior(dag, plan, input_clone, &mut branch_ctx)
                     .await
-                    .map_err(|e| DAGError::SplitBranchError {
-                        branch_id: plan.branch_id.clone(),
-                        error: e.to_string(),
-                    })?;
-                Ok::<_, DAGError>((outputs, branch_ctx))
+                {
+                    Ok(outputs) => Ok((outputs, branch_ctx)),
+                    // The branch's context is dropped here: carry its failing node out.
+                    Err(e) => Err((
+                        DAGError::SplitBranchError {
+                            branch_id: plan.branch_id.clone(),
+                            error: e.to_string(),
+                        },
+                        branch_ctx.failed_node.take(),
+                    )),
+                };
+                result
             });
         }
 
         // Execute branches (concurrently when parallelism is enabled).
-        let branch_results: Vec<DAGResult<(HashMap<NodeIndex, DAGData>, DAGContext)>> =
-            if self.enable_parallelism {
-                join_all(branch_futures).await
-            } else {
-                let mut out = Vec::with_capacity(branch_futures.len());
-                for fut in branch_futures {
-                    out.push(fut.await);
-                }
-                out
-            };
+        let branch_results: Vec<BranchResult> = if self.enable_parallelism {
+            join_all(branch_futures).await
+        } else {
+            let mut out = Vec::with_capacity(branch_futures.len());
+            for fut in branch_futures {
+                out.push(fut.await);
+            }
+            out
+        };
 
         // Merge every branch's outputs and node results back into the shared
         // state. The first error aborts the whole split.
         for result in branch_results {
-            let (outputs, branch_ctx) = result?;
+            let (outputs, branch_ctx) = match result {
+                Ok(ok) => ok,
+                Err((e, failed)) => {
+                    if ctx.failed_node.is_none() {
+                        ctx.failed_node = failed;
+                    }
+                    return Err(e);
+                }
+            };
             for (idx, data) in outputs {
                 node_outputs.insert(idx, data);
             }

@@ -3649,8 +3649,6 @@ dependencies = [
 [[package]]
 name = "livekit-api"
 version = "0.4.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "42a650aa52faaaa6bb33b7c3a7742d47f78a7dc21e65d7c936a518d43eb974b4"
 dependencies = [
  "base64 0.21.7",
  "futures-util",
@@ -8125,8 +8123,6 @@ dependencies = [
 [[package]]
 name = "webrtc-sys"
 version = "0.3.16"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "96fa109636ee0a2aeb84988208f266335ab7480dcdd2881234d795866773e529"
 dependencies = [
  "cc",
  "cxx",

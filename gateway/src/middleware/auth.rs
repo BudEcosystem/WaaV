@@ -214,9 +214,13 @@ async fn authenticate_request(
         };
     }
 
-    // Check authentication mode and validate accordingly
-    // Priority: API secret mode first (simpler), then JWT mode
-    if state.config.has_api_secret_auth() {
+    // Standalone authenticators, in the order `AUTH_MODE` sets (default `chain`): an API secret
+    // first, then — for any bearer that is not one — the external auth responder. A secret
+    // mismatch used to answer 401 here even with AUTH_SERVICE_URL configured, so the responder
+    // was never called (the documented "both methods can coexist" did not).
+    let try_secret = state.auth_policy.secrets_active(&state.config);
+    let try_responder = state.auth_policy.responder_active(&state.config);
+    if try_secret {
         // API Secret authentication mode - constant-time comparison
         if let Some(secret_id) = match_api_secret_id(&token, &state.config.auth_api_secrets) {
             tracing::info!(
@@ -227,7 +231,8 @@ async fn authenticate_request(
             );
             request.extensions_mut().insert(Auth::new(secret_id));
             return Ok(next.run(request).await);
-        } else {
+        }
+        if !try_responder {
             tracing::warn!(
                 method = %request_method,
                 path = %request_path,
@@ -235,10 +240,15 @@ async fn authenticate_request(
             );
             return Err(AuthError::Unauthorized("Invalid API secret".to_string()));
         }
+        tracing::debug!(
+            method = %request_method,
+            path = %request_path,
+            "bearer is not an API secret; asking the auth responder"
+        );
     }
 
     // JWT authentication mode - validate with external auth service
-    if state.config.has_jwt_auth() {
+    if try_responder {
         // Get the auth client from state
         let auth_client = state
             .auth_client

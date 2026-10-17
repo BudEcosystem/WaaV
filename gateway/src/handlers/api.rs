@@ -158,23 +158,154 @@ pub async fn readyz(State(state): State<Arc<AppState>>) -> Response {
 )]
 pub async fn metrics_handler(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     // RC8 /metrics guard:
-    // 1. Optional bearer auth: when WAAV_METRICS_TOKEN is set (non-empty), the request
-    //    must carry `Authorization: Bearer <token>` or it gets a 401. Unset/empty env
-    //    keeps the endpoint public (back-compat with existing scrape configs).
+    // 1. Access per [`MetricsPolicy`] (installed by `main`): bearer when WAAV_METRICS_TOKEN
+    //    is set; otherwise public only on a gateway whose API is itself open, or when
+    //    WAAV_METRICS_PUBLIC=true says so. Without an installed policy (library use, tests)
+    //    the historical rule applies: token if set, else public.
     // 2. Scrape-storm cache: the rendered exposition is cached for METRICS_CACHE_TTL
     //    (1 s) so a storm of scrapes re-renders at most once per window.
-    let required_token = std::env::var("WAAV_METRICS_TOKEN")
-        .ok()
-        .filter(|t| !t.is_empty());
+    let access = METRICS_POLICY
+        .get()
+        .map(|p| p.main.clone())
+        .unwrap_or_else(|| MetricsPolicy::legacy(metrics_token_from_env()).main);
+    serve_metrics(&access, &state, &headers)
+}
+
+/// `/metrics` on the dedicated listener (`WAAV_METRICS_ADDR`).
+pub async fn dedicated_metrics_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
+    let access = METRICS_POLICY
+        .get()
+        .and_then(|p| p.dedicated.as_ref().map(|(_, a)| a.clone()))
+        .unwrap_or(MetricsAccess::NotServed);
+    serve_metrics(&access, &state, &headers)
+}
+
+fn serve_metrics(access: &MetricsAccess, state: &AppState, headers: &HeaderMap) -> Response {
     let authorization = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
-
-    metrics_response(required_token.as_deref(), authorization, || {
+    metrics_response_for(access, authorization, || {
         cached_metrics_body(&METRICS_CACHE, METRICS_CACHE_TTL, || {
             state.core_state.metrics.render()
         })
     })
+}
+
+fn metrics_token_from_env() -> Option<String> {
+    std::env::var("WAAV_METRICS_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty())
+}
+
+/// Who may read `/metrics` on one listener.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MetricsAccess {
+    /// Anyone who can reach the listener.
+    Public,
+    /// `Authorization: Bearer <token>` required (401 otherwise).
+    Bearer(String),
+    /// Not served on this listener (404): metrics live on the dedicated listener, or are off.
+    NotServed,
+    /// The API requires authentication but no metrics credential or opt-in was configured,
+    /// so the exposition is refused (403) rather than left as the one open door.
+    Locked,
+}
+
+/// Where and how `/metrics` is served, resolved once at startup.
+///
+/// | WAAV_METRICS_ADDR | WAAV_METRICS_TOKEN | WAAV_METRICS_PUBLIC | API auth | main listener | dedicated |
+/// | --- | --- | --- | --- | --- | --- |
+/// | unset | set | any | any | bearer | - |
+/// | unset | unset | true | any | public | - |
+/// | unset | unset | false | any | 404 | - |
+/// | unset | unset | unset | off | public (as before) | - |
+/// | unset | unset | unset | on | 403 + startup warning | - |
+/// | set | token? | not true | any | 404 | bearer if token, else public |
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetricsPolicy {
+    pub main: MetricsAccess,
+    pub dedicated: Option<(std::net::SocketAddr, MetricsAccess)>,
+}
+
+static METRICS_POLICY: std::sync::OnceLock<MetricsPolicy> = std::sync::OnceLock::new();
+
+impl MetricsPolicy {
+    /// The pre-policy behaviour: bearer when a token is set, otherwise public.
+    pub fn legacy(token: Option<String>) -> Self {
+        Self::resolve(token, None, Some(true), false)
+    }
+
+    /// Read `WAAV_METRICS_TOKEN`, `WAAV_METRICS_ADDR` and `WAAV_METRICS_PUBLIC`.
+    /// `api_requires_auth`: the gateway authenticates API callers (AUTH_REQUIRED, API
+    /// secrets, or Bud mode).
+    pub fn from_env(api_requires_auth: bool) -> Result<Self, String> {
+        let addr = match std::env::var("WAAV_METRICS_ADDR")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+        {
+            Some(v) => Some(
+                v.trim()
+                    .parse()
+                    .map_err(|e| format!("WAAV_METRICS_ADDR={v:?} is not host:port: {e}"))?,
+            ),
+            None => None,
+        };
+        let public = match std::env::var("WAAV_METRICS_PUBLIC")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+        {
+            Some(v) => Some(
+                parse_bool(v.trim())
+                    .ok_or_else(|| format!("WAAV_METRICS_PUBLIC={v:?} is not a boolean"))?,
+            ),
+            None => None,
+        };
+        Ok(Self::resolve(
+            metrics_token_from_env(),
+            addr,
+            public,
+            api_requires_auth,
+        ))
+    }
+
+    pub fn resolve(
+        token: Option<String>,
+        addr: Option<std::net::SocketAddr>,
+        public: Option<bool>,
+        api_requires_auth: bool,
+    ) -> Self {
+        let gated = |open: MetricsAccess| match &token {
+            Some(t) => MetricsAccess::Bearer(t.clone()),
+            None => open,
+        };
+        match addr {
+            Some(addr) => Self {
+                main: if public == Some(true) {
+                    gated(MetricsAccess::Public)
+                } else {
+                    MetricsAccess::NotServed
+                },
+                dedicated: Some((addr, gated(MetricsAccess::Public))),
+            },
+            None => Self {
+                main: gated(match public {
+                    Some(true) => MetricsAccess::Public,
+                    Some(false) => MetricsAccess::NotServed,
+                    None if api_requires_auth => MetricsAccess::Locked,
+                    None => MetricsAccess::Public,
+                }),
+                dedicated: None,
+            },
+        }
+    }
+
+    /// Install the process-wide policy (first call wins).
+    pub fn install(self) {
+        let _ = METRICS_POLICY.set(self);
+    }
 }
 
 /// How long a rendered Prometheus exposition stays fresh (RC8 scrape-storm guard).
@@ -229,6 +360,25 @@ fn metrics_auth_ok(required_token: Option<&str>, authorization: Option<&str>) ->
         Some(token) => authorization
             .and_then(|header| header.strip_prefix("Bearer "))
             .is_some_and(|presented| constant_time_eq(presented, token)),
+    }
+}
+
+/// [`metrics_response`] for one listener's [`MetricsAccess`].
+fn metrics_response_for(
+    access: &MetricsAccess,
+    authorization: Option<&str>,
+    body: impl FnOnce() -> String,
+) -> Response {
+    match access {
+        MetricsAccess::Public => metrics_response(None, authorization, body),
+        MetricsAccess::Bearer(token) => metrics_response(Some(token.as_str()), authorization, body),
+        MetricsAccess::NotServed => (StatusCode::NOT_FOUND, "not found\n").into_response(),
+        MetricsAccess::Locked => (
+            StatusCode::FORBIDDEN,
+            "metrics are not public on an authenticated gateway: set WAAV_METRICS_TOKEN, \
+             WAAV_METRICS_ADDR, or WAAV_METRICS_PUBLIC=true\n",
+        )
+            .into_response(),
     }
 }
 
@@ -392,6 +542,53 @@ mod tests {
 
         assert_eq!(first, "old");
         assert_eq!(second, "new", "an expired cache entry must be re-rendered");
+    }
+
+    // ============== /metrics exposure policy ==============
+
+    #[test]
+    fn metrics_policy_defaults_follow_the_api_auth_posture() {
+        use MetricsAccess::*;
+        let open = MetricsPolicy::resolve(None, None, None, false);
+        assert_eq!((open.main, open.dedicated), (Public, None));
+        let authed = MetricsPolicy::resolve(None, None, None, true);
+        assert_eq!(authed.main, Locked);
+        let opted_in = MetricsPolicy::resolve(None, None, Some(true), true);
+        assert_eq!(opted_in.main, Public);
+        let off = MetricsPolicy::resolve(None, None, Some(false), false);
+        assert_eq!(off.main, NotServed);
+    }
+
+    #[test]
+    fn metrics_token_always_gates_and_dedicated_addr_moves_metrics_off_the_main_port() {
+        use MetricsAccess::*;
+        let tok = Some("t".to_string());
+        let gated = |p: MetricsPolicy| p.main;
+        assert_eq!(
+            gated(MetricsPolicy::resolve(tok.clone(), None, None, true)),
+            Bearer("t".into())
+        );
+        assert_eq!(
+            gated(MetricsPolicy::resolve(tok.clone(), None, Some(true), false)),
+            Bearer("t".into())
+        );
+        let addr: std::net::SocketAddr = "127.0.0.1:9464".parse().unwrap();
+        let p = MetricsPolicy::resolve(None, Some(addr), None, true);
+        assert_eq!((p.main, p.dedicated), (NotServed, Some((addr, Public))));
+        let p = MetricsPolicy::resolve(tok, Some(addr), None, false);
+        assert_eq!(p.dedicated, Some((addr, Bearer("t".into()))));
+        assert_eq!(MetricsPolicy::legacy(None).main, Public);
+    }
+
+    #[test]
+    fn locked_and_not_served_never_render_the_exposition() {
+        for access in [MetricsAccess::Locked, MetricsAccess::NotServed] {
+            let r = metrics_response_for(&access, Some("Bearer x"), || panic!("rendered"));
+            assert!(matches!(
+                r.status(),
+                StatusCode::FORBIDDEN | StatusCode::NOT_FOUND
+            ));
+        }
     }
 
     // ============== /metrics bearer gate (RC8) ==============
