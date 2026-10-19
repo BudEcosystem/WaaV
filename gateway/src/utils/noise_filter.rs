@@ -945,8 +945,10 @@ mod tests {
         assert!(clean.len() <= noisy.len());
         let rms = |pcm: &[u8]| {
             let samples = pcm
-                .chunks_exact(2)
-                .map(|b| i16::from_le_bytes([b[0], b[1]]) as f64);
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| i16::from_le_bytes(*b) as f64);
             (samples.map(|v| v * v).sum::<f64>() / (pcm.len() / 2).max(1) as f64).sqrt()
         };
         // Broadband noise is most of the input's energy; the model takes most of it away.
