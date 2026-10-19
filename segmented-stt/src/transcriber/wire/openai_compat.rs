@@ -2,8 +2,8 @@
 //!
 //! One implementation for five vendors. The row decides everything that differs: the full URL
 //! (Azure's is deployment-scoped and carries `api-version`), the credential header, the language
-//! field (`language`, the `languages[]` list of `gpt-transcribe`, or none for WaaV Infer, which
-//! answers 400 to a language), the context fields and the response format.
+//! field (`language`, or the `languages[]` list of `gpt-transcribe`), the context fields and the response
+//! format.
 //!
 //! Vocabulary: key terms go to the keywords field when the row has one (`gpt-transcribe`); a row
 //! with only a prompt (Whisper) gets them joined into the prompt after the caller's own text, as
@@ -658,20 +658,24 @@ mod tests {
         assert_eq!(r.text("language").as_deref(), Some("en"));
     }
 
+    /// WaaV Infer accepts a per-request `language` (since 17 Oct 2026: hints for auto-detect models, a 400 only
+    /// for a language the loaded model cannot do), so the session language is sent; no prompt.
     #[tokio::test]
-    async fn waav_infer_gets_no_language_and_no_prompt() {
+    async fn waav_infer_gets_the_session_language_and_no_prompt() {
         let vendor = MockVendor::start(Reply::json(200, r#"{"text":"ok"}"#)).await;
         let cfg = OpenAiCompatConfig {
-            language: LanguageDialect::none(),
+            language: LanguageDialect::single("language"),
             prompt_param: None,
             response_format: Some("json".into()),
             ..whisper_1(&url(&vendor.base))
         };
         kit::run(build(cfg).as_ref(), &ctx()).await.0.unwrap();
+        let r = vendor.last();
         assert_eq!(
-            vendor.last().part_names(),
-            vec!["file", "model", "response_format"]
+            r.part_names(),
+            vec!["file", "model", "response_format", "language"]
         );
+        assert_eq!(r.text("language").as_deref(), Some("en"));
     }
 
     #[tokio::test]

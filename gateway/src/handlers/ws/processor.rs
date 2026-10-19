@@ -216,6 +216,9 @@ pub enum WsAuthPath {
     Bud,
     /// Standalone WaaV: match against the configured API secret list.
     ApiSecret,
+    /// Standalone WaaV with both configured (`AUTH_MODE=chain`, the default): an API secret
+    /// first, then the external auth service for any other token — the HTTP middleware's chain.
+    ApiSecretThenJwt,
     /// JWT-only deployment: validate against the external auth service, as `auth_middleware`
     /// does for HTTP. Without this a JWT-only gateway advertises first-message auth and then
     /// closes every socket, leaving `?token=` — which leaks the token into access logs — as the
@@ -225,7 +228,9 @@ pub enum WsAuthPath {
     Unconfigured,
 }
 
-/// Bud mode wins whenever it is present, then API secrets, then JWT.
+/// Bud mode wins whenever it is present, then API secrets, then JWT (chained when both are
+/// active). The booleans are the ACTIVE authenticators (`AuthPolicy::secrets_active` /
+/// `responder_active`), not merely the configured ones.
 ///
 /// Same precedence as `auth_middleware`, and for the same reason: when a control plane is
 /// configured it IS the deployment's identity source, and falling through to a secret list
@@ -237,6 +242,8 @@ pub fn ws_auth_path(
 ) -> WsAuthPath {
     if bud_mode_present {
         WsAuthPath::Bud
+    } else if has_api_secrets && has_jwt_auth {
+        WsAuthPath::ApiSecretThenJwt
     } else if has_api_secrets {
         WsAuthPath::ApiSecret
     } else if has_jwt_auth {
@@ -254,13 +261,19 @@ async fn handle_auth_message(
 ) -> bool {
     let path = ws_auth_path(
         app_state.bud_mode.is_some(),
-        app_state.config.has_api_secret_auth(),
-        app_state.config.has_jwt_auth(),
+        app_state.auth_policy.secrets_active(&app_state.config),
+        app_state.auth_policy.responder_active(&app_state.config),
     );
 
     if path == WsAuthPath::Bud && !state.read().await.auth.is_pending() {
         return refresh_bud_credential(token, state, message_tx, app_state).await;
     }
+
+    // The chain's first link: a configured API secret admits without asking the responder.
+    let chained_secret_id = (path == WsAuthPath::ApiSecretThenJwt)
+        .then(|| match_api_secret_id(&token, &app_state.config.auth_api_secrets))
+        .flatten()
+        .map(str::to_string);
 
     let resolved: Option<String> = match path {
         WsAuthPath::Bud => {
@@ -292,7 +305,8 @@ async fn handle_auth_message(
         WsAuthPath::ApiSecret => {
             match_api_secret_id(&token, &app_state.config.auth_api_secrets).map(str::to_string)
         }
-        WsAuthPath::Jwt => {
+        WsAuthPath::ApiSecretThenJwt if chained_secret_id.is_some() => chained_secret_id,
+        WsAuthPath::Jwt | WsAuthPath::ApiSecretThenJwt => {
             // Route a first-message token through the SAME external auth service the HTTP
             // middleware uses (empty body/headers; the /ws upgrade context).
             let Some(auth_client) = app_state.auth_client.as_ref() else {
@@ -602,8 +616,12 @@ mod ws_auth_path_tests {
     #[test]
     fn standalone_waav_still_uses_its_api_secrets() {
         assert_eq!(ws_auth_path(false, true, false), WsAuthPath::ApiSecret);
-        // Secrets outrank JWT, matching the HTTP middleware's order.
-        assert_eq!(ws_auth_path(false, true, true), WsAuthPath::ApiSecret);
+        // Both active: secrets first, then the responder — the HTTP middleware's chain. (A
+        // secret mismatch used to close the socket without asking the responder.)
+        assert_eq!(
+            ws_auth_path(false, true, true),
+            WsAuthPath::ApiSecretThenJwt
+        );
     }
 
     #[test]

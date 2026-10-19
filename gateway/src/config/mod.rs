@@ -37,7 +37,7 @@ mod merge;
 pub mod pricing;
 mod sip;
 pub(crate) mod utils;
-mod validation;
+pub(crate) mod validation;
 mod yaml;
 
 pub use pricing::{

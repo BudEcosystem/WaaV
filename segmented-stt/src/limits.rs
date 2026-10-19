@@ -7,9 +7,10 @@
 //! | --- | --- | --- |
 //! | Queue allowance | hand-over | 1,500 ms |
 //! | Stall timeout | the first request's first byte | 1.25 × round-trip P99 + 250 ms + 50 ms per second of audio beyond 5 s; at least 1,500 ms, at most deadline − 2,500 ms |
-//! | Request limit | each request's start | the row's value, at most 10,000 ms |
-//! | Deadline | the turn's newest cut at hand-over | 6,000 ms; a deployment may set 3,000 to 10,000 |
+//! | Request limit | each request's start | the row's value, at most 10,000 ms (the operator may raise the ceiling) |
+//! | Deadline | the turn's newest cut at hand-over | 6,000 ms; a deployment may set 3,000 to 10,000 (the operator may change the default and raise the ceiling) |
 //! | Room for a second request | when it would start | max(500 ms, round-trip median + 100 ms) must remain |
+//! | Cold-start allowance | the turn's newest cut at hand-over | off; when the operator sets it, a target that has not answered in 30 minutes gets at least this deadline and request limit, and no stall-triggered second request |
 
 use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
@@ -42,12 +43,108 @@ pub struct SegmentDeadlines {
     pub deadline: Duration,
 }
 
+/// The largest value an operator may give any upload time limit: room for a self-hosted model
+/// that loads on its first request, never an unbounded wait.
+pub const MAX_OPERATOR_LIMIT_MS: u32 = 300_000;
+
+/// The operator's limits, read once at start-up from `WAAV_STT_SEGMENT_*`. The defaults are this
+/// module's constants, so a gateway that sets none of them behaves exactly as before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OperatorLimits {
+    /// The deadline of a session whose deployment sets none (every standalone session).
+    pub default_deadline_ms: u32,
+    /// The largest deadline a deployment, the operator or a session may ask for.
+    pub max_deadline_ms: u32,
+    /// The request limit of a session whose deployment sets none, in place of the row's value.
+    pub request_timeout_ms: Option<u32>,
+    /// The largest request limit.
+    pub max_request_limit_ms: u32,
+    /// While a target has not answered once in the last 30 minutes, its uploads get at least this
+    /// long and no stall-triggered second request: a model that loads on demand is not cut off
+    /// mid-load. `0` (default) is off.
+    pub cold_start_ms: u32,
+}
+
+impl Default for OperatorLimits {
+    fn default() -> Self {
+        Self {
+            default_deadline_ms: DEFAULT_DEADLINE_MS,
+            max_deadline_ms: DEADLINE_RANGE_MS.1,
+            request_timeout_ms: None,
+            max_request_limit_ms: MAX_REQUEST_LIMIT_MS,
+            cold_start_ms: 0,
+        }
+    }
+}
+
+impl OperatorLimits {
+    pub const DEADLINE_MS: &'static str = "WAAV_STT_SEGMENT_DEADLINE_MS";
+    pub const MAX_DEADLINE_MS: &'static str = "WAAV_STT_SEGMENT_MAX_DEADLINE_MS";
+    pub const REQUEST_TIMEOUT_MS: &'static str = "WAAV_STT_SEGMENT_REQUEST_TIMEOUT_MS";
+    pub const MAX_REQUEST_LIMIT_MS: &'static str = "WAAV_STT_SEGMENT_MAX_REQUEST_LIMIT_MS";
+    pub const COLD_START_MS: &'static str = "WAAV_STT_SEGMENT_COLD_START_MS";
+
+    /// Reads the limits through `get`. An unset or blank variable keeps its default; a malformed
+    /// or out-of-range one is an error that names it, so a typo fails start-up.
+    pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
+        let read = |name: &str, lo: u32| -> Result<Option<u32>, String> {
+            let Some(v) = get(name)
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+            else {
+                return Ok(None);
+            };
+            v.parse::<u32>()
+                .ok()
+                .filter(|n| (lo..=MAX_OPERATOR_LIMIT_MS).contains(n))
+                .map(Some)
+                .ok_or_else(|| {
+                    format!(
+                        "{name} must be a whole number of ms from {lo} to \
+                         {MAX_OPERATOR_LIMIT_MS}, got {v:?}"
+                    )
+                })
+        };
+        let mut l = Self::default();
+        if let Some(v) = read(Self::MAX_DEADLINE_MS, DEADLINE_RANGE_MS.1)? {
+            l.max_deadline_ms = v;
+        }
+        if let Some(v) = read(Self::DEADLINE_MS, DEADLINE_RANGE_MS.0)? {
+            l.default_deadline_ms = v.min(l.max_deadline_ms);
+        }
+        if let Some(v) = read(Self::MAX_REQUEST_LIMIT_MS, MAX_REQUEST_LIMIT_MS)? {
+            l.max_request_limit_ms = v;
+        }
+        l.request_timeout_ms = read(Self::REQUEST_TIMEOUT_MS, 1000)?;
+        l.cold_start_ms = read(Self::COLD_START_MS, 0)?.unwrap_or(0);
+        Ok(l)
+    }
+
+    /// The request limit for a row value: the value, at most the operator's ceiling.
+    pub fn request_limit_ms(&self, row_request_timeout_ms: Option<u32>) -> u32 {
+        row_request_timeout_ms
+            .unwrap_or(MAX_REQUEST_LIMIT_MS)
+            .min(self.max_request_limit_ms)
+    }
+}
+
 /// The raised deadline in force (Addendum A5): a deployment deadline below the silence ceiling
 /// plus 2,500 ms is raised to that sum. Returns the value and whether it was raised.
 pub fn effective_deadline_ms(deployment: Option<u32>, silence_ceiling_ms: u32) -> (u32, bool) {
-    let asked = deployment
-        .unwrap_or(DEFAULT_DEADLINE_MS)
-        .clamp(DEADLINE_RANGE_MS.0, DEADLINE_RANGE_MS.1);
+    effective_deadline_ms_with(deployment, silence_ceiling_ms, &OperatorLimits::default())
+}
+
+/// [`effective_deadline_ms`] under the operator's limits: the operator's default when the
+/// deployment (or session) asks for nothing, and the operator's ceiling in place of 10,000 ms.
+pub fn effective_deadline_ms_with(
+    deployment: Option<u32>,
+    silence_ceiling_ms: u32,
+    op: &OperatorLimits,
+) -> (u32, bool) {
+    let asked = deployment.unwrap_or(op.default_deadline_ms).clamp(
+        DEADLINE_RANGE_MS.0,
+        op.max_deadline_ms.max(DEADLINE_RANGE_MS.0),
+    );
     let floor = silence_ceiling_ms + 2500;
     if asked < floor {
         (floor, true)
@@ -204,6 +301,8 @@ pub struct LatencyStore {
     seeds: Mutex<HashMap<String, Option<u32>>>,
     end_to_final: Mutex<HashMap<String, Series>>,
     round_trip: Mutex<HashMap<String, Series>>,
+    /// When each target (host and model) last answered an upload.
+    answered: Mutex<HashMap<String, Instant>>,
 }
 
 fn nearest_rank(sorted: &[Entry], q: f64) -> (Option<u32>, bool, Option<u32>) {
@@ -324,6 +423,22 @@ impl LatencyStore {
             tail_censored: c50 || c95 || c99,
             samples: n,
         }
+    }
+
+    /// A target answered an upload.
+    pub fn mark_answered(&self, target: &str) {
+        self.answered
+            .lock()
+            .insert(target.to_string(), Instant::now());
+    }
+
+    /// Whether a target answered an upload in the last 30 minutes. One that has not may be a
+    /// model still loading on its server (the operator's cold-start allowance).
+    pub fn answered_recently(&self, target: &str) -> bool {
+        self.answered
+            .lock()
+            .get(target)
+            .is_some_and(|at| Instant::now().saturating_duration_since(*at) <= FRESH)
     }
 
     /// End of speech to final for a key.
@@ -464,6 +579,60 @@ mod tests {
         assert_eq!(effective_deadline_ms(Some(3000), 2900), (5400, true));
         assert_eq!(effective_deadline_ms(Some(8000), 1500), (8000, false));
         assert_eq!(effective_deadline_ms(Some(20_000), 1500), (10_000, true));
+    }
+
+    #[test]
+    fn operator_limits_default_to_todays_constants_and_raise_only_when_set() {
+        let none = OperatorLimits::from_lookup(|_| None).unwrap();
+        assert_eq!(none, OperatorLimits::default());
+        for (asked, ceiling) in [(None, 1500), (Some(3000), 2900), (Some(20_000), 1500)] {
+            assert_eq!(
+                effective_deadline_ms_with(asked, ceiling, &none),
+                effective_deadline_ms(asked, ceiling)
+            );
+        }
+        let env = |k: &str| match k {
+            OperatorLimits::MAX_DEADLINE_MS => Some("120000".to_string()),
+            OperatorLimits::DEADLINE_MS => Some("15000".to_string()),
+            OperatorLimits::MAX_REQUEST_LIMIT_MS => Some("120000".to_string()),
+            OperatorLimits::COLD_START_MS => Some("90000".to_string()),
+            _ => None,
+        };
+        let op = OperatorLimits::from_lookup(env).unwrap();
+        assert_eq!(effective_deadline_ms_with(None, 1500, &op), (15_000, false));
+        assert_eq!(
+            effective_deadline_ms_with(Some(60_000), 1500, &op),
+            (60_000, false)
+        );
+        assert_eq!(
+            effective_deadline_ms_with(Some(200_000), 1500, &op),
+            (120_000, true)
+        );
+        assert_eq!(op.request_limit_ms(Some(30_000)), 30_000);
+        assert_eq!(op.cold_start_ms, 90_000);
+        assert!(
+            OperatorLimits::from_lookup(
+                |k| (k == OperatorLimits::MAX_DEADLINE_MS).then(|| "5000".to_string())
+            )
+            .is_err(),
+            "a ceiling below today's 10 s is refused"
+        );
+        assert!(
+            OperatorLimits::from_lookup(
+                |k| (k == OperatorLimits::COLD_START_MS).then(|| "soon".to_string())
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_target_is_cold_until_it_answers_and_again_after_thirty_minutes() {
+        let store = LatencyStore::new();
+        assert!(!store.answered_recently("h|m"));
+        store.mark_answered("h|m");
+        assert!(store.answered_recently("h|m"));
+        tokio::time::advance(Duration::from_secs(31 * 60)).await;
+        assert!(!store.answered_recently("h|m"));
     }
 
     #[test]

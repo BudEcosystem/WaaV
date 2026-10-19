@@ -12,7 +12,7 @@ use waav_segmented_stt::breaker::{BreakerConfig, BreakerRegistry};
 use waav_segmented_stt::endpointer::EndOfTurnTextModel;
 use waav_segmented_stt::engine::EngineConfig;
 use waav_segmented_stt::fallback::{FallbackTarget, FallbackUpload};
-use waav_segmented_stt::limits::{LatencyStore, effective_deadline_ms};
+use waav_segmented_stt::limits::{LatencyStore, OperatorLimits, effective_deadline_ms_with};
 use waav_segmented_stt::live::{
     TargetSpec, adapter_built, build_transcriber, limit_spec, profile_for, quality_policy,
     seed_p99, unapplied_data_settings,
@@ -23,7 +23,7 @@ use waav_segmented_stt::resolve::{
     Delivery, Evidence, LatencyTier, Outcome, Refusal, Resolution, ResolveRequest, SessionKind,
     TranscriptionMode, Warning, resolve,
 };
-use waav_segmented_stt::rollout::Rollout;
+use waav_segmented_stt::rollout::{Rollout, SwitchMode};
 use waav_segmented_stt::sequencer::{AttemptsUpload, SegmentUpload};
 use waav_segmented_stt::transcriber::attempts::{
     RepairMemory, SecondRequestPolicy, SegmentAttempts, SessionHealth,
@@ -59,6 +59,16 @@ pub struct SttLiveShared {
     /// `WAAV_STT_SETUP_PROBE` (default on): probe a guessed row or a self-hosted server with one
     /// silent clip before the caller speaks.
     pub setup_probe: bool,
+    /// `WAAV_SEGMENTED_STT_HONOR_REQUEST` (default on): under `allowlist`, a standalone session
+    /// that asks for `transcription_mode: "segmented"` itself is covered. `off` still covers
+    /// nothing (the kill switch), and a Bud deployment still needs its listing.
+    pub honor_request: bool,
+    /// `WAAV_STT_SETUP_PROBE_TIMEOUT_MS` (default 2,000): how long the setup probe waits. Set it
+    /// to a self-hosted model's load time and `ready` waits until the model has answered once.
+    pub setup_probe_timeout_ms: u64,
+    /// `WAAV_STT_SEGMENT_DEADLINE_MS`, `..._MAX_DEADLINE_MS`, `..._REQUEST_TIMEOUT_MS`,
+    /// `..._MAX_REQUEST_LIMIT_MS`, `..._COLD_START_MS`: the operator's upload limits.
+    pub limits: OperatorLimits,
     /// `WAAV_STT_REDECODE_INTERIMS` (default on, Release 6): a self-hosted model is re-decoded
     /// while the caller speaks, so its sessions get text during speech (`interim_results: live`).
     pub redecode_interims: bool,
@@ -80,6 +90,10 @@ impl std::fmt::Debug for SttLiveShared {
             .field("map_version", &self.map.map_version())
             .field("rollout", &self.rollout.mode)
             .field("release", &self.rollout.release)
+            .field("allowlist_entries", &self.rollout.allowlist.len())
+            .field("honor_request", &self.honor_request)
+            .field("limits", &self.limits)
+            .field("setup_probe_timeout_ms", &self.setup_probe_timeout_ms)
             .finish_non_exhaustive()
     }
 }
@@ -103,6 +117,20 @@ impl SttLiveShared {
         turn_detector: Option<Arc<tokio::sync::RwLock<crate::core::turn_detect::TurnDetector>>>,
     ) -> Result<Self, String> {
         let rollout = Rollout::from_lookup(&get)?;
+        let limits = OperatorLimits::from_lookup(&get)?;
+        let setup_probe_timeout_ms = match get("WAAV_STT_SETUP_PROBE_TIMEOUT_MS")
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+        {
+            None => 2_000,
+            Some(v) => v
+                .parse::<u64>()
+                .ok()
+                .filter(|n| (500..=300_000).contains(n))
+                .ok_or_else(|| {
+                    format!("WAAV_STT_SETUP_PROBE_TIMEOUT_MS must be 500 to 300000 ms, got {v:?}")
+                })?,
+        };
         let mut http = HttpSettings::from_lookup(&get)?;
         // The gateway's one escape hatch for loopback and private vendor addresses (local
         // development and tests) applies to segmented uploads too.
@@ -143,6 +171,13 @@ impl SttLiveShared {
             clients: UploadClients::new(&http)?,
             detector_override: None,
             setup_probe: parse_flag("WAAV_STT_SETUP_PROBE", get("WAAV_STT_SETUP_PROBE"), true)?,
+            honor_request: parse_flag(
+                "WAAV_SEGMENTED_STT_HONOR_REQUEST",
+                get("WAAV_SEGMENTED_STT_HONOR_REQUEST"),
+                true,
+            )?,
+            setup_probe_timeout_ms,
+            limits,
             redecode_interims: parse_flag(
                 "WAAV_STT_REDECODE_INTERIMS",
                 get("WAAV_STT_REDECODE_INTERIMS"),
@@ -499,26 +534,48 @@ pub fn resolve_session(shared: &SttLiveShared, req: &LiveRequest) -> LiveResolut
     };
     let deployment_name = req.leg.as_ref().map(|l| l.name.clone());
     let deployment_on = seg.and_then(|s| s.enabled) != Some(false);
+    // A standalone client that asks for segmented itself has opted in: the allow-list stages Bud
+    // deployments, and today the request would silently get the buffering client instead.
+    let opted_in = shared.honor_request
+        && req.leg.is_none()
+        && mode == TranscriptionMode::Segmented
+        && mode_source == "request"
+        && shared.rollout.mode == SwitchMode::Allowlist
+        && shared.rollout.release >= 1;
     let covered = deployment_on
-        && (shared.rollout.covers(
-            req.leg.as_ref().map(|l| l.name.as_str()),
-            &req.provider,
-            &req.model,
-        ) || req.leg.as_ref().is_some_and(|l| {
-            shared
-                .rollout
-                .covers(Some(&l.id), &req.provider, &req.model)
-        }));
+        && (opted_in
+            || shared.rollout.covers(
+                req.leg.as_ref().map(|l| l.name.as_str()),
+                &req.provider,
+                &req.model,
+            )
+            || req.leg.as_ref().is_some_and(|l| {
+                shared
+                    .rollout
+                    .covers(Some(&l.id), &req.provider, &req.model)
+            }));
     let tuning_profile = SegmentProfile::default().with_tuning(&req.tuning);
-    let (deadline_ms, deadline_raised) = effective_deadline_ms(
-        seg.and_then(|s| s.deadline_ms),
+    // A standalone session may ask for its own deadline (`stt_config.extras.segment_deadline_ms`),
+    // within the operator's ceiling; a Bud leg's comes only from its deployment record.
+    let session_deadline = req
+        .leg
+        .is_none()
+        .then(|| req.extras.get("segment_deadline_ms"))
+        .flatten()
+        .and_then(|v| v.trim().parse::<u32>().ok());
+    let (deadline_ms, deadline_raised) = effective_deadline_ms_with(
+        seg.and_then(|s| s.deadline_ms).or(session_deadline),
         tuning_profile.max_endpointing_ms,
+        &shared.limits,
     );
     if deadline_raised {
         extra.push(ExtraWarning {
             code: "deployment_setting_not_applied",
             delivery: Delivery::Frame,
-            detail: serde_json::json!({ "setting": "stt.segmented.deadline_ms", "applied": deadline_ms }),
+            detail: serde_json::json!({
+                "setting": if req.leg.is_some() { "stt.segmented.deadline_ms" } else { "segment_deadline_ms" },
+                "applied": deadline_ms,
+            }),
         });
     }
     let language = language_of(&req.language);
@@ -620,6 +677,25 @@ pub fn resolve_session(shared: &SttLiveShared, req: &LiveRequest) -> LiveResolut
 
     if let Some(r) = data_setting_refusal(req, &decision, &resolution) {
         decision = LiveDecision::Refused(r);
+    }
+
+    // A session that asked for segmented and is not covered is told why, instead of only being
+    // handed today's client (`transcription_mode: "buffered"` with no reason).
+    if mode == TranscriptionMode::Segmented
+        && mode_source == "request"
+        && !resolution.covered
+        && decision != LiveDecision::Segmented
+    {
+        extra.push(ExtraWarning {
+            code: "stt_mode_unavailable",
+            delivery: Delivery::Frame,
+            detail: serde_json::json!({
+                "requested": "segmented",
+                "source": "request",
+                "reason": "not_covered",
+                "switch": shared.rollout.mode.as_str(),
+            }),
+        });
     }
 
     if decision == LiveDecision::Segmented {
@@ -740,7 +816,7 @@ pub async fn probe_session(
     let verdict = probe(
         transcriber.as_ref(),
         &ctx,
-        std::time::Duration::from_millis(2_000),
+        std::time::Duration::from_millis(shared.setup_probe_timeout_ms),
         &shared.repairs,
     )
     .await;
@@ -918,10 +994,13 @@ fn attempts_upload(shared: &SttLiveShared, u: UploadTarget<'_>) -> Result<Attemp
         .and_then(|l| l.ttfs_p99_ms)
         .or_else(|| seed_p99(t));
     shared.latency.seed(&u.store_key, seed);
+    // The deployment's value, else the operator's (a standalone gateway's only way to set
+    // one), else the row's.
     let row_timeout = u
         .leg
         .and_then(|l| l.segmented.as_ref())
         .and_then(|s| s.request_timeout_ms)
+        .or(shared.limits.request_timeout_ms)
         .or_else(|| {
             t.segment_profile
                 .as_ref()
@@ -935,6 +1014,9 @@ fn attempts_upload(shared: &SttLiveShared, u: UploadTarget<'_>) -> Result<Attemp
         row_request_timeout_ms: row_timeout,
         low_latency: u.low_latency,
         limiter,
+        max_request_limit_ms: shared.limits.max_request_limit_ms,
+        cold_start_ms: shared.limits.cold_start_ms,
+        target_key: format!("{}|{}", info.host_key, info.model),
     })
 }
 
@@ -1087,6 +1169,9 @@ impl SegmentUpload for AdmittedUpload {
     }
     fn deadline_ms(&self) -> u32 {
         self.inner.deadline_ms()
+    }
+    fn unit_deadline_ms(&self) -> u32 {
+        self.inner.unit_deadline_ms()
     }
     fn try_speculative(&self) -> bool {
         self.inner.try_speculative()
@@ -1821,6 +1906,50 @@ mod tests {
         let r = resolve_session(&s, &asking);
         assert_eq!(r.decision, LiveDecision::Segmented);
         assert_eq!(r.mode_source, "request");
+    }
+
+    /// Gaia's case: a standalone `/ws` conversation loop on an unlisted OpenAI-compatible model
+    /// that asks for segmented itself gets it under the default switch, is told why not under
+    /// `off`, and a Bud leg still needs its listing.
+    #[test]
+    fn an_explicit_segmented_request_is_honoured_under_the_default_allowlist() {
+        let conv = LiveSessionKind::Conversation {
+            turn_detection: true,
+        };
+        let mut asking = req("openai", "gaia-transcribe", conv);
+        asking.requested_mode = Some("segmented".into());
+
+        let r = resolve_session(&shared(&[]), &asking);
+        assert_eq!(r.decision, LiveDecision::Segmented);
+        assert_eq!(r.mode_source, "request");
+
+        let r = resolve_session(&shared(&[("WAAV_SEGMENTED_STT", "off")]), &asking);
+        assert_ne!(r.decision, LiveDecision::Segmented);
+        assert!(r.extra.iter().any(|w| w.code == "stt_mode_unavailable"
+            && w.detail["reason"] == "not_covered"
+            && w.detail["switch"] == "off"));
+
+        let r = resolve_session(
+            &shared(&[("WAAV_SEGMENTED_STT_HONOR_REQUEST", "off")]),
+            &asking,
+        );
+        assert_ne!(
+            r.decision,
+            LiveDecision::Segmented,
+            "the old behaviour on request"
+        );
+
+        let mut leg = asking.clone();
+        leg.leg = Some(data_leg(false, false));
+        let r = resolve_session(&shared(&[]), &leg);
+        assert_ne!(
+            r.decision,
+            LiveDecision::Segmented,
+            "Bud legs keep the allow-list"
+        );
+
+        let r = resolve_session(&shared(&[]), &req("openai", "gaia-transcribe", conv));
+        assert_ne!(r.decision, LiveDecision::Segmented, "no request, no opt-in");
     }
 
     #[test]

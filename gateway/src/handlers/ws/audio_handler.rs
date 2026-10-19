@@ -79,6 +79,10 @@ pub async fn handle_audio_message(
         return true;
     }
 
+    // RCA 2e: the session's denoiser, read under the same lock as the rest.
+    #[cfg(feature = "noise-filter")]
+    let denoiser;
+
     // Fast path: read lock to check state, get the voice manager, and (D8) opus-decode the frame.
     let (voice_manager, audio_data, leg_meter) = {
         let state_guard = state.read().await;
@@ -120,7 +124,24 @@ pub async fn handle_audio_message(
             None => audio_data,
         };
 
+        #[cfg(feature = "noise-filter")]
+        {
+            denoiser = state_guard.denoiser.clone();
+        }
+
         (voice_manager, audio_data, state_guard.leg_meter.clone())
+    };
+
+    // RCA 2e: denoise ahead of the VoiceManager (VAD / smart-turn, then STT). The model works in
+    // whole 10 ms hops, so a short chunk can come back empty: its audio goes with the next one.
+    #[cfg(feature = "noise-filter")]
+    let audio_data = match denoiser {
+        Some(denoiser) => match denoiser.process(audio_data.clone()).await {
+            Some(clean) if clean.is_empty() => return true,
+            Some(clean) => Bytes::from(clean),
+            None => audio_data,
+        },
+        None => audio_data,
     };
 
     // Send the (decoded) PCM audio to the STT provider. Bytes gives O(1) clones.

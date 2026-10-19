@@ -323,10 +323,12 @@ V/reoL3Jcy/mQ9MrmJx+K1VC
     async fn test_auth_service_returns_200_allows_request() {
         let mock_server = MockServer::start().await;
 
-        // Mock successful auth response
+        // Mock successful auth response: a 200 must name the caller.
         Mock::given(method("POST"))
             .and(path("/auth"))
-            .respond_with(ResponseTemplate::new(200))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "tenant-a"})),
+            )
             .expect(1)
             .mount(&mock_server)
             .await;
@@ -352,6 +354,79 @@ V/reoL3Jcy/mQ9MrmJx+K1VC
         let response = app.oneshot(request).await.unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// A responder `200` that names nobody (`{}`, `OK`, empty) must not admit: it is a contract
+    /// violation by the responder, answered 502 so the client is not told to rotate a key.
+    #[tokio::test]
+    async fn test_auth_service_200_without_identity_is_refused() {
+        for body in ["", "{}", "OK", r#"{"id":""}"#] {
+            let mock_server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/auth"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(body))
+                .expect(1)
+                .mount(&mock_server)
+                .await;
+            let (state, _temp_dir) =
+                create_test_state_with_auth(&format!("{}/auth", mock_server.uri())).await;
+            let app = Router::new()
+                .route("/test", get(test_handler))
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    auth_middleware,
+                ))
+                .with_state(state);
+            let request = Request::builder()
+                .method(Method::GET)
+                .uri("/test")
+                .header("authorization", "Bearer any-token")
+                .body(Body::empty())
+                .unwrap();
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "body {body:?}");
+        }
+    }
+
+    /// With BOTH an API secret and a responder configured (AUTH_MODE=chain, the default), a
+    /// bearer that is not a secret is asked of the responder — it used to get 401 without the
+    /// responder ever being called.
+    #[tokio::test]
+    async fn test_api_secret_and_responder_chain() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auth"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "tenant-a"})),
+            )
+            .expect(1) // the secret is NOT sent to the responder; the user token is
+            .mount(&mock_server)
+            .await;
+        let (state, _temp_dir) =
+            create_test_state_with_auth(&format!("{}/auth", mock_server.uri())).await;
+        let mut config = state.config.clone();
+        config.auth_api_secrets = vec![waav_gateway::config::AuthApiSecret {
+            id: "ops".to_string(),
+            secret: "ops-secret".to_string(),
+        }];
+        let state = AppState::new(config).await;
+        let app = Router::new()
+            .route("/test", get(test_handler))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                auth_middleware,
+            ))
+            .with_state(state);
+        for token in ["ops-secret", "user-token"] {
+            let request = Request::builder()
+                .method(Method::GET)
+                .uri("/test")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "token {token}");
+        }
     }
 
     #[tokio::test]

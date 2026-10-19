@@ -245,7 +245,7 @@ livekit = "=0.7.24"
 # crate calls them. See BUILD_NOTES.md.
 libwebrtc = "=0.3.19"
 webrtc-sys = "=0.3.16"
-livekit-api = "=0.4.9"
+livekit-api = "=0.4.9"  # patched: see [patch.crates-io] at the end of this file
 livekit-protocol = "=0.5.1"
 # Need prost/pbjson-types for SIP API client, using same versions as livekit to avoid conflicts
 prost = "0.12.6"
@@ -426,3 +426,20 @@ lto = "fat"         # Full LTO for maximum size reduction
 # - Incremental builds grow over time; periodic cleanup is essential
 # - Target dir >5GB indicates cleanup is needed
 # =============================================================================
+
+# =============================================================================
+# Patched dependencies
+# =============================================================================
+# livekit-api 0.4.9's Twirp client (RoomService/Egress/SIP) pushes "/twirp/livekit.X/Method"
+# as ONE path segment, so the url crate (every 2.x, by design) sends
+# "/%2Ftwirp%2Flivekit.RoomService%2FCreateRoom". LiveKit server 1.13+ answers 404 to that
+# (1.12 happened to route it), and the 404 body then surfaced as "error decoding response body".
+# The vendored copy is the published 0.4.9 source plus a fix to src/services/twirp_client.rs
+# (literal path, ws/wss -> http/https, readable non-Twirp errors). It is a path dependency, so
+# offline builds need nothing new. Drop this when an upstream livekit-api with the fix is
+# adopted together with the matching `livekit` crate.
+[patch.crates-io]
+livekit-api = { path = "vendor/livekit-api" }
+# x86-only NVIDIA codec trampolines no longer built on aarch64 (fresh GB10 builds with CUDA installed
+# failed in webrtc-sys); see the WaaV patch note in vendor/webrtc-sys/build.rs.
+webrtc-sys = { path = "vendor/webrtc-sys" }

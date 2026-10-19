@@ -1031,7 +1031,7 @@ async fn run(state: Arc<AppState>, p: Prepared, socket: WebSocket, slot: Option<
                     .record_failure(&p.endpoint_id, &p.vkey, &verdict);
             }
             let end = End::new("upstream_error", 1011).with_error("upstream_error", e.to_string());
-            finish(meter, end, &client_tx, writer, None, &vendor).await;
+            finish(meter, end, &client_tx, writer, client_rx, None, &vendor).await;
             return;
         }
     };
@@ -1161,8 +1161,29 @@ async fn run(state: Arc<AppState>, p: Prepared, socket: WebSocket, slot: Option<
         ))),
     )
     .await;
-    finish(meter, end, &client_tx, writer, Some(&session_id), &vendor).await;
+    finish(
+        meter,
+        end,
+        &client_tx,
+        writer,
+        client_rx,
+        Some(&session_id),
+        &vendor,
+    )
+    .await;
     drop(p);
+}
+
+/// How long the client gets to answer the close frame once it is delivered (the WebSocket closing handshake).
+const CLOSE_GRACE: Duration = Duration::from_secs(5);
+
+/// Read (and discard) what the client sends until it answers the close or goes away.
+async fn drain_client(client_rx: &mut futures_util::stream::SplitStream<WebSocket>) {
+    while let Some(Ok(msg)) = client_rx.next().await {
+        if matches!(msg, Message::Close(_)) {
+            break;
+        }
+    }
 }
 
 /// The common teardown: the error event and close, the session record, the metrics.
@@ -1171,6 +1192,7 @@ pub(super) async fn finish(
     end: End,
     client_tx: &mpsc::Sender<Outbound>,
     writer: tokio::task::JoinHandle<()>,
+    mut client_rx: futures_util::stream::SplitStream<WebSocket>,
     session_id: Option<&str>,
     vendor: &str,
 ) {
@@ -1178,22 +1200,46 @@ pub(super) async fn finish(
         .error
         .as_ref()
         .map(|(code, message)| gateway_error(code, message, None, None));
-    // Behind any backlog, so every frame queued before the close still arrives in order.
-    let _ = tokio::time::timeout(
-        Duration::from_secs(30),
-        client_tx.send(Outbound::Close {
-            error,
-            code: end.close_code.clamp(1000, 4999),
-            reason: end.reason.to_string(),
-        }),
-    )
-    .await;
-    let abort = writer.abort_handle();
-    if tokio::time::timeout(Duration::from_secs(30), writer)
-        .await
-        .is_err()
-    {
-        abort.abort();
+    let deliver = async {
+        // Behind any backlog, so every frame queued before the close still arrives in order.
+        let _ = tokio::time::timeout(
+            Duration::from_secs(30),
+            client_tx.send(Outbound::Close {
+                error,
+                code: end.close_code.clamp(1000, 4999),
+                reason: end.reason.to_string(),
+            }),
+        )
+        .await;
+        let abort = writer.abort_handle();
+        if tokio::time::timeout(Duration::from_secs(30), writer)
+            .await
+            .is_err()
+        {
+            abort.abort();
+        }
+    };
+    // While the backlog and the close go out, keep reading what the client sends. A socket dropped with
+    // unread client data (a slow client's pongs, say) makes the kernel send a TCP reset, and a reset discards
+    // everything still buffered for the client: the tail of the audio and the close frame itself, exactly
+    // when the client was too slow.
+    let client_gone = {
+        let drain = drain_client(&mut client_rx);
+        tokio::pin!(deliver, drain);
+        tokio::select! {
+            () = &mut deliver => false,
+            () = &mut drain => {
+                deliver.await;
+                true
+            }
+        }
+    };
+    // Then give the client a moment to answer the close, off the teardown path: the session's admission and
+    // connection slot are released now, not after the grace.
+    if !client_gone {
+        tokio::spawn(async move {
+            let _ = tokio::time::timeout(CLOSE_GRACE, drain_client(&mut client_rx)).await;
+        });
     }
     info!(
         session_id = session_id.unwrap_or(meter.session_id()),

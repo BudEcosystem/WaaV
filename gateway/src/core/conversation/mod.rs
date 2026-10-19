@@ -43,6 +43,10 @@ pub enum ConversationOrchestratorError {
     #[error("conversation LLM base_url rejected: {0}")]
     InvalidLlmUrl(String),
 
+    /// The configured key may not be used for this LLM target (`core::credentials`).
+    #[error("conversation LLM credential rejected: {0}")]
+    InvalidCredential(String),
+
     /// The LLM call itself failed (surfaced from a turn).
     #[error("conversation LLM error: {0}")]
     Llm(#[from] LlmError),
@@ -163,6 +167,10 @@ pub struct ConversationConfig {
     /// (or an explicit global `max_tokens` if larger intent), NEVER the fast
     /// tier's voice cap. The fast tier is unaffected.
     pub max_reasoning_tokens: Option<u32>,
+    /// The LLM request timeout in ms (`None` = `WAAV_LLM_TIMEOUT_MS`, else 60 s), clamped to
+    /// 1 s .. `WAAV_LLM_MAX_TIMEOUT_MS`. With `WAAV_LLM_STREAM_IDLE_TIMEOUT_MS` set, it bounds a
+    /// streamed reply's first token rather than the whole reply.
+    pub llm_timeout_ms: Option<u64>,
 }
 
 /// P2: default per-turn LLM re-inference ceiling. Matches the built-in tool-loop
@@ -224,6 +232,7 @@ impl Default for ConversationConfig {
             degradation_message: None,
             max_llm_calls_per_turn: DEFAULT_MAX_LLM_CALLS_PER_TURN,
             max_reasoning_tokens: None,
+            llm_timeout_ms: None,
         }
     }
 }
@@ -542,6 +551,7 @@ impl ConversationConfig {
             // X-G1: cap completion length for voice unless explicitly set.
             max_tokens: self.max_tokens.or(Some(VOICE_DEFAULT_MAX_TOKENS)),
             streaming: self.streaming,
+            timeout_ms: crate::core::llm::session_timeout_ms(self.llm_timeout_ms),
             max_history: self.max_history,
             provider_kind: self.provider_kind,
             // D1: send the floor-clamped value (an adaptive-only model can't
@@ -643,8 +653,15 @@ pub struct ConversationOrchestrator {
 fn build_reasoning_tier(
     base: &Arc<LlmClient>,
     config: &ConversationConfig,
-) -> Option<Arc<LlmClient>> {
-    let model = config.reasoning_model.clone()?;
+    keyed: bool,
+) -> Result<Option<Arc<LlmClient>>, ConversationOrchestratorError> {
+    let Some(model) = config.reasoning_model.clone() else {
+        // An inert reasoning_base_url is still client input: refuse an unsafe one early.
+        if keyed && let Some(rb) = &config.reasoning_base_url {
+            validate_llm_url(rb).map_err(ConversationOrchestratorError::InvalidLlmUrl)?;
+        }
+        return Ok(None);
+    };
     // The reasoning tier needs room to ACTUALLY think — independent of the fast
     // tier's voice max_tokens cap (256), which on Anthropic suppresses the
     // thinking block entirely (it needs budget ≥ 1024 < max_tokens). Default to a
@@ -654,19 +671,34 @@ fn build_reasoning_tier(
         .max_reasoning_tokens
         .or(config.max_tokens)
         .unwrap_or(REASONING_DEFAULT_MAX_TOKENS);
-    Some(Arc::new(
-        base.with_tier_overrides(
-            model,
-            config.reasoning_base_url.clone(),
-            config.reasoning_api_key.clone(),
-            config.reasoning_provider_kind,
-            // The reasoning tier wants to actually reason — let it (no forced Off).
-            config
-                .reasoning_effort
-                .or(Some(crate::core::llm::ReasoningEffort::Low)),
-            Some(reasoning_max_tokens),
-        ),
-    ))
+    let tier = base.with_tier_overrides(
+        model,
+        config.reasoning_base_url.clone(),
+        None, // keyed below, for ITS target
+        config.reasoning_provider_kind,
+        // The reasoning tier wants to actually reason — let it (no forced Off).
+        config
+            .reasoning_effort
+            .or(Some(crate::core::llm::ReasoningEffort::Low)),
+        Some(reasoning_max_tokens),
+    );
+    // The Bud gateway path keys every call with the session credential; a client-configured
+    // reasoning tier with its own key or host is keyed for ITS target (an inherited fast key
+    // never crosses to another origin — `with_tier_overrides`).
+    let needs_own_key = config.reasoning_api_key.is_some() || config.reasoning_base_url.is_some();
+    let tier = if !keyed || config.server_llm_endpoint || !needs_own_key {
+        tier
+    } else {
+        let target = config
+            .reasoning_base_url
+            .clone()
+            .unwrap_or_else(|| config.base_url.clone());
+        let key = client_key_for(&tier, config.reasoning_api_key.as_deref(), &target)?;
+        validate_llm_url_with_grants(&target, &key.private_grants)
+            .map_err(ConversationOrchestratorError::InvalidLlmUrl)?;
+        tier.with_client_key(key)
+    };
+    Ok(Some(Arc::new(tier)))
 }
 
 /// S3 (M6): may an async-tool result be VOLUNTEERED now? Only when the line is
@@ -723,14 +755,56 @@ pub struct TurnAttribution {
     pub endpoint_name: Option<String>,
 }
 
+/// Build and key the client-configured LLM legs (fast tier + optional reasoning tier).
+///
+/// Each leg is keyed ONCE, here, by `core::credentials`: the client's literal key, or an
+/// operator credential bound to the leg's host (`credential_ref` / `${NAME}`), or — with no
+/// key — the vendor's implicit key toward the vendor's own host only. Never an arbitrary env
+/// var, never an operator key toward a client-chosen host. (`${LOCAL_LLM_API_KEY}` used to be
+/// sent literally here while the DAG path expanded it; and an omitted key sent the operator's
+/// OPENAI_API_KEY to whatever base_url was given.)
+fn resolve_llm_legs(
+    config: &ConversationConfig,
+) -> Result<(Arc<LlmClient>, Option<Arc<LlmClient>>), ConversationOrchestratorError> {
+    let base = LlmClient::new(config.to_client_config());
+    let llm = if config.server_llm_endpoint {
+        // The operator's in-cluster Bud gateway, keyed per call by the session credential.
+        base
+    } else {
+        let key = client_key_for(&base, config.api_key.as_deref(), &config.base_url)?;
+        validate_llm_url_with_grants(&config.base_url, &key.private_grants)
+            .map_err(ConversationOrchestratorError::InvalidLlmUrl)?;
+        base.with_client_key(key)
+    };
+    let llm = Arc::new(llm);
+    // S1/S2: the reasoning tier's base_url is ALSO client-supplied — it is validated for SSRF
+    // (with its own key's grants) before it is ever used for a request.
+    let reasoning_llm = build_reasoning_tier(&llm, config, true)?;
+    Ok((llm, reasoning_llm))
+}
+
+/// The key decision for one client-configured LLM leg (`core::credentials`).
+fn client_key_for(
+    client: &LlmClient,
+    api_key: Option<&str>,
+    base_url: &str,
+) -> Result<crate::core::credentials::ClientKey, ConversationOrchestratorError> {
+    let default_env_key = crate::core::llm::LlmAdapter::default_env_key(
+        crate::core::llm::adapter::select_adapter(client.config()),
+    );
+    crate::core::credentials::global_credentials()
+        .resolve_client_key(api_key, None, base_url, default_env_key)
+        .map_err(|e| ConversationOrchestratorError::InvalidCredential(e.to_string()))
+}
+
 impl ConversationOrchestrator {
-    /// The key for the next LLM call: the session's live credential when it has one (FRD-023 RT6,
-    /// a Bud caller reaching budgateway), else the configured `api_key`.
+    /// The per-call key for the next LLM call: the session's live credential when it has one
+    /// (FRD-023 RT6, a Bud caller reaching budgateway). Otherwise `None`: the LLM client sends
+    /// the key `resolve_llm_legs` bound to it (literal or operator credential). Passing the raw
+    /// `config.api_key` here sent `${LOCAL_LLM_API_KEY}` verbatim — a per-call key is never
+    /// interpreted.
     fn llm_key(&self) -> Option<String> {
-        match &self.config.credential {
-            Some(credential) => Some(credential.current()),
-            None => self.config.api_key.clone(),
-        }
+        self.config.credential.as_ref().map(|c| c.current())
     }
 
     /// Create a new orchestrator for `session_id`.
@@ -743,18 +817,7 @@ impl ConversationOrchestrator {
         config: ConversationConfig,
         voice_manager: Arc<VoiceManager>,
     ) -> Result<Self, ConversationOrchestratorError> {
-        if !config.server_llm_endpoint {
-            validate_llm_url(&config.base_url)
-                .map_err(ConversationOrchestratorError::InvalidLlmUrl)?;
-        }
-        // S1/S2: the reasoning tier's base_url is ALSO client-supplied — validate
-        // it for SSRF before it is ever used for a request.
-        if let Some(rb) = &config.reasoning_base_url {
-            validate_llm_url(rb).map_err(ConversationOrchestratorError::InvalidLlmUrl)?;
-        }
-
-        let llm = Arc::new(LlmClient::new(config.to_client_config()));
-        let reasoning_llm = build_reasoning_tier(&llm, &config);
+        let (llm, reasoning_llm) = resolve_llm_legs(&config)?;
         Ok(Self {
             session_id: session_id.into(),
             llm,
@@ -784,7 +847,8 @@ impl ConversationOrchestrator {
         llm: Arc<LlmClient>,
         voice_manager: Arc<VoiceManager>,
     ) -> Self {
-        let reasoning_llm = build_reasoning_tier(&llm, &config);
+        // Test injector: the caller built (and keyed) the client itself.
+        let reasoning_llm = build_reasoning_tier(&llm, &config, false).ok().flatten();
         Self {
             session_id: session_id.into(),
             llm,
@@ -2344,6 +2408,14 @@ fn is_auth_failure(message: &str) -> bool {
 /// so the in-process mock LLM in the conversation tests can target `127.0.0.1`.
 fn validate_llm_url(url: &str) -> Result<(), String> {
     crate::core::net::validate_url_for_ssrf(url, &["http", "https"])
+}
+
+/// [`validate_llm_url`] honouring a bound operator credential's port-scoped private grants.
+fn validate_llm_url_with_grants(
+    url: &str,
+    grants: &[crate::core::net::HostPort],
+) -> Result<(), String> {
+    crate::core::net::validate_url_for_ssrf_with_grants(url, &["http", "https"], grants)
 }
 
 #[cfg(test)]

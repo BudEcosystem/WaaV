@@ -56,7 +56,12 @@ Defects fixed while consolidating:
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `WAAV_SEGMENTED_STT` | `allowlist` | `off`, `allowlist` (with `WAAV_SEGMENTED_STT_ALLOWLIST`), `on` |
+| `WAAV_SEGMENTED_STT` | `allowlist` | `off`, `allowlist` (with `WAAV_SEGMENTED_STT_ALLOWLIST`), `on`. With an empty allow-list, `allowlist` covers no deployment (a start-up warning says so) |
+| `WAAV_SEGMENTED_STT_HONOR_REQUEST` | on | Under `allowlist`, a standalone session that sends `transcription_mode: "segmented"` is covered; `off` restores allow-list-only. An uncovered request gets `config_warning` `stt_mode_unavailable` (`reason: not_covered`) |
+| `WAAV_STT_SEGMENT_DEADLINE_MS` / `_MAX_DEADLINE_MS` | 6000 / 10000 | Deadline of sessions whose deployment sets none, and the ceiling of any deadline (up to 300000); a standalone session may ask for its own with `stt_config.extras.segment_deadline_ms` |
+| `WAAV_STT_SEGMENT_REQUEST_TIMEOUT_MS` / `_MAX_REQUEST_LIMIT_MS` | row value / 10000 | Request limit of sessions whose deployment sets none, and its ceiling (up to 300000) |
+| `WAAV_STT_SEGMENT_COLD_START_MS` | 0 (off) | A target that has not answered in 30 min gets at least this deadline and request limit, and no stall-triggered second request |
+| `WAAV_STT_SETUP_PROBE_TIMEOUT_MS` | 2000 | Setup-probe wait; set to a self-hosted model's load time so `ready` follows a warm model |
 | `WAAV_STT_LIVE_RELEASE` | 6 | The release in force, 0 to 6 |
 | `WAAV_STT_SEGMENT_ALLOW_ENERGY_DETECTOR` | off | Use the loudness detector when Silero cannot load |
 | `WAAV_STT_FILE_ONLY_REFUSAL` | on | `off` withdraws the refusal of agents on buffering models (warning stays) |

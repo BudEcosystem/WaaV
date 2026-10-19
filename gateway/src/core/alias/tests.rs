@@ -120,6 +120,7 @@ fn client_field_overrides_alias_default() {
         transcription_mode: None,
         translation: None,
         audio_in_codec: None,
+        noise_suppression: None,
     });
     let mut tts = Some(TTSWebSocketConfig {
         provider: String::new(), // empty → alias fills elevenlabs

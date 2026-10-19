@@ -140,6 +140,10 @@ pub struct AliasLlm {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(value_type = Option<String>, example = "openai"))]
     pub provider_kind: Option<crate::core::llm::AdapterKind>,
+    /// Operator credential (`core::credentials`) the LLM leg uses when the client sends no key.
+    /// The NAME only — the secret stays in the credential's env var / file, bound to its hosts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_ref: Option<String>,
 }
 
 /// One alias definition (one `[aliases.<name>]` table in `config.yaml`).
@@ -346,6 +350,7 @@ fn default_alias_stt() -> STTWebSocketConfig {
         turn_detection: None,
         transcription_mode: None,
         audio_in_codec: None,
+        noise_suppression: None,
     }
 }
 
@@ -402,12 +407,15 @@ fn fallback_alias_conversation() -> ConversationWebSocketConfig {
         reasoning_model: None,
         reasoning_base_url: None,
         reasoning_api_key: None,
+        credential_ref: None,
+        reasoning_credential_ref: None,
         reasoning_provider_kind: None,
         reasoning_route: Default::default(),
         reasoning_budget_ms: None,
         degradation_message: None,
         max_llm_calls_per_turn: None,
         max_reasoning_tokens: None,
+        llm_timeout_ms: None,
     }
 }
 
@@ -533,6 +541,13 @@ pub fn splice_alias(
         {
             cfg.provider_kind = Some(pk);
         }
+        // The alias names the operator's credential; a client key (or ref) of its own wins.
+        if let Some(r) = &a.credential_ref
+            && cfg.api_key.is_none()
+            && cfg.credential_ref.is_none()
+        {
+            cfg.credential_ref = Some(r.clone());
+        }
     }
 
     // ── DAG template ──────────────────────────────────────────────────────────────
@@ -591,6 +606,8 @@ fn build_echo(
             reasoning_effort: c.reasoning_effort,
             reasoning_model: c.reasoning_model.clone(),
             provider_kind: c.provider_kind,
+            // The credential's NAME is not a secret, but the echo stays minimal.
+            credential_ref: None,
         });
     let echo_dag = def
         .dag_template
@@ -680,6 +697,7 @@ pub fn splice_alias_realtime(
             reasoning_effort: l.reasoning_effort,
             reasoning_model: l.reasoning_model.clone(),
             provider_kind: l.provider_kind,
+            credential_ref: None,
         }),
         dag_template: None,
     }

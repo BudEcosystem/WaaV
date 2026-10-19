@@ -49,7 +49,13 @@ fn openai_tts_url_from_base(source: &str, base: &str) -> Result<Option<String>, 
     }
     crate::core::net::validate_url_for_ssrf(base, &["http", "https"])
         .map_err(|msg| format!("{source} rejected (SSRF protection): {msg}"))?;
-    Ok(Some(format!("{base}/v1/audio/speech")))
+    // SDK-style bases end in `/v1` (`OPENAI_BASE_URL=http://host/v1`, as the OpenAI SDKs and the STT
+    // provider read it); appending `/v1/audio/speech` to one sent `/v1/v1/audio/speech`, a 404 on every
+    // OpenAI-compatible server (waav-infer included). Join the way STT does.
+    Ok(Some(waav_segmented_stt::vendor::openai::join_api_path(
+        base,
+        "/v1/audio/speech",
+    )))
 }
 
 fn resolve_openai_tts_url() -> Result<String, String> {
@@ -673,6 +679,25 @@ mod tests {
 
         let content_type = built.headers().get("Content-Type").unwrap();
         assert_eq!(content_type, "application/json");
+    }
+
+    #[test]
+    fn test_openai_tts_url_from_sdk_style_base_has_one_v1() {
+        // `OPENAI_BASE_URL` with or without the SDK's `/v1` reaches the same endpoint.
+        let _env = crate::core::net::ssrf_env_lock();
+        for base in [
+            "https://openai-compatible.invalid/v1",
+            "https://openai-compatible.invalid/v1/",
+            "https://openai-compatible.invalid",
+        ] {
+            assert_eq!(
+                openai_tts_url_from_base("OPENAI_BASE_URL", base)
+                    .unwrap()
+                    .as_deref(),
+                Some("https://openai-compatible.invalid/v1/audio/speech"),
+                "base {base}"
+            );
+        }
     }
 
     #[test]

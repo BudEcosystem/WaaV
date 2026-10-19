@@ -421,6 +421,28 @@ pub enum OutgoingMessage {
         #[cfg_attr(feature = "openapi", schema(value_type = Option<Object>))]
         detail: Option<serde_json::Value>,
     },
+    /// A turn of the session's DAG failed. It is an `error` (a client that reads only `message`
+    /// sees it as before) that also names the node: the turn is abandoned, the session stays up
+    /// and the next utterance runs the graph again.
+    #[serde(rename = "error")]
+    DagError {
+        /// Human-readable error, naming the node.
+        message: String,
+        /// `dag_node_failed`, `dag_node_timeout` (a node ran past its timeout) or
+        /// `dag_turn_timeout` (the turn ran past `dag_config.timeout_ms`).
+        #[cfg_attr(feature = "openapi", schema(example = "dag_node_timeout"))]
+        code: String,
+        /// The DAG's `id`.
+        dag_id: String,
+        /// The node that failed, when one did.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(example = "tts"))]
+        node_id: Option<String>,
+        /// The failed node's type (`tts_provider`, `llm_endpoint`, ...).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(example = "tts_provider"))]
+        node_type: Option<String>,
+    },
     /// Non-fatal configuration advisory (D1 / REALTIME_REASONING.md §7.4).
     ///
     /// Sent at config time when a setting is sub-optimal but the session still

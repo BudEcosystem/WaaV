@@ -86,6 +86,9 @@ pub struct AppState {
     pub livekit_sip_handler: Option<Arc<LiveKitSipHandler>>,
     /// Authentication client for validating bearer tokens (if auth is enabled)
     pub auth_client: Option<Arc<AuthClient>>,
+    /// Which standalone authenticators run, in which order (`AUTH_MODE`), and whether a
+    /// responder `200` must name the caller (`AUTH_RESPONDER_REQUIRE_IDENTITY`).
+    pub auth_policy: crate::auth::AuthPolicy,
     /// Active WebSocket connection count (for global limit enforcement)
     pub active_ws_connections: Arc<AtomicUsize>,
     /// Connection count per IP address (for per-IP limit enforcement)
@@ -408,11 +411,17 @@ impl AppState {
             (None, None)
         };
 
+        // Which authenticators run is decided ONCE, here, and reported: an operator who sets
+        // both an API secret and AUTH_SERVICE_URL must be told what actually happens.
+        let auth_policy = crate::auth::AuthPolicy::from_env()?;
+        auth_policy.startup_report(&config, crate::config::validation::bud_mode_configured());
+
         // Initialize auth client if JWT-based auth is configured
         // Note: API secret auth doesn't need a client - it's handled directly in middleware
-        let auth_client = if config.auth_required && config.has_jwt_auth() {
+        let auth_client = if config.auth_required && auth_policy.responder_active(&config) {
             match AuthClient::from_config(&config).await {
                 Ok(client) => {
+                    let client = client.with_require_identity(auth_policy.require_identity);
                     tracing::info!(
                         "JWT authentication enabled with service: {}",
                         config
@@ -561,6 +570,7 @@ impl AppState {
             recording_bucket,
             livekit_sip_handler,
             auth_client,
+            auth_policy,
             active_ws_connections: Arc::new(AtomicUsize::new(0)),
             connections_per_ip: Arc::new(DashMap::new()),
             shutdown: CancellationToken::new(),

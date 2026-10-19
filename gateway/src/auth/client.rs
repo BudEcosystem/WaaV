@@ -27,6 +27,8 @@ pub struct AuthClient {
     encoding_key: EncodingKey,
     /// Algorithm to use for JWT signing (RS256 or ES256)
     algorithm: Algorithm,
+    /// Whether a `200` must name the caller (`AUTH_RESPONDER_REQUIRE_IDENTITY`, default `true`).
+    require_identity: bool,
 }
 
 impl std::fmt::Debug for AuthClient {
@@ -35,6 +37,7 @@ impl std::fmt::Debug for AuthClient {
             .field("auth_service_url", &self.auth_service_url)
             .field("algorithm", &self.algorithm)
             .field("encoding_key", &"<redacted>")
+            .field("require_identity", &self.require_identity)
             .finish()
     }
 }
@@ -71,7 +74,15 @@ impl AuthClient {
             auth_service_url: auth_service_url.clone(),
             encoding_key,
             algorithm,
+            require_identity: true,
         })
+    }
+
+    /// Whether a `200` without an identity is refused (the default) or admitted anonymously
+    /// (legacy responders; see [`crate::auth::policy`]).
+    pub fn with_require_identity(mut self, require_identity: bool) -> Self {
+        self.require_identity = require_identity;
+        self
     }
 
     /// Validate a bearer token by calling the external auth service
@@ -147,30 +158,32 @@ impl AuthClient {
         let status = response.status();
         match status {
             StatusCode::OK => {
-                // Parse response body as Auth object
-                // Expected format: { "id": "project1", ... } or empty
-                let response_text = response.text().await.unwrap_or_else(|_| String::new());
-
-                let auth = if response_text.is_empty() {
-                    Auth::empty()
-                } else {
-                    // Parse as Auth struct, falling back to empty on parse failure
-                    serde_json::from_str::<Auth>(&response_text).unwrap_or_else(|e| {
-                        tracing::warn!(
-                            error = %e,
-                            "Failed to parse auth service response as Auth, using empty"
+                // A 200 admits the caller AS someone: the body must name them
+                // (`{"id": "project1"}`, or one of the other identity keys). An empty body,
+                // `{}`, `OK` or unparseable JSON used to fall back to `Auth::empty()` and admit
+                // an anonymous caller — no tenant prefix on rooms or recordings — on HTTP routes
+                // and header-keyed `/ws`, while first-message `/ws` auth refused the same answer.
+                let response_text = response.text().await.unwrap_or_default();
+                match crate::auth::policy::identity_from_responder_body(&response_text) {
+                    Some(id) => {
+                        tracing::debug!(auth_id = %id, "Token validation successful");
+                        Ok(Auth::new(id))
+                    }
+                    None if !self.require_identity => {
+                        tracing::debug!(
+                            "Token validation successful without an identity \
+                             (AUTH_RESPONDER_REQUIRE_IDENTITY=false)"
                         );
-                        Auth::empty()
-                    })
-                };
-
-                if let Some(ref id) = auth.id {
-                    tracing::debug!(auth_id = %id, "Token validation successful");
-                } else {
-                    tracing::debug!("Token validation successful (no id in response)");
+                        Ok(Auth::empty())
+                    }
+                    None => Err(AuthError::AuthServiceError(
+                        StatusCode::OK,
+                        "the auth responder answered 200 without an identity: its body must be \
+                         JSON naming the caller, e.g. {\"id\": \"<tenant>\"} \
+                         (AUTH_RESPONDER_REQUIRE_IDENTITY)"
+                            .to_string(),
+                    )),
                 }
-
-                Ok(auth)
             }
             _ => {
                 // Cap error body at 500 characters to prevent DoS
@@ -556,7 +569,7 @@ V/reoL3Jcy/mQ9MrmJx+K1VC
         Mock::given(method("POST"))
             .and(header("content-type", "application/jwt"))
             .respond_with(ResponseTemplate::new(200))
-            .expect(1)
+            .expect(2)
             .mount(&mock_server)
             .await;
 
@@ -636,9 +649,31 @@ V/reoL3Jcy/mQ9MrmJx+K1VC
             )
             .await;
 
-        assert!(result.is_ok());
-        let auth = result.unwrap();
-        assert_eq!(auth.id, None); // No id in empty response
+        // A 200 that names nobody is refused by default (fail closed): 502, not an anonymous
+        // admission.
+        let err = result.expect_err("an identity-less 200 must not admit");
+        assert!(
+            matches!(err, AuthError::AuthServiceError(StatusCode::OK, _)),
+            "{err:?}"
+        );
+        assert_eq!(err.status_code(), StatusCode::BAD_GATEWAY);
+
+        // The legacy opt-out admits it anonymously.
+        let legacy = AuthClient::from_config(&config)
+            .await
+            .unwrap()
+            .with_require_identity(false);
+        let auth = legacy
+            .validate_token(
+                "test-token",
+                &serde_json::json!({}),
+                HashMap::new(),
+                "/t",
+                "POST",
+            )
+            .await
+            .expect("legacy responders still admit");
+        assert_eq!(auth.id, None);
     }
 
     #[tokio::test]

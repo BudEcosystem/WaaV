@@ -681,6 +681,14 @@ components:
           - 'null'
           description: OpenAI-compatible base URL for the LLM.
           default: null
+        credential_ref:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Operator credential (`core::credentials`) the LLM leg uses when the client sends no key.
+            The NAME only — the secret stays in the credential's env var / file, bound to its hosts.
+          default: null
         model:
           type:
           - string
@@ -1007,7 +1015,12 @@ components:
           type:
           - string
           - 'null'
-          description: API key (literal or `${ENV_VAR}`); falls back to `OPENAI_API_KEY`.
+          description: |-
+            Your own API key, sent as is. `${NAME}` is the legacy spelling of `credential_ref: NAME`
+            (an operator credential, see below) — the gateway never reads an arbitrary environment
+            variable for a client. Omitted: the vendor's key configured on the gateway is used only
+            toward that vendor's own host (`OPENAI_API_KEY` → `api.openai.com`); any other host gets
+            no key.
         barge_in_min_words:
           type:
           - integer
@@ -1025,6 +1038,14 @@ components:
             refused if present — under the Bud control plane, where the LLM leg is a Bud chat
             deployment reached through the Bud gateway (FRD-023 RT6).
           example: https://api.openai.com/v1
+        credential_ref:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Name of an operator credential (`WAAV_CREDENTIALS_FILE`) to authenticate with. It is sent
+            only if `base_url` is one of the credential's hosts; otherwise the config is refused.
+            Takes precedence over `api_key`.
         degradation_message:
           type:
           - string
@@ -1063,6 +1084,19 @@ components:
           description: |-
             D3: custom masking phrases (action wording, e.g. "Let me check that order").
             Empty = the built-in pool. Pre-rendered at session start at the call's rate.
+        llm_timeout_ms:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: |-
+            LLM request timeout in ms. Omit for the server default (`WAAV_LLM_TIMEOUT_MS`, else
+            60000); clamped to 1000 .. `WAAV_LLM_MAX_TIMEOUT_MS` (default 300000). Raise it for a
+            self-hosted model that loads on its first request. With the server's
+            `WAAV_LLM_STREAM_IDLE_TIMEOUT_MS` set, it bounds the first token of a streamed reply,
+            not the whole reply.
+          example: 120000
+          minimum: 0
         max_history:
           type: integer
           description: Max retained history messages (default 20).
@@ -1145,6 +1179,13 @@ components:
             the safe default (15000); `0` disables. Ignored without a `reasoning_model`.
           example: 15000
           minimum: 0
+        reasoning_credential_ref:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Operator credential for the reasoning tier (bound to `reasoning_base_url`, or `base_url`
+            when that is unset). Takes precedence over `reasoning_api_key`.
         reasoning_effort:
           oneOf:
           - type: 'null'
@@ -2225,6 +2266,45 @@ components:
             - stt_warning
       - type: object
         description: |-
+          A turn of the session's DAG failed. It is an `error` (a client that reads only `message`
+          sees it as before) that also names the node: the turn is abandoned, the session stays up
+          and the next utterance runs the graph again.
+        required:
+        - message
+        - code
+        - dag_id
+        - type
+        properties:
+          code:
+            type: string
+            description: |-
+              `dag_node_failed`, `dag_node_timeout` (a node ran past its timeout) or
+              `dag_turn_timeout` (the turn ran past `dag_config.timeout_ms`).
+            example: dag_node_timeout
+          dag_id:
+            type: string
+            description: The DAG's `id`.
+          message:
+            type: string
+            description: Human-readable error, naming the node.
+          node_id:
+            type:
+            - string
+            - 'null'
+            description: The node that failed, when one did.
+            example: tts
+          node_type:
+            type:
+            - string
+            - 'null'
+            description: The failed node's type (`tts_provider`, `llm_endpoint`, ...).
+            example: tts_provider
+          type:
+            type: string
+            enum:
+            - error
+      - type: object
+        description: |-
           Non-fatal configuration advisory (D1 / REALTIME_REASONING.md §7.4).
 
           Sent at config time when a setting is sub-optimal but the session still
@@ -3058,6 +3138,17 @@ components:
             Model to use for transcription. Optional — defaults to empty, letting the provider pick its
             own default model (each provider maps an empty model to its recommended default).
           example: nova-2
+        noise_suppression:
+          type:
+          - boolean
+          - 'null'
+          description: |-
+            WaaV's own denoiser (DeepFilterNet) on this session's uplink, ahead of the VAD / turn
+            models and the STT provider — the same `noise_suppression` a Bud deployment's `stt`
+            settings carry for REST transcription, which is the default here. Off unless asked for:
+            it costs CPU per session and adds ~30 ms. Mono `linear16` (or gateway-decoded opus)
+            only. A build without the `noise-filter` feature, or a server with no stream to give,
+            says so in a `config_warning` and goes on unfiltered.
         provider:
           type: string
           description: |-

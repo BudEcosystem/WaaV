@@ -14,6 +14,7 @@ extend-exclude = [
   "**/target/**",
   "**/*.min.js",
   "inferv2/REVIEW/*.json",       # agent-run transcripts (truncated tool output), not prose
+  "gateway/vendor/**",           # vendored third-party crates (webrtc-sys, livekit-api): kept byte-close to upstream
 ]
 
 [default]

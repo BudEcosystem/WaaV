@@ -95,6 +95,7 @@ pub fn default_agent_stt_config() -> STTWebSocketConfig {
         translation: None,
         turn_detection: None,
         transcription_mode: None,
+        noise_suppression: None,
     }
 }
 
@@ -145,9 +146,19 @@ pub struct ConversationWebSocketConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,
 
-    /// API key (literal or `${ENV_VAR}`); falls back to `OPENAI_API_KEY`.
+    /// Your own API key, sent as is. `${NAME}` is the legacy spelling of `credential_ref: NAME`
+    /// (an operator credential, see below) — the gateway never reads an arbitrary environment
+    /// variable for a client. Omitted: the vendor's key configured on the gateway is used only
+    /// toward that vendor's own host (`OPENAI_API_KEY` → `api.openai.com`); any other host gets
+    /// no key.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+
+    /// Name of an operator credential (`WAAV_CREDENTIALS_FILE`) to authenticate with. It is sent
+    /// only if `base_url` is one of the credential's hosts; otherwise the config is refused.
+    /// Takes precedence over `api_key`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_ref: Option<String>,
 
     /// Sampling temperature.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -263,6 +274,11 @@ pub struct ConversationWebSocketConfig {
     /// S1/S2: reasoning-tier API key (literal or `${ENV_VAR}`; defaults to `api_key`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_api_key: Option<String>,
+
+    /// Operator credential for the reasoning tier (bound to `reasoning_base_url`, or `base_url`
+    /// when that is unset). Takes precedence over `reasoning_api_key`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_credential_ref: Option<String>,
     /// S1/S2: reasoning-tier vendor wire format (defaults to `provider_kind`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(value_type = Option<String>, example = "openai"))]
@@ -296,6 +312,14 @@ pub struct ConversationWebSocketConfig {
     #[serde(default)]
     #[cfg_attr(feature = "openapi", schema(example = 2048))]
     pub max_reasoning_tokens: Option<u32>,
+    /// LLM request timeout in ms. Omit for the server default (`WAAV_LLM_TIMEOUT_MS`, else
+    /// 60000); clamped to 1000 .. `WAAV_LLM_MAX_TIMEOUT_MS` (default 300000). Raise it for a
+    /// self-hosted model that loads on its first request. With the server's
+    /// `WAAV_LLM_STREAM_IDLE_TIMEOUT_MS` set, it bounds the first token of a streamed reply,
+    /// not the whole reply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(example = 120000))]
+    pub llm_timeout_ms: Option<u64>,
 }
 
 fn default_strip_markdown() -> bool {
@@ -314,6 +338,14 @@ fn default_conversation_allow_interruption() -> bool {
     true
 }
 
+/// `credential_ref` (as its `${NAME}` reference) when set, else the client's `api_key`.
+fn credential_reference(credential_ref: Option<&str>, api_key: Option<&str>) -> Option<String> {
+    match credential_ref.map(str::trim).filter(|r| !r.is_empty()) {
+        Some(name) => Some(format!("${{{name}}}")),
+        None => api_key.map(str::to_owned),
+    }
+}
+
 impl ConversationWebSocketConfig {
     /// Convert into the core `ConversationConfig`.
     pub fn to_conversation_config(&self) -> crate::core::conversation::ConversationConfig {
@@ -321,7 +353,9 @@ impl ConversationWebSocketConfig {
             base_url: self.base_url.clone(),
             model: self.model.clone(),
             system_prompt: self.system_prompt.clone(),
-            api_key: self.api_key.clone(),
+            // A credential NAME travels as its `${NAME}` reference; `core::credentials` resolves
+            // it against the operator's registry and the target host (never the raw env var).
+            api_key: credential_reference(self.credential_ref.as_deref(), self.api_key.as_deref()),
             server_llm_endpoint: false,
             credential: None,
             attribution: None,
@@ -343,7 +377,10 @@ impl ConversationWebSocketConfig {
             latency_filler_phrases: self.latency_filler_phrases.clone(),
             reasoning_model: self.reasoning_model.clone(),
             reasoning_base_url: self.reasoning_base_url.clone(),
-            reasoning_api_key: self.reasoning_api_key.clone(),
+            reasoning_api_key: credential_reference(
+                self.reasoning_credential_ref.as_deref(),
+                self.reasoning_api_key.as_deref(),
+            ),
             reasoning_provider_kind: self.reasoning_provider_kind,
             reasoning_route: self.reasoning_route,
             reasoning_budget_ms: self
@@ -358,6 +395,7 @@ impl ConversationWebSocketConfig {
                 .map(|n| n.max(1))
                 .unwrap_or(crate::core::conversation::DEFAULT_MAX_LLM_CALLS_PER_TURN),
             max_reasoning_tokens: self.max_reasoning_tokens,
+            llm_timeout_ms: self.llm_timeout_ms,
         }
     }
 }
@@ -454,6 +492,15 @@ pub struct STTWebSocketConfig {
     /// engine only when it asks for `segmented`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcription_mode: Option<String>,
+
+    /// WaaV's own denoiser (DeepFilterNet) on this session's uplink, ahead of the VAD / turn
+    /// models and the STT provider — the same `noise_suppression` a Bud deployment's `stt`
+    /// settings carry for REST transcription, which is the default here. Off unless asked for:
+    /// it costs CPU per session and adds ~30 ms. Mono `linear16` (or gateway-decoded opus)
+    /// only. A build without the `noise-filter` feature, or a server with no stream to give,
+    /// says so in a `config_warning` and goes on unfiltered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub noise_suppression: Option<bool>,
 }
 
 /// Per-session ML turn-detection knobs (provider-agnostic).
@@ -1139,6 +1186,7 @@ mod config_tests {
             transcription_mode: None,
             translation: None,
             audio_in_codec: None,
+            noise_suppression: None,
         }
     }
 

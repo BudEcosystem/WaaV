@@ -303,6 +303,11 @@ pub fn apply_stt(
         base.speech_begin_event = streaming.speech_begin_event;
     }
     cfg.features = overlay(base, &cfg.features);
+    // RCA 2e: the deployment's `stt.noise_suppression` (WaaV's own denoiser) applies on this
+    // plane too, as on REST; the client's explicit choice wins.
+    if cfg.noise_suppression.is_none() {
+        cfg.noise_suppression = settings.noise_suppression;
+    }
     if cfg.translation.is_none() {
         cfg.translation =
             endpoint_settings::translation_for(ep.config.translation.as_ref(), false, advisories);

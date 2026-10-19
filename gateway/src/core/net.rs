@@ -27,47 +27,149 @@
 //!    against the IPv4 rules.
 //! 5. Resolve-then-validate for DNS names (kills DNS-rebind / TOCTOU): every
 //!    address the name currently resolves to must pass the IP rules. Hosts
-//!    that do not resolve are allowed through (they may resolve later; the
-//!    transport applies its own checks at dial time).
+//!    that do not resolve pass THIS check; a client whose target is client-chosen
+//!    (the LLM legs) is built with [`guarded_client_builder`], whose DNS resolver
+//!    re-applies the IP rules to the addresses it actually dials — so a name that
+//!    is unresolvable (or public) at validation time and rebinds to a private
+//!    address before the dial is still refused.
 //!
-//! ## Test escape hatch
+//! ## Private targets the operator allows
 //!
-//! `WAAV_ALLOW_LOOPBACK_ENDPOINTS=1` (opt-in, OFF by default) skips the host
-//! checks — the scheme allowlist still applies — so in-process mock servers
-//! (DAG data-plane e2e, conversation-loop tests, `deepgram_aura_ws_e2e`) can
-//! target `127.0.0.1`. Never set it in production.
+//! * `WAAV_PRIVATE_EGRESS_ALLOWLIST=host:port,host:port` — exact, PORT-SCOPED
+//!   exemptions from rules 2-5 (e.g. `127.0.0.1:8000` for a local LLM, or
+//!   `llm.lan:8080`). The port is mandatory: allowing a loopback model server
+//!   must not open every other loopback service (admin APIs, Redis, the
+//!   gateway itself).
+//! * A named operator credential (`core::credentials`) with `private: true`
+//!   exempts exactly its `host:port` entries, for requests that carry it.
+//! * `WAAV_ALLOW_LOOPBACK_ENDPOINTS` (test escape hatch, OFF by default):
+//!   `1/true` = loopback on ANY port (legacy, logs a WARN), or a comma list of
+//!   ports (`8000,8001`) = loopback on those ports only. It exempts LOOPBACK
+//!   ONLY — it used to skip every host check, so `169.254.169.254` (cloud
+//!   metadata) and RFC1918 targets were reachable whenever it was on.
 //!
 //! This module is feature-free: it must be available to non-DAG builds.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 
 use crate::config::utils::parse_bool;
 
 pub(crate) const HTTP_URL_SCHEMES: &[&str] = &["http", "https"];
 pub(crate) const HTTP_WS_URL_SCHEMES: &[&str] = &["http", "https", "ws", "wss"];
 
-/// Whether loopback/private endpoint targets are explicitly permitted.
-///
-/// OFF by default. Opt-in via `WAAV_ALLOW_LOOPBACK_ENDPOINTS=1` so in-process
-/// mock servers can target `127.0.0.1` without weakening production SSRF
-/// protection. Never set in production.
-pub(crate) fn loopback_endpoints_allowed() -> bool {
-    match std::env::var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") {
-        Ok(value) => match loopback_flag_enabled(Some(&value)) {
-            Ok(enabled) => enabled,
+/// Env var: exact `host:port` targets exempt from the private-address rules.
+pub(crate) const PRIVATE_EGRESS_ALLOWLIST_ENV: &str = "WAAV_PRIVATE_EGRESS_ALLOWLIST";
+
+/// Which loopback targets the `WAAV_ALLOW_LOOPBACK_ENDPOINTS` escape hatch permits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LoopbackAllowance {
+    /// The default: loopback is blocked like every other private range.
+    Off,
+    /// `1/true/yes`: loopback on any port (legacy spelling; WARN at startup).
+    AnyPort,
+    /// `8000,8001`: loopback on these ports only.
+    Ports(Vec<u16>),
+}
+
+impl LoopbackAllowance {
+    fn permits(&self, port: Option<u16>) -> bool {
+        match self {
+            Self::Off => false,
+            Self::AnyPort => true,
+            Self::Ports(ports) => port.is_some_and(|p| ports.contains(&p)),
+        }
+    }
+}
+
+/// An exact `host:port` the operator exempted from the private-address rules.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostPort {
+    /// Lowercased host as `url::Url::host_str` spells it (IPv6 bracketed).
+    pub host: String,
+    pub port: u16,
+}
+
+impl HostPort {
+    /// Parse `host:port` (`[v6]:port` for IPv6). The port is mandatory.
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        let raw = raw.trim();
+        let (host, port) = raw
+            .rsplit_once(':')
+            .filter(|(h, _)| !h.is_empty() && (!h.contains(':') || h.starts_with('[')))
+            .ok_or_else(|| format!("'{raw}' is not host:port (the port is required)"))?;
+        let port = port
+            .parse::<u16>()
+            .map_err(|_| format!("'{raw}': '{port}' is not a port"))?;
+        Ok(Self {
+            host: host.to_ascii_lowercase(),
+            port,
+        })
+    }
+
+    fn matches(&self, host: &str, port: Option<u16>) -> bool {
+        port == Some(self.port) && self.host.eq_ignore_ascii_case(host)
+    }
+}
+
+/// The operator's `WAAV_PRIVATE_EGRESS_ALLOWLIST`, read per call (cheap; lets tests and a
+/// config reload see changes). Malformed entries are logged and skipped — never widened.
+pub(crate) fn private_egress_allowlist() -> Vec<HostPort> {
+    let Ok(raw) = std::env::var(PRIVATE_EGRESS_ALLOWLIST_ENV) else {
+        return Vec::new();
+    };
+    raw.split(',')
+        .filter(|e| !e.trim().is_empty())
+        .filter_map(|entry| match HostPort::parse(entry) {
+            Ok(hp) => Some(hp),
             Err(e) => {
-                tracing::error!(error = %e, "invalid loopback endpoint escape-hatch environment configuration");
-                false
+                tracing::error!(error = %e, "{PRIVATE_EGRESS_ALLOWLIST_ENV}: entry ignored");
+                None
             }
-        },
-        Err(std::env::VarError::NotPresent) => false,
+        })
+        .collect()
+}
+
+/// The loopback escape hatch, from `WAAV_ALLOW_LOOPBACK_ENDPOINTS`. OFF by default; a
+/// malformed value keeps it off (fail closed).
+pub(crate) fn loopback_allowance() -> LoopbackAllowance {
+    match std::env::var("WAAV_ALLOW_LOOPBACK_ENDPOINTS") {
+        Ok(value) => parse_loopback_allowance(&value).unwrap_or_else(|e| {
+            tracing::error!(error = %e, "invalid loopback endpoint escape-hatch environment configuration");
+            LoopbackAllowance::Off
+        }),
+        Err(std::env::VarError::NotPresent) => LoopbackAllowance::Off,
         Err(std::env::VarError::NotUnicode(_)) => {
             tracing::error!(
                 "WAAV_ALLOW_LOOPBACK_ENDPOINTS must be valid UTF-8; keeping SSRF protection enabled"
             );
-            false
+            LoopbackAllowance::Off
         }
     }
+}
+
+/// Pure parser: a boolean, or a comma list of ports.
+fn parse_loopback_allowance(value: &str) -> Result<LoopbackAllowance, String> {
+    if let Ok(enabled) = loopback_flag_enabled(Some(value)) {
+        return Ok(if enabled {
+            LoopbackAllowance::AnyPort
+        } else {
+            LoopbackAllowance::Off
+        });
+    }
+    let ports = value
+        .split(',')
+        .map(|p| p.trim().parse::<u16>())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| {
+            "WAAV_ALLOW_LOOPBACK_ENDPOINTS must be true/false/1/0/yes/no or a comma list of ports"
+                .to_string()
+        })?;
+    Ok(LoopbackAllowance::Ports(ports))
+}
+
+/// Whether ANY loopback target is permitted (kept for callers that only need a yes/no).
+pub(crate) fn loopback_endpoints_allowed() -> bool {
+    loopback_allowance() != LoopbackAllowance::Off
 }
 
 /// Pure parser for the escape-hatch flag value (unit-testable without touching
@@ -110,7 +212,24 @@ pub fn shared_http_client(
 /// comparison). Returns `Ok(())` for safe URLs, or a human-readable reason why
 /// the URL was rejected. See the module docs for the full rule set.
 pub fn validate_url_for_ssrf(url: &str, allowed_schemes: &[&str]) -> Result<(), String> {
-    validate_url_for_ssrf_inner(url, allowed_schemes, loopback_endpoints_allowed())
+    validate_url_for_ssrf_inner(
+        url,
+        allowed_schemes,
+        &loopback_allowance(),
+        &private_egress_allowlist(),
+    )
+}
+
+/// [`validate_url_for_ssrf`] that also exempts `granted` — the `host:port` entries of a named
+/// operator credential with `private: true` that this request carries.
+pub fn validate_url_for_ssrf_with_grants(
+    url: &str,
+    allowed_schemes: &[&str],
+    granted: &[HostPort],
+) -> Result<(), String> {
+    let mut allowed = private_egress_allowlist();
+    allowed.extend_from_slice(granted);
+    validate_url_for_ssrf_inner(url, allowed_schemes, &loopback_allowance(), &allowed)
 }
 
 /// [`validate_url_for_ssrf`] without the resolve-then-validate step: the scheme allowlist, the
@@ -125,7 +244,13 @@ pub fn validate_url_for_ssrf_without_dns(
     url: &str,
     allowed_schemes: &[&str],
 ) -> Result<(), String> {
-    ssrf_dns_host(url, allowed_schemes, loopback_endpoints_allowed()).map(|_| ())
+    ssrf_dns_host(
+        url,
+        allowed_schemes,
+        &loopback_allowance(),
+        &private_egress_allowlist(),
+    )
+    .map(|_| ())
 }
 
 /// Build a reqwest redirect policy that validates every redirect target before
@@ -158,6 +283,82 @@ pub(crate) fn ssrf_protected_client_builder(
     reqwest::Client::builder().redirect(ssrf_protected_redirect_policy(allowed_schemes))
 }
 
+/// A DNS resolver that applies the IP rules to the addresses a client ACTUALLY dials
+/// (connect-time SSRF check), closing the validate-then-resolve-again window (DNS rebinding)
+/// and the "unresolvable at validation time" pass-through. Private addresses are allowed only
+/// for `allowed_names` (from the operator's port-scoped allowlist / credential grants — the port
+/// itself was enforced when the URL was validated) and, under the loopback escape hatch, for
+/// loopback addresses.
+#[derive(Debug, Clone)]
+pub(crate) struct GuardedResolver {
+    allowed_names: Vec<String>,
+    loopback: LoopbackAllowance,
+}
+
+impl reqwest::dns::Resolve for GuardedResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        Box::pin(guarded_lookup(
+            self.clone(),
+            name.as_str().to_ascii_lowercase(),
+        ))
+    }
+}
+
+async fn guarded_lookup(
+    resolver: GuardedResolver,
+    host: String,
+) -> Result<reqwest::dns::Addrs, Box<dyn std::error::Error + Send + Sync>> {
+    let addrs: Vec<std::net::SocketAddr> =
+        tokio::net::lookup_host((host.as_str(), 0)).await?.collect();
+    let name_allowed = resolver
+        .allowed_names
+        .iter()
+        .any(|n| n.eq_ignore_ascii_case(&host));
+    for addr in &addrs {
+        let ip = addr.ip();
+        let loopback_ok = ip.is_loopback() && resolver.loopback != LoopbackAllowance::Off;
+        if is_private_ip(&ip) && !name_allowed && !loopback_ok {
+            return Err(format!(
+                "'{host}' resolves to private/internal IP '{ip}' (SSRF protection, connect time)"
+            )
+            .into());
+        }
+    }
+    Ok(Box::new(addrs.into_iter()))
+}
+
+/// [`ssrf_protected_client_builder`] plus the connect-time [`GuardedResolver`]. Use it for every
+/// client whose target a CLIENT chose (LLM `base_url`s); operator-addressed clients (the auth
+/// responder, the Bud gateway) keep [`ssrf_protected_client_builder`]. `granted` are the
+/// request's credential grants (see [`validate_url_for_ssrf_with_grants`]).
+pub(crate) fn guarded_client_builder(
+    allowed_schemes: &'static [&'static str],
+    granted: &[HostPort],
+) -> reqwest::ClientBuilder {
+    let mut allowed_names: Vec<String> = private_egress_allowlist()
+        .into_iter()
+        .map(|hp| hp.host)
+        .collect();
+    allowed_names.extend(granted.iter().map(|hp| hp.host.clone()));
+    ssrf_protected_client_builder(allowed_schemes).dns_resolver(std::sync::Arc::new(
+        GuardedResolver {
+            allowed_names,
+            loopback: loopback_allowance(),
+        },
+    ))
+}
+
+/// [`guarded_client_builder`] with no credential grants, built: for clients whose target a client
+/// chose but which carry no operator credential (DAG HTTP endpoints and webhooks). The URL check
+/// before the request and this resolver at connect time apply the same rules, so a name that
+/// resolves to a public address when checked and a private one when dialled (DNS rebinding) is
+/// refused.
+pub(crate) fn guarded_client(
+    allowed_schemes: &'static [&'static str],
+) -> Result<reqwest::Client, reqwest::Error> {
+    guarded_client_builder(allowed_schemes, &[]).build()
+}
+
 /// Build a reqwest client whose redirects are constrained by
 /// [`ssrf_protected_redirect_policy`].
 pub(crate) fn ssrf_protected_client(
@@ -173,16 +374,30 @@ pub(crate) fn ssrf_protected_client(
 fn validate_url_for_ssrf_inner(
     url: &str,
     allowed_schemes: &[&str],
-    loopback_allowed: bool,
+    loopback: &LoopbackAllowance,
+    allowed: &[HostPort],
 ) -> Result<(), String> {
-    match ssrf_dns_host(url, allowed_schemes, loopback_allowed)? {
+    match ssrf_dns_host(url, allowed_schemes, loopback, allowed)? {
         // Resolve-then-validate: when the host is a DNS name (not an IP literal),
-        // resolve it and reject if ANY resolved address is private/internal. This
-        // closes DNS-rebinding / TOCTOU holes where a public-looking hostname
-        // resolves to a private/metadata address.
-        Some(host) => validate_resolved_host_for_ssrf(&host),
+        // resolve it and reject if ANY resolved address is private/internal. (The
+        // dial re-resolves; clients of client-chosen targets close that window with
+        // `GuardedResolver`.)
+        Some((host, port)) => validate_resolved_host_inner(&host, loopback.permits(port)),
         None => Ok(()),
     }
+}
+
+/// Hostnames that name the loopback interface (the escape hatch's scope).
+fn is_loopback_name(host_lower: &str) -> bool {
+    matches!(
+        host_lower,
+        "localhost"
+            | "localhost.localdomain"
+            | "127.0.0.1"
+            | "::1"
+            | "[::1]"
+            | "[::ffff:127.0.0.1]"
+    )
 }
 
 /// Every check [`validate_url_for_ssrf_inner`] makes that needs no I/O. `Ok(Some(host))` when
@@ -190,8 +405,9 @@ fn validate_url_for_ssrf_inner(
 fn ssrf_dns_host(
     url: &str,
     allowed_schemes: &[&str],
-    loopback_allowed: bool,
-) -> Result<Option<String>, String> {
+    loopback: &LoopbackAllowance,
+    allowed: &[HostPort],
+) -> Result<Option<(String, Option<u16>)>, String> {
     let parsed = url::Url::parse(url).map_err(|e| format!("invalid URL '{}': {}", url, e))?;
 
     // Scheme allowlist — applies even when the loopback escape hatch is on.
@@ -204,17 +420,52 @@ fn ssrf_dns_host(
         ));
     }
 
-    // Test/local-mock escape hatch (opt-in, OFF by default).
-    if loopback_allowed {
-        return Ok(None);
-    }
-
     let host = parsed
         .host_str()
         .ok_or_else(|| format!("URL '{}' has no host", url))?;
+    let port = parsed.port_or_known_default();
+
+    // An exact host:port the operator allowed (allowlist or a credential grant): no host rule
+    // applies to it. Port-scoped, so allowing one loopback service opens no other.
+    if allowed.iter().any(|hp| hp.matches(host, port)) {
+        return Ok(None);
+    }
 
     // Blocked hostnames and every IP-literal spelling: the rule segmented sessions apply too.
-    waav_segmented_stt::net::check_host(host)
+    // The loopback escape hatch (test/local-mock only, OFF by default) exempts LOOPBACK ONLY —
+    // never link-local / cloud metadata / private ranges — and only on its permitted ports.
+    match waav_segmented_stt::net::check_host(host) {
+        Ok(Some(name)) => Ok(Some((name, port))),
+        Ok(None) => Ok(None),
+        Err(_) if loopback.permits(port) && is_loopback_host(host) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether a URL host (as `url::Url::host_str` writes it) names the loopback interface: a
+/// loopback hostname or a loopback IP literal in any spelling `check_host` recognises.
+fn is_loopback_host(host: &str) -> bool {
+    let host_lower = host.to_lowercase();
+    if is_loopback_name(&host_lower) {
+        return true;
+    }
+    let bare = host_lower
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(&host_lower);
+    if let Ok(ip) = bare.parse::<IpAddr>() {
+        return match ip {
+            IpAddr::V6(v6) => {
+                v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+            }
+            IpAddr::V4(v4) => v4.is_loopback(),
+        };
+    }
+    !bare.is_empty()
+        && bare.bytes().all(|b| b.is_ascii_digit())
+        && bare
+            .parse::<u32>()
+            .is_ok_and(|n| Ipv4Addr::from(n).is_loopback())
 }
 
 /// Resolve a DNS hostname and reject if any resolved IP is private/internal.
@@ -225,6 +476,12 @@ fn ssrf_dns_host(
 /// own checks); the goal here is to reject hosts that *currently* resolve to a
 /// blocked range, which is the DNS-rebind vector for client-supplied targets.
 pub fn validate_resolved_host_for_ssrf(host: &str) -> Result<(), String> {
+    validate_resolved_host_inner(host, false)
+}
+
+/// [`validate_resolved_host_for_ssrf`], optionally exempting LOOPBACK addresses (the escape
+/// hatch, already port-checked by the caller) — never any other private range.
+fn validate_resolved_host_inner(host: &str, loopback_ok: bool) -> Result<(), String> {
     use std::net::ToSocketAddrs;
 
     // Port is irrelevant for the IP check; use a dummy port for resolution.
@@ -235,7 +492,7 @@ pub fn validate_resolved_host_for_ssrf(host: &str) -> Result<(), String> {
 
     for addr in resolved {
         let ip = addr.ip();
-        if is_private_ip(&ip) {
+        if is_private_ip(&ip) && !(loopback_ok && ip.is_loopback()) {
             return Err(format!(
                 "Host '{}' resolves to private/internal IP '{}' (SSRF protection)",
                 host, ip
@@ -515,21 +772,80 @@ mod tests {
     /// real env path is covered end-to-end by `deepgram_aura_ws_e2e` /
     /// `conversation_loop` / `dag_dataplane` in their own processes.
     #[test]
-    fn loopback_gate_on_permits_private_targets() {
+    fn loopback_gate_on_permits_loopback_only() {
+        let on = LoopbackAllowance::AnyPort;
         for url in [
             "http://127.0.0.1:8080/v1",
-            "http://169.254.169.254/latest/meta-data",
-            "http://10.0.0.1/x",
             "http://localhost/x",
+            "http://[::1]:9000/x",
         ] {
             assert!(
-                validate_url_for_ssrf_inner(url, HTTP_SCHEMES, true).is_ok(),
+                validate_url_for_ssrf_inner(url, HTTP_SCHEMES, &on, &[]).is_ok(),
                 "{url} must be allowed with the gate on"
             );
         }
+        // The gate is a LOOPBACK hatch: metadata, link-local and RFC1918 stay blocked (they
+        // used to be allowed whenever the gate was on).
+        for url in [
+            "http://169.254.169.254/latest/meta-data",
+            "http://10.0.0.1/x",
+            "http://192.168.1.1/x",
+            "http://metadata.google.internal/x",
+        ] {
+            assert!(
+                validate_url_for_ssrf_inner(url, HTTP_SCHEMES, &on, &[]).is_err(),
+                "{url} must stay blocked with the gate on"
+            );
+        }
         // Scheme allowlist still applies with the gate on.
-        assert!(validate_url_for_ssrf_inner("ftp://example.com/x", HTTP_SCHEMES, true).is_err());
-        assert!(validate_url_for_ssrf_inner("ws://127.0.0.1/x", HTTP_SCHEMES, true).is_err());
+        assert!(
+            validate_url_for_ssrf_inner("ftp://example.com/x", HTTP_SCHEMES, &on, &[]).is_err()
+        );
+        assert!(validate_url_for_ssrf_inner("ws://127.0.0.1/x", HTTP_SCHEMES, &on, &[]).is_err());
+    }
+
+    #[test]
+    fn loopback_gate_can_be_port_scoped() {
+        let ports = parse_loopback_allowance("8000, 8001").unwrap();
+        assert_eq!(ports, LoopbackAllowance::Ports(vec![8000, 8001]));
+        assert!(
+            validate_url_for_ssrf_inner("http://127.0.0.1:8000/v1", HTTP_SCHEMES, &ports, &[])
+                .is_ok()
+        );
+        assert!(
+            validate_url_for_ssrf_inner("http://127.0.0.1:6379/", HTTP_SCHEMES, &ports, &[])
+                .is_err()
+        );
+        assert!(
+            validate_url_for_ssrf_inner("http://127.0.0.1/", HTTP_SCHEMES, &ports, &[]).is_err()
+        );
+        assert!(parse_loopback_allowance("8000,redis").is_err());
+    }
+
+    #[test]
+    fn allowlist_entries_are_exact_host_and_port() {
+        let allowed = [
+            HostPort::parse("127.0.0.1:8000").unwrap(),
+            HostPort::parse("LLM.lan:8080").unwrap(),
+        ];
+        let off = LoopbackAllowance::Off;
+        assert!(
+            validate_url_for_ssrf_inner("http://127.0.0.1:8000/v1", HTTP_SCHEMES, &off, &allowed)
+                .is_ok()
+        );
+        assert!(
+            validate_url_for_ssrf_inner("http://127.0.0.1:8001/v1", HTTP_SCHEMES, &off, &allowed)
+                .is_err()
+        );
+        assert!(
+            validate_url_for_ssrf_inner("http://llm.lan:8080/v1", HTTP_SCHEMES, &off, &allowed)
+                .is_ok()
+        );
+        assert!(
+            HostPort::parse("127.0.0.1").is_err(),
+            "the port is mandatory"
+        );
+        assert!(HostPort::parse("[::1]:8000").is_ok());
     }
 
     /// The env-flag parser itself (pure; no env mutation needed).
@@ -555,6 +871,24 @@ mod tests {
                 "error should name bad env var: {err}"
             );
         }
+    }
+
+    /// DAG HTTP endpoints and webhooks dial through the guarded resolver: a name that resolves to a
+    /// private address at connect time is refused even when nothing checked the URL first (the
+    /// DNS-rebinding window between the URL check and reqwest's own lookup).
+    #[tokio::test(flavor = "current_thread")]
+    async fn guarded_client_refuses_a_name_that_resolves_private_at_connect_time() {
+        let _guard = env_guard();
+        // SAFETY: test-only env mutation, serialized by the guard above.
+        unsafe { std::env::remove_var("WAAV_PRIVATE_EGRESS_ALLOWLIST") };
+        let client = guarded_client(HTTP_SCHEMES).expect("client");
+        let err = client
+            .get("http://localhost:9/metadata")
+            .send()
+            .await
+            .expect_err("a loopback address at connect time is refused");
+        let chain = format!("{err:?}");
+        assert!(chain.contains("SSRF protection, connect time"), "{chain}");
     }
 
     #[tokio::test(flavor = "current_thread")]

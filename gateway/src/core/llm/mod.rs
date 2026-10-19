@@ -87,8 +87,46 @@ pub const ALLOWED_ENV_VARS: &[&str] = &[
 /// malicious mock) from exhausting memory.
 const MAX_LLM_STREAM_CONTENT_BYTES: usize = 8 * 1024 * 1024;
 
-fn default_timeout_ms() -> u64 {
-    60000
+/// The request timeout of a config that names none: `WAAV_LLM_TIMEOUT_MS`, else 60 s. DAG LLM nodes
+/// default to it too.
+pub(crate) fn default_timeout_ms() -> u64 {
+    env_ms("WAAV_LLM_TIMEOUT_MS").unwrap_or(60_000)
+}
+
+/// A positive whole number of milliseconds from the environment. A malformed value is ignored
+/// with a warning, never a failed session.
+fn env_ms(name: &str) -> Option<u64> {
+    let raw = std::env::var(name).ok()?;
+    let v = raw.trim();
+    if v.is_empty() {
+        return None;
+    }
+    match v.parse::<u64>() {
+        Ok(n) if n > 0 => Some(n),
+        _ => {
+            warn!(%name, value = %v, "ignored: not a positive whole number of milliseconds");
+            None
+        }
+    }
+}
+
+/// The request timeout of a session that asks for its own (`conversation_config.llm_timeout_ms`):
+/// at least 1 s, at most `WAAV_LLM_MAX_TIMEOUT_MS` (default 300 s). `None` is the default.
+pub fn session_timeout_ms(asked: Option<u64>) -> u64 {
+    let max = env_ms("WAAV_LLM_MAX_TIMEOUT_MS")
+        .unwrap_or(300_000)
+        .max(1_000);
+    asked
+        .map(|ms| ms.clamp(1_000, max))
+        .unwrap_or_else(default_timeout_ms)
+}
+
+/// `WAAV_LLM_STREAM_IDLE_TIMEOUT_MS`: when set, a streamed reply is bounded by `timeout_ms` to its
+/// first chunk and by this between chunks, instead of by `timeout_ms` as a whole. Unset (default),
+/// `timeout_ms` bounds the whole streamed reply, as before.
+fn stream_idle_timeout() -> Option<Duration> {
+    static IDLE: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    *IDLE.get_or_init(|| env_ms("WAAV_LLM_STREAM_IDLE_TIMEOUT_MS").map(Duration::from_millis))
 }
 
 fn default_max_history() -> usize {
@@ -427,7 +465,9 @@ fn export_usage_metrics(provider: &str, usage: &Usage) {
 
 /// LLM client configuration. Field-compatible with the former
 /// `LlmEndpointConfig` so the DAG node can keep deserializing the same JSON.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written and redacts `api_key` and every `headers` value.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct LlmClientConfig {
     /// Custom base URL (e.g. `https://api.openai.com/v1`, `http://localhost:11434/v1`).
     pub base_url: String,
@@ -523,12 +563,25 @@ pub struct LlmClientConfig {
     /// (FRD-023 RT0).
     #[serde(skip, default = "default_allow_env_fallback")]
     pub allow_env_fallback: bool,
+    /// An operator credential this config may use (`core::credentials`), bound to `base_url`'s
+    /// host when the session was configured. Read per call. Never (de)serialised.
+    #[serde(skip)]
+    pub bound_credential: Option<crate::core::credentials::BoundCredential>,
+    /// `host:port` entries of `bound_credential` that may be private (port-scoped SSRF grant).
+    #[serde(skip)]
+    pub private_grants: Vec<crate::core::net::HostPort>,
+    /// `base_url` is CLIENT-chosen: build the HTTP client with the connect-time SSRF resolver
+    /// (`core::net::guarded_client_builder`). Operator-addressed configs (the Bud gateway, an
+    /// operator template) leave it off. Never (de)serialised.
+    #[serde(skip)]
+    pub guarded_egress: bool,
 }
 
 /// The key-resolution rule, over an injected environment lookup so it can be tested without
 /// touching the process environment. `env_allowed == false` means the lookup is never called.
 pub(crate) fn resolve_llm_api_key(
     per_call: Option<&str>,
+    bound: Option<&crate::core::credentials::BoundCredential>,
     config_key: Option<&str>,
     env_allowed: bool,
     default_env_key: &str,
@@ -536,6 +589,11 @@ pub(crate) fn resolve_llm_api_key(
 ) -> Option<String> {
     if let Some(key) = per_call {
         return Some(key.to_string());
+    }
+    // An operator credential bound to this target when the session was configured: the only
+    // way a CLIENT config reaches an operator secret.
+    if let Some(credential) = bound {
+        return credential.current();
     }
     if let Some(key) = config_key {
         if key.starts_with("${") && key.ends_with('}') {
@@ -565,6 +623,50 @@ pub(crate) fn resolve_llm_api_key(
 
 fn default_allow_env_fallback() -> bool {
     true
+}
+
+/// The HTTP client for a config: a client-chosen target (`guarded_egress`) also gets the
+/// connect-time SSRF resolver (DNS rebinding; names unresolvable at validation time); an
+/// operator-addressed one keeps the redirect-checked client.
+fn build_http_client(config: &LlmClientConfig) -> (Option<reqwest::Client>, Option<String>) {
+    let builder = if config.guarded_egress {
+        crate::core::net::guarded_client_builder(
+            crate::core::net::HTTP_URL_SCHEMES,
+            &config.private_grants,
+        )
+    } else {
+        crate::core::net::ssrf_protected_client_builder(crate::core::net::HTTP_URL_SCHEMES)
+    };
+    match builder
+        // The whole-request timeout is set per request (`build_http_request`), so a
+        // streamed reply can be bounded by first chunk and idle gap instead.
+        .connect_timeout(Duration::from_millis(
+            env_ms("WAAV_LLM_CONNECT_TIMEOUT_MS").unwrap_or(config.timeout_ms),
+        ))
+        .pool_max_idle_per_host(10)
+        .build()
+    {
+        Ok(client) => (Some(client), None),
+        Err(e) => {
+            let error = format!("failed to build SSRF-protected LLM HTTP client: {e}");
+            tracing::error!(%error);
+            (None, Some(error))
+        }
+    }
+}
+
+/// Whether two URLs share scheme, host and port (a key may travel between them).
+fn same_origin(a: &str, b: &str) -> bool {
+    match (url::Url::parse(a), url::Url::parse(b)) {
+        (Ok(a), Ok(b)) => a.origin() == b.origin(),
+        _ => false,
+    }
+}
+
+impl std::fmt::Debug for LlmClientConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        crate::observability::trace_redact::redacted_debug("LlmClientConfig", self, f)
+    }
 }
 
 impl Default for LlmClientConfig {
@@ -598,6 +700,9 @@ impl Default for LlmClientConfig {
             provider_kind: None,
             reasoning_effort: None,
             allow_env_fallback: true,
+            bound_credential: None,
+            private_grants: Vec::new(),
+            guarded_egress: false,
         }
     }
 }
@@ -753,22 +858,7 @@ impl LlmClient {
     /// that accept client-supplied URLs must validate separately (the DAG
     /// compiler and the conversation orchestrator both do).
     pub fn new(config: LlmClientConfig) -> Self {
-        let (client, http_client_init_error) =
-            match crate::core::net::ssrf_protected_client_builder(
-                crate::core::net::HTTP_URL_SCHEMES,
-            )
-            .timeout(Duration::from_millis(config.timeout_ms))
-            .pool_max_idle_per_host(10)
-            .build()
-            {
-                Ok(client) => (Some(client), None),
-                Err(e) => {
-                    let error = format!("failed to build SSRF-protected LLM HTTP client: {e}");
-                    tracing::error!(%error);
-                    (None, Some(error))
-                }
-            };
-
+        let (client, http_client_init_error) = build_http_client(&config);
         let adapter = adapter::select_adapter(&config);
         Self {
             config,
@@ -777,6 +867,28 @@ impl LlmClient {
             adapter,
             histories: Arc::new(RwLock::new(HashMap::new())),
             functions: None,
+        }
+    }
+
+    /// Re-key this client for a CLIENT-chosen target (`core::credentials::ClientKey`): its
+    /// literal key or bound operator credential, no environment fallback, and an HTTP client
+    /// with the connect-time SSRF resolver honouring the key's private grants. Shares the
+    /// histories (a tier of the same conversation).
+    pub fn with_client_key(&self, key: crate::core::credentials::ClientKey) -> Self {
+        let mut config = self.config.clone();
+        config.api_key = key.literal;
+        config.bound_credential = key.bound;
+        config.private_grants = key.private_grants;
+        config.allow_env_fallback = false;
+        config.guarded_egress = true;
+        let (client, http_client_init_error) = build_http_client(&config);
+        Self {
+            adapter: adapter::select_adapter(&config),
+            config,
+            client,
+            http_client_init_error,
+            histories: Arc::clone(&self.histories),
+            functions: self.functions.clone(),
         }
     }
 
@@ -827,6 +939,14 @@ impl LlmClient {
         config.model = model;
         let base_url_overridden = base_url.is_some();
         if let Some(b) = base_url {
+            // The fast tier's key (literal or bound) belongs to the fast tier's ORIGIN: a
+            // reasoning tier on another host must not inherit it — it used to, sending the fast
+            // key to a client-chosen `reasoning_base_url`.
+            if !same_origin(&config.base_url, &b) {
+                config.api_key = None;
+                config.bound_credential = None;
+                config.private_grants = Vec::new();
+            }
             config.base_url = b;
         }
         if let Some(k) = api_key {
@@ -893,6 +1013,7 @@ impl LlmClient {
             self.config.allow_env_fallback && !crate::auth::bud_mode::process_in_bud_mode();
         resolve_llm_api_key(
             per_call,
+            self.config.bound_credential.as_ref(),
             self.config.api_key.as_deref(),
             env_allowed,
             self.adapter.default_env_key(),
@@ -935,6 +1056,11 @@ impl LlmClient {
         let mut req = client
             .post(&rendered.url)
             .header("Content-Type", "application/json");
+        // A whole-request timeout also bounds the body: a streamed reply longer than it is cut
+        // off mid-sentence. Under a stream-idle timeout `complete_streaming` bounds it instead.
+        if !(stream && stream_idle_timeout().is_some()) {
+            req = req.timeout(Duration::from_millis(self.config.timeout_ms));
+        }
         if stream {
             req = req.header("Accept", "text/event-stream");
         }
@@ -1140,7 +1266,10 @@ impl LlmClient {
         }
     }
 
-    #[instrument(skip(self, cancel), fields(model = %self.config.model))]
+    // `api_key` and `input` are never span fields: a span field is printed on EVERY event inside
+    // the span (a WARN from the adapter printed the operator's key at the default log level) and
+    // is exported to OTLP. `input` is the caller's transcript.
+    #[instrument(skip(self, cancel, api_key, input), fields(model = %self.config.model))]
     async fn complete_sync(
         &self,
         session_id: &str,
@@ -1193,7 +1322,8 @@ impl LlmClient {
         })
     }
 
-    #[instrument(skip(self, cancel, on_token), fields(model = %self.config.model))]
+    // See `complete_sync`: never record `api_key` / `input` on the span.
+    #[instrument(skip(self, cancel, on_token, api_key, input), fields(model = %self.config.model))]
     async fn complete_streaming(
         &self,
         session_id: &str,
@@ -1205,10 +1335,27 @@ impl LlmClient {
     ) -> LlmResult<LlmResponse> {
         let messages = self.prepare_messages(session_id, input, staged).await;
         let http_request = self.build_http_request(&messages, true, api_key)?;
+        // Under a stream-idle timeout: `timeout_ms` to the first chunk (a model loading on demand,
+        // a long prefill), then `idle` between chunks, so a reply that keeps streaming is never
+        // cut off. Without one, the request's own whole-request timeout applies.
+        let idle = stream_idle_timeout();
+        let first_by = tokio::time::Instant::now() + Duration::from_millis(self.config.timeout_ms);
+        let first_wait = async {
+            match idle {
+                Some(_) => tokio::time::sleep_until(first_by).await,
+                None => std::future::pending().await,
+            }
+        };
 
         let response = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(LlmError::Cancelled),
+            _ = first_wait => {
+                return Err(self.endpoint_err(format!(
+                    "No response within {} ms",
+                    self.config.timeout_ms
+                )));
+            }
             r = http_request.send() => r.map_err(|e| self.endpoint_err(format!("Request failed: {}", e)))?,
         };
 
@@ -1231,8 +1378,16 @@ impl LlmClient {
 
         let mut byte_buffer: Vec<u8> = Vec::new();
         let mut buffer = String::new();
+        let mut got_chunk = false;
 
         loop {
+            let wait_until = idle.map(|d| {
+                if got_chunk {
+                    tokio::time::Instant::now() + d
+                } else {
+                    first_by
+                }
+            });
             // Honor cancellation promptly so barge-in/teardown stops token
             // accumulation instead of draining the whole upstream response.
             let chunk_result = tokio::select! {
@@ -1241,11 +1396,23 @@ impl LlmClient {
                     debug!("LLM stream cancelled");
                     return Err(LlmError::Cancelled);
                 }
+                _ = async {
+                    match wait_until {
+                        Some(t) => tokio::time::sleep_until(t).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    return Err(self.endpoint_err(match (got_chunk, idle) {
+                        (true, Some(d)) => format!("Stream idle for {} ms", d.as_millis()),
+                        _ => format!("No first token within {} ms", self.config.timeout_ms),
+                    }));
+                }
                 next = stream.next() => match next {
                     Some(c) => c,
                     None => break,
                 }
             };
+            got_chunk = true;
 
             let chunk =
                 chunk_result.map_err(|e| self.endpoint_err(format!("Stream error: {}", e)))?;
@@ -1596,6 +1763,21 @@ pub fn find_utf8_boundary(bytes: &[u8]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A session's own LLM timeout is honoured within 1 s .. the server's ceiling (300 s unless
+    /// `WAAV_LLM_MAX_TIMEOUT_MS` is set); omitted, the default applies.
+    #[test]
+    fn a_session_llm_timeout_is_clamped_to_the_server_ceiling() {
+        if std::env::var_os("WAAV_LLM_MAX_TIMEOUT_MS").is_some()
+            || std::env::var_os("WAAV_LLM_TIMEOUT_MS").is_some()
+        {
+            return; // the operator's environment decides; nothing to assert
+        }
+        assert_eq!(session_timeout_ms(None), 60_000);
+        assert_eq!(session_timeout_ms(Some(120_000)), 120_000);
+        assert_eq!(session_timeout_ms(Some(10)), 1_000);
+        assert_eq!(session_timeout_ms(Some(10_000_000)), 300_000);
+    }
 
     /// B-G1: a mid-session vendor switch shares the SAME histories (the
     /// canonical context is vendor-neutral) while swapping the wire format.
@@ -1950,11 +2132,12 @@ mod frd023_key_tests {
     fn tc_sec_02_no_env_fallback_when_env_is_not_allowed() {
         let reads = RefCell::new(Vec::new());
         assert_eq!(
-            resolve_llm_api_key(None, None, false, "OPENAI_API_KEY", canary(&reads)),
+            resolve_llm_api_key(None, None, None, false, "OPENAI_API_KEY", canary(&reads)),
             None
         );
         assert_eq!(
             resolve_llm_api_key(
+                None,
                 None,
                 Some("${OPENAI_API_KEY}"),
                 false,
@@ -1977,6 +2160,7 @@ mod frd023_key_tests {
             resolve_llm_api_key(
                 Some("bud_caller"),
                 None,
+                None,
                 false,
                 "OPENAI_API_KEY",
                 canary(&reads)
@@ -1986,6 +2170,7 @@ mod frd023_key_tests {
         );
         assert_eq!(
             resolve_llm_api_key(
+                None,
                 None,
                 Some("literal"),
                 false,
@@ -2002,7 +2187,8 @@ mod frd023_key_tests {
     fn standalone_mode_keeps_its_env_fallback() {
         let reads = RefCell::new(Vec::new());
         assert_eq!(
-            resolve_llm_api_key(None, None, true, "OPENAI_API_KEY", canary(&reads)).as_deref(),
+            resolve_llm_api_key(None, None, None, true, "OPENAI_API_KEY", canary(&reads))
+                .as_deref(),
             Some("sk-canary")
         );
         assert_eq!(reads.borrow().as_slice(), ["OPENAI_API_KEY".to_string()]);

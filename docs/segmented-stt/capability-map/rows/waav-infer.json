@@ -69,7 +69,7 @@
           },
           "gateway_client": {
             "status": "not_implemented",
-            "code_ref": "stub: gateway/src/core/stt/infer.rs:59-65 (connect always errors), :38 (default address ws://127.0.0.1:8123/v1/realtime); engine socket: waav-infer/crates/waav-infer-server/src/ws.rs:644-851, :1324-1372",
+            "code_ref": "stub: gateway/src/core/stt/infer.rs:59-65 (connect always errors), :38 (default address ws://127.0.0.1:8080/v1/ws); engine socket: waav-infer/crates/waav-infer-server/src/ws.rs:644-851, :1324-1372",
             "notes": "The engine serves GET /v1/ws on port 8080; the stub's default address names port 8123 and path /v1/realtime, which the engine does not serve. Binary frames are appended to a buffer (ws.rs:837); on a finalize frame the whole buffer is decoded, resampled and transcribed in one call (ws.rs:1338) and exactly one final transcript is sent. A per-session language or key terms are rejected at the handshake (ws.rs:373-401). The socket closes after 30 seconds idle, at most 64 sessions are open at once, and a session may hold at most 100 MiB of audio (lib.rs:157-160); the 100 MiB figure is recorded here as the upload limit. The adapter is deliberately absent from the plugin registry (gateway/src/plugin/builtin/mod.rs:2096-2130)."
           }
         }
@@ -185,7 +185,8 @@
           },
           "quality_signals": [],
           "dialect": {
-            "language_param": null,
+            "language_param": "languages",
+            "language_shape": "list",
             "language_format": "iso639_1",
             "context_params": [],
             "response_formats": [
@@ -199,7 +200,7 @@
           "gateway_client": {
             "status": "not_implemented",
             "code_ref": "engine route: waav-infer/crates/waav-infer-server/src/lib.rs:1598-1765 (POST /v1/audio/transcriptions); gateway request code to extract: gateway/src/handlers/transcribe.rs:769-814 and :947-1027",
-            "notes": "Request restrictions enforced by the engine, each answered with HTTP 400 (unsupported_param): a non-empty language or prompt (lib.rs:1564-1574, :1663-1676); any response_format other than json or text, so verbose_json fails (lib.rs:1704-1715); any temperature other than 0 (lib.rs:1576-1596). The model field must be empty or name the loaded family, otherwise model_not_found (lib.rs:1647-1662; engine.rs:2750-2764). Unknown fields such as stream are read and ignored. The response is {\"text\": ...} only: no timestamps, no confidence, no detected language. Send 16 kHz audio, because the engine otherwise resamples linearly. Limits are the engine defaults (lib.rs:144-166, :48): 100 MiB upload, 64 concurrent requests, a 2 second wait for admission and then HTTP 429 with code admission_rejected, a 30 second deadline per request. A 429 from the engine is load shedding and must not count as a failure for the circuit breaker (gateway/src/core/resilience/infer_reject.rs). Concurrent uploads are folded into one batched forward pass of up to 24 clips with no added delay (waav-infer-server/src/stt_coalescer.rs:26-33, :142-145). The engine binds loopback with no authentication by default and serves one speech-to-text model per process."
+            "notes": "Languages go as the OpenAI gpt-transcribe list, languages[] once per language: the session language alone when it is known, else the deployment's expected languages. An engine with the October 2026 language fix forces a single entry and restricts language detection to several (waav-infer-server/src/lib.rs stt_language_options); an older engine reads and ignores the field, so one gateway works against both. This row never sends the singular language field, which an older engine answers with HTTP 400. The restrictions below describe the older engine. Request restrictions enforced by the engine, each answered with HTTP 400 (unsupported_param): a non-empty language or prompt (lib.rs:1564-1574, :1663-1676); any response_format other than json or text, so verbose_json fails (lib.rs:1704-1715); any temperature other than 0 (lib.rs:1576-1596). The model field must be empty or name the loaded family, otherwise model_not_found (lib.rs:1647-1662; engine.rs:2750-2764). Unknown fields such as stream are read and ignored. The response is {\"text\": ...} only: no timestamps, no confidence, no detected language. Send 16 kHz audio, because the engine otherwise resamples linearly. Limits are the engine defaults (lib.rs:144-166, :48): 100 MiB upload, 64 concurrent requests, a 2 second wait for admission and then HTTP 429 with code admission_rejected, a 30 second deadline per request. A 429 from the engine is load shedding and must not count as a failure for the circuit breaker (gateway/src/core/resilience/infer_reject.rs). Concurrent uploads are folded into one batched forward pass of up to 24 clips with no added delay (waav-infer-server/src/stt_coalescer.rs:26-33, :142-145). The engine binds loopback with no authentication by default and serves one speech-to-text model per process."
           },
           "file_request_mode": "sync"
         },
@@ -237,7 +238,7 @@
           },
           "gateway_client": {
             "status": "not_implemented",
-            "code_ref": "stub: gateway/src/core/stt/infer.rs:59-65 (connect always errors), :38 (default address ws://127.0.0.1:8123/v1/realtime); engine socket: waav-infer/crates/waav-infer-server/src/ws.rs:644-851, :1324-1372",
+            "code_ref": "stub: gateway/src/core/stt/infer.rs:59-65 (connect always errors), :38 (default address ws://127.0.0.1:8080/v1/ws); engine socket: waav-infer/crates/waav-infer-server/src/ws.rs:644-851, :1324-1372",
             "notes": "The engine serves GET /v1/ws on port 8080; the stub's default address names port 8123 and path /v1/realtime, which the engine does not serve. Binary frames are appended to a buffer (ws.rs:837); on a finalize frame the whole buffer is decoded, resampled and transcribed in one call (ws.rs:1338) and exactly one final transcript is sent. A per-session language or key terms are rejected at the handshake (ws.rs:373-401). The socket closes after 30 seconds idle, at most 64 sessions are open at once, and a session may hold at most 100 MiB of audio (lib.rs:157-160); the 100 MiB figure is recorded here as the upload limit. The adapter is deliberately absent from the plugin registry (gateway/src/plugin/builtin/mod.rs:2096-2130)."
           }
         }
@@ -288,7 +289,7 @@
           "transports[0].upload.accepted (the engine decodes any container its decoder library supports; only WAV is relied on)",
           "billing.min_billed_ms (no vendor meters the engine; Bud's own price for the deployment decides what the customer pays)"
         ],
-        "notes": "Verified by reading the engine and gateway source on 2026-10-03. Whisper family: the family id whisper, and any id starting with whisper (such as whisper-1 or whisper-large-v3) when a Whisper model is loaded (engine.rs:2750-2764). The engine pads every clip to a 30 second window (waav-infer-components/src/mel.rs:79-82) and cuts longer audio at hard 30 second boundaries (waav-infer-core/src/stt/whisper.rs:277-291), so the gateway must split at a pause and must not raise its 25 second segment cap. Each call costs a full 30 second encoder pass whatever the clip length. The language comes from the model directory only; it cannot be set per request."
+        "notes": "Verified by reading the engine and gateway source on 2026-10-03. Whisper family: the family id whisper, and any id starting with whisper (such as whisper-1 or whisper-large-v3) when a Whisper model is loaded (engine.rs:2750-2764). The engine pads every clip to a 30 second window (waav-infer-components/src/mel.rs:79-82) and cuts longer audio at hard 30 second boundaries (waav-infer-core/src/stt/whisper.rs:277-291), so the gateway must split at a pause and must not raise its 25 second segment cap. Each call costs a full 30 second encoder pass whatever the clip length. Per-request language uses the languages[] list (see the file transport). Detection on short turns is unreliable for small Whisper models (an unsure model guesses English and translates), so deployments should set expected_languages."
       }
     },
     {
@@ -406,7 +407,7 @@
           },
           "gateway_client": {
             "status": "not_implemented",
-            "code_ref": "stub: gateway/src/core/stt/infer.rs:59-65 (connect always errors), :38 (default address ws://127.0.0.1:8123/v1/realtime); engine socket: waav-infer/crates/waav-infer-server/src/ws.rs:644-851, :1324-1372",
+            "code_ref": "stub: gateway/src/core/stt/infer.rs:59-65 (connect always errors), :38 (default address ws://127.0.0.1:8080/v1/ws); engine socket: waav-infer/crates/waav-infer-server/src/ws.rs:644-851, :1324-1372",
             "notes": "The engine serves GET /v1/ws on port 8080; the stub's default address names port 8123 and path /v1/realtime, which the engine does not serve. Binary frames are appended to a buffer (ws.rs:837); on a finalize frame the whole buffer is decoded, resampled and transcribed in one call (ws.rs:1338) and exactly one final transcript is sent. A per-session language or key terms are rejected at the handshake (ws.rs:373-401). The socket closes after 30 seconds idle, at most 64 sessions are open at once, and a session may hold at most 100 MiB of audio (lib.rs:157-160); the 100 MiB figure is recorded here as the upload limit. The adapter is deliberately absent from the plugin registry (gateway/src/plugin/builtin/mod.rs:2096-2130)."
           }
         }
@@ -565,7 +566,7 @@
           },
           "gateway_client": {
             "status": "not_implemented",
-            "code_ref": "stub: gateway/src/core/stt/infer.rs:59-65 (connect always errors), :38 (default address ws://127.0.0.1:8123/v1/realtime); engine socket: waav-infer/crates/waav-infer-server/src/ws.rs:644-851, :1324-1372",
+            "code_ref": "stub: gateway/src/core/stt/infer.rs:59-65 (connect always errors), :38 (default address ws://127.0.0.1:8080/v1/ws); engine socket: waav-infer/crates/waav-infer-server/src/ws.rs:644-851, :1324-1372",
             "notes": "The engine serves GET /v1/ws on port 8080; the stub's default address names port 8123 and path /v1/realtime, which the engine does not serve. Binary frames are appended to a buffer (ws.rs:837); on a finalize frame the whole buffer is decoded, resampled and transcribed in one call (ws.rs:1338) and exactly one final transcript is sent. A per-session language or key terms are rejected at the handshake (ws.rs:373-401). The socket closes after 30 seconds idle, at most 64 sessions are open at once, and a session may hold at most 100 MiB of audio (lib.rs:157-160); the 100 MiB figure is recorded here as the upload limit. The adapter is deliberately absent from the plugin registry (gateway/src/plugin/builtin/mod.rs:2096-2130)."
           }
         }

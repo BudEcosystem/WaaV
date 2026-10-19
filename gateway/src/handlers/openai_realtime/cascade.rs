@@ -1241,6 +1241,16 @@ impl CascadeGa {
                     None,
                 ));
             }
+            OutgoingMessage::DagError { code, message, .. } => {
+                out.push(super::policy::error_event(
+                    &next_event_id(),
+                    error_kind(code),
+                    code,
+                    message,
+                    None,
+                    None,
+                ));
+            }
             OutgoingMessage::Error { message } => {
                 // Leg refusals and setup failures are `code: message`.
                 let (code, text) = match message.split_once(": ") {

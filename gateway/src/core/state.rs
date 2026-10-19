@@ -191,6 +191,16 @@ impl CoreState {
             );
         }
         tracing::info!(stt_live = ?stt_live, "segmented speech-to-text configured");
+        if stt_live.rollout.mode == waav_segmented_stt::rollout::SwitchMode::Allowlist
+            && stt_live.rollout.allowlist.is_empty()
+        {
+            tracing::warn!(
+                "segmented speech-to-text: WAAV_SEGMENTED_STT is `allowlist` (the default) and \
+                 WAAV_SEGMENTED_STT_ALLOWLIST is empty, so no deployment and no voice agent is \
+                 covered; only standalone sessions that ask for transcription_mode \"segmented\" \
+                 get it. Set WAAV_SEGMENTED_STT=on to cover every session, or list deployments."
+            );
+        }
 
         Ok(Arc::new(Self {
             tts_req_managers: Arc::new(RwLock::new(tts_req_managers)),

@@ -121,7 +121,8 @@ Delegated validation with external auth service for advanced use cases.
    - Extracts and validates Authorization header format
    - **API Secret Mode**: Direct token comparison with configured secret list; matched id stored in `AuthContext`
    - **JWT Mode**: Buffers request body/headers and calls AuthClient
-   - Priority: API secret checked first if configured
+   - Priority: API secret checked first if configured; any other bearer then goes to the auth
+     responder (`AUTH_MODE=chain`, the default — see [Can I Use Both?](#can-i-use-both))
 
 2. **Server Config** (`src/config.rs`)
    - Loads authentication configuration from YAML and environment variables
@@ -266,7 +267,8 @@ Your external authentication service must:
 2. Verify JWT signature using the public key
 3. Validate the bearer token in the JWT payload
 4. Return:
-   - `200 OK` if token is valid
+   - `200 OK` with a JSON body naming the caller, e.g. `{"id": "tenant-a"}`, if the token is valid.
+     The identity is required (see [Response Format](#response-format)).
    - `401 Unauthorized` if token is invalid
    - Any other status code for errors
 
@@ -291,7 +293,8 @@ app.post('/auth', express.text(), (req, res) => {
     const isValid = validateToken(payload.token);
 
     if (isValid) {
-      res.status(200).send('OK');
+      // Name the caller: WaaV refuses a 200 without an identity.
+      res.status(200).json({ id: tenantIdFor(payload.token) });
     } else {
       res.status(401).send('Invalid token');
     }
@@ -555,8 +558,14 @@ The auth service should return:
 
 1. **Success (200 OK)**
    - Status: `200 OK`
-   - Body: Optional (ignored by WaaV Gateway)
-   - Meaning: Token is valid, allow the request
+   - Body: **required** JSON object naming the caller under `id` (also accepted, in this order:
+     `tenant_id`, `project_id`, `user_id`, `sub`) — a non-empty string of at most 256 characters.
+     It becomes the session's `auth_id`: the prefix of its LiveKit rooms and recordings.
+   - Meaning: Token is valid, allow the request as that identity
+   - A `200` whose body names nobody (`{}`, `OK`, empty, not JSON) is refused with
+     `502 auth_service_error`: the responder admitted someone without saying who. Set
+     `AUTH_RESPONDER_REQUIRE_IDENTITY=false` only to keep a legacy responder working while it is
+     fixed; such callers are admitted anonymously, with no tenant isolation.
 
 2. **Unauthorized (401)**
    - Status: `401 Unauthorized`
@@ -606,7 +615,7 @@ def verify_auth_request(jwt_string, public_key):
         if auth_data['request_path'] == '/admin' and not is_admin(bearer_token):
             return 401, "Insufficient permissions"
 
-        return 200, "OK"
+        return 200, json.dumps({"id": tenant_id_for(bearer_token)})
 
     except jwt.InvalidSignatureError:
         return 401, "Invalid JWT signature"
@@ -822,7 +831,11 @@ Use this decision guide to select the right authentication method:
 ### Can I Use Both?
 Yes! Both methods can coexist:
 - Configure both `AUTH_API_SECRETS_JSON` (or legacy `AUTH_API_SECRET`) and `AUTH_SERVICE_URL`
-- API Secret is checked first (takes priority)
+- `AUTH_MODE=chain` (the default): a bearer that matches an API secret is admitted as that
+  secret's id; **any other bearer is sent to the auth responder**
+- `AUTH_MODE=api_secret`: secrets only (the responder is never called; startup WARN)
+- `AUTH_MODE=responder`: responder only (secrets are never matched; startup WARN)
+- The gateway logs the effective chain at startup
 - Useful for: admin access via secret + user access via JWT
 
 ## Alternative Approaches Comparison

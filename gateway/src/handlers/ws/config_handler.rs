@@ -58,6 +58,24 @@ const LIVEKIT_POLL_INTERVAL_MS: u64 = 100;
 /// Lock timeout for LiveKit operations (in milliseconds)
 const LIVEKIT_LOCK_TIMEOUT_MS: u64 = 100;
 
+/// A setup step that fails after the session committed its stream id (from then on a second config
+/// is refused) leaves a session that can never become what it asked to be, still holding what it
+/// opened: provider streams, a LiveKit room. (A refused LLM credential or a DAG that cannot run
+/// used to leave a silent speech-to-text-only session.) Its cause has already gone to the client as an `error`; close with 1011
+/// so the client stops waiting for `ready` (it reconnects to retry) and the teardown releases what
+/// was opened. Before this, the socket stayed open and silent.
+async fn close_after_failed_setup(message_tx: &mpsc::Sender<MessageRoute>, reason: &str) -> bool {
+    send_critical(
+        message_tx,
+        MessageRoute::CloseWith {
+            code: 1011,
+            reason: reason.to_string(),
+        },
+    )
+    .await;
+    false
+}
+
 async fn send_critical(message_tx: &mpsc::Sender<MessageRoute>, route: MessageRoute) {
     send_with_policy(message_tx, route, MessageClass::Critical).await;
 }
@@ -87,6 +105,90 @@ async fn send_config_warning(
         }),
     )
     .await;
+}
+
+/// RCA 2e: whether the denoiser can take a session's uplink — mono 16-bit PCM, as the client
+/// sends it or as the gateway decodes it from opus.
+#[cfg(feature = "noise-filter")]
+fn uplink_is_mono_pcm16(
+    stt: &STTWebSocketConfig,
+    uplink: &crate::core::audio::CodecNegotiation,
+) -> bool {
+    stt.channels == 1
+        && (uplink.effective == crate::core::audio::AudioCodec::Opus
+            || crate::core::tts::sniff::is_linear_pcm16(&stt.encoding.to_ascii_lowercase()))
+}
+
+/// RCA 2e: the session's uplink denoiser, when `stt_config.noise_suppression` asks for one. A
+/// session the denoiser cannot serve (its audio format, or no stream free on the server) is told
+/// in a `config_warning` and goes on unfiltered: noise suppression never fails a session.
+#[cfg(feature = "noise-filter")]
+async fn open_uplink_denoiser(
+    stt: &STTWebSocketConfig,
+    uplink: &crate::core::audio::CodecNegotiation,
+    message_tx: &mpsc::Sender<MessageRoute>,
+) -> Option<Arc<crate::utils::noise_filter::StreamDenoiser>> {
+    if stt.noise_suppression != Some(true) {
+        return None;
+    }
+    if !uplink_is_mono_pcm16(stt, uplink) {
+        crate::core::metrics::bridge::record_degraded("ws", "noise_filter_format");
+        send_config_warning(
+            message_tx,
+            "noise_suppression_unsupported",
+            format!(
+                "noise_suppression needs mono linear16 (or opus) audio; this session sends {} \
+                 with {} channel(s), and its audio is not filtered",
+                stt.encoding, stt.channels
+            ),
+            None,
+        )
+        .await;
+        return None;
+    }
+    match crate::utils::noise_filter::StreamDenoiser::open(stt.sample_rate).await {
+        Ok(denoiser) => {
+            info!(
+                sample_rate = stt.sample_rate,
+                "/ws uplink noise filter active"
+            );
+            Some(Arc::new(denoiser))
+        }
+        Err(e) => {
+            warn!("/ws uplink noise filter unavailable: {e}");
+            crate::core::metrics::bridge::record_degraded("ws", "noise_filter_unavailable");
+            send_config_warning(
+                message_tx,
+                "noise_suppression_unavailable",
+                format!(
+                    "noise_suppression could not start ({e}); the session's audio is not filtered"
+                ),
+                None,
+            )
+            .await;
+            None
+        }
+    }
+}
+
+/// RCA 2e: a build without the `noise-filter` feature says so to a session that asks for
+/// `noise_suppression`, rather than leaving it to think its audio was filtered.
+#[cfg(not(feature = "noise-filter"))]
+async fn warn_uplink_denoiser_not_built(
+    stt: &STTWebSocketConfig,
+    message_tx: &mpsc::Sender<MessageRoute>,
+) {
+    if stt.noise_suppression == Some(true) {
+        crate::core::metrics::bridge::record_degraded("ws", "noise_filter_not_built");
+        send_config_warning(
+            message_tx,
+            "noise_suppression_unavailable",
+            "noise_suppression was asked for, but this gateway build does not include the \
+             noise-filter feature; the session's audio is not filtered",
+            None,
+        )
+        .await;
+    }
 }
 
 /// Resolve the stream identifier for the current session
@@ -517,9 +619,20 @@ pub async fn handle_config_message(
                     }
                 };
 
+                // RCA 2e: the uplink's denoiser, opened before the state lock is taken (its
+                // model loads on a thread of its own).
+                #[cfg(feature = "noise-filter")]
+                let denoiser = open_uplink_denoiser(stt_config, &uplink_codec, message_tx).await;
+                #[cfg(not(feature = "noise-filter"))]
+                warn_uplink_denoiser_not_built(stt_config, message_tx).await;
+
                 // Store in connection state
                 let mut state_guard = state.write().await;
                 state_guard.voice_manager = Some(vm.clone());
+                #[cfg(feature = "noise-filter")]
+                {
+                    state_guard.denoiser = denoiser;
+                }
 
                 // D8: build the uplink opus decoder for an opus-negotiated session and stash it on
                 // the connection state, so the audio hot path decodes each WS binary frame to PCM16
@@ -561,7 +674,7 @@ pub async fn handle_config_message(
                 }
                 Some(vm)
             }
-            None => return true,
+            None => return close_after_failed_setup(message_tx, "voice_setup_failed").await,
         }
     } else {
         info!("Audio processing disabled - skipping voice manager initialization");
@@ -649,7 +762,7 @@ pub async fn handle_config_message(
                     state_guard.recording_egress_id = egress_id;
                     (Some(client), Some(room_name), Some(identity), Some(name))
                 }
-                None => return true,
+                None => return close_after_failed_setup(message_tx, "livekit_setup_failed").await,
             }
         } else {
             (None, None, None, None)
@@ -723,7 +836,10 @@ pub async fn handle_config_message(
             Err(e) => {
                 error!("DAG routing initialization failed: {}", e);
                 send_error(message_tx, format!("DAG initialization failed: {}", e)).await;
-                false
+                // The session asked for a DAG it cannot run (a refused credential, a graph that does
+                // not compile); carrying on without it would look like a working agent that never
+                // answers.
+                return close_after_failed_setup(message_tx, "dag_setup_failed").await;
             }
         }
     } else {
@@ -829,7 +945,8 @@ pub async fn handle_config_message(
                     format!("Conversation loop initialization failed: {}", e),
                 )
                 .await;
-                false
+                // As for a DAG: no silent speech-to-text-only session in place of the agent asked for.
+                return close_after_failed_setup(message_tx, "conversation_setup_failed").await;
             }
         }
     } else {
@@ -955,6 +1072,13 @@ pub(crate) fn bud_mode_config_refusal(
         }
         if conv.reasoning_api_key.is_some() {
             fields.push("reasoning_api_key");
+        }
+        // Standalone operator credentials are not a Bud-mode concept either.
+        if conv.credential_ref.is_some() {
+            fields.push("credential_ref");
+        }
+        if conv.reasoning_credential_ref.is_some() {
+            fields.push("reasoning_credential_ref");
         }
         if !fields.is_empty() {
             return Some(format!(
@@ -3427,7 +3551,20 @@ async fn initialize_dag_routing(
     // Get DAG definition from template or inline
     let mut dag_definition: DAGDefinition = if let Some(ref def) = dag_config.definition {
         // Parse inline definition
-        serde_json::from_value(def.clone()).map_err(|e| format!("Invalid DAG definition: {}", e))?
+        let parsed: DAGDefinition = serde_json::from_value(def.clone())
+            .map_err(|e| format!("Invalid DAG definition: {}", e))?;
+        // The config carries the definition as raw JSON, so the config-wide lint cannot see inside
+        // it: a misspelled node key (`voice_ID`) was silently ignored. Lint it now it is parsed.
+        if let Ok(accepted) = serde_json::to_value(&parsed) {
+            super::config_lint::warn_unknown_keys_under(
+                "dag_config.definition",
+                def,
+                &accepted,
+                message_tx,
+            )
+            .await;
+        }
+        parsed
     } else if let Some(ref template_name) = dag_config.template {
         // Load from template registry
         let templates = global_templates();
@@ -3445,6 +3582,17 @@ async fn initialize_dag_routing(
         bind_bud_dag(app_state, state, message_tx, &mut dag_definition, stream_id).await?;
     }
 
+    // A graph that ends in a `tts_provider` (`stt → llm → tts`) is meant to be heard: its
+    // speech is routed to the session as if it had named an `audio_output`.
+    let routed = dag_definition.route_unread_speech();
+    if !routed.is_empty() {
+        info!(
+            dag_id = %dag_definition.id,
+            added = ?routed,
+            "Routed unread DAG speech to the session"
+        );
+    }
+
     info!(
         dag_id = %dag_definition.id,
         dag_name = %dag_definition.name,
@@ -3453,8 +3601,14 @@ async fn initialize_dag_routing(
         "Compiling DAG for session"
     );
 
-    // Compile the DAG
-    let compiler = DAGCompiler::new();
+    // Compile the DAG. An inline definition is CLIENT input (no environment reads; credential
+    // references must name an operator credential bound to the node's host); a template is the
+    // operator's.
+    let compiler = if dag_config.definition.is_some() {
+        DAGCompiler::new()
+    } else {
+        DAGCompiler::for_operator_template()
+    };
     let compiled_dag = compiler
         .compile(dag_definition)
         .map_err(|e| format!("DAG compilation failed: {}", e))?;
@@ -3476,14 +3630,15 @@ async fn initialize_dag_routing(
             conn_state.auth.id.clone(),
         )
     };
-    let dag_context = if let Some(timeout_ms) = dag_config.timeout_ms {
-        dag_context.with_timeout(std::time::Duration::from_millis(timeout_ms))
-    } else {
-        dag_context
-    };
+    // `timeout_ms` bounds each TURN: its deadline is set when the turn starts (the
+    // StreamDriver), never here — a deadline fixed at configuration time expired
+    // `timeout_ms` after the session began and failed every later turn before it ran.
+    let turn_timeout = dag_config.timeout_ms.map(Duration::from_millis);
 
-    // Create executor (decoupled from the DAG; uses the DAG at execute time).
-    let executor = Arc::new(DAGExecutor::new());
+    // Create executor (decoupled from the DAG; uses the DAG at execute time). A node without
+    // its own `timeout_ms` gets the operator's `dag_timeouts.node_execution_secs`.
+    let node_secs = app_state.config.dag_timeouts.node_execution_secs.max(1);
+    let executor = Arc::new(DAGExecutor::new().with_timeout(Duration::from_secs(node_secs)));
 
     // ── Output sink + drain task (W-O1) ─────────────────────────────────────────
     // Output nodes push `DagOutput`s here; the drain task maps them to LiveKit / WS.
@@ -3551,6 +3706,21 @@ async fn initialize_dag_routing(
                             None, // DAG sessions: chunking knob rides the conversation path only (carrier gap noted)
                         )
                         .await;
+                        // The utterance's last audio: tell the client, as a plain session's
+                        // TTS completion does.
+                        if audio.is_final {
+                            let timestamp = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_millis() as u64)
+                                .unwrap_or(0);
+                            send_critical(
+                                &message_tx,
+                                MessageRoute::Outgoing(OutgoingMessage::TTSPlaybackComplete {
+                                    timestamp,
+                                }),
+                            )
+                            .await;
+                        }
                     }
                     DagOutput::Text(text) => {
                         // Deliver DAG text output (e.g. an LLM response routed to a
@@ -3603,6 +3773,7 @@ async fn initialize_dag_routing(
             executor,
             dag_context,
             post_stt_node_id,
+            turn_timeout,
             message_tx,
             profiler,
         )
@@ -3613,6 +3784,47 @@ async fn initialize_dag_routing(
 
     info!(stream_id = %stream_id, "DAG routing enabled");
     Ok(true)
+}
+
+/// The client's `error` for a failed DAG turn, naming the node that failed it.
+#[cfg(feature = "dag-routing")]
+fn dag_turn_error(
+    dag: &crate::dag::compiler::CompiledDAG,
+    failed: Option<crate::dag::FailedNode>,
+    error: &crate::dag::DAGError,
+) -> MessageRoute {
+    let timeout = matches!(error, crate::dag::DAGError::ExecutionTimeout(_));
+    // The streaming executor wraps a node's error as `NodeExecutionError`; the message below names
+    // the node itself, so use the node's own words ("… failed: TTS provider 'openai' error: …").
+    let error: &dyn std::fmt::Display = match error {
+        crate::dag::DAGError::NodeExecutionError { error, .. } if failed.is_some() => error,
+        other => other,
+    };
+    let (code, message) = match &failed {
+        Some(node) if timeout => (
+            "dag_node_timeout",
+            format!(
+                "DAG node '{}' ({}) timed out: {error}",
+                node.id, node.node_type
+            ),
+        ),
+        Some(node) => (
+            "dag_node_failed",
+            format!(
+                "DAG node '{}' ({}) failed: {error}",
+                node.id, node.node_type
+            ),
+        ),
+        None if timeout => ("dag_turn_timeout", format!("DAG turn timed out: {error}")),
+        None => ("dag_node_failed", format!("DAG turn failed: {error}")),
+    };
+    MessageRoute::Outgoing(OutgoingMessage::DagError {
+        message,
+        code: code.to_string(),
+        dag_id: dag.definition.id.clone(),
+        node_id: failed.as_ref().map(|node| node.id.clone()),
+        node_type: failed.map(|node| node.node_type),
+    })
 }
 
 /// Find the node directly downstream of the STT provider node (the "post-STT" node),
@@ -3639,13 +3851,38 @@ fn find_post_stt_node(dag: &crate::dag::compiler::CompiledDAG) -> String {
     dag.graph[dag.entry].id.clone()
 }
 
+/// The DAG turn in flight on a session: its cancel token and its task.
+#[cfg(feature = "dag-routing")]
+struct RunningDagTurn {
+    cancel: tokio_util::sync::CancellationToken,
+    task: tokio::task::JoinHandle<()>,
+}
+
+/// Cancel the session's DAG turn if it is still running. `true` when one was.
+#[cfg(feature = "dag-routing")]
+fn cancel_running_dag_turn(running: &std::sync::Mutex<Option<RunningDagTurn>>) -> bool {
+    let taken = running.lock().unwrap_or_else(|p| p.into_inner()).take();
+    match taken {
+        Some(turn) if !turn.task.is_finished() => {
+            turn.cancel.cancel();
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Register the StreamDriver: on each finalized STT turn, run the compiled DAG once
 /// starting at the post-STT node, feeding it the transcript as an `STTResult`.
 ///
-/// A fresh per-turn `DAGContext` is derived from the template (carrying the same
-/// `stream_id`, auth, deadline and output sink) so per-turn node results don't leak
-/// across turns, while the LLM node's per-`stream_id` conversation history is
-/// preserved across turns.
+/// Each turn runs as its OWN task with a per-turn child of the session's cancel token, so the STT
+/// callback returns at once and the caller's next words are heard while the bot answers: a barge-in
+/// (the caller speaks while a turn runs) cancels the turn — its in-flight LLM/TTS calls are dropped —
+/// and clears queued TTS audio, as the conversation path does; a newer finished turn supersedes an
+/// older one still running. The turn runs on the streaming executor, so the TTS node starts speaking
+/// the LLM's first sentence while later ones are generated (graphs with a join fall back to the batch
+/// executor). A fresh per-turn `DAGContext` is derived from the template (carrying the same
+/// `stream_id`, auth and output sink) so per-turn node results don't leak across turns, while the
+/// LLM node's per-`stream_id` conversation history is preserved.
 #[cfg(feature = "dag-routing")]
 #[allow(clippy::too_many_arguments)]
 async fn register_dag_stream_driver(
@@ -3654,21 +3891,37 @@ async fn register_dag_stream_driver(
     executor: Arc<DAGExecutor>,
     ctx_template: DAGContext,
     post_stt_node_id: String,
+    turn_timeout: Option<Duration>,
     message_tx: &mpsc::Sender<MessageRoute>,
     profiler: Arc<crate::core::observability::LatencyProfiler>,
 ) {
     let message_tx = message_tx.clone();
-    // A-G0: the DAG session drives turn policy through the same controller
-    // spine as the conversation path (legacy set = previous inline gate).
-    // The controller's turn_id keys the TurnTrace (A11 partial: one id per
-    // turn across policy + profiling on this path).
-    let turn_controller = Arc::new(crate::core::turn::TurnController::new(
-        vec![Box::new(crate::core::turn::strategies::AnySpeechStart)],
-        vec![Box::new(
-            crate::core::turn::strategies::LegacySpeechFinalStop,
-        )],
-        vec![],
-    ));
+    let running: Arc<std::sync::Mutex<Option<RunningDagTurn>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    // Weak: the callback is stored on the voice manager itself.
+    let vm_weak = Arc::downgrade(voice_manager);
+    // A-G0: the DAG session drives turn policy through the same controller spine as the
+    // conversation path. The bot is "busy" while a DAG turn runs or the voice manager's playout
+    // estimate says it is audibly speaking, so a caller who starts talking then is a barge-in.
+    let probe_running = running.clone();
+    let probe_vm = vm_weak.clone();
+    let turn_controller = Arc::new(
+        crate::core::turn::TurnController::new(
+            vec![Box::new(crate::core::turn::strategies::AnySpeechStart)],
+            vec![Box::new(
+                crate::core::turn::strategies::LegacySpeechFinalStop,
+            )],
+            vec![],
+        )
+        .with_bot_speaking_probe(move || {
+            probe_running
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .as_ref()
+                .is_some_and(|t| !t.task.is_finished())
+                || probe_vm.upgrade().is_some_and(|vm| vm.is_bot_speaking())
+        }),
+    );
     let result = voice_manager
         .on_stt_result(move |stt: STTResult| {
             let compiled_dag = compiled_dag.clone();
@@ -3678,6 +3931,8 @@ async fn register_dag_stream_driver(
             let message_tx = message_tx.clone();
             let profiler = profiler.clone();
             let turn_controller = turn_controller.clone();
+            let running = running.clone();
+            let vm_weak = vm_weak.clone();
 
             Box::pin(async move {
                 // Transcript egress: the DAG path REPLACES the simple-path STT callback
@@ -3700,9 +3955,6 @@ async fn register_dag_stream_driver(
                 )
                 .await;
 
-                // Turn policy via the controller (legacy set ≡ the previous
-                // inline `is_speech_final && !empty` gate); the DAG runs on
-                // the Stopped event, keyed by the controller's turn_id.
                 let signal = if stt.is_final || stt.is_speech_final {
                     crate::core::turn::ControllerSignal::SttFinal {
                         // Turn policy sees the FULL segment; client egress
@@ -3718,35 +3970,42 @@ async fn register_dag_stream_driver(
                     }
                 };
                 let events = turn_controller.feed(&signal);
+
+                // Barge-in: the caller spoke while the bot was busy. Stop the running turn (its
+                // in-flight LLM/TTS calls are dropped) and clear audio the session still holds.
+                let barge_in = events.iter().any(|e| {
+                    matches!(
+                        e,
+                        crate::core::turn::TurnEvent::Started {
+                            interrupt: true,
+                            ..
+                        } | crate::core::turn::TurnEvent::BargeInMopUp
+                    )
+                });
+                if barge_in {
+                    let cancelled = cancel_running_dag_turn(&running);
+                    if let Some(vm) = vm_weak.upgrade()
+                        && let Err(e) = vm.clear_tts().await
+                    {
+                        warn!(error = %e, "StreamDriver: clear_tts during barge-in failed");
+                    }
+                    debug!(cancelled, "StreamDriver: barge-in");
+                }
+
                 let Some((turn_id, turn_transcript)) = events.into_iter().find_map(|e| match e {
                     crate::core::turn::TurnEvent::Stopped {
                         turn_id,
                         transcript,
                     } => Some((turn_id, transcript)),
-                    // Started/barge-in has no DAG-side action today. ROOT
-                    // CAUSE (traced, review wc023gbbz#1): DAG turns execute
-                    // SERIALLY — the STT provider's result-forwarding loop
-                    // (`while recv { callback(result).await }`,
-                    // e.g. stt/deepgram.rs:1109) awaits THIS callback, whose
-                    // `executor.execute_from(..).await` below runs the whole
-                    // turn. So a barge-in's STT result QUEUES behind the
-                    // in-flight turn and this `Started` cannot even fire until
-                    // the prior turn's response completes (≤ its done/30s).
-                    // A persistent S2S node (B-G2) therefore streams its full
-                    // response before barge-in is processed. Closing this is
-                    // NOT the naive "fire ctx.cancel_token here" (the event
-                    // never arrives mid-turn, and clone_for_branch SHARES the
-                    // token so cancelling it poisons the session template): it
-                    // needs the turn to run as a SPAWNED, per-turn-child-token
-                    // cancellable task so the next Started can cancel it — an
-                    // architectural change affecting ALL DAG paths (LLM/TTS
-                    // too), out of scope for the B-G2 wiring. Cascade/
-                    // conversation path handles barge-in in its orchestrator,
-                    // not here.
                     _ => None,
                 }) else {
                     return;
                 };
+
+                // A newer finished turn supersedes one still answering.
+                if cancel_running_dag_turn(&running) {
+                    debug!("StreamDriver: superseded the previous DAG turn");
+                }
 
                 debug!(
                     transcript = %turn_transcript,
@@ -3754,8 +4013,16 @@ async fn register_dag_stream_driver(
                     "StreamDriver: running DAG for finalized turn"
                 );
 
-                // Fresh per-turn context (shares stream_id/auth/deadline/output sink).
-                let mut ctx = ctx_template.clone_for_branch();
+                // Fresh per-turn context (shares stream_id/auth/output sink) with its OWN cancel
+                // token: a child of the session's, so teardown still stops it, while cancelling this
+                // turn leaves the session (and later turns) untouched. The turn's deadline starts now.
+                let cancel = ctx_template.cancel_token.child_token();
+                let mut ctx = ctx_template
+                    .clone_for_branch()
+                    .with_cancel_token(cancel.clone());
+                if let Some(timeout) = turn_timeout {
+                    ctx = ctx.with_timeout(timeout);
+                }
 
                 use crate::core::observability::{TurnOutcome, TurnPath, TurnSink, TurnTrace};
                 let mut trace = TurnTrace::open(
@@ -3774,31 +4041,80 @@ async fn register_dag_stream_driver(
                     ..Default::default()
                 });
 
-                let exec_result = executor
-                    .execute_from(&compiled_dag, &post_stt_node_id, input, &mut ctx)
-                    .await;
-                trace.audio_out_ns = crate::core::observability::now_monotonic_ns();
-                trace.node_durations_us = ctx
-                    .timing
-                    .node_durations
-                    .iter()
-                    .map(|(node, dur)| (Arc::from(node.as_str()), dur.as_micros() as u64))
-                    .collect();
-                trace.outcome = if exec_result.is_ok() {
-                    TurnOutcome::Completed
-                } else {
-                    TurnOutcome::Aborted
-                };
-                trace.bottleneck = trace.compute_bottleneck();
-                profiler.record_turn(trace);
-                match exec_result {
-                    Ok(_) => {
-                        debug!("StreamDriver: DAG turn completed");
+                let task = tokio::spawn(async move {
+                    let exec_result: Result<(), crate::dag::DAGError> =
+                        match executor.streamable_node_count(&compiled_dag, &post_stt_node_id) {
+                            Some(nodes) => {
+                                // The streaming executor has no per-node timeouts: bound the whole turn
+                                // by the session's turn deadline, else by what the batch path allows
+                                // (the per-node timeout once per node).
+                                let bound = turn_timeout.unwrap_or_else(|| {
+                                    executor.default_node_timeout().saturating_mul(
+                                        u32::try_from(nodes.max(1)).unwrap_or(u32::MAX),
+                                    )
+                                });
+                                match tokio::time::timeout(
+                                    bound,
+                                    executor.execute_streaming_from(
+                                        &compiled_dag,
+                                        &post_stt_node_id,
+                                        input,
+                                        &mut ctx,
+                                    ),
+                                )
+                                .await
+                                {
+                                    Ok(result) => result,
+                                    Err(_) => {
+                                        ctx.cancel_token.cancel();
+                                        Err(crate::dag::DAGError::ExecutionTimeout(
+                                            bound.as_millis() as u64,
+                                        ))
+                                    }
+                                }
+                            }
+                            None => executor
+                                .execute_from(&compiled_dag, &post_stt_node_id, input, &mut ctx)
+                                .await
+                                .map(|_| ()),
+                        };
+                    trace.audio_out_ns = crate::core::observability::now_monotonic_ns();
+                    trace.node_durations_us = ctx
+                        .timing
+                        .node_durations
+                        .iter()
+                        .map(|(node, dur)| (Arc::from(node.as_str()), dur.as_micros() as u64))
+                        .collect();
+                    trace.outcome = if exec_result.is_ok() {
+                        TurnOutcome::Completed
+                    } else {
+                        TurnOutcome::Aborted
+                    };
+                    trace.bottleneck = trace.compute_bottleneck();
+                    profiler.record_turn(trace);
+                    match exec_result {
+                        Ok(()) => {
+                            debug!("StreamDriver: DAG turn completed");
+                        }
+                        // Barge-in / a superseding turn / teardown: nothing failed.
+                        Err(crate::dag::DAGError::Cancelled) => {
+                            debug!("StreamDriver: DAG turn cancelled");
+                        }
+                        Err(e) => {
+                            warn!(
+                                error = %e,
+                                node_id = ?ctx.failed_node.as_ref().map(|n| n.id.as_str()),
+                                "StreamDriver: DAG turn failed"
+                            );
+                            // As a plain session reports its STT/TTS/LLM failures: the client is
+                            // told, the session stays up.
+                            let route = dag_turn_error(&compiled_dag, ctx.failed_node.take(), &e);
+                            send_critical(&message_tx, route).await;
+                        }
                     }
-                    Err(e) => {
-                        warn!(error = %e, "StreamDriver: DAG turn failed");
-                    }
-                }
+                });
+                *running.lock().unwrap_or_else(|p| p.into_inner()) =
+                    Some(RunningDagTurn { cancel, task });
             })
         })
         .await;
@@ -3880,6 +4196,7 @@ mod tests {
             translation: None,
             turn_detection: None,
             transcription_mode: None,
+            noise_suppression: None,
         }
     }
 
@@ -4476,6 +4793,51 @@ mod frd023_bud_mode_tests {
         let template: DAGWebSocketConfig =
             serde_json::from_value(serde_json::json!({"template": "support-agent"})).unwrap();
         assert!(bud_mode_config_refusal(None, Some(&template)).is_none());
+    }
+
+    /// A LiveKit setup that fails after the session committed its stream id used to leave the socket
+    /// open and silent (no `ready`, and a second config is refused). Now the cause is sent and the
+    /// session closes with 1011, so the client reconnects instead of waiting forever.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_failed_livekit_setup_closes_the_session_instead_of_hanging() {
+        let app_state = AppState::new(crate::test_support::minimal_config()).await;
+        assert!(
+            app_state.livekit_room_handler.is_none(),
+            "no LiveKit credentials, so setup fails"
+        );
+        let state = Arc::new(RwLock::new(ConnectionState::new()));
+        let (tx, mut rx) = mpsc::channel(16);
+        let livekit: LiveKitWebSocketConfig =
+            serde_json::from_value(serde_json::json!({"room_name": "room-1"})).unwrap();
+
+        let keep = handle_config_message(
+            None,
+            Some(false),
+            None,
+            None,
+            Some(livekit),
+            None,
+            None,
+            None,
+            None,
+            &state,
+            &tx,
+            &app_state,
+        )
+        .await;
+
+        assert!(!keep, "the session ends");
+        let (mut errors, mut close) = (0, None);
+        while let Ok(route) = rx.try_recv() {
+            match route {
+                MessageRoute::Outgoing(OutgoingMessage::Error { .. }) => errors += 1,
+                MessageRoute::CloseWith { code, reason } => close = Some((code, reason)),
+                _ => {}
+            }
+        }
+        assert!(errors >= 1, "the cause reaches the client first");
+        assert_eq!(close, Some((1011, "livekit_setup_failed".to_string())));
     }
 
     #[tokio::test]
