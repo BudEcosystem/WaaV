@@ -35,7 +35,7 @@ pub struct InferSTT {
 impl InferSTT {
     /// The default Infer endpoint when the config carries none (single-box sidecar over loopback).
     /// Real transport wiring is the sibling task; this keeps the field meaningful today.
-    pub const DEFAULT_ENDPOINT: &'static str = "ws://127.0.0.1:8123/v1/realtime";
+    pub const DEFAULT_ENDPOINT: &'static str = "ws://127.0.0.1:8080/v1/ws";
 
     /// The shared breaker for this provider, if resilience has been injected.
     pub fn breaker(&self) -> Option<&std::sync::Arc<crate::core::resilience::CircuitBreaker>> {

@@ -23,7 +23,7 @@ pub struct InferTTS {
 
 impl InferTTS {
     /// The default Infer endpoint when the config carries none (single-box sidecar over loopback).
-    pub const DEFAULT_ENDPOINT: &'static str = "ws://127.0.0.1:8123/v1/realtime";
+    pub const DEFAULT_ENDPOINT: &'static str = "ws://127.0.0.1:8080/v1/ws";
 }
 
 #[async_trait::async_trait]
