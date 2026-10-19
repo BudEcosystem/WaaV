@@ -88,6 +88,9 @@ paths = [
   '''gateway/tests/mock_providers/.*''',
   '''gateway/tests/fixtures/.*''',
   '''clients_sdk/.*/(README|example|examples)\b.*''',
+  # Vendored livekit-api's own unit-test JWT (iss "myapikey", sub "identity", expired March 2025), loaded only
+  # by its access_token.rs tests. Exactly this file, so a real secret elsewhere in vendor/ is still caught.
+  '''gateway/vendor/livekit-api/src/test_token\.txt''',
 ]
 regexes = [
   # Placeholder / templated values.
