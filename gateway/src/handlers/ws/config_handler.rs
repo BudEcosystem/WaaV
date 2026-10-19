@@ -3551,8 +3551,8 @@ async fn initialize_dag_routing(
     // Get DAG definition from template or inline
     let mut dag_definition: DAGDefinition = if let Some(ref def) = dag_config.definition {
         // Parse inline definition
-        let parsed: DAGDefinition =
-            serde_json::from_value(def.clone()).map_err(|e| format!("Invalid DAG definition: {}", e))?;
+        let parsed: DAGDefinition = serde_json::from_value(def.clone())
+            .map_err(|e| format!("Invalid DAG definition: {}", e))?;
         // The config carries the definition as raw JSON, so the config-wide lint cannot see inside
         // it: a misspelled node key (`voice_ID`) was silently ignored. Lint it now it is parsed.
         if let Ok(accepted) = serde_json::to_value(&parsed) {
@@ -3803,11 +3803,17 @@ fn dag_turn_error(
     let (code, message) = match &failed {
         Some(node) if timeout => (
             "dag_node_timeout",
-            format!("DAG node '{}' ({}) timed out: {error}", node.id, node.node_type),
+            format!(
+                "DAG node '{}' ({}) timed out: {error}",
+                node.id, node.node_type
+            ),
         ),
         Some(node) => (
             "dag_node_failed",
-            format!("DAG node '{}' ({}) failed: {error}", node.id, node.node_type),
+            format!(
+                "DAG node '{}' ({}) failed: {error}",
+                node.id, node.node_type
+            ),
         ),
         None if timeout => ("dag_turn_timeout", format!("DAG turn timed out: {error}")),
         None => ("dag_node_failed", format!("DAG turn failed: {error}")),
@@ -3890,7 +3896,8 @@ async fn register_dag_stream_driver(
     profiler: Arc<crate::core::observability::LatencyProfiler>,
 ) {
     let message_tx = message_tx.clone();
-    let running: Arc<std::sync::Mutex<Option<RunningDagTurn>>> = Arc::new(std::sync::Mutex::new(None));
+    let running: Arc<std::sync::Mutex<Option<RunningDagTurn>>> =
+        Arc::new(std::sync::Mutex::new(None));
     // Weak: the callback is stored on the voice manager itself.
     let vm_weak = Arc::downgrade(voice_manager);
     // A-G0: the DAG session drives turn policy through the same controller spine as the
@@ -3969,8 +3976,10 @@ async fn register_dag_stream_driver(
                 let barge_in = events.iter().any(|e| {
                     matches!(
                         e,
-                        crate::core::turn::TurnEvent::Started { interrupt: true, .. }
-                            | crate::core::turn::TurnEvent::BargeInMopUp
+                        crate::core::turn::TurnEvent::Started {
+                            interrupt: true,
+                            ..
+                        } | crate::core::turn::TurnEvent::BargeInMopUp
                     )
                 });
                 if barge_in {
@@ -4008,7 +4017,9 @@ async fn register_dag_stream_driver(
                 // token: a child of the session's, so teardown still stops it, while cancelling this
                 // turn leaves the session (and later turns) untouched. The turn's deadline starts now.
                 let cancel = ctx_template.cancel_token.child_token();
-                let mut ctx = ctx_template.clone_for_branch().with_cancel_token(cancel.clone());
+                let mut ctx = ctx_template
+                    .clone_for_branch()
+                    .with_cancel_token(cancel.clone());
                 if let Some(timeout) = turn_timeout {
                     ctx = ctx.with_timeout(timeout);
                 }
@@ -4038,9 +4049,9 @@ async fn register_dag_stream_driver(
                                 // by the session's turn deadline, else by what the batch path allows
                                 // (the per-node timeout once per node).
                                 let bound = turn_timeout.unwrap_or_else(|| {
-                                    executor
-                                        .default_node_timeout()
-                                        .saturating_mul(u32::try_from(nodes.max(1)).unwrap_or(u32::MAX))
+                                    executor.default_node_timeout().saturating_mul(
+                                        u32::try_from(nodes.max(1)).unwrap_or(u32::MAX),
+                                    )
                                 });
                                 match tokio::time::timeout(
                                     bound,
@@ -4102,7 +4113,8 @@ async fn register_dag_stream_driver(
                         }
                     }
                 });
-                *running.lock().unwrap_or_else(|p| p.into_inner()) = Some(RunningDagTurn { cancel, task });
+                *running.lock().unwrap_or_else(|p| p.into_inner()) =
+                    Some(RunningDagTurn { cancel, task });
             })
         })
         .await;

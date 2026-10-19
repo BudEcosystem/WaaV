@@ -10,8 +10,8 @@ pub mod policy;
 pub use api_secret::match_api_secret_id;
 pub use client::AuthClient;
 pub use context::{Auth, SessionCredential};
-pub use policy::{AuthMode, AuthPolicy};
 pub use jwt::{
     AuthClaims, AuthPayload, detect_algorithm, filter_headers, load_private_key, sign_auth_request,
     sign_auth_request_with_key,
 };
+pub use policy::{AuthMode, AuthPolicy};

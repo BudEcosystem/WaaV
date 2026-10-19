@@ -60,6 +60,9 @@ pub fn smart_turn_state() -> ModelState {
 }
 
 /// Load both models once, in the background. A failure is retried once a minute.
+// The early `return` is only "needless" when neither model feature is compiled (everything after it is
+// feature-gated); with either feature it guards the one-time spawn.
+#[allow(clippy::needless_return)]
 pub fn warm_up() {
     static STARTED: OnceLock<()> = OnceLock::new();
     if STARTED.set(()).is_err() {

@@ -24,10 +24,17 @@ pub fn credential_key() -> &'static CredentialKey {
         let key = rsa::RsaPrivateKey::new(&mut rng, 2048).expect("test key generates");
         let ciphertext = key
             .to_public_key()
-            .encrypt(&mut rng, rsa::Oaep::new::<sha2::Sha256>(), VENDOR_KEY.as_bytes())
+            .encrypt(
+                &mut rng,
+                rsa::Oaep::new::<sha2::Sha256>(),
+                VENDOR_KEY.as_bytes(),
+            )
             .expect("test credential encrypts");
         CredentialKey {
-            pem: key.to_pkcs8_pem(LineEnding::LF).expect("test key encodes").to_string(),
+            pem: key
+                .to_pkcs8_pem(LineEnding::LF)
+                .expect("test key encodes")
+                .to_string(),
             ciphertext: hex::encode(ciphertext),
         }
     })

@@ -214,6 +214,25 @@ async fn test_websocket_voice_config() {
                     "Expected error due to test API keys: {}",
                     parsed["message"].as_str().unwrap()
                 );
+                // A failed voice setup closes the session with 1011 (it used to leave a silent,
+                // half-configured session), so the client reconnects instead of waiting forever.
+                let mut close_code = None;
+                while let Some(msg) = read.next().await {
+                    match msg {
+                        Ok(Message::Close(frame)) => {
+                            close_code = frame.map(|f| u16::from(f.code));
+                            break;
+                        }
+                        Ok(_) => continue, // further error frames may precede the close
+                        Err(_) => break,
+                    }
+                }
+                assert_eq!(
+                    close_code,
+                    Some(1011),
+                    "a failed setup closes the session with 1011"
+                );
+                return;
             }
         }
         _ => panic!("Expected text message"),

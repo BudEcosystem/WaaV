@@ -198,9 +198,7 @@ pub fn join_segments(segments: &[Segment], gap_cap_ms: u32) -> Vec<i16> {
 mod tests {
     use super::*;
     use crate::breaker::{Breaker, BreakerConfig};
-    use crate::transcriber::attempts::{
-        RepairMemory, SecondRequestPolicy, SessionHealth,
-    };
+    use crate::transcriber::attempts::{RepairMemory, SecondRequestPolicy, SessionHealth};
     use crate::transcriber::gate::{LimitSpec, RetryBudget};
     use crate::transcriber::testing::{FakeStep, FakeTranscriber};
     use crate::types::CutReason;
@@ -254,7 +252,11 @@ mod tests {
             "the loading model's answer arrived: {:?}",
             r.result
         );
-        assert_eq!(t.calls(), 2, "the stall sent a second request beside the load");
+        assert_eq!(
+            t.calls(),
+            2,
+            "the stall sent a second request beside the load"
+        );
     }
 
     #[tokio::test(start_paused = true)]

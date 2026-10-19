@@ -2187,7 +2187,8 @@ mod frd023_key_tests {
     fn standalone_mode_keeps_its_env_fallback() {
         let reads = RefCell::new(Vec::new());
         assert_eq!(
-            resolve_llm_api_key(None, None, None, true, "OPENAI_API_KEY", canary(&reads)).as_deref(),
+            resolve_llm_api_key(None, None, None, true, "OPENAI_API_KEY", canary(&reads))
+                .as_deref(),
             Some("sk-canary")
         );
         assert_eq!(reads.borrow().as_slice(), ["OPENAI_API_KEY".to_string()]);

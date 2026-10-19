@@ -69,7 +69,7 @@
           },
           "gateway_client": {
             "status": "not_implemented",
-            "code_ref": "stub: gateway/src/core/stt/infer.rs:59-65 (connect always errors), :38 (default address ws://127.0.0.1:8123/v1/realtime); engine socket: waav-infer/crates/waav-infer-server/src/ws.rs:644-851, :1324-1372",
+            "code_ref": "stub: gateway/src/core/stt/infer.rs:59-65 (connect always errors), :38 (default address ws://127.0.0.1:8080/v1/ws); engine socket: waav-infer/crates/waav-infer-server/src/ws.rs:644-851, :1324-1372",
             "notes": "The engine serves GET /v1/ws on port 8080; the stub's default address names port 8123 and path /v1/realtime, which the engine does not serve. Binary frames are appended to a buffer (ws.rs:837); on a finalize frame the whole buffer is decoded, resampled and transcribed in one call (ws.rs:1338) and exactly one final transcript is sent. A per-session language or key terms are rejected at the handshake (ws.rs:373-401). The socket closes after 30 seconds idle, at most 64 sessions are open at once, and a session may hold at most 100 MiB of audio (lib.rs:157-160); the 100 MiB figure is recorded here as the upload limit. The adapter is deliberately absent from the plugin registry (gateway/src/plugin/builtin/mod.rs:2096-2130)."
           }
         }
@@ -238,7 +238,7 @@
           },
           "gateway_client": {
             "status": "not_implemented",
-            "code_ref": "stub: gateway/src/core/stt/infer.rs:59-65 (connect always errors), :38 (default address ws://127.0.0.1:8123/v1/realtime); engine socket: waav-infer/crates/waav-infer-server/src/ws.rs:644-851, :1324-1372",
+            "code_ref": "stub: gateway/src/core/stt/infer.rs:59-65 (connect always errors), :38 (default address ws://127.0.0.1:8080/v1/ws); engine socket: waav-infer/crates/waav-infer-server/src/ws.rs:644-851, :1324-1372",
             "notes": "The engine serves GET /v1/ws on port 8080; the stub's default address names port 8123 and path /v1/realtime, which the engine does not serve. Binary frames are appended to a buffer (ws.rs:837); on a finalize frame the whole buffer is decoded, resampled and transcribed in one call (ws.rs:1338) and exactly one final transcript is sent. A per-session language or key terms are rejected at the handshake (ws.rs:373-401). The socket closes after 30 seconds idle, at most 64 sessions are open at once, and a session may hold at most 100 MiB of audio (lib.rs:157-160); the 100 MiB figure is recorded here as the upload limit. The adapter is deliberately absent from the plugin registry (gateway/src/plugin/builtin/mod.rs:2096-2130)."
           }
         }
@@ -407,7 +407,7 @@
           },
           "gateway_client": {
             "status": "not_implemented",
-            "code_ref": "stub: gateway/src/core/stt/infer.rs:59-65 (connect always errors), :38 (default address ws://127.0.0.1:8123/v1/realtime); engine socket: waav-infer/crates/waav-infer-server/src/ws.rs:644-851, :1324-1372",
+            "code_ref": "stub: gateway/src/core/stt/infer.rs:59-65 (connect always errors), :38 (default address ws://127.0.0.1:8080/v1/ws); engine socket: waav-infer/crates/waav-infer-server/src/ws.rs:644-851, :1324-1372",
             "notes": "The engine serves GET /v1/ws on port 8080; the stub's default address names port 8123 and path /v1/realtime, which the engine does not serve. Binary frames are appended to a buffer (ws.rs:837); on a finalize frame the whole buffer is decoded, resampled and transcribed in one call (ws.rs:1338) and exactly one final transcript is sent. A per-session language or key terms are rejected at the handshake (ws.rs:373-401). The socket closes after 30 seconds idle, at most 64 sessions are open at once, and a session may hold at most 100 MiB of audio (lib.rs:157-160); the 100 MiB figure is recorded here as the upload limit. The adapter is deliberately absent from the plugin registry (gateway/src/plugin/builtin/mod.rs:2096-2130)."
           }
         }
@@ -566,7 +566,7 @@
           },
           "gateway_client": {
             "status": "not_implemented",
-            "code_ref": "stub: gateway/src/core/stt/infer.rs:59-65 (connect always errors), :38 (default address ws://127.0.0.1:8123/v1/realtime); engine socket: waav-infer/crates/waav-infer-server/src/ws.rs:644-851, :1324-1372",
+            "code_ref": "stub: gateway/src/core/stt/infer.rs:59-65 (connect always errors), :38 (default address ws://127.0.0.1:8080/v1/ws); engine socket: waav-infer/crates/waav-infer-server/src/ws.rs:644-851, :1324-1372",
             "notes": "The engine serves GET /v1/ws on port 8080; the stub's default address names port 8123 and path /v1/realtime, which the engine does not serve. Binary frames are appended to a buffer (ws.rs:837); on a finalize frame the whole buffer is decoded, resampled and transcribed in one call (ws.rs:1338) and exactly one final transcript is sent. A per-session language or key terms are rejected at the handshake (ws.rs:373-401). The socket closes after 30 seconds idle, at most 64 sessions are open at once, and a session may hold at most 100 MiB of audio (lib.rs:157-160); the 100 MiB figure is recorded here as the upload limit. The adapter is deliberately absent from the plugin registry (gateway/src/plugin/builtin/mod.rs:2096-2130)."
           }
         }

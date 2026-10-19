@@ -122,15 +122,15 @@ impl OpusStreamEncoder {
     /// Feed little-endian PCM16 bytes; return zero or more opus packets — one per full frame now
     /// available. Any sub-frame tail is buffered for the next call (or [`Self::flush`]).
     pub fn push_pcm(&mut self, pcm: &[u8]) -> Result<Vec<Vec<u8>>, OpusCodecError> {
-        if pcm.len() % 2 != 0 {
+        if !pcm.len().is_multiple_of(2) {
             self.reset_buffer();
             return Err(OpusCodecError::Framing(format!(
                 "PCM16 input length must be a multiple of 2 bytes, got {}",
                 pcm.len()
             )));
         }
-        for ch in pcm.chunks_exact(2) {
-            self.buf.push(i16::from_le_bytes([ch[0], ch[1]]));
+        for ch in pcm.as_chunks::<2>().0 {
+            self.buf.push(i16::from_le_bytes(*ch));
         }
         let mut packets = Vec::new();
         while self.buf.len() >= self.samples_per_frame {
@@ -186,7 +186,9 @@ mod tests {
         }
         let n = bytes.len() / 2;
         let sum: f64 = bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| {
                 let s = i16::from_le_bytes([c[0], c[1]]) as f64;
                 s * s

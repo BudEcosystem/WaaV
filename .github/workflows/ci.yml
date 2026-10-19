@@ -330,7 +330,18 @@ jobs:
           # Readiness probe must exist and return a JSON report (200 ready or 503 not_ready).
           # With no provider keys in config.example.yaml, no providers are enabled => ready (200).
           curl -fsS http://localhost:3001/readyz | grep -q '"status"' || { echo "readyz missing"; kill $PID 2>/dev/null; exit 1; }
-          # Metrics endpoint must expose the Prometheus exposition with the WaaV provider series.
+          # config.example.yaml configures API secrets, so the API requires auth and /metrics is locked (403)
+          # unless metrics access is configured — the secure default. Prove it, then boot again opted in.
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:3001/metrics)
+          [ "$code" = 403 ] || { echo "/metrics must be locked (403) on an authenticated API, got $code"; kill $PID 2>/dev/null; exit 1; }
+          kill $PID 2>/dev/null; wait $PID 2>/dev/null
+          WAAV_METRICS_PUBLIC=true ./target/release/waav-gateway -c config.yaml &
+          PID=$!
+          for i in $(seq 1 30); do
+            curl -fsS http://localhost:3001/livez >/dev/null 2>&1 && break
+            sleep 1
+          done
+          # Metrics endpoint (opted in) must expose the Prometheus exposition with the WaaV provider series.
           curl -fsS http://localhost:3001/metrics | grep -q 'waav_provider' || { echo "metrics missing waav_provider series"; kill $PID 2>/dev/null; exit 1; }
           echo "healthy"; kill $PID 2>/dev/null; exit 0
 

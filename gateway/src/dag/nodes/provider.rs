@@ -1153,10 +1153,7 @@ impl DAGNode for TTSProviderNode {
             if timed_out {
                 return Err(DAGError::TTSProviderError {
                     provider: self.provider.clone(),
-                    error: format!(
-                        "no audio within {} ms",
-                        timeout_duration.as_millis()
-                    ),
+                    error: format!("no audio within {} ms", timeout_duration.as_millis()),
                 });
             }
             warn!(

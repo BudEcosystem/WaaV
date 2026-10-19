@@ -316,7 +316,7 @@
       },
       "quality_signals": [],
       "dialect": {
-        "language_param": null,
+        "language_param": "language",
         "context_params": [],
         "response_formats": [
           "json",
@@ -325,7 +325,11 @@
         "wire": "openai_multipart",
         "language_format": "iso639_1",
         "auth": "bearer_optional",
-        "path": "/audio/transcriptions"
+        "path": "/audio/transcriptions",
+        "language_shape": "single",
+        "droppable_params": [
+          "language"
+        ]
       },
       "gateway_client": {
         "status": "not_implemented",

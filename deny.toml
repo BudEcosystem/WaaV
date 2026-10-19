@@ -42,6 +42,18 @@ ignore = [
   { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.102 only via tonic 0.11; validates Google's public chain" },
   { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.102 only via tonic 0.11; validates Google's public chain" },
   { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.102 only via tonic 0.11; CRLs are not configured" },
+  # rustls itself is on 0.23.46 (the fixed release); only the rustls 0.22 that tonic 0.11 pins remains.
+  { id = "RUSTSEC-2026-0346", reason = "rustls 0.22 only via tonic 0.11 (Google Speech client); session values are never Debug-logged" },
+  { id = "RUSTSEC-2026-0349", reason = "rustls 0.22 only via tonic 0.11; a downgrade still lands on classical TLS 1.3 to Google's endpoint" },
+  # zip: the advisories are in extract() (symlink/SUID handling when writing an archive to disk). WaaV never
+  # extracts: zip 0.6 is a BUILD dependency of webrtc-sys-build (unpacks the pinned upstream WebRTC archive at
+  # compile time), and zip 2 is ndarray-npy's .npz READER (via mel_spec).
+  { id = "RUSTSEC-2026-0367", reason = "zip extract() SUID bits; WaaV never extracts archives (build-time webrtc unpack, npz reader)" },
+  { id = "RUSTSEC-2026-0368", reason = "zip extract(); WaaV never extracts archives (build-time webrtc unpack, npz reader)" },
+  { id = "RUSTSEC-2026-0369", reason = "zip extract() symlink permissions; WaaV never extracts archives (build-time webrtc unpack, npz reader)" },
+  # serde_yaml 0.9 is deprecated, so unsafe-libyaml is unmaintained (not a vulnerability). It parses operator-
+  # authored config and DAG definitions. Leaves with a move to a maintained YAML crate.
+  { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml unmaintained via serde_yaml 0.9; parses operator-authored YAML only" },
   # tract_nnef::tensors::read_tensor reads NNEF archives. WaaV never loads one: noise-filter runs the
   # DeepFilterNet ONNX model compiled into the binary. The fixed 0.21.16+ caps `time` < 0.3.42,
   # which would reintroduce RUSTSEC-2026-0009 (fixed in time 0.3.47).

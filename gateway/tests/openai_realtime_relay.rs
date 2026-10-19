@@ -59,11 +59,19 @@ fn test_keys() -> &'static TestKeys {
         use rsa::pkcs8::{EncodePrivateKey, LineEnding};
         use rsa::traits::PublicKeyParts;
         let mut rng = rsa::rand_core::OsRng;
-        let pem = |key: &rsa::RsaPrivateKey| key.to_pkcs8_pem(LineEnding::LF).expect("test key encodes").to_string();
+        let pem = |key: &rsa::RsaPrivateKey| {
+            key.to_pkcs8_pem(LineEnding::LF)
+                .expect("test key encodes")
+                .to_string()
+        };
         let credential_key = rsa::RsaPrivateKey::new(&mut rng, 2048).expect("test key generates");
         let ciphertext = credential_key
             .to_public_key()
-            .encrypt(&mut rng, rsa::Oaep::new::<sha2::Sha256>(), VENDOR_KEY.as_bytes())
+            .encrypt(
+                &mut rng,
+                rsa::Oaep::new::<sha2::Sha256>(),
+                VENDOR_KEY.as_bytes(),
+            )
             .expect("test credential encrypts");
         let jwt_key = rsa::RsaPrivateKey::new(&mut rng, 2048).expect("test key generates");
         let b64 = |bytes: Vec<u8>| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
@@ -1345,7 +1353,11 @@ async fn tc_evt_16_slow_client_is_closed_without_silent_drops() {
             _ => {}
         }
     };
-    assert_eq!(close, Some(1011), "the read ended with {ended} after delta {last}");
+    assert_eq!(
+        close,
+        Some(1011),
+        "the read ended with {ended} after delta {last}"
+    );
     assert_eq!(errors, vec!["client_too_slow"]);
     assert!(last >= 0, "some deltas were delivered in order");
 }

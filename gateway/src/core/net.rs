@@ -455,13 +455,17 @@ fn is_loopback_host(host: &str) -> bool {
         .unwrap_or(&host_lower);
     if let Ok(ip) = bare.parse::<IpAddr>() {
         return match ip {
-            IpAddr::V6(v6) => v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()),
+            IpAddr::V6(v6) => {
+                v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+            }
             IpAddr::V4(v4) => v4.is_loopback(),
         };
     }
     !bare.is_empty()
         && bare.bytes().all(|b| b.is_ascii_digit())
-        && bare.parse::<u32>().is_ok_and(|n| Ipv4Addr::from(n).is_loopback())
+        && bare
+            .parse::<u32>()
+            .is_ok_and(|n| Ipv4Addr::from(n).is_loopback())
 }
 
 /// Resolve a DNS hostname and reject if any resolved IP is private/internal.
