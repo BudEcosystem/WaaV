@@ -191,18 +191,34 @@ mod tests {
                 .fmt_fields(log_fields(log_content));
             let subscriber = tracing_subscriber::registry().with(layer);
             tracing::subscriber::with_default(subscriber, || {
-                let span = tracing::info_span!("voice.turn", bud.voice.transcript = "my card number is 4111");
+                let span = tracing::info_span!(
+                    "voice.turn",
+                    bud.voice.transcript = "my card number is 4111"
+                );
                 let _e = span.enter();
                 tracing::warn!(transcript = %"call my sister", session = "s1", "turn done");
             });
             String::from_utf8(buf.lock().unwrap().clone()).unwrap()
         };
         let out = render(false);
-        assert!(!out.contains("4111") && !out.contains("call my sister"), "{out}");
-        assert!(out.contains("bud.voice.transcript=<redacted>") && out.contains("transcript=<redacted>"), "{out}");
-        assert!(out.contains("turn done") && out.contains("session=\"s1\""), "{out}");
+        assert!(
+            !out.contains("4111") && !out.contains("call my sister"),
+            "{out}"
+        );
+        assert!(
+            out.contains("bud.voice.transcript=<redacted>")
+                && out.contains("transcript=<redacted>"),
+            "{out}"
+        );
+        assert!(
+            out.contains("turn done") && out.contains("session=\"s1\""),
+            "{out}"
+        );
         let out = render(true);
-        assert!(out.contains("4111") && out.contains("call my sister"), "{out}");
+        assert!(
+            out.contains("4111") && out.contains("call my sister"),
+            "{out}"
+        );
     }
 
     struct SinkWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);

@@ -671,7 +671,10 @@ mod tests {
         };
         kit::run(build(cfg).as_ref(), &ctx()).await.0.unwrap();
         let r = vendor.last();
-        assert_eq!(r.part_names(), vec!["file", "model", "response_format", "language"]);
+        assert_eq!(
+            r.part_names(),
+            vec!["file", "model", "response_format", "language"]
+        );
         assert_eq!(r.text("language").as_deref(), Some("en"));
     }
 

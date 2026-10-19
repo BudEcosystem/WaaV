@@ -272,7 +272,10 @@ mod tests {
     fn unknown_keys_inside_array_elements_are_reported_with_their_index() {
         let raw = serde_json::json!({ "nodes": [ { "id": "a" }, { "id": "b", "voice_ID": "x" } ] });
         let accepted = serde_json::json!({ "nodes": [ { "id": "a" }, { "id": "b" } ] });
-        assert_eq!(unknown_config_keys(&raw, &accepted), vec!["nodes[1].voice_ID".to_string()]);
+        assert_eq!(
+            unknown_config_keys(&raw, &accepted),
+            vec!["nodes[1].voice_ID".to_string()]
+        );
     }
 
     /// An inline DAG definition: a misspelled node key is found by diffing the client's JSON
@@ -291,14 +294,24 @@ mod tests {
         });
         let parsed: crate::dag::DAGDefinition = serde_json::from_value(def.clone()).unwrap();
         let accepted = serde_json::to_value(&parsed).unwrap();
-        assert_eq!(unknown_config_keys(&def, &accepted), vec!["nodes[1].voice_ID".to_string()]);
+        assert_eq!(
+            unknown_config_keys(&def, &accepted),
+            vec!["nodes[1].voice_ID".to_string()]
+        );
 
         let mut clean = def.clone();
-        clean["nodes"][1].as_object_mut().unwrap().remove("voice_ID");
+        clean["nodes"][1]
+            .as_object_mut()
+            .unwrap()
+            .remove("voice_ID");
         clean["nodes"][1]["voice_id"] = serde_json::json!("alloy");
         let parsed: crate::dag::DAGDefinition = serde_json::from_value(clean.clone()).unwrap();
         let accepted = serde_json::to_value(&parsed).unwrap();
-        assert!(unknown_config_keys(&clean, &accepted).is_empty(), "{:?}", unknown_config_keys(&clean, &accepted));
+        assert!(
+            unknown_config_keys(&clean, &accepted).is_empty(),
+            "{:?}",
+            unknown_config_keys(&clean, &accepted)
+        );
     }
 
     /// Round-trip a config message exactly as the live handler does: parse the

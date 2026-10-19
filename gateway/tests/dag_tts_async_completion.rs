@@ -166,9 +166,7 @@ async fn tts_node_that_hears_nothing_fails_instead_of_returning_silence() {
     register();
     let node = TTSProviderNode::new("tts", "mock-tts-silent");
     let mut ctx = DAGContext::new("s").with_timeout(Duration::from_millis(300));
-    let result = node
-        .execute(DAGData::Text("hello".into()), &mut ctx)
-        .await;
+    let result = node.execute(DAGData::Text("hello".into()), &mut ctx).await;
     assert!(
         matches!(result, Err(DAGError::TTSProviderError { .. })),
         "a synthesis with no audio and no completion is an error: {result:?}"
@@ -271,8 +269,15 @@ async fn a_cancelled_turn_stops_mid_node_in_the_batch_executor() {
         .await
         .expect_err("the turn was cancelled");
     assert!(matches!(err, DAGError::Cancelled), "{err}");
-    assert!(started.elapsed() < Duration::from_millis(800), "stopped mid-speech: {:?}", started.elapsed());
-    assert!(ctx.failed_node.is_none(), "a cancellation is not a node failure");
+    assert!(
+        started.elapsed() < Duration::from_millis(800),
+        "stopped mid-speech: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        ctx.failed_node.is_none(),
+        "a cancellation is not a node failure"
+    );
 }
 
 /// The streaming executor (what a session's turns run on) reports a cancelled turn as `Cancelled`
@@ -296,7 +301,11 @@ async fn a_cancelled_streaming_turn_is_cancelled_not_failed() {
         .await
         .expect_err("the turn was cancelled");
     assert!(matches!(err, DAGError::Cancelled), "{err}");
-    assert!(started.elapsed() < Duration::from_millis(800), "{:?}", started.elapsed());
+    assert!(
+        started.elapsed() < Duration::from_millis(800),
+        "{:?}",
+        started.elapsed()
+    );
     assert!(ctx.failed_node.is_none());
 }
 

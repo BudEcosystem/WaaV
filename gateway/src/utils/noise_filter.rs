@@ -653,17 +653,17 @@ pub mod implementation {
                 _ => {
                     let (result_tx, result_rx) = oneshot::channel();
                     match self.jobs.try_send((pcm, result_tx)) {
-                        Ok(()) => match tokio::time::timeout(STREAM_CHUNK_DEADLINE, result_rx)
-                            .await
-                        {
-                            Ok(Ok(Ok(clean))) => return Some(clean),
-                            Ok(Ok(Err(err))) => {
-                                error!(error = %err, "noise filter failed on a /ws chunk");
-                                "noise_filter_failed"
+                        Ok(()) => {
+                            match tokio::time::timeout(STREAM_CHUNK_DEADLINE, result_rx).await {
+                                Ok(Ok(Ok(clean))) => return Some(clean),
+                                Ok(Ok(Err(err))) => {
+                                    error!(error = %err, "noise filter failed on a /ws chunk");
+                                    "noise_filter_failed"
+                                }
+                                Ok(Err(_)) => "noise_filter_gone",
+                                Err(_) => "noise_filter_behind",
                             }
-                            Ok(Err(_)) => "noise_filter_gone",
-                            Err(_) => "noise_filter_behind",
-                        },
+                        }
                         Err(_) => "noise_filter_behind",
                     }
                 }
@@ -912,7 +912,11 @@ mod tests {
         // Opening does not wait for the model: a chunk sent at once goes through as it came, and
         // the denoiser stays on for the chunks after the model is built.
         let early = Bytes::from(vec![1u8, 0, 2, 0, 3, 0, 4, 0]);
-        assert_eq!(denoiser.process(early).await, None, "passes through while the model builds");
+        assert_eq!(
+            denoiser.process(early).await,
+            None,
+            "passes through while the model builds"
+        );
         assert!(
             denoiser.wait_ready(Duration::from_secs(300)).await,
             "the stream's model builds"

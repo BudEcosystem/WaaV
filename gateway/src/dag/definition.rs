@@ -102,8 +102,10 @@ impl DAGDefinition {
                 id.push('_');
             }
             let destination = OutputDestination::WebSocket;
-            self.nodes
-                .push(NodeDefinition::new(&id, NodeType::AudioOutput { destination }));
+            self.nodes.push(NodeDefinition::new(
+                &id,
+                NodeType::AudioOutput { destination },
+            ));
             self.edges.push(EdgeDefinition::new(&tts, &id));
             // The output node is where the run now ends.
             match self.exit_nodes.iter_mut().find(|exit| **exit == tts) {
@@ -1177,9 +1179,16 @@ exit_nodes:
         dag.entry_node = "in".to_string();
         dag.exit_nodes = vec!["tts".to_string()];
 
-        assert_eq!(dag.route_unread_speech(), vec!["tts__audio_output".to_string()]);
+        assert_eq!(
+            dag.route_unread_speech(),
+            vec!["tts__audio_output".to_string()]
+        );
         assert_eq!(dag.exit_nodes, vec!["tts__audio_output".to_string()]);
-        assert!(dag.edges.iter().any(|e| e.from == "tts" && e.to == "tts__audio_output"));
+        assert!(
+            dag.edges
+                .iter()
+                .any(|e| e.from == "tts" && e.to == "tts__audio_output")
+        );
         assert!(dag.validate_structure().is_ok());
         // Idempotent: the speech is read now.
         assert!(dag.route_unread_speech().is_empty());

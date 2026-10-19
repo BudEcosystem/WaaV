@@ -691,7 +691,9 @@ mod tests {
             "https://openai-compatible.invalid",
         ] {
             assert_eq!(
-                openai_tts_url_from_base("OPENAI_BASE_URL", base).unwrap().as_deref(),
+                openai_tts_url_from_base("OPENAI_BASE_URL", base)
+                    .unwrap()
+                    .as_deref(),
                 Some("https://openai-compatible.invalid/v1/audio/speech"),
                 "base {base}"
             );

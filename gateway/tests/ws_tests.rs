@@ -227,7 +227,11 @@ async fn test_websocket_voice_config() {
                         Err(_) => break,
                     }
                 }
-                assert_eq!(close_code, Some(1011), "a failed setup closes the session with 1011");
+                assert_eq!(
+                    close_code,
+                    Some(1011),
+                    "a failed setup closes the session with 1011"
+                );
                 return;
             }
         }
