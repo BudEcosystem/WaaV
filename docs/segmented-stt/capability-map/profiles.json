@@ -316,7 +316,7 @@
       },
       "quality_signals": [],
       "dialect": {
-        "language_param": "language",
+        "language_param": "languages",
         "context_params": [],
         "response_formats": [
           "json",
@@ -326,9 +326,9 @@
         "language_format": "iso639_1",
         "auth": "bearer_optional",
         "path": "/audio/transcriptions",
-        "language_shape": "single",
+        "language_shape": "list",
         "droppable_params": [
-          "language"
+          "languages"
         ]
       },
       "gateway_client": {
