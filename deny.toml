@@ -42,6 +42,7 @@ ignore = [
   { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.102 only via tonic 0.11; validates Google's public chain" },
   { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.102 only via tonic 0.11; validates Google's public chain" },
   { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.102 only via tonic 0.11; CRLs are not configured" },
+  { id = "RUSTSEC-2026-0382", reason = "rustls-webpki 0.102 only via tonic 0.11 (0.103 is patched); validates Google's public chain" },
   # rustls itself is on 0.23.46 (the fixed release); only the rustls 0.22 that tonic 0.11 pins remains.
   { id = "RUSTSEC-2026-0346", reason = "rustls 0.22 only via tonic 0.11 (Google Speech client); session values are never Debug-logged" },
   { id = "RUSTSEC-2026-0349", reason = "rustls 0.22 only via tonic 0.11; a downgrade still lands on classical TLS 1.3 to Google's endpoint" },

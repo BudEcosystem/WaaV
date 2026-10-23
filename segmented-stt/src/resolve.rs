@@ -1582,7 +1582,10 @@ mod tests {
         // restrict detection), so Infer needs no per-replica `--stt-languages`.
         let dialect = &res.transport.as_ref().unwrap().transport.dialect;
         assert_eq!(dialect.language_param.as_deref(), Some("languages"));
-        assert_eq!(dialect.language_shape, Some(crate::map::LanguageShape::List));
+        assert_eq!(
+            dialect.language_shape,
+            Some(crate::map::LanguageShape::List)
+        );
     }
 
     #[test]
