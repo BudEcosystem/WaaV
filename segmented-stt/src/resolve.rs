@@ -1578,6 +1578,14 @@ mod tests {
         });
         assert_eq!(res.outcome, Outcome::Segmented);
         assert_eq!(adapter(&res), Some("openai_transcriptions"));
+        // The session's candidate languages go to WaaV Infer as `languages[]` (one forces it, several
+        // restrict detection), so Infer needs no per-replica `--stt-languages`.
+        let dialect = &res.transport.as_ref().unwrap().transport.dialect;
+        assert_eq!(dialect.language_param.as_deref(), Some("languages"));
+        assert_eq!(
+            dialect.language_shape,
+            Some(crate::map::LanguageShape::List)
+        );
     }
 
     #[test]
