@@ -67,13 +67,13 @@ fn parse_cors_allowed_origins(origins: &str) -> anyhow::Result<Vec<HeaderValue>>
 #[command(version, about, long_about = None)]
 struct Cli {
     /// Path to configuration file (YAML)
-    #[arg(short = 'c', long = "config", value_name = "FILE")]
+    #[arg(short = 'c', long = "config", value_name = "FILE", global = true)]
     config: Option<PathBuf>,
 
     /// Environment file to load before configuration (`KEY=value` lines; variables already
     /// set in the process environment win). Also `WAAV_ENV_FILE`. Default: `.env` in the
     /// current directory only, when it exists. An empty value disables env-file loading.
-    #[arg(long = "env-file", value_name = "FILE")]
+    #[arg(long = "env-file", value_name = "FILE", global = true)]
     env_file: Option<PathBuf>,
 
     /// Subcommand to run
