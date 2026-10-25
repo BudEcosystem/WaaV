@@ -1091,14 +1091,37 @@ mod tests {
         };
         let addr = listener.local_addr().unwrap();
 
-        // Spawn a simple HTTP server
+        // Spawn a simple HTTP server. It reads each request's headers before answering: one that
+        // answered and closed before the client had sent its request failed the client with
+        // `UnexpectedMessage` now and then.
         tokio::spawn(async move {
             loop {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 tokio::spawn(async move {
-                    use tokio::io::AsyncWriteExt;
-                    let response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
-                    let _ = socket.write_all(response.as_bytes()).await;
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut seen = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    loop {
+                        let mut ended = false;
+                        while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                            match socket.read(&mut buf).await {
+                                Ok(0) | Err(_) => {
+                                    ended = true;
+                                    break;
+                                }
+                                Ok(n) => seen.extend_from_slice(&buf[..n]),
+                            }
+                        }
+                        if ended {
+                            return;
+                        }
+                        let end = seen.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+                        seen.drain(..end);
+                        let response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
+                        if socket.write_all(response.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
                 });
             }
         });
