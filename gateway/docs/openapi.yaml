@@ -2419,7 +2419,10 @@ components:
             enum:
             - auth_required
       - type: object
-        description: 'Voice agent (spec 025): an agent turn began (`kind`: `agent` or `greeting`).'
+        description: |-
+          A reply began: a voice-agent turn (spec 025; `kind` `agent`, `greeting` or `notice`) or a
+          conversation-loop turn (`kind` `agent`; `input` absent for the idle check-in and async-tool
+          follow-ups).
         required:
         - turn_index
         - kind
@@ -2458,7 +2461,9 @@ components:
             enum:
             - agent_response_created
       - type: object
-        description: 'Voice agent: the agent''s words, as they are spoken (or shown, in text mode).'
+        description: |-
+          The reply's words as they are handed to speech (or shown, in a voice agent's text mode).
+          Voice-agent and conversation sessions; their concatenation is what the caller heard.
         required:
         - turn_index
         - delta
@@ -2519,7 +2524,9 @@ components:
             enum:
             - agent_output
       - type: object
-        description: 'Voice agent: the turn ended (`completed`, `cancelled`, `failed`, `incomplete`).'
+        description: |-
+          The reply ended (`completed`, `cancelled`, `failed`, `incomplete`). Voice-agent and
+          conversation sessions.
         required:
         - turn_index
         - kind
@@ -2549,7 +2556,9 @@ components:
           usage:
             type: object
       - type: object
-        description: 'Voice agent: the reply was cut off; the agent''s history keeps `spoken`.'
+        description: |-
+          The reply was cut off by the caller; `spoken` is what had been sent to speech and
+          `audio_end_ms` the reply's audio delivered by then. Voice-agent and conversation sessions.
         required:
         - turn_index
         - spoken

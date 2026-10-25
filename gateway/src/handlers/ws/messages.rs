@@ -488,7 +488,9 @@ pub enum OutgoingMessage {
     /// Client must send an `auth` message before any other commands.
     #[serde(rename = "auth_required")]
     AuthRequired,
-    /// Voice agent (spec 025): an agent turn began (`kind`: `agent` or `greeting`).
+    /// A reply began: a voice-agent turn (spec 025; `kind` `agent`, `greeting` or `notice`) or a
+    /// conversation-loop turn (`kind` `agent`; `input` absent for the idle check-in and async-tool
+    /// follow-ups).
     #[serde(rename = "agent_response_started")]
     AgentResponseStarted {
         turn_index: u64,
@@ -503,7 +505,8 @@ pub enum OutgoingMessage {
         turn_index: u64,
         response_id: String,
     },
-    /// Voice agent: the agent's words, as they are spoken (or shown, in text mode).
+    /// The reply's words as they are handed to speech (or shown, in a voice agent's text mode).
+    /// Voice-agent and conversation sessions; their concatenation is what the caller heard.
     #[serde(rename = "assistant_transcript")]
     AssistantTranscript { turn_index: u64, delta: String },
     /// Voice agent: a server-side tool's progress (`in_progress`, `completed`, `failed`).
@@ -523,7 +526,8 @@ pub enum OutgoingMessage {
         #[cfg_attr(feature = "openapi", schema(value_type = Object))]
         output: serde_json::Value,
     },
-    /// Voice agent: the turn ended (`completed`, `cancelled`, `failed`, `incomplete`).
+    /// The reply ended (`completed`, `cancelled`, `failed`, `incomplete`). Voice-agent and
+    /// conversation sessions.
     #[serde(rename = "agent_response_done")]
     AgentResponseDone {
         turn_index: u64,
@@ -537,7 +541,8 @@ pub enum OutgoingMessage {
         /// What the caller heard (or was shown).
         transcript: String,
     },
-    /// Voice agent: the reply was cut off; the agent's history keeps `spoken`.
+    /// The reply was cut off by the caller; `spoken` is what had been sent to speech and
+    /// `audio_end_ms` the reply's audio delivered by then. Voice-agent and conversation sessions.
     #[serde(rename = "agent_truncated")]
     AgentTruncated {
         turn_index: u64,

@@ -946,7 +946,7 @@ pub async fn handle_config_message(
     } else if let (Some(conv_config), Some(vm)) =
         (conversation_ws_config.as_ref(), voice_manager.as_ref())
     {
-        let (credential, attribution) = {
+        let (credential, attribution, tracker) = {
             let guard = state.read().await;
             let attribution = guard.leg_meter.as_ref().map(|m| {
                 let p = &m.caller().principal;
@@ -958,7 +958,11 @@ pub async fn handle_config_message(
                     endpoint_name: Some(conv_config.model.clone()),
                 }
             });
-            (guard.credential.clone(), attribution)
+            (
+                guard.credential.clone(),
+                attribution,
+                guard.task_tracker.clone(),
+            )
         };
         match initialize_conversation_loop(
             conv_config,
@@ -968,6 +972,7 @@ pub async fn handle_config_message(
             app_state,
             credential,
             attribution,
+            &tracker,
         )
         .await
         {
@@ -1796,6 +1801,7 @@ async fn initialize_conversation_loop(
     app_state: &Arc<AppState>,
     credential: Option<crate::auth::SessionCredential>,
     attribution: Option<crate::core::conversation::TurnAttribution>,
+    tracker: &crate::core::observability::SessionTaskTracker,
 ) -> Result<bool, String> {
     let mut config = conv_config.to_conversation_config();
     if app_state.bud_mode.is_some() {
@@ -1819,6 +1825,14 @@ async fn initialize_conversation_loop(
     }
 
     let orchestrator = Arc::new(orchestrator);
+
+    // Each turn's lifecycle and spoken words, as the voice-agent path sends them:
+    // `agent_response_started`, `assistant_transcript`, `agent_truncated`, `agent_response_done`.
+    {
+        let (signal_tx, signal_rx) = mpsc::unbounded_channel();
+        orchestrator.set_turn_signals(signal_tx);
+        super::agent::spawn_signal_forwarder(signal_rx, message_tx.clone(), tracker);
+    }
 
     // S3 (REALTIME_REASONING.md §5): wire the async-tool final sink so an async
     // tool's result is recorded to history and (turn-id-gated) volunteered.

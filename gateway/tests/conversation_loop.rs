@@ -2892,3 +2892,172 @@ async fn a_bud_conversation_turn_is_attributed_to_its_caller() {
         "the legs bill themselves: {f:?}"
     );
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Gaia 25 Oct §19: a conversation turn reports its reply to the client — started, the words as
+// they are handed to speech, and how it ended — the same lifecycle a voice-agent turn reports.
+// ──────────────────────────────────────────────────────────────────────────────
+use waav_gateway::core::agent::{AgentSignal, TurnStatus};
+
+fn turn_signals(
+    orch: &ConversationOrchestrator,
+) -> tokio::sync::mpsc::UnboundedReceiver<AgentSignal> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    orch.set_turn_signals(tx);
+    rx
+}
+
+fn drain(rx: &mut tokio::sync::mpsc::UnboundedReceiver<AgentSignal>) -> Vec<AgentSignal> {
+    std::iter::from_fn(|| rx.try_recv().ok()).collect()
+}
+
+fn deltas(signals: &[AgentSignal]) -> String {
+    signals
+        .iter()
+        .filter_map(|s| match s {
+            AgentSignal::Transcript { delta, .. } => Some(delta.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn a_streamed_reply_reaches_the_client_as_it_is_spoken() {
+    unsafe {
+        std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1");
+    }
+    register_mock_tts();
+    reset_tts_stats();
+    let (url, _server) = start_steady_stream_sse_mock().await;
+    let vm = build_voice_manager();
+    vm.start().await.expect("vm start");
+    let _ = wire_audio_egress(&vm).await;
+    let cfg = ConversationConfig {
+        latency_filler: LatencyFiller::Off,
+        ..conv_config(url, true)
+    };
+    let orch = ConversationOrchestrator::new("reply-words", cfg, vm.clone()).expect("orch");
+    let mut rx = turn_signals(&orch);
+
+    orch.run_turn("count for me").await.expect("turn");
+    let got = drain(&mut rx);
+
+    assert!(
+        matches!(&got[0], AgentSignal::ResponseStarted { turn: 0, input: Some(i), .. } if i == "count for me"),
+        "{got:?}"
+    );
+    let words = deltas(&got);
+    let expected = (0..5)
+        .map(|n| format!("Sentence number {n} here."))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert_eq!(words, expected, "the deltas concatenate to the reply");
+    // One delta per sentence handed to speech, never chain-of-thought or a whole-reply repeat.
+    let spoken = TTS_STATS.spoken.lock().clone();
+    assert_eq!(
+        got.iter()
+            .filter(|s| matches!(s, AgentSignal::Transcript { .. }))
+            .count(),
+        spoken.len(),
+        "a delta per spoken chunk: {spoken:?}"
+    );
+    assert!(
+        matches!(got.last(), Some(AgentSignal::ResponseDone { turn: 0, status: TurnStatus::Completed, transcript, .. }) if *transcript == expected),
+        "{got:?}"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn a_whole_reply_and_a_failed_turn_are_reported() {
+    unsafe {
+        std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1");
+    }
+    register_mock_tts();
+    reset_tts_stats();
+    let st = LlmMockState::default();
+    *st.reply.lock() = "Paris, the capital of France.".to_string();
+    let (url, _server) = start_llm_mock(st.clone()).await;
+    let vm = build_voice_manager();
+    vm.start().await.expect("vm start");
+    let _ = wire_audio_egress(&vm).await;
+    let cfg = ConversationConfig {
+        latency_filler: LatencyFiller::Off,
+        ..conv_config(url, false)
+    };
+    let orch = ConversationOrchestrator::new("reply-whole", cfg, vm.clone()).expect("orch");
+    let mut rx = turn_signals(&orch);
+
+    orch.run_turn("what is the capital of France")
+        .await
+        .expect("turn");
+    let got = drain(&mut rx);
+    assert_eq!(deltas(&got), "Paris, the capital of France.");
+    assert!(matches!(
+        got.last(),
+        Some(AgentSignal::ResponseDone {
+            turn: 0,
+            status: TurnStatus::Completed,
+            ..
+        })
+    ));
+
+    // Every tier down: the apology is what the caller heard, and the turn failed.
+    st.fail.store(true, Ordering::SeqCst);
+    let _ = orch.run_turn("hello").await;
+    let got = drain(&mut rx);
+    assert!(deltas(&got).contains("having trouble"), "{got:?}");
+    assert!(matches!(
+        got.last(),
+        Some(AgentSignal::ResponseDone {
+            turn: 1,
+            status: TurnStatus::Failed,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn a_barged_in_reply_is_reported_cancelled() {
+    unsafe {
+        std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1");
+    }
+    register_mock_tts();
+    reset_tts_stats();
+    let st = LlmMockState::default();
+    *st.reply.lock() = "This is a long answer.".to_string();
+    st.delay_ms.store(1500, Ordering::SeqCst);
+    let (url, _server) = start_llm_mock(st.clone()).await;
+    let vm = build_voice_manager();
+    vm.start().await.expect("vm start");
+    let _ = wire_audio_egress(&vm).await;
+    let cfg = ConversationConfig {
+        latency_filler: LatencyFiller::Off,
+        ..conv_config(url, false)
+    };
+    let orch = Arc::new(ConversationOrchestrator::new("reply-cut", cfg, vm.clone()).expect("orch"));
+    let mut rx = turn_signals(&orch);
+
+    let o = orch.clone();
+    let turn = tokio::spawn(async move { o.run_turn("tell me a long story").await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    orch.handle_barge_in().await;
+    let _ = tokio::time::timeout(Duration::from_secs(3), turn).await;
+
+    let got = drain(&mut rx);
+    assert_eq!(deltas(&got), "", "nothing was spoken: {got:?}");
+    assert!(
+        !got.iter()
+            .any(|s| matches!(s, AgentSignal::Truncated { .. })),
+        "nothing heard, nothing truncated: {got:?}"
+    );
+    assert!(matches!(
+        got.last(),
+        Some(AgentSignal::ResponseDone {
+            status: TurnStatus::Cancelled,
+            ..
+        })
+    ));
+}
