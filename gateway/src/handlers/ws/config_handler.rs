@@ -485,7 +485,9 @@ pub async fn handle_config_message(
     // deployment's extras and never a process key.
     if app_state.bud_mode.is_none()
         && let Some(refusal) =
-            client_destination_refusal(stt_ws_config.as_ref(), tts_ws_config.as_ref())
+            client_destination_refusal(stt_ws_config.as_ref(), tts_ws_config.as_ref(), |p| {
+                app_state.config.get_api_key(p).is_ok()
+            })
     {
         warn!(reason = %refusal, "Refusing a client destination for an operator credential");
         send_error(message_tx, refusal).await;
@@ -1078,13 +1080,19 @@ pub(crate) fn agent_config_refusal(
 pub(crate) fn client_destination_refusal(
     stt: Option<&STTWebSocketConfig>,
     tts: Option<&TTSWebSocketConfig>,
+    server_has_key: impl Fn(&str) -> bool,
 ) -> Option<String> {
-    use crate::core::client_destination::refusal;
+    use crate::core::client_destination::{refusal, uses_operator_credential};
+    let operator = |provider: &str,
+                    api_key: Option<&str>,
+                    extras: &serde_json::Map<String, serde_json::Value>| {
+        uses_operator_credential(provider, api_key, extras, &server_has_key)
+    };
     let stt = stt
-        .filter(|c| super::config::client_api_key(c.api_key.as_deref()).is_none())
+        .filter(|c| operator(&c.provider, c.api_key.as_deref(), &c.extras.0))
         .and_then(|c| refusal("stt_config", &c.provider, &c.extras.0));
     stt.or_else(|| {
-        tts.filter(|c| super::config::client_api_key(c.api_key.as_deref()).is_none())
+        tts.filter(|c| operator(&c.provider, c.api_key.as_deref(), &c.extras.0))
             .and_then(|c| refusal("tts_config", &c.provider, &c.extras.0))
     })
 }
@@ -5272,27 +5280,40 @@ mod standalone_destination_tests {
     #[test]
     fn an_override_with_the_operator_key_is_refused_on_either_leg() {
         let evil = json!({"extras": {"endpoint_override": "wss://attacker.example"}});
-        let refusal = client_destination_refusal(Some(&stt(evil.clone())), None).expect("stt");
+        let refusal =
+            client_destination_refusal(Some(&stt(evil.clone())), None, |_| true).expect("stt");
         assert!(
             refusal.contains("stt_config.extras.endpoint_override"),
             "{refusal}"
         );
-        let refusal = client_destination_refusal(None, Some(&tts(evil))).expect("tts");
+        let refusal = client_destination_refusal(None, Some(&tts(evil)), |_| true).expect("tts");
         assert!(
             refusal.contains("tts_config.extras.endpoint_override"),
             "{refusal}"
         );
         let segmented = json!({"extras": {"base_url": "https://attacker.example/v1"}});
-        assert!(client_destination_refusal(Some(&stt(segmented)), None).is_some());
+        assert!(client_destination_refusal(Some(&stt(segmented)), None, |_| true).is_some());
     }
 
     #[test]
     fn a_client_with_its_own_key_may_point_it_anywhere() {
         let own =
             json!({"api_key": "dg-own", "extras": {"endpoint_override": "wss://proxy.example"}});
-        assert_eq!(client_destination_refusal(Some(&stt(own)), None), None);
         assert_eq!(
-            client_destination_refusal(Some(&stt(json!({}))), Some(&tts(json!({})))),
+            client_destination_refusal(Some(&stt(own)), None, |_| true),
+            None
+        );
+        assert_eq!(
+            client_destination_refusal(Some(&stt(json!({}))), Some(&tts(json!({}))), |_| true),
+            None
+        );
+    }
+
+    #[test]
+    fn a_leg_the_server_holds_no_key_for_is_not_judged() {
+        let evil = json!({"extras": {"endpoint_override": "wss://attacker.example"}});
+        assert_eq!(
+            client_destination_refusal(Some(&stt(evil)), None, |_| false),
             None
         );
     }

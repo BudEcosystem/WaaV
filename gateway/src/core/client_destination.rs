@@ -80,6 +80,28 @@ pub fn operator_approved(provider: &str, url: &str) -> bool {
         .is_some_and(|var| global_credentials().bind(var, url).is_ok())
 }
 
+/// Whether a leg would carry the OPERATOR's credential for `provider`: the client sent no key of
+/// its own — neither `api_key` nor a credential in `extras` that providers use in its place
+/// (`access_token` for Google and Cartesia, an AWS key pair for Transcribe and Polly) — and the
+/// server holds one (`server_has_key`, `ServerConfig::get_api_key` succeeding).
+pub fn uses_operator_credential(
+    provider: &str,
+    client_api_key: Option<&str>,
+    extras: &serde_json::Map<String, serde_json::Value>,
+    server_has_key: impl Fn(&str) -> bool,
+) -> bool {
+    let set = |k: &str| {
+        extras
+            .get(k)
+            .and_then(|v| v.as_str())
+            .is_some_and(|v| !v.trim().is_empty())
+    };
+    let client_owns = client_api_key.is_some_and(|k| !k.trim().is_empty())
+        || set("access_token")
+        || (set("aws_access_key_id") && set("aws_secret_access_key"));
+    !client_owns && server_has_key(provider)
+}
+
 /// Why a client config may not use these destinations with the operator's key, or `None`.
 ///
 /// `role` names the config block in the message (`stt_config`, `tts_config`, `config`).
@@ -209,6 +231,34 @@ mod tests {
         assert_eq!(
             refusal("tts_config", "deepgram", &serde_json::Map::new()),
             None
+        );
+    }
+
+    #[test]
+    fn only_a_leg_carrying_the_operators_credential_is_judged() {
+        let none = serde_json::Map::new();
+        let has = |_: &str| true;
+        let lacks = |_: &str| false;
+        assert!(uses_operator_credential("deepgram", None, &none, has));
+        assert!(uses_operator_credential("deepgram", Some("  "), &none, has));
+        assert!(!uses_operator_credential(
+            "deepgram",
+            Some("dg-own"),
+            &none,
+            has
+        ));
+        assert!(
+            !uses_operator_credential("deepgram", None, &none, lacks),
+            "no server key to leak"
+        );
+        let token = extras(json!({ "access_token": "ya29.client" }));
+        assert!(!uses_operator_credential("google", None, &token, has));
+        let aws = extras(json!({ "aws_access_key_id": "AKIA", "aws_secret_access_key": "s" }));
+        assert!(!uses_operator_credential("aws-transcribe", None, &aws, has));
+        let half = extras(json!({ "aws_access_key_id": "AKIA" }));
+        assert!(
+            uses_operator_credential("aws-transcribe", None, &half, has),
+            "half a key pair is not the client's credential"
         );
     }
 
