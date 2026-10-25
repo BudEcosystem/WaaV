@@ -180,6 +180,13 @@ fn check_configuration(config_path: Option<&PathBuf>) -> Vec<String> {
     if let Err(e) = waav_gateway::auth::AuthPolicy::from_env() {
         problems.push(format!("auth: {e}"));
     }
+    // A malformed value refuses every client endpoint at runtime (fail closed): say so here.
+    use waav_gateway::core::client_destination::{CLIENT_ENDPOINTS_ENV, parse_client_endpoints};
+    if let Err(e) = parse_client_endpoints(std::env::var(CLIENT_ENDPOINTS_ENV).ok().as_deref()) {
+        problems.push(format!(
+            "{e} (a malformed value refuses every client-chosen endpoint)"
+        ));
+    }
     if let Some(config) = config.as_ref() {
         let api_requires_auth = config.auth_required
             || config.has_api_secret_auth()
