@@ -687,6 +687,46 @@ impl ServerConfig {
     ///
     /// # Returns
     /// * `String` - The Azure region identifier (e.g., "eastus", "westus2")
+    /// The operator's key for a REALTIME (speech-to-speech) provider, as `/realtime` and DAG
+    /// realtime nodes use it, or `None` when none is configured. Nova Sonic authenticates through
+    /// the AWS credential chain, so it gets a present-but-empty key.
+    pub fn get_realtime_api_key(&self, provider: &str) -> Option<String> {
+        match provider.to_lowercase().as_str() {
+            "openai" => self.openai_api_key.clone(),
+            "hume" => self.hume_api_key.clone(),
+            // OpenAI-protocol clones (own credentials, GA wire reused by delegation).
+            "azure" | "azure-openai" | "azure_openai" => self.azure_openai_api_key.clone(),
+            "grok" | "xai" => self.grok_api_key.clone(),
+            "inworld" => self.inworld_api_key.clone(),
+            // Deepgram Voice Agent (S2S) reuses the EXISTING deepgram credential
+            // (shared with Deepgram STT/TTS — no new config field).
+            "deepgram" | "deepgram-agent" | "deepgram_voice_agent" => self.deepgram_api_key.clone(),
+            // ElevenLabs Conversational AI (S2S) reuses the EXISTING elevenlabs
+            // credential (shared with ElevenLabs STT/TTS — no new config field).
+            "elevenlabs" | "elevenlabs-convai" | "11labs" => self.elevenlabs_api_key.clone(),
+            // Google Gemini Live (BidiGenerateContent S2S) uses the dedicated Gemini
+            // API key (the `?key=` query param) — distinct from `google_credentials`
+            // (the service-account JSON for Google STT/TTS).
+            "gemini" | "gemini-live" | "google" => self.gemini_api_key.clone(),
+            // Ultravox (hosted S2S model API) uses the dedicated Ultravox API key
+            // (the `X-API-Key` create-call header).
+            "ultravox" | "fixie" => self.ultravox_api_key.clone(),
+            // AWS Nova Sonic (Amazon Bedrock S2S) authenticates with AWS credentials
+            // via the `aws-config` default chain (env / shared config / IAM role), NOT
+            // an api-key — so there is NO `nova_sonic_api_key` config field. Supply a
+            // present-but-empty key so the "missing_api_key" guard below is satisfied;
+            // `NovaSonicProtocol::from_config` ignores `cfg.api_key` entirely and the
+            // transport resolves SigV4 credentials at connect (exactly like the AWS
+            // Transcribe STT provider).
+            "nova_sonic" | "nova-sonic" | "aws" => Some(String::new()),
+            // Yandex Cloud AI Studio Realtime (OpenAI-protocol clone) uses the dedicated
+            // Yandex API key (a Yandex IAM token / static API key), passed as the
+            // `Authorization: Bearer <token>` value. The folder id is injected below.
+            "yandex" | "yandexgpt" | "yandex-cloud" => self.yandex_api_key.clone(),
+            _ => None,
+        }
+    }
+
     pub fn get_azure_speech_region(&self) -> String {
         self.azure_speech_region
             .clone()
@@ -763,6 +803,31 @@ pub(crate) fn parse_auth_api_secrets_json(
         .collect())
 }
 
+/// The environment variable that holds `provider`'s operator key, as [`ServerConfig::get_api_key`]
+/// reads it, or `None` for a provider the server holds no key for.
+///
+/// The NAME an operator credential uses to say where that key may go
+/// (`core::credentials`): declaring `DEEPGRAM_API_KEY: {env: DEEPGRAM_API_KEY, hosts: [...]}`
+/// approves those hosts as destinations for the gateway's Deepgram key. Kept beside
+/// `get_api_key_inner`, which must accept exactly the providers this names (tested).
+pub fn provider_key_variable(provider: &str) -> Option<&'static str> {
+    Some(match provider.trim().to_ascii_lowercase().as_str() {
+        "deepgram" => "DEEPGRAM_API_KEY",
+        "elevenlabs" => "ELEVENLABS_API_KEY",
+        "google" => "GOOGLE_APPLICATION_CREDENTIALS",
+        "microsoft-azure" | "azure" => "AZURE_SPEECH_SUBSCRIPTION_KEY",
+        "cartesia" => "CARTESIA_API_KEY",
+        "openai" => "OPENAI_API_KEY",
+        "assemblyai" => "ASSEMBLYAI_API_KEY",
+        "hume" => "HUME_API_KEY",
+        "groq" => "GROQ_API_KEY",
+        "ibm-watson" | "ibm_watson" | "ibm" | "watson" => "IBM_WATSON_API_KEY",
+        "aws" | "aws-transcribe" | "aws-polly" | "amazon" => "AWS_ACCESS_KEY_ID",
+        "gnani" | "gnani-ai" | "gnani.ai" | "vachana" => "GNANI_TOKEN",
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -770,6 +835,51 @@ mod tests {
     use std::env;
     use std::fs;
     use tempfile::TempDir;
+
+    /// `provider_key_variable` names a variable for exactly the providers `get_api_key` serves:
+    /// a provider missing from it could not have its key's destinations declared, and one extra
+    /// would approve destinations for a key the server never sends.
+    #[test]
+    fn provider_key_variable_covers_exactly_the_providers_get_api_key_serves() {
+        let config = test_config();
+        for provider in [
+            "deepgram",
+            "elevenlabs",
+            "google",
+            "microsoft-azure",
+            "azure",
+            "cartesia",
+            "openai",
+            "assemblyai",
+            "hume",
+            "groq",
+            "ibm-watson",
+            "ibm_watson",
+            "ibm",
+            "watson",
+            "aws",
+            "aws-transcribe",
+            "aws-polly",
+            "amazon",
+            "gnani",
+            "gnani-ai",
+            "gnani.ai",
+            "vachana",
+        ] {
+            assert!(provider_key_variable(provider).is_some(), "{provider}");
+            let served = config.get_api_key_inner(provider);
+            assert!(
+                !served
+                    .as_ref()
+                    .is_err_and(|e| e.starts_with("Unsupported provider")),
+                "{provider}: {served:?}"
+            );
+        }
+        for provider in ["sarvam", "speechmatics", "no-such-vendor"] {
+            assert_eq!(provider_key_variable(provider), None, "{provider}");
+            assert!(config.get_api_key_inner(provider).is_err(), "{provider}");
+        }
+    }
 
     /// Helper function to create a test ServerConfig with defaults
     fn test_config() -> ServerConfig {

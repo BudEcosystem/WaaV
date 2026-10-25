@@ -435,14 +435,15 @@ async fn ws_asking_to_stream_a_file_only_model_is_a_coded_refusal_and_the_socket
 async fn ws_a_client_named_private_base_is_refused_without_the_escape_hatch() {
     // The same check, at plan time, with the hatch off: a private address the client named is
     // never dialled. The hatch is process-wide here, so the check is exercised directly.
+    let off = waav_segmented_stt::net::PrivateReach::default();
     assert!(
-        waav_segmented_stt::transcriber::http::check_untrusted_base("http://127.0.0.1:9/v1", false)
+        waav_segmented_stt::transcriber::http::check_untrusted_base("http://127.0.0.1:9/v1", &off)
             .is_err()
     );
     assert!(
         waav_segmented_stt::transcriber::http::check_untrusted_base(
             "http://169.254.169.254/",
-            false
+            &off
         )
         .is_err()
     );

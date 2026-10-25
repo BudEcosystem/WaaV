@@ -607,6 +607,9 @@ impl ConversationConfig {
 pub struct ConversationOrchestrator {
     session_id: String,
     llm: Arc<LlmClient>,
+    /// Set when the LLM leg runs keyless although the vendor key is configured (see
+    /// [`KeyAdvisory`]); the `/ws` handler sends it as a `config_warning`.
+    key_advisory: Option<KeyAdvisory>,
     voice_manager: Arc<VoiceManager>,
     config: Arc<ConversationConfig>,
     /// In-flight LLM turn token + its generation id.
@@ -765,8 +768,9 @@ pub struct TurnAttribution {
 /// OPENAI_API_KEY to whatever base_url was given.)
 fn resolve_llm_legs(
     config: &ConversationConfig,
-) -> Result<(Arc<LlmClient>, Option<Arc<LlmClient>>), ConversationOrchestratorError> {
+) -> Result<KeyedLegs, ConversationOrchestratorError> {
     let base = LlmClient::new(config.to_client_config());
+    let mut key_advisory = None;
     let llm = if config.server_llm_endpoint {
         // The operator's in-cluster Bud gateway, keyed per call by the session credential.
         base
@@ -774,13 +778,69 @@ fn resolve_llm_legs(
         let key = client_key_for(&base, config.api_key.as_deref(), &config.base_url)?;
         validate_llm_url_with_grants(&config.base_url, &key.private_grants)
             .map_err(ConversationOrchestratorError::InvalidLlmUrl)?;
+        key_advisory = key
+            .withheld
+            .as_deref()
+            .map(|name| withheld_key_advisory(name, &config.base_url));
         base.with_client_key(key)
     };
     let llm = Arc::new(llm);
     // S1/S2: the reasoning tier's base_url is ALSO client-supplied — it is validated for SSRF
     // (with its own key's grants) before it is ever used for a request.
     let reasoning_llm = build_reasoning_tier(&llm, config, true)?;
-    Ok((llm, reasoning_llm))
+    Ok(KeyedLegs {
+        llm,
+        reasoning_llm,
+        key_advisory,
+    })
+}
+
+/// The LLM legs [`resolve_llm_legs`] built, and what the client should hear about their keys.
+struct KeyedLegs {
+    llm: Arc<LlmClient>,
+    reasoning_llm: Option<Arc<LlmClient>>,
+    key_advisory: Option<KeyAdvisory>,
+}
+
+/// The LLM leg runs keyless although the operator configured the vendor's key: its target is not
+/// one of that key's hosts (`core::credentials`). Sent to the client as `config_warning
+/// llm_key_not_sent`, and logged, so the server's 401 has an explanation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyAdvisory {
+    /// The withheld key's name (e.g. `OPENAI_API_KEY`), never its value.
+    pub credential: String,
+    /// The target's `host:port`.
+    pub host: String,
+}
+
+impl KeyAdvisory {
+    pub fn message(&self) -> String {
+        format!(
+            "{} is configured on this gateway but was not sent to {}: it is bound to other hosts. \
+             Declare a credential for this host (WAAV_CREDENTIALS_JSON) and name it with \
+             credential_ref, or send your own api_key",
+            self.credential, self.host
+        )
+    }
+}
+
+fn withheld_key_advisory(credential: &str, base_url: &str) -> KeyAdvisory {
+    let host = url::Url::parse(base_url)
+        .ok()
+        .and_then(|u| {
+            let host = u.host_str()?.to_string();
+            Some(match u.port_or_known_default() {
+                Some(p) => format!("{host}:{p}"),
+                None => host,
+            })
+        })
+        .unwrap_or_else(|| base_url.to_string());
+    let advisory = KeyAdvisory {
+        credential: credential.to_string(),
+        host,
+    };
+    warn!(credential = %advisory.credential, host = %advisory.host, "LLM leg runs without the operator key: the target is not one of its hosts");
+    advisory
 }
 
 /// The key decision for one client-configured LLM leg (`core::credentials`).
@@ -817,11 +877,16 @@ impl ConversationOrchestrator {
         config: ConversationConfig,
         voice_manager: Arc<VoiceManager>,
     ) -> Result<Self, ConversationOrchestratorError> {
-        let (llm, reasoning_llm) = resolve_llm_legs(&config)?;
+        let KeyedLegs {
+            llm,
+            reasoning_llm,
+            key_advisory,
+        } = resolve_llm_legs(&config)?;
         Ok(Self {
             session_id: session_id.into(),
             llm,
             reasoning_llm,
+            key_advisory,
             last_turn_was_reasoning: Arc::new(SyncMutex::new(false)),
             voice_manager,
             config: Arc::new(config),
@@ -836,6 +901,11 @@ impl ConversationOrchestrator {
             masking_handle: Arc::new(SyncMutex::new(None)),
             masking_phrase_idx: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
+    }
+
+    /// Why the LLM leg runs without the configured vendor key, if it does.
+    pub fn key_advisory(&self) -> Option<&KeyAdvisory> {
+        self.key_advisory.as_ref()
     }
 
     /// Construct from a pre-built `LlmClient` (used in tests to inject a mock
@@ -853,6 +923,7 @@ impl ConversationOrchestrator {
             session_id: session_id.into(),
             llm,
             reasoning_llm,
+            key_advisory: None,
             last_turn_was_reasoning: Arc::new(SyncMutex::new(false)),
             voice_manager,
             config: Arc::new(config),

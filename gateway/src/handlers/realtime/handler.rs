@@ -689,44 +689,7 @@ async fn handle_config(
     }
 
     // Get API key from config based on provider
-    let api_key = match provider_name.to_lowercase().as_str() {
-        "openai" => app_state.config.openai_api_key.clone(),
-        "hume" => app_state.config.hume_api_key.clone(),
-        // OpenAI-protocol clones (own credentials, GA wire reused by delegation).
-        "azure" | "azure-openai" | "azure_openai" => app_state.config.azure_openai_api_key.clone(),
-        "grok" | "xai" => app_state.config.grok_api_key.clone(),
-        "inworld" => app_state.config.inworld_api_key.clone(),
-        // Deepgram Voice Agent (S2S) reuses the EXISTING deepgram credential
-        // (shared with Deepgram STT/TTS — no new config field).
-        "deepgram" | "deepgram-agent" | "deepgram_voice_agent" => {
-            app_state.config.deepgram_api_key.clone()
-        }
-        // ElevenLabs Conversational AI (S2S) reuses the EXISTING elevenlabs
-        // credential (shared with ElevenLabs STT/TTS — no new config field).
-        "elevenlabs" | "elevenlabs-convai" | "11labs" => {
-            app_state.config.elevenlabs_api_key.clone()
-        }
-        // Google Gemini Live (BidiGenerateContent S2S) uses the dedicated Gemini
-        // API key (the `?key=` query param) — distinct from `google_credentials`
-        // (the service-account JSON for Google STT/TTS).
-        "gemini" | "gemini-live" | "google" => app_state.config.gemini_api_key.clone(),
-        // Ultravox (hosted S2S model API) uses the dedicated Ultravox API key
-        // (the `X-API-Key` create-call header).
-        "ultravox" | "fixie" => app_state.config.ultravox_api_key.clone(),
-        // AWS Nova Sonic (Amazon Bedrock S2S) authenticates with AWS credentials
-        // via the `aws-config` default chain (env / shared config / IAM role), NOT
-        // an api-key — so there is NO `nova_sonic_api_key` config field. Supply a
-        // present-but-empty key so the "missing_api_key" guard below is satisfied;
-        // `NovaSonicProtocol::from_config` ignores `cfg.api_key` entirely and the
-        // transport resolves SigV4 credentials at connect (exactly like the AWS
-        // Transcribe STT provider).
-        "nova_sonic" | "nova-sonic" | "aws" => Some(String::new()),
-        // Yandex Cloud AI Studio Realtime (OpenAI-protocol clone) uses the dedicated
-        // Yandex API key (a Yandex IAM token / static API key), passed as the
-        // `Authorization: Bearer <token>` value. The folder id is injected below.
-        "yandex" | "yandexgpt" | "yandex-cloud" => app_state.config.yandex_api_key.clone(),
-        _ => None,
-    };
+    let api_key = app_state.config.get_realtime_api_key(provider_name);
 
     let Some(api_key) = api_key else {
         send_realtime_with_policy(

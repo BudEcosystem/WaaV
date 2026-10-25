@@ -32,10 +32,10 @@ pub struct HttpSettings {
     /// Equal to the largest depth the warming rule asks for, so the cap never undoes a warm-up.
     pub pool_max_idle_per_host: usize,
     pub tcp_keepalive: Duration,
-    /// The operator's escape hatch (the gateway's `WAAV_ALLOW_LOOPBACK_ENDPOINTS`, for local
-    /// development and tests): the public pool may then connect to private addresses, and a base
-    /// a client named may be one.
-    pub public_may_reach_private: bool,
+    /// The private targets the operator lets a client-named base reach (the gateway's
+    /// `WAAV_ALLOW_LOOPBACK_ENDPOINTS` and `WAAV_PRIVATE_EGRESS_ALLOWLIST`). The public pool's
+    /// resolver and [`check_untrusted_base`] apply the same rule.
+    pub private_reach: crate::net::PrivateReach,
 }
 
 impl Default for HttpSettings {
@@ -47,7 +47,7 @@ impl Default for HttpSettings {
             pool_idle_timeout: Duration::from_millis(50_000),
             pool_max_idle_per_host: 64,
             tcp_keepalive: Duration::from_secs(15),
-            public_may_reach_private: false,
+            private_reach: crate::net::PrivateReach::default(),
         }
     }
 }
@@ -170,21 +170,21 @@ impl UploadClients {
             None
         } else {
             Some((
-                build(settings, false, !settings.public_may_reach_private)?,
+                build(settings, false, true)?,
                 build(settings, false, false)?,
             ))
         };
         Ok(Self {
-            public: build(settings, true, !settings.public_may_reach_private)?,
+            public: build(settings, true, true)?,
             trusted: build(settings, true, false)?,
             http2,
             settings: settings.clone(),
         })
     }
 
-    /// Whether a base a client named may be a private address (the operator's escape hatch).
-    pub fn public_may_reach_private(&self) -> bool {
-        self.settings.public_may_reach_private
+    /// The private targets a base a client named may reach (the operator's exemptions).
+    pub fn private_reach(&self) -> &crate::net::PrivateReach {
+        &self.settings.private_reach
     }
 
     /// The HTTP/1.1 client for public vendor hosts, or for a trusted in-cluster base.
@@ -222,7 +222,9 @@ fn build(s: &HttpSettings, http1_only: bool, public_only: bool) -> Result<reqwes
         .tcp_keepalive(s.tcp_keepalive)
         .tcp_nodelay(true);
     let b = if public_only {
-        b.dns_resolver(std::sync::Arc::new(PublicOnlyResolver))
+        b.dns_resolver(std::sync::Arc::new(PublicOnlyResolver {
+            reach: s.private_reach.clone(),
+        }))
     } else {
         b
     };
@@ -240,15 +242,19 @@ fn build(s: &HttpSettings, http1_only: bool, public_only: bool) -> Result<reqwes
 /// The public pool's resolver: a name is used only through its public addresses, so a vendor host
 /// (or a host a client named) that resolves to a private, loopback or metadata address is never
 /// dialled. An IP literal skips resolution; [`check_untrusted_base`] refuses those at plan time.
-struct PublicOnlyResolver;
+/// The operator's exemptions ([`crate::net::PrivateReach`]) are the only private addresses kept.
+struct PublicOnlyResolver {
+    reach: crate::net::PrivateReach,
+}
 
 impl reqwest::dns::Resolve for PublicOnlyResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let reach = self.reach.clone();
         Box::pin(async move {
             let host = name.as_str().to_string();
             let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host.as_str(), 0))
                 .await?
-                .filter(|a| is_public_ip(&a.ip()))
+                .filter(|a| is_public_ip(&a.ip()) || reach.permits_resolved(&host, &a.ip()))
                 .collect();
             if addrs.is_empty() {
                 return Err(format!(
@@ -265,8 +271,9 @@ pub use crate::net::is_public_ip;
 
 /// A base address a client named (not one from a Bud deployment record): `http` or `https`, and
 /// a host the gateway's SSRF rule accepts ([`crate::net::check_host`]). Names are checked again at
-/// connect time by the public pool's resolver. `allow_private` is the operator's escape hatch.
-pub fn check_untrusted_base(base: &str, allow_private: bool) -> Result<(), String> {
+/// connect time by the public pool's resolver. `reach` is what the operator exempted: loopback
+/// (on its permitted ports) and exact `host:port` pairs, never any other private range.
+pub fn check_untrusted_base(base: &str, reach: &crate::net::PrivateReach) -> Result<(), String> {
     let u = url::Url::parse(base.trim())
         .map_err(|e| format!("'{base}' is not a valid address: {e}"))?;
     if !matches!(u.scheme(), "http" | "https") {
@@ -274,12 +281,12 @@ pub fn check_untrusted_base(base: &str, allow_private: bool) -> Result<(), Strin
             "'{base}': only http and https addresses are accepted"
         ));
     }
-    if allow_private {
-        return Ok(());
-    }
     let host = u
         .host_str()
         .ok_or_else(|| format!("'{base}' has no host"))?;
+    if reach.permits_host(host, u.port_or_known_default()) {
+        return Ok(());
+    }
     crate::net::check_host(host)
         .map(|_| ())
         .map_err(|e| format!("'{base}': {e}"))
@@ -359,6 +366,7 @@ pub async fn warm_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::net::PrivateReach;
     use std::collections::{HashMap, HashSet};
     use std::net::SocketAddr;
     use std::sync::Arc;
@@ -464,7 +472,10 @@ mod tests {
         );
 
         let dev = UploadClients::new(&HttpSettings {
-            public_may_reach_private: true,
+            private_reach: crate::net::PrivateReach {
+                loopback_ports: Some(Vec::new()),
+                allowed: Vec::new(),
+            },
             ..Default::default()
         })
         .unwrap();
@@ -519,19 +530,84 @@ mod tests {
             "ftp://files.example.com",
             "not a url",
         ] {
-            assert!(check_untrusted_base(bad, false).is_err(), "{bad}");
+            assert!(
+                check_untrusted_base(bad, &PrivateReach::default()).is_err(),
+                "{bad}"
+            );
         }
         for good in ["https://api.example.com/v1", "http://asr.example.com:8000"] {
-            assert!(check_untrusted_base(good, false).is_ok(), "{good}");
+            assert!(
+                check_untrusted_base(good, &PrivateReach::default()).is_ok(),
+                "{good}"
+            );
         }
+        let any_loopback = PrivateReach {
+            loopback_ports: Some(Vec::new()),
+            allowed: Vec::new(),
+        };
         assert!(
-            check_untrusted_base("http://127.0.0.1:9/v1", true).is_ok(),
+            check_untrusted_base("http://127.0.0.1:9/v1", &any_loopback).is_ok(),
             "the operator's escape hatch"
         );
         assert!(
-            check_untrusted_base("ftp://x.example.com", true).is_err(),
+            check_untrusted_base("ftp://x.example.com", &any_loopback).is_err(),
             "never another scheme"
         );
+    }
+
+    /// The loopback escape hatch exempts LOOPBACK, on its ports: it used to let a client-named base
+    /// reach every private range, cloud metadata included, while the gateway's other legs refused.
+    #[test]
+    fn the_escape_hatch_reaches_loopback_only_and_exemptions_are_port_exact() {
+        let any_loopback = PrivateReach {
+            loopback_ports: Some(Vec::new()),
+            allowed: Vec::new(),
+        };
+        for bad in [
+            "http://169.254.169.254/latest",
+            "http://10.0.0.5:80",
+            "http://192.168.1.10:8000",
+            "http://[fe80::1]/",
+            "http://metadata.google.internal/",
+        ] {
+            assert!(check_untrusted_base(bad, &any_loopback).is_err(), "{bad}");
+        }
+        for good in [
+            "http://127.0.0.1:8080",
+            "http://localhost:9000",
+            "http://[::1]:7/",
+        ] {
+            assert!(check_untrusted_base(good, &any_loopback).is_ok(), "{good}");
+        }
+
+        let port_8080 = PrivateReach {
+            loopback_ports: Some(vec![8080]),
+            allowed: Vec::new(),
+        };
+        assert!(check_untrusted_base("http://127.0.0.1:8080/v1", &port_8080).is_ok());
+        assert!(check_untrusted_base("http://127.0.0.1:8081/v1", &port_8080).is_err());
+
+        let allowlisted = PrivateReach {
+            loopback_ports: None,
+            allowed: vec![("10.0.0.5".into(), 8000)],
+        };
+        assert!(check_untrusted_base("http://10.0.0.5:8000", &allowlisted).is_ok());
+        assert!(check_untrusted_base("http://10.0.0.5:8001", &allowlisted).is_err());
+        assert!(check_untrusted_base("http://127.0.0.1:8000", &allowlisted).is_err());
+    }
+
+    #[test]
+    fn the_resolver_keeps_private_addresses_only_for_exemptions() {
+        let reach = PrivateReach {
+            loopback_ports: Some(vec![8080]),
+            allowed: vec![("asr.lan".into(), 8000)],
+        };
+        let loopback: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let rfc1918: std::net::IpAddr = "10.0.0.5".parse().unwrap();
+        assert!(reach.permits_resolved("anything", &loopback));
+        assert!(!reach.permits_resolved("anything", &rfc1918));
+        assert!(reach.permits_resolved("ASR.lan", &rfc1918));
+        assert!(!PrivateReach::default().permits_resolved("anything", &loopback));
     }
 
     #[test]

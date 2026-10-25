@@ -253,6 +253,9 @@ pub struct STTProviderNode {
     config: serde_json::Value,
     /// Configurable timeout in seconds (default: 30, max: 300)
     timeout_secs: u64,
+    /// The gateway's own key for this provider, used when the node's config names none
+    /// (`DAGCompiler::with_server_keys`). Never printed: the `Debug` impl omits it.
+    server_key: Option<String>,
 }
 
 impl STTProviderNode {
@@ -265,7 +268,14 @@ impl STTProviderNode {
             language: None,
             config: serde_json::Value::Null,
             timeout_secs: DEFAULT_STT_TIMEOUT_SECS,
+            server_key: None,
         }
+    }
+
+    /// The gateway's own key for this provider, used when the node's config names none.
+    pub fn with_server_key(mut self, key: Option<String>) -> Self {
+        self.server_key = key;
+        self
     }
 
     /// Set the model to use
@@ -375,6 +385,7 @@ impl DAGNode for STTProviderNode {
             &self.provider,
             "STT",
         )?
+        .or_else(|| self.server_key.clone())
         .unwrap_or_default();
         let stt_config = crate::core::stt::STTConfig {
             provider: self.provider.clone(),
@@ -626,6 +637,9 @@ pub struct TTSProviderNode {
     max_audio_bytes: usize,
     /// FRD-023 WP-RT6.3: bound to a Bud deployment by the server.
     bud: Option<Arc<BudNodeBinding>>,
+    /// The gateway's own key for this provider, used when the node's config names none
+    /// (`DAGCompiler::with_server_keys`). Never printed: the `Debug` impl omits it.
+    server_key: Option<String>,
 }
 
 impl TTSProviderNode {
@@ -639,7 +653,14 @@ impl TTSProviderNode {
             config: serde_json::Value::Null,
             max_audio_bytes: DEFAULT_MAX_TTS_AUDIO_BYTES,
             bud: None,
+            server_key: None,
         }
+    }
+
+    /// The gateway's own key for this provider, used when the node's config names none.
+    pub fn with_server_key(mut self, key: Option<String>) -> Self {
+        self.server_key = key;
+        self
     }
 
     /// Set the voice ID
@@ -710,6 +731,7 @@ impl TTSProviderNode {
                 &self.provider,
                 "TTS",
             )?
+            .or_else(|| self.server_key.clone())
             .unwrap_or_default(),
         };
         let defaults = crate::core::tts::TTSConfig::default();
@@ -1316,6 +1338,9 @@ pub struct RealtimeProviderNode {
     provider: String,
     model: Option<String>,
     config: serde_json::Value,
+    /// The gateway's own key for this provider, used when the node's config names none
+    /// (`DAGCompiler::with_server_keys`). Never printed: the `Debug` impl omits it.
+    server_key: Option<String>,
 }
 
 impl RealtimeProviderNode {
@@ -1326,7 +1351,14 @@ impl RealtimeProviderNode {
             provider: provider.into(),
             model: None,
             config: serde_json::Value::Null,
+            server_key: None,
         }
+    }
+
+    /// The gateway's own key for this provider, used when the node's config names none.
+    pub fn with_server_key(mut self, key: Option<String>) -> Self {
+        self.server_key = key;
+        self
     }
 
     /// Set the model
@@ -1399,6 +1431,11 @@ impl RealtimeProviderNode {
         // Credential resolution WINS over any `api_key` the config JSON carried, but
         // fall back to the deserialized key if the resolver found nothing.
         if let Some(key) = resolve_node_credential(&self.config, "api_key") {
+            realtime_config.api_key = key;
+        }
+        if realtime_config.api_key.trim().is_empty()
+            && let Some(key) = self.server_key.clone()
+        {
             realtime_config.api_key = key;
         }
         // SSRF: never let a DAG `config` redirect the gateway's upstream connection.

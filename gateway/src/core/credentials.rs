@@ -62,6 +62,31 @@ pub const IMPLICIT_BINDINGS: &[(&str, &[&str])] = &[
     ("PERPLEXITY_API_KEY", &["api.perplexity.ai"]),
     ("COHERE_API_KEY", &["api.cohere.ai", "api.cohere.com"]),
     ("SARVAM_API_KEY", &["api.sarvam.ai"]),
+    // Speech vendors' keys, against the vendor's own hosts: what a client-chosen destination for
+    // the gateway's speech credential may be without a declaration (`core::client_destination`).
+    (
+        "DEEPGRAM_API_KEY",
+        &["api.deepgram.com", "api.eu.deepgram.com"],
+    ),
+    (
+        "ELEVENLABS_API_KEY",
+        &["api.elevenlabs.io", "*.elevenlabs.io"],
+    ),
+    ("CARTESIA_API_KEY", &["api.cartesia.ai"]),
+    (
+        "ASSEMBLYAI_API_KEY",
+        &["api.assemblyai.com", "*.assemblyai.com"],
+    ),
+    ("HUME_API_KEY", &["api.hume.ai"]),
+    (
+        "AZURE_SPEECH_SUBSCRIPTION_KEY",
+        &[
+            "*.stt.speech.microsoft.com",
+            "*.tts.speech.microsoft.com",
+            "*.api.cognitive.microsoft.com",
+            "*.cognitiveservices.azure.com",
+        ],
+    ),
 ];
 
 /// One operator credential as written in the credentials file.
@@ -80,6 +105,15 @@ pub struct CredentialSpec {
     /// addresses. Never applies to entries without a port.
     #[serde(default)]
     pub private: bool,
+    /// Whether a CLIENT may name it (`credential_ref`, `${NAME}`, a client DAG's LLM node).
+    /// `false` keeps it for the operator's own config — aliases and server DAG templates — so a
+    /// key holder cannot spend it against its hosts with any model and path. Default `true`.
+    #[serde(default = "default_true")]
+    pub clients: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// A credential a request is allowed to use, bound to the request's target. Read at call time
@@ -125,6 +159,8 @@ struct Credential {
     source: SecretSourceSpec,
     hosts: Vec<HostPattern>,
     private: bool,
+    /// See [`CredentialSpec::clients`]; implicit vendor bindings are always nameable.
+    clients: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -197,6 +233,11 @@ pub enum CredentialError {
     BadUrl(String),
     #[error("both api_key and credential_ref are set; send one")]
     Ambiguous,
+    #[error(
+        "credential '{0}' is reserved for this gateway's own configuration (aliases and server \
+         DAG templates); a client may not name it. Use an alias that carries it"
+    )]
+    NotForClients(String),
 }
 
 /// The key decision for one client-configured LLM target.
@@ -208,6 +249,10 @@ pub struct ClientKey {
     pub bound: Option<BoundCredential>,
     /// `host:port` entries of `bound` that may be private (for the SSRF check and the resolver).
     pub private_grants: Vec<HostPort>,
+    /// The vendor's default key (e.g. `OPENAI_API_KEY`) when it is configured but was NOT bound,
+    /// because the target is not one of its hosts. Callers say so: the leg runs keyless, and the
+    /// server's 401 would otherwise name neither the key nor the host.
+    pub withheld: Option<String>,
 }
 
 /// The process-wide registry of operator credentials.
@@ -258,6 +303,12 @@ pub fn initialize_credentials() -> Result<usize, String> {
              WAAV_PRIVATE_EGRESS_ALLOWLIST=127.0.0.1:8000"
         );
     }
+    if std::env::var(OPENAI_BASE_URL_ENV).is_ok_and(|v| v.trim().is_empty()) {
+        tracing::warn!(
+            "{OPENAI_BASE_URL_ENV} is set but empty: the openai providers use OpenAI's cloud \
+             (api.openai.com). Unset it to mean that, or set the server's address"
+        );
+    }
     let _ = GLOBAL.set(Arc::new(registry));
     Ok(n)
 }
@@ -303,6 +354,7 @@ impl CredentialRegistry {
                     source,
                     hosts,
                     private: spec.private,
+                    clients: spec.clients,
                 },
             );
         }
@@ -314,21 +366,13 @@ impl CredentialRegistry {
         if let Some(c) = self.by_name.get(&name.to_ascii_lowercase()) {
             return Some(c.clone());
         }
-        IMPLICIT_BINDINGS
-            .iter()
-            .find(|(var, _)| var.eq_ignore_ascii_case(name))
-            .map(|(var, hosts)| Credential {
-                name: (*var).to_string(),
-                source: SecretSourceSpec::Env((*var).to_string()),
-                hosts: hosts
-                    .iter()
-                    .map(|h| HostPattern {
-                        host: (*h).to_string(),
-                        port: None,
-                    })
-                    .collect(),
-                private: false,
-            })
+        implicit_binding(name).map(|implicit| {
+            if implicit.name == OPENAI_KEY_ENV {
+                with_operator_base(implicit, std::env::var(OPENAI_BASE_URL_ENV).ok().as_deref())
+            } else {
+                implicit
+            }
+        })
     }
 
     /// Bind credential `name` to `url`, or say why not.
@@ -378,6 +422,40 @@ impl CredentialRegistry {
         ))
     }
 
+    /// Refuse a credential a CLIENT named (`api_key: "${NAME}"` or `credential_ref`) when the
+    /// operator kept it for its own config (`clients: false`). Call it where a value is known to
+    /// come from the client — before an alias is spliced in, or for a client DAG — since
+    /// [`Self::resolve_client_key`] also serves alias-supplied names. A name nobody declared is
+    /// left to `resolve_client_key`, which refuses it with its own reason.
+    pub fn refuse_operator_only(
+        &self,
+        api_key: Option<&str>,
+        credential_ref: Option<&str>,
+    ) -> Result<(), CredentialError> {
+        let named = credential_ref
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                api_key
+                    .and_then(explicit_api_key)
+                    .as_deref()
+                    .and_then(env_reference)
+                    .map(str::to_string)
+            });
+        match named {
+            Some(name)
+                if self
+                    .by_name
+                    .get(&name.to_ascii_lowercase())
+                    .is_some_and(|c| !c.clients) =>
+            {
+                Err(CredentialError::NotForClients(name))
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// The key decision for a CLIENT-configured LLM target (`conversation_config`, an inline
     /// DAG `llm_endpoint`/`translate`, `interaction.tasks.llm`):
     ///
@@ -404,9 +482,9 @@ impl CredentialRegistry {
         if let Some(name) = reference {
             let (bound, private_grants) = self.bind(&name, base_url)?;
             return Ok(ClientKey {
-                literal: None,
                 bound: Some(bound),
                 private_grants,
+                ..Default::default()
             });
         }
         if let Some(literal) = api_key {
@@ -418,13 +496,72 @@ impl CredentialRegistry {
         // No key named: the vendor's own key, only toward the vendor's own host.
         Ok(match self.bind(default_env_key, base_url) {
             Ok((bound, private_grants)) => ClientKey {
-                literal: None,
                 bound: Some(bound),
                 private_grants,
+                ..Default::default()
             },
-            Err(_) => ClientKey::default(),
+            Err(_) => ClientKey {
+                withheld: env_api_key(default_env_key).map(|_| default_env_key.to_string()),
+                ..Default::default()
+            },
         })
     }
+}
+
+/// An [`IMPLICIT_BINDINGS`] entry as a credential: the vendor's key, its own hosts, no port.
+fn implicit_binding(name: &str) -> Option<Credential> {
+    IMPLICIT_BINDINGS
+        .iter()
+        .find(|(var, _)| var.eq_ignore_ascii_case(name))
+        .map(|(var, hosts)| Credential {
+            name: (*var).to_string(),
+            source: SecretSourceSpec::Env((*var).to_string()),
+            hosts: hosts
+                .iter()
+                .map(|h| HostPattern {
+                    host: (*h).to_string(),
+                    port: None,
+                })
+                .collect(),
+            private: false,
+            clients: true,
+        })
+}
+
+const OPENAI_KEY_ENV: &str = "OPENAI_API_KEY";
+const OPENAI_BASE_URL_ENV: &str = "OPENAI_BASE_URL";
+
+/// The implicit `OPENAI_API_KEY` binding, widened to the operator's `OPENAI_BASE_URL`.
+///
+/// The speech legs already send that key to that base (it is operator configuration), so an LLM
+/// leg pointed at the same server gets the key too, where it used to get none: a conversation
+/// `base_url` naming the operator's local OpenAI-compatible server received no `Authorization`
+/// and failed as a 401 nobody could trace. The entry is the base's exact `host:port`, and that
+/// one entry may be private — a loopback or LAN server is the usual reason to set the variable.
+/// Unset or blank leaves `api.openai.com` only.
+fn with_operator_base(mut cred: Credential, base: Option<&str>) -> Credential {
+    let Some(base) = base.map(str::trim).filter(|b| !b.is_empty()) else {
+        return cred;
+    };
+    let Some((host, port)) = url::Url::parse(base).ok().and_then(|u| {
+        Some((
+            u.host_str()?.to_ascii_lowercase(),
+            u.port_or_known_default()?,
+        ))
+    }) else {
+        tracing::warn!(base = %base, "{OPENAI_BASE_URL_ENV} is not a URL; {OPENAI_KEY_ENV} stays bound to api.openai.com only");
+        return cred;
+    };
+    if cred.hosts.iter().all(|h| h.host != host) {
+        cred.hosts.push(HostPattern {
+            host,
+            port: Some(port),
+        });
+        // Private grants come only from patterns with a port: api.openai.com has none, so this
+        // exempts exactly the operator's base.
+        cred.private = true;
+    }
+    cred
 }
 
 /// `${NAME}` → `NAME` (the legacy reference spelling), else `None`.
@@ -574,6 +711,131 @@ azure:
             k.bound.as_ref().map(BoundCredential::name),
             Some("OPENAI_API_KEY")
         );
+    }
+
+    fn implicit_openai() -> Credential {
+        implicit_binding("OPENAI_API_KEY").expect("an implicit binding")
+    }
+
+    fn bind_with(
+        cred: Credential,
+        url: &str,
+    ) -> Result<(BoundCredential, Vec<HostPort>), CredentialError> {
+        let mut by_name = HashMap::new();
+        by_name.insert("openai_api_key".to_string(), cred);
+        CredentialRegistry { by_name }.bind("OPENAI_API_KEY", url)
+    }
+
+    /// The operator's OPENAI_BASE_URL is where the speech legs already send OPENAI_API_KEY; an
+    /// LLM leg aimed at the same server now gets it too (it used to get no key and a 401).
+    #[test]
+    fn the_operator_openai_base_extends_the_implicit_binding_by_exact_host_port() {
+        let widened = with_operator_base(implicit_openai(), Some("http://127.0.0.1:8080"));
+        let (_, grants) = bind_with(widened.clone(), "http://127.0.0.1:8080/v1").unwrap();
+        assert_eq!(
+            grants,
+            vec![HostPort {
+                host: "127.0.0.1".into(),
+                port: 8080
+            }]
+        );
+        assert!(bind_with(widened.clone(), "http://127.0.0.1:8081/v1").is_err());
+        let (_, grants) = bind_with(widened, "https://api.openai.com/v1").unwrap();
+        assert!(grants.is_empty(), "api.openai.com is never a private grant");
+
+        let ported = with_operator_base(implicit_openai(), Some("https://llm.lan/v1"));
+        assert!(bind_with(ported.clone(), "https://llm.lan:443/v1").is_ok());
+        assert!(bind_with(ported, "https://evil.example/v1").is_err());
+    }
+
+    #[test]
+    fn a_blank_or_unparseable_operator_base_widens_nothing() {
+        for base in [None, Some(""), Some("   "), Some("not a url")] {
+            let cred = with_operator_base(implicit_openai(), base);
+            assert_eq!(cred.hosts.len(), 1, "{base:?}");
+            assert!(!cred.private, "{base:?}");
+        }
+    }
+
+    #[test]
+    fn an_operator_only_credential_cannot_be_named_by_a_client() {
+        let specs: HashMap<String, CredentialSpec> = serde_yaml::from_str(
+            r#"
+local-gw:
+  env: WAAV_TEST_LOCAL_GW_KEY
+  hosts: ["127.0.0.1:8080"]
+  private: true
+  clients: false
+shared:
+  env: WAAV_TEST_SHARED_KEY
+  hosts: ["api.example.com"]
+"#,
+        )
+        .unwrap();
+        let r = CredentialRegistry::from_specs(specs).unwrap();
+        assert_eq!(
+            r.refuse_operator_only(None, Some("local-gw")),
+            Err(CredentialError::NotForClients("local-gw".into()))
+        );
+        assert_eq!(
+            r.refuse_operator_only(Some("${local-gw}"), None),
+            Err(CredentialError::NotForClients("local-gw".into()))
+        );
+        // Nameable credentials, literals, unknown names (refused later, by resolve) and nothing.
+        assert_eq!(r.refuse_operator_only(None, Some("shared")), Ok(()));
+        assert_eq!(r.refuse_operator_only(Some("sk-literal"), None), Ok(()));
+        assert_eq!(r.refuse_operator_only(None, Some("nobody")), Ok(()));
+        assert_eq!(r.refuse_operator_only(None, None), Ok(()));
+        // The operator's own config (an alias) still binds it.
+        assert!(r.bind("local-gw", "http://127.0.0.1:8080/v1").is_ok());
+    }
+
+    #[test]
+    fn a_configured_default_key_that_is_not_sent_is_reported_by_name() {
+        // SAFETY: test-only env mutation of a variable no other test reads.
+        unsafe { std::env::set_var("WAAV_TEST_WITHHELD_KEY", "sk-test") };
+        let mut by_name = HashMap::new();
+        by_name.insert(
+            "waav_test_withheld_key".to_string(),
+            Credential {
+                name: "WAAV_TEST_WITHHELD_KEY".into(),
+                source: SecretSourceSpec::Env("WAAV_TEST_WITHHELD_KEY".into()),
+                hosts: vec![HostPattern::parse("api.vendor.example").unwrap()],
+                private: false,
+                clients: true,
+            },
+        );
+        let r = CredentialRegistry { by_name };
+        let k = r
+            .resolve_client_key(
+                None,
+                None,
+                "http://127.0.0.1:8080/v1",
+                "WAAV_TEST_WITHHELD_KEY",
+            )
+            .unwrap();
+        assert!(k.bound.is_none() && k.literal.is_none());
+        assert_eq!(k.withheld.as_deref(), Some("WAAV_TEST_WITHHELD_KEY"));
+        let k = r
+            .resolve_client_key(
+                None,
+                None,
+                "https://api.vendor.example/v1",
+                "WAAV_TEST_WITHHELD_KEY",
+            )
+            .unwrap();
+        assert!(k.bound.is_some() && k.withheld.is_none());
+        // A key that is not configured is not "withheld".
+        let k = r
+            .resolve_client_key(
+                None,
+                None,
+                "http://127.0.0.1:8080/v1",
+                "WAAV_TEST_UNSET_KEY_X",
+            )
+            .unwrap();
+        assert_eq!(k.withheld, None);
+        unsafe { std::env::remove_var("WAAV_TEST_WITHHELD_KEY") };
     }
 
     #[test]
