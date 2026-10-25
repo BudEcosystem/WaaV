@@ -38,7 +38,11 @@ Notes on these:
   `WAAV_CREDENTIALS_JSON`.
 - **Which name to use.** Name the credential after the variable the gateway reads the key from:
   `DEEPGRAM_API_KEY`, `ELEVENLABS_API_KEY`, `AZURE_SPEECH_SUBSCRIPTION_KEY`, `IBM_WATSON_API_KEY`,
-  `GNANI_TOKEN`, and so on.
+  `GNANI_TOKEN`, and so on. Providers that read their own key from the environment use the same
+  rule: `MURF_API_KEY`, `WELLSAID_API_KEY`, `TINKOFF_API_KEY`, `DASHSCOPE_API_KEY` and so on.
+- **What counts as the client's own credential.** `api_key`, or in `extras`: `access_token`
+  (Google, Cartesia), an `aws_access_key_id` / `aws_secret_access_key` pair, or Gnani's `token`
+  and `access_key`. Any other leg is treated as carrying your key.
 - **Vendor hosts without a declaration.** These keys reach their vendor's own hosts with no
   declaration: OpenAI, Anthropic, Google AI, Groq, Mistral, Together, Fireworks, Perplexity,
   Cohere and Sarvam, plus the speech vendors Deepgram, ElevenLabs, Cartesia, AssemblyAI, Hume

@@ -58,6 +58,56 @@ fn destinations<'a>(
         .collect()
 }
 
+/// The environment variables a provider's OPERATOR credential is read from: the one
+/// `ServerConfig::get_api_key` reads, and those providers read themselves when a leg has no key
+/// (Murf's `MURF_API_KEY`, Tinkoff's key pair, …). A credential declared under any of these names
+/// approves its hosts for that provider. Provider names are compared with `-` and `.` as `_`.
+pub fn operator_key_variables(provider: &str) -> Vec<&'static str> {
+    let mut vars: Vec<&'static str> = crate::config::provider_key_variable(provider)
+        .into_iter()
+        .collect();
+    let normalized = provider
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['-', '.'], "_");
+    let own: &[&'static str] = match normalized.as_str() {
+        "alibaba_cloud" | "alibaba" | "dashscope" => &["DASHSCOPE_API_KEY"],
+        "amivoice" => &["AMIVOICE_APPKEY"],
+        "fpt_ai" | "fpt" => &["FPT_AI_API_KEY"],
+        "gladia" => &["GLADIA_API_KEY"],
+        "gnani" | "gnani_ai" | "vachana" => &["GNANI_TOKEN", "GNANI_ACCESS_KEY"],
+        "nectec" => &["NECTEC_API_KEY"],
+        "reverie" => &["REVERIE_APP_ID"],
+        "sarvam" => &["SARVAM_API_KEY"],
+        "speechmatics" => &["SPEECHMATICS_API_KEY"],
+        "tinkoff" | "tinkoff_voicekit" => &[
+            "TINKOFF_API_KEY",
+            "TINKOFF_SECRET_KEY",
+            "TINKOFF_VOICEKIT_API_KEY",
+            "TINKOFF_VOICEKIT_SECRET_KEY",
+        ],
+        "acapela" => &["ACAPELA_API_KEY"],
+        "murf" => &["MURF_API_KEY"],
+        "resemble" => &["RESEMBLE_API_KEY"],
+        "sberdevices" | "salute" | "salutespeech" | "smartspeech" => &[
+            "SBERDEVICES_API_KEY",
+            "SALUTE_SPEECH_API_KEY",
+            "SMARTSPEECH_API_KEY",
+        ],
+        "speechify" => &["SPEECHIFY_API_KEY"],
+        "unrealspeech" | "unreal_speech" => &["UNREALSPEECH_API_KEY"],
+        "wellsaid" => &["WELLSAID_API_KEY"],
+        "zalo_ai" | "zalo" => &["ZALO_API_KEY"],
+        _ => &[],
+    };
+    for var in own {
+        if !vars.contains(var) {
+            vars.push(var);
+        }
+    }
+    vars
+}
+
 /// Whether the operator approved `url` as a destination for `provider`'s operator key.
 pub fn operator_approved(provider: &str, url: &str) -> bool {
     let Ok(parsed) = url::Url::parse(url) else {
@@ -76,19 +126,20 @@ pub fn operator_approved(provider: &str, url: &str) -> bool {
     if loopback_allowance().permits(port) && waav_segmented_stt::net::is_loopback_host(host) {
         return true;
     }
-    crate::config::provider_key_variable(provider)
-        .is_some_and(|var| global_credentials().bind(var, url).is_ok())
+    let registry = global_credentials();
+    operator_key_variables(provider)
+        .into_iter()
+        .any(|var| registry.bind(var, url).is_ok())
 }
 
-/// Whether a leg would carry the OPERATOR's credential for `provider`: the client sent no key of
-/// its own — neither `api_key` nor a credential in `extras` that providers use in its place
-/// (`access_token` for Google and Cartesia, an AWS key pair for Transcribe and Polly) — and the
-/// server holds one (`server_has_key`, `ServerConfig::get_api_key` succeeding).
-pub fn uses_operator_credential(
-    provider: &str,
+/// Whether the client brought a credential of its own for this leg: `api_key`, or one in `extras`
+/// that providers use in its place (`access_token` for Google and Cartesia, an AWS key pair for
+/// Transcribe and Polly, Gnani's token and access key). Without one, the leg may carry the
+/// OPERATOR's credential — whether the server holds it in its config or the provider reads it
+/// from the environment itself, as about thirty providers do — so its destination is judged.
+pub fn client_supplies_credential(
     client_api_key: Option<&str>,
     extras: &serde_json::Map<String, serde_json::Value>,
-    server_has_key: impl Fn(&str) -> bool,
 ) -> bool {
     let set = |k: &str| {
         extras
@@ -96,10 +147,10 @@ pub fn uses_operator_credential(
             .and_then(|v| v.as_str())
             .is_some_and(|v| !v.trim().is_empty())
     };
-    let client_owns = client_api_key.is_some_and(|k| !k.trim().is_empty())
+    client_api_key.is_some_and(|k| !k.trim().is_empty())
         || set("access_token")
-        || (set("aws_access_key_id") && set("aws_secret_access_key"));
-    !client_owns && server_has_key(provider)
+        || (set("aws_access_key_id") && set("aws_secret_access_key"))
+        || (set("token") && set("access_key"))
 }
 
 /// Why a client config may not use these destinations with the operator's key, or `None`.
@@ -117,10 +168,11 @@ pub fn refusal(
                 .and_then(|u| u.host_str().map(str::to_string))
                 .unwrap_or_else(|| url.to_string());
             return Some(format!(
-                "{role}.extras.{key} points the gateway's {provider} credential at '{host}', which \
-                 the operator has not approved. Send your own api_key to use a destination of \
-                 your choice, or ask the operator to allow it (a credential for this provider's \
-                 key listing the host, or WAAV_PRIVATE_EGRESS_ALLOWLIST)"
+                "{role}.extras.{key} points this {provider} leg at '{host}', which the operator \
+                 has not approved for the gateway's {provider} credential (a leg without a \
+                 credential of the client's own uses the gateway's). Send your own api_key to \
+                 choose a destination, or ask the operator to allow the host (a credential for \
+                 this provider's key listing it, or WAAV_PRIVATE_EGRESS_ALLOWLIST)"
             ));
         }
     }
@@ -235,31 +287,50 @@ mod tests {
     }
 
     #[test]
-    fn only_a_leg_carrying_the_operators_credential_is_judged() {
+    fn a_leg_is_judged_unless_the_client_brought_its_own_credential() {
         let none = serde_json::Map::new();
-        let has = |_: &str| true;
-        let lacks = |_: &str| false;
-        assert!(uses_operator_credential("deepgram", None, &none, has));
-        assert!(uses_operator_credential("deepgram", Some("  "), &none, has));
-        assert!(!uses_operator_credential(
-            "deepgram",
-            Some("dg-own"),
-            &none,
-            has
-        ));
-        assert!(
-            !uses_operator_credential("deepgram", None, &none, lacks),
-            "no server key to leak"
-        );
+        assert!(!client_supplies_credential(None, &none));
+        assert!(!client_supplies_credential(Some("  "), &none));
+        assert!(client_supplies_credential(Some("dg-own"), &none));
         let token = extras(json!({ "access_token": "ya29.client" }));
-        assert!(!uses_operator_credential("google", None, &token, has));
+        assert!(client_supplies_credential(None, &token));
         let aws = extras(json!({ "aws_access_key_id": "AKIA", "aws_secret_access_key": "s" }));
-        assert!(!uses_operator_credential("aws-transcribe", None, &aws, has));
+        assert!(client_supplies_credential(None, &aws));
         let half = extras(json!({ "aws_access_key_id": "AKIA" }));
         assert!(
-            uses_operator_credential("aws-transcribe", None, &half, has),
+            !client_supplies_credential(None, &half),
             "half a key pair is not the client's credential"
         );
+        let gnani = extras(json!({ "token": "t", "access_key": "k" }));
+        assert!(client_supplies_credential(None, &gnani));
+    }
+
+    /// About thirty providers read their key from the environment themselves (Murf's
+    /// `MURF_API_KEY`), so the gateway's config holding no key does not mean no key is sent.
+    #[test]
+    fn providers_that_read_their_own_key_are_judged_and_approvable_by_that_name() {
+        let e = extras(json!({ "endpoint_override": "https://attacker.example" }));
+        let msg = refusal("tts_config", "murf", &e).expect("refused");
+        assert!(
+            msg.contains("murf") && msg.contains("attacker.example"),
+            "{msg}"
+        );
+        assert_eq!(operator_key_variables("murf"), vec!["MURF_API_KEY"]);
+        assert_eq!(
+            operator_key_variables("tinkoff"),
+            vec![
+                "TINKOFF_API_KEY",
+                "TINKOFF_SECRET_KEY",
+                "TINKOFF_VOICEKIT_API_KEY",
+                "TINKOFF_VOICEKIT_SECRET_KEY"
+            ]
+        );
+        assert_eq!(operator_key_variables("deepgram"), vec!["DEEPGRAM_API_KEY"]);
+        assert_eq!(
+            operator_key_variables("gnani"),
+            vec!["GNANI_TOKEN", "GNANI_ACCESS_KEY"]
+        );
+        assert!(operator_key_variables("fpt-ai").contains(&"FPT_AI_API_KEY"));
     }
 
     #[test]

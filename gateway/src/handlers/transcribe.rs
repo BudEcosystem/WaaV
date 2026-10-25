@@ -480,11 +480,9 @@ pub async fn submit_batch(
     // With the gateway's own key, a destination the request chose must be one the operator
     // approved (`core::client_destination`): an `endpoint_override` used to receive the
     // operator's vendor key wherever it pointed.
-    let operator_key = crate::core::client_destination::uses_operator_credential(
-        &provider,
+    let operator_key = !crate::core::client_destination::client_supplies_credential(
         Some(&req.config.base.api_key),
         &req.config.extras.0,
-        |p| state.config.get_api_key(p).is_ok(),
     );
     let destination_refusal = if crate::core::client_destination::client_endpoints_denied() {
         crate::core::client_destination::any_destination("config", &provider, &req.config.extras.0)
