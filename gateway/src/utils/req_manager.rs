@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{Semaphore, SemaphorePermit};
 use tokio::time::MissedTickBehavior;
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 
 /// Performance metrics for monitoring request behavior
 #[derive(Debug, Default)]
@@ -540,6 +540,22 @@ impl ReqManager {
         url: &str,
         warmup_type: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // A target on this host or the LAN: a connection costs nothing to open on first use, and
+        // the warm requests (unauthenticated, several per session) only filled the server's log
+        // with 401s.
+        if waav_segmented_stt::net::is_local_origin(url) {
+            debug!(url, "warmup skipped: local target");
+            return Ok(());
+        }
+        self.warm_connections(url, warmup_type).await
+    }
+
+    /// [`Self::warmup`]'s requests, whatever the target.
+    async fn warm_connections(
+        &self,
+        url: &str,
+        warmup_type: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         use futures::future::join_all;
 
         // Use multiple concurrent lightweight requests to prime TLS, ALPN, and pools.
@@ -592,7 +608,7 @@ impl ReqManager {
                             let elapsed = start.elapsed();
                             if i < 5 {
                                 // Only log first few to avoid spam
-                                println!("  Warmup stream {i} completed in {elapsed:?}");
+                                debug!(stream = i, ?elapsed, "warmup stream completed");
                             }
                             Ok(elapsed)
                         }
@@ -623,10 +639,10 @@ impl ReqManager {
         if !successful_times.is_empty() {
             let avg_ms = successful_times.iter().map(|d| d.as_millis()).sum::<u128>()
                 / successful_times.len() as u128;
-            println!(
-                "Warmup complete: {} streams, avg latency: {}ms",
-                successful_times.len(),
-                avg_ms
+            debug!(
+                streams = successful_times.len(),
+                avg_latency_ms = avg_ms,
+                "warmup complete"
             );
         }
 
@@ -650,7 +666,7 @@ impl ReqManager {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         use futures::future::join_all;
 
-        println!("Starting intelligent aggressive warmup");
+        debug!("starting aggressive warmup");
 
         // Phase 1: Probe with smaller number of requests
         let probe_count = (self.max_concurrent_requests / 2).max(1);
@@ -684,7 +700,7 @@ impl ReqManager {
             .sum::<u128>()
             / probe_count as u128;
 
-        println!("  Phase 1 probe: avg latency {avg_latency_ms}ms");
+        debug!(avg_latency_ms, "aggressive warmup phase 1 probe");
 
         // Phase 2: Full warmup if latency is good
         if avg_latency_ms < 200 {
@@ -718,9 +734,9 @@ impl ReqManager {
             let results = join_all(warmup_futures).await;
             let successful = results.iter().filter(|r| r.is_ok()).count();
 
-            println!("  Phase 2 aggressive: {successful}/{warmup_count} successful");
+            debug!(successful, warmup_count, "aggressive warmup phase 2");
         } else {
-            println!("  Skipping phase 2 due to high latency");
+            debug!("aggressive warmup: phase 2 skipped (high latency)");
         }
 
         Ok(())
@@ -743,7 +759,7 @@ impl ReqManager {
         let client = Arc::clone(&self.client);
         let _metrics = Arc::clone(&self.metrics);
 
-        println!("Starting adaptive keep-alive task for URL: {url}");
+        debug!(url, "starting adaptive keep-alive task");
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(3));
@@ -1243,17 +1259,38 @@ mod tests {
         let manager = ReqManager::new(3).await.unwrap();
         let url = format!("http://{addr}/warmup");
 
-        // Test warmup with OPTIONS
-        manager.warmup(&url, "OPTIONS").await.unwrap();
+        // The requests themselves (a local target is skipped by `warmup`, tested below).
+        manager.warm_connections(&url, "OPTIONS").await.unwrap();
 
         // Small delay between warmups
         sleep(Duration::from_millis(10)).await;
 
-        // Test warmup with GET
-        manager.warmup(&url, "GET").await.unwrap();
+        manager.warm_connections(&url, "GET").await.unwrap();
 
         // Cleanup
         let _ = tx.send(()).await;
+    }
+
+    /// A local target gets no warm requests at all: they were unauthenticated, several per
+    /// session, and every one a 401 in the local server's log.
+    #[tokio::test]
+    async fn warmup_sends_nothing_to_a_local_target() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            while listener.accept().await.is_ok() {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        let manager = ReqManager::new(4).await.unwrap();
+        manager
+            .warmup(&format!("http://{addr}/v1/audio/speech"), "HEAD")
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(50)).await;
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

@@ -427,6 +427,13 @@ impl Drop for ServerConfig {
 }
 
 impl ServerConfig {
+    /// The keys a YAML config file sets that no field reads, as dotted paths (`waav-gateway check`).
+    pub fn unknown_yaml_keys(path: &PathBuf) -> Result<Vec<String>, String> {
+        yaml::YamlConfig::from_file_reporting(path)
+            .map(|(_, unknown)| unknown)
+            .map_err(|e| e.to_string())
+    }
+
     /// Load configuration from a YAML file with environment variable base
     ///
     /// Loads .env file (if present), then merges environment variables (with defaults),
