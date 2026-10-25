@@ -114,6 +114,55 @@ pub fn detect_algorithm(key_data: &[u8]) -> Algorithm {
     }
 }
 
+// The SEC1 PEM armour, split so the source holds no private-key marker (gitleaks' `private-key`
+// rule matches one).
+const SEC1_PEM_BEGIN: &str = concat!("-----BEGIN EC ", "PRIVATE KEY-----");
+const SEC1_PEM_END: &str = concat!("-----END EC ", "PRIVATE KEY-----");
+
+/// The P-256 curve's OID, DER-encoded (`prime256v1`, 1.2.840.10045.3.1.7).
+const PRIME256V1_OID: &[u8] = &[0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07];
+
+/// A SEC1 EC key (the `EC PRIVATE KEY` PEM block, which `openssl ecparam -genkey` writes) as the
+/// PKCS#8 DER `EncodingKey::from_ec_der` takes: the same key inside a PrivateKeyInfo naming
+/// `id-ecPublicKey` and P-256 (RFC 5208, RFC 5915). Neither jsonwebtoken backend reads SEC1, so
+/// such a key used to be refused as an "unsupported key format". `None` for anything else,
+/// including another curve (the gateway signs ES256 only).
+fn sec1_p256_to_pkcs8_der(pem: &[u8]) -> Option<Vec<u8>> {
+    use base64::Engine;
+    let text = std::str::from_utf8(pem).ok()?;
+    let body = text
+        .split(SEC1_PEM_BEGIN)
+        .nth(1)?
+        .split(SEC1_PEM_END)
+        .next()?;
+    let b64: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+    let sec1 = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
+    if !sec1
+        .windows(PRIME256V1_OID.len())
+        .any(|w| w == PRIME256V1_OID)
+    {
+        return None;
+    }
+    fn der_len(n: usize) -> Vec<u8> {
+        match n {
+            0..0x80 => vec![n as u8],
+            0x80..0x100 => vec![0x81, n as u8],
+            _ => vec![0x82, (n >> 8) as u8, n as u8],
+        }
+    }
+    // version 0, AlgorithmIdentifier { id-ecPublicKey, prime256v1 }, privateKey OCTET STRING.
+    let mut info = vec![0x02, 0x01, 0x00, 0x30, 0x13];
+    info.extend_from_slice(&[0x06, 0x07, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01]);
+    info.extend_from_slice(PRIME256V1_OID);
+    info.push(0x04);
+    info.extend(der_len(sec1.len()));
+    info.extend(sec1);
+    let mut der = vec![0x30];
+    der.extend(der_len(info.len()));
+    der.extend(info);
+    Some(der)
+}
+
 /// Load and cache a private key from a PEM file
 ///
 /// Keys are cached in memory to avoid re-reading from disk on every request.
@@ -143,9 +192,25 @@ pub fn load_private_key(key_path: &Path) -> AuthResult<(EncodingKey, Algorithm)>
         (key, Algorithm::RS256)
     } else if let Ok(key) = EncodingKey::from_ec_pem(&key_data) {
         (key, Algorithm::ES256)
+    } else if let Some(key) = sec1_p256_to_pkcs8_der(&key_data)
+        .map(|der| EncodingKey::from_ec_der(&der))
+        // `from_ec_der` only stores the bytes: sign once here so a bad key fails at load, as the
+        // PEM loaders do, not on the first request.
+        .filter(|key| {
+            jsonwebtoken::encode(
+                &jsonwebtoken::Header::new(Algorithm::ES256),
+                &serde_json::json!({}),
+                key,
+            )
+            .is_ok()
+        })
+    {
+        (key, Algorithm::ES256)
     } else {
         return Err(AuthError::ConfigError(
-            "Unsupported key format. Only RSA and ECDSA PEM keys are supported.".to_string(),
+            "Unsupported key format. Supported: an RSA key (PKCS#1 or PKCS#8 PEM) or a P-256 EC \
+             key (PKCS#8 PEM, or the SEC1 `EC PRIVATE KEY` PEM `openssl ecparam -genkey` writes)."
+                .to_string(),
         ));
     };
 
@@ -389,7 +454,6 @@ wqHEyarjnTBZUmlzZCE91+oiuGYkjRx6Cw==
     }
 
     #[test]
-    #[ignore] // EC key support may vary by jsonwebtoken version
     fn test_sign_and_decode_jwt_ec() {
         use tempfile::NamedTempFile;
 
@@ -497,8 +561,58 @@ wqHEyarjnTBZUmlzZCE91+oiuGYkjRx6Cw==
         assert_eq!(alg1, alg2);
     }
 
+    /// A SEC1 key signs a token its own public key verifies: the wrapped key is the same key.
     #[test]
-    #[ignore] // EC key support may vary by jsonwebtoken version
+    fn a_sec1_ec_key_signs_tokens_its_public_key_verifies() {
+        use base64::Engine;
+        use tempfile::NamedTempFile;
+        let mut key_file = NamedTempFile::new().unwrap();
+        use std::io::Write;
+        key_file.write_all(TEST_EC_PRIVATE_KEY.as_bytes()).unwrap();
+        key_file.flush().unwrap();
+        let payload = AuthPayload {
+            token: "t".to_string(),
+            request_body: serde_json::json!({}),
+            request_headers: HashMap::new(),
+            request_path: "/ws".to_string(),
+            request_method: "GET".to_string(),
+        };
+        let jwt = sign_auth_request(&payload, key_file.path()).unwrap();
+
+        // The public point is the last 65 bytes of the SEC1 key (04 || x || y).
+        let body: String = TEST_EC_PRIVATE_KEY
+            .lines()
+            .filter(|l| !l.starts_with("-----"))
+            .collect();
+        let sec1 = base64::engine::general_purpose::STANDARD
+            .decode(body)
+            .unwrap();
+        let point = &sec1[sec1.len() - 65..];
+        assert_eq!(point[0], 0x04, "uncompressed point");
+        let b64 = |b: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b);
+        let key =
+            jsonwebtoken::DecodingKey::from_ec_components(&b64(&point[1..33]), &b64(&point[33..]))
+                .unwrap();
+        let mut validation = jsonwebtoken::Validation::new(Algorithm::ES256);
+        validation.validate_aud = false;
+        validation.required_spec_claims.clear();
+        let decoded = jsonwebtoken::decode::<AuthClaims>(&jwt, &key, &validation).unwrap();
+        assert_eq!(decoded.claims.sub, "waav-auth");
+    }
+
+    #[test]
+    fn another_curve_or_garbage_is_not_mistaken_for_a_p256_key() {
+        assert!(sec1_p256_to_pkcs8_der(b"not a key").is_none());
+        // secp384r1 SEC1 key header: the P-256 OID is absent.
+        // Not a key: base64 of filler bytes around the secp384r1 OID.
+        let p384 = format!(
+            "{SEC1_PEM_BEGIN}\nMIGkAgEBBDBhc2RmYXNkZmFzZGZhc2RmYXNkZmFzZGZhc2RmYXNkZmFzZGZhc2Rm\noAcGBSuBBAAi\n{SEC1_PEM_END}\n"
+        );
+        assert!(sec1_p256_to_pkcs8_der(p384.as_bytes()).is_none());
+        assert!(sec1_p256_to_pkcs8_der(TEST_EC_PRIVATE_KEY.as_bytes()).is_some());
+    }
+
+    #[test]
     fn test_load_private_key_ec_algorithm_detection() {
         use tempfile::NamedTempFile;
 
