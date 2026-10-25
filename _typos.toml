@@ -35,6 +35,7 @@ mut = "mut"
 crate = "crate"
 WaaV = "WaaV"
 waav = "waav"
+securty = "securty"  # the deliberately misspelled section in the unknown-YAML-key tests and docs
 # Acronyms and domain abbreviations.
 fpt = "fpt"          # FPT.AI, a Vietnamese speech provider
 ane = "ane"          # Apple Neural Engine
