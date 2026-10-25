@@ -3918,8 +3918,24 @@ async fn initialize_dag_routing(
 
     // Create executor (decoupled from the DAG; uses the DAG at execute time). A node without
     // its own `timeout_ms` gets the operator's `dag_timeouts.node_execution_secs`.
-    let node_secs = app_state.config.dag_timeouts.node_execution_secs.max(1);
-    let executor = Arc::new(DAGExecutor::new().with_timeout(Duration::from_secs(node_secs)));
+    // and a node of a kind the operator gave its own value (`llm_endpoint_secs` …) gets that.
+    let timeouts = &app_state.config.dag_timeouts;
+    let node_secs = timeouts.node_execution_secs.max(1);
+    let kind_timeouts = [
+        "stt_provider",
+        "tts_provider",
+        "realtime_provider",
+        "llm_endpoint",
+        "websocket_endpoint",
+    ]
+    .into_iter()
+    .map(|kind| (kind, Duration::from_secs(timeouts.for_kind(kind))))
+    .collect();
+    let executor = Arc::new(
+        DAGExecutor::new()
+            .with_timeout(Duration::from_secs(node_secs))
+            .with_kind_timeouts(kind_timeouts),
+    );
 
     // ── Output sink + drain task (W-O1) ─────────────────────────────────────────
     // Output nodes push `DagOutput`s here; the drain task maps them to LiveKit / WS.

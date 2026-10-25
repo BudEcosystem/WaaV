@@ -125,3 +125,54 @@ fn test_config_serialization() {
     assert_eq!(config.threshold, deserialized.threshold);
     assert_eq!(config.max_context_turns, deserialized.max_context_turns);
 }
+
+/// Concurrent sessions used to queue on ONE turn-detector model behind one lock, inline on the
+/// async workers. The pool grows under contention, and inference runs on the blocking pool, so a
+/// burst of end-of-turn checks from many sessions overlaps. Live: needs the model
+/// (`waav-gateway init`, CACHE_PATH) and ORT_DYLIB_PATH.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "Requires model files to be downloaded"]
+async fn concurrent_checks_overlap_once_the_pool_has_grown() -> anyhow::Result<()> {
+    use std::sync::Arc;
+    use std::time::Instant;
+    let detector = Arc::new(TurnDetector::new(None).await?);
+    let texts = [
+        "what's the weather like in paris tomorrow",
+        "i was thinking that maybe we could",
+        "book me a table for two at seven",
+    ];
+    // Warm the pool: a burst grows it in the background.
+    let burst = |n: usize| {
+        let d = Arc::clone(&detector);
+        async move {
+            let tasks: Vec<_> = (0..n)
+                .map(|i| {
+                    let d = Arc::clone(&d);
+                    let t = texts[i % texts.len()];
+                    tokio::spawn(async move { d.is_turn_complete(t).await })
+                })
+                .collect();
+            for t in tasks {
+                t.await??;
+            }
+            anyhow::Ok(())
+        }
+    };
+    burst(12).await?;
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+    let started = Instant::now();
+    for i in 0..12 {
+        detector.is_turn_complete(texts[i % texts.len()]).await?;
+    }
+    let sequential = started.elapsed();
+    let started = Instant::now();
+    burst(12).await?;
+    let concurrent = started.elapsed();
+    println!("12 checks: sequential {sequential:?}, concurrent {concurrent:?}");
+    assert!(
+        concurrent < sequential,
+        "concurrent {concurrent:?} should beat sequential {sequential:?} with a grown pool"
+    );
+    Ok(())
+}

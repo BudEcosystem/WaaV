@@ -16,9 +16,78 @@ static PUNCT_REGEX: Lazy<Result<Regex, regex::Error>> = Lazy::new(|| Regex::new(
 static WHITESPACE_REGEX: Lazy<Result<Regex, regex::Error>> = Lazy::new(|| Regex::new(r"\s+"));
 
 pub struct TurnDetector {
-    model: Arc<tokio::sync::Mutex<ModelManager>>,
+    models: Arc<ModelPool>,
     tokenizer: Arc<Tokenizer>,
     config: TurnDetectorConfig,
+}
+
+/// The turn-detector's ONNX sessions. One process-wide instance used to serve every session
+/// behind one lock, and ran on the async workers: with 16 talking sessions the end-of-utterance
+/// check queued (Gaia measured 158 checks over 50 ms in 60 s), and each 4-thread inference held
+/// a runtime worker. The pool starts with one instance and adds one in the background whenever
+/// every instance is busy, up to [`ModelPool::max_for`] — a quiet gateway pays for one model, a
+/// busy one stops queueing. No setting: the ceiling follows the host's cores.
+struct ModelPool {
+    config: TurnDetectorConfig,
+    instances: tokio::sync::RwLock<Vec<Arc<tokio::sync::Mutex<ModelManager>>>>,
+    max: usize,
+    growing: std::sync::atomic::AtomicBool,
+    next: std::sync::atomic::AtomicUsize,
+}
+
+impl ModelPool {
+    /// At most three instances (each holds the ~165 MB quantised model, so the pool can add
+    /// ~330 MB, and only under contention), and no more than the cores can run at the configured
+    /// intra-op thread count.
+    fn max_for(cores: usize, threads_per_instance: usize) -> usize {
+        (cores / threads_per_instance.max(1)).clamp(1, 3)
+    }
+
+    fn new(first: ModelManager, config: TurnDetectorConfig) -> Self {
+        let threads = config.num_threads.unwrap_or(1);
+        Self {
+            max: Self::max_for(
+                std::thread::available_parallelism().map_or(1, |n| n.get()),
+                threads,
+            ),
+            config,
+            instances: tokio::sync::RwLock::new(vec![Arc::new(tokio::sync::Mutex::new(first))]),
+            growing: std::sync::atomic::AtomicBool::new(false),
+            next: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// A free instance, else (growing the pool in the background when there is room) the next
+    /// one in turn, waited for.
+    async fn acquire(self: &Arc<Self>) -> tokio::sync::OwnedMutexGuard<ModelManager> {
+        use std::sync::atomic::Ordering;
+        let instances = self.instances.read().await.clone();
+        for m in &instances {
+            if let Ok(guard) = Arc::clone(m).try_lock_owned() {
+                return guard;
+            }
+        }
+        if instances.len() < self.max && !self.growing.swap(true, Ordering::AcqRel) {
+            let pool = Arc::clone(self);
+            tokio::spawn(async move {
+                match ModelManager::new(pool.config.clone()).await {
+                    Ok(model) => {
+                        let mut all = pool.instances.write().await;
+                        all.push(Arc::new(tokio::sync::Mutex::new(model)));
+                        info!(
+                            instances = all.len(),
+                            max = pool.max,
+                            "turn detector pool grew"
+                        );
+                    }
+                    Err(e) => warn!(error = %e, "turn detector pool could not grow"),
+                }
+                pool.growing.store(false, Ordering::Release);
+            });
+        }
+        let i = self.next.fetch_add(1, Ordering::Relaxed) % instances.len();
+        Arc::clone(&instances[i]).lock_owned().await
+    }
 }
 
 impl TurnDetector {
@@ -34,11 +103,10 @@ impl TurnDetector {
     pub async fn with_config(config: TurnDetectorConfig) -> Result<Self> {
         info!("Initializing TurnDetector with config: {:?}", config);
 
-        let model = Arc::new(tokio::sync::Mutex::new(
-            ModelManager::new(config.clone())
-                .await
-                .context("Failed to initialize model manager")?,
-        ));
+        let first = ModelManager::new(config.clone())
+            .await
+            .context("Failed to initialize model manager")?;
+        let models = Arc::new(ModelPool::new(first, config.clone()));
 
         let tokenizer = Arc::new(
             Tokenizer::new(&config)
@@ -47,7 +115,7 @@ impl TurnDetector {
         );
 
         Ok(Self {
-            model,
+            models,
             tokenizer,
             config,
         })
@@ -102,13 +170,13 @@ impl TurnDetector {
             .await
             .context("Failed to encode user input")?;
 
-        let probability = self
-            .model
-            .lock()
-            .await
-            .predict(input_ids.view(), Some(attention_mask.view()))
-            .await
-            .context("Model prediction failed")?;
+        let mut model = self.models.acquire().await;
+        let probability = tokio::task::spawn_blocking(move || {
+            model.predict(input_ids.view(), Some(attention_mask.view()))
+        })
+        .await
+        .context("Model prediction task failed")?
+        .context("Model prediction failed")?;
 
         let elapsed = start.elapsed();
         debug!(
@@ -268,6 +336,19 @@ impl TurnDetectorBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_pool_ceiling_follows_the_cores() {
+        assert_eq!(ModelPool::max_for(20, 4), 3, "GB10: capped at three");
+        assert_eq!(ModelPool::max_for(8, 4), 2);
+        assert_eq!(ModelPool::max_for(2, 4), 1, "never below one");
+        assert_eq!(ModelPool::max_for(64, 1), 3, "never above three");
+        assert_eq!(
+            ModelPool::max_for(2, 0),
+            2,
+            "a zero thread count is treated as one"
+        );
+    }
 
     #[test]
     fn test_normalization_regexes_compile_without_unwrap() {

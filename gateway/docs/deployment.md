@@ -320,6 +320,22 @@ returns its verdict without the per-provider breakdown, which would otherwise te
 vendor credentials the gateway holds. The full breakdown stays on the operator listener. All
 probes remain on the public port, so existing liveness and readiness probes keep working.
 
+### A Unix socket for local callers
+
+`WAAV_UNIX_SOCKET=/run/waav/waav.sock` also serves the whole API on a Unix socket, for callers on the
+same host that address services by path. How it behaves:
+
+- **Auth.** It is required exactly as on TCP.
+- **No rate limiter.** Every caller on the socket would share one bucket.
+- **Connection cap.** The per-peer connection cap counts all socket callers as one peer.
+- **Permissions.** The socket is created `0660`; its file permissions decide who may connect.
+- **Stale files.** A socket left by a crashed run is reused. Anything else at the path is
+  refused, never deleted. The socket is removed on a graceful stop.
+
+```sh
+curl --unix-socket /run/waav/waav.sock -H "Authorization: Bearer $KEY" http://localhost/voices
+```
+
 ## 11. Verification Checklist
 
 1. `curl http://<waav-gateway-host>:3001/` returns `{ "status": "OK" }`.

@@ -343,6 +343,16 @@ impl DAGCompiler {
         if self.client_supplied {
             check_client_provider_credential(def)?;
         }
+        if def.retry_on_failure
+            && !crate::dag::executor::RETRYABLE_KINDS.contains(&def.node_type.type_tag().as_str())
+        {
+            tracing::warn!(
+                node_id = %def.id,
+                node_type = %def.node_type.type_tag(),
+                "retry_on_failure is ignored for this node kind: a retry would repeat an effect \
+                 outside the gateway (or audio already spoken)"
+            );
+        }
 
         let node: Arc<dyn DAGNode> = match &def.node_type {
             NodeType::AudioInput => Arc::new(AudioInputNode::new(&def.id)),

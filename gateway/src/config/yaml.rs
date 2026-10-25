@@ -299,13 +299,13 @@ pub struct PluginsYaml {
 /// # Example YAML structure
 /// ```yaml
 /// dag_timeouts:
-///   node_execution_secs: 30
-///   provider_operation_secs: 30
-///   stt_endpoint_secs: 60
-///   tts_endpoint_secs: 60
-///   llm_endpoint_secs: 120
-///   websocket_operation_secs: 30
+///   node_execution_secs: 30        # every node without its own timeout_ms (default 30)
+///   provider_operation_secs: 45    # optional: STT/TTS/realtime provider nodes
+///   llm_endpoint_secs: 120         # optional: llm_endpoint nodes
 /// ```
+/// The per-kind values (`stt_endpoint_secs`, `tts_endpoint_secs`, `llm_endpoint_secs`,
+/// `websocket_operation_secs`) and `provider_operation_secs` have no default: unset, a node
+/// falls back to `node_execution_secs` (see `DAGTimeoutsConfig::for_kind`).
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 pub struct DAGTimeoutsYaml {

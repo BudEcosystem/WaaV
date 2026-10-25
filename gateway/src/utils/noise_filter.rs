@@ -69,30 +69,45 @@ pub mod implementation {
 
     // Type aliases for cleaner code
     type WorkerSender = mpsc::Sender<WorkerTask>;
-    type PoolSender = mpsc::Sender<WorkerSender>;
-    type PoolReceiver = Arc<Mutex<mpsc::Receiver<WorkerSender>>>;
-    type SenderPool = (PoolSender, PoolReceiver, Arc<AtomicUsize>, Arc<Notify>);
 
-    // The pool of senders to the worker threads, managed by a channel.
-    // This is the core of our thread-safe, async-friendly pool for the !Send models.
-    static SENDER_POOL: LazyLock<SenderPool> = LazyLock::new(|| {
-        // Use a pool size based on available CPU cores, with a minimum of 2.
-        let pool_size = num_cpus::get().max(2);
-        let (pool_tx, pool_rx) = mpsc::channel(pool_size);
-        let live_workers = Arc::new(AtomicUsize::new(0));
-        let worker_death = Arc::new(Notify::new());
-        let (init_tx, init_rx) = std::sync::mpsc::channel();
-        let mut launched = 0usize;
+    /// The pool of senders to the worker threads, managed by a channel: the core of a
+    /// thread-safe, async-friendly pool for the !Send models.
+    ///
+    /// It starts [`INITIAL_WORKERS`] workers and adds one (a thread holding its own DeepFilterNet
+    /// model) whenever a caller finds every worker busy, up to one per core. It used to start
+    /// one per core at the first LiveKit track — twenty models on a 20-core host, whatever the
+    /// load — with no way to say otherwise.
+    struct SenderPool {
+        pool_tx: mpsc::Sender<WorkerSender>,
+        pool_rx: Arc<Mutex<mpsc::Receiver<WorkerSender>>>,
+        live_workers: Arc<AtomicUsize>,
+        worker_death: Arc<Notify>,
+        /// Workers started (alive or not), for the ceiling.
+        started: AtomicUsize,
+        max_workers: usize,
+    }
 
-        for worker_index in 0..pool_size {
-            let pool_tx_clone = pool_tx.clone();
-            let init_tx_clone = init_tx.clone();
+    /// Workers started with the pool; the rest come on demand.
+    const INITIAL_WORKERS: usize = 2;
 
-            // Spawn a dedicated OS thread for each worker.
-            // This is crucial for pinning the !Send DfTract model to a single thread.
-            match std::thread::Builder::new()
-                .name(format!("waav-noise-filter-{worker_index}"))
-                .spawn(move || {
+    /// Start one worker thread; it adds itself to the pool (and to `live_workers`) once its
+    /// model is ready, and reports readiness on `ready` when given.
+    fn spawn_worker(
+        worker_index: usize,
+        pool_tx: mpsc::Sender<WorkerSender>,
+        live_workers: Arc<AtomicUsize>,
+        ready: Option<std::sync::mpsc::Sender<bool>>,
+    ) -> bool {
+        let report = move |ok: bool| {
+            if let Some(ready) = &ready {
+                let _ = ready.send(ok);
+            }
+        };
+        // Spawn a dedicated OS thread for each worker.
+        // This is crucial for pinning the !Send DfTract model to a single thread.
+        std::thread::Builder::new()
+            .name(format!("waav-noise-filter-{worker_index}"))
+            .spawn(move || {
                 let (worker_task_tx, mut worker_task_rx) = mpsc::channel::<WorkerTask>(1);
 
                 // Create the expensive DfTract model ONCE on this thread.
@@ -106,18 +121,19 @@ pub mod implementation {
                             error = %err,
                             "Failed to create DfTract model in noise-filter worker"
                         );
-                        let _ = init_tx_clone.send(false);
+                        report(false);
                         return;
                     }
                 };
 
                 // Provide this worker's sender to the pool only after the model is ready.
-                if pool_tx_clone.blocking_send(worker_task_tx).is_err() {
-                    let _ = init_tx_clone.send(false);
+                live_workers.fetch_add(1, Ordering::AcqRel);
+                if pool_tx.blocking_send(worker_task_tx).is_err() {
+                    live_workers.fetch_sub(1, Ordering::AcqRel);
+                    report(false);
                     return;
                 }
-                let _ = init_tx_clone.send(true);
-                drop(init_tx_clone);
+                report(true);
 
                 info!(
                     worker_index,
@@ -132,43 +148,89 @@ pub mod implementation {
                     // Send result back to the caller. Ignore error if caller hung up.
                     let _ = result_tx.send(result);
                 }
-                })
-            {
-                Ok(_) => launched += 1,
-                Err(err) => {
-                    error!(
-                        worker_index,
-                        error = %err,
-                        "Failed to spawn noise-filter worker thread"
-                    );
-                }
-            }
-        }
+            })
+            .inspect_err(|err| {
+                error!(
+                    worker_index,
+                    error = %err,
+                    "Failed to spawn noise-filter worker thread"
+                );
+            })
+            .is_ok()
+    }
 
+    static SENDER_POOL: LazyLock<SenderPool> = LazyLock::new(|| {
+        let max_workers = std::thread::available_parallelism()
+            .map_or(INITIAL_WORKERS, |n| n.get())
+            .max(INITIAL_WORKERS);
+        let (pool_tx, pool_rx) = mpsc::channel(max_workers);
+        let live_workers = Arc::new(AtomicUsize::new(0));
+        let (init_tx, init_rx) = std::sync::mpsc::channel();
+        let launched = (0..INITIAL_WORKERS)
+            .filter(|&i| {
+                spawn_worker(
+                    i,
+                    pool_tx.clone(),
+                    live_workers.clone(),
+                    Some(init_tx.clone()),
+                )
+            })
+            .count();
         drop(init_tx);
         let initialized = init_rx
             .into_iter()
             .take(launched)
             .filter(|ready| *ready)
             .count();
-        live_workers.store(initialized, Ordering::Release);
         if initialized == 0 {
             error!("Noise-filter worker pool initialized with no live workers");
-        } else if initialized < pool_size {
+        } else if initialized < INITIAL_WORKERS {
             error!(
                 initialized,
-                requested = pool_size,
+                requested = INITIAL_WORKERS,
                 "Noise-filter worker pool initialized with fewer workers than requested"
             );
         }
 
-        (
+        SenderPool {
             pool_tx,
-            Arc::new(Mutex::new(pool_rx)),
+            pool_rx: Arc::new(Mutex::new(pool_rx)),
             live_workers,
-            worker_death,
-        )
+            worker_death: Arc::new(Notify::new()),
+            started: AtomicUsize::new(INITIAL_WORKERS),
+            max_workers,
+        }
     });
+
+    /// Workers started so far and the ceiling, for tests.
+    #[cfg(test)]
+    pub(crate) fn pool_size_for_tests() -> (usize, usize) {
+        let pool = &*SENDER_POOL;
+        (pool.started.load(Ordering::Acquire), pool.max_workers)
+    }
+
+    /// Every worker is busy: start one more if the ceiling allows (it joins the pool when its
+    /// model is ready; the caller waits for whichever worker frees first).
+    fn grow_pool(pool: &SenderPool) {
+        let started = pool.started.fetch_add(1, Ordering::AcqRel);
+        if started >= pool.max_workers {
+            pool.started.fetch_sub(1, Ordering::AcqRel);
+            return;
+        }
+        info!(
+            workers = started + 1,
+            max = pool.max_workers,
+            "noise-filter pool growing"
+        );
+        if !spawn_worker(
+            started,
+            pool.pool_tx.clone(),
+            pool.live_workers.clone(),
+            None,
+        ) {
+            pool.started.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
 
     fn mark_worker_dead(live_workers: &Arc<AtomicUsize>, worker_death: &Arc<Notify>) {
         let mut current = live_workers.load(Ordering::Acquire);
@@ -215,7 +277,13 @@ pub mod implementation {
     /// Asynchronously checks out a worker sender from the pool.
     /// It will wait efficiently if the pool is empty.
     async fn get_sender() -> Result<PooledWorkerSender, Box<dyn std::error::Error + Send + Sync>> {
-        let (pool_tx, pool_rx_mutex, live_workers, worker_death) = &*SENDER_POOL;
+        let pool = &*SENDER_POOL;
+        let (pool_tx, pool_rx_mutex, live_workers, worker_death) = (
+            &pool.pool_tx,
+            &pool.pool_rx,
+            &pool.live_workers,
+            &pool.worker_death,
+        );
         loop {
             if live_workers.load(Ordering::Acquire) == 0 {
                 return Err("Noise-filter worker pool has no live workers".into());
@@ -223,6 +291,11 @@ pub mod implementation {
 
             // Lock the mutex asynchronously. The guard is Send and can be held across an await.
             let mut pool_rx = pool_rx_mutex.lock().await;
+            // No worker free right now: the pool grows (up to one worker per core) and this
+            // caller takes whichever worker frees first.
+            if pool_rx.is_empty() {
+                grow_pool(pool);
+            }
             let Some(sender) = (tokio::select! {
                 maybe_sender = pool_rx.recv() => maybe_sender,
                 _ = worker_death.notified() => continue,
@@ -814,6 +887,29 @@ mod tests {
             pcm.extend_from_slice(&sample.to_le_bytes());
         }
         pcm
+    }
+
+    /// The pool starts small and grows when callers find every worker busy (it used to start
+    /// one DeepFilterNet model per core on the first track, whatever the load).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_pool_grows_under_concurrent_load_and_serves_everyone() {
+        let pcm = Bytes::from(create_test_pcm(16_000));
+        let calls: Vec<_> = (0..8)
+            .map(|_| {
+                let pcm = pcm.clone();
+                tokio::spawn(async move { reduce_noise_async(pcm, 16_000).await })
+            })
+            .collect();
+        for call in calls {
+            let out = call.await.unwrap().expect("every caller is served");
+            assert_eq!(out.len(), pcm.len());
+        }
+        let (started, max) = pool_size_for_tests();
+        assert!(started <= max, "{started} > {max}");
+        assert!(
+            started > 2 || max == 2,
+            "8 concurrent callers should grow a pool of 2 (started {started}, max {max})"
+        );
     }
 
     #[tokio::test]

@@ -138,6 +138,34 @@ enum Commands {
     },
 }
 
+/// Bind `WAAV_UNIX_SOCKET`. A socket file left by a previous run is removed when nothing is
+/// listening on it; anything else at that path (a live socket, a regular file) is refused, never
+/// deleted. The socket is made group-accessible (0660): access is the file's permissions.
+fn bind_unix_socket(path: &std::path::Path) -> anyhow::Result<tokio::net::UnixListener> {
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if !meta.file_type().is_socket() {
+            anyhow::bail!(
+                "WAAV_UNIX_SOCKET={}: the path exists and is not a socket",
+                path.display()
+            );
+        }
+        if std::os::unix::net::UnixStream::connect(path).is_ok() {
+            anyhow::bail!(
+                "WAAV_UNIX_SOCKET={}: another process is listening on it",
+                path.display()
+            );
+        }
+        std::fs::remove_file(path)
+            .map_err(|e| anyhow!("WAAV_UNIX_SOCKET={}: {e}", path.display()))?;
+    }
+    let listener = tokio::net::UnixListener::bind(path)
+        .map_err(|e| anyhow!("WAAV_UNIX_SOCKET={}: {e}", path.display()))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))
+        .map_err(|e| anyhow!("WAAV_UNIX_SOCKET={}: {e}", path.display()))?;
+    Ok(listener)
+}
+
 /// Every check `main` makes before it binds, without binding, loading models or dialling
 /// anything: what `waav-gateway check` reports. Each entry names its source.
 fn check_configuration(config_path: Option<&PathBuf>) -> Vec<String> {
@@ -199,6 +227,17 @@ fn check_configuration(config_path: Option<&PathBuf>) -> Vec<String> {
         if let Err(e) = waav_gateway::handlers::api::MetricsPolicy::from_env(api_requires_auth) {
             problems.push(format!("metrics: {e}"));
         }
+    }
+    if let Some(path) = std::env::var_os("WAAV_UNIX_SOCKET").filter(|p| !p.is_empty())
+        && let Some(dir) = std::path::Path::new(&path).parent()
+        && !dir.as_os_str().is_empty()
+        && !dir.is_dir()
+    {
+        problems.push(format!(
+            "WAAV_UNIX_SOCKET={}: the directory {} does not exist",
+            path.to_string_lossy(),
+            dir.display()
+        ));
     }
     if let Err(e) = waav_gateway::core::stt::segmented::live::SttLiveShared::from_env(None) {
         problems.push(format!("segmented speech-to-text: {e}"));
@@ -676,14 +715,36 @@ async fn main() -> anyhow::Result<()> {
     // the SAME bucket as all real traffic. Counting probes against it means a busy pod fails
     // its own liveness check and is restarted for being popular, which is precisely backwards.
     // These are also the endpoints that must answer when the pod is in trouble.
-    let limited_routes = webhook_routes
+    let routed = webhook_routes
         .merge(protected_routes)
         .merge(ws_routes)
         .merge(realtime_routes)
         .merge(openai_realtime_routes)
         .merge(debug_profile_routes)
-        .with_state(app_state.clone())
+        .with_state(app_state.clone());
+    let limited_routes = routed
+        .clone()
         .layer(tower::util::option_layer(governor_layer));
+
+    // WAAV_UNIX_SOCKET: the same API (auth included) on a Unix socket, for callers on this host
+    // that address services by path (Gaia's local model registry). No rate limiter there: every
+    // such caller shares one peer, and they are processes on this machine; a stand-in loopback
+    // peer address keeps the per-peer connection limit working.
+    let unix_socket = std::env::var_os("WAAV_UNIX_SOCKET")
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from);
+    let unix_app = unix_socket.as_ref().map(|_| {
+        public_routes
+            .clone()
+            .merge(routed)
+            .with_state(app_state.clone())
+            .layer(cors_layer.clone())
+            .layer(security_headers.clone())
+            .layer(axum::middleware::from_fn(request_id_middleware))
+            .layer(axum::extract::connect_info::MockConnectInfo(
+                SocketAddr::from(([127, 0, 0, 1], 0)),
+            ))
+    });
 
     // The operator listener (WAAV_METRICS_ADDR): Prometheus and the probes, bound to an address
     // the ingress does not route to. `/readyz` there carries the per-provider breakdown, which the
@@ -728,6 +789,21 @@ async fn main() -> anyhow::Result<()> {
         // auth, rate-limiting, or any handler logs — every nested `tracing` event inherits it,
         // and it is echoed on the response `x-request-id` header (W-C1 / E13).
         .layer(axum::middleware::from_fn(request_id_middleware));
+
+    if let (Some(path), Some(unix_app)) = (unix_socket, unix_app) {
+        let listener = bind_unix_socket(&path)?;
+        info!("Also serving on unix:{}", path.display());
+        let shutdown = shutdown_token.clone();
+        tokio::spawn(async move {
+            let served = axum::serve(listener, unix_app)
+                .with_graceful_shutdown(async move { shutdown.cancelled().await })
+                .await;
+            if let Err(e) = served {
+                error!(error = %e, "unix socket listener stopped");
+            }
+            let _ = std::fs::remove_file(&path);
+        });
+    }
 
     // Parse socket address
     let socket_addr: SocketAddr = address

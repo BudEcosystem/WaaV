@@ -93,7 +93,9 @@ impl ModelManager {
         Ok(())
     }
 
-    pub async fn predict(
+    /// Run the model on one encoded input. Synchronous (CPU only): callers run it off the async
+    /// workers (`TurnDetector` uses the blocking pool).
+    pub fn predict(
         &mut self,
         input_ids: ArrayView2<'_, i64>,
         attention_mask: Option<ArrayView2<'_, i64>>,
