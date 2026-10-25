@@ -47,7 +47,7 @@ aliases:
 | `tts.request_timeout_secs` | Synthesis timeout when the client names none. The default is 60 s; values are clamped to 1–300 s. |
 | `llm.base_url`, `llm.model`, `llm.system_prompt`, `llm.reasoning_effort`, `llm.reasoning_model`, `llm.provider_kind`, `llm.credential_ref` | LLM defaults. |
 | `dag_template` | Route the session through a server DAG template instead. |
-| `openai_compatible` | Lets `/v1/audio/speech` and `/v1/audio/transcriptions` resolve the alias as `model`. |
+| `openai_compatible` | Lets `/v1/audio/speech`, `/v1/audio/transcriptions` and `/v1/realtime` resolve the alias as `model`. |
 
 ## A leg's own server
 
@@ -79,11 +79,13 @@ The key a leg with a `base_url` sends is decided in this order:
 
 ## The OpenAI-compatible routes (standalone)
 
-Without the Bud control plane, `/v1/audio/speech`, `/v1/audio/transcriptions` and
-`/v1/audio/translations` resolve `model` through aliases marked `openai_compatible: true`:
+Without the Bud control plane, `/v1/audio/speech`, `/v1/audio/transcriptions`,
+`/v1/audio/translations` and `/v1/realtime` resolve `model` through aliases marked
+`openai_compatible: true`:
 
 - speech uses the alias's `tts` leg;
-- transcription and translation use its `stt` leg.
+- transcription and translation use its `stt` leg;
+- realtime uses all three legs, `stt`, `llm` and `tts` (below).
 
 On these routes a leg's `base_url` must be on an `openai` leg, since it is served as an
 OpenAI-compatible server; the server refuses to start otherwise. An alias that isn't marked
@@ -97,4 +99,33 @@ curl -X POST "$WAAV/v1/audio/speech" -H "Authorization: Bearer $KEY" \
      -H 'Content-Type: application/json' -d '{"model":"local-voice","input":"hello","voice":"alloy"}'
 curl -X POST "$WAAV/v1/audio/transcriptions" -H "Authorization: Bearer $KEY" \
      -F model=local-voice -F file=@hello.wav
+```
+
+### `/v1/realtime` (standalone)
+
+`wss://…/v1/realtime?model=<alias>` speaks the OpenAI Realtime GA protocol over an alias marked
+`openai_compatible: true` that has `stt`, `llm` and `tts` legs. The conversation loop runs the
+session, as it would a `/ws` client that sent `{"type":"config","alias":"<alias>"}`: speech-to-text,
+the LLM and text-to-speech, with the reply's words as `response.output_audio_transcript.delta`.
+
+- **Authentication** uses the gateway's own authenticators (API secrets, then the auth responder).
+  The key comes as `Authorization: Bearer`, an `api-key` header, or, from a browser, the
+  `openai-insecure-api-key.<key>` subprotocol offered with `realtime`. `?token=` is refused on this
+  route. With authentication off, a session without a key is accepted.
+- **Audio** is PCM16 at 24 kHz both ways, as in the GA protocol.
+- **Turns are the server's.** The session answers when the caller stops speaking (`server_vad`), and
+  the caller can interrupt the reply. A typed message (`conversation.item.create`, then
+  `response.create`) is a turn too, and `response.cancel` stops the reply.
+- **What the caller may set** in `session.update` before the session starts: the voice, the speed
+  and the transcription language. Instructions and tools are the server's: the alias's
+  `llm.system_prompt`, and no client tools. Text-only output and manual turn detection are refused.
+- **Refusals:** `404 model_not_found` for an alias that isn't marked, and
+  `400 alias_not_realtime` for one missing a leg. An alias that should relay to a vendor's own
+  realtime API (`kind: realtime`) isn't supported without the Bud control plane.
+
+```python
+# OpenAI's Python SDK (GA)
+async with client.realtime.connect(model="local-voice") as conn:
+    await conn.session.update(session={"type": "realtime"})
+    ...
 ```

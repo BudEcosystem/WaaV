@@ -912,3 +912,178 @@ fn the_manual_flag_reaches_the_session_before_it_starts() {
     assert!(acts.iter().any(|a| matches!(a, ClientAct::Manual(true))));
     assert!(s.is_manual());
 }
+
+// ---------------------------------------------------------------------------------------------
+// A standalone alias session (Gaia 25 Oct §2): the same GA face over the conversation loop.
+// ---------------------------------------------------------------------------------------------
+
+fn alias_def() -> crate::core::alias::AliasDefinition {
+    serde_yaml::from_str(
+        r#"
+kind: agent
+openai_compatible: true
+stt: { provider: openai, model: local-transcribe, language: en }
+tts: { provider: openai, model: local-speak, voice: alloy }
+llm: { base_url: "http://127.0.0.1:8080/v1", model: local-chat }
+"#,
+    )
+    .unwrap()
+}
+
+fn alias_ga() -> CascadeGa {
+    CascadeGa::for_alias("sess_a", "local-voice", "local-voice", &alias_def())
+}
+
+#[test]
+fn an_alias_session_shows_its_legs_and_no_prompt() {
+    let s = alias_ga();
+    assert_eq!(s.alias(), Some("local-voice"));
+    let created: Value = serde_json::from_str(&s.session_created()).unwrap();
+    let sess = &created["session"];
+    assert_eq!(sess["model"], "local-voice");
+    assert_eq!(sess["prompt"], Value::Null);
+    assert_eq!(sess["audio"]["output"]["voice"], "alloy");
+    assert_eq!(
+        sess["audio"]["input"]["transcription"],
+        json!({"model": "local-transcribe", "language": "en"})
+    );
+    assert_eq!(
+        sess["audio"]["input"]["turn_detection"]["type"],
+        "server_vad"
+    );
+    assert_eq!(
+        sess["audio"]["input"]["turn_detection"]["interrupt_response"],
+        true
+    );
+    // The legs' configs carry the GA format only: the alias supplies providers and models.
+    let (stt, tts) = s.leg_configs();
+    assert!(stt.provider.is_empty() && stt.model.is_empty());
+    assert_eq!(stt.sample_rate, 24_000);
+    let tts = tts.unwrap();
+    assert!(tts.provider.is_empty());
+    assert_eq!(tts.sample_rate, Some(24_000));
+}
+
+#[test]
+fn an_alias_session_refuses_what_the_conversation_loop_cannot_honour() {
+    let mut s = alias_ga();
+    let (events, acts) = s.client(
+        &json!({"type": "session.update", "session": {
+            "instructions": "be a pirate",
+            "tools": [{"type": "function", "name": "f"}],
+            "prompt": {"id": "x"},
+            "output_modalities": ["text"],
+            "audio": {"input": {"turn_detection": null}},
+        }})
+        .to_string(),
+    );
+    let params: Vec<Value> = parse(&events)
+        .into_iter()
+        .filter(|e| e["type"] == "error")
+        .map(|e| e["error"]["param"].clone())
+        .collect();
+    assert_eq!(
+        params,
+        vec![
+            json!("session.instructions"),
+            json!("session.tools"),
+            json!("session.prompt"),
+            json!("session.output_modalities"),
+            json!("session.audio.input.turn_detection"),
+        ]
+    );
+    assert!(
+        !acts.iter().any(|a| matches!(
+            a,
+            ClientAct::TextOnly(_) | ClientAct::Manual(_) | ClientAct::Variables(_)
+        )),
+        "{acts:?}"
+    );
+    assert!(!s.is_manual());
+}
+
+#[test]
+fn an_alias_caller_may_pick_voice_speed_and_language_before_the_start() {
+    let mut s = alias_ga();
+    let (events, acts) = s.client(
+        &json!({"type": "session.update", "session": {"audio": {
+            "input": {"transcription": {"language": "fr"}},
+            "output": {"voice": "nova", "speed": 1.2},
+        }}})
+        .to_string(),
+    );
+    assert!(
+        parse(&events).iter().all(|e| e["type"] != "error"),
+        "{events:?}"
+    );
+    assert_eq!(acts, vec![ClientAct::Start]);
+    let (stt, tts) = s.leg_configs();
+    assert_eq!(stt.language, "fr");
+    let tts = tts.unwrap();
+    assert_eq!(tts.voice_id.as_deref(), Some("nova"));
+    assert_eq!(tts.speaking_rate, Some(1.2));
+}
+
+/// The conversation loop's turn messages (bd1ec96) read as a GA response, like an agent's.
+#[test]
+fn a_conversation_turn_reads_as_a_ga_response() {
+    let mut s = alias_ga();
+    let mut all = Vec::new();
+    all.extend(s.core(&OutgoingMessage::STTResult {
+        transcript: "What is the capital of France?".into(),
+        is_final: true,
+        is_speech_final: true,
+        confidence: 1.0,
+        segment_transcript: None,
+        translations: vec![],
+    }));
+    all.extend(s.core(&OutgoingMessage::AgentResponseStarted {
+        turn_index: 0,
+        kind: "agent".into(),
+        input: Some("What is the capital of France?".into()),
+    }));
+    all.extend(s.core(&OutgoingMessage::AssistantTranscript {
+        turn_index: 0,
+        delta: "Paris.".into(),
+    }));
+    all.extend(s.audio(&[0u8, 1, 2, 3]));
+    all.extend(s.core(&OutgoingMessage::AgentResponseDone {
+        turn_index: 0,
+        kind: "agent".into(),
+        response_id: None,
+        status: "completed".into(),
+        usage: None,
+        transcript: "Paris.".into(),
+    }));
+    let evs = parse(&all);
+    let kinds = types(&all);
+    assert!(kinds.contains(&"conversation.item.input_audio_transcription.completed".to_string()));
+    assert!(kinds.contains(&"response.created".to_string()));
+    let delta = evs
+        .iter()
+        .find(|e| e["type"] == "response.output_audio_transcript.delta")
+        .unwrap();
+    assert_eq!(delta["delta"], "Paris.");
+    assert!(kinds.contains(&"response.output_audio.delta".to_string()));
+    let done = evs.last().unwrap();
+    assert_eq!(done["type"], "response.done");
+    assert_eq!(done["response"]["status"], "completed");
+}
+
+#[test]
+fn an_alias_typed_message_and_cancel_become_acts() {
+    let mut s = alias_ga();
+    s.mark_started();
+    let (_, acts) = s.client(
+        &json!({"type": "conversation.item.create", "item": {"type": "message", "role": "user",
+            "content": [{"type": "input_text", "text": "hello"}]}})
+        .to_string(),
+    );
+    assert!(acts.is_empty() || !acts.iter().any(|a| matches!(a, ClientAct::Turn(_))));
+    let (_, acts) = s.client(&json!({"type": "response.create"}).to_string());
+    assert_eq!(acts, vec![ClientAct::Turn("hello".into())]);
+    assert_eq!(
+        s.client(&json!({"type": "response.cancel"}).to_string()).1,
+        vec![ClientAct::Cancel]
+    );
+}

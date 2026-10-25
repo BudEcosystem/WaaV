@@ -58,6 +58,8 @@ pub struct ConnectionState {
     pub leg_admissions: Vec<crate::core::deployment_policy::Admission>,
     /// Spec 025: the session's voice agent, when `config.agent` named one.
     pub agent: Option<Arc<crate::core::agent::AgentEngine>>,
+    /// The session's conversation loop (`conversation_config`, or an alias with an `llm` leg).
+    pub conversation: Option<Arc<crate::core::conversation::ConversationOrchestrator>>,
     /// The turn mode a `/v1/realtime` client chose before its agent session started (the agent's
     /// own `turn_detection` otherwise).
     pub agent_manual: Option<bool>,
@@ -116,6 +118,7 @@ impl ConnectionState {
             leg_meter: None,
             leg_admissions: Vec::new(),
             agent: None,
+            conversation: None,
             agent_manual: None,
             #[cfg(feature = "opus-codec")]
             opus_decoder: None,
@@ -151,6 +154,7 @@ impl ConnectionState {
             leg_meter: None,
             leg_admissions: Vec::new(),
             agent: None,
+            conversation: None,
             agent_manual: None,
             #[cfg(feature = "opus-codec")]
             opus_decoder: None,

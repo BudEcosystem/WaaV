@@ -159,12 +159,25 @@ pub async fn handle_incoming_message(
             true
         }
         IncomingMessage::AgentInput { text } => {
-            match state.read().await.agent.clone() {
-                Some(engine) => engine.start_turn(text).await,
-                None => {
+            let (engine, conversation, tracker) = {
+                let s = state.read().await;
+                (
+                    s.agent.clone(),
+                    s.conversation.clone(),
+                    s.task_tracker.clone(),
+                )
+            };
+            match (engine, conversation) {
+                (Some(engine), _) => engine.start_turn(text).await,
+                // A conversation turn runs until its reply is spoken: off the message loop.
+                (None, Some(conversation)) => tracker.track(
+                    "typed-turn",
+                    tokio::spawn(async move { conversation.take_typed_turn(&text).await }),
+                ),
+                (None, None) => {
                     send_error(
                         message_tx,
-                        "agent_input applies to voice-agent sessions only",
+                        "agent_input applies to voice-agent and conversation sessions only",
                     )
                     .await
                 }

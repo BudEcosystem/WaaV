@@ -362,6 +362,10 @@ pub(crate) async fn teardown_session(
     if let Some(engine) = state.read().await.agent.clone() {
         engine.shutdown().await;
     }
+    // End the conversation loop's live turn and drop its history.
+    if let Some(conversation) = state.write().await.conversation.take() {
+        conversation.shutdown().await;
+    }
 
     // Snapshot state before cleanup so we can drop the read lock before awaiting
     let (voice_manager, livekit_client, recording_egress_id, room_name) = {
