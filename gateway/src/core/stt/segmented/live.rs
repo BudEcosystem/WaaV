@@ -296,6 +296,9 @@ pub struct LiveRequest {
     pub tuning: EndpointTuning,
     /// `extras` the client sent (a standalone session's base URL or region).
     pub extras: BTreeMap<String, String>,
+    /// The leg's server as the OPERATOR configured it (a server alias's `stt.base_url`): trusted
+    /// like `OPENAI_BASE_URL`, and never from a client.
+    pub trusted_base: Option<String>,
 }
 
 /// What the session gets.
@@ -419,10 +422,12 @@ fn target_spec(req: &LiveRequest, provider: &str, model: &str) -> TargetSpec {
                 .get("base_url")
                 .or_else(|| req.extras.get("api_base"))
                 .cloned();
-            let operator = (provider == "openai")
-                .then(|| std::env::var("OPENAI_BASE_URL").ok())
-                .flatten()
-                .filter(|s| !s.trim().is_empty());
+            let operator = req.trusted_base.clone().or_else(|| {
+                (provider == "openai")
+                    .then(|| std::env::var("OPENAI_BASE_URL").ok())
+                    .flatten()
+                    .filter(|s| !s.trim().is_empty())
+            });
             spec.trusted = named.is_none() && operator.is_some();
             spec.api_base = named.or(operator);
             spec.region = req.extras.get("region").cloned();
@@ -1776,6 +1781,7 @@ mod tests {
             prompt: None,
             tuning: EndpointTuning::default(),
             extras: BTreeMap::new(),
+            trusted_base: None,
         }
     }
 

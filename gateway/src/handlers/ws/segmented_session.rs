@@ -100,6 +100,7 @@ pub fn resolve(
     agent: Option<&crate::state::ResolvedVoiceAgent>,
     client_vad_events: Option<bool>,
     client_named_model: bool,
+    trusted_base: Option<String>,
 ) -> LiveSetup {
     let tuning = match agent {
         Some(a) => agent_tuning(&a.entry),
@@ -138,6 +139,7 @@ pub fn resolve(
         prompt,
         tuning,
         extras,
+        trusted_base,
     };
     let live = resolve_session(shared, &req);
     let barge_in_ms = agent

@@ -781,6 +781,7 @@ mod tests {
                 prompt: None,
                 tuning: EndpointTuning::default(),
                 extras: BTreeMap::new(),
+                trusted_base: None,
             },
         )
     }
@@ -871,6 +872,7 @@ mod tests {
                 prompt: None,
                 tuning: EndpointTuning::default(),
                 extras: BTreeMap::new(),
+                trusted_base: None,
             },
         );
         let LiveDecision::Refused(r) = &l.decision else {

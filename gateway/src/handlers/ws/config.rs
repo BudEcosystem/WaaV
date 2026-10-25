@@ -19,6 +19,10 @@ use crate::{
 ///
 /// `None`, empty strings, and whitespace-only strings mean "fall back to server
 /// config"; non-empty values are trimmed before being forwarded to providers.
+/// The longest synthesis request a session may ask for (`tts_config.request_timeout`, or an
+/// alias's `tts.request_timeout_secs`): the LLM leg's default ceiling (`WAAV_LLM_MAX_TIMEOUT_MS`).
+pub const MAX_TTS_REQUEST_TIMEOUT_SECS: u64 = 300;
+
 pub(crate) fn client_api_key(api_key: Option<&str>) -> Option<String> {
     api_key
         .map(str::trim)
@@ -819,7 +823,12 @@ impl TTSWebSocketConfig {
             audio_format: self.audio_format.clone().or(defaults.audio_format),
             sample_rate: self.sample_rate.or(defaults.sample_rate),
             connection_timeout: self.connection_timeout.or(defaults.connection_timeout),
-            request_timeout: self.request_timeout.or(defaults.request_timeout),
+            // A client's (or an alias's) value is clamped: unbounded, a session could hold a
+            // synthesis request (and its pooled connection) for as long as it liked.
+            request_timeout: self
+                .request_timeout
+                .map(|secs| secs.clamp(1, MAX_TTS_REQUEST_TIMEOUT_SECS))
+                .or(defaults.request_timeout),
             pronunciations: self.pronunciations.clone(),
             request_pool_size: defaults.request_pool_size,
             emotion_config,

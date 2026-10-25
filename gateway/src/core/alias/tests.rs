@@ -328,3 +328,146 @@ fn client_cannot_inject_alias_definition_object() {
         _ => panic!("expected Config"),
     }
 }
+
+// ── A leg's own server (Gaia's 25 Oct report, items 2, 3 and 4) ─────────────────────────────
+
+fn config_of(aliases: &[(&str, &str)]) -> AliasConfig {
+    AliasConfig {
+        aliases: aliases
+            .iter()
+            .map(|(n, y)| (n.to_string(), parse_def(y)))
+            .collect(),
+    }
+}
+
+#[test]
+fn a_leg_names_its_own_server_and_credential_server_side_only() {
+    let def = parse_def(
+        r#"
+openai_compatible: true
+stt: { provider: openai, model: local-transcribe, base_url: "https://stt.example.com", credential_ref: gw }
+tts: { provider: openai, model: local-speak, voice: alloy, base_url: "https://tts.example.com/v1", request_timeout_secs: 150 }
+"#,
+    );
+    assert!(def.openai_compatible);
+    let stt = def.stt_endpoint().unwrap();
+    assert_eq!(stt.base_url, "https://stt.example.com");
+    assert_eq!(stt.credential_ref.as_deref(), Some("gw"));
+    assert_eq!(stt.openai_api_base(), "https://stt.example.com/v1");
+    let tts = def.tts_endpoint().unwrap();
+    assert_eq!(
+        tts.openai_api_base(),
+        "https://tts.example.com/v1",
+        "never /v1/v1"
+    );
+    assert!(tts.applies_to("OpenAI") && !tts.applies_to("deepgram"));
+
+    // The splice fills the timeout and never writes the server into the client configs, and the
+    // echo the client receives carries neither.
+    let mut stt_cfg = None;
+    let mut tts_cfg = None;
+    let echo = splice_alias(
+        "gaia",
+        &def,
+        &mut stt_cfg,
+        &mut tts_cfg,
+        &mut None,
+        &mut None,
+    );
+    let tts_cfg = tts_cfg.unwrap();
+    assert_eq!(tts_cfg.request_timeout, Some(150));
+    assert!(tts_cfg.extras.0.is_empty());
+    let json = serde_json::to_string(&echo).unwrap();
+    assert!(
+        !json.contains("example.com") && !json.contains("credential_ref"),
+        "{json}"
+    );
+}
+
+#[test]
+fn startup_refuses_a_leg_server_it_cannot_honour() {
+    let no_provider = config_of(&[("a", r#"tts: { base_url: "https://tts.example.com" }"#)]);
+    assert!(
+        validate_aliases(&no_provider)
+            .unwrap_err()
+            .contains("needs tts.provider")
+    );
+
+    let private = config_of(&[(
+        "b",
+        r#"stt: { provider: openai, base_url: "http://10.0.0.5:8000" }"#,
+    )]);
+    let e = validate_aliases(&private).unwrap_err();
+    assert!(e.contains("WAAV_PRIVATE_EGRESS_ALLOWLIST"), "{e}");
+
+    let not_openai = config_of(&[(
+        "c",
+        r#"
+openai_compatible: true
+tts: { provider: deepgram, base_url: "https://proxy.example.com" }
+"#,
+    )]);
+    assert!(
+        validate_aliases(&not_openai)
+            .unwrap_err()
+            .contains("must be openai")
+    );
+
+    let nothing_to_serve = config_of(&[("d", "openai_compatible: true\n")]);
+    assert!(validate_aliases(&nothing_to_serve).is_err());
+
+    let fine = config_of(&[
+        (
+            "e",
+            r#"
+openai_compatible: true
+tts: { provider: openai, base_url: "https://tts.example.com" }
+"#,
+        ),
+        ("f", support_bot_yaml()),
+    ]);
+    assert_eq!(validate_aliases(&fine), Ok(()));
+}
+
+fn endpoint(base: &str, credential_ref: Option<&str>) -> AliasLegEndpoint {
+    AliasLegEndpoint {
+        provider: "openai".into(),
+        base_url: base.into(),
+        credential_ref: credential_ref.map(str::to_string),
+    }
+}
+
+#[test]
+fn an_alias_leg_key_is_the_clients_then_the_aliases_then_an_approved_operator_key() {
+    // The client's own key wins.
+    let k = alias_leg_key(&endpoint("https://x.example", None), Some("sk-own"), || {
+        Some("sk-op".into())
+    })
+    .unwrap();
+    assert_eq!(k.key, "sk-own");
+
+    // The operator's OPENAI_API_KEY may go to api.openai.com (its implicit binding).
+    let k = alias_leg_key(&endpoint("https://api.openai.com", None), None, || {
+        Some("sk-op".into())
+    })
+    .unwrap();
+    assert_eq!((k.key.as_str(), k.withheld), ("sk-op", false));
+
+    // …but not to a server nobody approved: the leg runs keyless, and the client is told.
+    let k = alias_leg_key(&endpoint("https://x.example", None), None, || {
+        Some("sk-op".into())
+    })
+    .unwrap();
+    assert_eq!((k.key.as_str(), k.withheld), ("", true));
+
+    // A keyless server with no operator key: nothing withheld.
+    let k = alias_leg_key(&endpoint("https://x.example", None), None, || None).unwrap();
+    assert_eq!(k, AliasLegKey::default());
+
+    // A credential the operator never declared is an error, not a silent fallback.
+    let e = alias_leg_key(&endpoint("https://x.example", Some("nobody")), None, || {
+        None
+    })
+    .unwrap_err();
+    assert!(e.contains("nobody"), "{e}");
+}
