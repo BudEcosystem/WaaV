@@ -332,7 +332,11 @@ impl LlmEndpointNode {
         let default_env_key = crate::core::llm::LlmAdapter::default_env_key(
             crate::core::llm::adapter::select_adapter(&probe),
         );
-        let key = crate::core::credentials::global_credentials()
+        let registry = crate::core::credentials::global_credentials();
+        registry
+            .refuse_operator_only(config.api_key.as_deref(), credential_ref)
+            .map_err(|e| DAGError::ConfigError(format!("LLM node '{id}': {e}")))?;
+        let key = registry
             .resolve_client_key(
                 config.api_key.as_deref(),
                 credential_ref,

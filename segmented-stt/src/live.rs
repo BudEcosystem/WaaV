@@ -369,7 +369,7 @@ pub fn build_transcriber(
     if !spec.trusted
         && let Some(base) = spec.url.as_deref().or(spec.api_base.as_deref())
     {
-        crate::transcriber::http::check_untrusted_base(base, clients.public_may_reach_private())?;
+        crate::transcriber::http::check_untrusted_base(base, clients.private_reach())?;
     }
     match adapter {
         "openai_transcriptions" | "groq_transcriptions" | "azure_openai_transcriptions" => {

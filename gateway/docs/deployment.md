@@ -92,6 +92,11 @@ Minimal multi-secret example:
 AUTH_API_SECRETS_JSON='[{"id":"default","secret":"sk_test_default_123"}]'
 ```
 
+Your vendor keys are sent only to their vendors' hosts, and to hosts you approve. To approve other
+hosts (a proxy, a local OpenAI-compatible server), use `WAAV_CREDENTIALS_JSON` /
+`WAAV_CREDENTIALS_FILE` and `WAAV_PRIVATE_EGRESS_ALLOWLIST`. `WAAV_CLIENT_ENDPOINTS=deny` stops
+clients from choosing endpoints at all. See [Egress and operator credentials](egress-and-credentials.md).
+
 ## 4. Local Docker Run
 
 ```bash

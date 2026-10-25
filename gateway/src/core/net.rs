@@ -72,7 +72,7 @@ pub(crate) enum LoopbackAllowance {
 }
 
 impl LoopbackAllowance {
-    fn permits(&self, port: Option<u16>) -> bool {
+    pub(crate) fn permits(&self, port: Option<u16>) -> bool {
         match self {
             Self::Off => false,
             Self::AnyPort => true,
@@ -165,6 +165,42 @@ fn parse_loopback_allowance(value: &str) -> Result<LoopbackAllowance, String> {
                 .to_string()
         })?;
     Ok(LoopbackAllowance::Ports(ports))
+}
+
+/// The same exemptions as data, for the segmented speech-to-text uploader, which sits below the
+/// gateway and cannot call it: `WAAV_ALLOW_LOOPBACK_ENDPOINTS` and `WAAV_PRIVATE_EGRESS_ALLOWLIST`
+/// read through `get` (the caller's lookup, so tests need no process environment). Malformed
+/// values keep loopback off and drop the bad allowlist entry, as [`loopback_allowance`] and
+/// [`private_egress_allowlist`] do.
+pub(crate) fn private_reach_from(
+    get: impl Fn(&str) -> Option<String>,
+) -> waav_segmented_stt::net::PrivateReach {
+    let loopback_ports =
+        match get("WAAV_ALLOW_LOOPBACK_ENDPOINTS").map(|v| parse_loopback_allowance(&v)) {
+            Some(Ok(LoopbackAllowance::AnyPort)) => Some(Vec::new()),
+            Some(Ok(LoopbackAllowance::Ports(ports))) => Some(ports),
+            Some(Ok(LoopbackAllowance::Off)) | None => None,
+            Some(Err(e)) => {
+                tracing::error!(error = %e, "invalid loopback endpoint escape-hatch configuration");
+                None
+            }
+        };
+    let allowed = get(PRIVATE_EGRESS_ALLOWLIST_ENV)
+        .unwrap_or_default()
+        .split(',')
+        .filter(|e| !e.trim().is_empty())
+        .filter_map(|entry| match HostPort::parse(entry) {
+            Ok(hp) => Some((hp.host, hp.port)),
+            Err(e) => {
+                tracing::error!(error = %e, "{PRIVATE_EGRESS_ALLOWLIST_ENV}: entry ignored");
+                None
+            }
+        })
+        .collect();
+    waav_segmented_stt::net::PrivateReach {
+        loopback_ports,
+        allowed,
+    }
 }
 
 /// Whether ANY loopback target is permitted (kept for callers that only need a yes/no).
@@ -562,6 +598,37 @@ mod tests {
         );
     }
     use super::*;
+
+    #[test]
+    fn segmented_uploads_get_the_same_exemptions_as_data() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| {
+                pairs
+                    .iter()
+                    .find(|(name, _)| *name == k)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        let off = private_reach_from(env(&[]));
+        assert_eq!(off, waav_segmented_stt::net::PrivateReach::default());
+        let any = private_reach_from(env(&[("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1")]));
+        assert_eq!(any.loopback_ports, Some(Vec::new()));
+        let ports = private_reach_from(env(&[("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "8080,9000")]));
+        assert_eq!(ports.loopback_ports, Some(vec![8080, 9000]));
+        let bad = private_reach_from(env(&[("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "maybe")]));
+        assert_eq!(bad.loopback_ports, None, "a malformed hatch stays off");
+        let listed = private_reach_from(env(&[(
+            "WAAV_PRIVATE_EGRESS_ALLOWLIST",
+            "10.0.0.5:8000, nonsense ,LLM.lan:8080",
+        )]));
+        assert_eq!(
+            listed.allowed,
+            vec![
+                ("10.0.0.5".to_string(), 8000),
+                ("llm.lan".to_string(), 8080)
+            ]
+        );
+    }
 
     const HTTP_SCHEMES: &[&str] = &["http", "https"];
     const WS_SCHEMES: &[&str] = &["http", "https", "ws", "wss"];

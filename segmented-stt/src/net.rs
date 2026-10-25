@@ -24,6 +24,80 @@ pub const BLOCKED_HOSTNAMES: &[&str] = &[
     "intranet",
 ];
 
+/// The private targets an operator lets a CLIENT-named address reach: the gateway's
+/// `WAAV_ALLOW_LOOPBACK_ENDPOINTS` (loopback only, on any or on listed ports) and
+/// `WAAV_PRIVATE_EGRESS_ALLOWLIST` (exact `host:port` pairs). The default reaches nothing private.
+///
+/// Data, not a flag: a boolean "may reach private" let a client-named base reach every private
+/// range — cloud metadata and RFC 1918 included — whenever the loopback escape hatch was on.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PrivateReach {
+    /// Loopback: `None` blocked, `Some(empty)` any port, `Some(ports)` those ports only.
+    pub loopback_ports: Option<Vec<u16>>,
+    /// Exact `(host, port)` pairs exempt from the private-address rules; hosts lower case, as
+    /// `url::Url::host_str` writes them (IPv6 bracketed).
+    pub allowed: Vec<(String, u16)>,
+}
+
+impl PrivateReach {
+    /// Whether the loopback escape hatch admits `port`.
+    pub fn loopback_permits(&self, port: Option<u16>) -> bool {
+        match &self.loopback_ports {
+            None => false,
+            Some(ports) if ports.is_empty() => true,
+            Some(ports) => port.is_some_and(|p| ports.contains(&p)),
+        }
+    }
+
+    /// Whether `host:port` is one of the operator's exact exemptions.
+    pub fn allows_exactly(&self, host: &str, port: Option<u16>) -> bool {
+        port.is_some_and(|port| {
+            self.allowed
+                .iter()
+                .any(|(h, p)| *p == port && h.eq_ignore_ascii_case(host))
+        })
+    }
+
+    /// Whether a URL host (as `url::Url::host_str` writes it) on `port` may be a private target:
+    /// an exact exemption, or a loopback name or literal under the escape hatch.
+    pub fn permits_host(&self, host: &str, port: Option<u16>) -> bool {
+        self.allows_exactly(host, port) || (self.loopback_permits(port) && is_loopback_host(host))
+    }
+
+    /// Whether a resolved address of `name` may be dialled although it is not public: `name` is an
+    /// exempt host (its port was enforced when the URL was checked), or the address is loopback
+    /// and the escape hatch is on.
+    pub fn permits_resolved(&self, name: &str, ip: &IpAddr) -> bool {
+        self.allowed
+            .iter()
+            .any(|(h, _)| h.eq_ignore_ascii_case(name))
+            || (self.loopback_ports.is_some() && is_loopback_ip(ip))
+    }
+}
+
+fn is_loopback_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback(),
+        IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
+    }
+}
+
+/// Whether a URL host names the loopback interface: `localhost` forms or a loopback IP literal
+/// (bracketed IPv6 included). Never link-local, metadata or another private range.
+pub fn is_loopback_host(host: &str) -> bool {
+    let lower = host.to_ascii_lowercase();
+    if matches!(lower.as_str(), "localhost" | "localhost.localdomain") {
+        return true;
+    }
+    let bare = lower
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(&lower);
+    bare.parse::<IpAddr>().is_ok_and(|ip| is_loopback_ip(&ip))
+}
+
 /// The half of the SSRF rule that needs no lookup, for a URL's host as `url::Url::host_str`
 /// writes it: a blocked name, a `.localhost` name, or an IP literal in any spelling (bracketed
 /// IPv6, decimal IPv4) that is not public is refused. `Ok(Some(name))` is a DNS name, to be

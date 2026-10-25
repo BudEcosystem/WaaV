@@ -8,6 +8,7 @@ pub mod alias;
 pub mod audio;
 pub mod cache;
 pub mod capabilities;
+pub mod client_destination;
 pub mod conversation;
 pub mod credentials;
 /// FRD-022: a Bud deployment's rate limits, concurrency cap, retry, fallback and breakers.

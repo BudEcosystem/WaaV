@@ -132,14 +132,11 @@ impl SttLiveShared {
                 })?,
         };
         let mut http = HttpSettings::from_lookup(&get)?;
-        // The gateway's one escape hatch for loopback and private vendor addresses (local
-        // development and tests) applies to segmented uploads too.
-        http.public_may_reach_private = get("WAAV_ALLOW_LOOPBACK_ENDPOINTS").is_some_and(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        });
+        // The gateway's private-target exemptions apply to segmented uploads with the same
+        // scope as everywhere else: loopback on the escape hatch's ports, and exact allowlisted
+        // host:port pairs. A boolean here used to let a client-named base reach every private
+        // range, cloud metadata included, whenever the escape hatch was on.
+        http.private_reach = crate::core::net::private_reach_from(&get);
         Ok(Self {
             map: CapabilityMap::embedded(),
             rollout,

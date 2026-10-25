@@ -309,6 +309,21 @@ pub async fn handle_config_message(
         send_error(message_tx, refusal).await;
         return true;
     }
+    // Standalone: what the CLIENT itself wrote, checked here, before an alias is spliced in, so
+    // the operator's own choices (an alias's base_url and credential_ref) are never refused.
+    if app_state.bud_mode.is_none()
+        && let Some(refusal) = standalone_client_config_refusal(
+            conversation_ws_config.as_ref(),
+            dag_ws_config.as_ref(),
+            stt_ws_config.as_ref(),
+            tts_ws_config.as_ref(),
+            crate::core::client_destination::client_endpoints_denied(),
+        )
+    {
+        warn!(reason = %refusal, "Refusing a standalone /ws config");
+        send_error(message_tx, refusal).await;
+        return true;
+    }
 
     // Spec 025: a voice agent decides its own legs and runs its own turns.
     if let Some(agent) = agent_ws_config.as_ref() {
@@ -461,6 +476,20 @@ pub async fn handle_config_message(
             )
             .await;
         }
+    }
+
+    // A standalone leg with no key of the client's own carries the OPERATOR's vendor credential,
+    // and providers read their destination from the client's `extras` (`endpoint_override` and
+    // friends). Refused here, before segmented setup or any provider reads them, unless the
+    // operator approved the host (`core::client_destination`). Under Bud mode the legs use the
+    // deployment's extras and never a process key.
+    if app_state.bud_mode.is_none()
+        && let Some(refusal) =
+            client_destination_refusal(stt_ws_config.as_ref(), tts_ws_config.as_ref())
+    {
+        warn!(reason = %refusal, "Refusing a client destination for an operator credential");
+        send_error(message_tx, refusal).await;
+        return true;
     }
 
     // Segmented speech-to-text: how this session's model is reached on a live call, decided once
@@ -1041,6 +1070,108 @@ pub(crate) fn agent_config_refusal(
             clash.join(" or ")
         )
     })
+}
+
+/// The first client-chosen destination in a standalone session's STT or TTS `extras` that would
+/// receive the operator's vendor credential without the operator's approval, as the refusal to
+/// send. A leg carrying the client's own `api_key` may point anywhere (SSRF rules still apply).
+pub(crate) fn client_destination_refusal(
+    stt: Option<&STTWebSocketConfig>,
+    tts: Option<&TTSWebSocketConfig>,
+) -> Option<String> {
+    use crate::core::client_destination::refusal;
+    let stt = stt
+        .filter(|c| super::config::client_api_key(c.api_key.as_deref()).is_none())
+        .and_then(|c| refusal("stt_config", &c.provider, &c.extras.0));
+    stt.or_else(|| {
+        tts.filter(|c| super::config::client_api_key(c.api_key.as_deref()).is_none())
+            .and_then(|c| refusal("tts_config", &c.provider, &c.extras.0))
+    })
+}
+
+/// What a standalone `/ws` config, as the client wrote it, may not carry, or `None`.
+///
+/// * A credential the operator kept for its own config (`clients: false`), named by
+///   `credential_ref` or `api_key: "${NAME}"` on either LLM tier — always.
+/// * With `WAAV_CLIENT_ENDPOINTS=deny` (`endpoints_denied`): every endpoint a client chooses —
+///   `conversation_config.base_url` / `reasoning_base_url`, any operator credential it names, an
+///   inline `dag_config.definition`, and STT/TTS `extras` destinations. Clients then name aliases
+///   and server templates only, as under Bud mode.
+pub(crate) fn standalone_client_config_refusal(
+    conversation: Option<&ConversationWebSocketConfig>,
+    dag: Option<&DAGWebSocketConfig>,
+    stt: Option<&STTWebSocketConfig>,
+    tts: Option<&TTSWebSocketConfig>,
+    endpoints_denied: bool,
+) -> Option<String> {
+    let registry = crate::core::credentials::global_credentials();
+    if let Some(conv) = conversation {
+        for (field, api_key, credential_ref) in [
+            (
+                "conversation_config",
+                conv.api_key.as_deref(),
+                conv.credential_ref.as_deref(),
+            ),
+            (
+                "conversation_config (reasoning tier)",
+                conv.reasoning_api_key.as_deref(),
+                conv.reasoning_credential_ref.as_deref(),
+            ),
+        ] {
+            if let Err(e) = registry.refuse_operator_only(api_key, credential_ref) {
+                return Some(format!("{field}: {e}"));
+            }
+        }
+    }
+    if !endpoints_denied {
+        return None;
+    }
+    if let Some(conv) = conversation {
+        let mut fields: Vec<&str> = Vec::new();
+        if !conv.base_url.trim().is_empty() {
+            fields.push("base_url");
+        }
+        if conv.reasoning_base_url.is_some() {
+            fields.push("reasoning_base_url");
+        }
+        if conv.credential_ref.is_some()
+            || conv
+                .api_key
+                .as_deref()
+                .and_then(crate::core::credentials::env_reference)
+                .is_some()
+        {
+            fields.push("credential_ref");
+        }
+        if conv.reasoning_credential_ref.is_some()
+            || conv
+                .reasoning_api_key
+                .as_deref()
+                .and_then(crate::core::credentials::env_reference)
+                .is_some()
+        {
+            fields.push("reasoning_credential_ref");
+        }
+        if !fields.is_empty() {
+            return Some(format!(
+                "conversation_config.{} is not accepted by this gateway: it does not let clients \
+                 choose endpoints or name its credentials ({}=deny). Use an alias, which carries \
+                 the operator's LLM endpoint and credential",
+                fields.join(", conversation_config."),
+                crate::core::client_destination::CLIENT_ENDPOINTS_ENV,
+            ));
+        }
+    }
+    if dag.is_some_and(|d| d.definition.is_some()) {
+        return Some(format!(
+            "dag_config.definition is not accepted by this gateway ({}=deny): use a server \
+             template (dag_config.template)",
+            crate::core::client_destination::CLIENT_ENDPOINTS_ENV,
+        ));
+    }
+    use crate::core::client_destination::any_destination;
+    stt.and_then(|c| any_destination("stt_config", &c.provider, &c.extras.0))
+        .or_else(|| tts.and_then(|c| any_destination("tts_config", &c.provider, &c.extras.0)))
 }
 
 /// What a Bud-mode `/ws` config may not carry (FRD-023 RT0, FR-WS-2, FR-WS-3), or `None`.
@@ -1664,6 +1795,18 @@ async fn initialize_conversation_loop(
     let orchestrator =
         ConversationOrchestrator::new(stream_id.to_string(), config, voice_manager.clone())
             .map_err(|e| e.to_string())?;
+    if let Some(advisory) = orchestrator.key_advisory() {
+        send_config_warning(
+            message_tx,
+            "llm_key_not_sent",
+            advisory.message(),
+            Some(serde_json::json!({
+                "credential": advisory.credential,
+                "host": advisory.host,
+            })),
+        )
+        .await;
+    }
 
     let orchestrator = Arc::new(orchestrator);
 
@@ -3609,6 +3752,15 @@ async fn initialize_dag_routing(
     } else {
         DAGCompiler::for_operator_template()
     };
+    // Standalone: a provider node without a key of its own uses the gateway's, as a `/ws` leg
+    // does. Under Bud mode a node's credential comes from its deployment, never the process.
+    let compiler = if app_state.bud_mode.is_none() {
+        compiler.with_server_keys(crate::dag::compiler::ServerKeys::from_config(
+            &app_state.config,
+        ))
+    } else {
+        compiler
+    };
     let compiled_dag = compiler
         .compile(dag_definition)
         .map_err(|e| format!("DAG compilation failed: {}", e))?;
@@ -5081,5 +5233,121 @@ mod frd023_bud_mode_tests {
             leg(serde_json::json!({"stt": {"model": "nova-3"}, "tts": {"provider": "deepgram"}}));
         let err = validate_audio_config_values(&stt, &tts).unwrap_err();
         assert!(err.contains("STT provider"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod standalone_destination_tests {
+    //! A standalone session's client may not point the OPERATOR's vendor credential at a host of
+    //! its choosing (`core::client_destination`), and `WAAV_CLIENT_ENDPOINTS=deny` refuses every
+    //! client-chosen endpoint before an alias is spliced in.
+    use super::*;
+    use serde_json::json;
+
+    fn stt(extra: serde_json::Value) -> STTWebSocketConfig {
+        let mut base = json!({"provider": "deepgram", "language": "en-US", "sample_rate": 16000,
+            "channels": 1, "punctuation": true});
+        for (k, v) in extra.as_object().unwrap() {
+            base[k] = v.clone();
+        }
+        serde_json::from_value(base).expect("stt config")
+    }
+
+    fn tts(extra: serde_json::Value) -> TTSWebSocketConfig {
+        let mut base = json!({"provider": "elevenlabs"});
+        for (k, v) in extra.as_object().unwrap() {
+            base[k] = v.clone();
+        }
+        serde_json::from_value(base).expect("tts config")
+    }
+
+    fn conversation(extra: serde_json::Value) -> ConversationWebSocketConfig {
+        let mut base = json!({"base_url": "", "model": "m"});
+        for (k, v) in extra.as_object().unwrap() {
+            base[k] = v.clone();
+        }
+        serde_json::from_value(base).expect("conversation config")
+    }
+
+    #[test]
+    fn an_override_with_the_operator_key_is_refused_on_either_leg() {
+        let evil = json!({"extras": {"endpoint_override": "wss://attacker.example"}});
+        let refusal = client_destination_refusal(Some(&stt(evil.clone())), None).expect("stt");
+        assert!(
+            refusal.contains("stt_config.extras.endpoint_override"),
+            "{refusal}"
+        );
+        let refusal = client_destination_refusal(None, Some(&tts(evil))).expect("tts");
+        assert!(
+            refusal.contains("tts_config.extras.endpoint_override"),
+            "{refusal}"
+        );
+        let segmented = json!({"extras": {"base_url": "https://attacker.example/v1"}});
+        assert!(client_destination_refusal(Some(&stt(segmented)), None).is_some());
+    }
+
+    #[test]
+    fn a_client_with_its_own_key_may_point_it_anywhere() {
+        let own =
+            json!({"api_key": "dg-own", "extras": {"endpoint_override": "wss://proxy.example"}});
+        assert_eq!(client_destination_refusal(Some(&stt(own)), None), None);
+        assert_eq!(
+            client_destination_refusal(Some(&stt(json!({}))), Some(&tts(json!({})))),
+            None
+        );
+    }
+
+    #[test]
+    fn allow_mode_leaves_client_llm_endpoints_alone() {
+        let conv = conversation(json!({"base_url": "https://llm.example/v1"}));
+        assert_eq!(
+            standalone_client_config_refusal(Some(&conv), None, None, None, false),
+            None
+        );
+    }
+
+    #[test]
+    fn deny_mode_refuses_every_client_chosen_endpoint() {
+        for (extra, field) in [
+            (json!({"base_url": "https://llm.example/v1"}), "base_url"),
+            (
+                json!({"reasoning_base_url": "https://llm.example/v1"}),
+                "reasoning_base_url",
+            ),
+            (json!({"credential_ref": "local-gw"}), "credential_ref"),
+            (json!({"api_key": "${local-gw}"}), "credential_ref"),
+        ] {
+            let conv = conversation(extra);
+            let refusal = standalone_client_config_refusal(Some(&conv), None, None, None, true)
+                .unwrap_or_else(|| panic!("{field} accepted"));
+            assert!(
+                refusal.contains(field) && refusal.contains("WAAV_CLIENT_ENDPOINTS"),
+                "{refusal}"
+            );
+        }
+        // A literal key of the client's own, with an alias's endpoint, is fine.
+        let own = conversation(json!({"api_key": "sk-own"}));
+        assert_eq!(
+            standalone_client_config_refusal(Some(&own), None, None, None, true),
+            None
+        );
+
+        let dag: DAGWebSocketConfig =
+            serde_json::from_value(json!({"definition": {"nodes": []}})).unwrap();
+        assert!(standalone_client_config_refusal(None, Some(&dag), None, None, true).is_some());
+        let template: DAGWebSocketConfig =
+            serde_json::from_value(json!({"template": "support"})).unwrap();
+        assert_eq!(
+            standalone_client_config_refusal(None, Some(&template), None, None, true),
+            None
+        );
+
+        let own_key_override =
+            stt(json!({"api_key": "own", "extras": {"endpoint_override": "wss://proxy.example"}}));
+        assert!(
+            standalone_client_config_refusal(None, None, Some(&own_key_override), None, true)
+                .is_some(),
+            "deny refuses client endpoints whoever's key they carry"
+        );
     }
 }

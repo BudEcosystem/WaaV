@@ -477,6 +477,25 @@ pub async fn submit_batch(
         Err(e) => return err(StatusCode::BAD_REQUEST, &e),
     };
 
+    // With the gateway's own key, a destination the request chose must be one the operator
+    // approved (`core::client_destination`): an `endpoint_override` used to receive the
+    // operator's vendor key wherever it pointed.
+    let client_owns_key = matches!(
+        client_batch_api_key(&provider, &req.config.base.api_key),
+        Ok(Some(_))
+    );
+    let destination_refusal = if crate::core::client_destination::client_endpoints_denied() {
+        crate::core::client_destination::any_destination("config", &provider, &req.config.extras.0)
+    } else if client_owns_key {
+        None
+    } else {
+        crate::core::client_destination::refusal("config", &provider, &req.config.extras.0)
+    };
+    if let Some(refusal) = destination_refusal {
+        warn!(%provider, reason = %refusal, "Refusing a batch destination for an operator credential");
+        return err(StatusCode::BAD_REQUEST, &refusal);
+    }
+
     let job_id = Uuid::new_v4().to_string();
 
     // Build the provider-native submission. AssemblyAI bytes need a prior upload (done below).
