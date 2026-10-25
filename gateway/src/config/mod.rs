@@ -105,29 +105,51 @@ pub struct PluginConfig {
 /// ```
 #[derive(Debug, Clone)]
 pub struct DAGTimeoutsConfig {
-    /// Default node execution timeout in seconds (default: 30)
+    /// Default node execution timeout in seconds (default: 30): any node without its own
+    /// `timeout_ms` or a per-kind value below.
     pub node_execution_secs: u64,
-    /// Provider operation timeout in seconds (default: 30)
-    pub provider_operation_secs: u64,
-    /// STT endpoint timeout in seconds (default: 60)
-    pub stt_endpoint_secs: u64,
-    /// TTS endpoint timeout in seconds (default: 60)
-    pub tts_endpoint_secs: u64,
-    /// LLM endpoint timeout in seconds (default: 120)
-    pub llm_endpoint_secs: u64,
-    /// WebSocket operation timeout in seconds (default: 30)
-    pub websocket_operation_secs: u64,
+    /// STT, TTS and realtime provider nodes, when their own per-kind value is unset.
+    pub provider_operation_secs: Option<u64>,
+    /// `stt_provider` nodes.
+    pub stt_endpoint_secs: Option<u64>,
+    /// `tts_provider` nodes.
+    pub tts_endpoint_secs: Option<u64>,
+    /// `llm_endpoint` nodes.
+    pub llm_endpoint_secs: Option<u64>,
+    /// `websocket_endpoint` nodes.
+    pub websocket_operation_secs: Option<u64>,
+}
+
+impl DAGTimeoutsConfig {
+    /// The timeout a node of `kind` (its type tag) runs under when it has no `timeout_ms`: the
+    /// kind's own value if the operator set one, else `provider_operation_secs` for a provider
+    /// node, else `node_execution_secs`. The per-kind values used to be parsed and never read,
+    /// so an operator who set `llm_endpoint_secs: 5` still got 30 s; they have no default now,
+    /// so a deployment that never set them keeps exactly the node default it had.
+    pub fn for_kind(&self, kind: &str) -> u64 {
+        let provider = matches!(kind, "stt_provider" | "tts_provider" | "realtime_provider")
+            .then_some(self.provider_operation_secs)
+            .flatten();
+        let own = match kind {
+            "stt_provider" => self.stt_endpoint_secs,
+            "tts_provider" => self.tts_endpoint_secs,
+            "llm_endpoint" => self.llm_endpoint_secs,
+            "websocket_endpoint" => self.websocket_operation_secs,
+            _ => None,
+        };
+        own.or(provider).unwrap_or(self.node_execution_secs).max(1)
+    }
 }
 
 impl Default for DAGTimeoutsConfig {
     fn default() -> Self {
         Self {
             node_execution_secs: 30,
-            provider_operation_secs: 30,
-            stt_endpoint_secs: 60,
-            tts_endpoint_secs: 60,
-            llm_endpoint_secs: 120,
-            websocket_operation_secs: 30,
+            provider_operation_secs: None,
+            stt_endpoint_secs: None,
+            tts_endpoint_secs: None,
+            llm_endpoint_secs: None,
+            websocket_operation_secs: None,
         }
     }
 }
@@ -886,6 +908,36 @@ mod tests {
             assert_eq!(provider_key_variable(provider), None, "{provider}");
             assert!(config.get_api_key_inner(provider).is_err(), "{provider}");
         }
+    }
+
+    #[test]
+    fn a_node_kind_gets_its_own_timeout_then_the_provider_one_then_the_default() {
+        let unset = DAGTimeoutsConfig::default();
+        for kind in ["llm_endpoint", "stt_provider", "http_endpoint"] {
+            assert_eq!(
+                unset.for_kind(kind),
+                30,
+                "{kind}: nothing set keeps the node default"
+            );
+        }
+        let set = DAGTimeoutsConfig {
+            node_execution_secs: 20,
+            provider_operation_secs: Some(45),
+            stt_endpoint_secs: None,
+            tts_endpoint_secs: Some(90),
+            llm_endpoint_secs: Some(5),
+            websocket_operation_secs: Some(12),
+        };
+        assert_eq!(set.for_kind("llm_endpoint"), 5);
+        assert_eq!(set.for_kind("tts_provider"), 90);
+        assert_eq!(
+            set.for_kind("stt_provider"),
+            45,
+            "a provider kind without its own value"
+        );
+        assert_eq!(set.for_kind("realtime_provider"), 45);
+        assert_eq!(set.for_kind("websocket_endpoint"), 12);
+        assert_eq!(set.for_kind("http_endpoint"), 20);
     }
 
     /// Helper function to create a test ServerConfig with defaults

@@ -32,6 +32,8 @@ pub struct DAGExecutor {
     enable_parallelism: bool,
     /// Maximum concurrent branch executions
     max_concurrent_branches: usize,
+    /// Per-kind default timeouts, by node type tag (see [`Self::with_kind_timeouts`]).
+    kind_timeouts: HashMap<&'static str, Duration>,
 }
 
 impl DAGExecutor {
@@ -41,6 +43,7 @@ impl DAGExecutor {
             default_timeout: Duration::from_secs(30),
             enable_parallelism: true,
             max_concurrent_branches: 10,
+            kind_timeouts: HashMap::new(),
         }
     }
 
@@ -900,24 +903,64 @@ impl DAGExecutor {
             .definition
             .timeout_ms
             .map(Duration::from_millis)
+            .or_else(|| self.kind_timeouts.get(node_type).copied())
             .unwrap_or(self.default_timeout);
         // Cancellation (barge-in, a superseding turn, teardown) drops the node's in-flight work at
         // once instead of waiting for its LLM or TTS call to finish.
         let cancel = ctx.cancel_token.clone();
-        let result = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => Err(DAGError::Cancelled),
-            r = timeout(node_timeout, node.execute(input, ctx)) => match r {
-                Ok(result) => result,
-                Err(_) => {
+        // `retry_on_failure` / `max_retries`, for the kinds a retry cannot duplicate
+        // (`retry_attempts`). Every attempt shares the node's ONE time budget, so a retry never
+        // stretches the turn, and the input is cloned only when a retry is possible.
+        let max_retries = retry_attempts(&compiled_node.definition, node_type);
+        let deadline = start + node_timeout;
+        let mut input = Some(input);
+        let mut attempt: u32 = 0;
+        let result = loop {
+            let this_input = if attempt < max_retries {
+                input.clone()
+            } else {
+                input.take()
+            }
+            .expect("input is kept until the last attempt");
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let attempted = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => Err(DAGError::Cancelled),
+                r = timeout(remaining, node.execute(this_input, ctx)) => match r {
+                    Ok(result) => result,
+                    Err(_) => {
+                        warn!(
+                            node_id = %node_id,
+                            timeout_ms = %node_timeout.as_millis(),
+                            "Node execution timed out"
+                        );
+                        Err(DAGError::ExecutionTimeout(node_timeout.as_millis() as u64))
+                    }
+                },
+            };
+            match attempted {
+                Err(e) if attempt < max_retries && is_transient(&e) => {
+                    let backoff = Duration::from_millis(100u64 << attempt.min(3));
+                    if Instant::now() + backoff >= deadline {
+                        break Err(e);
+                    }
+                    attempt += 1;
                     warn!(
                         node_id = %node_id,
-                        timeout_ms = %node_timeout.as_millis(),
-                        "Node execution timed out"
+                        attempt,
+                        max_retries,
+                        error = %e,
+                        "Node failed; retrying"
                     );
-                    Err(DAGError::ExecutionTimeout(node_timeout.as_millis() as u64))
+                    crate::core::metrics::bridge::record_dag_node_retry(node_type);
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => break Err(DAGError::Cancelled),
+                        _ = tokio::time::sleep(backoff) => {}
+                    }
                 }
-            },
+                other => break other,
+            }
         };
 
         let duration = start.elapsed();
@@ -957,6 +1000,13 @@ impl DAGExecutor {
         }
 
         result
+    }
+
+    /// Per-kind default timeouts (`dag_timeouts.llm_endpoint_secs` and friends), keyed by the
+    /// node's type tag; a node's own `timeout_ms` wins, `default_timeout` covers the rest.
+    pub fn with_kind_timeouts(mut self, timeouts: HashMap<&'static str, Duration>) -> Self {
+        self.kind_timeouts = timeouts;
+        self
     }
 
     /// Execute the precomputed branch interiors of a split node exactly once.
@@ -1346,6 +1396,36 @@ fn dynamic_to_dag_data(value: &Dynamic) -> DAGResult<DAGData> {
     Ok(DAGData::Json(serde_json::json!(value.to_string())))
 }
 
+/// Node kinds a retry cannot duplicate: in `execute_node` they return their result when done,
+/// and only a downstream output node delivers it. HTTP, gRPC, WebSocket, IPC and webhook nodes
+/// have effects outside the gateway (a POST to someone else's system), and a realtime node speaks
+/// as it goes, so neither is retried whatever its definition says.
+pub(crate) const RETRYABLE_KINDS: &[&str] = &["stt_provider", "tts_provider", "llm_endpoint"];
+
+/// How many retries a node gets: its `max_retries` (at most 5) when `retry_on_failure` is set
+/// and its kind is in [`RETRYABLE_KINDS`], else none. Those fields used to be parsed and never
+/// read, so a node error failed the turn whatever the definition asked for.
+fn retry_attempts(definition: &crate::dag::definition::NodeDefinition, kind: &str) -> u32 {
+    if definition.retry_on_failure && RETRYABLE_KINDS.contains(&kind) {
+        definition.max_retries.min(5)
+    } else {
+        0
+    }
+}
+
+/// Errors worth another attempt: a vendor or transport failure. Never a cancellation, an
+/// exhausted time budget, or a configuration error (each would fail the same way again).
+fn is_transient(e: &DAGError) -> bool {
+    matches!(
+        e,
+        DAGError::STTProviderError { .. }
+            | DAGError::TTSProviderError { .. }
+            | DAGError::LlmEndpointError { .. }
+            | DAGError::EndpointTimeout(_)
+            | DAGError::NodeExecutionError { .. }
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1497,6 +1577,207 @@ mod tests {
                 count: self.count.clone(),
             })
         }
+    }
+
+    /// A node of a chosen kind that fails its first `fail_first` executions with `error`.
+    struct FlakyNode {
+        kind: &'static str,
+        fail_first: usize,
+        error: fn() -> DAGError,
+        delay: Duration,
+        count: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl DAGNode for FlakyNode {
+        fn id(&self) -> &str {
+            "mid"
+        }
+        fn node_type(&self) -> &str {
+            self.kind
+        }
+        fn capabilities(&self) -> Vec<NodeCapability> {
+            vec![NodeCapability::TextInput, NodeCapability::TextOutput]
+        }
+        async fn execute(&self, input: DAGData, _ctx: &mut DAGContext) -> DAGResult<DAGData> {
+            tokio::time::sleep(self.delay).await;
+            if self.count.fetch_add(1, Ordering::SeqCst) < self.fail_first {
+                return Err((self.error)());
+            }
+            Ok(input)
+        }
+        fn clone_boxed(&self) -> Arc<dyn DAGNode> {
+            Arc::new(FlakyNode {
+                kind: self.kind,
+                fail_first: self.fail_first,
+                error: self.error,
+                delay: self.delay,
+                count: self.count.clone(),
+            })
+        }
+    }
+
+    fn llm_down() -> DAGError {
+        DAGError::LlmEndpointError {
+            provider: "mock".into(),
+            model: "m".into(),
+            error: "503".into(),
+        }
+    }
+
+    /// input → mid → output, `mid` a [`FlakyNode`]; `retry` sets its `retry_on_failure`.
+    fn flaky_dag(node: FlakyNode, retry: bool) -> CompiledDAG {
+        let mut def = DAGDefinition::new("flaky", "Flaky");
+        def.add_node(NodeDefinition::new("input", NodeType::TextInput));
+        def.add_node(NodeDefinition::new("mid", NodeType::Passthrough));
+        def.add_node(NodeDefinition::new("output", NodeType::Passthrough));
+        def.add_edge(EdgeDefinition::new("input", "mid"));
+        def.add_edge(EdgeDefinition::new("mid", "output"));
+        def.with_entry("input");
+        def.add_exit("output");
+        let mut dag = DAGCompiler::new().compile(def).unwrap();
+        let idx = dag.get_node_index("mid").unwrap();
+        dag.graph[idx].node = Arc::new(node);
+        dag.graph[idx].definition.retry_on_failure = retry;
+        dag.graph[idx].definition.max_retries = 3;
+        dag
+    }
+
+    fn flaky(
+        kind: &'static str,
+        fail_first: usize,
+        error: fn() -> DAGError,
+    ) -> (FlakyNode, Arc<AtomicUsize>) {
+        let count = Arc::new(AtomicUsize::new(0));
+        (
+            FlakyNode {
+                kind,
+                fail_first,
+                error,
+                delay: Duration::ZERO,
+                count: count.clone(),
+            },
+            count,
+        )
+    }
+
+    /// `retry_on_failure` was parsed and never read: one vendor hiccup failed the turn.
+    #[tokio::test]
+    async fn a_transient_failure_of_a_retryable_node_is_retried() {
+        let (node, count) = flaky("llm_endpoint", 1, llm_down);
+        let out = DAGExecutor::new()
+            .execute(
+                &flaky_dag(node, true),
+                DAGData::Text("hi".into()),
+                &mut DAGContext::new("s"),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(out, DAGData::Text(t) if t == "hi"));
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+    }
+
+    /// An HTTP endpoint's request has effects outside the gateway: never replayed.
+    #[tokio::test]
+    async fn a_node_with_outside_effects_is_never_retried() {
+        let (node, count) = flaky("http_endpoint", 1, || DAGError::HttpEndpointError {
+            url: "https://x".into(),
+            error: "500".into(),
+        });
+        let r = DAGExecutor::new()
+            .execute(
+                &flaky_dag(node, true),
+                DAGData::Text("hi".into()),
+                &mut DAGContext::new("s"),
+            )
+            .await;
+        assert!(r.is_err());
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_configuration_error_or_retry_off_is_not_retried() {
+        let (node, count) = flaky("llm_endpoint", 1, || {
+            DAGError::MissingConfiguration("no key".into())
+        });
+        let r = DAGExecutor::new()
+            .execute(
+                &flaky_dag(node, true),
+                DAGData::Text("hi".into()),
+                &mut DAGContext::new("s"),
+            )
+            .await;
+        assert!(r.is_err());
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "a config error fails the same way again"
+        );
+
+        let (node, count) = flaky("llm_endpoint", 1, llm_down);
+        let r = DAGExecutor::new()
+            .execute(
+                &flaky_dag(node, false),
+                DAGData::Text("hi".into()),
+                &mut DAGContext::new("s"),
+            )
+            .await;
+        assert!(r.is_err());
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    /// Every attempt shares the node's one budget: retries never stretch the turn.
+    #[tokio::test]
+    async fn retries_stay_inside_the_nodes_time_budget() {
+        let (mut node, count) = flaky("stt_provider", usize::MAX, || DAGError::STTProviderError {
+            provider: "mock".into(),
+            error: "reset".into(),
+        });
+        node.delay = Duration::from_millis(60);
+        let started = Instant::now();
+        let r = DAGExecutor::new()
+            .with_timeout(Duration::from_millis(400))
+            .execute(
+                &flaky_dag(node, true),
+                DAGData::Text("hi".into()),
+                &mut DAGContext::new("s"),
+            )
+            .await;
+        assert!(r.is_err());
+        assert!(
+            started.elapsed() < Duration::from_millis(600),
+            "{:?}",
+            started.elapsed()
+        );
+        let attempts = count.load(Ordering::SeqCst);
+        assert!((2..=4).contains(&attempts), "attempts {attempts}");
+    }
+
+    /// `dag_timeouts.llm_endpoint_secs` (and friends) used to be parsed and never read.
+    #[tokio::test]
+    async fn a_kind_timeout_applies_to_nodes_of_that_kind() {
+        let (mut node, _) = flaky("llm_endpoint", 0, llm_down);
+        node.delay = Duration::from_secs(5);
+        let executor = DAGExecutor::new()
+            .with_timeout(Duration::from_secs(30))
+            .with_kind_timeouts(HashMap::from([(
+                "llm_endpoint",
+                Duration::from_millis(150),
+            )]));
+        let started = Instant::now();
+        let r = executor
+            .execute(
+                &flaky_dag(node, false),
+                DAGData::Text("hi".into()),
+                &mut DAGContext::new("s"),
+            )
+            .await;
+        assert!(r.is_err());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     /// Build a split → 2 branches → join → output DAG where each branch node is

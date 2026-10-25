@@ -298,13 +298,11 @@ impl ServerConfig {
         // DAG timeout configuration
         let dag_timeouts = DAGTimeoutsConfig {
             node_execution_secs: parse_env_value::<u64>("DAG_NODE_EXECUTION_SECS")?.unwrap_or(30),
-            provider_operation_secs: parse_env_value::<u64>("DAG_PROVIDER_OPERATION_SECS")?
-                .unwrap_or(30),
-            stt_endpoint_secs: parse_env_value::<u64>("DAG_STT_ENDPOINT_SECS")?.unwrap_or(60),
-            tts_endpoint_secs: parse_env_value::<u64>("DAG_TTS_ENDPOINT_SECS")?.unwrap_or(60),
-            llm_endpoint_secs: parse_env_value::<u64>("DAG_LLM_ENDPOINT_SECS")?.unwrap_or(120),
-            websocket_operation_secs: parse_env_value::<u64>("DAG_WEBSOCKET_OPERATION_SECS")?
-                .unwrap_or(30),
+            provider_operation_secs: parse_env_value::<u64>("DAG_PROVIDER_OPERATION_SECS")?,
+            stt_endpoint_secs: parse_env_value::<u64>("DAG_STT_ENDPOINT_SECS")?,
+            tts_endpoint_secs: parse_env_value::<u64>("DAG_TTS_ENDPOINT_SECS")?,
+            llm_endpoint_secs: parse_env_value::<u64>("DAG_LLM_ENDPOINT_SECS")?,
+            websocket_operation_secs: parse_env_value::<u64>("DAG_WEBSOCKET_OPERATION_SECS")?,
         };
 
         Ok(ServerConfig {

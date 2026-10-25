@@ -99,6 +99,8 @@ pub const TURNS_TOTAL: &str = "waav_turns_total";
 pub const TURN_BOTTLENECK_TOTAL: &str = "waav_turn_bottleneck_total";
 /// Per-DAG-node wall time (histogram, ms), labelled `node`.
 pub const DAG_NODE_MS: &str = "waav_dag_node_ms";
+/// DAG node retries (`retry_on_failure`), labelled `kind` (counter).
+pub const DAG_NODE_RETRIES_TOTAL: &str = "waav_dag_node_retries_total";
 /// Per-frame stage budget (histogram, ms), labelled `stage`
 /// (`receive`/`decode`/`vad`/`smart_turn`/`stt_send`).
 pub const FRAME_STAGE_MS: &str = "waav_frame_stage_ms";
@@ -554,6 +556,12 @@ pub fn record_degraded(component: &'static str, reason: &'static str) {
 /// polluted by healthy async-tool operation.
 pub fn record_async_tool(outcome: &'static str) {
     counter!("waav_async_tool_total", "outcome" => outcome).increment(1);
+}
+
+/// Count a DAG node retry on `waav_dag_node_retries_total`, labelled by node kind (a type tag:
+/// a closed set, so the label stays bounded).
+pub fn record_dag_node_retry(kind: &str) {
+    counter!(DAG_NODE_RETRIES_TOTAL, "kind" => kind.to_string()).increment(1);
 }
 
 /// Observe a per-DAG-node wall time (ms) on `waav_dag_node_ms`.

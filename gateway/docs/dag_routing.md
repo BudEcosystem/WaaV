@@ -829,12 +829,38 @@ Metrics are exposed via the application's metrics endpoint and include:
 
 ```yaml
 - id: llm
-  type: http_endpoint
-  url: "https://api.openai.com/..."
+  type: llm_endpoint
+  base_url: "https://api.openai.com/v1"
+  model: gpt-4o-mini
   retry_on_failure: true
-  max_retries: 3
-  timeout_ms: 30000
+  max_retries: 3        # at most 5
+  timeout_ms: 30000     # one budget for every attempt
 ```
+
+How retries work:
+
+- **Which kinds retry.** Only `stt_provider`, `tts_provider` and `llm_endpoint` nodes retry. They
+  return their result when done, so a retry cannot duplicate what was delivered.
+- **Which kinds never retry.** `http_endpoint`, `grpc_endpoint`, `websocket_endpoint`,
+  `ipc_endpoint`, `webhook_output` and `realtime_provider` nodes are not retried, whatever their
+  definition says, and the compiler logs a warning for such a node. A retry would repeat an
+  effect outside the gateway, or audio already spoken.
+- **Which errors retry.** A vendor or transport failure does. A cancellation, a configuration
+  error, or an exhausted time budget does not.
+- **Timing.** Attempts share the node's one timeout, with a backoff of 100, 200, 400 and 800 ms.
+  Each retry counts on `waav_dag_node_retries_total{kind}`.
+
+### Node Timeouts
+
+A node without its own `timeout_ms` uses the first of these that applies:
+
+1. its kind's value, if set: `dag_timeouts.stt_endpoint_secs`, `tts_endpoint_secs`,
+   `llm_endpoint_secs` or `websocket_operation_secs`;
+2. for a provider node, `provider_operation_secs`, if set;
+3. `node_execution_secs` (default 30).
+
+The per-kind values have no defaults, so leaving them out keeps every node on
+`node_execution_secs`. They are also read from `DAG_*_SECS` environment variables.
 
 ### Error Propagation
 
