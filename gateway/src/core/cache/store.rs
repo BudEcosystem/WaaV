@@ -682,16 +682,17 @@ mod tests {
 
         let cache = CacheStore::from_config(config).await.unwrap();
 
-        // Set with short TTL
+        // A TTL long enough that a scheduling stall between `put` and `exists` cannot expire it
+        // (100 ms did, about once a run on a loaded host), short enough to keep the test quick.
         cache
-            .put_with_ttl("key1", b"value1".to_vec(), Duration::from_millis(100))
+            .put_with_ttl("key1", b"value1".to_vec(), Duration::from_millis(1000))
             .await
             .unwrap();
 
         assert!(cache.exists("key1").await.unwrap());
 
         // Wait for expiration
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        tokio::time::sleep(Duration::from_millis(1300)).await;
 
         assert!(cache.get("key1").await.unwrap().is_none());
     }

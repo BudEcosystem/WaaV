@@ -173,7 +173,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 hound = "3.5"
 
 # JWT authentication
-jsonwebtoken = { version = "10.2.0", features = ["rust_crypto"] }
+jsonwebtoken = { version = "10.2.0", features = ["aws_lc_rs"] }
 
 # WebSocket client
 tokio-tungstenite = { version = "0.28.0", features = ["rustls-tls-webpki-roots"] }
