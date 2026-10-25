@@ -204,18 +204,11 @@ export class WebSocketSession {
     this.turnDetectionConfig = config.turnDetection;
     this.featuresConfig = config.features;
 
-    // Build WebSocket URL with auth
-    let wsUrl = config.url;
-    if (config.apiKey) {
-      const urlObj = new URL(config.url);
-      urlObj.searchParams.set('token', config.apiKey);
-      wsUrl = urlObj.toString();
-    }
-
     this.connection = new WebSocketConnection({
       // D6: default to the 35s connect timeout so an audio=true session's
       // server-side PROVIDER_READY (up to ~30s) isn't tripped as a failure.
-      url: wsUrl,
+      url: config.url,
+      apiKey: config.apiKey,
       timeout: config.connectionTimeout ?? DEFAULT_CONNECT_TIMEOUT_MS,
       WebSocket: config.WebSocket,
     });

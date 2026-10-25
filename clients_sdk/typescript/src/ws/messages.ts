@@ -342,6 +342,7 @@ function sttConfigToWire(
   // Segmented STT: the kind of speech-to-text wanted (auto | streaming | segmented). Omitted = auto;
   // the gateway reports the mode the session got on `ready.stt.transcription_mode`.
   setIfDefined(wire, 'transcription_mode', config.transcriptionMode);
+  setIfDefined(wire, 'noise_suppression', config.noiseSuppression);
   setIfDefined(wire, 'model', config.model);
   setIfDefined(wire, 'api_key', config.apiKey);
 

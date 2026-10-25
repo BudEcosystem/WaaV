@@ -262,6 +262,12 @@ export interface STTConfig {
    * {@link TranscriptionMode}; the mode the session got is reported on `ready.stt`.
    */
   transcriptionMode?: TranscriptionMode;
+  /**
+   * Run WaaV's own denoiser on this session's uplink, ahead of turn detection and the STT provider
+   * (mono `linear16` or opus). Costs CPU and ~30 ms; a gateway built without it says so in a
+   * `config_warning` and continues unfiltered.
+   */
+  noiseSuppression?: boolean;
   /** Model to use for transcription (e.g., "nova-2", "nova-3") */
   model?: string;
   /** Enable interim/partial results */

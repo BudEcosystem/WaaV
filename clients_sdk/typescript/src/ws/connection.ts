@@ -41,6 +41,38 @@ function hasPing(ws: unknown): ws is WsPingLike {
 }
 
 /**
+ * Whether `impl` is the Node `ws` library's WebSocket class, whose constructor takes a third
+ * `{ headers }` argument. The browser's and Node's built-in WebSocket can't send headers.
+ */
+function acceptsHeaders(impl: unknown): boolean {
+  const proto = (impl as { prototype?: { ping?: unknown; terminate?: unknown } })?.prototype;
+  return typeof proto?.ping === 'function' && typeof proto?.terminate === 'function';
+}
+
+/**
+ * Where the API key goes on the upgrade request. The Node `ws` library sends
+ * `Authorization: Bearer`, which every gateway accepts and no access log records. Any other
+ * WebSocket can't set headers, so the key goes in `?token=` (refused by a gateway run with
+ * `AUTH_QUERY_TOKEN=deny`).
+ */
+export function authenticatedUpgrade(
+  url: string,
+  apiKey: string | undefined,
+  impl: unknown
+): { url: string; headers?: Record<string, string> } {
+  if (!apiKey) return { url };
+  if (acceptsHeaders(impl)) return { url, headers: { Authorization: `Bearer ${apiKey}` } };
+  return { url: withQueryToken(url, apiKey) };
+}
+
+/** `url` with `?token=<apiKey>`, for a WebSocket that can't send headers. */
+export function withQueryToken(url: string, apiKey: string): string {
+  const withToken = new URL(url);
+  withToken.searchParams.set('token', apiKey);
+  return withToken.toString();
+}
+
+/**
  * Default WebSocket connect timeout in ms (D6). Sized to comfortably exceed the
  * gateway's ~30s PROVIDER_READY ceiling for an `audio=true` session
  * (config_handler.rs:45). See {@link WebSocketConnectionOptions.timeout}.
@@ -67,6 +99,8 @@ export interface WebSocketConnectionOptions {
   WebSocket?: typeof WebSocket;
   /** Protocol to use (default: none) */
   protocols?: string | string[];
+  /** API key, sent as the upgrade's `Authorization` header or `?token=` (see `authenticatedUpgrade`) */
+  apiKey?: string;
 }
 
 /**
@@ -99,6 +133,9 @@ export class WebSocketConnection {
   private timeout: number;
   private WebSocketImpl: typeof WebSocket;
   private protocols?: string | string[];
+  /** `url` plus `?token=` when the key can't ride a header; never put in messages or errors. */
+  private upgradeUrl: string;
+  private headers?: Record<string, string>;
   private state: ConnectionState = 'disconnected';
   private handlers: ConnectionEventHandlers = {};
   private connectPromise: Promise<void> | null = null;
@@ -113,10 +150,13 @@ export class WebSocketConnection {
   private rateLimit: { statusCode: number; retryAfterMs?: number; retryAfter?: string } | null = null;
 
   constructor(options: WebSocketConnectionOptions) {
-    this.url = options.url;
     this.timeout = options.timeout ?? DEFAULT_CONNECT_TIMEOUT_MS;
     this.WebSocketImpl = options.WebSocket ?? globalThis.WebSocket;
     this.protocols = options.protocols;
+    const upgrade = authenticatedUpgrade(options.url, options.apiKey, this.WebSocketImpl);
+    this.url = options.url;
+    this.upgradeUrl = upgrade.url;
+    this.headers = upgrade.headers;
 
     if (!this.WebSocketImpl) {
       throw new ConnectionError('WebSocket is not available in this environment', {
@@ -192,7 +232,13 @@ export class WebSocketConnection {
 
       try {
         this.rateLimit = null;
-        this.ws = new this.WebSocketImpl(this.url, this.protocols);
+        this.ws = this.headers
+          ? new (this.WebSocketImpl as unknown as new (
+              url: string,
+              protocols: string | string[] | undefined,
+              options: { headers: Record<string, string> }
+            ) => WebSocket)(this.upgradeUrl, this.protocols, { headers: this.headers })
+          : new this.WebSocketImpl(this.upgradeUrl, this.protocols);
         this.ws.binaryType = 'arraybuffer';
 
         // Under Node (`ws`), the HTTP upgrade response is exposed via the
