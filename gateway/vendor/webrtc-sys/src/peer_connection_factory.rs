@@ -83,11 +83,18 @@ pub mod ffi {
 
     unsafe extern "C++" {
         include!("livekit/peer_connection_factory.h");
+        include!("livekit/network_policy.h");
 
         type PeerConnection = crate::peer_connection::ffi::PeerConnection;
         type PeerConnectionFactory;
 
         fn create_peer_connection_factory() -> SharedPtr<PeerConnectionFactory>;
+
+        // WaaV patch: which local networks ICE gathers on (livekit/network_policy.h). `cidrs`
+        // are "ip/len" prefixes (empty = every network); `include_loopback` gathers loopback,
+        // which libwebrtc ignores by default. Applies to peer connections created afterwards.
+        #[namespace = "livekit"]
+        fn set_ice_network_policy(cidrs: Vec<String>, include_loopback: bool);
 
         fn create_peer_connection(
             self: &PeerConnectionFactory,

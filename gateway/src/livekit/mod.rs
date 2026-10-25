@@ -43,6 +43,7 @@
 //! - Supporting the WebSocket API abstraction layer
 
 mod client;
+pub mod ice;
 pub mod operations;
 pub mod room_handler;
 pub mod sip_handler;

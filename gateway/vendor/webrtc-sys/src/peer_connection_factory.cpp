@@ -33,6 +33,7 @@
 #include "api/video_codecs/builtin_video_encoder_factory.h"
 #include "livekit/audio_device.h"
 #include "livekit/audio_track.h"
+#include "livekit/network_policy.h"
 #include "livekit/peer_connection.h"
 #include "livekit/rtc_error.h"
 #include "livekit/rtp_parameters.h"
@@ -60,6 +61,9 @@ PeerConnectionFactory::PeerConnectionFactory(
   dependencies.task_queue_factory = webrtc::CreateDefaultTaskQueueFactory();
   dependencies.event_log_factory = std::make_unique<webrtc::RtcEventLogFactory>();
   dependencies.trials = std::make_unique<webrtc::FieldTrialBasedConfig>();
+  // WaaV patch: gather ICE candidates on the networks the policy allows (network_policy.h).
+  dependencies.network_manager = create_policy_network_manager(
+      webrtc::CreateEnvironment(), dependencies.socket_factory);
 
   audio_device_ = rtc_runtime_->worker_thread()->BlockingCall([&] {
     return webrtc::make_ref_counted<livekit::AudioDevice>(
@@ -101,6 +105,11 @@ PeerConnectionFactory::~PeerConnectionFactory() {
 std::shared_ptr<PeerConnection> PeerConnectionFactory::create_peer_connection(
     RtcConfiguration config,
     rust::Box<PeerConnectionObserverWrapper> observer) const {
+  // WaaV patch: whether loopback is gathered is decided per connection (network_policy.h).
+  webrtc::PeerConnectionFactoryInterface::Options options;
+  options.network_ignore_mask = ice_network_ignore_mask();
+  peer_factory_->SetOptions(options);
+
   std::shared_ptr<PeerConnection> pc = std::make_shared<PeerConnection>(
       rtc_runtime_, peer_factory_, std::move(observer));
 

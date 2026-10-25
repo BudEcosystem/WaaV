@@ -82,6 +82,7 @@ Add the relevant variables before starting the container. The most common ones a
 | `LIVEKIT_URL` | Server-to-server WebSocket URL (internal). | `ws://livekit:7880` |
 | `LIVEKIT_PUBLIC_URL` | URL clients should dial (returned via APIs). | `https://rtc.yourdomain.com` |
 | `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` | Credentials used to mint LiveKit tokens in `/livekit/token` and during WebSocket LiveKit bring-up. | `lk_key` / `lk_secret` |
+| `WAAV_LIVEKIT_ICE_IPS` | Keep WaaV's LiveKit media sockets (ICE candidates) on addresses in these CIDR prefixes. Unset: every interface, plus loopback when `LIVEKIT_URL` is loopback. See section 7. | `127.0.0.1/32` |
 | `RECORDING_S3_*` | Bucket configuration for LiveKit recordings (bucket, region, endpoint, access key, secret key). | `recordings`, `us-east-1`, etc. |
 
 Set `AUTH_REQUIRED` plus either `AUTH_API_SECRETS_JSON` (preferred) or `AUTH_SERVICE_URL`/`AUTH_SIGNING_KEY_PATH` only if you follow the separate authentication guide. Legacy `AUTH_API_SECRET` is still supported with optional `AUTH_API_SECRET_ID`.
@@ -253,6 +254,20 @@ Store `DEEPGRAM_API_KEY`, `ELEVENLABS_API_KEY`, `LIVEKIT_API_KEY`, `LIVEKIT_API_
      ```
    - Receive `ready` with `livekit_room_name`, `livekit_url`, and the WaaV Gateway participant metadata.
    - For each human participant, request a token via `POST /livekit/token` and join the LiveKit room directly.
+4. **Media sockets (ICE)**: WaaV's participant opens its WebRTC media sockets on the host's
+   interfaces. By default that's every interface (the LAN, each Docker bridge, VPNs, IPv6), plus
+   loopback when `LIVEKIT_URL` points at loopback. To keep them on chosen addresses, set
+   `WAAV_LIVEKIT_ICE_IPS` to CIDR prefixes. Any interface whose address is in one of them is used;
+   no other is.
+   - A single machine with everything on loopback: `WAAV_LIVEKIT_ICE_IPS=127.0.0.1/32`. LiveKit
+     must offer loopback candidates too: `rtc.node_ip: 127.0.0.1`,
+     `rtc.ips.includes: [127.0.0.1/32]` and `rtc.enable_loopback_candidate: true`.
+   - A LAN deployment that shouldn't use Docker bridges or VPNs: the LAN prefix, for example
+     `192.168.1.0/24`.
+
+   A malformed value gathers no candidates at all (it fails closed), so LiveKit calls fail
+   rather than quietly using every interface. `waav-gateway check` reports it. The setting is
+   process-wide, because WebRTC's network stack is.
 
 ## 8. Configuration Variations
 

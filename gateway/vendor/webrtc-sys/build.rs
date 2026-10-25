@@ -54,6 +54,8 @@ fn main() {
     builder.files(&[
         "src/peer_connection.cpp",
         "src/peer_connection_factory.cpp",
+        // WaaV patch: the ICE network policy (livekit/network_policy.h).
+        "src/network_policy.cpp",
         "src/media_stream.cpp",
         "src/media_stream_track.cpp",
         "src/audio_track.cpp",
