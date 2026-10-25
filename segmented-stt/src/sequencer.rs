@@ -69,6 +69,10 @@ pub struct AttemptsUpload {
     /// The target's identity for the cold-start rule: host and model, never a row shared by
     /// several servers.
     pub target_key: String,
+    /// Whether to open warm connections ahead of uploads. The gateway turns it off for a target
+    /// on this host or a private network (`net::is_local_origin`), where a connection costs
+    /// nothing and the warm request only adds a line to the server's error log.
+    pub prewarm: bool,
 }
 
 impl AttemptsUpload {
@@ -150,7 +154,9 @@ impl SegmentUpload for AttemptsUpload {
     }
 
     async fn prewarm(&self, connections: usize) {
-        self.attempts.transcriber.prewarm(connections).await;
+        if self.prewarm {
+            self.attempts.transcriber.prewarm(connections).await;
+        }
     }
 
     fn min_audio_ms(&self) -> u32 {
@@ -225,6 +231,7 @@ mod tests {
             max_request_limit_ms: MAX_REQUEST_LIMIT_MS,
             cold_start_ms,
             target_key: "http://infer:8000|gaia-transcribe".into(),
+            prewarm: true,
         }
     }
 

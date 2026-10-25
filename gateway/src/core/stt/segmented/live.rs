@@ -1014,6 +1014,9 @@ fn attempts_upload(shared: &SttLiveShared, u: UploadTarget<'_>) -> Result<Attemp
         max_request_limit_ms: shared.limits.max_request_limit_ms,
         cold_start_ms: shared.limits.cold_start_ms,
         target_key: format!("{}|{}", info.host_key, info.model),
+        // A server on this host or the LAN gains nothing from a warm connection, and its
+        // unauthenticated warm request was a 401 line in that server's log per session.
+        prewarm: !waav_segmented_stt::net::is_local_origin(&info.host_key),
     })
 }
 

@@ -120,6 +120,11 @@ enum Commands {
     /// Initialize turn detection models
     Init,
 
+    /// Check the configuration without starting the server: the environment and env file, the
+    /// config file (`-c`, unknown keys included), operator credentials, DAG templates, and the
+    /// auth, metrics and segmented speech-to-text settings. Prints each problem; exits 1 if any.
+    Check,
+
     /// Generate OpenAPI specification
     #[cfg(feature = "openapi")]
     Openapi {
@@ -131,6 +136,62 @@ enum Commands {
         #[arg(short = 'o', long = "output")]
         output: Option<PathBuf>,
     },
+}
+
+/// Every check `main` makes before it binds, without binding, loading models or dialling
+/// anything: what `waav-gateway check` reports. Each entry names its source.
+fn check_configuration(config_path: Option<&PathBuf>) -> Vec<String> {
+    let mut problems = Vec::new();
+    let config = match config_path {
+        Some(path) => {
+            match ServerConfig::unknown_yaml_keys(path) {
+                Ok(keys) => problems.extend(
+                    keys.into_iter()
+                        .map(|k| format!("{}: unknown key `{k}`", path.display())),
+                ),
+                Err(e) => problems.push(e),
+            }
+            ServerConfig::from_file(path).map_err(|e| e.to_string())
+        }
+        None => ServerConfig::from_env().map_err(|e| e.to_string()),
+    };
+    let config = match config {
+        Ok(config) => Some(config),
+        Err(e) => {
+            problems.push(format!("configuration: {e}"));
+            None
+        }
+    };
+    if let Err(e) = waav_gateway::core::credentials::initialize_credentials() {
+        problems.push(format!("credentials: {e}"));
+    }
+    #[cfg(feature = "dag-routing")]
+    if let Ok(dir) = std::env::var("WAAV_DAG_TEMPLATES_DIR")
+        && !dir.trim().is_empty()
+        && let Err(e) =
+            waav_gateway::dag::initialize_templates(&waav_gateway::dag::TemplatesConfig {
+                templates: Default::default(),
+                templates_dir: Some(PathBuf::from(dir)),
+                templates_dir_required: true,
+            })
+    {
+        problems.push(format!("DAG templates: {e}"));
+    }
+    if let Err(e) = waav_gateway::auth::AuthPolicy::from_env() {
+        problems.push(format!("auth: {e}"));
+    }
+    if let Some(config) = config.as_ref() {
+        let api_requires_auth = config.auth_required
+            || config.has_api_secret_auth()
+            || waav_gateway::auth::bud_mode::BudModeConfig::from_env().is_some();
+        if let Err(e) = waav_gateway::handlers::api::MetricsPolicy::from_env(api_requires_auth) {
+            problems.push(format!("metrics: {e}"));
+        }
+    }
+    if let Err(e) = waav_gateway::core::stt::segmented::live::SttLiveShared::from_env(None) {
+        problems.push(format!("segmented speech-to-text: {e}"));
+    }
+    problems
 }
 
 #[tokio::main]
@@ -178,6 +239,18 @@ async fn main() -> anyhow::Result<()> {
             Commands::Init => {
                 init::run().await?;
                 return Ok(());
+            }
+            Commands::Check => {
+                let problems = check_configuration(cli.config.as_ref());
+                if problems.is_empty() {
+                    println!("configuration OK");
+                    return Ok(());
+                }
+                for problem in &problems {
+                    eprintln!("error: {problem}");
+                }
+                eprintln!("{} problem(s) found", problems.len());
+                std::process::exit(1);
             }
             #[cfg(feature = "openapi")]
             Commands::Openapi { format, output } => {
@@ -596,19 +669,33 @@ async fn main() -> anyhow::Result<()> {
         .with_state(app_state.clone())
         .layer(tower::util::option_layer(governor_layer));
 
-    // Prometheus on its own listener (WAAV_METRICS_ADDR): bind it to an address the ingress
-    // does not route to, and scrape it without exposing anything on the public port.
+    // The operator listener (WAAV_METRICS_ADDR): Prometheus and the probes, bound to an address
+    // the ingress does not route to. `/readyz` there carries the per-provider breakdown, which the
+    // public port then omits (it named the vendor credentials this gateway holds). The probes stay
+    // on the public port too: the kubelet and the Bud chart poll them there.
     if let Some((metrics_addr, _)) = metrics_policy.dedicated {
         let metrics_app = Router::new()
             .route(
                 "/metrics",
                 axum::routing::get(waav_gateway::handlers::api::dedicated_metrics_handler),
             )
+            .route(
+                "/livez",
+                axum::routing::get(waav_gateway::handlers::api::livez),
+            )
+            .route(
+                "/ready",
+                axum::routing::get(waav_gateway::handlers::api::readiness_check),
+            )
+            .route(
+                "/readyz",
+                axum::routing::get(waav_gateway::handlers::api::admin_readyz),
+            )
             .with_state(app_state.clone());
         let metrics_listener = TcpListener::bind(metrics_addr)
             .await
             .map_err(|e| anyhow!("Failed to bind metrics listener {metrics_addr}: {e}"))?;
-        info!("Prometheus metrics served on http://{metrics_addr}/metrics");
+        info!("Operator listener on http://{metrics_addr}: /metrics, /livez, /ready, /readyz");
         tokio::spawn(async move {
             if let Err(e) = axum::serve(metrics_listener, metrics_app).await {
                 error!(error = %e, "metrics listener stopped");

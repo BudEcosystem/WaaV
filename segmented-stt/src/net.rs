@@ -98,6 +98,17 @@ pub fn is_loopback_host(host: &str) -> bool {
     bare.parse::<IpAddr>().is_ok_and(|ip| is_loopback_ip(&ip))
 }
 
+/// Whether `url` names a target on this host or a private network by its spelling: a loopback or
+/// blocked name, or a non-public IP literal ([`check_host`] refuses it). A warm-up connection
+/// saves nothing there, and its unauthenticated request lands in the server's error log. A DNS
+/// name is not resolved: it counts as remote.
+pub fn is_local_origin(url: &str) -> bool {
+    url::Url::parse(url.trim())
+        .ok()
+        .and_then(|u| u.host_str().map(|h| check_host(h).is_err()))
+        .unwrap_or(false)
+}
+
 /// The half of the SSRF rule that needs no lookup, for a URL's host as `url::Url::host_str`
 /// writes it: a blocked name, a `.localhost` name, or an IP literal in any spelling (bracketed
 /// IPv6, decimal IPv4) that is not public is refused. `Ok(Some(name))` is a DNS name, to be
@@ -189,6 +200,26 @@ pub fn is_public_ip(ip: &IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_origins_are_recognised_by_their_spelling() {
+        for local in [
+            "http://127.0.0.1:8080/v1",
+            "http://localhost:9000",
+            "http://[::1]:7/",
+            "http://10.0.0.5:8000",
+            "http://192.168.1.10/",
+        ] {
+            assert!(is_local_origin(local), "{local}");
+        }
+        for remote in [
+            "https://api.openai.com/v1/audio/speech",
+            "https://8.8.8.8/",
+            "not a url",
+        ] {
+            assert!(!is_local_origin(remote), "{remote}");
+        }
+    }
 
     #[test]
     fn a_host_is_refused_by_name_or_by_any_spelling_of_a_private_address() {

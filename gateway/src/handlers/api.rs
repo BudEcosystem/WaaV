@@ -122,22 +122,54 @@ pub async fn readyz(State(state): State<Arc<AppState>>) -> Response {
                 .into_response();
         }
     };
-    let config = state.config.clone();
+    let report = readiness::evaluate_cached(&state.config, !skip_network).await;
+    let code = if report.is_ready() {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    // With an operator listener (WAAV_METRICS_ADDR), the per-provider breakdown is served there
+    // only: on the public port it told anyone which vendor credentials this gateway holds.
+    let report = if admin_listener_configured() {
+        public_readiness(report)
+    } else {
+        report
+    };
+    (code, Json(report)).into_response()
+}
 
-    let report = tokio::task::spawn_blocking(move || readiness::evaluate(&config, !skip_network))
-        .await
-        .unwrap_or_else(|_| ReadinessReport {
-            status: "not_ready".to_string(),
-            config_loaded: true,
-            providers: Vec::new(),
-        });
-
+/// `/readyz` on the operator listener (`WAAV_METRICS_ADDR`): the full per-provider breakdown.
+pub async fn admin_readyz(State(state): State<Arc<AppState>>) -> Response {
+    let skip_network = match parse_readiness_skip_network_env() {
+        Ok(skip_network) => skip_network,
+        Err(e) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(readiness_config_error_report(e)),
+            )
+                .into_response();
+        }
+    };
+    let report = readiness::evaluate_cached(&state.config, !skip_network).await;
     let code = if report.is_ready() {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
     (code, Json(report)).into_response()
+}
+
+/// Whether `main` installed a dedicated operator listener (`WAAV_METRICS_ADDR`).
+fn admin_listener_configured() -> bool {
+    METRICS_POLICY.get().is_some_and(|p| p.dedicated.is_some())
+}
+
+/// The readiness the public port may tell: the verdict, never which providers are configured.
+fn public_readiness(report: ReadinessReport) -> ReadinessReport {
+    ReadinessReport {
+        providers: Vec::new(),
+        ..report
+    }
 }
 
 /// Prometheus metrics handler (`/metrics`).

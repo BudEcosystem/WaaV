@@ -323,6 +323,27 @@ pub struct DAGTimeoutsYaml {
     pub websocket_operation_secs: Option<u64>,
 }
 
+/// A path as an operator writes it: `security.rate_limit_request_per_second`, `aliases.x.tts`,
+/// `hooks[2].url` (serde_ignored's own form prints `?` for every optional section).
+fn dotted(path: &serde_ignored::Path<'_>) -> String {
+    use serde_ignored::Path;
+    match path {
+        Path::Root => String::new(),
+        Path::Seq { parent, index } => format!("{}[{index}]", dotted(parent)),
+        Path::Map { parent, key } => {
+            let parent = dotted(parent);
+            if parent.is_empty() {
+                key.to_string()
+            } else {
+                format!("{parent}.{key}")
+            }
+        }
+        Path::Some { parent }
+        | Path::NewtypeStruct { parent }
+        | Path::NewtypeVariant { parent } => dotted(parent),
+    }
+}
+
 impl YamlConfig {
     /// Load configuration from a YAML file
     ///
@@ -338,13 +359,37 @@ impl YamlConfig {
     /// - The YAML is malformed
     /// - Required fields have invalid types
     pub fn from_file(path: &PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
+        let (config, unknown) = Self::from_file_reporting(path)?;
+        // Not an error at startup, so an existing file with a stale key keeps starting; but never
+        // silent: `securty:` used to start the gateway with default security limits.
+        for key in &unknown {
+            tracing::warn!(
+                file = %path.display(),
+                key = %key,
+                "unknown configuration key ignored (`waav-gateway check` reports these as errors)"
+            );
+        }
+        Ok(config)
+    }
+
+    /// [`Self::from_file`] and the keys the file sets that no field reads (`security.rate_limit_request_per_second`).
+    pub fn from_file_reporting(
+        path: &PathBuf,
+    ) -> Result<(Self, Vec<String>), Box<dyn std::error::Error>> {
         let contents = std::fs::read_to_string(path)
             .map_err(|e| format!("Failed to read config file {}: {e}", path.display()))?;
+        Ok(Self::parse_reporting(&contents)?)
+    }
 
-        let config: YamlConfig = serde_yaml::from_str(&contents)
+    /// Parse YAML, collecting the dotted paths of keys that no field reads.
+    pub fn parse_reporting(contents: &str) -> Result<(Self, Vec<String>), String> {
+        let mut unknown = Vec::new();
+        let config: YamlConfig =
+            serde_ignored::deserialize(serde_yaml::Deserializer::from_str(contents), |path| {
+                unknown.push(dotted(&path))
+            })
             .map_err(|e| format!("Failed to parse YAML config: {e}"))?;
-
-        Ok(config)
+        Ok((config, unknown))
     }
 }
 
@@ -353,6 +398,45 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn unknown_keys_are_reported_by_their_path_and_known_ones_are_not() {
+        let (config, unknown) = YamlConfig::parse_reporting(
+            r#"
+securty:
+  rate_limit_requests_per_second: 5
+security:
+  rate_limit_request_per_second: 7
+  rate_limit_requests_per_second: 9
+server:
+  port: 3001
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            unknown,
+            vec![
+                "securty".to_string(),
+                "security.rate_limit_request_per_second".to_string()
+            ]
+        );
+        assert_eq!(
+            config.security.unwrap().rate_limit_requests_per_second,
+            Some(9)
+        );
+        let (_, none) = YamlConfig::parse_reporting("server:\n  port: 3001\n").unwrap();
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn the_example_config_sets_no_unknown_key() {
+        let example = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config.example.yaml"),
+        )
+        .unwrap();
+        let (_, unknown) = YamlConfig::parse_reporting(&example).unwrap();
+        assert!(unknown.is_empty(), "config.example.yaml: {unknown:?}");
+    }
 
     #[test]
     fn test_yaml_config_full() {

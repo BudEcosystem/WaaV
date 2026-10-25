@@ -191,6 +191,8 @@ dotenvy = "0.15"
 
 # Configuration
 serde_yaml = "0.9"
+# Reports the YAML keys a config file sets but no field reads (typos such as `securty:`).
+serde_ignored = "0.1"
 
 # Error handling
 thiserror = "2.0.12"

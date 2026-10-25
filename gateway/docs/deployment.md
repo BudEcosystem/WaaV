@@ -284,7 +284,43 @@ Store `DEEPGRAM_API_KEY`, `ELEVENLABS_API_KEY`, `LIVEKIT_API_KEY`, `LIVEKIT_API_
   docker build -t waav-gateway:minimal --build-arg CARGO_BUILD_FEATURES="--no-default-features" .
   ```
 
-## 9. Verification Checklist
+## 9. Checking a Configuration
+
+`waav-gateway check -c config.yaml [--env-file .env]` runs the start-up checks without starting the
+server, loading models or dialling anything. It checks:
+
+- the env file and the config file, including **unknown keys** (a typo such as `securty:` would
+  otherwise be ignored and the defaults used);
+- operator credentials and DAG templates;
+- the auth, metrics and segmented speech-to-text settings.
+
+Each problem is printed, and the exit status is 1 when there is one. When the server itself
+starts, an unknown key is logged as a warning rather than refused, so existing files keep starting.
+
+## 10. Probes and the Operator Listener
+
+| Path | Answers | Notes |
+|---|---|---|
+| `/livez` | process up | never touches an upstream |
+| `/ready` | Bud control plane hydrated; `503 draining` after SIGTERM | the Bud chart's probe |
+| `/readyz` | provider credentials present and reachable | `503` names the unready provider |
+| `/metrics` | Prometheus | see `WAAV_METRICS_TOKEN` / `WAAV_METRICS_PUBLIC` |
+
+How `/readyz` probes:
+
+- It probes the address each provider's traffic actually goes to. For the openai providers that
+  is `OPENAI_BASE_URL` when it is set. `WAAV_READINESS_PROBE_<PROVIDER>=host:port` overrides it.
+- One evaluation answers every request for 10 seconds, and simultaneous requests share it, so
+  polling `/readyz` does not multiply outbound connections.
+- `WAAV_READINESS_SKIP_NETWORK=1` checks credentials only.
+
+`WAAV_METRICS_ADDR=host:port` opens an operator listener on an address your ingress does not
+route to. It serves `/metrics`, `/livez`, `/ready` and `/readyz`. With it set, the public `/readyz`
+returns its verdict without the per-provider breakdown, which would otherwise tell anyone which
+vendor credentials the gateway holds. The full breakdown stays on the operator listener. All
+probes remain on the public port, so existing liveness and readiness probes keep working.
+
+## 11. Verification Checklist
 
 1. `curl http://<waav-gateway-host>:3001/` returns `{ "status": "OK" }`.
 2. `GET /voices` succeeds (requires provider keys).
