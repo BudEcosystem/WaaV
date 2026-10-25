@@ -162,6 +162,11 @@ fn check_configuration(config_path: Option<&PathBuf>) -> Vec<String> {
             None
         }
     };
+    if let Some(config) = config.as_ref()
+        && let Err(e) = waav_gateway::core::alias::validate_aliases(&config.aliases)
+    {
+        problems.push(format!("aliases: {e}"));
+    }
     if let Err(e) = waav_gateway::core::credentials::initialize_credentials() {
         problems.push(format!("credentials: {e}"));
     }
