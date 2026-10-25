@@ -96,6 +96,7 @@ fn request(
         prompt: None,
         tuning: Default::default(),
         extras: Default::default(),
+        trusted_base: None,
     }
 }
 

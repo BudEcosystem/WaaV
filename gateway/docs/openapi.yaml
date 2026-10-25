@@ -734,6 +734,21 @@ components:
         field always overrides. Mirrors the public, provider-agnostic shape of
         [`STTWebSocketConfig`].
       properties:
+        base_url:
+          type:
+          - string
+          - 'null'
+          description: |-
+            The leg's own server (an OpenAI-compatible base such as `http://127.0.0.1:8080/v1`),
+            instead of the process-wide `OPENAI_BASE_URL`. SERVER-CONFIG-ONLY: never echoed and never
+            settable by a client; validated at startup with the egress rules (`validate_aliases`).
+          default: null
+        credential_ref:
+          type:
+          - string
+          - 'null'
+          description: Operator credential (`core::credentials`) the leg sends to `base_url`.
+          default: null
         language:
           type:
           - string
@@ -761,6 +776,18 @@ components:
         Mirrors the public, provider-agnostic shape of [`TTSWebSocketConfig`]. `emotion` is
         the canonical emotion token (resolved by the emotion mapper downstream).
       properties:
+        base_url:
+          type:
+          - string
+          - 'null'
+          description: The leg's own OpenAI-compatible speech server; see [`AliasStt::base_url`].
+          default: null
+        credential_ref:
+          type:
+          - string
+          - 'null'
+          description: Operator credential the leg sends to `base_url`.
+          default: null
         emotion:
           oneOf:
           - type: 'null'
@@ -779,6 +806,16 @@ components:
           - 'null'
           description: TTS provider name (e.g. `elevenlabs`).
           default: null
+        request_timeout_secs:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: |-
+            The synthesis request's timeout, seconds, when the client names none (the default is
+            60 s; a model loading on demand can take longer). Clamped like a client's value.
+          default: null
+          minimum: 0
         voice:
           type:
           - string

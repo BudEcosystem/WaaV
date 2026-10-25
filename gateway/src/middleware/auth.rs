@@ -49,6 +49,27 @@ fn extract_token(request: &Request) -> Result<String, AuthError> {
     Err(AuthError::MissingAuthHeader)
 }
 
+/// Whether a request's body is JSON for the auth responder: no `Content-Type` (the historical
+/// default: such a body is parsed as JSON, and refused when it is not), or a JSON media type
+/// (`application/json`, `application/*+json`).
+fn declares_json_body(headers: &axum::http::HeaderMap) -> bool {
+    match headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+    {
+        None => true,
+        Some(ct) => {
+            let essence = ct
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            essence == "application/json" || essence.ends_with("+json")
+        }
+    }
+}
+
 fn parse_auth_request_body(body_bytes: &[u8]) -> Result<serde_json::Value, AuthError> {
     if body_bytes.is_empty() {
         Ok(serde_json::json!({}))
@@ -258,6 +279,41 @@ async fn authenticate_request(
         // Filter request headers (exclude sensitive ones)
         let request_headers = filter_headers(request.headers());
 
+        // A body that is not JSON (a multipart upload to /v1/audio/transcriptions, raw audio): the
+        // responder judges the bearer by the request's method, path and headers — Content-Type and
+        // Content-Length among them — and the body streams to the handler unread. It used to be
+        // parsed as JSON for the responder and refused with 400 before the responder was asked,
+        // so no transcription upload could pass a responder; and a large body was buffered whole
+        // before anyone had authenticated. The handlers that parse JSON refuse another content
+        // type themselves, so the responder and the handler cannot disagree about what was sent.
+        if !declares_json_body(request.headers()) {
+            let auth = auth_client
+                .validate_token(
+                    &token,
+                    &serde_json::json!({}),
+                    request_headers,
+                    &request_path,
+                    &request_method,
+                )
+                .await
+                .inspect_err(|e| {
+                    tracing::warn!(
+                        method = %request_method,
+                        path = %request_path,
+                        error = %e,
+                        "JWT authentication failed"
+                    );
+                })?;
+            tracing::info!(
+                method = %request_method,
+                path = %request_path,
+                auth_id = ?auth.id,
+                "JWT authentication successful"
+            );
+            request.extensions_mut().insert(auth);
+            return Ok(next.run(request).await);
+        }
+
         // Buffer the request body for auth validation
         // Note: This buffers the entire request body in memory, which is acceptable for
         // the current use case (small JSON payloads). For routes with large file uploads,
@@ -358,6 +414,25 @@ mod tests {
             parsed,
             serde_json::json!({"text": "Hello", "metadata": {"x": 1}})
         );
+    }
+
+    #[test]
+    fn only_a_json_or_untyped_body_is_parsed_for_the_responder() {
+        use axum::http::{HeaderMap, HeaderValue, header::CONTENT_TYPE};
+        let with = |ct: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(CONTENT_TYPE, HeaderValue::from_str(ct).unwrap());
+            h
+        };
+        assert!(declares_json_body(&HeaderMap::new()));
+        assert!(declares_json_body(&with("application/json")));
+        assert!(declares_json_body(&with("Application/JSON; charset=utf-8")));
+        assert!(declares_json_body(&with("application/merge-patch+json")));
+        assert!(!declares_json_body(&with(
+            "multipart/form-data; boundary=x"
+        )));
+        assert!(!declares_json_body(&with("audio/wav")));
+        assert!(!declares_json_body(&with("application/octet-stream")));
     }
 
     #[test]

@@ -356,9 +356,12 @@ pub async fn handle_config_message(
     // SAME config-message layer the `dag_config.template` already resolves at, and
     // composes with the P2 canonical language/emotion mappers downstream (they map
     // whatever provider the alias resolved to).
+    let mut alias_legs = crate::core::alias::AliasLegs::default();
     let resolved_alias = if let Some(alias_name) = alias.as_deref() {
         match crate::core::alias::global_aliases().resolve(alias_name) {
             Some(def) => {
+                // The legs' own servers stay server-side (never in the client-writable configs).
+                alias_legs = crate::core::alias::AliasLegs::of(&def);
                 let echo = crate::core::alias::splice_alias(
                     alias_name,
                     &def,
@@ -507,6 +510,11 @@ pub async fn handle_config_message(
                 stt,
             );
             let leg = bud_legs.as_ref().and_then(|l| l.stt_leg.clone());
+            let trusted_base = alias_legs
+                .stt
+                .as_ref()
+                .filter(|e| e.applies_to(&stt.provider))
+                .map(|e| e.base_url.clone());
             let setup = super::segmented_session::resolve(
                 shared,
                 stt,
@@ -515,6 +523,7 @@ pub async fn handle_config_message(
                 resolved_agent.as_ref(),
                 client_vad_events,
                 client_named_model,
+                trusted_base,
             );
             if let Some(refusal) = super::segmented_session::refusal_message(
                 &setup,
@@ -603,6 +612,7 @@ pub async fn handle_config_message(
             message_tx,
             bud_legs.as_ref(),
             live_setup.as_ref(),
+            &alias_legs,
         )
         .await
         {
@@ -2186,6 +2196,84 @@ fn validate_audio_config_values(
     Ok(())
 }
 
+/// An alias leg's key ([`crate::core::alias::alias_leg_key`]), telling the client when the
+/// operator's key was withheld from the leg's server, or refusing the session when the alias's
+/// credential cannot be used there.
+async fn alias_leg_key_or_refuse(
+    endpoint: &crate::core::alias::AliasLegEndpoint,
+    client_key: Option<&str>,
+    role: &str,
+    config: &ServerConfig,
+    message_tx: &mpsc::Sender<MessageRoute>,
+) -> Option<String> {
+    match crate::core::alias::alias_leg_key(endpoint, client_key, || {
+        config.get_api_key(&endpoint.provider).ok()
+    }) {
+        Ok(leg) => {
+            if leg.withheld {
+                let host = url::Url::parse(&endpoint.base_url)
+                    .ok()
+                    .and_then(|u| u.host_str().map(str::to_string))
+                    .unwrap_or_else(|| endpoint.base_url.clone());
+                send_config_warning(
+                    message_tx,
+                    format!("{role}_key_not_sent"),
+                    format!(
+                        "the gateway holds a {} key but it may not be sent to {host}; the {role} \
+                         leg runs without one. Name a credential for this host in the alias \
+                         ({role}.credential_ref)",
+                        endpoint.provider
+                    ),
+                    Some(serde_json::json!({ "provider": endpoint.provider, "host": host })),
+                )
+                .await;
+            }
+            Some(leg.key)
+        }
+        Err(message) => {
+            warn!(role, error = %message, "Refusing an alias leg's credential");
+            send_error(message_tx, message).await;
+            None
+        }
+    }
+}
+
+/// Point the legs at a server alias's own servers ([`crate::core::alias::AliasLegEndpoint`]):
+/// an OpenAI-compatible TTS server through the self-hosted provider (OpenAI's `/audio/speech`,
+/// at the base's `/v1`), any other leg through its provider's endpoint override.
+fn apply_alias_leg_endpoints(
+    legs: &crate::core::alias::AliasLegs,
+    stt: &mut crate::core::stt::standard::StandardSTTConfig,
+    tts: &mut crate::core::tts::standard::StandardTTSConfig,
+) {
+    use crate::core::stt::standard::ENDPOINT_OVERRIDE_KEY;
+    if let Some(endpoint) = legs
+        .stt
+        .as_ref()
+        .filter(|e| e.applies_to(&stt.base.provider))
+    {
+        stt.extras.0.insert(
+            ENDPOINT_OVERRIDE_KEY.to_string(),
+            serde_json::Value::String(endpoint.base_url.clone()),
+        );
+    }
+    if let Some(endpoint) = legs
+        .tts
+        .as_ref()
+        .filter(|e| e.applies_to(&tts.base.provider))
+    {
+        if endpoint.provider.trim().eq_ignore_ascii_case("openai") {
+            tts.base.provider = "self_hosted".to_string();
+            tts.base.api_base = Some(endpoint.openai_api_base());
+        } else {
+            tts.extras.0.insert(
+                ENDPOINT_OVERRIDE_KEY.to_string(),
+                serde_json::Value::String(endpoint.base_url.clone()),
+            );
+        }
+    }
+}
+
 /// Initialize voice manager with STT and TTS providers
 async fn initialize_voice_manager(
     stt_ws_config: &STTWebSocketConfig,
@@ -2194,6 +2282,7 @@ async fn initialize_voice_manager(
     message_tx: &mpsc::Sender<MessageRoute>,
     bud_legs: Option<&super::bud_legs::PreparedLegs>,
     live_setup: Option<&super::segmented_session::LiveSetup>,
+    alias_legs: &crate::core::alias::AliasLegs,
 ) -> Option<Arc<VoiceManager>> {
     info!(
         "Initializing voice manager with STT provider: {} and TTS provider: {}",
@@ -2207,24 +2296,60 @@ async fn initialize_voice_manager(
     let (stt_api_key, tts_api_key) = match bud_legs {
         Some(legs) => (legs.stt_key.clone(), legs.tts_key.clone()),
         None => {
-            let stt_api_key = resolve_provider_api_key(
-                stt_ws_config.api_key.as_deref(),
-                &stt_ws_config.provider,
-                "stt",
-                allow_client_keys,
-                &app_state.config,
-                message_tx,
-            )
-            .await?;
-            let tts_api_key = resolve_provider_api_key(
-                tts_ws_config.api_key.as_deref(),
-                &tts_ws_config.provider,
-                "tts",
-                allow_client_keys,
-                &app_state.config,
-                message_tx,
-            )
-            .await?;
+            let stt_api_key = match alias_legs
+                .stt
+                .as_ref()
+                .filter(|e| e.applies_to(&stt_ws_config.provider))
+            {
+                Some(endpoint) => {
+                    alias_leg_key_or_refuse(
+                        endpoint,
+                        stt_ws_config.api_key.as_deref(),
+                        "stt",
+                        &app_state.config,
+                        message_tx,
+                    )
+                    .await?
+                }
+                None => {
+                    resolve_provider_api_key(
+                        stt_ws_config.api_key.as_deref(),
+                        &stt_ws_config.provider,
+                        "stt",
+                        allow_client_keys,
+                        &app_state.config,
+                        message_tx,
+                    )
+                    .await?
+                }
+            };
+            let tts_api_key = match alias_legs
+                .tts
+                .as_ref()
+                .filter(|e| e.applies_to(&tts_ws_config.provider))
+            {
+                Some(endpoint) => {
+                    alias_leg_key_or_refuse(
+                        endpoint,
+                        tts_ws_config.api_key.as_deref(),
+                        "tts",
+                        &app_state.config,
+                        message_tx,
+                    )
+                    .await?
+                }
+                None => {
+                    resolve_provider_api_key(
+                        tts_ws_config.api_key.as_deref(),
+                        &tts_ws_config.provider,
+                        "tts",
+                        allow_client_keys,
+                        &app_state.config,
+                        message_tx,
+                    )
+                    .await?
+                }
+            };
             (stt_api_key, tts_api_key)
         }
     };
@@ -2306,11 +2431,15 @@ async fn initialize_voice_manager(
     // on the flat factory path. The flat `stt_config`/`tts_config` are still derived (== the
     // standardized bases) for cache hashing and other flat consumers below.
     let segmented_key = stt_api_key.clone();
-    let standard_stt = stt_ws_config.to_standard_stt(stt_api_key);
+    let mut standard_stt = stt_ws_config.to_standard_stt(stt_api_key);
     let mut standard_tts = tts_ws_config.to_standard_tts(tts_api_key);
     if let Some(legs) = bud_legs {
         // The deployment's address, published by budapp — never the client's (§5.9).
         standard_tts.base.api_base = legs.tts_api_base.clone();
+    } else {
+        // A server alias's own servers, set here — after the client's extras were judged —
+        // and only for a leg that kept the alias's provider.
+        apply_alias_leg_endpoints(alias_legs, &mut standard_stt, &mut standard_tts);
     }
 
     // P2 language standardization: the client's canonical `language` was just mapped to each
@@ -5354,6 +5483,86 @@ mod standalone_destination_tests {
             standalone_client_config_refusal(None, None, Some(&own_key_override), None, true)
                 .is_some(),
             "deny refuses client endpoints whoever's key they carry"
+        );
+    }
+}
+
+#[cfg(test)]
+mod alias_leg_endpoint_tests {
+    //! A server alias's own servers reach the legs server-side, and only legs that kept the
+    //! alias's provider (Gaia's 25 Oct report, item 4).
+    use super::*;
+    use crate::core::alias::{AliasLegEndpoint, AliasLegs};
+    use serde_json::json;
+
+    fn legs() -> AliasLegs {
+        AliasLegs {
+            stt: Some(AliasLegEndpoint {
+                provider: "openai".into(),
+                base_url: "http://127.0.0.1:8081".into(),
+                credential_ref: None,
+            }),
+            tts: Some(AliasLegEndpoint {
+                provider: "openai".into(),
+                base_url: "http://127.0.0.1:8082".into(),
+                credential_ref: None,
+            }),
+        }
+    }
+
+    fn configs(
+        stt: &str,
+        tts: &str,
+    ) -> (
+        crate::core::stt::standard::StandardSTTConfig,
+        crate::core::tts::standard::StandardTTSConfig,
+    ) {
+        let stt: STTWebSocketConfig = serde_json::from_value(json!({"provider": stt,
+            "language": "en", "sample_rate": 16000, "channels": 1, "punctuation": true}))
+        .unwrap();
+        let tts: TTSWebSocketConfig = serde_json::from_value(json!({"provider": tts})).unwrap();
+        (
+            stt.to_standard_stt(String::new()),
+            tts.to_standard_tts(String::new()),
+        )
+    }
+
+    #[test]
+    fn an_openai_compatible_alias_server_is_used_by_both_legs() {
+        let (mut stt, mut tts) = configs("openai", "openai");
+        apply_alias_leg_endpoints(&legs(), &mut stt, &mut tts);
+        assert_eq!(stt.endpoint_override(), Some("http://127.0.0.1:8081"));
+        assert_eq!(tts.base.provider, "self_hosted");
+        assert_eq!(
+            tts.base.api_base.as_deref(),
+            Some("http://127.0.0.1:8082/v1")
+        );
+    }
+
+    #[test]
+    fn a_leg_whose_client_chose_another_provider_keeps_its_vendor() {
+        let (mut stt, mut tts) = configs("deepgram", "elevenlabs");
+        apply_alias_leg_endpoints(&legs(), &mut stt, &mut tts);
+        assert_eq!(stt.endpoint_override(), None);
+        assert_eq!(tts.base.provider, "elevenlabs");
+        assert_eq!(tts.base.api_base, None);
+    }
+
+    #[test]
+    fn a_session_synthesis_timeout_is_clamped() {
+        let tts: TTSWebSocketConfig =
+            serde_json::from_value(json!({"provider": "openai", "request_timeout": 100000}))
+                .unwrap();
+        assert_eq!(
+            tts.to_tts_config(String::new()).request_timeout,
+            Some(super::super::config::MAX_TTS_REQUEST_TIMEOUT_SECS)
+        );
+        let tts: TTSWebSocketConfig =
+            serde_json::from_value(json!({"provider": "openai"})).unwrap();
+        assert_eq!(
+            tts.to_tts_config(String::new()).request_timeout,
+            Some(60),
+            "default unchanged"
         );
     }
 }

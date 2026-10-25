@@ -162,6 +162,11 @@ fn check_configuration(config_path: Option<&PathBuf>) -> Vec<String> {
             None
         }
     };
+    if let Some(config) = config.as_ref()
+        && let Err(e) = waav_gateway::core::alias::validate_aliases(&config.aliases)
+    {
+        problems.push(format!("aliases: {e}"));
+    }
     if let Err(e) = waav_gateway::core::credentials::initialize_credentials() {
         problems.push(format!("credentials: {e}"));
     }
@@ -303,6 +308,10 @@ async fn main() -> anyhow::Result<()> {
     // only (SSRF-safe). A client may NAME an alias on its `config` message but never
     // DEFINE one. Done before serving so the first connection resolves correctly.
     {
+        // A leg's own server must pass the egress rules: a mistake stops the server here rather
+        // than failing every session that names the alias.
+        waav_gateway::core::alias::validate_aliases(&config.aliases)
+            .map_err(|e| anyhow!("aliases: {e}"))?;
         let n = waav_gateway::core::alias::initialize_aliases(&config.aliases);
         if n > 0 {
             info!("Registered {} server-side config alias(es)", n);
