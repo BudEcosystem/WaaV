@@ -281,6 +281,7 @@ auth:
   # Legacy single-secret alias (ignored when api_secrets is non-empty):
   # api_secret: "sk_test_legacy_123456"       # ENV: AUTH_API_SECRET (AUTH_API_SECRET_ID optional)
   timeout_seconds: 5                          # ENV: AUTH_TIMEOUT_SECONDS
+  # Query-string credentials (`?token=`) are env-only: AUTH_QUERY_TOKEN=allow (default) or deny.
 
 # SIP configuration (optional)
 # Used for SIP trunk integration and webhook forwarding

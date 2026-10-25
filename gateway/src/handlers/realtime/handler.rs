@@ -97,6 +97,10 @@ pub async fn realtime_handler(
 
     ws.max_frame_size(MAX_WS_FRAME_SIZE)
         .max_message_size(MAX_WS_MESSAGE_SIZE)
+        // A browser that sends its key as the `openai-insecure-api-key.<key>` subprotocol offers
+        // `realtime` beside it; selecting it in the 101 is what Node's `ws` and browsers expect
+        // (the key itself is never echoed). A client offering none sees no change.
+        .protocols([crate::handlers::openai_realtime::handshake::SUBPROTOCOL])
         .on_upgrade(move |socket| {
             // Held for the session: released when it ends (FRD-022 Phase 0.1 — realtime
             // sessions used to leak their slot).

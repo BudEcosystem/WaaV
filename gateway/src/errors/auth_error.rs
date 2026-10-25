@@ -15,6 +15,7 @@ pub mod error_codes {
     pub const UNAUTHORIZED: &str = "unauthorized";
     pub const JWT_SIGNING_ERROR: &str = "jwt_signing_error";
     pub const CONFIG_ERROR: &str = "config_error";
+    pub const QUERY_TOKEN_REFUSED: &str = "query_token_refused";
 }
 
 /// Authentication error types
@@ -27,6 +28,14 @@ pub enum AuthError {
     /// Authorization header format is invalid (not "Bearer {token}")
     #[error("Invalid Authorization header format")]
     InvalidAuthHeader,
+
+    /// A `?token=` credential on a gateway that refuses them (`AUTH_QUERY_TOKEN=deny`)
+    #[error(
+        "Credentials are not accepted in the query string on this gateway (query strings are \
+         logged). Send `Authorization: Bearer <key>`, or from a browser the WebSocket subprotocol \
+         `openai-insecure-api-key.<key>` (with `realtime`)"
+    )]
+    QueryTokenRefused,
 
     /// Request body could not be parsed for auth validation
     #[error("Invalid request body: {0}")]
@@ -67,6 +76,7 @@ impl AuthError {
         match self {
             AuthError::MissingAuthHeader => error_codes::MISSING_AUTH_HEADER,
             AuthError::InvalidAuthHeader => error_codes::INVALID_AUTH_HEADER,
+            AuthError::QueryTokenRefused => error_codes::QUERY_TOKEN_REFUSED,
             AuthError::InvalidRequestBody(_) => error_codes::INVALID_REQUEST_BODY,
             AuthError::AuthServiceUnavailable(_) => error_codes::AUTH_SERVICE_UNAVAILABLE,
             AuthError::AuthServiceError(_, _) => error_codes::AUTH_SERVICE_ERROR,
@@ -81,7 +91,9 @@ impl AuthError {
     /// Get the HTTP status code for this error
     pub fn status_code(&self) -> StatusCode {
         match self {
-            AuthError::MissingAuthHeader | AuthError::InvalidAuthHeader => StatusCode::UNAUTHORIZED,
+            AuthError::MissingAuthHeader
+            | AuthError::InvalidAuthHeader
+            | AuthError::QueryTokenRefused => StatusCode::UNAUTHORIZED,
             AuthError::InvalidRequestBody(_) => StatusCode::BAD_REQUEST,
             AuthError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             AuthError::AuthServiceUnavailable(_) | AuthError::HttpError(_) => {
@@ -108,6 +120,9 @@ impl AuthError {
             // Debug level for expected auth failures (missing/invalid headers)
             AuthError::MissingAuthHeader | AuthError::InvalidAuthHeader => {
                 tracing::debug!("{}", self);
+            }
+            AuthError::QueryTokenRefused => {
+                tracing::warn!("Refused a query-string credential (AUTH_QUERY_TOKEN=deny)");
             }
             AuthError::InvalidRequestBody(msg) => {
                 tracing::warn!("Invalid request body for auth validation: {}", msg);

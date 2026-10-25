@@ -90,6 +90,10 @@ pub async fn ws_voice_handler(
     let response = ws
         .max_frame_size(MAX_WS_FRAME_SIZE)
         .max_message_size(MAX_WS_MESSAGE_SIZE)
+        // A browser that sends its key as the `openai-insecure-api-key.<key>` subprotocol offers
+        // `realtime` beside it; selecting it in the 101 is what Node's `ws` and browsers expect
+        // (the key itself is never echoed). A client offering none sees no change.
+        .protocols([crate::handlers::openai_realtime::handshake::SUBPROTOCOL])
         .on_upgrade(move |socket| {
             debug!("WebSocket upgrade callback triggered");
             handle_voice_socket(socket, state, auth, ip, slot, credential)
