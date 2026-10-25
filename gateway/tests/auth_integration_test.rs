@@ -356,6 +356,84 @@ V/reoL3Jcy/mQ9MrmJx+K1VC
         assert_eq!(response.status(), StatusCode::OK);
     }
 
+    /// A multipart upload (an OpenAI-SDK `audio.transcriptions` call) passes a responder: it is
+    /// asked once, with the request's headers, and the handler receives the whole body. It used to
+    /// be refused with 400 "request body must be valid JSON for auth validation" first.
+    #[tokio::test]
+    async fn test_responder_admits_a_multipart_upload_and_the_body_reaches_the_handler() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auth"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "tenant-a"})),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        let (state, _temp_dir) =
+            create_test_state_with_auth(&format!("{}/auth", mock_server.uri())).await;
+
+        async fn body_len(body: axum::body::Bytes) -> String {
+            body.len().to_string()
+        }
+        let app = Router::new()
+            .route("/upload", axum::routing::post(body_len))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                auth_middleware,
+            ))
+            .with_state(state);
+
+        let body = "--x\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\n\
+                    Content-Type: audio/wav\r\n\r\nRIFF....WAVE\r\n--x--\r\n";
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/upload")
+            .header("authorization", "Bearer valid-token")
+            .header("content-type", "multipart/form-data; boundary=x")
+            .body(Body::from(body))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let got = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(got, body.len().to_string().as_bytes());
+    }
+
+    /// A body that says it is JSON is still parsed for the responder, and malformed JSON is still
+    /// refused before the responder is asked.
+    #[tokio::test]
+    async fn test_responder_still_refuses_malformed_json() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auth"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "tenant-a"})),
+            )
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+        let (state, _temp_dir) =
+            create_test_state_with_auth(&format!("{}/auth", mock_server.uri())).await;
+        let app = Router::new()
+            .route("/test", axum::routing::post(test_handler))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                auth_middleware,
+            ))
+            .with_state(state);
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/test")
+            .header("authorization", "Bearer valid-token")
+            .header("content-type", "application/json")
+            .body(Body::from("{not json"))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
     /// A responder `200` that names nobody (`{}`, `OK`, empty) must not admit: it is a contract
     /// violation by the responder, answered 502 so the client is not told to rotate a key.
     #[tokio::test]
