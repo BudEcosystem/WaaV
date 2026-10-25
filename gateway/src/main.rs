@@ -222,6 +222,15 @@ fn check_configuration(config_path: Option<&PathBuf>) -> Vec<String> {
             "{e} (a malformed value refuses every query-string credential)"
         ));
     }
+    if let Err(e) = waav_gateway::livekit::ice::parse_ice_ips(
+        std::env::var(waav_gateway::livekit::ice::ICE_IPS_ENV)
+            .ok()
+            .as_deref(),
+    ) {
+        problems.push(format!(
+            "{e} (a malformed value gathers no ICE candidates, so LiveKit calls fail)"
+        ));
+    }
     // A malformed value refuses every client endpoint at runtime (fail closed): say so here.
     use waav_gateway::core::client_destination::{CLIENT_ENDPOINTS_ENV, parse_client_endpoints};
     if let Err(e) = parse_client_endpoints(std::env::var(CLIENT_ENDPOINTS_ENV).ok().as_deref()) {

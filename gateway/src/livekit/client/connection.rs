@@ -20,6 +20,8 @@ impl LiveKitClient {
     pub async fn connect(&mut self) -> Result<(), AppError> {
         Self::validate_audio_config(&self.config)?;
         info!("Connecting to LiveKit room with URL: {}", self.config.url);
+        // Which local networks this participant's media sockets may use (Gaia 25 Oct §20).
+        crate::livekit::ice::apply_for(&self.config.url);
 
         match Room::connect(&self.config.url, &self.config.token, RoomOptions::default()).await {
             Ok((room, room_events)) => {
