@@ -124,6 +124,48 @@ pub fn agent_signal_message(signal: &AgentSignal) -> Option<OutgoingMessage> {
 /// Close codes the agent ends a session with.
 const CLOSE_NORMAL: u16 = 1000;
 
+/// Send a turn's signals to the client as `/ws` messages, in order, until the sender is dropped.
+/// Shared by voice-agent and conversation sessions. `Idle` (agents only) ends the session.
+pub(super) fn spawn_signal_forwarder(
+    mut signal_rx: mpsc::UnboundedReceiver<AgentSignal>,
+    tx: mpsc::Sender<MessageRoute>,
+    tracker: &crate::core::observability::SessionTaskTracker,
+) {
+    let handle = tokio::spawn(async move {
+        while let Some(signal) = signal_rx.recv().await {
+            if matches!(signal, AgentSignal::Idle) {
+                let _ = send_with_policy(
+                    &tx,
+                    MessageRoute::Outgoing(OutgoingMessage::AgentError {
+                        code: "idle_timeout".into(),
+                        message: "The session ended after a long silence.".into(),
+                    }),
+                    MessageClass::Critical,
+                )
+                .await;
+                let _ = send_with_policy(
+                    &tx,
+                    MessageRoute::CloseWith {
+                        code: CLOSE_NORMAL,
+                        reason: "idle_timeout".into(),
+                    },
+                    MessageClass::Critical,
+                )
+                .await;
+                return;
+            }
+            let class = match &signal {
+                AgentSignal::Transcript { .. } => MessageClass::Transcript,
+                _ => MessageClass::Critical,
+            };
+            if let Some(msg) = agent_signal_message(&signal) {
+                send_with_policy(&tx, MessageRoute::Outgoing(msg), class).await;
+            }
+        }
+    });
+    tracker.track("turn-signals", handle);
+}
+
 /// Wire the session's VoiceManager to a voice agent and start listening.
 pub(super) async fn initialize_agent_loop(
     agent: ResolvedVoiceAgent,
@@ -147,7 +189,7 @@ pub(super) async fn initialize_agent_loop(
         .ok_or_else(|| "a voice agent needs your Bud API key or token".to_string())?;
 
     let entry = Arc::clone(&agent.entry);
-    let (signal_tx, mut signal_rx) = mpsc::unbounded_channel::<AgentSignal>();
+    let (signal_tx, signal_rx) = mpsc::unbounded_channel::<AgentSignal>();
     let engine = AgentEngine::new(
         AgentSessionConfig {
             session_id: stream_id.to_string(),
@@ -183,41 +225,8 @@ pub(super) async fn initialize_agent_loop(
 
     // Engine signals -> /ws messages.
     {
-        let tx = message_tx.clone();
         let tracker = state.read().await.task_tracker.clone();
-        let handle = tokio::spawn(async move {
-            while let Some(signal) = signal_rx.recv().await {
-                if matches!(signal, AgentSignal::Idle) {
-                    let _ = send_with_policy(
-                        &tx,
-                        MessageRoute::Outgoing(OutgoingMessage::AgentError {
-                            code: "idle_timeout".into(),
-                            message: "The session ended after a long silence.".into(),
-                        }),
-                        MessageClass::Critical,
-                    )
-                    .await;
-                    let _ = send_with_policy(
-                        &tx,
-                        MessageRoute::CloseWith {
-                            code: CLOSE_NORMAL,
-                            reason: "idle_timeout".into(),
-                        },
-                        MessageClass::Critical,
-                    )
-                    .await;
-                    return;
-                }
-                let class = match &signal {
-                    AgentSignal::Transcript { .. } => MessageClass::Transcript,
-                    _ => MessageClass::Critical,
-                };
-                if let Some(msg) = agent_signal_message(&signal) {
-                    send_with_policy(&tx, MessageRoute::Outgoing(msg), class).await;
-                }
-            }
-        });
-        tracker.track("agent-signals", handle);
+        spawn_signal_forwarder(signal_rx, message_tx.clone(), &tracker);
     }
 
     // The session's length is the agent's limit, capped by the gateway's.

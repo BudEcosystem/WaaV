@@ -25,13 +25,17 @@
 //! It is **opt-in**: instantiated only when a `conversation` config block is
 //! present. Absent it, the existing STT/TTS-primitive behavior is unchanged.
 
+mod report;
+
 use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::Mutex as SyncMutex;
+use report::TurnReport;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
+use crate::core::agent::{AgentSignal, TurnStatus};
 use crate::core::llm::{LlmClient, LlmClientConfig, LlmError};
 use crate::core::stt::STTResult;
 use crate::core::voice_manager::{VoiceManager, VoiceManagerError};
@@ -650,6 +654,9 @@ pub struct ConversationOrchestrator {
     /// so a short anaphoric follow-up can stick to the reasoning thread for one
     /// turn (set unconditionally in `select_tier` on every two-tier turn).
     last_turn_was_reasoning: Arc<SyncMutex<bool>>,
+    /// Where each turn reports its lifecycle and spoken words (see [`report`]); `None` = nobody
+    /// listens (tests, direct embedding).
+    turn_signals: Arc<SyncMutex<Option<tokio::sync::mpsc::UnboundedSender<AgentSignal>>>>,
 }
 
 /// S1/S2: build the reasoning tier (sharing `base.histories`) when configured.
@@ -900,6 +907,7 @@ impl ConversationOrchestrator {
             masking_fired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             masking_handle: Arc::new(SyncMutex::new(None)),
             masking_phrase_idx: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            turn_signals: Arc::new(SyncMutex::new(None)),
         })
     }
 
@@ -937,6 +945,7 @@ impl ConversationOrchestrator {
             masking_fired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             masking_handle: Arc::new(SyncMutex::new(None)),
             masking_phrase_idx: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            turn_signals: Arc::new(SyncMutex::new(None)),
         }
     }
 
@@ -1008,6 +1017,7 @@ impl ConversationOrchestrator {
         allow_interruption: bool,
         token: &CancellationToken,
         spoke: bool,
+        report: &TurnReport,
     ) -> bool {
         // A real barge-in already cleared this turn — degrading would talk over
         // the caller. The epoch guard below is the final backstop.
@@ -1072,10 +1082,13 @@ impl ConversationOrchestrator {
                         primary_is_reasoning,
                         "P1: primary LLM tier failed — degraded to the fallback tier"
                     );
-                    let _ = self
+                    if let Ok(true) = self
                         .voice_manager
                         .speak_if_epoch(&text, true, allow_interruption, epoch)
-                        .await;
+                        .await
+                    {
+                        report.spoke(&text);
+                    }
                     return true; // recovered on the fallback tier
                 }
                 Ok(other) => {
@@ -1105,10 +1118,13 @@ impl ConversationOrchestrator {
             .degradation_message
             .as_deref()
             .unwrap_or(DEFAULT_DEGRADATION_MESSAGE);
-        let _ = self
+        if let Ok(true) = self
             .voice_manager
             .speak_if_epoch(msg, true, allow_interruption, epoch)
-            .await;
+            .await
+        {
+            report.spoke(msg);
+        }
         false
     }
 
@@ -1234,10 +1250,23 @@ impl ConversationOrchestrator {
                     content
                 };
                 crate::core::metrics::bridge::record_async_tool("spoke");
-                let _ = self
+                let report = self.report_turn(id, None);
+                let status = match self
                     .voice_manager
                     .speak_if_epoch(&text, true, self.config.allow_interruption, epoch)
-                    .await;
+                    .await
+                {
+                    Ok(true) => {
+                        report.spoke(&text);
+                        TurnStatus::Completed
+                    }
+                    Ok(false) => TurnStatus::Cancelled,
+                    Err(e) => {
+                        warn!(session = %self.session_id, error = %e, "S3 follow-up speech failed");
+                        TurnStatus::Failed
+                    }
+                };
+                report.done(status, self.voice_manager.audio_out_ms());
             }
             Ok(_) => debug!(session = %self.session_id, "S3 follow-up produced no content"),
             Err(LlmError::Cancelled) => {
@@ -1367,6 +1396,16 @@ impl ConversationOrchestrator {
     /// whatever the executor runs next on that thread, which silently mis-attributes the very
     /// legs this exists to measure.
     pub async fn run_turn(&self, transcript: &str) -> Result<(), ConversationOrchestratorError> {
+        self.run_turn_for(transcript, Some(transcript)).await
+    }
+
+    /// [`Self::run_turn`] for a prompt that is not the caller's words (`input: None`): the idle
+    /// check-in. `input` is what the turn reports as having started it.
+    async fn run_turn_for(
+        &self,
+        transcript: &str,
+        input: Option<&str>,
+    ) -> Result<(), ConversationOrchestratorError> {
         let span = crate::voice_turn_span!(capability = "conversation", transport = "websocket");
         span.record(
             crate::observability::voice_attrs::turn::SESSION_ID,
@@ -1390,12 +1429,17 @@ impl ConversationOrchestrator {
                 }
             }
         }
-        tracing::Instrument::instrument(self.run_turn_inner(transcript), span).await
+        tracing::Instrument::instrument(self.run_turn_inner(transcript, input), span).await
     }
 
-    async fn run_turn_inner(&self, transcript: &str) -> Result<(), ConversationOrchestratorError> {
+    async fn run_turn_inner(
+        &self,
+        transcript: &str,
+        input: Option<&str>,
+    ) -> Result<(), ConversationOrchestratorError> {
         let span = tracing::Span::current();
         let (id, token) = self.begin_turn();
+        let report = self.report_turn(id, input);
         span.record(crate::observability::voice_attrs::turn::TURN_INDEX, id);
         // S2: select the fast or reasoning tier for this turn (both share
         // history; the D3 filler masks the reasoning tier's latency).
@@ -1456,6 +1500,7 @@ impl ConversationOrchestrator {
                 let token_t = token.clone();
                 let latch = self.masking_fired.clone();
                 let session = self.session_id.clone();
+                let report_t = report.clone();
                 let handle = tokio::spawn(async move {
                     tokio::time::sleep(Duration::from_millis(wait_ms)).await;
                     // Re-check at fire time: not cancelled, no audio yet, not
@@ -1477,7 +1522,10 @@ impl ConversationOrchestrator {
                     // re-introduced the §4.4 failure). Echo cancellation, not a
                     // session-wide suppression window, handles the bot's own tail.
                     match vm.speak_if_epoch(&phrase, true, true, epoch).await {
-                        Ok(true) => debug!(session = %session, %phrase, "D3 masking filler spoken"),
+                        Ok(true) => {
+                            report_t.spoke(&phrase);
+                            debug!(session = %session, %phrase, "D3 masking filler spoken")
+                        }
                         Ok(false) => {
                             // Cleared before we could speak — undo the latch so a
                             // recovery line can still fire if content is empty.
@@ -1533,6 +1581,7 @@ impl ConversationOrchestrator {
             let spoke_pump = spoke.clone();
             let obs_pump = observers.clone();
             let strip_md = self.config.strip_markdown;
+            let report_pump = report.clone();
             let handle = tokio::spawn(async move {
                 let mut agg = crate::core::text::SentenceAggregator::default();
                 // Reasoning-model chain-of-thought (`<think>…</think>`) must NEVER
@@ -1549,6 +1598,7 @@ impl ConversationOrchestrator {
                     strip_markdown: bool,
                     spoke: &std::sync::atomic::AtomicBool,
                     obs: &Option<Arc<crate::core::observability::ObserverRegistry>>,
+                    report: &TurnReport,
                 ) -> bool {
                     // C-G4: strip markdown on the COMPLETE sentence (the
                     // aggregator's unit — per-token would tear ** pairs).
@@ -1571,7 +1621,10 @@ impl ConversationOrchestrator {
                         .speak_if_epoch(&text, true, allow_interruption, epoch)
                         .await
                     {
-                        Ok(true) => true,
+                        Ok(true) => {
+                            report.spoke(&text);
+                            true
+                        }
                         Ok(false) => {
                             // A barge-in cleared TTS since this turn started:
                             // the rest of this turn's sentences are stale.
@@ -1602,7 +1655,7 @@ impl ConversationOrchestrator {
                                     if token_for_cb.is_cancelled() {
                                         break 'pump;
                                     }
-                                    if !speak_sentence(&vm_pump, sentence, allow_interruption, epoch, strip_md, &spoke_pump, &obs_pump).await {
+                                    if !speak_sentence(&vm_pump, sentence, allow_interruption, epoch, strip_md, &spoke_pump, &obs_pump, &report_pump).await {
                                         break 'pump;
                                     }
                                 }
@@ -1616,13 +1669,13 @@ impl ConversationOrchestrator {
                                 if !think_tail.is_empty() {
                                     for sentence in agg.push_str(&think_tail) {
                                         if token_for_cb.is_cancelled() { break; }
-                                        let _ = speak_sentence(&vm_pump, sentence, allow_interruption, epoch, strip_md, &spoke_pump, &obs_pump).await;
+                                        let _ = speak_sentence(&vm_pump, sentence, allow_interruption, epoch, strip_md, &spoke_pump, &obs_pump, &report_pump).await;
                                     }
                                 }
                                 if !token_for_cb.is_cancelled()
                                     && let Some(tail) = agg.flush()
                                 {
-                                    let _ = speak_sentence(&vm_pump, tail, allow_interruption, epoch, strip_md, &spoke_pump, &obs_pump).await;
+                                    let _ = speak_sentence(&vm_pump, tail, allow_interruption, epoch, strip_md, &spoke_pump, &obs_pump, &report_pump).await;
                                 }
                                 break;
                             }
@@ -1652,6 +1705,8 @@ impl ConversationOrchestrator {
             0
         };
         let mut budget_exceeded = false;
+        // How the turn ended when that is not read off `outcome` and the token (see the report below).
+        let mut ended: Option<TurnStatus> = None;
         // Wraps BOTH completion branches: the budgeted reasoning path and the plain one. Timing
         // only one of them would leave the reasoning turns — the slow ones, the whole reason the
         // measurement is interesting — silently unmeasured.
@@ -1803,7 +1858,10 @@ impl ConversationOrchestrator {
                         .speak_if_epoch(&speak_text, true, allow_interruption, epoch)
                         .await
                     {
-                        Ok(true) => Ok(()),
+                        Ok(true) => {
+                            report.spoke(&speak_text);
+                            Ok(())
+                        }
                         Ok(false) => {
                             debug!(session = %self.session_id,
                                    "speak skipped: barge-in cleared since turn start");
@@ -1826,15 +1884,14 @@ impl ConversationOrchestrator {
                             .masking_fired
                             .load(std::sync::atomic::Ordering::Acquire)
                         {
-                            let _ = self
+                            let line = "Sorry, I didn't catch that — could you say it again?";
+                            if let Ok(true) = self
                                 .voice_manager
-                                .speak_if_epoch(
-                                    "Sorry, I didn't catch that — could you say it again?",
-                                    true,
-                                    allow_interruption,
-                                    epoch,
-                                )
-                                .await;
+                                .speak_if_epoch(line, true, allow_interruption, epoch)
+                                .await
+                            {
+                                report.spoke(line);
+                            }
                         }
                     }
                     Ok(())
@@ -1863,6 +1920,7 @@ impl ConversationOrchestrator {
                         "conversation",
                         "reasoning_stall_after_partial",
                     );
+                    ended = Some(TurnStatus::Incomplete);
                     debug!(
                         session = %self.session_id,
                         "A7: reasoner stalled after partial audio — committed partial, no restart"
@@ -1872,14 +1930,19 @@ impl ConversationOrchestrator {
                     // No audio yet (TTFA breach): degrade to the fast draft /
                     // canned apology rather than leaving the caller on a stuck
                     // reasoner. A deliberate budget cancel is never surfaced.
-                    self.speak_degraded(
-                        is_reasoning,
-                        epoch,
-                        allow_interruption,
-                        &token,
-                        spoke.load(std::sync::atomic::Ordering::Acquire),
-                    )
-                    .await;
+                    if !self
+                        .speak_degraded(
+                            is_reasoning,
+                            epoch,
+                            allow_interruption,
+                            &token,
+                            spoke.load(std::sync::atomic::Ordering::Acquire),
+                            &report,
+                        )
+                        .await
+                    {
+                        ended = Some(TurnStatus::Failed);
+                    }
                     Ok(())
                 }
             }
@@ -1918,6 +1981,7 @@ impl ConversationOrchestrator {
                         allow_interruption,
                         &token,
                         spoke.load(std::sync::atomic::Ordering::Acquire),
+                        &report,
                     )
                     .await
                 {
@@ -1932,6 +1996,16 @@ impl ConversationOrchestrator {
         // already fired or first audio aborted it; prevents a late stray filler).
         self.abort_masking();
         self.end_turn(id);
+        let status = if token.is_cancelled() {
+            TurnStatus::Cancelled
+        } else if let Some(status) = ended {
+            status
+        } else if outcome.is_err() {
+            TurnStatus::Failed
+        } else {
+            TurnStatus::Completed
+        };
+        report.done(status, self.voice_manager.audio_out_ms());
 
         // A-G5 (review wf_d43814c3 #4): the bot completed a turn that ran to
         // completion (not a barge-in cancel) — flip the greeting-guard latch
@@ -2205,6 +2279,8 @@ impl ConversationOrchestrator {
                     // to the bot-busy probe), and epoch-gate each sentence so
                     // a barge-in mid-confirm stops the rest.
                     let (turn_id, _confirm_token) = self.begin_turn();
+                    let report = self.report_turn(turn_id, Some(transcript));
+                    let mut status = TurnStatus::Completed;
                     let epoch = self.voice_manager.clear_epoch();
                     self.llm
                         .commit_turn(&self.session_id, transcript, &content)
@@ -2231,20 +2307,23 @@ impl ConversationOrchestrator {
                             .speak_if_epoch(&sentence, true, self.config.allow_interruption, epoch)
                             .await
                         {
-                            Ok(true) => {}
+                            Ok(true) => report.spoke(&sentence),
                             Ok(false) => {
                                 debug!(session = %self.session_id,
                                        "eager reply truncated: barge-in cleared mid-confirm");
+                                status = TurnStatus::Cancelled;
                                 break;
                             }
                             Err(e) => {
                                 warn!(session = %self.session_id, error = %e,
                                       "speaking confirmed eager reply failed");
+                                status = TurnStatus::Failed;
                                 break;
                             }
                         }
                     }
                     self.end_turn(turn_id);
+                    report.done(status, self.voice_manager.audio_out_ms());
                     // A5: a confirmed eager reply ALWAYS ran on the FAST tier
                     // (committed via self.llm) but bypassed select_tier, so keep
                     // the reasoning-stickiness ledger honest — otherwise a prior
@@ -2310,6 +2389,21 @@ impl ConversationOrchestrator {
         }
     }
 
+    /// Send every turn's lifecycle and spoken words here (`/ws` `assistant_transcript` & co.).
+    pub fn set_turn_signals(&self, tx: tokio::sync::mpsc::UnboundedSender<AgentSignal>) {
+        *self.turn_signals.lock() = Some(tx);
+    }
+
+    /// Start reporting turn `id`; `input` is the caller's words that started it, if any.
+    fn report_turn(&self, id: u64, input: Option<&str>) -> TurnReport {
+        TurnReport::start(
+            self.turn_signals.lock().clone(),
+            id,
+            input,
+            self.voice_manager.audio_out_ms(),
+        )
+    }
+
     /// D-G3: install the fatal-error handler (invoked once per fatal).
     pub fn set_fatal_handler(&self, handler: Arc<dyn Fn(String) + Send + Sync>) {
         *self.fatal_handler.lock() = Some(handler);
@@ -2355,10 +2449,11 @@ impl ConversationOrchestrator {
                 }
                 debug!(session = %orch.session_id, "user idle; re-engaging");
                 if let Err(e) = orch
-                    .run_turn(
+                    .run_turn_for(
                         "[The user has been silent for a while. Briefly and \
                          naturally check in with them or offer help — one short \
                          sentence.]",
+                        None,
                     )
                     .await
                 {
