@@ -1849,7 +1849,9 @@ components:
             enum:
             - truncate
       - type: object
-        description: 'Voice-agent sessions (spec 025): a typed user turn — no speech, the same agent turn.'
+        description: |-
+          A typed user turn — no speech, the same turn — on a voice-agent (spec 025) or
+          conversation session. It interrupts the reply in progress.
         required:
         - text
         - type

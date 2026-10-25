@@ -976,12 +976,12 @@ pub async fn handle_config_message(
         )
         .await
         {
-            Ok(true) => {
+            Ok(orchestrator) => {
                 info!("Conversation loop initialized for stream {}", stream_id);
+                state.write().await.conversation = Some(orchestrator);
                 emit_reasoning_config_warnings(conv_config, message_tx).await;
                 true
             }
-            Ok(false) => false,
             Err(e) => {
                 error!("Conversation loop initialization failed: {}", e);
                 send_error(
@@ -1802,7 +1802,7 @@ async fn initialize_conversation_loop(
     credential: Option<crate::auth::SessionCredential>,
     attribution: Option<crate::core::conversation::TurnAttribution>,
     tracker: &crate::core::observability::SessionTaskTracker,
-) -> Result<bool, String> {
+) -> Result<Arc<ConversationOrchestrator>, String> {
     let mut config = conv_config.to_conversation_config();
     if app_state.bud_mode.is_some() {
         bud_llm_leg(&mut config, credential)?;
@@ -2057,7 +2057,7 @@ async fn initialize_conversation_loop(
         return Err(format!("failed to register conversation STT callback: {e}"));
     }
 
-    Ok(true)
+    Ok(orchestrator)
 }
 
 /// Validate audio configurations are present

@@ -1,4 +1,4 @@
-use crate::auth::{Auth, filter_headers, match_api_secret_id};
+use crate::auth::{Auth, filter_headers};
 use crate::errors::auth_error::AuthError;
 use crate::state::AppState;
 use axum::{
@@ -292,38 +292,43 @@ async fn authenticate_request(
     // first, then — for any bearer that is not one — the external auth responder. A secret
     // mismatch used to answer 401 here even with AUTH_SERVICE_URL configured, so the responder
     // was never called (the documented "both methods can coexist" did not).
-    let try_secret = state.auth_policy.secrets_active(&state.config);
     let try_responder = state.auth_policy.responder_active(&state.config);
-    if try_secret {
-        // API Secret authentication mode - constant-time comparison
-        if let Some(secret_id) = match_api_secret_id(&token, &state.config.auth_api_secrets) {
-            tracing::info!(
-                method = %request_method,
-                path = %request_path,
-                auth_id = %secret_id,
-                "API secret authentication successful"
-            );
-            request.extensions_mut().insert(Auth::new(secret_id));
-            return Ok(next.run(request).await);
-        }
-        if !try_responder {
-            tracing::warn!(
-                method = %request_method,
-                path = %request_path,
-                "API secret authentication failed: token mismatch"
-            );
-            return Err(AuthError::Unauthorized("Invalid API secret".to_string()));
-        }
-        tracing::debug!(
+
+    // Without a responder, or for a body that is not JSON (a multipart upload to
+    // /v1/audio/transcriptions, raw audio), the shared standalone authenticator: the responder
+    // judges the bearer by the request's method, path and headers — Content-Type and
+    // Content-Length among them — and the body streams to the handler unread. A non-JSON body used
+    // to be parsed as JSON for the responder and refused with 400 before the responder was asked,
+    // so no transcription upload could pass a responder; and a large body was buffered whole
+    // before anyone had authenticated. The handlers that parse JSON refuse another content type
+    // themselves, so the responder and the handler cannot disagree about what was sent.
+    if !try_responder || !declares_json_body(request.headers()) {
+        let auth = crate::auth::standalone::authenticate_bearer(
+            &state,
+            &token,
+            request.headers(),
+            &request_path,
+            &request_method,
+        )
+        .await?;
+        request.extensions_mut().insert(auth);
+        return Ok(next.run(request).await);
+    }
+
+    // A JSON body: an API secret first, then the responder, which sees the parsed body.
+    if let Some(auth) = crate::auth::standalone::secret_auth(&state, &token) {
+        tracing::info!(
             method = %request_method,
             path = %request_path,
-            "bearer is not an API secret; asking the auth responder"
+            auth_id = ?auth.id,
+            "API secret authentication successful"
         );
+        request.extensions_mut().insert(auth);
+        return Ok(next.run(request).await);
     }
 
     // JWT authentication mode - validate with external auth service
-    if try_responder {
-        // Get the auth client from state
+    {
         let auth_client = state
             .auth_client
             .as_ref()
@@ -331,41 +336,6 @@ async fn authenticate_request(
 
         // Filter request headers (exclude sensitive ones)
         let request_headers = filter_headers(request.headers());
-
-        // A body that is not JSON (a multipart upload to /v1/audio/transcriptions, raw audio): the
-        // responder judges the bearer by the request's method, path and headers — Content-Type and
-        // Content-Length among them — and the body streams to the handler unread. It used to be
-        // parsed as JSON for the responder and refused with 400 before the responder was asked,
-        // so no transcription upload could pass a responder; and a large body was buffered whole
-        // before anyone had authenticated. The handlers that parse JSON refuse another content
-        // type themselves, so the responder and the handler cannot disagree about what was sent.
-        if !declares_json_body(request.headers()) {
-            let auth = auth_client
-                .validate_token(
-                    &token,
-                    &serde_json::json!({}),
-                    request_headers,
-                    &request_path,
-                    &request_method,
-                )
-                .await
-                .inspect_err(|e| {
-                    tracing::warn!(
-                        method = %request_method,
-                        path = %request_path,
-                        error = %e,
-                        "JWT authentication failed"
-                    );
-                })?;
-            tracing::info!(
-                method = %request_method,
-                path = %request_path,
-                auth_id = ?auth.id,
-                "JWT authentication successful"
-            );
-            request.extensions_mut().insert(auth);
-            return Ok(next.run(request).await);
-        }
 
         // Buffer the request body for auth validation
         // Note: This buffers the entire request body in memory, which is acceptable for
@@ -420,11 +390,6 @@ async fn authenticate_request(
                 Err(e)
             }
         }
-    } else {
-        // No authentication method configured
-        Err(AuthError::ConfigError(
-            "Authentication required but no auth method configured".to_string(),
-        ))
     }
 }
 

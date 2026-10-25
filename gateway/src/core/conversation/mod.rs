@@ -2186,6 +2186,33 @@ impl ConversationOrchestrator {
         self.handle_turn_events(&events).await;
     }
 
+    /// A typed user turn (`/ws` `agent_input`, a `/v1/realtime` typed message): it interrupts the
+    /// reply in progress and runs like a spoken one. Returns when the turn has run.
+    pub async fn take_typed_turn(&self, text: &str) {
+        if self
+            .fatal_stopped
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        use crate::core::turn::TurnEvent;
+        self.handle_turn_events(&[
+            TurnEvent::Started {
+                turn_id: 0,
+                interrupt: true,
+            },
+            TurnEvent::Stopped {
+                turn_id: 0,
+                transcript: text.to_string(),
+            },
+        ])
+        .await;
+    }
+
     /// Act on turn-decision events (from a [`crate::core::turn::TurnController`]
     /// or the [`Self::on_stt_result`] compatibility derivation) — the SINGLE
     /// place that owns the eager/barge-in ordering: the speculation is taken

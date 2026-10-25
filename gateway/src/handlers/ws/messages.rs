@@ -226,7 +226,8 @@ pub enum IncomingMessage {
         /// Milliseconds of the reply's audio the client actually played.
         audio_end_ms: u64,
     },
-    /// Voice-agent sessions (spec 025): a typed user turn — no speech, the same agent turn.
+    /// A typed user turn — no speech, the same turn — on a voice-agent (spec 025) or
+    /// conversation session. It interrupts the reply in progress.
     #[serde(rename = "agent_input")]
     AgentInput {
         /// What the user typed.

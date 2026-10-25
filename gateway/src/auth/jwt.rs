@@ -72,7 +72,8 @@ impl AuthClaims {
 /// Filter request headers to exclude sensitive and internal headers
 ///
 /// Excludes:
-/// - authorization (already extracted)
+/// - authorization, api-key and a `openai-insecure-api-key.<key>` WebSocket subprotocol (the
+///   credential, already extracted)
 /// - cookie (sensitive)
 /// - x-forwarded-* (internal proxy headers)
 /// - x-waav-* (internal application headers)
@@ -83,8 +84,11 @@ pub fn filter_headers(headers: &axum::http::HeaderMap) -> HashMap<String, String
         .filter_map(|(name, value)| {
             let name_str = name.as_str().to_lowercase();
 
-            // Exclude sensitive and internal headers
+            // Exclude sensitive and internal headers. `api-key` and a WebSocket's
+            // `openai-insecure-api-key.<key>` subprotocol carry the credential itself (it is sent
+            // as `token`; a copy among the headers would be logged with them).
             if name_str == "authorization"
+                || name_str == "api-key"
                 || name_str == "cookie"
                 || name_str.starts_with("x-forwarded-")
                 || name_str.starts_with("x-waav-")
@@ -92,6 +96,19 @@ pub fn filter_headers(headers: &axum::http::HeaderMap) -> HashMap<String, String
                 || name_str == "x-real-ip"
             {
                 None
+            } else if name_str == "sec-websocket-protocol" {
+                let kept: Vec<&str> = value
+                    .to_str()
+                    .ok()?
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|p| {
+                        !p.starts_with(
+                            crate::handlers::openai_realtime::handshake::KEY_SUBPROTOCOL_PREFIX,
+                        )
+                    })
+                    .collect();
+                (!kept.is_empty()).then(|| (name_str, kept.join(", ")))
             } else {
                 value.to_str().ok().map(|v| (name_str, v.to_string()))
             }
@@ -338,6 +355,29 @@ mod tests {
         assert!(!filtered.contains_key("host"));
         assert!(filtered.contains_key("content-type"));
         assert!(filtered.contains_key("user-agent"));
+    }
+
+    #[test]
+    fn filter_headers_drops_every_copy_of_the_credential() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("api-key", "sk-header".parse().unwrap());
+        headers.insert(
+            "sec-websocket-protocol",
+            "realtime, openai-insecure-api-key.sk-browser"
+                .parse()
+                .unwrap(),
+        );
+        let filtered = filter_headers(&headers);
+        assert!(!filtered.contains_key("api-key"));
+        assert_eq!(filtered["sec-websocket-protocol"], "realtime");
+        assert!(!filtered.values().any(|v| v.contains("sk-")));
+        // A key-only offer leaves nothing to send.
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "sec-websocket-protocol",
+            "openai-insecure-api-key.sk-browser".parse().unwrap(),
+        );
+        assert!(filter_headers(&headers).is_empty());
     }
 
     #[test]

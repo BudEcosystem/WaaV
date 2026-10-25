@@ -279,8 +279,9 @@ fn bud_mode_required() -> HandshakeError {
     HandshakeError::new(
         StatusCode::NOT_FOUND,
         "bud_mode_required",
-        "/v1/realtime serves Bud deployments and this gateway has no Bud control plane; \
-         WaaV's native realtime protocol is at /realtime.",
+        "This needs the Bud control plane, which this gateway does not run. Without it, \
+         /v1/realtime serves server aliases marked `openai_compatible: true` (no client \
+         secrets), and WaaV's native realtime protocol is at /realtime.",
     )
 }
 
@@ -510,11 +511,19 @@ pub async fn realtime_ws_handler(
     slot: Option<Extension<ConnectionSlot>>,
     ws: Result<WebSocketUpgrade, axum::extract::ws::rejection::WebSocketUpgradeRejection>,
 ) -> Response {
-    // Spec 025: `?model=prompt:<agent>` is a voice agent — the Cascade engine.
-    if handshake::parse(uri.query(), &headers)
+    // The Cascade engine: a Bud voice agent (`?model=prompt:<agent>`, spec 025) or, on a gateway
+    // without the Bud control plane, a server alias run by the conversation loop.
+    let cascade = if state.bud_mode.is_none() {
+        Some(super::cascade::prepare_alias(&state, uri.query(), &headers, uri.path()).await)
+    } else if handshake::parse(uri.query(), &headers)
         .is_ok_and(|hs| super::cascade::is_agent_model(&hs.model))
     {
-        let prepared = match super::cascade::prepare(&state, uri.query(), &headers).await {
+        Some(super::cascade::prepare(&state, uri.query(), &headers).await)
+    } else {
+        None
+    };
+    if let Some(prepared) = cascade {
+        let prepared = match prepared {
             Ok(p) => p,
             Err(e) => {
                 metrics::counter!("waav_realtime_refusals_total", "code" => e.code).increment(1);
