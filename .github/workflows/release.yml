@@ -1,7 +1,11 @@
 name: Release
 
-# Cut a release of the WaaV gateway: build and publish the image, then create (or update)
-# the GitHub Release for the tag.
+# Cut a release of the WaaV gateway: build and publish the multi-arch image (linux/amd64 +
+# linux/arm64) and the stripped binary archives (linux-x86_64, linux-aarch64, with SHA256SUMS),
+# then create (or update) the GitHub Release for the tag.
+#
+# The tag MUST equal gateway/Cargo.toml's version: `waav-gateway --version` is how an operator
+# identifies a binary, so a mismatch fails the run before anything is built.
 #
 # Three ways in:
 #   * publish a Release in the UI  -> the `release` event; this is how releases are actually cut
@@ -60,16 +64,13 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  image:
-    name: build + publish image
-    # Blacksmith, like every release workflow in bud-runtime. 8 vCPU because this is a Rust
-    # build with ONNX in it, not a script.
-    runs-on: blacksmith-8vcpu-ubuntu-2204
-    timeout-minutes: 120
+  meta:
+    name: resolve the tag
+    runs-on: blacksmith-2vcpu-ubuntu-2204
+    timeout-minutes: 10
     outputs:
       version: ${{ steps.meta.outputs.version }}
       tag: ${{ steps.meta.outputs.tag }}
-      digest: ${{ steps.build.outputs.digest }}
       tags: ${{ steps.meta.outputs.tags }}
     steps:
       - name: Resolve the tag
@@ -88,17 +89,14 @@ jobs:
           # A pre-release must not move :latest. Same rule as the sibling repo's release
           # workflows, so an -rc image cannot become the default pull for a cluster.
           if printf '%s' "$VERSION" | grep -qiE -- '-(rc|alpha|beta|pre|dev|hotfix|snapshot)'; then
-            PRERELEASE=true
             TAGS="${IMAGE}:${VERSION}"
             echo "::notice::Pre-release '${VERSION}' — :latest will not be moved."
           else
-            PRERELEASE=false
             TAGS="${IMAGE}:${VERSION}"$'\n'"${IMAGE}:latest"
           fi
           {
             echo "tag=${TAG}"
             echo "version=${VERSION}"
-            echo "prerelease=${PRERELEASE}"
             echo 'tags<<TAGS_EOF'; printf '%s\n' "$TAGS"; echo 'TAGS_EOF'
           } >> "$GITHUB_OUTPUT"
           echo "publishing:"; printf '%s\n' "$TAGS" | sed 's/^/     /'
@@ -107,21 +105,22 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ steps.meta.outputs.tag }}
-          fetch-depth: 0
 
-      - name: Compare the tag against the crate version
+      - name: Require the tag to equal the crate version
         env:
           VERSION: ${{ steps.meta.outputs.version }}
         run: |
           set -euo pipefail
           CRATE="$(sed -n '1,20{s/^version[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p;}' gateway/Cargo.toml | head -1)"
+          # A gate, not a warning: the binary reports the CRATE version (`waav-gateway
+          # --version`), and an operator verifying a supplied binary by that output could not
+          # tell two releases apart when it disagreed with the tag (0.1.x tags shipped a binary
+          # saying 1.0.0). Bump gateway/Cargo.toml in the release commit, then tag.
           if [ "$CRATE" != "$VERSION" ]; then
-            # A warning, not a gate: the tag is the release's identity and the crate version
-            # is metadata inside it. Worth seeing on every release, not worth blocking one.
-            echo "::warning::tag ${VERSION} != gateway/Cargo.toml version ${CRATE}"
-          else
-            echo "tag matches gateway/Cargo.toml (${CRATE})"
+            echo "::error::tag ${VERSION} != gateway/Cargo.toml version ${CRATE}. Set the crate version to the tag (or tag the crate version) and re-run." >&2
+            exit 1
           fi
+          echo "tag matches gateway/Cargo.toml (${CRATE})"
 
       - name: Require the registry credentials
         env:
@@ -136,6 +135,29 @@ jobs:
             exit 1
           fi
 
+  image:
+    name: build + publish image (${{ matrix.suffix }})
+    needs: meta
+    # Native runners per architecture, as bud-runtime's release workflows do: QEMU for a Rust +
+    # ONNX build is not a substitute. 8 vCPU because this is a Rust build with ONNX in it.
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - runner: blacksmith-8vcpu-ubuntu-2204
+            platform: linux/amd64
+            suffix: amd64
+          - runner: blacksmith-8vcpu-ubuntu-2204-arm
+            platform: linux/arm64
+            suffix: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    steps:
+      - name: Checkout the tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.meta.outputs.tag }}
+
       - name: Set up Docker Buildx
         uses: useblacksmith/setup-docker-builder@v1
 
@@ -149,52 +171,170 @@ jobs:
       # Context is the REPO ROOT, not gateway/: the Dockerfile copies the sibling crates
       # (bud-auth, waav-openai-audio, plugin-api) that gateway/Cargo.toml depends on by path.
       # Building from gateway/ fails at `COPY bud-auth /app/bud-auth`.
-      # amd64 only. bud-runtime builds arm64 on a native `blacksmith-*-arm` runner and joins
-      # the two with `docker buildx imagetools create`; QEMU for a Rust + ONNX build is not a
-      # substitute. Mirror that matrix here if an arm64 cluster ever needs this image.
-      - name: Build and push
-        id: build
+      - name: Build and push the ${{ matrix.suffix }} image
         uses: useblacksmith/build-push-action@v2
         with:
           context: .
           file: gateway/Dockerfile
-          platforms: linux/amd64
+          platforms: ${{ matrix.platform }}
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          tags: ${{ env.IMAGE }}:${{ needs.meta.outputs.version }}-${{ matrix.suffix }}
           provenance: false
 
-      - name: Summarise
+  manifest:
+    name: publish the multi-arch manifest
+    needs: [meta, image]
+    runs-on: blacksmith-2vcpu-ubuntu-2204
+    timeout-minutes: 15
+    outputs:
+      digest: ${{ steps.manifest.outputs.digest }}
+    steps:
+      - name: Log in to registry.bud.studio
+        uses: docker/login-action@v3
+        with:
+          registry: registry.bud.studio
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: useblacksmith/setup-docker-builder@v1
+
+      - name: Join the per-architecture images
+        id: manifest
         env:
-          VERSION: ${{ steps.meta.outputs.version }}
-          DIGEST: ${{ steps.build.outputs.digest }}
+          VERSION: ${{ needs.meta.outputs.version }}
+          TAGS: ${{ needs.meta.outputs.tags }}
         run: |
+          set -euo pipefail
+          while IFS= read -r tag; do
+            [ -n "$tag" ] || continue
+            docker buildx imagetools create -t "$tag" \
+              "${IMAGE}:${VERSION}-amd64" "${IMAGE}:${VERSION}-arm64"
+          done <<< "$TAGS"
+          DIGEST="$(docker buildx imagetools inspect "${IMAGE}:${VERSION}" --format '{{json .Manifest}}' | jq -r .digest)"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
           {
             echo "### WaaV ${VERSION}"
             echo
             echo '| | |'
             echo '|---|---|'
-            echo "| image | \`${IMAGE}:${VERSION}\` |"
+            echo "| image | \`${IMAGE}:${VERSION}\` (linux/amd64, linux/arm64) |"
             echo "| digest | \`${DIGEST}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
 
+  binaries:
+    name: binary archive (linux-${{ matrix.arch }})
+    needs: meta
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - runner: blacksmith-8vcpu-ubuntu-2204
+            arch: x86_64
+          - runner: blacksmith-8vcpu-ubuntu-2204-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    env:
+      # The production feature set: the same one gateway/Dockerfile and CI's gating jobs build.
+      FEATURES: dag-routing,turn-ensemble,noise-filter,openapi
+      # Same as gateway/Dockerfile's RUST_VERSION.
+      RUST_VERSION: "1.96.0"
+      # webrtc-sys enables the NVIDIA codec when <CUDA_HOME>/include/cuda.h exists.
+      CUDA_HOME: /tmp/nocuda
+    steps:
+      - name: Checkout the tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.meta.outputs.tag }}
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+
+      - uses: Swatinem/rust-cache@v2
+        with: { workspaces: gateway, key: "release-${{ matrix.arch }}" }
+
+      - uses: ./.github/actions/native-deps
+
+      - name: Build
+        working-directory: gateway
+        run: cargo build --release --locked --features "$FEATURES"
+
+      - name: Pack
+        id: pack
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          NAME="waav-gateway-${VERSION}-linux-${ARCH}"
+          mkdir -p "dist/${NAME}"
+          cp gateway/target/release/waav-gateway "dist/${NAME}/"
+          strip "dist/${NAME}/waav-gateway"
+          cp gateway/LICENSE "dist/${NAME}/"
+          BIN="dist/${NAME}/waav-gateway"
+          GLIBC="$(objdump -T "$BIN" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)"
+          {
+            echo "waav-gateway ${VERSION}"
+            echo "commit: $(git rev-parse HEAD)"
+            echo "target: $(rustc -vV | sed -n 's/^host: //p')"
+            echo "rustc: $(rustc --version)"
+            echo "cargo features: ${FEATURES}"
+            echo "glibc floor: ${GLIBC#GLIBC_}"
+            echo "shared libraries: $(ldd "$BIN" | awk '{print $1}' | grep -v '^/' | sort -u | tr '\n' ' ')"
+            echo "ONNX Runtime: loaded at run time (ort 2.0.0-rc.10, load-dynamic); needs 1.22 or newer."
+            echo "  Point ORT_DYLIB_PATH at libonnxruntime.so; the release image ships 1.23.2."
+          } > "dist/${NAME}/BUILD-INFO"
+          cat "dist/${NAME}/BUILD-INFO"
+          tar -C dist -czf "dist/${NAME}.tar.gz" "${NAME}"
+          echo "archive=dist/${NAME}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke-test the packed binary
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+          ARCHIVE: ${{ steps.pack.outputs.archive }}
+        run: |
+          set -euo pipefail
+          T="$(mktemp -d)"
+          tar -C "$T" -xzf "$ARCHIVE"
+          GOT="$("$T"/waav-gateway-*/waav-gateway --version)"
+          if [ "$GOT" != "waav-gateway ${VERSION}" ]; then
+            echo "::error::--version printed '${GOT}', expected 'waav-gateway ${VERSION}'" >&2
+            exit 1
+          fi
+          echo "ok: ${GOT}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: archive-${{ matrix.arch }}
+          path: ${{ steps.pack.outputs.archive }}
+          if-no-files-found: error
+
   release:
     name: create or update the release
-    needs: image
+    needs: [meta, manifest, binaries]
     runs-on: blacksmith-2vcpu-ubuntu-2204
     timeout-minutes: 15
     steps:
       - name: Checkout the tag
         uses: actions/checkout@v4
         with:
-          ref: ${{ needs.image.outputs.tag }}
+          ref: ${{ needs.meta.outputs.tag }}
           fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: archive-*
+          path: dist
+          merge-multiple: true
 
       - name: Create or update the release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.image.outputs.tag }}
-          VERSION: ${{ needs.image.outputs.version }}
-          DIGEST: ${{ needs.image.outputs.digest }}
+          TAG: ${{ needs.meta.outputs.tag }}
+          VERSION: ${{ needs.meta.outputs.version }}
+          DIGEST: ${{ needs.manifest.outputs.digest }}
           DRAFT: ${{ inputs.draft }}
         run: |
           set -euo pipefail
@@ -214,12 +354,19 @@ jobs:
             echo "${DIGEST}"
             echo '```'
             echo
-            echo "Platform: \`linux/amd64\`."
+            echo "Platforms: \`linux/amd64\`, \`linux/arm64\`. The digest is the multi-arch index;"
+            echo "\`docker pull\` picks the platform's image from it."
             echo
             echo "Pull by digest to pin exactly what was tested:"
             echo '```bash'
             echo "docker pull ${IMAGE}@${DIGEST}"
             echo '```'
+            echo
+            echo "## Binaries"
+            echo
+            echo "\`waav-gateway-${VERSION}-linux-x86_64.tar.gz\` and \`waav-gateway-${VERSION}-linux-aarch64.tar.gz\`,"
+            echo "each with the stripped binary, \`LICENSE\` and \`BUILD-INFO\` (commit, features, glibc floor,"
+            echo "ONNX Runtime requirement). Verify with \`sha256sum -c SHA256SUMS\`."
             echo "$END"
           } > image-block.md
 
@@ -243,4 +390,8 @@ jobs:
           { cat kept-body.md; echo; cat image-block.md; } > new-body.md
           gh release edit "$TAG" --notes-file new-body.md
 
-          echo "release $TAG now points at ${IMAGE}:${VERSION}"
+          # The archives and their checksums. --clobber so a re-run replaces them.
+          (cd dist && sha256sum ./*.tar.gz | sed 's# \./# #' > SHA256SUMS && cat SHA256SUMS)
+          gh release upload "$TAG" dist/*.tar.gz dist/SHA256SUMS --clobber
+
+          echo "release $TAG now points at ${IMAGE}:${VERSION} and carries both archives"
