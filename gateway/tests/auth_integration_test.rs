@@ -821,6 +821,51 @@ mod with_api_secret {
         assert_eq!(json["message"], "Missing Authorization header");
     }
 
+    /// `/ws` defers to first-message auth only when no credential was offered; an offered but
+    /// malformed or wrong credential is a 401, not an unauthenticated pending session.
+    #[tokio::test]
+    async fn test_ws_defers_only_when_no_credential_is_offered() {
+        let state = create_test_state_with_api_secret("my-secret-token").await;
+        let app = Router::new()
+            .route("/ws", get(test_handler))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                auth_middleware,
+            ))
+            .with_state(state);
+        let status = |headers: &[(&str, &str)]| {
+            let mut b = Request::builder().method(Method::GET).uri("/ws");
+            for (k, v) in headers {
+                b = b.header(*k, *v);
+            }
+            let app = app.clone();
+            let request = b.body(Body::empty()).unwrap();
+            async move { app.oneshot(request).await.unwrap().status() }
+        };
+
+        assert_eq!(status(&[]).await, StatusCode::OK);
+        assert_eq!(
+            status(&[("authorization", "InvalidFormat")]).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            status(&[(
+                "sec-websocket-protocol",
+                "realtime, openai-insecure-api-key.wrong"
+            )])
+            .await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            status(&[(
+                "sec-websocket-protocol",
+                "realtime, openai-insecure-api-key.my-secret-token"
+            )])
+            .await,
+            StatusCode::OK
+        );
+    }
+
     #[tokio::test]
     async fn test_api_secret_auth_invalid_header_format_returns_401() {
         let state = create_test_state_with_api_secret("my-secret-token").await;

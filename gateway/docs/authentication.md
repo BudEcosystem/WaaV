@@ -323,6 +323,7 @@ app.listen(3000);
 | `AUTH_SERVICE_URL` | Conditional** | - | External auth service endpoint (JWT mode) |
 | `AUTH_SIGNING_KEY_PATH` | Conditional** | - | Path to RSA/ECDSA private key (JWT mode) |
 | `AUTH_TIMEOUT_SECONDS` | No | `5` | Auth request timeout in seconds (JWT mode only) |
+| `AUTH_QUERY_TOKEN` | No | `allow` | `deny` refuses `?token=` credentials (see WebSocket Authentication) |
 
 **Configuration Requirements:**
 
@@ -627,22 +628,34 @@ def verify_auth_request(jwt_string, public_key):
 
 ## WebSocket Authentication
 
-WebSocket authentication is currently not implemented (see action plan task 8). Options for future implementation:
+`/ws` and `/realtime` are authenticated at the HTTP upgrade (the request that turns the connection
+into a WebSocket), with the same API secrets or auth service as REST. The credential is read from
+the first source present:
 
-### Option A: Authenticate During HTTP Upgrade
-Extract token from query parameters or headers during the WebSocket upgrade handshake.
+1. `Authorization: Bearer <key>`. Use this from servers (Node, Python, Go, …).
+2. The `openai-insecure-api-key.<key>` WebSocket subprotocol. A browser can't set headers on a
+   WebSocket, so it sends the key this way, together with `realtime`, which the gateway selects in
+   its reply. It's the same convention OpenAI's realtime clients use:
 
-```javascript
-const ws = new WebSocket('ws://localhost:3001/ws?token=bearer-token');
-```
+   ```javascript
+   const ws = new WebSocket('wss://gateway.example.com/ws',
+                            ['realtime', `openai-insecure-api-key.${key}`]);
+   ```
 
-### Option B: First Message Authentication
-Require authentication in the first WebSocket message (Config message).
+3. `?token=<key>`, unless `AUTH_QUERY_TOKEN=deny`.
+4. `/ws` only, when the client offered no credential at all: first-message auth. The upgrade
+   succeeds and the first message must be `{"type": "auth", "token": "<key>"}`. A credential that
+   was offered but is malformed or wrong is a `401` at the upgrade; it is never turned into an
+   unauthenticated session.
 
-### Option C: No WebSocket Auth
-Keep WebSocket open and only protect REST endpoints.
+### Refusing query-string credentials
 
-**Current Implementation**: Option C (no WebSocket auth)
+A key in the URL ends up in proxy and load-balancer access logs and in browser history. Set
+`AUTH_QUERY_TOKEN=deny` to refuse it. Any request carrying a `token` query parameter then gets
+`401 query_token_refused`, even when it also sends a valid header, because the key has already been
+logged by the time it reaches the gateway. The default is `allow`, so existing clients keep working.
+A value other than `allow` or `deny` refuses query tokens (the setting fails closed), and
+`waav-gateway check` reports it.
 
 ## Security Considerations
 

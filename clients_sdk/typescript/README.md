@@ -909,6 +909,17 @@ const bud = new BudClient({ baseUrl: 'http://localhost:3001' });
 
 ---
 
+## How the API key is sent on a WebSocket
+
+- **Node with the `ws` package:** as the `Authorization: Bearer` header of the upgrade request.
+- **Browsers (and other WebSockets that can't set headers):** as `?token=` on the URL. Query
+  strings end up in proxy access logs, so a gateway can refuse them (`AUTH_QUERY_TOKEN=deny`). In
+  that case use the `ws` package from a server.
+
+The key is never included in the URL that errors and timeouts report.
+
+---
+
 ## License
 
 MIT

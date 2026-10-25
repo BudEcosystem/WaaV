@@ -213,6 +213,15 @@ fn check_configuration(config_path: Option<&PathBuf>) -> Vec<String> {
     if let Err(e) = waav_gateway::auth::AuthPolicy::from_env() {
         problems.push(format!("auth: {e}"));
     }
+    if let Err(e) = waav_gateway::middleware::auth::parse_query_token_policy(
+        std::env::var(waav_gateway::middleware::auth::QUERY_TOKEN_ENV)
+            .ok()
+            .as_deref(),
+    ) {
+        problems.push(format!(
+            "{e} (a malformed value refuses every query-string credential)"
+        ));
+    }
     // A malformed value refuses every client endpoint at runtime (fail closed): say so here.
     use waav_gateway::core::client_destination::{CLIENT_ENDPOINTS_ENV, parse_client_endpoints};
     if let Err(e) = parse_client_endpoints(std::env::var(CLIENT_ENDPOINTS_ENV).ok().as_deref()) {

@@ -215,6 +215,29 @@ describe('conversation + dag config → wire', () => {
     expect('max_tokens' in w).toBe(false);
   });
 
+  it('sends the operator-credential, LLM-timeout and denoiser fields', () => {
+    expect(
+      conversationConfigToWire({
+        baseUrl: 'u',
+        model: 'm',
+        credentialRef: 'local-gw',
+        reasoningCredentialRef: 'reasoner',
+        llmTimeoutMs: 150000,
+      })
+    ).toEqual({
+      base_url: 'u',
+      model: 'm',
+      credential_ref: 'local-gw',
+      reasoning_credential_ref: 'reasoner',
+      llm_timeout_ms: 150000,
+    });
+    const wire = wireOf({
+      type: 'config',
+      stt: { provider: 'deepgram', language: 'en-US', noiseSuppression: true },
+    });
+    expect(wire.stt_config.noise_suppression).toBe(true);
+  });
+
   it('serializes DAG config into dag_config', () => {
     const wire = wireOf({
       type: 'config',

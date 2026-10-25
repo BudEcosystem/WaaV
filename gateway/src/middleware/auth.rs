@@ -10,18 +10,59 @@ use axum::{
 use http_body_util::BodyExt;
 use std::sync::Arc;
 
+/// Env var: `allow` (default) or `deny` `?token=` credentials. Query strings land in proxy and
+/// access logs and in browser history, so an operator may refuse them; browsers then authenticate
+/// a WebSocket with the `openai-insecure-api-key.<key>` subprotocol (or `/ws` first-message auth).
+pub const QUERY_TOKEN_ENV: &str = "AUTH_QUERY_TOKEN";
+
+/// `allow` / `deny`; anything else is refused at parse (the caller fails closed).
+pub fn parse_query_token_policy(value: Option<&str>) -> Result<bool, String> {
+    match value.map(|v| v.trim().to_ascii_lowercase()) {
+        None => Ok(false),
+        Some(v) if v.is_empty() || v == "allow" => Ok(false),
+        Some(v) if v == "deny" => Ok(true),
+        Some(v) => Err(format!(
+            "{QUERY_TOKEN_ENV} must be allow or deny, got '{v}'"
+        )),
+    }
+}
+
+/// Whether `?token=` is refused (`AUTH_QUERY_TOKEN=deny`). Read once; a malformed value refuses
+/// (a security switch an operator set must not silently mean "allow").
+fn query_tokens_denied() -> bool {
+    static DENIED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DENIED.get_or_init(|| {
+        parse_query_token_policy(std::env::var(QUERY_TOKEN_ENV).ok().as_deref()).unwrap_or_else(
+            |e| {
+                tracing::error!(error = %e, "refusing query-string credentials (fail closed)");
+                true
+            },
+        )
+    })
+}
+
 /// Extract authentication token from request
 ///
-/// Supports multiple token sources for browser/WebSocket compatibility:
-/// 1. Authorization header: `Authorization: Bearer <token>` (preferred)
-/// 2. Query parameter: `?token=<token>` (for WebSocket connections)
-///
-/// # Arguments
-/// * `request` - The incoming HTTP request
-///
-/// # Returns
-/// * `Result<String, AuthError>` - The extracted token or an error
+/// Token sources, in order:
+/// 1. `Authorization: Bearer <token>` (preferred)
+/// 2. the `openai-insecure-api-key.<token>` WebSocket subprotocol — what a browser can send on a
+///    WebSocket (it cannot set headers), the convention OpenAI's realtime clients use
+/// 3. `?token=<token>`, unless `AUTH_QUERY_TOKEN=deny` (then any `token` query parameter is
+///    refused, even beside a header)
 fn extract_token(request: &Request) -> Result<String, AuthError> {
+    extract_token_with(request, query_tokens_denied())
+}
+
+fn extract_token_with(request: &Request, query_denied: bool) -> Result<String, AuthError> {
+    let query_token = request.uri().query().and_then(|query| {
+        url::form_urlencoded::parse(query.as_bytes())
+            .find(|(key, _)| key == "token")
+            .map(|(_, value)| value.to_string())
+    });
+    if query_denied && query_token.is_some() {
+        return Err(AuthError::QueryTokenRefused);
+    }
+
     // Try Authorization header first (preferred method)
     if let Some(auth_header) = request.headers().get("authorization") {
         let auth_str = auth_header
@@ -35,14 +76,24 @@ fn extract_token(request: &Request) -> Result<String, AuthError> {
         return Err(AuthError::InvalidAuthHeader);
     }
 
+    // A browser WebSocket: the key rides a subprotocol (`realtime, openai-insecure-api-key.<k>`).
+    if let Some(token) =
+        crate::handlers::openai_realtime::handshake::offered_subprotocols(request.headers())
+            .iter()
+            .find_map(|p| {
+                p.strip_prefix(crate::handlers::openai_realtime::handshake::KEY_SUBPROTOCOL_PREFIX)
+                    .filter(|k| !k.trim().is_empty())
+                    .map(str::to_string)
+            })
+    {
+        tracing::debug!("Token extracted from the WebSocket subprotocol");
+        return Ok(token);
+    }
+
     // Try query parameter (for WebSocket browser connections)
-    if let Some(query) = request.uri().query() {
-        for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
-            if key == "token" {
-                tracing::debug!("Token extracted from query parameter");
-                return Ok(value.to_string());
-            }
-        }
+    if let Some(token) = query_token {
+        tracing::debug!("Token extracted from query parameter");
+        return Ok(token);
     }
 
     // No token found
@@ -156,8 +207,10 @@ async fn authenticate_request(
         Ok(t) => t,
         Err(e) => {
             // For WebSocket connections, allow deferred auth (first-message auth)
-            // This enables browser clients to authenticate after connection
-            if request_path == "/ws" {
+            // This enables browser clients to authenticate after connection. Only when NO
+            // credential was offered: a malformed `Authorization` header or a refused `?token=`
+            // used to fall through to an unauthenticated pending session instead of a 401.
+            if request_path == "/ws" && matches!(e, AuthError::MissingAuthHeader) {
                 tracing::info!(
                     path = %request_path,
                     "WebSocket connection without token, enabling first-message auth"
@@ -414,6 +467,71 @@ mod tests {
             parsed,
             serde_json::json!({"text": "Hello", "metadata": {"x": 1}})
         );
+    }
+
+    fn request(uri: &str, headers: &[(&str, &str)]) -> Request {
+        let mut b = Request::builder().uri(uri);
+        for (k, v) in headers {
+            b = b.header(*k, *v);
+        }
+        b.body(Body::empty()).unwrap()
+    }
+
+    #[test]
+    fn a_browser_websocket_authenticates_with_the_key_subprotocol() {
+        let r = request(
+            "/realtime",
+            &[(
+                "sec-websocket-protocol",
+                "realtime, openai-insecure-api-key.sk-browser",
+            )],
+        );
+        assert_eq!(extract_token_with(&r, false).unwrap(), "sk-browser");
+        // The header still wins; an empty subprotocol key is no key.
+        let r = request(
+            "/ws",
+            &[
+                ("authorization", "Bearer sk-header"),
+                (
+                    "sec-websocket-protocol",
+                    "openai-insecure-api-key.sk-browser",
+                ),
+            ],
+        );
+        assert_eq!(extract_token_with(&r, false).unwrap(), "sk-header");
+        let r = request(
+            "/ws",
+            &[(
+                "sec-websocket-protocol",
+                "realtime, openai-insecure-api-key.",
+            )],
+        );
+        assert!(matches!(
+            extract_token_with(&r, false),
+            Err(AuthError::MissingAuthHeader)
+        ));
+    }
+
+    #[test]
+    fn a_query_token_is_accepted_by_default_and_refused_when_denied() {
+        let r = request("/ws?token=sk-query", &[]);
+        assert_eq!(extract_token_with(&r, false).unwrap(), "sk-query");
+        assert!(matches!(
+            extract_token_with(&r, true),
+            Err(AuthError::QueryTokenRefused)
+        ));
+        // Refused even beside a valid header: the key already landed in a log.
+        let r = request(
+            "/ws?token=sk-query",
+            &[("authorization", "Bearer sk-header")],
+        );
+        assert!(matches!(
+            extract_token_with(&r, true),
+            Err(AuthError::QueryTokenRefused)
+        ));
+        assert_eq!(parse_query_token_policy(Some(" DENY ")), Ok(true));
+        assert_eq!(parse_query_token_policy(None), Ok(false));
+        assert!(parse_query_token_policy(Some("no")).is_err());
     }
 
     #[test]

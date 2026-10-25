@@ -295,7 +295,8 @@ pub struct ConnectionState {
 
 **Token Extraction Priority:**
 1. Authorization header: `Bearer <token>`
-2. Query parameter: `?token=<token>`
+2. WebSocket subprotocol: `openai-insecure-api-key.<token>`
+3. Query parameter: `?token=<token>` (refused with `AUTH_QUERY_TOKEN=deny`)
 
 **Problem:** Can't add new auth strategies without modifying middleware.
 

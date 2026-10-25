@@ -37,6 +37,7 @@
 // =============================================================================
 
 import { EventEmitter } from 'events';
+import { withQueryToken } from '../ws/connection.js';
 
 /**
  * The 11 realtime/S2S providers reachable through the gateway `/realtime`
@@ -347,8 +348,9 @@ export class GatewayRealtime extends EventEmitter {
 
     return new Promise((resolve, reject) => {
       try {
-        // Browser WebSocket has no header support; Node `ws` accepts a 2nd arg.
-        // Auth header is best-effort (only applied where the impl supports it).
+        // Node's WebSockets take `{ headers }` as the 2nd argument. A browser reads it as a
+        // subprotocol and throws; it then sends the key as `?token=` (it used to reconnect with
+        // no key at all, which every gateway requiring auth refused).
         let ws: WebSocket;
         if (this.apiKey) {
           try {
@@ -357,7 +359,7 @@ export class GatewayRealtime extends EventEmitter {
               opts: { headers: Record<string, string> },
             ) => WebSocket)(this.url, { headers: { Authorization: `Bearer ${this.apiKey}` } });
           } catch {
-            ws = new this.WebSocketImpl(this.url);
+            ws = new this.WebSocketImpl(withQueryToken(this.url, this.apiKey));
           }
         } else {
           ws = new this.WebSocketImpl(this.url);

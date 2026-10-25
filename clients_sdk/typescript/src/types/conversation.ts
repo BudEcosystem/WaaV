@@ -73,8 +73,16 @@ export interface ConversationConfig {
   model: string;
   /** Optional system prompt seeding the conversation. */
   systemPrompt?: string;
-  /** API key (literal or '${ENV_VAR}'); falls back to OPENAI_API_KEY server-side. */
+  /**
+   * API key (literal or '${ENV_VAR}'). Without one the gateway uses its own key, but only for a
+   * base URL the operator approved (docs/egress-and-credentials.md).
+   */
   apiKey?: string;
+  /**
+   * Name of an operator credential to authenticate with; sent only if baseUrl is one of its
+   * hosts, otherwise the config is refused. Takes precedence over apiKey.
+   */
+  credentialRef?: string;
   /** Sampling temperature. */
   temperature?: number;
   /** Max tokens per completion. */
@@ -119,6 +127,11 @@ export interface ConversationConfig {
   reasoningBaseUrl?: string;
   /** Reasoning-tier API key (defaults to apiKey). */
   reasoningApiKey?: string;
+  /**
+   * Operator credential for the reasoning tier, bound to reasoningBaseUrl (else baseUrl).
+   * Takes precedence over reasoningApiKey.
+   */
+  reasoningCredentialRef?: string;
   /** Reasoning-tier vendor wire format (defaults to providerKind). */
   reasoningProviderKind?: AdapterKind;
   /** Route turns between tiers: 'auto' (default) or 'always'. */
@@ -131,6 +144,11 @@ export interface ConversationConfig {
   maxLlmCallsPerTurn?: number;
   /** Hard ceiling on the reasoning tier's output tokens. */
   maxReasoningTokens?: number;
+  /**
+   * LLM request timeout in ms (gateway default 60000, clamped to 1000 .. the server's maximum).
+   * Raise it for a self-hosted model that loads on its first request.
+   */
+  llmTimeoutMs?: number;
 }
 
 /**
@@ -166,12 +184,15 @@ export function conversationConfigToWire(config: ConversationConfig): Record<str
     ['reasoningModel', 'reasoning_model'],
     ['reasoningBaseUrl', 'reasoning_base_url'],
     ['reasoningApiKey', 'reasoning_api_key'],
+    ['reasoningCredentialRef', 'reasoning_credential_ref'],
     ['reasoningProviderKind', 'reasoning_provider_kind'],
     ['reasoningRoute', 'reasoning_route'],
     ['reasoningBudgetMs', 'reasoning_budget_ms'],
     ['degradationMessage', 'degradation_message'],
     ['maxLlmCallsPerTurn', 'max_llm_calls_per_turn'],
     ['maxReasoningTokens', 'max_reasoning_tokens'],
+    ['credentialRef', 'credential_ref'],
+    ['llmTimeoutMs', 'llm_timeout_ms'],
   ];
 
   for (const [field, key] of optional) {

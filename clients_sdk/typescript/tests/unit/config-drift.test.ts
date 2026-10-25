@@ -115,6 +115,8 @@ const STT_SDK = new Set([
   'audioInCodec',
   // Segmented STT: requested kind of speech-to-text (auto|streaming|segmented):
   'transcriptionMode',
+  // WaaV's own uplink denoiser:
+  'noiseSuppression',
   // features{} canonical surface (flattened onto STTConfig):
   'interimResults', 'diarize', 'wordTimestamps', 'smartFormat', 'profanityFilter',
   'fillerWords', 'vadEvents', 'endpointingMs', 'utteranceEndMsFeature', 'keyterms',
@@ -150,6 +152,7 @@ const CONVERSATION_SDK = new Set([
   'latencyFillerPhrases', 'reasoningEffort', 'reasoningModel', 'reasoningBaseUrl',
   'reasoningApiKey', 'reasoningProviderKind', 'reasoningRoute', 'reasoningBudgetMs',
   'degradationMessage', 'maxLlmCallsPerTurn', 'maxReasoningTokens',
+  'credentialRef', 'reasoningCredentialRef', 'llmTimeoutMs',
 ]);
 
 const TURN_SDK = new Set(['enabled', 'threshold', 'eager']);
