@@ -25,14 +25,15 @@ use std::time::Duration;
 // Test Helper Functions
 // =============================================================================
 
+/// The variable's value; an empty one counts as unset (CI passes a missing secret as "").
 fn get_env_or_skip(key: &str) -> Option<String> {
-    env::var(key).ok()
+    env::var(key).ok().filter(|v| !v.trim().is_empty())
 }
 
 fn require_env(key: &str) -> String {
-    env::var(key).unwrap_or_else(|_| {
+    get_env_or_skip(key).unwrap_or_else(|| {
         panic!(
-            "Environment variable {} is required for this test. Set it and run with --ignored",
+            "Environment variable {} is required (and non-empty) for this test. Set it and run with --ignored",
             key
         )
     })
