@@ -427,7 +427,8 @@ async fn test_speak_endpoint_with_pronunciations() {
 
     // Will fail with test API key, but that's expected
     // We're just testing that the endpoint accepts the pronunciations field
-    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    // The vendor refuses the test key: an upstream failure, so 502 (not 500, which means WaaV).
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
 }
 
 #[tokio::test]

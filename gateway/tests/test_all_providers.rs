@@ -269,7 +269,7 @@ async fn test_elevenlabs_tts_api() -> Result<u64, String> {
     let voice_id = "21m00Tcm4TlvDq8ikWAM"; // Rachel voice
     let payload = serde_json::json!({
         "text": "Hello, this is a test.",
-        "model_id": "eleven_monolingual_v1"
+        "model_id": "eleven_flash_v2_5"
     });
 
     let start = Instant::now();

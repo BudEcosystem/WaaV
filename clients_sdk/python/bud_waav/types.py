@@ -334,7 +334,7 @@ TTS_PROVIDER_CAPABILITIES: dict[TTSProvider, dict[str, Any]] = {
         "emotion": True,
         "voice_cloning": True,
         "languages": ["en", "es", "fr", "de", "it", "pt", "pl", "hi", "ar"],
-        "models": ["eleven_turbo_v2_5", "eleven_multilingual_v2", "eleven_monolingual_v1"],
+        "models": ["eleven_flash_v2_5", "eleven_turbo_v2_5", "eleven_multilingual_v2"],
     },
     TTSProvider.GOOGLE: {
         "streaming": True,
