@@ -446,3 +446,6 @@ livekit-api = { path = "vendor/livekit-api" }
 # x86-only NVIDIA codec trampolines no longer built on aarch64 (fresh GB10 builds with CUDA installed
 # failed in webrtc-sys); see the WaaV patch note in vendor/webrtc-sys/build.rs.
 webrtc-sys = { path = "vendor/webrtc-sys" }
+# zip without zstd for the libwebrtc download (RUSTSEC-2026-0395..0410); see the WaaV patch note in
+# vendor/webrtc-sys-build/Cargo.toml.
+webrtc-sys-build = { path = "vendor/webrtc-sys-build" }
