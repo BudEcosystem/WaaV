@@ -27,7 +27,10 @@ const SENTENCE: &str = "The quick brown fox jumps over the lazy dog.";
 const SAMPLE_RATE: u32 = 24000;
 
 fn api_key() -> String {
-    std::env::var("DEEPGRAM_API_KEY").expect("DEEPGRAM_API_KEY must be set for live tests")
+    std::env::var("DEEPGRAM_API_KEY")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .expect("DEEPGRAM_API_KEY must be set for live tests")
 }
 
 struct TestServer {

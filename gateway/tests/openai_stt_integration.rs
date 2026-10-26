@@ -334,7 +334,10 @@ async fn test_openai_live_transcription() {
     use tokio::sync::mpsc;
     use waav_gateway::core::stt::openai::OpenAISTTConfig;
 
-    let api_key = std::env::var("OPENAI_API_KEY").expect("OPENAI_API_KEY must be set");
+    let api_key = std::env::var("OPENAI_API_KEY")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .expect("OPENAI_API_KEY must be set");
 
     let config = OpenAISTTConfig::from_base(STTConfig {
         provider: "openai".to_string(),
@@ -412,7 +415,10 @@ async fn test_openai_verbose_json_format() {
     use tokio::sync::mpsc;
     use waav_gateway::core::stt::openai::OpenAISTTConfig;
 
-    let api_key = std::env::var("OPENAI_API_KEY").expect("OPENAI_API_KEY must be set");
+    let api_key = std::env::var("OPENAI_API_KEY")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .expect("OPENAI_API_KEY must be set");
 
     let config = OpenAISTTConfig::from_base(STTConfig {
         provider: "openai".to_string(),

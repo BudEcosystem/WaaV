@@ -318,7 +318,10 @@ async fn test_real_openai_tts() {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::time::{Duration, timeout};
 
-    let api_key = std::env::var("OPENAI_API_KEY").expect("OPENAI_API_KEY not set");
+    let api_key = std::env::var("OPENAI_API_KEY")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .expect("OPENAI_API_KEY not set");
 
     let config = TTSConfig {
         api_key,
@@ -424,7 +427,10 @@ async fn test_real_openai_tts() {
 #[tokio::test]
 #[ignore = "Requires OPENAI_API_KEY environment variable"]
 async fn test_openai_tts_hd_model() {
-    let api_key = std::env::var("OPENAI_API_KEY").expect("OPENAI_API_KEY not set");
+    let api_key = std::env::var("OPENAI_API_KEY")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .expect("OPENAI_API_KEY not set");
 
     let config = TTSConfig {
         api_key,

@@ -52,7 +52,9 @@ use waav_gateway::core::tts::{
 /// Returns the path to credentials file if `GOOGLE_APPLICATION_CREDENTIALS` is set,
 /// or None if credentials are not configured.
 fn get_credentials_path() -> Option<String> {
-    std::env::var("GOOGLE_APPLICATION_CREDENTIALS").ok()
+    std::env::var("GOOGLE_APPLICATION_CREDENTIALS")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
 }
 
 /// Create a test TTS config with Google credentials.

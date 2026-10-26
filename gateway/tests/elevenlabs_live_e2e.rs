@@ -21,7 +21,10 @@ use waav_gateway::core::tts::{
 const RACHEL_VOICE: &str = "21m00Tcm4TlvDq8ikWAM";
 
 fn api_key() -> String {
-    std::env::var("ELEVENLABS_API_KEY").expect("ELEVENLABS_API_KEY must be set for live tests")
+    std::env::var("ELEVENLABS_API_KEY")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .expect("ELEVENLABS_API_KEY must be set for live tests")
 }
 
 struct TestServer {
