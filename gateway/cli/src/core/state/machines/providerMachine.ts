@@ -367,7 +367,7 @@ export const TTS_PROVIDERS: ProviderInfo[] = [
     features: ['Voice cloning', 'Emotional control', 'Multiple voices'],
     requiresApiKey: true,
     envVar: 'ELEVENLABS_API_KEY',
-    models: ['eleven_turbo_v2_5', 'eleven_multilingual_v2', 'eleven_monolingual_v1'],
+    models: ['eleven_flash_v2_5', 'eleven_turbo_v2_5', 'eleven_multilingual_v2'],
     configured: false,
   },
   {
