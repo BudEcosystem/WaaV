@@ -44,6 +44,11 @@ impl SileroVAD {
         anyhow::bail!("Silero VAD feature is not enabled")
     }
 
+    /// Stub of the context-framed inference.
+    pub fn probability_with_context(&mut self, _context_and_chunk: &[f32]) -> anyhow::Result<f32> {
+        anyhow::bail!("Silero VAD feature is not enabled")
+    }
+
     /// Returns false.
     pub fn is_in_speech(&self) -> bool {
         false

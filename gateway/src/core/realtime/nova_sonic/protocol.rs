@@ -48,7 +48,7 @@ use std::sync::Mutex;
 use crate::core::realtime::base::ReplayConversationItem;
 use crate::core::realtime::base::{
     FunctionCallRequest, RealtimeConfig, RealtimeError, RealtimeResponseOverride, RealtimeResult,
-    TranscriptRole,
+    RealtimeVerb, TranscriptRole,
 };
 use crate::core::realtime::scaffold::{
     BedrockBidiTransportFactory, ConnectSpec, Inbound, OutFrame, ProtocolCaps, RealtimeProtocol,
@@ -123,9 +123,78 @@ pub struct NovaSonicProtocol {
     /// The running `usageEvent` totals on THIS connection, for a report that carries totals
     /// but no delta. Reset at every (re)connect: a new stream counts from zero.
     usage_totals: Mutex<crate::core::realtime_cost::RealtimeUsage>,
+    /// Provider fix `nova_interactive_text`: typed text takes a turn (`interactive: true`).
+    interactive_text: bool,
+    /// The other provider fixes of this wire (`core::interaction::config::PROVIDER_FIXES`).
+    fixes: NovaFixes,
+}
+
+/// Provider fixes of the Nova Sonic wire, each against
+/// <https://docs.aws.amazon.com/nova/latest/nova2-userguide/sonic-input-events.html>. All
+/// off: today's wire.
+#[derive(Debug, Clone, Copy, Default)]
+struct NovaFixes {
+    /// `nova_close_sequence`: a stream ends with the audio `contentEnd`, `promptEnd` and
+    /// `sessionEnd` ("Skipping any of these closing events can result in incomplete
+    /// conversations or orphaned resources").
+    close_sequence: bool,
+    /// `nova_history_before_audio`: a reconnect's history goes before the audio content opens
+    /// ("A conversation history can be included only once, after the system prompt and
+    /// before audio streaming begins").
+    history_before_audio: bool,
+    /// `setup_once`: a mid-session change is refused (no event changes an open stream's
+    /// session; today the whole bootstrap is sent again on it).
+    setup_once: bool,
+    /// `nova_interrupted_marker`: the `{ "interrupted" : true }` text is a barge-in, not words.
+    interrupted_marker: bool,
+    /// `nova_tool_result_object`: a tool result is a stringified JSON object.
+    tool_result_object: bool,
+    /// `nova_turn_detection`: `turnDetectionConfiguration.endpointingSensitivity`.
+    turn_detection: bool,
 }
 
 impl NovaSonicProtocol {
+    /// A user text message as a one-shot TEXT content block (contentStart(TEXT, USER) /
+    /// textInput / contentEnd) with a fresh content id. `interactive: true` is the documented
+    /// cross-modal input the model answers during a voice session; `false` is "standard text
+    /// input for system prompts and conversation history"
+    /// (<https://docs.aws.amazon.com/nova/latest/nova2-userguide/sonic-input-events.html>,
+    /// "InputContentStartEvent", Text).
+    fn user_text_block(&self, text: &str, interactive: bool) -> Vec<Value> {
+        let content_name = uuid::Uuid::new_v4().to_string();
+        vec![
+            json!({
+                "event": {
+                    "contentStart": {
+                        "promptName": self.prompt_name,
+                        "contentName": content_name,
+                        "type": "TEXT",
+                        "interactive": interactive,
+                        "role": "USER",
+                        "textInputConfiguration": { "mediaType": "text/plain" },
+                    }
+                }
+            }),
+            json!({
+                "event": {
+                    "textInput": {
+                        "promptName": self.prompt_name,
+                        "contentName": content_name,
+                        "content": text,
+                    }
+                }
+            }),
+            json!({
+                "event": {
+                    "contentEnd": {
+                        "promptName": self.prompt_name,
+                        "contentName": content_name,
+                    }
+                }
+            }),
+        ]
+    }
+
     /// Resolve the model id: configured, else `amazon.nova-sonic-v1:0`.
     fn resolve_model(cfg: &RealtimeConfig) -> String {
         let m = cfg.model.trim();
@@ -258,6 +327,35 @@ impl NovaSonicProtocol {
         })]
     }
 
+    /// The USER AUDIO `contentStart`: opens the single audio container.
+    fn audio_content_start(&self) -> Value {
+        json!({
+            "event": {
+                "contentStart": {
+                    "promptName": self.prompt_name,
+                    "contentName": self.audio_content_name,
+                    "type": "AUDIO",
+                    "interactive": true,
+                    "role": "USER",
+                    "audioInputConfiguration": Self::audio_input_config(),
+                }
+            }
+        })
+    }
+
+    /// Fix `nova_tool_result_object`: "content": "{\"key\": \"value\"}" // stringified JSON
+    /// object as a tool result. An object passes as it is; anything else is `{"result": …}`.
+    fn tool_result_content(&self, result: &str) -> String {
+        if !self.fixes.tool_result_object {
+            return result.to_string();
+        }
+        match serde_json::from_str::<Value>(result) {
+            Ok(Value::Object(_)) => result.to_string(),
+            Ok(other) => json!({ "result": other }).to_string(),
+            Err(_) => json!({ "result": result }).to_string(),
+        }
+    }
+
     /// `{"event": {"audioInput": {promptName, contentName, content}}}` — one
     /// base64-PCM user-audio chunk into the single audio content container.
     fn audio_input_event(&self, pcm: &[u8]) -> Value {
@@ -303,6 +401,15 @@ impl RealtimeProtocol for NovaSonicProtocol {
             current_text: Mutex::new(None),
             current_audio: Mutex::new(None),
             usage_totals: Mutex::new(Default::default()),
+            interactive_text: cfg.fix("nova_interactive_text"),
+            fixes: NovaFixes {
+                close_sequence: cfg.fix("nova_close_sequence"),
+                history_before_audio: cfg.fix("nova_history_before_audio"),
+                setup_once: cfg.fix("setup_once"),
+                interrupted_marker: cfg.fix("nova_interrupted_marker"),
+                tool_result_object: cfg.fix("nova_tool_result_object"),
+                turn_detection: cfg.fix("nova_turn_detection"),
+            },
         })
     }
 
@@ -389,6 +496,25 @@ impl RealtimeProtocol for NovaSonicProtocol {
                 Value::Object(inference),
             );
         }
+        // Fix `nova_turn_detection`: a semantic VAD's eagerness is Nova's
+        // `endpointingSensitivity` (HIGH "Detects pauses quickly", MEDIUM, LOW "Waits longer").
+        if self.fixes.turn_detection
+            && let Some(crate::core::realtime::base::TurnDetectionConfig::SemanticVad {
+                eagerness: Some(eagerness),
+                ..
+            }) = &cfg.turn_detection
+            && let Some(sensitivity) = match eagerness.to_ascii_lowercase().as_str() {
+                "high" => Some("HIGH"),
+                "medium" => Some("MEDIUM"),
+                "low" => Some("LOW"),
+                _ => None,
+            }
+        {
+            session_start.insert(
+                "turnDetectionConfiguration".to_string(),
+                json!({ "endpointingSensitivity": sensitivity }),
+            );
+        }
         events.push(json!({ "event": { "sessionStart": Value::Object(session_start) } }));
 
         // 2. promptStart(audioOutputConfiguration [+ toolConfiguration]).
@@ -441,21 +567,49 @@ impl RealtimeProtocol for NovaSonicProtocol {
         // 4. USER AUDIO contentStart — opens the single audio container so the
         //    session is ready for `audioInput`. (The matching contentEnd is sent on
         //    disconnect / turn close by the driver via `commit_turn`; Nova Sonic
-        //    keeps ALL audio frames in this one container.)
-        events.push(json!({
-            "event": {
-                "contentStart": {
-                    "promptName": self.prompt_name,
-                    "contentName": self.audio_content_name,
-                    "type": "AUDIO",
-                    "interactive": true,
-                    "role": "USER",
-                    "audioInputConfiguration": Self::audio_input_config(),
-                }
-            }
-        }));
+        //    keeps ALL audio frames in this one container.) With the fix
+        //    `nova_history_before_audio` it follows the replayed history (`after_replay`).
+        if !self.fixes.history_before_audio {
+            events.push(self.audio_content_start());
+        }
 
         events
+    }
+
+    /// Fix `nova_history_before_audio`: the audio content opens after the history.
+    fn after_replay(&self) -> Vec<Self::Wire> {
+        if self.fixes.history_before_audio {
+            vec![self.audio_content_start()]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Fix `nova_close_sequence`: "Close any open audio streams with the contentEnd event.
+    /// Send a promptEnd event that references the original promptName. Send the sessionEnd
+    /// event."
+    fn close_wires(&self) -> Vec<Self::Wire> {
+        if !self.fixes.close_sequence {
+            return Vec::new();
+        }
+        vec![
+            json!({ "event": { "contentEnd": {
+                "promptName": self.prompt_name,
+                "contentName": self.audio_content_name,
+            } } }),
+            json!({ "event": { "promptEnd": { "promptName": self.prompt_name } } }),
+            json!({ "event": { "sessionEnd": {} } }),
+        ]
+    }
+
+    /// Fix `setup_once`: a stream takes one `sessionStart` / `promptStart`; no event changes
+    /// them, so a mid-session change is refused.
+    fn session_update(
+        &self,
+        _old: &RealtimeConfig,
+        new: &RealtimeConfig,
+    ) -> Option<Vec<Self::Wire>> {
+        (!self.fixes.setup_once).then(|| self.build_session_config(new, None))
     }
 
     fn map_server_event(&self, raw: Inbound<'_>) -> Vec<S2sEvent> {
@@ -531,6 +685,15 @@ impl RealtimeProtocol for NovaSonicProtocol {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
+                // Fix `nova_interrupted_marker`: Nova's barge-in signal arrives as the text
+                // `{ "interrupted" : true }` (AWS's sample `nova_sonic.py` tests for it);
+                // it is not the assistant's words.
+                if self.fixes.interrupted_marker
+                    && serde_json::from_str::<Value>(text.trim())
+                        .is_ok_and(|v| v.get("interrupted") == Some(&Value::Bool(true)))
+                {
+                    return vec![S2sEvent::InterruptedByServer];
+                }
                 let state =
                     self.current_text
                         .lock()
@@ -643,41 +806,10 @@ impl RealtimeProtocol for NovaSonicProtocol {
     }
 
     fn send_text(&self, text: &str) -> Vec<Self::Wire> {
-        // A user text message as a one-shot TEXT content block (contentStart(TEXT,
-        // USER) / textInput / contentEnd) using a fresh content id. This is the
-        // text-injection surface (audio is the primary input).
-        let content_name = uuid::Uuid::new_v4().to_string();
-        vec![
-            json!({
-                "event": {
-                    "contentStart": {
-                        "promptName": self.prompt_name,
-                        "contentName": content_name,
-                        "type": "TEXT",
-                        "interactive": false,
-                        "role": "USER",
-                        "textInputConfiguration": { "mediaType": "text/plain" },
-                    }
-                }
-            }),
-            json!({
-                "event": {
-                    "textInput": {
-                        "promptName": self.prompt_name,
-                        "contentName": content_name,
-                        "content": text,
-                    }
-                }
-            }),
-            json!({
-                "event": {
-                    "contentEnd": {
-                        "promptName": self.prompt_name,
-                        "contentName": content_name,
-                    }
-                }
-            }),
-        ]
+        // The text-injection surface (audio is the primary input). Today's block is
+        // non-interactive; the provider fix `nova_interactive_text` (off until Nova's live
+        // probe; escape flag `nova_text_non_interactive`) makes it a turn the model answers.
+        self.user_text_block(text, self.interactive_text)
     }
 
     fn create_response(&self, _overrides: Option<&RealtimeResponseOverride>) -> Vec<Self::Wire> {
@@ -766,7 +898,7 @@ impl RealtimeProtocol for NovaSonicProtocol {
                     "toolResult": {
                         "promptName": self.prompt_name,
                         "contentName": content_name,
-                        "content": result,
+                        "content": self.tool_result_content(result),
                     }
                 }
             }),
@@ -779,6 +911,16 @@ impl RealtimeProtocol for NovaSonicProtocol {
                 }
             }),
         ]
+    }
+
+    fn verb(&self, verb: &RealtimeVerb<'_>) -> Option<Vec<Self::Wire>> {
+        match *verb {
+            // The `send_text` block marked interactive: the model answers it now, in speech.
+            RealtimeVerb::SayGuided(guidance) => Some(self.user_text_block(guidance, true)),
+            RealtimeVerb::SayExact(_) | RealtimeVerb::AddContext(_) | RealtimeVerb::StopOutput => {
+                None
+            }
+        }
     }
 
     fn serialize(&self, msg: &Self::Wire) -> RealtimeResult<OutFrame> {
@@ -1314,6 +1456,35 @@ mod tests {
         assert_eq!(msgs[2]["event"]["contentEnd"]["contentName"], cn);
     }
 
+    /// `SayGuided` is the `send_text` block with `interactive: true` (the model answers it at
+    /// once); `send_text` itself keeps `interactive: false`. No wire for the other verbs.
+    #[test]
+    fn verb_say_guided_is_an_interactive_user_text_block() {
+        let p = proto(&base_cfg());
+        let msgs = p
+            .verb(&RealtimeVerb::SayGuided("Say you are checking."))
+            .unwrap();
+        assert_eq!(msgs.len(), 3);
+        let start = &msgs[0]["event"]["contentStart"];
+        assert_eq!(start["interactive"], true);
+        assert_eq!(start["role"], "USER");
+        assert_eq!(start["type"], "TEXT");
+        assert_eq!(
+            msgs[1]["event"]["textInput"]["content"],
+            "Say you are checking."
+        );
+        let cn = start["contentName"].as_str().unwrap();
+        assert_eq!(msgs[1]["event"]["textInput"]["contentName"], cn);
+        assert_eq!(msgs[2]["event"]["contentEnd"]["contentName"], cn);
+        assert_eq!(
+            p.send_text("hello")[0]["event"]["contentStart"]["interactive"],
+            false
+        );
+        assert!(p.verb(&RealtimeVerb::SayExact("x")).is_none());
+        assert!(p.verb(&RealtimeVerb::AddContext("x")).is_none());
+        assert!(p.verb(&RealtimeVerb::StopOutput).is_none());
+    }
+
     /// format_tool_result ⇒ a TOOL content block referencing the toolUseId, with
     /// the result string in toolResult.content.
     #[test]
@@ -1342,5 +1513,181 @@ mod tests {
         assert!(p.cancel_response().is_empty());
         assert!(p.truncate("x", 1).is_empty());
         assert!(p.clear_input_buffer().is_empty());
+    }
+
+    /// Provider fix `nova_interactive_text`. Off: typed text is today's block with
+    /// `interactive: false`, field for field (the content id is fresh per block). On: the
+    /// documented cross-modal input, `contentStart{type: TEXT, role: USER, interactive: true}`
+    /// (<https://docs.aws.amazon.com/nova/latest/nova2-userguide/sonic-input-events.html>,
+    /// "Example - Cross-modal Input"), with the same textInput and contentEnd.
+    #[test]
+    fn the_interactive_text_fix_makes_typed_text_a_turn() {
+        let off = proto(&base_cfg());
+        let block = off.send_text("hello");
+        let name = block[0]["event"]["contentStart"]["contentName"].clone();
+        let prompt = off.prompt_name.clone();
+        let today = |interactive: bool, name: &Value, prompt: &str| {
+            vec![
+                json!({"event": {"contentStart": {"promptName": prompt, "contentName": name,
+                    "type": "TEXT", "interactive": interactive, "role": "USER",
+                    "textInputConfiguration": {"mediaType": "text/plain"}}}}),
+                json!({"event": {"textInput": {"promptName": prompt, "contentName": name,
+                    "content": "hello"}}}),
+                json!({"event": {"contentEnd": {"promptName": prompt, "contentName": name}}}),
+            ]
+        };
+        assert_eq!(block, today(false, &name, &prompt));
+        let on = proto(&RealtimeConfig {
+            provider_fixes: vec!["nova_interactive_text".into()],
+            ..base_cfg()
+        });
+        let block = on.send_text("hello");
+        let name = block[0]["event"]["contentStart"]["contentName"].clone();
+        assert_eq!(block, today(true, &name, &on.prompt_name));
+    }
+
+    fn nova_fixed(fixes: &[&str], cfg: RealtimeConfig) -> (NovaSonicProtocol, RealtimeConfig) {
+        let cfg = RealtimeConfig {
+            provider_fixes: fixes.iter().map(|f| (*f).to_string()).collect(),
+            ..cfg
+        };
+        (proto(&cfg), cfg)
+    }
+
+    fn event_name(v: &Value) -> String {
+        v["event"]
+            .as_object()
+            .and_then(|e| e.keys().next().cloned())
+            .unwrap_or_default()
+    }
+
+    /// `nova_close_sequence`: the documented close, in order - the audio `contentEnd`, then
+    /// `promptEnd` naming the prompt, then `sessionEnd {}`. Off: nothing.
+    #[test]
+    fn the_close_sequence_fix_ends_audio_prompt_and_session() {
+        let (p, _) = nova_fixed(&["nova_close_sequence"], base_cfg());
+        let close = p.close_wires();
+        assert_eq!(
+            close,
+            vec![
+                json!({"event": {"contentEnd": {"promptName": p.prompt_name, "contentName": p.audio_content_name}}}),
+                json!({"event": {"promptEnd": {"promptName": p.prompt_name}}}),
+                json!({"event": {"sessionEnd": {}}}),
+            ]
+        );
+        assert!(proto(&base_cfg()).close_wires().is_empty());
+    }
+
+    /// `nova_history_before_audio`: the bootstrap stops after the system prompt and the audio
+    /// content opens after the replayed history (`after_replay`). Off: the audio content is
+    /// the bootstrap's last event and nothing follows the history.
+    #[test]
+    fn the_history_fix_opens_the_audio_after_the_history() {
+        let (p, cfg) = nova_fixed(&["nova_history_before_audio"], base_cfg());
+        let names: Vec<String> = p
+            .build_session_config(&cfg, None)
+            .iter()
+            .map(event_name)
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "sessionStart",
+                "promptStart",
+                "contentStart",
+                "textInput",
+                "contentEnd"
+            ]
+        );
+        match p.after_replay().as_slice() {
+            [open] => assert_eq!(open["event"]["contentStart"]["type"], "AUDIO"),
+            other => panic!("expected the audio contentStart, got {other:?}"),
+        }
+        let off = proto(&base_cfg());
+        let last = off.build_session_config(&base_cfg(), None).pop().unwrap();
+        assert_eq!(last["event"]["contentStart"]["type"], "AUDIO");
+        assert!(off.after_replay().is_empty());
+    }
+
+    /// `setup_once`: a mid-session change is refused; off, the whole bootstrap again.
+    #[test]
+    fn setup_once_refuses_a_mid_session_change() {
+        let (p, cfg) = nova_fixed(&["setup_once"], base_cfg());
+        assert!(p.session_update(&cfg, &cfg).is_none());
+        let off = proto(&base_cfg());
+        assert!(
+            off.session_update(&base_cfg(), &base_cfg())
+                .is_some_and(|w| !w.is_empty())
+        );
+    }
+
+    /// `nova_interrupted_marker`: the barge-in text is not a transcript. Off: it is one.
+    #[test]
+    fn the_interrupted_marker_fix_reads_the_marker_as_a_barge_in() {
+        let raw = json!({"event": {"textOutput": {"promptName": "p", "contentName": "c",
+            "content": "{ \"interrupted\" : true }", "role": "ASSISTANT"}}})
+        .to_string();
+        let (p, _) = nova_fixed(&["nova_interrupted_marker"], base_cfg());
+        assert!(matches!(
+            p.map_server_event(Inbound::Text(&raw)).as_slice(),
+            [S2sEvent::InterruptedByServer]
+        ));
+        assert!(matches!(
+            proto(&base_cfg())
+                .map_server_event(Inbound::Text(&raw))
+                .as_slice(),
+            [S2sEvent::Transcript { .. }]
+        ));
+    }
+
+    /// `nova_tool_result_object`: "stringified JSON object as a tool result" - an object
+    /// passes, plain text and other JSON are wrapped as `{"result": …}`. Off: as given.
+    #[test]
+    fn the_tool_result_fix_sends_a_json_object() {
+        let content = |p: &NovaSonicProtocol, result: &str| {
+            p.format_tool_result("t1", result)[1]["event"]["toolResult"]["content"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let (p, _) = nova_fixed(&["nova_tool_result_object"], base_cfg());
+        assert_eq!(content(&p, r#"{"key": "value"}"#), r#"{"key": "value"}"#);
+        assert_eq!(content(&p, "Sunny, 20C"), r#"{"result":"Sunny, 20C"}"#);
+        assert_eq!(content(&p, "[1,2]"), r#"{"result":[1,2]}"#);
+        assert_eq!(content(&proto(&base_cfg()), "Sunny, 20C"), "Sunny, 20C");
+    }
+
+    /// `nova_turn_detection`: a semantic VAD's eagerness is `sessionStart`'s
+    /// `turnDetectionConfiguration.endpointingSensitivity`; `auto` and server VAD send none.
+    #[test]
+    fn the_turn_detection_fix_sends_the_endpointing_sensitivity() {
+        let semantic = |eagerness: &str| RealtimeConfig {
+            turn_detection: Some(
+                crate::core::realtime::base::TurnDetectionConfig::SemanticVad {
+                    eagerness: Some(eagerness.into()),
+                    create_response: None,
+                    interrupt_response: None,
+                },
+            ),
+            ..base_cfg()
+        };
+        let start = |fixes: &[&str], cfg: RealtimeConfig| {
+            let (p, cfg) = nova_fixed(fixes, cfg);
+            p.build_session_config(&cfg, None)[0]["event"]["sessionStart"].clone()
+        };
+        assert_eq!(
+            start(&["nova_turn_detection"], semantic("low"))["turnDetectionConfiguration"],
+            json!({"endpointingSensitivity": "LOW"})
+        );
+        assert!(
+            start(&["nova_turn_detection"], semantic("auto"))
+                .get("turnDetectionConfiguration")
+                .is_none()
+        );
+        assert!(
+            start(&[], semantic("high"))
+                .get("turnDetectionConfiguration")
+                .is_none()
+        );
     }
 }

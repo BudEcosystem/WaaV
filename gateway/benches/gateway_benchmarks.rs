@@ -161,6 +161,7 @@ fn bench_message_serialization(c: &mut Criterion) {
         resolved_alias: None,
         audio_in_codec: None,
         audio_out_codec: None,
+        interaction: None,
     };
 
     // STT result
@@ -171,6 +172,7 @@ fn bench_message_serialization(c: &mut Criterion) {
         confidence: 0.95,
         segment_transcript: None,
         translations: Vec::new(),
+        detected_language: None,
     };
 
     // Error message

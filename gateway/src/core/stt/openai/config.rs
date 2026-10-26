@@ -48,6 +48,11 @@ fn resolve_openai_audio_url(endpoint_override: Option<&str>, path: &str) -> Resu
     Ok(format!("{OPENAI_API_BASE_URL}{path}"))
 }
 
+/// The model an empty id takes under the provider fix `openai_stt_default`: `whisper-1` and
+/// the `gpt-4o-transcribe` family shut down on 2027-02-26 and the plan names `gpt-transcribe`
+/// their replacement (shared with the segmented speech-to-text plan).
+pub const OPENAI_STT_DEFAULT_SUCCESSOR: &str = "gpt-transcribe";
+
 // =============================================================================
 // OpenAI STT Models
 // =============================================================================
@@ -669,8 +674,28 @@ impl OpenAISTTConfig {
     /// through [`model_id`](Self::model_id), for OpenAI to accept or name in its error. It used
     /// to become `whisper-1` too, silently transcribing with a model nobody chose.
     pub fn from_base(base: STTConfig) -> Self {
+        let moved = crate::core::interaction::config::provider_fix("openai_stt_default");
+        Self::from_base_with(base, moved)
+    }
+
+    /// The id an empty model sends: `whisper-1`, or, under the provider fix
+    /// `openai_stt_default` (off until the plan's probe of OpenAI's models), its replacement
+    /// [`OPENAI_STT_DEFAULT_SUCCESSOR`].
+    pub fn default_model_id(moved: bool) -> &'static str {
+        if moved {
+            OPENAI_STT_DEFAULT_SUCCESSOR
+        } else {
+            OpenAISTTModel::default().as_str()
+        }
+    }
+
+    /// [`from_base`](Self::from_base) with the default move given.
+    fn from_base_with(base: STTConfig, moved: bool) -> Self {
         let requested = base.model.trim();
-        let (model, model_id) = if requested.is_empty() {
+        let (model, model_id) = if requested.is_empty() && moved {
+            let id = OPENAI_STT_DEFAULT_SUCCESSOR;
+            (OpenAISTTModel::family_of(id), Some(id.to_owned()))
+        } else if requested.is_empty() {
             (OpenAISTTModel::default(), None)
         } else {
             match OpenAISTTModel::parse_known(requested) {
@@ -1546,5 +1571,31 @@ mod tests {
     #[test]
     fn test_chunking_strategy_type_as_str() {
         assert_eq!(ChunkingStrategyType::ServerVad.as_str(), "server_vad");
+    }
+
+    /// Provider fix `openai_stt_default`: off, an empty model is today's `whisper-1` with its
+    /// `verbose_json` default; on, it is `gpt-transcribe`, sent verbatim and treated as the
+    /// GPT-4o transcribe family (`json`, no `verbose_json`: the transcription reference's
+    /// `response_format` for non-Whisper models,
+    /// <https://platform.openai.com/docs/api-reference/audio/createTranscription>). A named model
+    /// is never changed.
+    #[test]
+    fn the_default_model_fix_moves_only_an_empty_model() {
+        let base = |model: &str| STTConfig {
+            model: model.into(),
+            ..Default::default()
+        };
+        let today = OpenAISTTConfig::from_base_with(base(""), false);
+        assert_eq!(today.wire_model(), "whisper-1");
+        assert_eq!(today.model_id, None);
+        assert_eq!(today.response_format, ResponseFormat::VerboseJson);
+        let moved = OpenAISTTConfig::from_base_with(base(""), true);
+        assert_eq!(moved.wire_model(), "gpt-transcribe");
+        assert!(!moved.is_whisper_model());
+        assert_eq!(moved.response_format, ResponseFormat::Json);
+        let named = OpenAISTTConfig::from_base_with(base("whisper-1"), true);
+        assert_eq!(named.wire_model(), "whisper-1");
+        assert_eq!(OpenAISTTConfig::default_model_id(false), "whisper-1");
+        assert_eq!(OpenAISTTConfig::default_model_id(true), "gpt-transcribe");
     }
 }

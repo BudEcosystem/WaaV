@@ -7,6 +7,15 @@
 //! session's messages become GA server events. One cascade core; two front-ends.
 //!
 //! [`CascadeGa`] is the translation, pure and unit-tested. [`run`] is the socket loop around it.
+//!
+//! A session whose agent runs interaction mode has the interaction actor in place of the agent
+//! engine. Its events leave as `bud.*` events with the bodies they have on `/ws`, each line the
+//! agent says is one GA response, and the client's `bud.task.answer`, `bud.task.cancel` and
+//! `bud.interaction.update` reach the actor.
+//!
+//! Where the agent's `session_overrides` list `tools` or `instructions`, a session may declare
+//! function tools of its own and give instructions (for the session, or for one response).
+//! That is what an OpenAI Realtime client expects of a speech-to-speech model.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -21,6 +30,8 @@ use serde_json::{Map, Value, json};
 use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, info, warn};
 
+use crate::core::interaction::actor::Msg;
+use crate::core::interaction::types::HitlOutcome;
 use crate::handlers::ws::config::{AgentWebSocketConfig, STTWebSocketConfig, TTSWebSocketConfig};
 use crate::handlers::ws::messages::{IncomingMessage, MessageRoute, OutgoingMessage};
 use crate::handlers::ws::state::ConnectionState;
@@ -138,12 +149,41 @@ pub enum ClientAct {
     TextOnly(bool),
     Manual(bool),
     Auth(String),
+    /// The session's own function tools (`session.tools`).
+    Tools(Vec<Value>),
+    /// The session's instructions (`session.instructions`).
+    Instructions(Option<String>),
+    /// An input item for the next run: a function's output, a system note.
+    Item(Value),
+    /// `response.create` that asks for a run of its own: over typed text, staged items, or
+    /// instructions for this response only.
+    Respond {
+        text: String,
+        instructions: Option<String>,
+    },
+    /// Interaction mode: `bud.task.answer`, `bud.task.cancel` and `bud.interaction.update`.
+    TaskAnswer {
+        request_id: String,
+        outcome: HitlOutcome,
+    },
+    TaskCancel(String),
+    /// `bud.task.seen`: the caller read the task's result on the screen.
+    TaskSeen(String),
+    Update(Value),
+    /// `bud.control`: a conversation control (plan chapter 9).
+    Control(crate::core::interaction::controls::Control),
 }
 
 #[derive(Debug, Default)]
 struct UserItem {
     id: Option<String>,
     started_ms: u64,
+    /// `speech_started` went out and `speech_stopped` has not.
+    speaking: bool,
+    /// The final transcripts so far, and (interaction mode) whether the caller's turn was
+    /// answered before any of them came.
+    text: String,
+    due: bool,
 }
 
 #[derive(Debug)]
@@ -158,6 +198,11 @@ struct Resp {
     output: Vec<Value>,
     tools: HashMap<String, (u64, Value)>,
     bud_response_id: Option<String>,
+    /// More `metadata`: what the client sent with `response.create`, or what the line is in
+    /// interaction mode (`bud_utterance_id`, `bud_kind`, ...).
+    metadata: Map<String, Value>,
+    /// Interaction mode: the utterance this response is.
+    utterance: Option<String>,
 }
 
 /// GA ⇄ `/ws` agent translation for one session.
@@ -191,13 +236,29 @@ pub struct CascadeGa {
     items: HashMap<u64, String>,
     last_item_id: Option<String>,
     clock: std::time::Instant,
+    /// The session's own function tools and instructions, where the agent allows them.
+    tools: Vec<Value>,
+    instructions: Option<String>,
+    /// Items wait for the next run (a function's output, a system note).
+    staged: bool,
+    /// `response.create`'s metadata, for the response it starts.
+    metadata: Option<Map<String, Value>>,
+    /// The session runs interaction mode (its `ready` said so).
+    interaction: bool,
+    /// Interaction mode: a `floor_state` came, so the caller's speech edges follow the floor.
+    floor: bool,
+    /// Interaction mode: the caller turn the agent's last line belonged to.
+    turn_seen: u64,
+    /// Interaction mode: agent audio that came ahead of its line's transcript.
+    held: Vec<Bytes>,
+    held_bytes: usize,
 }
 
 fn new_id(prefix: &str) -> String {
     format!("{prefix}_bud_{}", uuid::Uuid::new_v4().simple())
 }
 
-fn event(kind: &str, body: Value) -> String {
+pub(super) fn event(kind: &str, body: Value) -> String {
     let mut m = match body {
         Value::Object(m) => m,
         _ => Map::new(),
@@ -232,6 +293,34 @@ fn ga_usage(usage: &Value) -> Value {
         "input_token_details": {"text_tokens": input, "audio_tokens": 0, "cached_tokens": cached},
         "output_token_details": {"text_tokens": output, "audio_tokens": 0},
     })
+}
+
+/// The `bud.*` name of an interaction-mode event that keeps its body
+/// (`docs/duplex-agent/providers/wire_events.md`).
+pub(super) fn bud_event(kind: &str) -> Option<&'static str> {
+    Some(match kind {
+        "unverified_claim" => "bud.claim.unverified",
+        "task_created" => "bud.task.created",
+        "task_progress" => "bud.task.progress",
+        "task_question" => "bud.task.question",
+        "task_answer_received" => "bud.task.answer_received",
+        "task_result" => "bud.task.result",
+        "task_output" => "bud.task.output",
+        "task_cancelled" => "bud.task.cancelled",
+        "interaction_updated" => "bud.interaction.updated",
+        _ => return None,
+    })
+}
+
+/// Whether a `config_warning` is about the session's `interaction` block. Only those are sent
+/// (as `bud.warning`): a session that never met the mode sees what it saw before.
+fn interaction_warning(code: &str, detail: Option<&Value>) -> bool {
+    let path = detail
+        .and_then(|detail| detail.get("path"))
+        .and_then(Value::as_str);
+    code.starts_with("interaction_")
+        || code == "front_model_scripted"
+        || path.is_some_and(|path| path.starts_with("interaction"))
 }
 
 /// The error type GA clients expect for a code.
@@ -275,6 +364,15 @@ impl CascadeGa {
             items: HashMap::new(),
             last_item_id: None,
             clock: std::time::Instant::now(),
+            tools: Vec::new(),
+            instructions: None,
+            staged: false,
+            metadata: None,
+            interaction: false,
+            floor: false,
+            turn_seen: 0,
+            held: Vec::new(),
+            held_bytes: 0,
         }
     }
 
@@ -290,7 +388,8 @@ impl CascadeGa {
         self.allow.iter().any(|a| a == setting)
     }
 
-    /// The GA session object (instructions and tools are the agent's, never shown: §5.6).
+    /// The GA session object. The agent's instructions and tools are its own and never shown
+    /// (§5.6): what is listed is what the session itself declared.
     pub fn session_object(&self) -> Value {
         let format = json!({"type": "audio/pcm", "rate": GA_RATE});
         let turn_detection = if self.manual {
@@ -308,8 +407,8 @@ impl CascadeGa {
             "id": self.session_id,
             "model": self.model,
             "output_modalities": [if self.text_only { "text" } else { "audio" }],
-            "instructions": "",
-            "tools": [],
+            "instructions": self.instructions.as_deref().unwrap_or_default(),
+            "tools": self.tools,
             "tool_choice": "auto",
             "prompt": {"id": self.prompt_name, "version": self.version.to_string()},
             "audio": {
@@ -429,10 +528,11 @@ impl CascadeGa {
             "conversation.item.create" => self.item_create(&ev, eid, &mut out, &mut acts),
             "response.create" => {
                 let r = ev.get("response").cloned().unwrap_or(Value::Null);
-                if r.get("instructions")
+                let instructions = r
+                    .get("instructions")
                     .and_then(Value::as_str)
-                    .is_some_and(|s| !s.is_empty())
-                {
+                    .filter(|s| !s.is_empty());
+                if instructions.is_some() && !self.allows("instructions") {
                     out.push(refuse(
                         "response.instructions",
                         "A voice agent's instructions are its own; per-response instructions are not accepted.",
@@ -454,10 +554,22 @@ impl CascadeGa {
                 if !self.started {
                     acts.push(ClientAct::Start);
                 }
-                match self.typed.take() {
-                    Some(text) => acts.push(ClientAct::Turn(text)),
-                    None if self.manual => acts.push(ClientAct::Commit),
-                    None => {}
+                let staged = std::mem::take(&mut self.staged);
+                match (self.typed.take(), instructions) {
+                    (Some(text), None) if !staged => acts.push(ClientAct::Turn(text)),
+                    (None, None) if !staged => {
+                        if self.manual {
+                            acts.push(ClientAct::Commit);
+                        }
+                    }
+                    (text, instructions) => acts.push(ClientAct::Respond {
+                        text: text.unwrap_or_default(),
+                        instructions: instructions.map(str::to_string),
+                    }),
+                }
+                // The response this starts carries the client's metadata.
+                if acts.iter().any(|act| !matches!(act, ClientAct::Start)) {
+                    self.metadata = r.get("metadata").and_then(Value::as_object).cloned();
                 }
             }
             "response.cancel" => acts.push(ClientAct::Cancel),
@@ -480,6 +592,57 @@ impl CascadeGa {
                     eid,
                 )),
             },
+            "bud.task.answer" => match super::interaction::task_answer(&ev) {
+                Some((request_id, outcome)) => acts.push(ClientAct::TaskAnswer {
+                    request_id,
+                    outcome,
+                }),
+                None => out.push(gateway_error(
+                    "invalid_event",
+                    super::interaction::ANSWER_REQUIRED,
+                    Some("outcome"),
+                    eid,
+                )),
+            },
+            "bud.control" => {
+                use crate::core::interaction::controls::{Control, ControlSource};
+                match Control::from_json(&ev, ControlSource::Client) {
+                    Ok(control) => acts.push(ClientAct::Control(control)),
+                    Err(why) => out.push(gateway_error("invalid_event", &why, Some("kind"), eid)),
+                }
+            }
+            "bud.task.cancel" | "bud.task.seen" => {
+                match ev.get("task_id").and_then(Value::as_str) {
+                    Some(task) if kind == "bud.task.seen" => {
+                        acts.push(ClientAct::TaskSeen(task.to_string()))
+                    }
+                    Some(task) => acts.push(ClientAct::TaskCancel(task.to_string())),
+                    None => out.push(gateway_error(
+                        "invalid_event",
+                        "`task_id` is required.",
+                        Some("task_id"),
+                        eid,
+                    )),
+                }
+            }
+            "bud.interaction.update" => {
+                let patch = ev.get("interaction").cloned().unwrap_or(Value::Null);
+                let mut refused = Vec::new();
+                let allowed = self.allowed_patch("interaction", &patch, &mut refused);
+                if !refused.is_empty() {
+                    let refused: Vec<Value> = refused
+                        .iter()
+                        .map(|path| json!({"path": path, "reason": "not_allowed"}))
+                        .collect();
+                    out.push(event(
+                        "bud.interaction.updated",
+                        json!({"applied": [], "refused": refused}),
+                    ));
+                }
+                if let Some(patch) = allowed {
+                    acts.push(ClientAct::Update(patch));
+                }
+            }
             "conversation.item.retrieve" | "conversation.item.delete" => {
                 out.push(refuse(
                     &kind,
@@ -519,25 +682,37 @@ impl CascadeGa {
             ));
             return;
         }
-        if s.get("instructions")
-            .and_then(Value::as_str)
-            .is_some_and(|i| !i.trim().is_empty())
-        {
-            out.push(refuse(
-                "session.instructions",
-                "A voice agent's instructions are its own (set in the agent); `instructions` is ignored.",
-                eid,
-            ));
+        if let Some(text) = s.get("instructions").and_then(Value::as_str) {
+            let text = Some(text.to_string()).filter(|i| !i.trim().is_empty());
+            if self.allows("instructions") {
+                if text != self.instructions {
+                    self.instructions = text.clone();
+                    acts.push(ClientAct::Instructions(text));
+                }
+            } else if text.is_some() {
+                out.push(refuse(
+                    "session.instructions",
+                    "A voice agent's instructions are its own (set in the agent); `instructions` is ignored.",
+                    eid,
+                ));
+            }
         }
-        if s.get("tools")
-            .and_then(Value::as_array)
-            .is_some_and(|t| !t.is_empty())
-        {
-            out.push(refuse(
-                "session.tools",
-                "A voice agent's tools are its own (MCP, native, A2A); client tools are not supported (NG-2).",
-                eid,
-            ));
+        if let Some(tools) = s.get("tools").and_then(Value::as_array) {
+            let functions = tools
+                .iter()
+                .all(|t| t.get("type").and_then(Value::as_str) == Some("function"));
+            if self.allows("tools") && functions {
+                if *tools != self.tools {
+                    self.tools = tools.clone();
+                    acts.push(ClientAct::Tools(tools.clone()));
+                }
+            } else if !tools.is_empty() {
+                out.push(refuse(
+                    "session.tools",
+                    "A voice agent's tools are its own (MCP, native, A2A); client tools are not supported (NG-2).",
+                    eid,
+                ));
+            }
         }
         if let Some(p) = s.get("prompt").filter(|p| !p.is_null()) {
             let id = p.get("id").and_then(Value::as_str).unwrap_or_default();
@@ -618,7 +793,10 @@ impl CascadeGa {
             }
             if let Some(input) = audio.get("input").and_then(Value::as_object) {
                 if let Some(td) = input.get("turn_detection") {
-                    let manual = td.is_null();
+                    // `null` in the GA protocol; this gateway's own OpenAI client writes
+                    // `{"type": "none"}` for the same.
+                    let manual =
+                        td.is_null() || td.get("type").and_then(Value::as_str) == Some("none");
                     if manual != self.manual {
                         self.manual = manual;
                         acts.push(ClientAct::Manual(manual));
@@ -714,12 +892,35 @@ impl CascadeGa {
         acts: &mut Vec<ClientAct>,
     ) {
         let item = ev.get("item").cloned().unwrap_or(Value::Null);
-        let is_user_message = item
-            .get("type")
-            .and_then(Value::as_str)
-            .is_none_or(|t| t == "message")
-            && item.get("role").and_then(Value::as_str) == Some("user");
-        if !is_user_message {
+        let kind = item.get("type").and_then(Value::as_str);
+        let role = item.get("role").and_then(Value::as_str);
+        // The output of a function the session declared: it goes with the next run.
+        if kind == Some("function_call_output") && self.allows("tools") {
+            let id = item
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| new_id("item"));
+            let output = json!({"type": "function_call_output", "call_id": item.get("call_id"),
+                                "output": item.get("output")});
+            let mut added = output.clone();
+            added["id"] = json!(id);
+            added["object"] = json!("realtime.item");
+            added["status"] = json!("completed");
+            out.push(event(
+                "conversation.item.added",
+                json!({"previous_item_id": self.last_item_id, "item": added}),
+            ));
+            out.push(event("conversation.item.done", json!({"item": added})));
+            self.last_item_id = Some(id);
+            self.staged = true;
+            acts.push(ClientAct::Item(output));
+            return;
+        }
+        let is_message = kind.is_none_or(|t| t == "message");
+        let is_system = is_message && role == Some("system") && self.allows("instructions");
+        let is_user_message = is_message && role == Some("user");
+        if !is_user_message && !is_system {
             out.push(refuse(
                 "item.type",
                 "A voice-agent session accepts typed user messages only (no function_call_output: NG-2).",
@@ -752,7 +953,8 @@ impl CascadeGa {
             .and_then(Value::as_str)
             .map(str::to_string)
             .unwrap_or_else(|| new_id("item"));
-        let added = json!({"id": id, "object": "realtime.item", "type": "message", "role": "user",
+        let role = if is_system { "system" } else { "user" };
+        let added = json!({"id": id, "object": "realtime.item", "type": "message", "role": role,
                            "status": "completed", "content": [{"type": "input_text", "text": text}]});
         out.push(event(
             "conversation.item.added",
@@ -760,13 +962,42 @@ impl CascadeGa {
         ));
         out.push(event("conversation.item.done", json!({"item": added})));
         self.last_item_id = Some(id);
+        if !self.started {
+            acts.push(ClientAct::Start);
+        }
+        if is_system {
+            // Context for the agent: nothing is said until the next run.
+            self.staged = true;
+            acts.push(ClientAct::Item(json!({"role": "system", "content": text})));
+            return;
+        }
         self.typed = Some(match self.typed.take() {
             Some(prev) => format!("{prev} {text}"),
             None => text,
         });
-        if !self.started {
-            acts.push(ClientAct::Start);
+    }
+
+    /// The part of a `bud.interaction.update` patch the agent lets a session set: a path is
+    /// allowed when the agent's `session_overrides` list it or a path above it
+    /// (`interaction`, `interaction.policy`, `interaction.events.floor`). Every other leaf is
+    /// named in `refused`, as the path inside the block.
+    fn allowed_patch(&self, path: &str, patch: &Value, refused: &mut Vec<String>) -> Option<Value> {
+        if self.allows(path) {
+            return Some(patch.clone());
         }
+        let Some(fields) = patch.as_object().filter(|fields| !fields.is_empty()) else {
+            let inside = path.strip_prefix("interaction.").unwrap_or(path);
+            refused.push(inside.to_string());
+            return None;
+        };
+        let kept: Map<String, Value> = fields
+            .iter()
+            .filter_map(|(key, value)| {
+                let value = self.allowed_patch(&format!("{path}.{key}"), value, refused)?;
+                Some((key.clone(), value))
+            })
+            .collect();
+        (!kept.is_empty()).then_some(Value::Object(kept))
     }
 
     // ---------------------------------------------------------------------------------------
@@ -774,35 +1005,67 @@ impl CascadeGa {
     // ---------------------------------------------------------------------------------------
 
     fn user_item(&mut self, out: &mut Vec<String>) -> String {
+        self.open_user(true, out)
+    }
+
+    /// The caller's item in progress, opened when there is none. `speech`: its opening is
+    /// also the start of the caller's speech.
+    fn open_user(&mut self, speech: bool, out: &mut Vec<String>) -> String {
         if let Some(id) = &self.user.id {
             return id.clone();
         }
         let id = new_id("item");
-        self.user.started_ms = self.clock.elapsed().as_millis() as u64;
+        self.user = UserItem {
+            id: Some(id.clone()),
+            started_ms: self.clock.elapsed().as_millis() as u64,
+            ..UserItem::default()
+        };
         let item = json!({"id": id, "object": "realtime.item", "type": "message", "role": "user",
                           "status": "in_progress", "content": [{"type": "input_audio", "transcript": Value::Null}]});
         out.push(event(
             "conversation.item.added",
             json!({"previous_item_id": self.last_item_id, "item": item}),
         ));
-        out.push(event(
-            "input_audio_buffer.speech_started",
-            json!({"audio_start_ms": self.user.started_ms, "item_id": id}),
-        ));
         self.last_item_id = Some(id.clone());
-        self.user.id = Some(id.clone());
+        if speech {
+            self.speech_edge(true, out);
+        }
         id
     }
 
-    fn close_user(&mut self, transcript: &str, out: &mut Vec<String>) {
-        let Some(id) = self.user.id.take() else {
+    /// `speech_started` or `speech_stopped` for the caller's item, once per change.
+    fn speech_edge(&mut self, speaking: bool, out: &mut Vec<String>) {
+        let Some(id) = self.user.id.as_deref() else {
             return;
         };
+        if std::mem::replace(&mut self.user.speaking, speaking) == speaking {
+            return;
+        }
         let now = self.clock.elapsed().as_millis() as u64;
-        out.push(event(
-            "input_audio_buffer.speech_stopped",
-            json!({"audio_end_ms": now, "item_id": id}),
-        ));
+        out.push(if speaking {
+            // The item's own start, or now when the caller speaks again in the same item.
+            let at = if self.user.text.is_empty() {
+                self.user.started_ms
+            } else {
+                now
+            };
+            event(
+                "input_audio_buffer.speech_started",
+                json!({"audio_start_ms": at, "item_id": id}),
+            )
+        } else {
+            event(
+                "input_audio_buffer.speech_stopped",
+                json!({"audio_end_ms": now, "item_id": id}),
+            )
+        });
+    }
+
+    fn close_user(&mut self, transcript: &str, out: &mut Vec<String>) {
+        self.speech_edge(false, out);
+        let Some(id) = std::mem::take(&mut self.user).id else {
+            return;
+        };
         out.push(event(
             "input_audio_buffer.committed",
             json!({"previous_item_id": Value::Null, "item_id": id}),
@@ -817,12 +1080,27 @@ impl CascadeGa {
     }
 
     fn start_response(&mut self, turn: u64, greeting: bool, out: &mut Vec<String>) {
+        // A greeting is the agent's own: the client's metadata waits for the run it asked for.
+        let asked = if greeting { None } else { self.metadata.take() };
+        self.open_response(turn, greeting, asked.unwrap_or_default(), out);
+    }
+
+    fn open_response(
+        &mut self,
+        turn: u64,
+        greeting: bool,
+        metadata: Map<String, Value>,
+        out: &mut Vec<String>,
+    ) {
         let id = new_id("resp");
+        let mut shown = json!({"bud_agent": self.prompt_name, "bud_turn": turn});
+        if let Some(shown) = shown.as_object_mut() {
+            shown.extend(metadata.clone());
+        }
         out.push(event(
             "response.created",
             json!({"response": {"id": id, "object": "realtime.response", "status": "in_progress",
-                                "output": [], "usage": Value::Null,
-                                "metadata": {"bud_agent": self.prompt_name, "bud_turn": turn}}}),
+                                "output": [], "usage": Value::Null, "metadata": shown}}),
         ));
         self.response = Some(Resp {
             id,
@@ -835,6 +1113,8 @@ impl CascadeGa {
             output: Vec::new(),
             tools: HashMap::new(),
             bud_response_id: None,
+            metadata,
+            utterance: None,
         });
     }
 
@@ -953,6 +1233,9 @@ impl CascadeGa {
         if r.greeting {
             response["metadata"]["bud_greeting"] = json!(true);
         }
+        if let Some(shown) = response["metadata"].as_object_mut() {
+            shown.extend(r.metadata);
+        }
         out.push(event("response.done", json!({"response": response})));
     }
 
@@ -963,17 +1246,33 @@ impl CascadeGa {
             OutgoingMessage::STTResult {
                 transcript,
                 is_final,
+                is_speech_final,
                 ..
             } => {
                 if transcript.trim().is_empty() {
                     return out;
                 }
-                let item = self.user_item(&mut out);
+                // In interaction mode the floor says when the caller speaks, once it reports.
+                let speech = !(self.interaction && self.floor);
+                let item = self.open_user(speech, &mut out);
                 if *is_final {
                     out.push(event(
                         "conversation.item.input_audio_transcription.delta",
                         json!({"item_id": item, "content_index": 0, "delta": format!("{} ", transcript.trim())}),
                     ));
+                    self.user.text.push_str(transcript.trim());
+                    self.user.text.push(' ');
+                    if self.interaction {
+                        if self.user.due {
+                            self.settle_user(&mut out);
+                        }
+                    } else if *is_speech_final {
+                        // As OpenAI does: the caller's item is complete once its words are,
+                        // whether or not the agent answers the turn. `transcript` is only the
+                        // last fragment; the item holds all of its finals.
+                        let text = std::mem::take(&mut self.user.text);
+                        self.close_user(text.trim(), &mut out);
+                    }
                 }
             }
             OutgoingMessage::AgentResponseStarted {
@@ -985,7 +1284,11 @@ impl CascadeGa {
                     self.turns_ran = true;
                     if let Some(text) = input.as_deref() {
                         if self.user.id.is_some() {
-                            self.close_user(text, &mut out);
+                            // The item's own finals when it has any: the turn's input may
+                            // also hold the words of items already completed.
+                            let own = std::mem::take(&mut self.user.text);
+                            let own = own.trim();
+                            self.close_user(if own.is_empty() { text } else { own }, &mut out);
                         }
                     }
                 }
@@ -1006,21 +1309,50 @@ impl CascadeGa {
                 if self.response.as_ref().is_none_or(|r| r.turn != *turn_index) {
                     return out;
                 }
-                let Some((rid, iid, idx)) = self.message_item(&mut out) else {
+                self.say(delta, &mut out);
+            }
+            OutgoingMessage::AgentFunctionCall {
+                turn_index,
+                item_id,
+                call_id,
+                name,
+                arguments,
+            } => {
+                let last = self.last_item_id.clone();
+                let Some(r) = self.response.as_mut().filter(|r| r.turn == *turn_index) else {
                     return out;
                 };
-                if let Some(r) = self.response.as_mut() {
-                    r.transcript.push_str(delta);
-                }
-                let kind = if self.text_only {
-                    "response.output_text.delta"
-                } else {
-                    "response.output_audio_transcript.delta"
-                };
+                let idx = r.next_index;
+                r.next_index += 1;
+                let mut item = json!({"id": item_id, "object": "realtime.item", "type": "function_call",
+                                      "call_id": call_id, "name": name, "arguments": "", "status": "in_progress"});
                 out.push(event(
-                    kind,
-                    json!({"response_id": rid, "item_id": iid, "output_index": idx, "content_index": 0, "delta": delta}),
+                    "response.output_item.added",
+                    json!({"response_id": r.id, "output_index": idx, "item": item}),
                 ));
+                out.push(event(
+                    "conversation.item.added",
+                    json!({"previous_item_id": last, "item": item}),
+                ));
+                out.push(event(
+                    "response.function_call_arguments.delta",
+                    json!({"response_id": r.id, "item_id": item_id, "output_index": idx,
+                           "call_id": call_id, "delta": arguments}),
+                ));
+                out.push(event(
+                    "response.function_call_arguments.done",
+                    json!({"response_id": r.id, "item_id": item_id, "output_index": idx,
+                           "call_id": call_id, "name": name, "arguments": arguments}),
+                ));
+                item["arguments"] = json!(arguments);
+                item["status"] = json!("completed");
+                out.push(event(
+                    "response.output_item.done",
+                    json!({"response_id": r.id, "output_index": idx, "item": item}),
+                ));
+                out.push(event("conversation.item.done", json!({"item": item})));
+                r.output.push(item);
+                self.last_item_id = Some(item_id.clone());
             }
             OutgoingMessage::AgentTool {
                 turn_index,
@@ -1131,14 +1463,198 @@ impl CascadeGa {
             OutgoingMessage::Authenticated { .. } => {
                 out.push(event("bud.session.authenticated", json!({})));
             }
+            // The session runs interaction mode: its resolved settings.
+            OutgoingMessage::Ready {
+                interaction: Some(echo),
+                ..
+            } => {
+                self.interaction = true;
+                out.push(event("bud.interaction.state", json!({"interaction": echo})));
+            }
+            OutgoingMessage::ConfigWarning {
+                code,
+                message,
+                detail,
+            } if interaction_warning(code, detail.as_ref()) => {
+                out.push(event(
+                    "bud.warning",
+                    json!({"code": code, "message": message, "detail": detail}),
+                ));
+            }
             _ => {}
         }
         out
     }
 
+    /// Words of the response in flight: its transcript (or its text, in text mode).
+    fn say(&mut self, delta: &str, out: &mut Vec<String>) {
+        let Some((rid, iid, idx)) = self.message_item(out) else {
+            return;
+        };
+        if let Some(r) = self.response.as_mut() {
+            r.transcript.push_str(delta);
+        }
+        let kind = if self.text_only {
+            "response.output_text.delta"
+        } else {
+            "response.output_audio_transcript.delta"
+        };
+        out.push(event(
+            kind,
+            json!({"response_id": rid, "item_id": iid, "output_index": idx, "content_index": 0, "delta": delta}),
+        ));
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Interaction mode -> client
+    // ---------------------------------------------------------------------------------------
+
+    /// One interaction-mode event of the session, as the JSON it is on `/ws`. A task, floor,
+    /// audio or settings event leaves under its `bud.*` name with the same body; an `error`
+    /// is a GA `error` with its code; a line of the agent is a GA response.
+    pub fn interaction(&mut self, raw: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let Ok(Value::Object(mut body)) = serde_json::from_str::<Value>(raw) else {
+            return out;
+        };
+        let kind = match body.remove("type") {
+            Some(Value::String(kind)) => kind,
+            _ => return out,
+        };
+        let body = Value::Object(body);
+        let text = |key: &str| body.get(key).and_then(Value::as_str).unwrap_or_default();
+        match kind.as_str() {
+            "assistant_transcript" => self.agent_line(&body, &mut out),
+            "error" => out.push(super::policy::error_event(
+                &next_event_id(),
+                error_kind(text("code")),
+                text("code"),
+                text("message"),
+                None,
+                None,
+            )),
+            "floor_state" => {
+                self.floor = true;
+                let caller = matches!(text("holder"), "user" | "both");
+                if caller {
+                    self.open_user(false, &mut out);
+                }
+                self.speech_edge(caller, &mut out);
+                out.push(event("bud.floor.state", body));
+            }
+            "agent_audio_stopped" => {
+                // The line that was cut is over: what of it went out, then its response.
+                let cut = self.response.as_ref().and_then(|r| {
+                    let utterance = r.utterance.as_deref()?;
+                    let ids = body.get("utterance_ids")?.as_array()?;
+                    let at = ids.iter().position(|id| id.as_str() == Some(utterance))?;
+                    let ms = body.get("delivered_ms")?.get(at)?.as_u64()?;
+                    Some((r.item_id.clone(), ms))
+                });
+                out.push(event("bud.audio.stopped", body));
+                if let Some((item, ms)) = cut {
+                    if let Some(item) = item {
+                        out.push(event(
+                            "conversation.item.truncated",
+                            json!({"item_id": item, "content_index": 0, "audio_end_ms": ms}),
+                        ));
+                    }
+                    self.finish_response("cancelled", None, &mut out);
+                }
+            }
+            // Not sent on this protocol: each line already opens and closes its own response,
+            // and a client of it pings the socket itself.
+            "audio_segment" | "heartbeat" => {}
+            other => match bud_event(other) {
+                Some(name) => out.push(event(name, body)),
+                None => warn!(
+                    event = other,
+                    "interaction event with no bud.* name; not sent"
+                ),
+            },
+        }
+        out
+    }
+
+    /// A line of the agent in interaction mode. It arrives with its words when it starts to
+    /// play: that opens a response, which carries what the line is in `metadata.bud_*`. It
+    /// arrives again without words when the caller heard all of it or it was cut.
+    fn agent_line(&mut self, line: &Value, out: &mut Vec<String>) {
+        let utterance = line.get("utterance_id").and_then(Value::as_str);
+        let words = line
+            .get("delta")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if words.is_empty() {
+            let open = self.response.as_ref().and_then(|r| r.utterance.as_deref());
+            if utterance.is_some() && open == utterance {
+                let heard = line.get("heard").and_then(Value::as_str);
+                let status = if heard == Some("full") {
+                    "completed"
+                } else {
+                    "cancelled"
+                };
+                self.finish_response(status, None, out);
+            }
+            return;
+        }
+        // The first line after a turn of the caller's: that turn is settled.
+        let turn = line.get("turn_index").and_then(Value::as_u64).unwrap_or(0);
+        if turn > self.turn_seen {
+            self.turn_seen = turn;
+            self.settle_user(out);
+        }
+        // A line whose end was not reported (its synthesis failed) is over.
+        if self.response.is_some() {
+            self.finish_response("completed", None, out);
+        }
+        let metadata: Map<String, Value> = [
+            ("utterance_id", "bud_utterance_id"),
+            ("source", "bud_source"),
+            ("kind", "bud_kind"),
+            ("verbatim", "bud_verbatim"),
+            ("act", "bud_act"),
+            ("task_id", "bud_task_id"),
+            ("sentence", "bud_sentence"),
+        ]
+        .into_iter()
+        .filter_map(|(field, name)| Some((name.to_string(), line.get(field)?.clone())))
+        .collect();
+        self.open_response(turn, false, metadata, out);
+        if let Some(r) = self.response.as_mut() {
+            r.utterance = utterance.map(str::to_string);
+        }
+        self.say(words, out);
+        // Its first audio came ahead of it.
+        self.held_bytes = 0;
+        for pcm in std::mem::take(&mut self.held) {
+            out.extend(self.audio(&pcm));
+        }
+    }
+
+    /// The caller's turn was answered: its item is complete once it has a final transcript.
+    fn settle_user(&mut self, out: &mut Vec<String>) {
+        if self.user.id.is_none() {
+            return;
+        }
+        self.user.due = self.user.text.is_empty();
+        if !self.user.due {
+            let text = std::mem::take(&mut self.user.text);
+            self.close_user(text.trim(), out);
+        }
+    }
+
     /// TTS audio (24 kHz PCM16) for the response in flight.
     pub fn audio(&mut self, pcm: &[u8]) -> Vec<String> {
         let mut out = Vec::new();
+        if self.interaction && self.response.is_none() && !pcm.is_empty() {
+            // A line's audio is delivered ahead of the event that says it started to play.
+            if self.held_bytes + pcm.len() <= MAX_HELD_AUDIO {
+                self.held_bytes += pcm.len();
+                self.held.push(Bytes::copy_from_slice(pcm));
+            }
+            return out;
+        }
         if self.text_only || pcm.is_empty() || self.response.is_none() {
             return out;
         }
@@ -1229,6 +1745,9 @@ pub async fn run(
                 Some(MessageRoute::Binary(pcm)) => {
                     if !send(&client, ga.audio(&pcm)).await { break (1000, "client_gone", None); }
                 }
+                Some(MessageRoute::Json(event)) => {
+                    if !send(&client, ga.interaction(&event)).await { break (1000, "client_gone", None); }
+                }
                 Some(MessageRoute::Close) => break (1000, "session_closed", None),
                 Some(MessageRoute::CloseWith { code, reason }) => {
                     let reason: &'static str = match reason.as_str() {
@@ -1281,13 +1800,20 @@ pub async fn run(
     debug!(session = %session_id, reason = end.1, "voice agent realtime session ending");
     // Flush what the core already said (e.g. the error before a revocation close).
     while let Ok(route) = core_rx.try_recv() {
-        if let MessageRoute::Outgoing(msg) = route {
-            let _ = send(&client, ga.core(&msg)).await;
+        match route {
+            MessageRoute::Outgoing(msg) => {
+                let _ = send(&client, ga.core(&msg)).await;
+            }
+            MessageRoute::Json(event) => {
+                let _ = send(&client, ga.interaction(&event)).await;
+            }
+            _ => {}
         }
     }
     close(&client, end.0, end.1, end.2).await;
     drop(client);
-    crate::handlers::ws::handler::teardown_session(&conn, &state).await;
+    // A realtime client does not come back to a session: its end is always a clean one.
+    crate::handlers::ws::handler::teardown_session(&conn, &state, true).await;
     let _ = tokio::time::timeout(Duration::from_secs(2), writer).await;
     info!(session = %session_id, reason = end.1, "voice agent realtime session closed");
 }
@@ -1319,14 +1845,20 @@ async fn start_core(
         state,
     )
     .await;
-    let engine = conn.read().await.agent.clone();
-    let Some(engine) = engine.filter(|_| keep) else {
-        warn!("voice agent realtime session could not start its agent");
-        // The core sent its refusal as `error` (+ a close); the loop relays and ends.
-        return keep && conn.read().await.voice_manager.is_some();
+    let (engine, interaction) = {
+        let conn = conn.read().await;
+        (conn.agent.clone(), conn.interaction.is_some())
     };
-    if ga.manual {
-        engine.set_manual(true);
+    match engine.filter(|_| keep) {
+        Some(engine) if ga.manual => engine.set_manual(true),
+        Some(_) => {}
+        // Interaction mode runs the agent itself: there is no engine.
+        None if keep && interaction => {}
+        None => {
+            warn!("voice agent realtime session could not start its agent");
+            // The core sent its refusal as `error` (+ a close); the loop relays and ends.
+            return keep && conn.read().await.voice_manager.is_some();
+        }
     }
     for pcm in held.drain(..) {
         crate::handlers::ws::audio_handler::handle_audio_message(pcm, conn, core_tx).await;
@@ -1344,9 +1876,79 @@ async fn apply(
     core_tx: &mpsc::Sender<MessageRoute>,
     act: ClientAct,
 ) {
-    let engine = conn.read().await.agent.clone();
+    let (engine, actor) = {
+        let conn = conn.read().await;
+        (conn.agent.clone(), conn.interaction.clone())
+    };
+    // Interaction mode: the actor takes the turns, the cuts and its own three messages. It
+    // measures what the caller heard itself, and the agent's runs take no item of a session's.
+    if let Some(actor) = actor {
+        let msg = match act {
+            ClientAct::Audio(pcm) => {
+                crate::handlers::ws::audio_handler::handle_audio_message(pcm, conn, core_tx).await;
+                return;
+            }
+            ClientAct::Auth(token) => {
+                let auth = IncomingMessage::Auth { token };
+                crate::handlers::ws::processor::handle_incoming_message(auth, conn, core_tx, state)
+                    .await;
+                return;
+            }
+            ClientAct::Turn(text) | ClientAct::Respond { text, .. } if !text.is_empty() => {
+                Msg::TypedTurn(text)
+            }
+            ClientAct::Cancel => Msg::ClientClear,
+            ClientAct::Commit => Msg::AudioEnd,
+            ClientAct::TaskAnswer {
+                request_id,
+                outcome,
+            } => Msg::TaskAnswer {
+                request_id,
+                outcome,
+            },
+            ClientAct::TaskCancel(task_id) => Msg::TaskCancel { task_id },
+            ClientAct::TaskSeen(task_id) => Msg::TaskSeen { task_id },
+            ClientAct::Update(patch) => Msg::Update(patch),
+            ClientAct::Control(control) => Msg::Control(control),
+            _ => return,
+        };
+        actor.send(msg).await;
+        return;
+    }
     match act {
         ClientAct::Start => {}
+        ClientAct::TaskAnswer { .. }
+        | ClientAct::TaskCancel(_)
+        | ClientAct::TaskSeen(_)
+        | ClientAct::Update(_)
+        | ClientAct::Control(_) => {
+            let _ = core_tx
+                .send(MessageRoute::Outgoing(OutgoingMessage::AgentError {
+                    code: "interaction_not_enabled".into(),
+                    message: "This session does not run interaction mode.".into(),
+                }))
+                .await;
+        }
+        ClientAct::Tools(tools) => {
+            if let Some(engine) = engine {
+                engine.set_client_tools(tools);
+            }
+        }
+        ClientAct::Instructions(instructions) => {
+            if let Some(engine) = engine {
+                engine.set_instructions(instructions);
+            }
+        }
+        ClientAct::Item(item) => {
+            if let Some(engine) = engine {
+                engine.add_input(item);
+            }
+        }
+        ClientAct::Respond { text, instructions } => {
+            if let Some(engine) = engine {
+                engine.respond(text, instructions).await;
+            }
+        }
         ClientAct::Audio(pcm) => {
             crate::handlers::ws::audio_handler::handle_audio_message(pcm, conn, core_tx).await;
         }

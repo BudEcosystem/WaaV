@@ -37,10 +37,40 @@ pub const MAX_AUTH_TOKEN_SIZE: usize = 4 * 1024;
 /// committed `docs/openapi.yaml` (regenerate the spec whenever this changes).
 pub const PROTOCOL_VERSION: &str = "1.0";
 
+/// The `protocol_version` of a `ready` whose session runs interaction mode: 1.0 plus the
+/// interaction events and the `task_answer`, `task_cancel` and `interaction_update` messages.
+pub const INTERACTION_PROTOCOL_VERSION: &str = "1.1";
+
 use super::config::{
     ConversationWebSocketConfig, DAGWebSocketConfig, LiveKitWebSocketConfig, STTWebSocketConfig,
     TTSWebSocketConfig, default_allow_interruption, default_audio_enabled,
 };
+
+/// What a client may answer a `task_question` with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum TaskAnswerOutcome {
+    Accept,
+    Decline,
+    Cancel,
+}
+
+impl TaskAnswerOutcome {
+    /// The answer as the interaction session reads it.
+    pub fn read(
+        self,
+        value: Option<serde_json::Value>,
+        correction: Option<String>,
+    ) -> crate::core::interaction::types::HitlOutcome {
+        use crate::core::interaction::types::HitlOutcome;
+        match self {
+            Self::Accept => HitlOutcome::Accept { value },
+            Self::Decline => HitlOutcome::Decline { correction },
+            Self::Cancel => HitlOutcome::Cancel,
+        }
+    }
+}
 
 /// WebSocket message types for incoming messages
 #[derive(Debug, Deserialize, Serialize)]
@@ -106,6 +136,18 @@ pub enum IncomingMessage {
         #[serde(skip_serializing_if = "Option::is_none")]
         #[cfg_attr(feature = "openapi", schema(example = "support-bot"))]
         alias: Option<String>,
+        /// Interaction mode (protocol 1.1): `true` for the defaults, or an object of settings.
+        /// The agent then keeps the floor, acknowledges, runs the request as a background task
+        /// and relays its answer. Needs the server switch and a `conversation_config` (or
+        /// `interaction.tasks.llm`); otherwise the session runs without it and a
+        /// `config_warning` says why. The resolved settings are echoed on `ready`. On a
+        /// voice-agent session (`agent`) the agent's own entry or the operator sets the block,
+        /// and this value counts only where the agent lets a session override `interaction`.
+        /// With a `livekit` block the mode runs on the room's audio, hears one participant
+        /// (the first whose audio arrives) and also publishes its events in the room, on the
+        /// data topic `waav.interaction`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        interaction: Option<serde_json::Value>,
     },
     #[serde(rename = "speak")]
     Speak {
@@ -232,6 +274,66 @@ pub enum IncomingMessage {
         /// What the user typed.
         text: String,
     },
+    /// Interaction mode: the client's answer to a `task_question` (a button instead of speech).
+    #[serde(rename = "task_answer")]
+    TaskAnswer {
+        /// The `request_id` of the `task_question`.
+        request_id: String,
+        /// A chosen option or a value is an `accept` with `value`.
+        outcome: TaskAnswerOutcome,
+        /// With `accept`: the chosen option or the value asked for (any JSON).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        value: Option<serde_json::Value>,
+        /// With `decline`: what to change, in the user's words.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correction: Option<String>,
+    },
+    /// Interaction mode: cancel a background task.
+    #[serde(rename = "task_cancel")]
+    TaskCancel {
+        /// The `task_id` of the `task_created` event.
+        task_id: String,
+    },
+    /// Interaction mode: the caller has read a task's result on the screen (`task_output`),
+    /// so no spoken update of it is due any more.
+    #[serde(rename = "task_seen")]
+    TaskSeen {
+        /// The `task_id` of the `task_output`.
+        task_id: String,
+    },
+    /// Interaction mode: a conversation control (plan chapter 9), as from a "slower" button
+    /// or a language picker. The gateway answers with `control_applied`.
+    #[serde(rename = "control")]
+    Control {
+        /// One of `stop`, `hold`, `resume`, `repeat`, `not_heard`, `clarify`, `spell`, `rate`,
+        /// `volume`, `verbosity`, `language`, `voice`, `backchannels`, `updates`, `to_screen`,
+        /// `end`, `human`.
+        kind: String,
+        /// The kind's value: `slower`, `louder`, `brief`, `es`, `number`, `30` (a hold's
+        /// seconds) ... A `repeat` takes `slower` or `louder` (that line only); a `voice` one
+        /// or two of `male`, `female`, `young`, `old`, `american`, `british`, `australian`,
+        /// `irish`, `indian`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        value: Option<String>,
+    },
+    /// Interaction mode: change `policy.*`, `duplex.*` (not `duplex.echo`), `events.*`,
+    /// `hitl.channels`, the caller's fields (`front.caller.*`) or `tasks.announce`
+    /// mid-session.
+    #[serde(rename = "interaction_update")]
+    InteractionUpdate {
+        /// The settings to change, in the shape of `config.interaction`.
+        #[cfg_attr(feature = "openapi", schema(value_type = Object))]
+        patch: serde_json::Value,
+    },
+    /// Interaction mode: how much of an utterance the client has played (at most four a
+    /// second). From the first one on, what the caller heard is what the client reports.
+    #[serde(rename = "playback_position")]
+    PlaybackPosition {
+        /// The `utterance_id` of the `audio_segment` or `assistant_transcript`.
+        utterance_id: String,
+        /// Milliseconds of that utterance's audio the client has played.
+        played_ms: u64,
+    },
 }
 
 /// Unified message structure for all incoming messages from various sources
@@ -325,6 +427,11 @@ pub enum OutgoingMessage {
         #[serde(skip_serializing_if = "Option::is_none")]
         #[cfg_attr(feature = "openapi", schema(example = "opus"))]
         audio_out_codec: Option<String>,
+        /// The resolved interaction-mode settings. Present only when the session runs
+        /// interaction mode; `protocol_version` is then `1.1`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(value_type = Option<Object>))]
+        interaction: Option<serde_json::Value>,
     },
     #[serde(rename = "stt_result")]
     STTResult {
@@ -352,6 +459,11 @@ pub enum OutgoingMessage {
         /// no-translation case), so non-translation sessions see no change.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         translations: Vec<crate::core::stt::standard::Translation>,
+        /// The language the recogniser heard, when it names one: a multilingual Deepgram
+        /// model (`language: "multi"`) gives a code such as `de`, OpenAI's Whisper a name such
+        /// as `german`. Skipped on the wire otherwise.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detected_language: Option<String>,
     },
     #[serde(rename = "message")]
     Message {
@@ -445,6 +557,17 @@ pub enum OutgoingMessage {
         name: String,
         status: String,
     },
+    /// Voice agent: a call to a function the session declared, for the client to run. Only
+    /// `/v1/realtime` lets a session declare one.
+    #[serde(rename = "agent_function_call")]
+    AgentFunctionCall {
+        turn_index: u64,
+        item_id: String,
+        call_id: String,
+        name: String,
+        /// The arguments, as the JSON text the agent wrote.
+        arguments: String,
+    },
     /// Voice agent: a structured-output agent's JSON.
     #[serde(rename = "agent_output")]
     AgentOutput {
@@ -499,6 +622,8 @@ pub enum OutgoingMessage {
 #[derive(Debug)]
 pub enum MessageRoute {
     Outgoing(OutgoingMessage),
+    /// A pre-serialised JSON text frame (the interaction-mode events).
+    Json(String),
     Binary(Bytes),
     Close,
     /// Close with a code and reason (FRD-023 RT6: 1013 when a leg's deployment is at capacity,
@@ -712,6 +837,50 @@ impl IncomingMessage {
             IncomingMessage::Clear => {}
             IncomingMessage::AudioEnd => {}
             IncomingMessage::Truncate { .. } => {}
+            IncomingMessage::Control { kind: id, .. }
+            | IncomingMessage::TaskCancel { task_id: id, .. }
+            | IncomingMessage::TaskSeen { task_id: id }
+            | IncomingMessage::PlaybackPosition {
+                utterance_id: id, ..
+            } => {
+                let task_id = id;
+                if task_id.len() > MAX_STREAM_ID_SIZE {
+                    return Err(MessageValidationError::StreamIdTooLarge {
+                        size: task_id.len(),
+                        max: MAX_STREAM_ID_SIZE,
+                    });
+                }
+            }
+            IncomingMessage::TaskAnswer {
+                request_id,
+                value,
+                correction,
+                ..
+            } => {
+                if request_id.len() > MAX_STREAM_ID_SIZE {
+                    return Err(MessageValidationError::StreamIdTooLarge {
+                        size: request_id.len(),
+                        max: MAX_STREAM_ID_SIZE,
+                    });
+                }
+                let content = value.as_ref().map_or(0, |value| value.to_string().len())
+                    + correction.as_ref().map_or(0, String::len);
+                if content > MAX_MESSAGE_CONTENT_SIZE {
+                    return Err(MessageValidationError::MessageContentTooLarge {
+                        size: content,
+                        max: MAX_MESSAGE_CONTENT_SIZE,
+                    });
+                }
+            }
+            IncomingMessage::InteractionUpdate { patch } => {
+                let size = patch.to_string().len();
+                if size > MAX_MESSAGE_CONTENT_SIZE {
+                    return Err(MessageValidationError::MessageContentTooLarge {
+                        size,
+                        max: MAX_MESSAGE_CONTENT_SIZE,
+                    });
+                }
+            }
             IncomingMessage::AgentInput { text } => {
                 if text.len() > MAX_SPEAK_TEXT_SIZE {
                     return Err(MessageValidationError::SpeakTextTooLarge {
@@ -763,6 +932,7 @@ mod tests {
             resolved_alias: None,
             audio_in_codec: None,
             audio_out_codec: None,
+            interaction: None,
         };
 
         let json = serde_json::to_string(&ready).expect("Should serialize");
@@ -786,6 +956,7 @@ mod tests {
             resolved_alias: None,
             audio_in_codec: None,
             audio_out_codec: None,
+            interaction: None,
         };
 
         let json = serde_json::to_string(&ready).expect("Should serialize");
@@ -808,6 +979,7 @@ mod tests {
             resolved_alias: None,
             audio_in_codec: None,
             audio_out_codec: None,
+            interaction: None,
         };
 
         let json = serde_json::to_string(&ready).expect("Should serialize");
@@ -834,6 +1006,7 @@ mod tests {
             resolved_alias: None,
             audio_in_codec: None,
             audio_out_codec: None,
+            interaction: None,
         };
 
         let json = serde_json::to_string(&ready).expect("Should serialize");
@@ -853,6 +1026,7 @@ mod tests {
             resolved_alias: None,
             audio_in_codec: None,
             audio_out_codec: None,
+            interaction: None,
         };
 
         let json = serde_json::to_string(&ready).expect("Should serialize");
@@ -882,6 +1056,7 @@ mod tests {
             resolved_alias: None,
             audio_in_codec: Some("opus".to_string()),
             audio_out_codec: Some("linear16".to_string()),
+            interaction: None,
         };
         let json = serde_json::to_string(&with_opus).expect("serialize");
         assert!(json.contains(r#""audio_in_codec":"opus""#), "got {json}");
@@ -901,6 +1076,7 @@ mod tests {
             resolved_alias: None,
             audio_in_codec: None,
             audio_out_codec: None,
+            interaction: None,
         };
         let json = serde_json::to_string(&default).expect("serialize");
         assert!(!json.contains("audio_in_codec"), "got {json}");
@@ -1099,8 +1275,86 @@ mod tests {
             conversation_config: None,
             agent: None,
             alias: None,
+            interaction: None,
         };
         assert!(msg.validate_size().is_ok());
+    }
+
+    #[test]
+    fn interaction_messages_parse_and_are_size_checked() {
+        let answer: IncomingMessage = serde_json::from_str(
+            r#"{"type":"task_answer","request_id":"q_task_1","outcome":"decline","correction":"make it four"}"#,
+        )
+        .expect("task_answer");
+        assert!(answer.validate_size().is_ok());
+        assert!(matches!(
+            answer,
+            IncomingMessage::TaskAnswer { value: None, correction: Some(c), .. } if c == "make it four"
+        ));
+        let cancel: IncomingMessage =
+            serde_json::from_str(r#"{"type":"task_cancel","task_id":"task_1"}"#).expect("cancel");
+        assert!(matches!(cancel, IncomingMessage::TaskCancel { task_id } if task_id == "task_1"));
+        let update: IncomingMessage = serde_json::from_str(
+            r#"{"type":"interaction_update","patch":{"policy":{"ack_due_ms":250}}}"#,
+        )
+        .expect("update");
+        assert!(update.validate_size().is_ok());
+
+        let long = "x".repeat(MAX_MESSAGE_CONTENT_SIZE + 1);
+        let too_large = IncomingMessage::InteractionUpdate {
+            patch: serde_json::json!({ "front": { "preferred_name": long.clone() } }),
+        };
+        assert!(too_large.validate_size().is_err());
+        let too_large = IncomingMessage::TaskAnswer {
+            request_id: "q_task_1".to_string(),
+            outcome: TaskAnswerOutcome::Decline,
+            value: None,
+            correction: Some(long),
+        };
+        assert!(too_large.validate_size().is_err());
+        let too_large = IncomingMessage::TaskCancel {
+            task_id: "t".repeat(MAX_STREAM_ID_SIZE + 1),
+        };
+        assert!(too_large.validate_size().is_err());
+    }
+
+    #[test]
+    fn the_interaction_block_is_optional_on_config_and_ready() {
+        let plain: IncomingMessage = serde_json::from_str(r#"{"type":"config"}"#).expect("config");
+        assert!(matches!(
+            plain,
+            IncomingMessage::Config {
+                interaction: None,
+                ..
+            }
+        ));
+        let asked: IncomingMessage =
+            serde_json::from_str(r#"{"type":"config","interaction":{"duplex":{"eager":false}}}"#)
+                .expect("config");
+        assert!(matches!(
+            asked,
+            IncomingMessage::Config { interaction: Some(block), .. } if block["duplex"]["eager"] == false
+        ));
+
+        // A session without the mode sends `ready` as before: no `interaction` key.
+        let ready = |interaction| OutgoingMessage::Ready {
+            protocol_version: PROTOCOL_VERSION.to_string(),
+            stream_id: "s".to_string(),
+            livekit_room_name: None,
+            livekit_url: None,
+            waav_participant_identity: None,
+            waav_participant_name: None,
+            resolved_alias: None,
+            audio_in_codec: None,
+            audio_out_codec: None,
+            interaction,
+        };
+        assert_eq!(
+            serde_json::to_string(&ready(None)).unwrap(),
+            r#"{"type":"ready","protocol_version":"1.0","stream_id":"s"}"#
+        );
+        let on = serde_json::to_value(ready(Some(serde_json::json!({ "enabled": true })))).unwrap();
+        assert_eq!(on["interaction"]["enabled"], true);
     }
 
     #[test]
@@ -1206,6 +1460,7 @@ mod tests {
                 confidence: 0.9,
                 segment_transcript: None,
                 translations: Vec::new(),
+                detected_language: None,
             }),
             MessageClass::Transcript,
         )
@@ -1248,6 +1503,7 @@ mod tests {
                 confidence: 0.5,
                 segment_transcript: None,
                 translations: Vec::new(),
+                detected_language: None,
             }),
             MessageClass::Transcript,
         )

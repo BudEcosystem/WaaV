@@ -69,6 +69,7 @@ SDK_CONFIG_REACH: dict[str, set[str]] = {
         "dag_config",
         "conversation_config",
         "alias",  # P3 server-side alias name (ws/session.py::_send_config)
+        "interaction",  # protocol 1.1 interaction mode, sent as-is (WebSocketSession.interaction)
     },
     # ---- STTWebSocketConfig (config.rs:296) -----------------------------------
     "STTWebSocketConfig": {

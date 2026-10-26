@@ -723,6 +723,62 @@ pub struct TurnAttribution {
     pub endpoint_name: Option<String>,
 }
 
+/// The `voice.turn` span of one conversation turn: the session, what the caller said and, in
+/// Bud mode, who the caller is. The turn's LLM calls are made inside it.
+pub fn turn_span(
+    session_id: &str,
+    transcript: &str,
+    attribution: Option<&TurnAttribution>,
+) -> tracing::Span {
+    use crate::observability::voice_attrs::turn;
+    let span = crate::voice_turn_span!(capability = "conversation", transport = "websocket");
+    span.record(turn::SESSION_ID, session_id);
+    span.record(turn::TRANSCRIPT, transcript);
+    if let Some(a) = attribution {
+        for (key, value) in [
+            (turn::PROJECT_ID, &a.project_id),
+            (turn::API_KEY_ID, &a.api_key_id),
+            (turn::API_KEY_PROJECT_ID, &a.api_key_project_id),
+            (turn::USER_ID, &a.user_id),
+            (turn::ENDPOINT_NAME, &a.endpoint_name),
+        ] {
+            if let Some(v) = value.as_deref().filter(|v| !v.is_empty()) {
+                span.record(key, v);
+            }
+        }
+    }
+    span
+}
+
+/// Build the LLM clients of a conversation: the fast tier and, when one is configured, the
+/// reasoning tier (which shares the fast tier's histories and registry).
+///
+/// Validates the LLM `base_url` for SSRF (resolve-then-validate, with the
+/// `WAAV_ALLOW_LOOPBACK_ENDPOINTS=1` test escape hatch) before building the
+/// client, since `base_url` is client-supplied. `functions`, when given, is
+/// advertised on every request of both tiers.
+pub fn resolve_llm_legs(
+    config: &ConversationConfig,
+    functions: Option<Arc<crate::core::llm::FunctionRegistry>>,
+) -> Result<(Arc<LlmClient>, Option<Arc<LlmClient>>), ConversationOrchestratorError> {
+    if !config.server_llm_endpoint {
+        validate_llm_url(&config.base_url).map_err(ConversationOrchestratorError::InvalidLlmUrl)?;
+    }
+    // S1/S2: the reasoning tier's base_url is ALSO client-supplied — validate
+    // it for SSRF before it is ever used for a request.
+    if let Some(rb) = &config.reasoning_base_url {
+        validate_llm_url(rb).map_err(ConversationOrchestratorError::InvalidLlmUrl)?;
+    }
+
+    let llm = LlmClient::new(config.to_client_config());
+    let llm = Arc::new(match functions {
+        Some(registry) => llm.with_functions(registry),
+        None => llm,
+    });
+    let reasoning_llm = build_reasoning_tier(&llm, config);
+    Ok((llm, reasoning_llm))
+}
+
 impl ConversationOrchestrator {
     /// The key for the next LLM call: the session's live credential when it has one (FRD-023 RT6,
     /// a Bud caller reaching budgateway), else the configured `api_key`.
@@ -743,18 +799,7 @@ impl ConversationOrchestrator {
         config: ConversationConfig,
         voice_manager: Arc<VoiceManager>,
     ) -> Result<Self, ConversationOrchestratorError> {
-        if !config.server_llm_endpoint {
-            validate_llm_url(&config.base_url)
-                .map_err(ConversationOrchestratorError::InvalidLlmUrl)?;
-        }
-        // S1/S2: the reasoning tier's base_url is ALSO client-supplied — validate
-        // it for SSRF before it is ever used for a request.
-        if let Some(rb) = &config.reasoning_base_url {
-            validate_llm_url(rb).map_err(ConversationOrchestratorError::InvalidLlmUrl)?;
-        }
-
-        let llm = Arc::new(LlmClient::new(config.to_client_config()));
-        let reasoning_llm = build_reasoning_tier(&llm, &config);
+        let (llm, reasoning_llm) = resolve_llm_legs(&config, None)?;
         Ok(Self {
             session_id: session_id.into(),
             llm,
@@ -1232,29 +1277,11 @@ impl ConversationOrchestrator {
     /// whatever the executor runs next on that thread, which silently mis-attributes the very
     /// legs this exists to measure.
     pub async fn run_turn(&self, transcript: &str) -> Result<(), ConversationOrchestratorError> {
-        let span = crate::voice_turn_span!(capability = "conversation", transport = "websocket");
-        span.record(
-            crate::observability::voice_attrs::turn::SESSION_ID,
-            self.session_id.as_str(),
-        );
-        span.record(
-            crate::observability::voice_attrs::turn::TRANSCRIPT,
+        let span = turn_span(
+            &self.session_id,
             transcript,
+            self.config.attribution.as_ref(),
         );
-        if let Some(a) = &self.config.attribution {
-            use crate::observability::voice_attrs::turn;
-            for (key, value) in [
-                (turn::PROJECT_ID, &a.project_id),
-                (turn::API_KEY_ID, &a.api_key_id),
-                (turn::API_KEY_PROJECT_ID, &a.api_key_project_id),
-                (turn::USER_ID, &a.user_id),
-                (turn::ENDPOINT_NAME, &a.endpoint_name),
-            ] {
-                if let Some(v) = value.as_deref().filter(|v| !v.is_empty()) {
-                    span.record(key, v);
-                }
-            }
-        }
         tracing::Instrument::instrument(self.run_turn_inner(transcript), span).await
     }
 

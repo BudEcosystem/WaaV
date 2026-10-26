@@ -81,6 +81,42 @@ impl DAGDefinition {
         }
     }
 
+    /// Whether the graph produces audio for the caller: an audio output, a text-to-speech
+    /// node or a speech-to-speech node. Interaction mode speaks for the session itself, so
+    /// such a graph cannot be its background.
+    pub fn has_audio_output(&self) -> bool {
+        self.nodes.iter().any(|node| {
+            matches!(
+                node.node_type,
+                NodeType::AudioOutput { .. }
+                    | NodeType::TtsProvider { .. }
+                    | NodeType::RealtimeProvider { .. }
+            )
+        })
+    }
+
+    /// Whether the graph ends in text for the caller (a `text_output` node).
+    pub fn has_text_output(&self) -> bool {
+        let text = |node: &NodeDefinition| matches!(node.node_type, NodeType::TextOutput { .. });
+        self.nodes.iter().any(text)
+    }
+
+    /// Whether a run of the graph may call something outside the gateway other than its
+    /// models: an endpoint node or a webhook.
+    pub fn has_endpoints(&self) -> bool {
+        self.nodes.iter().any(|node| {
+            matches!(
+                node.node_type,
+                NodeType::HttpEndpoint { .. }
+                    | NodeType::GrpcEndpoint { .. }
+                    | NodeType::WebSocketEndpoint { .. }
+                    | NodeType::IpcEndpoint { .. }
+                    | NodeType::LiveKitEndpoint { .. }
+                    | NodeType::WebhookOutput { .. }
+            )
+        })
+    }
+
     /// Add a node to the DAG
     pub fn add_node(&mut self, node: NodeDefinition) -> &mut Self {
         self.nodes.push(node);

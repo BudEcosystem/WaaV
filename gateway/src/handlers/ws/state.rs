@@ -58,6 +58,12 @@ pub struct ConnectionState {
     pub leg_admissions: Vec<crate::core::deployment_policy::Admission>,
     /// Spec 025: the session's voice agent, when `config.agent` named one.
     pub agent: Option<Arc<crate::core::agent::AgentEngine>>,
+    /// Interaction mode: the `interaction` value of the session's `config` (or the server's
+    /// default block), and whether the session sent it itself. `None` for a session that
+    /// asked for nothing.
+    pub interaction_request: Option<(serde_json::Value, bool)>,
+    /// Interaction mode: the session's actor, once it runs.
+    pub interaction: Option<crate::core::interaction::actor::InteractionHandle>,
 
     /// D8 uplink opus decoder (feature `opus-codec`): `Some` only when the session negotiated
     /// `stt_config.audio_in_codec = opus`. Each client WS binary frame is one opus packet decoded
@@ -106,6 +112,8 @@ impl ConnectionState {
             leg_meter: None,
             leg_admissions: Vec::new(),
             agent: None,
+            interaction_request: None,
+            interaction: None,
             #[cfg(feature = "opus-codec")]
             opus_decoder: None,
             #[cfg(feature = "dag-routing")]
@@ -138,6 +146,8 @@ impl ConnectionState {
             leg_meter: None,
             leg_admissions: Vec::new(),
             agent: None,
+            interaction_request: None,
+            interaction: None,
             #[cfg(feature = "opus-codec")]
             opus_decoder: None,
             #[cfg(feature = "dag-routing")]

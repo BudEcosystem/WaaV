@@ -19,7 +19,7 @@
 
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -1225,7 +1225,8 @@ impl LlmClient {
         let mut finish_reason: Option<String> = None;
         let mut usage: Option<Usage> = None;
         // index → (id, name, accumulated args)
-        let mut tool_call_builders: HashMap<u32, (String, String, String)> = HashMap::new();
+        // By index, so the calls of a round keep the order the model wrote them in.
+        let mut tool_call_builders: BTreeMap<u32, (String, String, String)> = BTreeMap::new();
         let mut parse_state = adapter::StreamParseState::default();
         let mut stream_done = false;
 

@@ -1,0 +1,9 @@
+{
+  "type": "config",
+  "agent": {"id": "support"},
+  "alias": "support-interactive",
+  "interaction": {
+    "front": {"caller": {"verbosity": "brief"}},
+    "events": {"floor": true}
+  }
+}

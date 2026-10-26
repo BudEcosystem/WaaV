@@ -1,0 +1,50 @@
+# compose_line.gbnf: the compose-mode line grammar alone (W2 sections 3.2.5 and 3.2.6), for the same
+# turn as act_grammar.gbnf. Lines are built only from phrase-bank fragments and copy spans of the
+# caller's newest utterance (pronouns turned; spans never contain the caller's 'you'; restating spans
+# stop before verbs, auxiliaries and claim words). Used to compile-check bank lines and to test lines.
+root ::= ack | restate | clarify | social | refuse | prog-t1
+opener ::= "Okay" | "Got it" | "Alright" | "One moment" | "Good question"
+inquiry ::= "let me check" | "let me check whether" | "I'll find out if" | "I'll look into" | "let me look into"
+a10-1 ::= "fare"
+a9-2 ::= "the" ( " " a10-1 )?
+a8-3 ::= "in" ( " " a9-2 )?
+a7-4 ::= "included" ( " " a8-3 )?
+a6-5 ::= "is" ( " " a7-4 )?
+a5-6 ::= "bag" ( " " a6-5 )?
+a4-7 ::= "your" ( " " a5-6 )?
+a10-2 ::= "fare"
+a9-3 ::= "the" ( " " a10-2 )?
+a8-4 ::= "in" ( " " a9-3 )?
+a7-5 ::= "included" ( " " a8-4 )?
+a6-6 ::= "is" ( " " a7-5 )?
+a5-7 ::= "bag" ( " " a6-6 )?
+a10-4 ::= "fare"
+a9-5 ::= "the" ( " " a10-4 )?
+a8-6 ::= "in" ( " " a9-5 )?
+a7-7 ::= "included" ( " " a8-6 )?
+a10-5 ::= "fare"
+a9-6 ::= "the" ( " " a10-5 )?
+a8-7 ::= "in" ( " " a9-6 )?
+a10-6 ::= "fare"
+a9-7 ::= "the" ( " " a10-6 )?
+a10-7 ::= "fare"
+aspan ::= a4-7 | a5-7 | a7-7 | a8-7 | a9-7 | a10-7
+ack ::= opener ( ", " inquiry ( " " aspan )? )? "."
+uopener ::= "Okay" | "Got it" | "Alright"
+r5-6 ::= "bag"
+r4-7 ::= "your" ( " " r5-6 )?
+r5-7 ::= "bag"
+r10-5 ::= "fare"
+r9-6 ::= "the" ( " " r10-5 )?
+r8-7 ::= "in" ( " " r9-6 )?
+r10-6 ::= "fare"
+r9-7 ::= "the" ( " " r10-6 )?
+r10-7 ::= "fare"
+rspan ::= r4-7 | r5-7 | r8-7 | r9-7 | r10-7
+closer ::= " instead" | " then"
+restate ::= uopener ", " rspan closer? "."
+social ::= "Hi there, how can I help with your travel?" | "You're very welcome." | "Thanks for calling Northwind Travel. Safe travels." | "Yes, I'm here." | "You've reached Northwind Travel. I'm Ava, an automated assistant." | "I'm doing well, thanks for asking." | "That sounds lovely." | "Fair enough." | "I hear you." | "Glad to hear it."
+refuse ::= "That's not something I can help with on this call." | "Sorry, I can't help with that here." | "I'm not able to help with that on this line." | "That's outside what I can do on this call."
+wopener ::= "Still working on it" | "I'm still on it" | "Still checking on that" | "It's still in progress"
+prog-t1 ::= wopener "." | "Still working on your flight search."
+clarify ::= "Sorry, could you say that again?" | "Sorry, I didn't catch that. Could you repeat it?" | "Sorry, the line cut out. Could you say that again?" | "Could you say that once more?" | "Sorry, did you say " rspan "?"

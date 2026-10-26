@@ -184,6 +184,14 @@ impl From<TTSConfig> for StandardTTSConfig {
     }
 }
 
+/// Whether `provider` has a streaming TTS variant that `features.streaming` selects: Deepgram's
+/// WebSocket, ElevenLabs' HTTP streaming endpoint. The others synthesise over their plain HTTP
+/// API (the `/ws` session is told so in a `config_warning`).
+pub fn has_streaming_variant(provider: &str) -> bool {
+    let provider = provider.trim();
+    provider.eq_ignore_ascii_case("deepgram") || provider.eq_ignore_ascii_case("elevenlabs")
+}
+
 /// Create a TTS provider from the standardized config — the reachable W1 keystone path, mirroring
 /// [`crate::core::stt::standard::create_stt_standard`].
 ///
@@ -204,8 +212,7 @@ pub fn create_tts_standard(
     // streaming variant where one exists. Providers without a WS variant degrade
     // gracefully to their HTTP path with a warning (RC5) — never an error.
     let streaming_requested = config.features.streaming == Some(true);
-    let has_ws_variant = matches!(provider_key.as_str(), "deepgram");
-    if streaming_requested && !has_ws_variant {
+    if streaming_requested && !has_streaming_variant(&provider_key) {
         tracing::warn!(
             provider = %provider,
             "features.streaming=true requested but this provider has no WebSocket \

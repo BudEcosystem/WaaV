@@ -883,6 +883,7 @@ mod tests {
             confidence: result.confidence,
             segment_transcript: result.segment_transcript.clone(),
             translations: result.translations.clone(),
+            detected_language: None,
         };
         let json = serde_json::to_string(&egress).unwrap();
         assert!(json.contains("\"translations\":[{"));

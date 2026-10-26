@@ -635,7 +635,9 @@ fn azure_voices_list_url(region: &str) -> Result<String, String> {
         get,
         path = "/voices",
         responses(
-            (status = 200, description = "Available voices grouped by provider", body = HashMap<String, Vec<Voice>>),
+            (status = 200, description = "Available voices grouped by provider. A configured vendor whose list could not be read is left out and named in the `x-voices-failed` header (`vendor: reason; ...`)", body = HashMap<String, Vec<Voice>>,
+                headers(("x-voices-failed" = String, description = "The vendors whose voice list failed, with their reason"))),
+            (status = 502, description = "Every configured vendor refused or failed its voice list; the body names each vendor's reason"),
             (status = 500, description = "Internal server error")
         ),
         security(
@@ -644,10 +646,10 @@ fn azure_voices_list_url(region: &str) -> Result<String, String> {
         tag = "voices"
     )
 )]
-pub async fn list_voices(
-    State(state): State<Arc<AppState>>,
-) -> Result<Json<VoicesResponse>, StatusCode> {
+pub async fn list_voices(State(state): State<Arc<AppState>>) -> axum::response::Response {
     let mut voices_response = HashMap::new();
+    // The vendors that refused or failed their voice list, with what they said.
+    let mut failed: Vec<(&str, String)> = Vec::new();
 
     // Fetch ElevenLabs voices - skip if not configured
     if let Ok(api_key) = state.config.get_api_key("elevenlabs") {
@@ -657,6 +659,7 @@ pub async fn list_voices(
             }
             Err(e) => {
                 tracing::warn!("Failed to fetch ElevenLabs voices: {}", e);
+                failed.push(("elevenlabs", e.to_string()));
             }
         }
     } else {
@@ -671,6 +674,7 @@ pub async fn list_voices(
             }
             Err(e) => {
                 tracing::warn!("Failed to fetch Deepgram voices: {}", e);
+                failed.push(("deepgram", e.to_string()));
             }
         }
     } else {
@@ -686,6 +690,7 @@ pub async fn list_voices(
             }
             Err(e) => {
                 tracing::warn!("Failed to fetch Google TTS voices: {}", e);
+                failed.push(("google", e.to_string()));
             }
         }
     } else {
@@ -701,13 +706,60 @@ pub async fn list_voices(
             }
             Err(e) => {
                 tracing::warn!("Failed to fetch Azure TTS voices: {}", e);
+                failed.push(("azure", e.to_string()));
             }
         }
     } else {
         tracing::debug!("Azure Speech credentials not configured, skipping");
     }
 
-    Ok(Json(voices_response))
+    voices_answer(voices_response, failed)
+}
+
+/// The `/voices` answer: the lists that came back. A vendor that failed is named in the
+/// `x-voices-failed` header (`vendor: reason; …`); when every configured vendor failed, the
+/// answer is 502 with each vendor's reason instead of an empty 200.
+fn voices_answer(voices: VoicesResponse, failed: Vec<(&str, String)>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if failed.is_empty() {
+        return Json(voices).into_response();
+    }
+    if voices.is_empty() {
+        let errors: HashMap<&str, String> = failed.into_iter().collect();
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "error": "no voice list could be read from the configured vendors",
+                "providers": errors,
+            })),
+        )
+            .into_response();
+    }
+    let named: Vec<String> = failed
+        .iter()
+        .map(|(vendor, reason)| format!("{vendor}: {reason}"))
+        .collect();
+    // A header carries visible ASCII only.
+    let header: String = named
+        .join("; ")
+        .chars()
+        .map(|c| {
+            if c.is_ascii_graphic() || c == ' ' {
+                c
+            } else {
+                ' '
+            }
+        })
+        .take(1024)
+        .collect();
+    let mut response = Json(voices).into_response();
+    if let Ok(value) = axum::http::HeaderValue::from_str(&header) {
+        response.headers_mut().insert(
+            axum::http::HeaderName::from_static("x-voices-failed"),
+            value,
+        );
+    }
+    response
 }
 
 // =============================================================================
@@ -781,6 +833,96 @@ pub(crate) async fn fetch_catalog_with_key(
     Some(fetched.map_err(|e| e.to_string()))
 }
 
+/// A credential as a cache key holds it: hashed, never the key itself.
+fn credential_hash(key: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut h);
+    h.finish()
+}
+
+/// One vendor list as [`fetch_catalog_shared`] keeps it: read once, shared by every session
+/// asking with the same credential while it is fresh.
+struct SharedCatalog {
+    since: std::time::Instant,
+    list: Arc<tokio::sync::OnceCell<Vec<Voice>>>,
+}
+
+fn shared_catalogs() -> &'static parking_lot::Mutex<HashMap<String, SharedCatalog>> {
+    static CATALOGS: std::sync::OnceLock<parking_lot::Mutex<HashMap<String, SharedCatalog>>> =
+        std::sync::OnceLock::new();
+    CATALOGS.get_or_init(Default::default)
+}
+
+/// As [`fetch_catalog_with_key`], kept in this process per vendor and credential (hashed) for
+/// [`VOICE_CATALOG_CACHE_TTL_SECS`]; a caller that comes while the list is being read waits
+/// for that read instead of making its own. Only a list that was read is kept: a failure is
+/// tried again by the next caller. Interaction mode reads it at session start (and the server
+/// at its start), so a language switch does not wait on the vendor (live CT2: Deepgram's
+/// `/v1/models` took 3 to 30 s from this machine).
+pub(crate) async fn fetch_catalog_shared(
+    provider: &str,
+    api_key: &str,
+) -> Option<Result<Vec<Voice>, String>> {
+    let vendor = provider.to_lowercase();
+    if !matches!(vendor.as_str(), "elevenlabs" | "eleven_labs" | "deepgram") {
+        return None;
+    }
+    let key = format!("{vendor}:{:x}", credential_hash(api_key));
+    let list = {
+        let mut catalogs = shared_catalogs().lock();
+        let ttl = std::time::Duration::from_secs(VOICE_CATALOG_CACHE_TTL_SECS);
+        // A list is kept no longer than it serves: sessions' own keys would add up otherwise.
+        catalogs.retain(|_, entry| entry.since.elapsed() < ttl);
+        let entry = catalogs.entry(key).or_insert_with(|| SharedCatalog {
+            since: std::time::Instant::now(),
+            list: Arc::default(),
+        });
+        entry.list.clone()
+    };
+    let read = list
+        .get_or_try_init(|| async {
+            match fetch_catalog_with_key(&vendor, api_key).await {
+                Some(Ok(voices)) => Ok(voices),
+                Some(Err(error)) => Err(error),
+                None => Err("no voice list for this vendor".to_owned()),
+            }
+        })
+        .await;
+    Some(read.cloned())
+}
+
+/// Reads the voice lists of the vendors the server holds a key for into
+/// [`fetch_catalog_shared`]'s store, off the caller's path: at server start when interaction
+/// mode's operator block lets callers switch language (`controls.languages`).
+pub fn prefetch_catalogs(state: &Arc<AppState>) {
+    let server = crate::core::interaction::config::server();
+    let languages = (server.default.as_ref())
+        .and_then(|block| block.pointer("/controls/languages"))
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|languages| !languages.is_empty());
+    if !server.enabled || !languages {
+        return;
+    }
+    for vendor in ["deepgram", "elevenlabs"] {
+        let Ok(key) = state.config.get_api_key(vendor) else {
+            continue;
+        };
+        if key.trim().is_empty() {
+            continue;
+        }
+        tokio::spawn(async move {
+            match fetch_catalog_shared(vendor, key.trim()).await {
+                Some(Ok(voices)) => {
+                    tracing::info!(vendor, voices = voices.len(), "voice list read at start")
+                }
+                // The reason is not logged: a vendor's error may carry its request.
+                _ => tracing::warn!(vendor, "voice list not read at start"),
+            }
+        });
+    }
+}
+
 /// A fetched catalog, or empty — logging why when it is empty because the fetch FAILED.
 ///
 /// Empty is the documented degrade (the resolver falls back to a default), but a silent one hid
@@ -815,12 +957,7 @@ pub(crate) async fn fetch_provider_catalog_with_key(
     // keys see different voice libraries, and a shared entry would hand one of them the other's.
     // The key is hashed, never stored.
     let cache_key = match supplied {
-        Some(key) => {
-            use std::hash::{Hash, Hasher};
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            key.hash(&mut h);
-            format!("voice_catalog:{provider_key}:{:x}", h.finish())
-        }
+        Some(key) => format!("voice_catalog:{provider_key}:{:x}", credential_hash(key)),
         None => format!("voice_catalog:{provider_key}"),
     };
 
@@ -2397,6 +2534,87 @@ pub async fn clone_voice(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The shared voice lists: one read serves its key while fresh, and a list past the TTL is
+    /// dropped on the next read of any key (sessions' own keys do not add up).
+    #[tokio::test]
+    async fn a_shared_voice_list_serves_while_fresh_and_is_dropped_after() {
+        let ttl = std::time::Duration::from_secs(VOICE_CATALOG_CACHE_TTL_SECS + 1);
+        let listed = |id: &str| {
+            let cell = tokio::sync::OnceCell::new();
+            cell.set(vec![Voice {
+                id: id.to_owned(),
+                ..Default::default()
+            }])
+            .unwrap();
+            Arc::new(cell)
+        };
+        let (old, fresh) = (
+            format!("deepgram:{:x}", credential_hash("review-old-key")),
+            format!("deepgram:{:x}", credential_hash("review-fresh-key")),
+        );
+        {
+            let mut catalogs = shared_catalogs().lock();
+            let since = std::time::Instant::now().checked_sub(ttl).unwrap();
+            let list = listed("old");
+            catalogs.insert(old.clone(), SharedCatalog { since, list });
+            let since = std::time::Instant::now();
+            let list = listed("fresh");
+            catalogs.insert(fresh.clone(), SharedCatalog { since, list });
+        }
+        // Served from the store: no request to the vendor.
+        let read = fetch_catalog_shared("deepgram", "review-fresh-key").await;
+        assert_eq!(read.unwrap().unwrap()[0].id, "fresh");
+        let catalogs = shared_catalogs().lock();
+        assert!(
+            !catalogs.contains_key(&old),
+            "a list past its TTL is dropped"
+        );
+        assert!(catalogs.contains_key(&fresh));
+    }
+
+    /// A vendor that refused its list is reported: in a header beside the lists that came
+    /// back, or as a 502 naming it when nothing came back (it was an empty 200).
+    #[tokio::test]
+    async fn a_refused_voice_list_is_reported() {
+        let refused = || {
+            vec![("elevenlabs", "elevenlabs /v2/voices answered 401 Unauthorized: missing the permission voices_read".to_string())]
+        };
+        let only_refused = voices_answer(HashMap::new(), refused());
+        assert_eq!(only_refused.status(), StatusCode::BAD_GATEWAY);
+        let body = axum::body::to_bytes(only_refused.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            body["providers"]["elevenlabs"]
+                .as_str()
+                .unwrap()
+                .contains("voices_read")
+        );
+
+        let mut some = HashMap::new();
+        some.insert("deepgram".to_string(), Vec::new());
+        let partial = voices_answer(some.clone(), refused());
+        assert_eq!(partial.status(), StatusCode::OK);
+        let header = partial.headers()["x-voices-failed"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            header.starts_with("elevenlabs: elevenlabs /v2/voices answered 401"),
+            "{header}"
+        );
+
+        let fine = voices_answer(some, Vec::new());
+        assert_eq!(fine.status(), StatusCode::OK);
+        assert!(fine.headers().get("x-voices-failed").is_none());
+        // Nothing configured: an empty 200, as before.
+        assert_eq!(
+            voices_answer(HashMap::new(), Vec::new()).status(),
+            StatusCode::OK
+        );
+    }
 
     #[test]
     fn elevenlabs_labels_become_age_description_and_use_case() {

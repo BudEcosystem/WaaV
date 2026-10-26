@@ -62,7 +62,7 @@ pub use types::{CanonicalLanguage, LANG_ALIASES};
 /// `model` disambiguates the model-aware providers (Google STT vs TTS, ElevenLabs v2.5).
 pub fn map_language(raw: &str, provider: &str, model: &str) -> MappedLanguage {
     match resolve(raw) {
-        Some(canonical) => to_provider_language(canonical, provider, model),
+        Some(canonical) => get_language_mapper(provider).map_raw(raw, canonical, model),
         None => MappedLanguage::native(raw.to_string()).warn(format!(
             "unrecognized language token '{raw}'; passed to {provider} as-is"
         )),

@@ -61,8 +61,10 @@ pub struct AudioInput {
     pub transcription: Option<InputAudioTranscription>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub noise_reduction: Option<NoiseReduction>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub turn_detection: Option<TurnDetection>,
+    /// `Some(None)` is JSON `null`: manual turns under the provider fix
+    /// `openai_manual_turn_null` ("To clear a field like `turn_detection`, pass `null`").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_detection: Option<Option<TurnDetection>>,
 }
 
 /// GA Realtime `session.audio.output` block.
@@ -402,6 +404,12 @@ pub enum ClientEvent {
     /// Cancel the current response
     #[serde(rename = "response.cancel")]
     ResponseCancel,
+
+    /// A whole event built as JSON (its own `type`): a `session.update` naming only the
+    /// changed fields (fix `openai_update_delta`), or a wire of a provider that reuses this
+    /// one with other field names (Grok, fix `grok_session`).
+    #[serde(untagged)]
+    Raw(serde_json::Value),
 }
 
 impl ClientEvent {
@@ -704,6 +712,9 @@ pub enum ServerEvent {
         call_id: String,
         /// Full arguments
         arguments: String,
+        /// The function's name (GA; read under the fix `openai_inbound`).
+        #[serde(default)]
+        name: Option<String>,
     },
 
     /// Rate limits updated

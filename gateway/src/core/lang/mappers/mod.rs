@@ -16,6 +16,7 @@
 mod aws;
 mod azure;
 mod baidu;
+mod deepgram;
 mod elevenlabs;
 mod google;
 mod iflytek;
@@ -27,6 +28,7 @@ mod tencent;
 pub use aws::{AwsPollyLanguageMapper, AwsTranscribeLanguageMapper};
 pub use azure::AzureLanguageMapper;
 pub use baidu::{BaiduSttLanguageMapper, BaiduTtsLanguageMapper};
+pub use deepgram::DeepgramLanguageMapper;
 pub use elevenlabs::ElevenLabsLanguageMapper;
 pub use google::{GoogleSttLanguageMapper, GoogleTtsLanguageMapper};
 pub use iflytek::IFlytekLanguageMapper;
@@ -172,16 +174,8 @@ impl LanguageMapper for DefaultLanguageMapper {
 pub fn get_language_mapper(provider: &str) -> Box<dyn LanguageMapper> {
     match provider.to_lowercase().as_str() {
         // ===== IDENTITY-BCP47 (region preserved; Chinese zh/cmn override) =====
-        "deepgram" => Box::new(
-            DefaultLanguageMapper::new("deepgram", NotationKind::Bcp47, "Deepgram").with_overrides(
-                NotationMap::empty()
-                    .with(CanonicalLanguage::CmnCn, "zh-CN")
-                    .with(CanonicalLanguage::CmnTw, "zh-TW")
-                    .with(CanonicalLanguage::YueHk, "zh-HK")
-                    // Nova-3 multilingual code-switch (NOT detect_language — streaming gap).
-                    .with_auto("multi"),
-            ),
-        ),
+        // Model-aware: the code each Deepgram model takes (`deepgram.rs`).
+        "deepgram" => Box::new(DeepgramLanguageMapper::new()),
         "azure" | "microsoft-azure" | "microsoft_azure" => Box::new(AzureLanguageMapper),
         "aws-transcribe" | "aws_transcribe" => Box::new(AwsTranscribeLanguageMapper),
         "aws-polly" | "aws_polly" | "amazon-polly" | "polly" => Box::new(AwsPollyLanguageMapper),

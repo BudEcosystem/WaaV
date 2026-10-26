@@ -21,8 +21,9 @@ use bytes::Bytes;
 
 use crate::core::realtime::base::{
     AudioOutputCallback, BaseRealtime, ConnectionState, FunctionCallCallback, RealtimeConfig,
-    RealtimeErrorCallback, RealtimeResponseOverride, RealtimeResult, ReconnectionCallback,
-    ReplayConversationItem, ResponseDoneCallback, SpeechEventCallback, TranscriptCallback,
+    RealtimeErrorCallback, RealtimeResponseOverride, RealtimeResult, RealtimeVerb,
+    ReconnectionCallback, ReplayConversationItem, ResponseDoneCallback, SpeechEventCallback,
+    TranscriptCallback,
 };
 use crate::core::realtime::scaffold::RealtimeSession;
 
@@ -130,18 +131,26 @@ impl BaseRealtime for GrokRealtime {
         self.0.update_session(config).await
     }
 
+    async fn apply_verb(&mut self, verb: RealtimeVerb<'_>) -> RealtimeResult<()> {
+        self.0.apply_verb(verb).await
+    }
+
     async fn submit_function_result(&mut self, call_id: &str, result: &str) -> RealtimeResult<()> {
         self.0.submit_function_result(call_id, result).await
     }
 
     fn get_provider_info(&self) -> serde_json::Value {
+        // The model xAI names (fix `grok_events`), as the driver reports it.
+        let driver = self.0.get_provider_info();
         serde_json::json!({
             "provider": "grok",
+            "named_model": driver["named_model"],
+            "model_pending": driver["model_pending"],
             "api_type": "WebSocket Realtime (xAI)",
             "version": "1.0.0",
             "wire": "OpenAI GA-compatible",
             "auth": "Authorization: Bearer",
-            "endpoint_status": "best-known (not live-probed)",
+            "endpoint_status": "live-probed 23 Oct 2026",
             "features": {
                 "bidirectional_audio": true,
                 "vad": true,

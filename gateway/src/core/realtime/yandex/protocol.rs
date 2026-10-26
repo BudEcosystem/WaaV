@@ -29,7 +29,8 @@
 
 use super::super::openai::protocol::OpenAiProtocol;
 use crate::core::realtime::base::{
-    RealtimeConfig, RealtimeError, RealtimeResponseOverride, RealtimeResult, ReplayConversationItem,
+    RealtimeConfig, RealtimeError, RealtimeResponseOverride, RealtimeResult, RealtimeVerb,
+    ReplayConversationItem,
 };
 use crate::core::realtime::openai::ClientEvent;
 use crate::core::realtime::scaffold::{
@@ -46,6 +47,9 @@ pub(crate) const YANDEX_REALTIME_URL: &str = "wss://ai.api.cloud.yandex.net/v1/r
 /// `gpt://<FOLDER_ID>/<MODEL_NAME>`). From the official example
 /// (`speech-realtime-250923`).
 pub(crate) const YANDEX_DEFAULT_MODEL: &str = "speech-realtime-250923";
+
+/// The most functions a Yandex realtime session should carry.
+const MAX_FUNCTIONS: usize = 8;
 
 /// Yandex Realtime protocol. A thin wrapper over [`OpenAiProtocol`]: the GA wire is
 /// delegated verbatim; only the connect target (the Yandex host + the `gpt://…`
@@ -89,7 +93,12 @@ impl RealtimeProtocol for YandexProtocol {
         // Reuse the OpenAI protocol's validation (api-key non-empty, model/voice/
         // audio-format parsing) verbatim. The api-key (a Yandex IAM token or static
         // API key) MUST be non-empty — `OpenAiProtocol::from_config` enforces that.
-        let inner = OpenAiProtocol::from_config(cfg)?;
+        let mut inner = OpenAiProtocol::from_config(cfg)?;
+        // Yandex documents neither manual turns nor a replayed assistant line's content type
+        // (its per-event reference is not published): today's `{"type": "none"}` and `text`
+        // stay, whatever OpenAI's `openai_manual_turn_null` / `openai_replay_output_text`.
+        inner.fixes.manual_turn_null = false;
+        inner.fixes.replay_output_text = false;
 
         // Yandex needs the FOLDER ID to build the `gpt://<folder>/…` model URI. Read
         // it from `cfg.endpoint` (the generic endpoint slot — the handler injects
@@ -191,7 +200,43 @@ impl RealtimeProtocol for YandexProtocol {
         cfg: &RealtimeConfig,
         resumption: Option<&str>,
     ) -> Vec<Self::Wire> {
-        self.inner.build_session_config(cfg, resumption)
+        // "Connect no more than eight functions at a time"
+        // (<https://aistudio.yandex.ru/docs/en/ai-studio/concepts/agents/realtime>).
+        let functions = cfg.tools.as_ref().map_or(0, Vec::len);
+        if functions > MAX_FUNCTIONS {
+            tracing::warn!(
+                functions,
+                "Yandex realtime takes no more than {MAX_FUNCTIONS} functions at a time"
+            );
+        }
+        let mut wires = self.inner.build_session_config(cfg, resumption);
+        crate::core::realtime::openai::clone::edit_session(&mut wires, |session| {
+            // Fix `openai_clone_voice`: a SpeechKit voice ("compatible with all Yandex
+            // SpeechKit's standard voices and roles"; the examples send `dasha`, `alena`).
+            if cfg.fix("openai_clone_voice") {
+                crate::core::realtime::openai::clone::set_voice(session, cfg.voice.as_deref());
+            }
+            // Fix `yandex_languages`: "Input language is set via `languages`"
+            // (`audio.input.languages`, e.g. `["kk-KZ"]`).
+            if cfg.fix("yandex_languages")
+                && let Some(language) = cfg
+                    .language
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                && let Some(input) = session
+                    .pointer_mut("/audio/input")
+                    .and_then(|i| i.as_object_mut())
+            {
+                input.insert("languages".into(), serde_json::json!([language]));
+            }
+        });
+        wires
+    }
+
+    /// The verbs as OpenAI's (the capability data's "as openai").
+    fn verb(&self, verb: &RealtimeVerb<'_>) -> Option<Vec<Self::Wire>> {
+        self.inner.verb(verb)
     }
 
     fn map_server_event(&self, raw: Inbound<'_>) -> Vec<S2sEvent> {
@@ -441,6 +486,34 @@ mod tests {
         assert!(append_json.contains("input_audio_buffer.append"));
     }
 
+    /// OpenAI's `openai_manual_turn_null` and `openai_replay_output_text` (on by default) leave
+    /// Yandex's frames as today: its reference documents neither.
+    #[test]
+    fn openais_documented_turn_and_replay_fixes_leave_yandex_as_today() {
+        let cfg = RealtimeConfig {
+            turn_detection: Some(crate::core::realtime::base::TurnDetectionConfig::None),
+            provider_fixes: vec![
+                "openai_manual_turn_null".into(),
+                "openai_replay_output_text".into(),
+            ],
+            ..base_cfg()
+        };
+        let p = proto(&cfg);
+        assert_eq!(
+            session_json(&p, &cfg)["audio"]["input"]["turn_detection"],
+            serde_json::json!({"type": "none"})
+        );
+        let item = ReplayConversationItem {
+            role: crate::core::realtime::base::TranscriptRole::Assistant,
+            text: "It is open.".into(),
+        };
+        let replayed = match p.serialize(&p.replay_item(&item)[0]).unwrap() {
+            OutFrame::Text(s) => serde_json::from_str::<serde_json::Value>(&s).unwrap(),
+            OutFrame::Binary(_) => panic!("text frame"),
+        };
+        assert_eq!(replayed["item"]["content"][0]["type"], "text");
+    }
+
     /// Yandex bootstraps with `session.created` (like OpenAI) — delegated mapping.
     #[test]
     fn session_created_maps_via_delegation() {
@@ -451,6 +524,64 @@ mod tests {
                 assert_eq!(session_id.as_deref(), Some("sess_y"));
             }
             other => panic!("expected delegated SessionReady, got {other:?}"),
+        }
+    }
+
+    fn session_json(p: &YandexProtocol, cfg: &RealtimeConfig) -> serde_json::Value {
+        match p.serialize(&p.build_session_config(cfg, None)[0]).unwrap() {
+            OutFrame::Text(s) => {
+                serde_json::from_str::<serde_json::Value>(&s).unwrap()["session"].clone()
+            }
+            OutFrame::Binary(_) => panic!("text frame"),
+        }
+    }
+
+    /// `openai_clone_voice` and `yandex_languages`: the SpeechKit voice as given and the
+    /// input language as `audio.input.languages` (the documented `"voice": "dasha"` and
+    /// `"languages": ["kk-KZ"]`). Off: `alloy` and no languages.
+    #[test]
+    fn the_voice_and_language_fixes_send_speechkits_voice_and_language() {
+        let cfg = RealtimeConfig {
+            voice: Some("dasha".into()),
+            language: Some("kk-KZ".into()),
+            ..base_cfg()
+        };
+        let on = RealtimeConfig {
+            provider_fixes: vec!["openai_clone_voice".into(), "yandex_languages".into()],
+            ..cfg.clone()
+        };
+        let session = session_json(&proto(&on), &on);
+        assert_eq!(session["audio"]["output"]["voice"], "dasha");
+        assert_eq!(
+            session["audio"]["input"]["languages"],
+            serde_json::json!(["kk-KZ"])
+        );
+        let today = session_json(&proto(&cfg), &cfg);
+        assert_eq!(today["audio"]["output"]["voice"], "alloy");
+        assert!(today["audio"]["input"].get("languages").is_none());
+        // A mid-session voice change reaches the wire with the fix.
+        let changed = RealtimeConfig {
+            voice: Some("marina".into()),
+            ..on.clone()
+        };
+        let update = proto(&on).session_update(&on, &changed).unwrap();
+        match proto(&on).serialize(&update[0]).unwrap() {
+            OutFrame::Text(s) => assert!(s.contains(r#""voice":"marina""#), "{s}"),
+            OutFrame::Binary(_) => panic!("text frame"),
+        }
+    }
+
+    /// The verbs are OpenAI's.
+    #[test]
+    fn the_verbs_are_openais() {
+        let p = proto(&base_cfg());
+        assert!(p.verb(&RealtimeVerb::SayExact("x")).is_none());
+        for verb in [
+            RealtimeVerb::SayGuided("x"),
+            RealtimeVerb::AddContext("x"),
+            RealtimeVerb::StopOutput,
+        ] {
+            assert!(p.verb(&verb).is_some(), "{verb:?}");
         }
     }
 }

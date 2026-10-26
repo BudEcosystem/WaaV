@@ -33,6 +33,7 @@
 //! ```
 
 use realfft::{FftError, RealFftPlanner, RealToComplex};
+use std::collections::VecDeque;
 use std::f32::consts::PI;
 use std::sync::Arc;
 use thiserror::Error;
@@ -148,6 +149,7 @@ impl WhisperMelExtractor {
         let mut mel_spec = vec![vec![0.0f32; n_frames]; N_MELS];
 
         // Process each frame
+        let mut column = [0.0f32; N_MELS];
         for frame_idx in 0..n_frames {
             let start = frame_idx * HOP_LENGTH;
             let end = start + N_FFT;
@@ -161,25 +163,9 @@ impl WhisperMelExtractor {
                 });
             }
 
-            // Apply window using SIMD-optimized multiplication
-            // This achieves 4-6x speedup for N_FFT=400 samples
-            simd_ops::apply_window_simd(&audio[start..end], &self.window, &mut self.fft_input);
-
-            // Compute FFT with proper error propagation
-            self.fft
-                .process(&mut self.fft_input, &mut self.fft_output)?;
-
-            // Compute power spectrum (|FFT|^2) using SIMD
-            // Extract real and imaginary parts for SIMD processing
-            let fft_re: Vec<f32> = self.fft_output.iter().map(|c| c.re).collect();
-            let fft_im: Vec<f32> = self.fft_output.iter().map(|c| c.im).collect();
-            let power_spectrum = simd_ops::power_spectrum_simd(&fft_re, &fft_im);
-
-            // Apply mel filterbank using SIMD-optimized dot products
-            // This is the critical inner loop - SIMD achieves 4-6x speedup for 80x201 filterbank
-            for (mel_idx, filter) in self.mel_filterbank.iter().enumerate() {
-                mel_spec[mel_idx][frame_idx] =
-                    simd_ops::mel_filter_dot_simd(filter, &power_spectrum);
+            self.frame_power(&audio[start..end], &mut column)?;
+            for (mel_idx, value) in column.iter().enumerate() {
+                mel_spec[mel_idx][frame_idx] = *value;
             }
         }
 
@@ -187,6 +173,30 @@ impl WhisperMelExtractor {
         self.apply_whisper_normalization(&mut mel_spec);
 
         Ok(mel_spec)
+    }
+
+    /// The mel power of one frame of `N_FFT` samples, before the normalization.
+    fn frame_power(&mut self, frame: &[f32], out: &mut [f32; N_MELS]) -> Result<(), MelError> {
+        // Apply window using SIMD-optimized multiplication
+        // This achieves 4-6x speedup for N_FFT=400 samples
+        simd_ops::apply_window_simd(frame, &self.window, &mut self.fft_input);
+
+        // Compute FFT with proper error propagation
+        self.fft
+            .process(&mut self.fft_input, &mut self.fft_output)?;
+
+        // Compute power spectrum (|FFT|^2) using SIMD
+        // Extract real and imaginary parts for SIMD processing
+        let fft_re: Vec<f32> = self.fft_output.iter().map(|c| c.re).collect();
+        let fft_im: Vec<f32> = self.fft_output.iter().map(|c| c.im).collect();
+        let power_spectrum = simd_ops::power_spectrum_simd(&fft_re, &fft_im);
+
+        // Apply mel filterbank using SIMD-optimized dot products
+        // This is the critical inner loop - SIMD achieves 4-6x speedup for 80x201 filterbank
+        for (value, filter) in out.iter_mut().zip(&self.mel_filterbank) {
+            *value = simd_ops::mel_filter_dot_simd(filter, &power_spectrum);
+        }
+        Ok(())
     }
 
     /// Applies Whisper-style normalization to mel spectrogram using SIMD.
@@ -299,6 +309,66 @@ impl WhisperMelExtractor {
 impl Default for WhisperMelExtractor {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// The spectrogram of a stream of 16 kHz audio, worked out frame by frame as the audio comes:
+/// asking for it costs only the normalization, not the transform of the whole window (in a
+/// debug build 8 s took about 270 ms at once). The frames lie on a grid from the stream's first
+/// sample, and the values are those of [`WhisperMelExtractor::compute`] over the same samples.
+pub struct MelStream {
+    mel: WhisperMelExtractor,
+    /// The samples from the start of the next frame on.
+    pending: Vec<f32>,
+    /// The newest frames as log10 mel power, each with its largest value.
+    frames: VecDeque<([f32; N_MELS], f32)>,
+    max_frames: usize,
+}
+
+impl MelStream {
+    /// Keeps the newest `max_frames` frames.
+    pub fn new(max_frames: usize) -> Self {
+        Self {
+            mel: WhisperMelExtractor::new(),
+            pending: Vec::with_capacity(2 * N_FFT),
+            frames: VecDeque::with_capacity(max_frames),
+            max_frames,
+        }
+    }
+
+    /// The next samples of the stream.
+    pub fn push(&mut self, samples: &[f32]) -> anyhow::Result<()> {
+        self.pending.extend_from_slice(samples);
+        let mut start = 0;
+        while self.pending.len() - start >= N_FFT {
+            let mut frame = [0.0f32; N_MELS];
+            self.mel
+                .frame_power(&self.pending[start..start + N_FFT], &mut frame)?;
+            let max = simd_ops::whisper_norm_log_max_simd(&mut frame);
+            if self.frames.len() == self.max_frames {
+                self.frames.pop_front();
+            }
+            self.frames.push_back((frame, max));
+            start += HOP_LENGTH;
+        }
+        self.pending.drain(..start);
+        Ok(())
+    }
+
+    /// The normalized spectrogram of the frames kept, `[frames][mels]`, oldest first.
+    pub fn frames(&self) -> Vec<Vec<f32>> {
+        let max = self
+            .frames
+            .iter()
+            .fold(f32::NEG_INFINITY, |max, (_, frame_max)| max.max(*frame_max));
+        self.frames
+            .iter()
+            .map(|(frame, _)| {
+                let mut row = frame.to_vec();
+                simd_ops::whisper_norm_threshold_scale_simd(&mut row, max);
+                row
+            })
+            .collect()
     }
 }
 
@@ -546,6 +616,47 @@ mod tests {
                         val
                     );
                 }
+            }
+        }
+    }
+
+    /// The stream's frames are those of the whole window at once, on the same grid: the last
+    /// `max_frames` frames of 3 s fed 512 samples at a time, against `compute` over the samples
+    /// they cover. Bit for bit, the normalization included.
+    #[test]
+    fn a_stream_gives_the_spectrogram_of_its_last_frames() {
+        let audio: Vec<f32> = (0..3 * SAMPLE_RATE)
+            .map(|i| {
+                let t = i as f32 / SAMPLE_RATE as f32;
+                let tone = (2.0 * PI * 220.0 * t).sin() * (0.05 + 0.4 * (t * 1.3).sin().abs());
+                tone + ((i * 7919) % 1013) as f32 / 1013.0 * 0.02
+            })
+            .collect();
+        let max_frames = 100;
+        let mut stream = MelStream::new(max_frames);
+        // Before a whole frame there is nothing.
+        stream.push(&audio[..N_FFT - 1]).expect("push");
+        assert!(stream.frames().is_empty());
+        stream.push(&audio[N_FFT - 1..512]).expect("push");
+        for chunk in audio[512..].chunks(512) {
+            stream.push(chunk).expect("push");
+        }
+        let frames = stream.frames();
+        assert_eq!(frames.len(), max_frames);
+
+        let total = (audio.len() - N_FFT) / HOP_LENGTH + 1;
+        let first = (total - max_frames) * HOP_LENGTH;
+        let covered = &audio[first..first + (max_frames - 1) * HOP_LENGTH + N_FFT];
+        let whole = WhisperMelExtractor::new()
+            .compute(covered)
+            .expect("compute");
+        for (frame_idx, row) in frames.iter().enumerate() {
+            for (mel_idx, value) in row.iter().enumerate() {
+                assert_eq!(
+                    value.to_bits(),
+                    whole[mel_idx][frame_idx].to_bits(),
+                    "frame {frame_idx} mel {mel_idx}"
+                );
             }
         }
     }

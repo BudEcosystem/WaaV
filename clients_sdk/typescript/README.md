@@ -471,6 +471,40 @@ const humeClone = await bud.voice.clone({
 
 ---
 
+## Interaction Mode
+
+With interaction mode (gateway protocol 1.1) the gateway keeps the call alive while a slower background does the work: it acknowledges the caller, runs each request as a task, asks for confirmations and relays the answer word for word. The gateway needs `interaction.enabled`; see `gateway/docs/interaction_mode.md` for every setting and event.
+
+```typescript
+const agent = bud.agent({
+  stt: { provider: 'deepgram', language: 'en-US' },
+  tts: { provider: 'deepgram', voiceId: 'aura-asteria-en' },
+  llm: { baseUrl: 'https://llm.example.com/v1', model: 'my-model' },
+  interaction: true, // or settings, e.g. { hitl: { channels: ['voice', 'client'] } }
+});
+
+agent.on('interaction', (event) => {
+  switch (event.type) {
+    case 'task_question':
+      if (event.channels.includes('client')) agent.answerTask(event.request_id, 'accept');
+      break;
+    case 'task_result':
+      console.log(event.task_ref, event.state, event.summary, event.effects);
+      break;
+  }
+});
+const ready = await agent.connect();
+console.log(ready.protocolVersion, ready.interaction); // '1.1' and the resolved settings
+```
+
+- **Config** - `interaction` on `bud.agent(...)` and `SessionConfig`: `true`, an `InteractionConfig` object (sent as-is, with the gateway's snake_case keys), or `false` to turn off an alias's or the server's default block.
+- **Ready** - `ReadyEvent.protocolVersion` is `'1.1'` and `ReadyEvent.interaction` (also `getInteraction()`) holds the echo. A session that asked and cannot have the mode gets a `configWarning` saying why, and runs as before.
+- **Events** - one `interaction` event per frame, an `InteractionEvent` union discriminated by `type` (`task_created`, `task_progress`, `task_question`, `task_answer_received`, `task_result`, `task_cancelled`, `floor_state`, `audio_segment`, `agent_audio_stopped`, `interaction_updated`, `assistant_transcript`, `unverified_claim` on `/realtime` only), in the gateway's wire shape.
+- **Messages** - `answerTask(requestId, outcome, { value, correction })` (`accept`, `decline`, `cancel`), `cancelTask(taskId)`, `updateInteraction(patch)` (reply: `interaction_updated`), `reportPlayback(utteranceId, playedMs)` (at most four a second, for a client that knows what it actually played).
+- **Tasks** - `bud.listTasks(streamId)` and `bud.getTask(taskId, streamId)` (`GET /v1/tasks`) return `TaskView`; `getTask(...).result` holds the outcome once the task ended. Without authentication the `streamId` is required.
+
+---
+
 ## DAG Configuration
 
 Configure custom audio processing pipelines with DAG routing.

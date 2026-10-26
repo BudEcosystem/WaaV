@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use futures::StreamExt;
+use livekit::participant::ParticipantKind;
 use livekit::prelude::{RemoteTrack, RoomEvent};
 use livekit::webrtc::audio_stream::native::NativeAudioStream;
 use tokio::sync::Mutex;
@@ -109,6 +110,34 @@ impl LiveKitClient {
         }
     }
 
+    /// One frame of a participant's audio to the session's audio callback, through the noise
+    /// filter when it is on.
+    #[cfg_attr(not(feature = "noise-filter"), allow(unused_variables))]
+    async fn deliver_frame(
+        audio_buffer: Vec<u8>,
+        enable_noise_filter: bool,
+        sample_rate: u32,
+        pool: &Arc<Mutex<Vec<Vec<u8>>>>,
+        callback: &AudioCallback,
+    ) {
+        #[cfg(feature = "noise-filter")]
+        if enable_noise_filter {
+            // For noise filtering, we need to clone since the filter may modify the buffer
+            match reduce_noise_async(audio_buffer.clone().into(), sample_rate).await {
+                Ok(filtered_audio) => {
+                    LiveKitClient::return_buffer_to_pool(pool, audio_buffer);
+                    callback(filtered_audio);
+                }
+                Err(e) => {
+                    error!("Error reducing noise: {:?}", e);
+                    callback(audio_buffer);
+                }
+            }
+            return;
+        }
+        callback(audio_buffer);
+    }
+
     async fn handle_room_event(
         event: RoomEvent,
         audio_callback: &Option<AudioCallback>,
@@ -150,6 +179,19 @@ impl LiveKitClient {
                             participant.identity()
                         );
 
+                        // Interaction mode hears one caller: the first whose audio arrives.
+                        let phone = participant.kind() == ParticipantKind::Sip;
+                        if let Some(tap) = &config.caller_tap
+                            && !tap.admits(participant.identity().as_str(), phone)
+                        {
+                            debug!(
+                                "Ignoring audio track from participant {} (not the session's caller)",
+                                participant.identity()
+                            );
+                            return Ok(());
+                        }
+                        let caller_tap = config.caller_tap.clone();
+
                         if let Some(callback) = audio_callback {
                             let callback_clone = Arc::clone(callback);
                             let rtc_track = audio_track.rtc_track();
@@ -162,7 +204,6 @@ impl LiveKitClient {
                             );
 
                             let enable_noise_filter = config.enable_noise_filter;
-                            #[cfg(feature = "noise-filter")]
                             let sample_rate = config.ingress_sample_rate;
                             let participant_id = participant.identity().to_string();
 
@@ -185,6 +226,33 @@ impl LiveKitClient {
                                     );
                                 }
 
+                                // Interaction mode: the caller's frames reach its tap as they
+                                // arrive, ahead of the noise filter. The filter works on a
+                                // queue of its own, so when it is slow (its workers start
+                                // with the first frame) the tap does not wait for it. The
+                                // queue holds 64 frames: beyond that a frame is dropped, as
+                                // the stream drops frames nobody reads, so speech-to-text
+                                // never falls further behind the call.
+                                let filtered = caller_tap.map(|tap| {
+                                    let (queue, mut queued) =
+                                        tokio::sync::mpsc::channel::<Vec<u8>>(64);
+                                    let (callback, pool) =
+                                        (callback_clone.clone(), stream_buffer_pool.clone());
+                                    tokio::spawn(async move {
+                                        while let Some(audio_buffer) = queued.recv().await {
+                                            LiveKitClient::deliver_frame(
+                                                audio_buffer,
+                                                enable_noise_filter,
+                                                sample_rate,
+                                                &pool,
+                                                &callback,
+                                            )
+                                            .await;
+                                        }
+                                    });
+                                    (tap, queue)
+                                });
+
                                 while let Some(audio_frame) = audio_stream.next().await {
                                     debug!(
                                         "Received audio frame: {} samples",
@@ -195,36 +263,29 @@ impl LiveKitClient {
                                         &audio_frame,
                                         Some(&stream_buffer_pool),
                                     );
-
-                                    if enable_noise_filter {
-                                        #[cfg(feature = "noise-filter")]
-                                        {
-                                            // For noise filtering, we need to clone since the filter may modify the buffer
-                                            match reduce_noise_async(
-                                                audio_buffer.clone().into(),
-                                                sample_rate,
-                                            )
-                                            .await
+                                    match &filtered {
+                                        Some((tap, queue)) => {
+                                            tap.audio(&audio_buffer);
+                                            if let Err(
+                                                tokio::sync::mpsc::error::TrySendError::Full(_),
+                                            ) = queue.try_send(audio_buffer)
                                             {
-                                                Ok(filtered_audio) => {
-                                                    LiveKitClient::return_buffer_to_pool(
-                                                        &stream_buffer_pool,
-                                                        audio_buffer,
-                                                    );
-                                                    callback_clone(filtered_audio);
-                                                }
-                                                Err(e) => {
-                                                    error!("Error reducing noise: {:?}", e);
-                                                    callback_clone(audio_buffer);
-                                                }
+                                                crate::core::metrics::bridge::record_degraded(
+                                                    "livekit",
+                                                    "noise_filter_behind",
+                                                );
                                             }
                                         }
-                                        #[cfg(not(feature = "noise-filter"))]
-                                        {
-                                            callback_clone(audio_buffer);
+                                        None => {
+                                            LiveKitClient::deliver_frame(
+                                                audio_buffer,
+                                                enable_noise_filter,
+                                                sample_rate,
+                                                &stream_buffer_pool,
+                                                &callback_clone,
+                                            )
+                                            .await;
                                         }
-                                    } else {
-                                        callback_clone(audio_buffer);
                                     }
                                 }
 
@@ -318,8 +379,24 @@ impl LiveKitClient {
             RoomEvent::ParticipantConnected(participant) => {
                 info!("Participant connected: {}", participant.identity());
             }
+            RoomEvent::SipDTMFReceived {
+                code,
+                digit,
+                participant,
+            } => {
+                if let Some(tap) = &config.caller_tap {
+                    let identity = participant.as_ref().map(|p| p.identity().to_string());
+                    tap.key(identity.as_deref(), code, digit.as_deref());
+                }
+            }
             RoomEvent::ParticipantDisconnected(participant) => {
                 info!("Participant disconnected: {}", participant.identity());
+                if let Some(tap) = &config.caller_tap
+                    && tap.is_other(participant.identity().as_str())
+                {
+                    // The session goes on with its caller.
+                    return Ok(());
+                }
 
                 if let Some(callback) = participant_disconnect_callback {
                     let event = ParticipantDisconnectEvent {

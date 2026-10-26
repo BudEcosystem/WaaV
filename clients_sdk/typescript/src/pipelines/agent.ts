@@ -15,6 +15,7 @@ import type { STTConfig, TTSConfig, ConversationConfig } from '../types/config.j
 import type { TurnDetectionConfig } from '../types/audio-features.js';
 import type { ReconnectConfig } from '../ws/reconnect.js';
 import type { ConnectGate } from '../ws/connect-gate.js';
+import type { InteractionConfig, InteractionEcho, TaskAnswerOutcome } from '../types/interaction.js';
 import { WebSocketSession } from '../ws/session.js';
 import type {
   SessionEventMap,
@@ -73,6 +74,12 @@ export interface AgentConfig {
   streamId?: string;
   /** Custom WebSocket implementation (Node). */
   WebSocket?: typeof WebSocket;
+  /**
+   * Interaction mode (protocol 1.1): `true` or an object of settings. The gateway then
+   * acknowledges, runs each request as a background task and relays its answer; listen on
+   * `interaction` and answer questions with {@link AgentSession.answerTask}.
+   */
+  interaction?: boolean | InteractionConfig;
 }
 
 /**
@@ -118,6 +125,7 @@ export function buildAgentSessionConfig(
   alias?: string;
   turnDetection?: TurnDetectionConfig;
   connectGate?: ConnectGate;
+  interaction?: boolean | InteractionConfig;
 } {
   // An agent needs an LLM from SOMEWHERE: an explicit `llm`, or a server `alias`
   // that resolves one. (stt/tts have sane defaults; the LLM loop does not.)
@@ -160,6 +168,7 @@ export function buildAgentSessionConfig(
   if (config.reconnect !== undefined) out.reconnect = config.reconnect;
   if (config.streamId !== undefined) out.streamId = config.streamId;
   if (turnDetection !== undefined) out.turnDetection = turnDetection;
+  if (config.interaction !== undefined) out.interaction = config.interaction;
   // D7: pass the shared connect gate through (BudClient injects it) so the agent
   // session's connect paces with the rest of the client's sessions.
   if (connectGate !== undefined) out.connectGate = connectGate;
@@ -227,7 +236,37 @@ export class AgentSession {
     this.session.sendMessage(message, role);
   }
 
-  /** Subscribe to a session event (transcript | audio | configWarning | error | ready | ...). */
+  /** Interaction mode: answer a `task_question` (`task_answer`). */
+  answerTask(requestId: string, outcome: TaskAnswerOutcome = 'accept', options?: { value?: unknown; correction?: string }): void {
+    this.session.answerTask(requestId, outcome, options);
+  }
+
+  /** Interaction mode: cancel a task (`task_cancel`). */
+  cancelTask(taskId: string): void {
+    this.session.cancelTask(taskId);
+  }
+
+  /** The caller read the task's result on the screen (`task_seen`). */
+  markTaskSeen(taskId: string): void {
+    this.session.markTaskSeen(taskId);
+  }
+
+  /** Interaction mode: change settings mid-session (`interaction_update`). */
+  updateInteraction(patch: InteractionConfig): void {
+    this.session.updateInteraction(patch);
+  }
+
+  /** Interaction mode: report how much of an utterance was played (`playback_position`). */
+  reportPlayback(utteranceId: string, playedMs: number): void {
+    this.session.reportPlayback(utteranceId, playedMs);
+  }
+
+  /** Interaction mode: the resolved settings from `ready` (undefined without the mode). */
+  getInteraction(): InteractionEcho | undefined {
+    return this.session.getInteraction();
+  }
+
+  /** Subscribe to a session event (transcript | audio | configWarning | interaction | error | ready | ...). */
   on<K extends keyof SessionEventMap>(event: K, handler: SessionEventHandler<K>): () => void {
     return this.session.on(event, handler);
   }

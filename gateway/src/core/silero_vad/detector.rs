@@ -349,17 +349,32 @@ impl SileroVAD {
         }
     }
 
+    /// Speech probability of one chunk handed over WITH the model's context: the last 64
+    /// samples of the previous chunk followed by the chunk itself (576 samples at 16 kHz).
+    /// This is the input Silero v5 was trained on (its reference wrapper prepends the
+    /// context); on the bare chunk that [`Self::process`] feeds, the model scores speech near
+    /// zero. The caller keeps the context and applies the threshold. Used by interaction mode
+    /// only; `process` and its speech tracking are untouched.
+    pub fn probability_with_context(&mut self, context_and_chunk: &[f32]) -> Result<f32> {
+        self.maybe_reset_state();
+        self.infer(context_and_chunk.to_vec())
+    }
+
     /// Runs ONNX inference and returns the speech probability.
     fn run_inference(&mut self) -> Result<f32> {
+        // Input audio: shape [1, chunk_size]
+        let input_data: Vec<f32> = self.input_buffer.iter().copied().collect();
+        self.infer(input_data)
+    }
+
+    /// One inference over `input_data` (shape [1, len]), carrying the recurrent state.
+    fn infer(&mut self, input_data: Vec<f32>) -> Result<f32> {
         // Prepare input tensors using ort 2.0 API.
         // Silero VAD v5 expects: `input`, `state` (unified [2,1,128]), `sr`.
         // (The v4 model used `input`, `sr`, `h`, `c`; feeding those to v5 fails with
         //  `Invalid input name: h` — confirmed live.)
-
-        // Input audio: shape [1, chunk_size]
-        let input_data: Vec<f32> = self.input_buffer.iter().copied().collect();
         let input_tensor = ort::value::Tensor::from_array((
-            [1usize, self.config.chunk_size],
+            [1usize, input_data.len()],
             input_data.into_boxed_slice(),
         ))?;
 

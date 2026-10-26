@@ -37,9 +37,11 @@
 //! - **Binary frames**: Audio data from TTS
 
 mod handler;
+pub(crate) mod interaction;
 pub mod messages;
 
 pub use handler::realtime_handler;
 // Re-exported so the config-plumbing integration test can call the REAL
 // `RealtimeSessionConfig -> RealtimeConfig` converter (no in-test mirror to drift).
 pub use handler::build_realtime_config;
+pub(crate) use handler::{lifecycle_notice, provider_for};

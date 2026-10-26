@@ -61,6 +61,9 @@ pub use mel_extractor::{
 };
 
 #[cfg(feature = "smart-turn")]
+pub use whisper_mel::MelStream;
+
+#[cfg(feature = "smart-turn")]
 pub use detector::{
     SMART_TURN_MAX_FRAMES, SmartTurnDetector, SmartTurnDetectorBuilder, SmartTurnDetectorConfig,
     SmartTurnResult,

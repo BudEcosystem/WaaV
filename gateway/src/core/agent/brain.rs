@@ -48,6 +48,16 @@ pub enum AgentEvent {
         name: String,
         ok: bool,
     },
+    /// A function call finished being written. It is a tool of the agent's own unless the
+    /// session declared a function of that name ([`ClientExtras::tools`]): then the client
+    /// runs it and sends its output with a later run.
+    FunctionCall {
+        item_id: String,
+        name: String,
+        ok: bool,
+        call_id: String,
+        arguments: String,
+    },
     /// The run completed.
     Completed {
         usage: Option<Value>,
@@ -197,6 +207,18 @@ pub struct Truncate {
     pub output_text: String,
 }
 
+/// What a session adds to its agent's runs, where the agent lets a session do so (the GA
+/// cascade's `session.tools` and `session.instructions`). All of it travels as the Responses
+/// API's own request fields.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ClientExtras {
+    /// Function tools the client runs itself.
+    pub tools: Vec<Value>,
+    pub instructions: Option<String>,
+    /// Input items sent ahead of the caller's words: a client tool's output, a system note.
+    pub items: Vec<Value>,
+}
+
 /// One agent turn as the Bud gateway receives it.
 #[derive(Debug, Clone)]
 pub struct AgentTurnRequest {
@@ -212,6 +234,7 @@ pub struct AgentTurnRequest {
     pub truncate: Option<Truncate>,
     pub session_id: String,
     pub turn_index: u64,
+    pub extras: ClientExtras,
 }
 
 impl AgentTurnRequest {
@@ -236,6 +259,21 @@ impl AgentTurnRequest {
         if let Some(t) = &self.truncate {
             body["bud_truncate"] =
                 json!({"response_id": t.response_id, "output_text": t.output_text});
+        }
+        let extras = &self.extras;
+        // A run the client asked for with no words of the caller has a list for its input.
+        if !extras.items.is_empty() || (self.input.is_empty() && extras.instructions.is_some()) {
+            let mut input = extras.items.clone();
+            if !self.input.is_empty() {
+                input.push(json!({"role": "user", "content": self.input}));
+            }
+            body["input"] = Value::Array(input);
+        }
+        if !extras.tools.is_empty() {
+            body["tools"] = Value::Array(extras.tools.clone());
+        }
+        if let Some(instructions) = &extras.instructions {
+            body["instructions"] = Value::from(instructions.as_str());
         }
         body
     }
@@ -391,11 +429,21 @@ pub fn map_event(event: Option<&str>, data: &str) -> Option<AgentEvent> {
             } else {
                 let failed = item.get("status").and_then(Value::as_str) == Some("failed")
                     || item.get("error").is_some_and(|e| !e.is_null());
-                Some(AgentEvent::ToolFinished {
-                    item_id,
-                    name,
-                    ok: !failed,
-                })
+                let text = |key: &str| item.get(key).and_then(Value::as_str).map(str::to_string);
+                match text("call_id").filter(|_| item_type == "function_call") {
+                    Some(call_id) => Some(AgentEvent::FunctionCall {
+                        item_id,
+                        name,
+                        ok: !failed,
+                        call_id,
+                        arguments: text("arguments").unwrap_or_default(),
+                    }),
+                    None => Some(AgentEvent::ToolFinished {
+                        item_id,
+                        name,
+                        ok: !failed,
+                    }),
+                }
             }
         }
         "response.completed" => Some(AgentEvent::Completed {
@@ -662,6 +710,7 @@ mod tests {
             }),
             session_id: "s1".into(),
             turn_index: 4,
+            extras: ClientExtras::default(),
         };
         let b = req.body();
         assert_eq!(
@@ -694,10 +743,69 @@ mod tests {
             truncate: None,
             session_id: "s".into(),
             turn_index: 0,
+            extras: ClientExtras::default(),
         };
         let b = req.body();
         assert!(b["prompt"].get("variables").is_none());
         assert!(b.get("bud_truncate").is_none());
+        // Nothing of a session's own is sent for a session that declared nothing.
+        assert_eq!(b["input"], "hi");
+        assert!(b.get("tools").is_none() && b.get("instructions").is_none());
+
+        // A client tool's output goes ahead of the caller's words, with the session's tools.
+        let output = json!({"type": "function_call_output", "call_id": "call_1", "output": "{}"});
+        let tool = json!({"type": "function", "name": "delegate"});
+        let with = AgentTurnRequest {
+            extras: ClientExtras {
+                tools: vec![tool.clone()],
+                instructions: Some("Say hello.".into()),
+                items: vec![output.clone()],
+            },
+            ..req.clone()
+        };
+        let b = with.body();
+        assert_eq!(
+            b["input"],
+            json!([output, {"role": "user", "content": "hi"}])
+        );
+        assert_eq!(b["tools"], json!([tool]));
+        assert_eq!(b["instructions"], "Say hello.");
+        // A run the client asked for with only instructions has an empty list for its input.
+        let injected = AgentTurnRequest {
+            input: String::new(),
+            extras: ClientExtras {
+                instructions: Some("Say hello.".into()),
+                ..ClientExtras::default()
+            },
+            ..req
+        };
+        assert_eq!(injected.body()["input"], json!([]));
+    }
+
+    #[test]
+    fn a_function_call_carries_its_call_id_and_arguments() {
+        let done = sse(
+            "response.output_item.done",
+            json!({"item": {"id": "fc_1", "type": "function_call", "name": "delegate",
+                            "call_id": "call_1", "arguments": "{\"q\":1}", "status": "completed"}}),
+        );
+        let mut d = SseDecoder::default();
+        let got: Vec<_> = d
+            .push(done.as_bytes())
+            .unwrap()
+            .iter()
+            .filter_map(|(e, data)| map_event(e.as_deref(), data))
+            .collect();
+        assert_eq!(
+            got,
+            vec![AgentEvent::FunctionCall {
+                item_id: "fc_1".into(),
+                name: "delegate".into(),
+                ok: true,
+                call_id: "call_1".into(),
+                arguments: "{\"q\":1}".into(),
+            }]
+        );
     }
 
     #[test]

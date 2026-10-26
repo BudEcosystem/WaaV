@@ -543,6 +543,26 @@ impl BaseTTS for DeepgramTTS {
         Some(&mut self.provider)
     }
 
+    /// The `speed` query parameter (Deepgram's 0.7 to 1.5). The cache key follows it.
+    fn set_speaking_rate(&mut self, rate: f32) -> bool {
+        let builder = &mut self.request_builder;
+        builder.speak.speed = Some(rate.clamp(0.7, 1.5));
+        self.config_hash = compute_tts_config_hash(&builder.config, &builder.speak);
+        true
+    }
+
+    fn takes_rate(&self) -> bool {
+        true
+    }
+
+    /// The `model` query parameter is the voice (`aura-2-celeste-es`). The cache key follows.
+    fn set_voice(&mut self, voice: &str) -> bool {
+        let builder = &mut self.request_builder;
+        builder.config.voice_id = Some(voice.to_owned());
+        self.config_hash = compute_tts_config_hash(&builder.config, &builder.speak);
+        true
+    }
+
     async fn connect(&mut self) -> TTSResult<()> {
         self.provider
             .generic_connect_with_config(DEEPGRAM_TTS_URL, &self.request_builder.config)

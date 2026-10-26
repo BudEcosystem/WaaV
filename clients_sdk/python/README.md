@@ -336,6 +336,39 @@ clone_result = await bud.voice.clone(VoiceCloneRequest(
 
 ---
 
+## Interaction Mode
+
+With interaction mode (gateway protocol 1.1) the gateway keeps the call alive while a slower background does the work: it acknowledges the caller, runs each request as a task, asks for confirmations and relays the answer word for word. The gateway needs `interaction.enabled`; see `gateway/docs/interaction_mode.md` for every setting and event.
+
+```python
+from bud_waav import BudClient, ConversationConfig, TaskQuestion, TaskResult
+
+bud = BudClient(base_url="http://localhost:3001", api_key="your-api-key")
+call = bud.talk.create(
+    stt={"provider": "deepgram", "model": "nova-3"},
+    tts={"provider": "deepgram", "voice_id": "aura-asteria-en"},
+    conversation_config=ConversationConfig(base_url="https://llm.example.com/v1", model="my-model"),
+    interaction=True,  # or an object of settings, e.g. {"hitl": {"channels": ["voice", "client"]}}
+)
+
+async with call:
+    print(call.interaction_settings)  # the resolved settings, None when the gateway refused the mode
+    async for ev in call:
+        event = ev.interaction
+        if isinstance(event, TaskQuestion) and "client" in event.channels:
+            await call.answer_task(event.request_id, "accept")  # a button on the screen
+        elif isinstance(event, TaskResult):
+            print(event.task_ref, event.state, event.summary, event.effects)
+```
+
+- **Config** - `interaction` on `bud.talk.create`, `bud.agent` and `WebSocketSession`: `True`, an object (sent as-is, with the gateway's snake_case keys), or `False` to turn off an alias's or the server's default block.
+- **Ready** - `protocol_version` is `"1.1"` and `interaction_settings` holds the echo. A session that asked and cannot have the mode gets a `warning` event (`config_warning`) saying why, and runs as before.
+- **Events** - one `interaction` event per frame, typed by `type`: `TaskCreated`, `TaskProgress`, `TaskQuestion`, `TaskAnswerReceived`, `TaskResult`, `TaskCancelled`, `FloorState`, `AudioSegment`, `AgentAudioStopped`, `InteractionUpdated`, `AssistantTranscript`, `UnverifiedClaim` (`/realtime` only). In `async for event in call` they arrive as `TalkEvent(type="interaction", interaction=...)`. Unknown fields are kept in `model_extra`.
+- **Messages** - `answer_task(request_id, outcome, value=None, correction=None)` (`accept`, `decline`, `cancel`), `cancel_task(task_id)`, `update_interaction(patch)` (reply: `InteractionUpdated`), `report_playback(utterance_id, played_ms)` (at most four a second, for a client that knows what it actually played).
+- **Tasks** - `await bud.list_tasks(stream_id=...)` and `await bud.get_task(task_id, stream_id=...)` (`GET /v1/tasks`) return `TaskView`; `get_task(...).result` holds the outcome once the task ended. Without authentication the `stream_id` is required.
+
+---
+
 ## DAG Configuration
 
 Configure custom audio processing pipelines with DAG routing.

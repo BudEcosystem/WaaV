@@ -20,8 +20,8 @@ use bytes::Bytes;
 use super::config::{EVIVersion, HumeEVIConfig};
 use super::messages::{
     AudioInput, AudioSettings, EVIClientMessage, EVIServerMessage, HUME_EVI_DEFAULT_SAMPLE_RATE,
-    SessionSettings, StopAssistant, TextInput, ToolResponse, deserialize_server_message,
-    serialize_client_message,
+    HumeTool, SessionSettings, StopAssistant, TextInput, ToolResponse, deserialize_server_message,
+    serialize_client_message, wav_pcm,
 };
 use crate::core::realtime::base::{
     FunctionCallRequest, RealtimeConfig, RealtimeError, RealtimeResponseOverride, RealtimeResult,
@@ -35,6 +35,35 @@ use crate::core::realtime::scaffold::{
 /// (floored). Hume EVI's audio output is linear16 @ [`HUME_EVI_DEFAULT_SAMPLE_RATE`].
 const OUTPUT_BYTES_PER_MS: u64 = (HUME_EVI_DEFAULT_SAMPLE_RATE as u64 * 2) / 1000;
 
+/// EVI's `audio_output`: "The returned audio format is WAV and the sample rate is 48kHz"
+/// (<https://dev.hume.ai/reference/speech-to-speech-evi/chat>). Provider fix `hume_wav_output`.
+const WAV_OUTPUT_SAMPLE_RATE: u32 = 48_000;
+
+/// The provider fixes of the Hume EVI wire (`core::interaction::config::PROVIDER_FIXES`), each
+/// against <https://dev.hume.ai/reference/speech-to-speech-evi/chat> and
+/// <https://dev.hume.ai/docs/speech-to-speech-evi/guides/audio>. All off: today's wire.
+#[derive(Debug, Clone, Copy, Default)]
+struct HumeFixes {
+    /// `hume_user_input`: typed text is `user_input` (today `text_input`, not an EVI message).
+    user_input: bool,
+    /// `hume_audio_settings`: `session_settings` with `audio` is always sent ("Linear 16 PCM
+    /// is a headerless audio format ... you must first send a session_settings message").
+    audio_settings: bool,
+    /// `hume_cancel_local`: a cancel sends nothing (today `stop_assistant`, not an EVI message).
+    cancel_local: bool,
+    /// `hume_tools`: the session's functions go in `session_settings.tools`.
+    tools: bool,
+    /// `hume_voice_settings`: the voice is `session_settings.voice_id`, not a query parameter;
+    /// no `evi_version` query (neither is a documented query parameter).
+    voice_settings: bool,
+    /// `hume_message_ids`: a `user_message` / `assistant_message` without `id` is read.
+    message_ids: bool,
+    /// `hume_wav_output`: `audio_output` is a WAV file at 48 kHz: its samples go out.
+    wav_output: bool,
+    /// `hume_interruption`: `user_interruption` is a barge-in (the playback is cleared).
+    interruption: bool,
+}
+
 /// The Hume EVI protocol. Stateless: the full [`HumeEVIConfig`] (api key, EVI
 /// version, voice, encoding, sample rate, system prompt, ws url, …) is parsed once
 /// in `from_config` and re-read by the wire methods — the bespoke client carried
@@ -43,6 +72,8 @@ pub struct HumeProtocol {
     /// The parsed EVI config (validated by `from_config`). Drives the ws-url
     /// query-param auth, the conditional session-settings message, and `caps()`.
     config: HumeEVIConfig,
+    /// The provider fixes in force (none on the `from_hume_config` path).
+    fixes: HumeFixes,
 }
 
 impl HumeProtocol {
@@ -53,7 +84,10 @@ impl HumeProtocol {
         config
             .validate()
             .map_err(|e| RealtimeError::InvalidConfiguration(e.to_string()))?;
-        Ok(Self { config })
+        Ok(Self {
+            config,
+            fixes: HumeFixes::default(),
+        })
     }
 
     /// Borrow the parsed EVI config (for the newtype's inherent accessors +
@@ -75,7 +109,33 @@ impl HumeProtocol {
             }),
             system_prompt,
             context: None,
+            voice_id: None,
+            tools: None,
         }
+    }
+
+    /// The session's functions as EVI tools (`parameters` stringified).
+    fn tools(cfg: &RealtimeConfig) -> Option<Vec<HumeTool>> {
+        let tools = cfg.tools.as_deref().filter(|t| !t.is_empty())?;
+        Some(
+            tools
+                .iter()
+                .map(|t| HumeTool {
+                    tool_type: "function".to_string(),
+                    name: t.function.name.clone(),
+                    parameters: t.function.parameters.as_ref().map_or_else(
+                        || r#"{"type":"object","properties":{}}"#.to_string(),
+                        |p| p.to_string(),
+                    ),
+                    description: t.function.description.clone(),
+                })
+                .collect(),
+        )
+    }
+
+    /// An `id` EVI may leave out: `None` when empty.
+    fn id(id: String) -> Option<String> {
+        (!id.is_empty()).then_some(id)
     }
 }
 
@@ -103,7 +163,18 @@ impl RealtimeProtocol for HumeProtocol {
         };
         // Same validation as the bespoke client (shared with the
         // `HumeEVI::from_hume_config` path).
-        Self::from_hume_config(config)
+        let mut protocol = Self::from_hume_config(config)?;
+        protocol.fixes = HumeFixes {
+            user_input: cfg.fix("hume_user_input"),
+            audio_settings: cfg.fix("hume_audio_settings"),
+            cancel_local: cfg.fix("hume_cancel_local"),
+            tools: cfg.fix("hume_tools"),
+            voice_settings: cfg.fix("hume_voice_settings"),
+            message_ids: cfg.fix("hume_message_ids"),
+            wav_output: cfg.fix("hume_wav_output"),
+            interruption: cfg.fix("hume_interruption"),
+        };
+        Ok(protocol)
     }
 
     fn provider_id(&self) -> &'static str {
@@ -115,6 +186,15 @@ impl RealtimeProtocol for HumeProtocol {
     }
 
     fn caps(&self) -> ProtocolCaps {
+        if self.fixes.wav_output {
+            return ProtocolCaps {
+                emits_user_turn_frames: true,
+                output_bytes_per_ms: u64::from(WAV_OUTPUT_SAMPLE_RATE) * 2 / 1000,
+                output_sample_rate: WAV_OUTPUT_SAMPLE_RATE,
+                supports_truncate: false,
+                supports_input_buffer: false,
+            };
+        }
         ProtocolCaps {
             // Hume EVI runs SERVER-side VAD + turn-taking (it auto-generates
             // responses on detected end-of-turn), so it owns turns and emits
@@ -140,7 +220,18 @@ impl RealtimeProtocol for HumeProtocol {
         // EXACTLY `HumeEVIConfig::build_websocket_url()`. No auth HEADER. The
         // standard WS-upgrade headers are generated by `into_client_request()` in
         // the transport factory.
-        let default_url = self.config.build_websocket_url();
+        let mut default_url = self.config.build_websocket_url();
+        // Fix `hume_voice_settings`: `voice_id` and `evi_version` are not query parameters of
+        // the chat socket (the voice goes in `session_settings`; the version follows the config).
+        if self.fixes.voice_settings
+            && let Some((base, query)) = default_url.split_once('?')
+        {
+            let kept: Vec<&str> = query
+                .split('&')
+                .filter(|p| !p.starts_with("voice_id=") && !p.starts_with("evi_version="))
+                .collect();
+            default_url = format!("{base}?{}", kept.join("&"));
+        }
         // SERVER-CONFIG `realtime_endpoint_override` (proxy / self-hosted / gov-cloud
         // / local mock) WINS over the EVI host when set. EVI auths via the QUERY, so
         // the full EVI query (api_key + version + …) is appended to the override when
@@ -181,13 +272,23 @@ impl RealtimeProtocol for HumeProtocol {
             .instructions
             .clone()
             .or_else(|| self.config.system_prompt.clone());
+        let voice_id = cfg
+            .voice
+            .clone()
+            .or_else(|| self.config.voice_id.clone())
+            .filter(|v| self.fixes.voice_settings && !v.trim().is_empty());
+        let tools = Self::tools(cfg).filter(|_| self.fixes.tools);
         if self.config.input_encoding != super::messages::AudioEncoding::default()
             || self.config.sample_rate != HUME_EVI_DEFAULT_SAMPLE_RATE
             || system_prompt.is_some()
+            || self.fixes.audio_settings
+            || voice_id.is_some()
+            || tools.is_some()
         {
-            vec![EVIClientMessage::SessionSettings(
-                self.session_settings(system_prompt),
-            )]
+            let mut settings = self.session_settings(system_prompt);
+            settings.voice_id = voice_id;
+            settings.tools = tools;
+            vec![EVIClientMessage::SessionSettings(settings)]
         } else {
             Vec::new()
         }
@@ -228,17 +329,34 @@ impl RealtimeProtocol for HumeProtocol {
             // user_message ⇒ User transcript. is_final = NOT interim (the bespoke
             // client: `interim != Some(true)`). Prosody was only trace-logged — no
             // wire/callback effect — so it is intentionally NOT mapped.
+            // EVI's `user_message` carries no `id`: read without one only with the fix
+            // `hume_message_ids` (today such a frame is dropped).
+            EVIServerMessage::UserMessage(user_msg)
+                if user_msg.id.is_empty() && !self.fixes.message_ids =>
+            {
+                vec![S2sEvent::Ignore]
+            }
             EVIServerMessage::UserMessage(user_msg) => vec![S2sEvent::Transcript {
                 role: TranscriptRole::User,
                 text: user_msg.message.content,
                 is_final: user_msg.interim != Some(true),
-                item_id: Some(user_msg.id),
+                item_id: Self::id(user_msg.id),
             }],
 
             // user_interruption ⇒ a VAD Started edge (the bespoke client fired ONLY
             // the speech-event callback with `audio_start_ms = time.unwrap_or(0)`,
             // item_id None). It did NOT cancel/truncate, so we do NOT emit
             // InterruptedByServer here — byte-identical: speech edge only.
+            // Fix `hume_interruption`: "Indicates the user has interrupted the assistant's
+            // response" - the playback stops ("stop the currently playing audio and empty the
+            // queue", the audio guide); `time` is a Unix timestamp, not a stream offset.
+            EVIServerMessage::UserInterruption(_) if self.fixes.interruption => vec![
+                S2sEvent::InterruptedByServer,
+                S2sEvent::Speech(SpeechEvent::Started {
+                    audio_start_ms: 0,
+                    item_id: None,
+                }),
+            ],
             EVIServerMessage::UserInterruption(interruption) => {
                 vec![S2sEvent::Speech(SpeechEvent::Started {
                     audio_start_ms: interruption.time.unwrap_or(0),
@@ -249,11 +367,16 @@ impl RealtimeProtocol for HumeProtocol {
             // assistant_message ⇒ Assistant transcript (always final in the bespoke
             // client). The driver's conversation_log + accumulator reset replace the
             // old `current_response_id` write (now session bookkeeping).
+            EVIServerMessage::AssistantMessage(asst_msg)
+                if asst_msg.id.is_empty() && !self.fixes.message_ids =>
+            {
+                vec![S2sEvent::Ignore]
+            }
             EVIServerMessage::AssistantMessage(asst_msg) => vec![S2sEvent::Transcript {
                 role: TranscriptRole::Assistant,
                 text: asst_msg.message.content,
                 is_final: true,
-                item_id: Some(asst_msg.id),
+                item_id: Self::id(asst_msg.id),
             }],
 
             // assistant_prosody was trace-logged only ⇒ no actionable event.
@@ -264,7 +387,16 @@ impl RealtimeProtocol for HumeProtocol {
             // decode error was warn-logged + dropped ⇒ Ignore.
             EVIServerMessage::AudioOutput(output) => match output.decode_audio() {
                 Ok(audio_bytes) => vec![S2sEvent::Audio {
-                    data: Bytes::from(audio_bytes),
+                    // Fix `hume_wav_output`: each chunk is a WAV file; its header is not audio.
+                    data: match wav_pcm(&audio_bytes).filter(|_| self.fixes.wav_output) {
+                        Some((pcm, rate)) => {
+                            if rate.is_some_and(|r| r != WAV_OUTPUT_SAMPLE_RATE) {
+                                tracing::warn!(?rate, "Hume audio_output is not at 48 kHz");
+                            }
+                            Bytes::copy_from_slice(pcm)
+                        }
+                        None => Bytes::from(audio_bytes),
+                    },
                     item_id: Some(output.id),
                     response_id: None,
                 }],
@@ -320,9 +452,16 @@ impl RealtimeProtocol for HumeProtocol {
 
     fn send_text(&self, text: &str) -> Vec<Self::Wire> {
         // EXTRACTED verbatim from `HumeEVI::send_text`.
-        vec![EVIClientMessage::TextInput(TextInput {
+        // Fix `hume_user_input`: EVI's typed user turn is `user_input` ("treated as the
+        // user's speech to EVI"); today's `text_input` is not an EVI message.
+        let input = TextInput {
             text: text.to_string(),
-        })]
+        };
+        vec![if self.fixes.user_input {
+            EVIClientMessage::UserInput(input)
+        } else {
+            EVIClientMessage::TextInput(input)
+        }]
     }
 
     fn create_response(&self, _overrides: Option<&RealtimeResponseOverride>) -> Vec<Self::Wire> {
@@ -338,7 +477,12 @@ impl RealtimeProtocol for HumeProtocol {
     }
 
     fn cancel_response(&self) -> Vec<Self::Wire> {
-        // EXTRACTED verbatim from `HumeEVI::cancel_response`: `StopAssistant`.
+        // EXTRACTED verbatim from `HumeEVI::cancel_response`: `StopAssistant`. With the fix
+        // `hume_cancel_local` (and `hume_interruption`, which makes every barge-in a cancel)
+        // nothing: EVI has no client message that stops its response, barge-in is its own.
+        if self.fixes.cancel_local || self.fixes.interruption {
+            return Vec::new();
+        }
         vec![EVIClientMessage::StopAssistant(StopAssistant::default())]
     }
 
@@ -835,5 +979,200 @@ mod tests {
             })
             .is_empty()
         );
+    }
+
+    /// A protocol with these provider fixes in force.
+    fn fixed(cfg: &RealtimeConfig, fixes: &[&str]) -> HumeProtocol {
+        let cfg = RealtimeConfig {
+            provider_fixes: fixes.iter().map(|f| (*f).to_string()).collect(),
+            ..cfg.clone()
+        };
+        proto(&cfg)
+    }
+
+    fn wire_json(p: &HumeProtocol, w: &EVIClientMessage) -> serde_json::Value {
+        match p.serialize(w).unwrap() {
+            OutFrame::Text(s) => serde_json::from_str(&s).unwrap(),
+            OutFrame::Binary(_) => panic!("text frame"),
+        }
+    }
+
+    /// `hume_user_input`: typed text is EVI's `user_input` `{text}`; off, today's `text_input`.
+    #[test]
+    fn the_user_input_fix_sends_typed_text_as_user_input() {
+        let p = fixed(&base_cfg(), &["hume_user_input"]);
+        assert_eq!(
+            wire_json(&p, &p.send_text("What time is it?")[0]),
+            serde_json::json!({"type": "user_input", "text": "What time is it?"})
+        );
+        let p = proto(&base_cfg());
+        assert_eq!(wire_json(&p, &p.send_text("x")[0])["type"], "text_input");
+    }
+
+    /// `hume_audio_settings`: a session with no instructions still declares its linear16
+    /// audio ("you must first send a session_settings message ... with an audio property").
+    #[test]
+    fn the_audio_settings_fix_always_declares_the_audio() {
+        let cfg = RealtimeConfig {
+            provider: "hume".into(),
+            api_key: "hume-key".into(),
+            ..Default::default()
+        };
+        let p = fixed(&cfg, &["hume_audio_settings"]);
+        let wires = p.build_session_config(&cfg, None);
+        assert_eq!(wires.len(), 1);
+        assert_eq!(
+            wire_json(&p, &wires[0]),
+            serde_json::json!({"type": "session_settings",
+                "audio": {"encoding": "linear16", "sample_rate": 44100, "channels": 1}})
+        );
+    }
+
+    /// `hume_cancel_local` (and `hume_interruption`): a cancel sends nothing.
+    #[test]
+    fn the_cancel_local_fix_sends_no_stop_assistant() {
+        assert!(
+            fixed(&base_cfg(), &["hume_cancel_local"])
+                .cancel_response()
+                .is_empty()
+        );
+        assert!(
+            fixed(&base_cfg(), &["hume_interruption"])
+                .cancel_response()
+                .is_empty()
+        );
+        assert_eq!(proto(&base_cfg()).cancel_response().len(), 1);
+    }
+
+    /// `hume_tools`: the session's functions are `session_settings.tools`, their schema a
+    /// string; off, they are not sent.
+    #[test]
+    fn the_tools_fix_sends_the_sessions_functions() {
+        use crate::core::realtime::base::{FunctionDefinition, ToolDefinition};
+        let cfg = RealtimeConfig {
+            tools: Some(vec![ToolDefinition {
+                tool_type: "function".into(),
+                function: FunctionDefinition {
+                    name: "get_weather".into(),
+                    description: Some("Weather for a city".into()),
+                    parameters: Some(serde_json::json!({"type": "object",
+                        "properties": {"city": {"type": "string"}}})),
+                },
+            }]),
+            ..base_cfg()
+        };
+        let p = fixed(&cfg, &["hume_tools"]);
+        let settings = wire_json(&p, &p.build_session_config(&cfg, None)[0]);
+        let tool = &settings["tools"][0];
+        assert_eq!(
+            (&tool["type"], &tool["name"], &tool["description"]),
+            (
+                &serde_json::json!("function"),
+                &serde_json::json!("get_weather"),
+                &serde_json::json!("Weather for a city")
+            )
+        );
+        let schema: serde_json::Value =
+            serde_json::from_str(tool["parameters"].as_str().expect("a string")).unwrap();
+        assert_eq!(schema["properties"]["city"]["type"], "string");
+        let p = proto(&cfg);
+        assert!(
+            wire_json(&p, &p.build_session_config(&cfg, None)[0])
+                .get("tools")
+                .is_none()
+        );
+    }
+
+    /// `hume_voice_settings`: the voice is `session_settings.voice_id` (sent again on an
+    /// update), and the chat URL carries neither `voice_id` nor `evi_version`.
+    #[test]
+    fn the_voice_settings_fix_moves_the_voice_into_session_settings() {
+        let p = fixed(&base_cfg(), &["hume_voice_settings"]);
+        let ConnectSpec::WebSocket { url, .. } = p.connect_spec(&base_cfg()).unwrap() else {
+            panic!("expected WebSocket")
+        };
+        assert!(url.contains("api_key=hume-key"), "{url}");
+        assert!(
+            !url.contains("voice_id=") && !url.contains("evi_version="),
+            "{url}"
+        );
+        let updated = RealtimeConfig {
+            voice: Some("ito".into()),
+            ..base_cfg()
+        };
+        let settings = wire_json(&p, &p.build_session_config(&updated, None)[0]);
+        assert_eq!(settings["voice_id"], "ito");
+    }
+
+    /// `hume_message_ids`: a `user_message` as EVI sends it (no `id`) is a transcript; off,
+    /// it is dropped as today.
+    #[test]
+    fn the_message_ids_fix_reads_a_user_message_without_an_id() {
+        let raw = r#"{"type":"user_message","from_text":false,"interim":true,
+            "message":{"role":"user","content":"I need"},"models":{},"time":{"begin":0,"end":400}}"#;
+        let p = fixed(&base_cfg(), &["hume_message_ids"]);
+        match p.map_server_event(Inbound::Text(raw)).as_slice() {
+            [
+                S2sEvent::Transcript {
+                    role: TranscriptRole::User,
+                    text,
+                    is_final: false,
+                    item_id: None,
+                },
+            ] => {
+                assert_eq!(text, "I need")
+            }
+            other => panic!("expected an interim user transcript, got {other:?}"),
+        }
+        assert!(matches!(
+            proto(&base_cfg())
+                .map_server_event(Inbound::Text(raw))
+                .as_slice(),
+            [S2sEvent::Ignore]
+        ));
+    }
+
+    /// `hume_wav_output`: each `audio_output` is a WAV file at 48 kHz; its samples go out, the
+    /// header does not, and the audio is stamped 48 kHz.
+    #[test]
+    fn the_wav_output_fix_strips_the_wav_header_at_48_khz() {
+        let pcm = vec![7u8, 0, 9, 0];
+        let wav = crate::core::stt::wav::encode_pcm16_wav(&pcm, 48_000, 1).unwrap();
+        let raw = format!(
+            r#"{{"type":"audio_output","id":"a1","index":0,"data":"{}"}}"#,
+            BASE64.encode(&wav)
+        );
+        let p = fixed(&base_cfg(), &["hume_wav_output"]);
+        match p.map_server_event(Inbound::Text(&raw)).as_slice() {
+            [S2sEvent::Audio { data, .. }] => assert_eq!(data.as_ref(), pcm.as_slice()),
+            other => panic!("expected Audio, got {other:?}"),
+        }
+        assert_eq!(p.caps().output_sample_rate, 48_000);
+        assert_eq!(p.caps().output_bytes_per_ms, 96);
+        match proto(&base_cfg())
+            .map_server_event(Inbound::Text(&raw))
+            .as_slice()
+        {
+            [S2sEvent::Audio { data, .. }] => assert_eq!(data.len(), wav.len(), "today: as is"),
+            other => panic!("expected Audio, got {other:?}"),
+        }
+    }
+
+    /// `hume_interruption`: `user_interruption` clears the playback (a server barge-in) and
+    /// starts the user's speech at 0, not at the Unix `time`.
+    #[test]
+    fn the_interruption_fix_is_a_barge_in() {
+        let p = fixed(&base_cfg(), &["hume_interruption"]);
+        let raw = r#"{"type":"user_interruption","time":1761200000}"#;
+        assert!(matches!(
+            p.map_server_event(Inbound::Text(raw)).as_slice(),
+            [
+                S2sEvent::InterruptedByServer,
+                S2sEvent::Speech(SpeechEvent::Started {
+                    audio_start_ms: 0,
+                    item_id: None
+                })
+            ]
+        ));
     }
 }

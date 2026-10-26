@@ -31,8 +31,15 @@ livekit:
 
 # Provider API keys
 providers:
+  # Deepgram: each STT model gets a language code it takes (the caller's own when the model
+  # lists it); whisper-* models are file-only (POST /transcribe/batch, refused on /ws).
   deepgram_api_key: "your-deepgram-api-key"     # ENV: DEEPGRAM_API_KEY
+  # ElevenLabs: also used by POST /transcribe/batch when the request's api_key is empty.
   elevenlabs_api_key: "your-elevenlabs-api-key" # ENV: ELEVENLABS_API_KEY
+  # ElevenLabs text-to-speech: tts_config.features.streaming: true synthesises on the HTTP
+  # streaming endpoint (/v1/text-to-speech/{voice}/stream), audio as it is made. A proxy or a
+  # stand-in for the vendor is set in the environment only: ELEVENLABS_TTS_URL (default
+  # https://api.elevenlabs.io/v1/text-to-speech).
 
   # Google Cloud settings (used for both Speech-to-Text and Text-to-Speech)
   # Authentication options (in order of precedence):
@@ -54,8 +61,12 @@ providers:
 
   # Cartesia API key (used for both STT and TTS)
   # STT uses ink-whisper model, TTS uses sonic-3 model
+  # The STT key is sent in the X-API-Key handshake header, never in the URL.
   # Get from Cartesia dashboard: https://play.cartesia.ai/
   cartesia_api_key: ""                           # ENV: CARTESIA_API_KEY
+  # A vendor account's concurrency limit (Cartesia's plans allow 2 and up) is set in the
+  # environment only: WAAV_TTS_ACCOUNT_CONCURRENCY="cartesia=2,elevenlabs=5". Requests over it
+  # wait their turn instead of drawing the vendor's 429 (docs/interaction_mode.md).
 
   # OpenAI API key (used for STT, TTS, and Realtime Audio-to-Audio)
   # STT: Whisper models (whisper-1, gpt-4o-transcribe, gpt-4o-mini-transcribe)
@@ -332,3 +343,410 @@ dag_timeouts:
   llm_endpoint_secs: 120         # ENV: DAG_LLM_ENDPOINT_SECS
   # WebSocket operation timeout in seconds
   websocket_operation_secs: 30   # ENV: DAG_WEBSOCKET_OPERATION_SECS
+
+# Interaction mode (optional, off by default)
+# A /ws session that sends `"interaction": true` (or an object of settings) in its config
+# message then gets the duplex agent: it keeps the floor, acknowledges, runs the request as a
+# background task on the session's LLM and relays the answer. The session needs a
+# conversation_config (or interaction.tasks.llm), or it is a Bud voice-agent session, whose
+# agent then does the tasks (see agent_default). With the switch off, or on a session it does
+# not fit, the session runs as before and a config_warning says why. The mode speaks English:
+# a session whose stt_config.language is not English runs without it. A session with a
+# `livekit` block runs it on the room's audio (a SIP call is a participant of such a room) and
+# its events are also published in the room, on the data topic `waav.interaction`. A session
+# with a dag_config runs it when the graph ends in text (a text_output node and no node that
+# produces audio): the graph then does the tasks. A voice-agent session on
+# /v1/realtime?model=prompt:<agent> runs it like one on /ws, with the events as `bud.*` events.
+#
+# interaction:
+#   enabled: true                             # ENV: WAAV_INTERACTION_ENABLED
+#   # The block of a session that sends none, and the base of every session's own block
+#   # (JSON `true` or an object). With it set, every /ws session that fits runs the mode.
+#   default:                                  # ENV: WAAV_INTERACTION_DEFAULT (JSON)
+#     # A packaged persona's id, or the persona itself as an object (persona.schema.json),
+#     # checked like the packaged ones. A session may only name one.
+#     front:
+#       persona: "default"
+#     # Conversation controls (docs/interaction_mode.md, "Conversation Controls"): the front
+#     # model reads "slower please", "say that again", "stop talking", "talk to me in Spanish"
+#     # in context; the orchestrator's conversation_control tool and the client's `control`
+#     # message give the same controls. The operator's bounds; a session cannot set them.
+#     controls:
+#       allowed: [stop, hold, resume, repeat, not_heard, clarify, spell, rate, volume,
+#                 verbosity, language, voice, backchannels, updates, to_screen, end, human]
+#       rate: [0.7, 1.3]                        # speaking-rate bounds, steps of 0.15
+#       volume_db: [-9, 9]                      # playback gain bounds, steps of 3 dB
+#       languages: []                           # e.g. [es]: switchable where the recogniser
+#                                               # hears it (a multilingual model, or a second
+#                                               # one opened in it) and the provider has a voice;
+#                                               # the front model is shown them by code and name
+#       from_agents: true                       # the orchestrator may issue controls
+#       from_clients: true                      # the client app may
+#       answers_only: false                     # switch without a reviewed pack: partial
+#       # "Let me talk to a person": a room's SIP caller is referred to transfer_to (the SIP
+#       # leg's transfer); any other session sends `human_requested` to the client and the
+#       # same, signed with tool_secret, to url (with a task_id and its callback route). The
+#       # operator answers human_connected (the transfer line, then the session ends) or
+#       # human_unavailable, in its reply or on the callback route, within wait_s; none, or
+#       # unavailable: an honest line and the call goes on. Neither set: an honest line.
+#       human:
+#         transfer_to: null                     # e.g. "+15551230000"
+#         url: null                             # e.g. "https://ops.example.com/handoff"
+#         wait_s: 60                            # 0-600; 0: hand over at once, no callback
+#     # When a service fails (docs/interaction_mode.md, "When Services Fail"): pre-made lines
+#     # in the session's voice ("Sorry, my systems are acting up..."), at most 3 stalls 8 s
+#     # apart, then the exit line, `session_failed` and the signed push. `lines` and
+#     # `follow_up` are the operator's; a session may set the two times. A speech-to-speech
+#     # session (/realtime, a room's realtime voice) plays the server's default set
+#     # (failure_voice below) when its provider fails, stalls or is lost.
+#     failure:
+#       stall_after_ms: 2500                    # no first token (any background: LLM, agent, DAG,
+#                                               # backend) / no audio / no provider answer: a stall
+#       max_wait_s: 30                          # still down this long after the first stall: exit
+#       follow_up: false                        # your system calls back: the exit line promises it
+#       lines: {}                               # e.g. {"exit": "...please call us back later."}
+#     # The agent's own voice coming back on the caller's line. The gate keeps it from
+#     # interrupting the agent. The canceller removes it, also from what the speech-to-text
+#     # hears: "auto" turns it on for a caller on a phone line (a room's SIP participant, a
+#     # client with phone_line: true or 8 kHz audio), for a client with client_aec: false,
+#     # and after auto_enable_after_echo_episodes stretches of echo within 30 s; "on" is for
+#     # clients that play the agent aloud and cancel no echo.
+#     # Listening sounds ("mhm") while the caller tells a long story: "auto" is on except
+#     # for a caller on a phone line; intensity lowers the persona's (low: one a turn).
+#     # A pause the turn-end model is sure is not the end (under 0.05, or under 0.7 on a
+#     # dangling "and"/"to"/"the") is held (nothing is said, no task starts) up to 800 ms
+#     # after the speech-to-text's final; it has no setting.
+#     duplex:
+#       echo:
+#         correlation_gate: true
+#         aec: "auto"                           # "auto" | "on" | "off"
+#         client_aec: null                      # the client cancels echo itself: true | false
+#         phone_line: null                      # the client's caller is on a phone line
+#         tail_ms: 2000                         # 0 to 5000: words this long after echo are its
+#         max_bulk_delay_ms: 1000               # 200 to 1500: the latest echo that is found
+#         auto_enable_after_echo_episodes: 2    # 0 (never) to 10
+#       backchannel:
+#         enabled: "auto"                       # "auto" | true | false
+#         intensity: "medium"                   # "off" | "low" | "medium" | "high"
+#         # The pack's gap_ms counts from the last listening sound and from the end of the
+#         # agent's last line (a caller who has just said "wait a second" hears none).
+#     # What is known about the caller. pace also sets the speaking rate (15% slower or
+#     # faster) on the openai and deepgram text-to-speech; it may change mid-session.
+#     #   front: { caller: { verbosity: "brief", pace: "slower" } }
+#     # Where a question may be answered: with "client" the client shows forms, sign-in
+#     # links and sensitive values (a card number) on a screen; without it they are declined.
+#     # With "dtmf" a caller on a phone line (a SIP participant of a LiveKit room) confirms
+#     # with keys 1 and 2, picks a choice's option by its number, and types a sensitive value
+#     # on the keypad, ending it with # or a pause of policy.hitl_key_gap_ms (5000); a room's
+#     # recording is stopped while it is typed and started again as <stream_id>-part2.
+#     hitl:
+#       channels: ["voice", "client"]           # add "dtmf" for phone lines
+#     # Tasks after the call. session_end auto: a task that may change something, or whose
+#     # result has a reader (push_url, or the caller of a lost connection for the grace), runs
+#     # on for at most orphan_max_s; any other is cancelled. cancel_all stops every task but a
+#     # tool call already on the wire; continue_all lets every live task run on. After a lost
+#     # connection the caller has reconnect_grace_s to come back for the result (a new session
+#     # with the same stream_id); when nobody did, or the client closed the session itself,
+#     # the result is posted to push_url, signed with tool_secret like a tool call. Only this
+#     # file, an alias and an agent entry can set push_url, session_end and orphan_max_s.
+#     tasks:
+#       reconnect_grace_s: 60                   # 0 to 600
+#       push_url: "https://hooks.example.com/waav/tasks"
+#       session_end: auto                       # auto | cancel_all | continue_all
+#       orphan_max_s: 1800                      # 0 to 86400
+#       # No limit on work by default. Beyond a limit a request waits in a queue (never
+#       # refused) and the caller hears it is queued. A session may lower max_live; only
+#       # this file, an alias and an agent entry set max_live_tenant (this process's
+#       # sessions of one tenant). Children of an orchestrator count against their entry's
+#       # max_concurrent instead.
+#       limits:
+#         max_live: 8                           # 1 to 10000
+#         max_live_tenant: 200
+#       # An orchestrator: a large model on the LLM tier whose tools are these entries of
+#       # task_backends (below). Calling one starts a child task and returns at once; the
+#       # child's result comes back to the orchestrator as a later message. A model name runs
+#       # on the session's own LLM; an object of the tasks.llm shape is an LLM of its own
+#       # (max_tokens 4096 unless set). Its system_prompt should say what the agents know
+#       # and that they ask the caller themselves, or a model may ask for every detail first.
+#       orchestrator: { base_url: "http://127.0.0.1:18790/v1", model: "gpt-oss-20b",
+#                       system_prompt: "You hand the caller's requests to agents; they know the caller's account and ask for anything else themselves." }
+#       agents: ["browser", "coder"]
+#       # How a child's result reaches the caller while the conversation goes on. It is
+#       # published at once (task_output, GET /v1/tasks/events) and spoken only at a slot:
+#       # the agent's answer is over and the caller is not speaking; after 4 s of silence it
+#       # is said. ask: one short offer at the end of the answer ("want it now?"); tell: the
+#       # update itself; screen: never spoken unless asked. The front words each update
+#       # (at most 20 words, within 1.2 s, checked against the result); without such a line
+#       # it waits for the next slot (there is no template).
+#       # It may change mid-session: interaction_update {"tasks": {"announce": "screen"}}.
+#       announce: ask                           # ask | tell | screen
+#       # A finished task's agent keeps its context for follow-ups this long ("can it be a
+#       # window seat?" goes to the same agent with its A2A contextId, webhook task_id, MCP
+#       # task id or Responses response id); later, the new task carries a line of the old
+#       # result instead. A question the stored result answers is answered from it.
+#       follow_up_ttl_s: 1800                   # 0-86400
+#       # resume_key: a caller's own key (8-128 of A-Z a-z 0-9 - _ . :): a caller who calls
+#       # back with it on another stream_id gets the tasks' outcomes and pending updates.
+#       # Accepted from a session only with allow_resume_key (below).
+#   # The block of a Bud voice-agent session (`config.agent`) whose agent entry carries no
+#   # `interaction` block of its own; the entry's block wins. Such a session never takes
+#   # `default` as its block. `background.answer_marker` names the line an agent is known to
+#   # write before its final answer: its answer is then spoken sentence by sentence as it is
+#   # written. Without a marker the answer is spoken when the agent's run completes.
+#   agent_default:                            # ENV: WAAV_INTERACTION_AGENT_DEFAULT (JSON)
+#     background:
+#       answer_marker: "ANSWER:"
+#   # Speech-to-speech providers (/realtime, the /v1/realtime relay, and a /ws LiveKit room
+#   # whose session sets interaction.speech.realtime) keep their own voice: the gateway
+#   # monitors what they say and cannot prevent it. Interaction mode runs on one only when it
+#   # is listed here, as "provider" or "provider:model". A room's realtime voice also needs
+#   # the provider's key (for example openai_api_key) and the livekit settings.
+#   truth_ack: ["openai"]                     # ENV: WAAV_INTERACTION_TRUTH_ACK (comma-separated)
+#   # The half-cascade needs no listing: a session with speech.voice_owner: "gateway" on an
+#   # OpenAI-family provider (/realtime, a room, or the /v1/realtime relay through
+#   # realtime_default below) has the provider write its replies and the gateway check and say
+#   # each sentence in its own voice: the session's speech.voice (a tts_config object), else
+#   # failure_voice below. On the relay each such line reaches the client as a response of the
+#   # gateway's own (metadata bud_source "gateway", bud_kind "voice").
+#   # The block of every /v1/realtime relay session (Bud realtime deployments whose vendor
+#   # speaks OpenAI Realtime). It needs a background: tasks.llm or tasks.default_backend.
+#   realtime_default:                         # ENV: WAAV_INTERACTION_REALTIME_DEFAULT (JSON)
+#     regime: "delegating"
+#     speech:
+#       claim_policy: "correct"
+#     tasks:
+#       llm: { base_url: "https://llm.example.com/v1", model: "your-model" }
+#   # A llama-server that words the acknowledgements and reads what the caller meant (every
+#   # turn, an answer, a stop, another language). Interaction mode needs it: without a ready
+#   # one a session runs without the mode, a speech-to-speech one too (there it reads the
+#   # caller's answer to the gateway's question, a cancel and a continuer). With `command` the gateway runs it itself: it starts it, polls
+#   # <url>/health, restarts it with backoff when it exits or stops answering, and stops it
+#   # at shutdown; the sessions use it while it is ready. A model file named *lfm* needs
+#   # `licence` (lfm_open_eligible | liquid_commercial) and a LICENSE file beside it.
+#   front_model:
+#     url: "http://127.0.0.1:18741"           # ENV: WAAV_INTERACTION_FRONT_URL
+#     model: "qwen1.5b"                       # ENV: WAAV_INTERACTION_FRONT_MODEL
+#     # Two slots (-np 2): the gateway keeps the second for its decisions about the caller's
+#     # words over the agent and primes it at each agent line (read from GET /props).
+#     command: ["/opt/llama/llama-server", "-m", "/models/front.gguf", "--port", "18741",
+#               "-np", "2", "-c", "8192"]
+#                                             # ENV: WAAV_INTERACTION_FRONT_COMMAND (space-separated)
+#     # With url "unix:" the gateway runs the command on a private UNIX socket instead: a
+#     # per-boot run directory $WAAV_RUN_DIR/front-<boot>/ (0700; default <temp dir>/waav-run)
+#     # with a fresh key file (0600), "--host <dir>/front.sock --api-key-file <dir>/front.key"
+#     # added to the command; children an earlier gateway left running are stopped at start.
+#     # The model is ready once /health is 200 and one canary decision came back. No GPU-to-
+#     # CPU fallback.
+#     licence: "lfm_open_eligible"            # ENV: WAAV_FRONT_LICENCE
+#     # (also checked against an operator-run server's GET /props: LFM weights need it)
+#   # Signs the HTTP calls of the tools in `default` above (X-WaaV-Signature: HMAC-SHA256 of
+#   # "<timestamp>.<body>"). A tool a session declares itself is never signed.
+#   tool_secret: "your-tool-signing-secret"   # ENV: WAAV_INTERACTION_TOOL_SECRET
+#   # Accept `interaction.tasks.tools` from a session (never under the Bud control plane)
+#   allow_client_tools: false                 # ENV: WAAV_INTERACTION_ALLOW_CLIENT_TOOLS
+#   # A Redis the gateway processes of one deployment share for their tasks: GET /v1/tasks
+#   # then answers for every process, a caller who comes back on another process gets the
+#   # result there, and the tasks a dead process left running are marked (state "unknown"
+#   # where a call may have been on the wire): a process whose 30 s lease has run out is
+#   # swept 15 s later if it has not renewed it; one that was only cut off re-asserts its
+#   # tasks when it is back. Tenant personas are kept there too (each PUT is atomic).
+#   # GET /v1/tasks/events on any process streams every process's task events (pub/sub), and
+#   # a backend's callback (a webhook's, an A2A push, the answer to a controls.human.url
+#   # hand-off) that reaches the wrong process is handed to the one that runs the task (which
+#   # checks its signature or token; a push's token crosses the Redis only as its SHA-256).
+#   # Without it tasks are kept in each process.
+#   # Not WAAV_REDIS_URL, which is the Bud control plane's.
+#   task_redis_url: "redis://127.0.0.1:6379/3"  # ENV: WAAV_TASK_REDIS_URL
+#   # Backgrounds other than an LLM of the session's: a session names one of these with
+#   # `interaction.tasks.default_backend` and its tasks run there. The address and the secret
+#   # stay here; a session never sends either. `secret_env` (also `bearer_env`, `api_key_env`)
+#   # names the environment variable that holds the secret. `side_effects: "none"` says a task
+#   # changes nothing outside the backend ("possible" is the default).
+#   task_backends:                            # ENV: WAAV_INTERACTION_TASK_BACKENDS (JSON list)
+#     # A webhook: each task is POSTed to it, signed like a tool call with its secret (or
+#     # tool_secret); it answers, or reports later on POST /v1/tasks/{task_id}/callback.
+#     - name: "crm"
+#       type: "webhook"
+#       url: "https://crm.example.com/waav/tasks"
+#       secret_env: "CRM_WEBHOOK_SECRET"
+#     # As an orchestrator's agent: what it reads to choose the entry, how many tasks of a
+#     # session run on it at once (no limit when not set), how long a task may take (600 s),
+#     # how long the caller has to answer its question (at most hitl_answer_timeout_ms; a
+#     # question's own expires_in_ms wins; either is the job's deadline, and a question that
+#     # cannot wait for the end of the agent's answer breaks into it at a clause boundary),
+#     # and the entry that takes new tasks while this one keeps failing (its breaker opens
+#     # after 3 failed tasks, for 30 s). A task that changes nothing is tried once more when
+#     # the backend did not answer.
+#     - name: "browser"
+#       type: "a2a"
+#       url: "https://agents.example.com/browser"
+#       bearer_env: "BROWSER_AGENT_TOKEN"
+#       description: "Operates websites in a browser: bookings, forms, purchases."
+#       max_concurrent: 4
+#       timeout_s: 300
+#       question_deadline_ms: 5000
+#       fallback: "concierge"
+#     # An Agent2Agent 1.0 agent. Its Agent Card (<url>/.well-known/agent-card.json, read at
+#     # the start of a session that uses it, as an orchestrator's agent or its default_backend,
+#     # and kept catalog_ttl_s, 300 s) describes it when the entry has no description, names
+#     # its binding (JSON-RPC, else HTTP+JSON, else gRPC, on the entry's origin; gRPC on its
+#     # host), says whether it streams (SendStreamingMessage) and in which header the secret
+#     # goes. `oauth` (client_id, client_secret_env, optional scope; token_url optional: the
+#     # card's OAuth 2.0 client-credentials scheme names it when it is https or on the entry's
+#     # origin) in place of secret_env: a client-credentials token as the bearer.
+#     # A card that says it has an authenticated extended card is followed by that card,
+#     # asked for with the entry's secret (GetExtendedAgentCard). With push_base_url (the
+#     # gateway's address as the agent reaches it) and a card that says pushNotifications, a
+#     # task's first message carries a push configuration (<push_base_url>/v1/tasks/<task_id>/
+#     # callback and a token of the task's); its pushes are read as a stream's events, and
+#     # the task is read only every 5 s meanwhile.
+#     - name: "concierge"
+#       type: "a2a"
+#       url: "https://agents.example.com/concierge"
+#       bearer_env: "CONCIERGE_TOKEN"
+#       catalog_ttl_s: 300
+#       push_base_url: "https://gateway.example.com"
+#     # An MCP server whose tools are an orchestrator's own tools, each with the server's name,
+#     # description and input schema: ["*"] or the names it may call. A call that may change
+#     # things (side_effects possible, and the tool's annotations not readOnlyHint or
+#     # destructiveHint false) is confirmed with the caller first; `confirm` overrides that:
+#     # true or false for every call, or per tool name. Every call is a child task.
+#     - name: "notes"
+#       type: "mcp"
+#       url: "https://notes.example.com/mcp"
+#       bearer_env: "NOTES_TOKEN"
+#       tools: ["*"]
+#       confirm: { "archive_note": false }
+#     # A tool of an MCP 2026-07-28 server that runs as a task (Tasks extension). The
+#     # caller's request is the tool's `argument` ("request" when not set).
+#     # Each MCP server gets `initialize` once per process (kept catalog_ttl_s): later requests
+#     # carry the agreed version and its Mcp-Session-Id; its GET stream is then read (an
+#     # elicitation about a call's task is that caller's question; a request about no call
+#     # is refused). A server asks for a conversation control with the notification
+#     # notifications/io.waav/control or _meta["io.waav/control"] in a result. `oauth` (in place of secret_env):
+#     # the gateway fetches an access token with the client credentials grant, renews it
+#     # before it expires, and sends it as a bearer token; neither is ever logged.
+#     - name: "stock"
+#       type: "mcp"
+#       url: "https://mcp.example.com/mcp"
+#       tool: "find_item"
+#       argument: "question"
+#       side_effects: "none"
+#       oauth:
+#         token_url: "https://auth.example.com/oauth/token"
+#         client_id: "waav-gateway"
+#         client_secret_env: "STOCK_CLIENT_SECRET"
+#         scope: "stock.read"                   # optional; also resource (RFC 8707)
+#     # A model behind the OpenAI Responses API, run as background responses. It gets the
+#     # session's tools and prompt like the session's own LLM. `mode: "poll"` reads each
+#     # response until it is done; without it the response is streamed.
+#     - name: "research"
+#       type: "openai_responses"
+#       url: "https://api.openai.com/v1"
+#       model: "your-model"
+#       api_key_env: "OPENAI_API_KEY"
+#   # Let a session name a backend itself, or several (tasks.backends: an orchestrator, else
+#   # the session's own LLM, chooses among them per request), never under the Bud control
+#   # plane. The server's `default` and `agent_default` blocks, an alias and an agent entry
+#   # always may.
+#   allow_client_backends: false              # ENV: WAAV_INTERACTION_ALLOW_CLIENT_BACKENDS
+#   # Let a session name its own tasks.push_url with its own tasks.push_secret (16 to 256
+#   # characters): its pushes are signed with that secret, never with tool_secret.
+#   allow_client_push: false                  # ENV: WAAV_INTERACTION_ALLOW_CLIENT_PUSH
+#   # Let a session bring tasks.resume_key: its tasks and their updates follow a caller who
+#   # comes back with the same key on another stream_id (after a hang-up too).
+#   allow_resume_key: false                   # ENV: WAAV_INTERACTION_ALLOW_RESUME_KEY
+#   # Tenants register their own personas (PUT /v1/interaction/personas/{id}, checked like the
+#   # packaged ones, 20 per tenant, 5 versions each; GET reads one back, DELETE removes it);
+#   # a session of the tenant names one.
+#   tenant_personas: false                    # ENV: WAAV_INTERACTION_TENANT_PERSONAS
+#   # Caller memory, off without this key: up to 10 short facts about a returning caller,
+#   # newest first (PUT and GET /v1/interaction/memory/{subject}); a session that carries an
+#   # identity token signed with this key (front.caller.identity_token) reads the first 3, and
+#   # after the call its background LLM adds what it learnt. Kept 90 days, in task_redis_url
+#   # when it is set.
+#   caller_memory_key: "your-caller-identity-key"  # ENV: WAAV_INTERACTION_CALLER_MEMORY_KEY
+#   # Language packs added as data: guard_lexicon.<code>.json, phrase_banks.<code>.json and
+#   # templates.<code>.json (the shape of the English files). A session whose
+#   # stt_config.language has that code runs the mode on the pack; a pack that fails the
+#   # checks is left out with a line in the log. Phrases match in any script (accents kept;
+#   # in Chinese, Japanese or Thai each letter is a word). A pack's phrase_banks
+#   # backchannel group also carries the listening-sound fallback word (a clip id) and the
+#   # language's timing ({gap_ms, skip_every, min_voiced_ms}; English 6000, 3, 1500).
+#   # The front model is shown the pack's lexicon rows (rule_layer_cues) as examples in the
+#   # pack's language, so it must be a multilingual model; a pack with an empty row of those
+#   # is refused interaction mode (front_unavailable).
+#   packs_dir: "/etc/waav/packs"              # ENV: WAAV_INTERACTION_PACKS_DIR
+#   # Recorded listening sounds: <provider>/<voice>/<language>/<clip id>.wav (for example
+#   # openai/alloy/en/mhm.wav; voice "default" when the session names none). A recording
+#   # replaces the clip rendered in that voice when it passes the same checks (at most
+#   # 600 ms once silence is trimmed, not silent).
+#   # The lines said when a service fails are recorded as .../<language>/failure/<line id>.wav
+#   # (stall-1, hearing-1, exit, exit-follow-up, back, ...), and the gateway keeps the ones it
+#   # rendered under .../<language>/failure/cache/ so later sessions start with them.
+#   clips_dir: "/etc/waav/clips"              # ENV: WAAV_INTERACTION_CLIPS_DIR
+#   # The server's default voice: the failure lines are made in it once at server start, for
+#   # sessions whose own voice cannot give them (a tts_config object with PCM audio). It is
+#   # also the gateway's voice on a speech-to-speech session that names no speech.voice
+#   # (the half-cascade, gateway clips).
+#   failure_voice: {"provider": "openai", "voice_id": "alloy", "model": "tts-1",
+#                   "audio_format": "pcm", "sample_rate": 24000}  # ENV: WAAV_INTERACTION_FAILURE_VOICE (JSON)
+#   # Escape flags of the speech-to-speech provider wire fixes: each restores today's frames
+#   # of one fix (deepgram_text_as_agent_message, nova_text_non_interactive,
+#   # gemini_omit_tool_behavior, gemini_media_chunks, gemini_response_id_only,
+#   # allow_setup_resend, deepgram_settings_resend, deepgram_omit_tools, ultravox_omit_tools,
+#   # openai_session_resend, grok_openai_session, grok_openai_events, grok_legacy_model,
+#   # openai_turn_detection_none, openai_replay_text, azure_deployment_query,
+#   # hume_drop_id_less_messages, inworld_endpoint_session_only, nova_stream_drop_on_close,
+#   # nova_audio_before_history, nova_tool_result_as_given, nova_omit_turn_detection,
+#   # ultravox_new_call_on_redial, ultravox_legacy_model, ultravox_omit_call_settings,
+#   # elevenlabs_omit_voice, hume_text_input, hume_settings_when_needed, hume_stop_assistant,
+#   # hume_omit_tools, hume_voice_query, inworld_encode_key, inworld_whisper_model,
+#   # openai_clone_voice_alloy, inworld_omit_model, inworld_auto_tool_response,
+#   # inworld_openai_response, yandex_omit_languages).
+#   # A flag wins over a listed fix below.
+#   realtime_legacy_wire: []                  # ENV: WAAV_REALTIME_LEGACY_WIRE (comma-separated)
+#   # Provider wire fixes and OpenAI default moves, built and OFF until each vendor's live
+#   # probe: listing one turns it on for every session (gemini_tool_behavior,
+#   # gemini_tool_call_cancellation, gemini_interaction_status, gemini_response_scheduling,
+#   # gemini_realtime_audio, gemini_response_name, setup_once, deepgram_tools,
+#   # deepgram_update_prompt, nova_interactive_text, ultravox_tools, openai_realtime_default,
+#   # openai_stt_default, openai_manual_turn_null, openai_replay_output_text,
+#   # openai_update_delta, openai_modalities, openai_inbound, azure_ga_url, grok_session,
+#   # grok_events, grok_voice_default, gemini_turn_transcripts, gemini_context_compression,
+#   # gemini_turn_detection, gemini_await_setup, gemini_update_resume, gemini_json_schema,
+#   # gemini_max_output_tokens, gemini_inbound, nova_close_sequence,
+#   # nova_history_before_audio, nova_interrupted_marker, nova_tool_result_object,
+#   # nova_turn_detection, ultravox_transcripts, ultravox_prior_call, ultravox_default_model,
+#   # ultravox_call_settings, elevenlabs_server_events, elevenlabs_voice_override,
+#   # hume_user_input, hume_audio_settings, hume_cancel_local, hume_tools,
+#   # hume_voice_settings, hume_message_ids, hume_wav_output, hume_interruption,
+#   # inworld_basic_key, inworld_session_key, inworld_stt_default, openai_clone_voice,
+#   # inworld_model, inworld_tool_response, inworld_transcript_index, inworld_response_shape,
+#   # yandex_languages). setup_once also covers Nova Sonic, Ultravox and ElevenLabs Agents.
+#   # deepgram_user_text, deepgram_tools and deepgram_update_prompt passed their probes and
+#   # are ON without being listed (their escape flags deepgram_text_as_agent_message,
+#   # deepgram_omit_tools and deepgram_settings_resend turn them off), and so are
+#   # grok_session, grok_events and grok_voice_default (xAI, probed 23 Oct; escape flags
+#   # grok_openai_session, grok_openai_events, grok_legacy_model; under grok_events session_created
+#   # names the model xAI reports, live grok-voice-3.0). Also ON, by documentation evidence
+#   # (24 Oct; the vendor's reference refuses today's frame): azure_ga_url,
+#   # openai_manual_turn_null, openai_replay_output_text (Yandex keeps today's for both),
+#   # hume_user_input, hume_audio_settings, hume_cancel_local, hume_message_ids,
+#   # inworld_basic_key, inworld_session_key (escape flags azure_deployment_query,
+#   # openai_turn_detection_none, openai_replay_text, hume_text_input,
+#   # hume_settings_when_needed, hume_stop_assistant, hume_drop_id_less_messages,
+#   # inworld_encode_key, inworld_endpoint_session_only). deepgram_tools sends a Voice Agent
+#   # session's functions to the agent (an interaction-mode session sends them without it).
+#   # See docs/interaction_mode.md, "Provider Fixes" and "Deepgram".
+#   provider_fixes: []                        # ENV: WAAV_PROVIDER_FIXES (comma-separated)
+#   # A /realtime session's config may turn a fix off for itself ("provider_fixes":
+#   # {"deepgram_user_text": false}); with this, also on.
+#   provider_fixes_per_session: false         # ENV: WAAV_PROVIDER_FIXES_PER_SESSION
+#
+# Retiring providers and models, with interaction mode on or off: a session whose traffic goes
+# to the vendor's own host gets a config_warning (provider_sunset, model_retiring) and is
+# refused from the shutdown date (provider_retired, model_retired). Hume (EVI and text-to-
+# speech): refused from 2026-11-13. OpenAI tts-1 family: from 2027-01-06; gpt-realtime:
+# from 2027-01-20; whisper-1 and the gpt-4o-transcribe family: from 2027-02-26. A session
+# with OPENAI_BASE_URL or <PROVIDER>_REALTIME_URL pointing elsewhere is not affected.

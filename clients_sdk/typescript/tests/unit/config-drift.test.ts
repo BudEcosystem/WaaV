@@ -131,7 +131,7 @@ const DAG_SDK = new Set(['template', 'definition', 'enableMetrics', 'timeoutMs']
 // Top-level config envelope (IncomingMessage::Config branch).
 const ENVELOPE_SDK = new Set([
   'streamId', 'audio', 'sttConfig', 'ttsConfig', 'livekit', 'dag', 'conversation',
-  'turnDetection',
+  'turnDetection', 'interaction',
 ]);
 
 /**
@@ -189,7 +189,7 @@ describe('config drift guard: SDK config ⊇ gateway openapi config schemas', ()
     // the regenerated openapi IncomingMessage oneOf).
     const envelopeProps = [
       'stream_id', 'audio', 'audio_disabled', 'stt_config', 'tts_config',
-      'livekit', 'dag_config', 'conversation_config', 'type',
+      'livekit', 'dag_config', 'conversation_config', 'interaction', 'type',
     ];
     const exc = EXCEPTIONS.ConfigEnvelope!;
     // Map wire key → SDK field name.

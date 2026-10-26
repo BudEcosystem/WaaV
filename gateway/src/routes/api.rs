@@ -1,13 +1,15 @@
 use axum::{
     Router,
     extract::DefaultBodyLimit,
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
 };
 use tower_http::trace::TraceLayer;
 
 use crate::core::stt::batch::BATCH_JSON_BODY_LIMIT_BYTES;
 use crate::handlers::voices::VOICE_CLONE_JSON_BODY_LIMIT_BYTES;
-use crate::handlers::{capabilities, dag, livekit, recording, sip, speak, transcribe, voices};
+use crate::handlers::{
+    capabilities, dag, livekit, recording, sip, speak, tasks, transcribe, voices,
+};
 use crate::state::AppState;
 use std::sync::Arc;
 
@@ -144,6 +146,21 @@ pub fn create_api_router() -> Router<Arc<AppState>> {
                 .layer(DefaultBodyLimit::max(BATCH_JSON_BODY_LIMIT_BYTES)),
         )
         .route("/transcribe/batch/{job_id}", get(transcribe::get_batch))
+        // Interaction mode: the caller's background tasks.
+        .route("/v1/tasks", get(tasks::list_tasks))
+        .route("/v1/tasks/events", get(tasks::task_events))
+        .route("/v1/tasks/{task_id}", get(tasks::get_task))
+        // What a tenant keeps across sessions: its personas, what is known about its callers.
+        .route(
+            "/v1/interaction/personas/{id}",
+            put(tasks::put_persona)
+                .get(tasks::get_persona)
+                .delete(tasks::delete_persona),
+        )
+        .route(
+            "/v1/interaction/memory/{subject}",
+            put(tasks::put_memory).get(tasks::get_memory),
+        )
         .layer(TraceLayer::new_for_http())
 }
 

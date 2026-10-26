@@ -1,0 +1,57 @@
+{
+  "interaction": {
+    "enabled": true,
+    "speech": {"truth_ack": ["gemini", "grok", "azure", "openai:gpt-realtime-2.1"]},
+    "defaults": {
+      "agent_ids": ["support", "billing"],
+      "agent": {
+        "front": {"persona": "acme-support@3"},
+        "tasks": {"speculative_start": "auto"},
+        "events": {"floor": true},
+        "background": {"answer_marker": "ANSWER:"}
+      },
+      "realtime_deployments": ["acme-voice-gemini"],
+      "realtime": {
+        "tasks": {"default_backend": "llm"},
+        "speech": {"voice_mismatch": "confirmations_only", "fallback": {"provider": "openai", "model": "gpt-realtime-2.1", "voice": "marin"}}
+      }
+    },
+    "allow_client_override": ["front.caller.verbosity", "front.caller.pace", "events.floor"],
+    "realtime_legacy_wire": [],
+    "tasks": {
+      "task_backends": [
+        {"name": "crm", "type": "webhook", "url": "https://crm.example.com/waav/tasks", "secret_env": "CRM_WEBHOOK_SECRET", "side_effects": "possible", "trust": "first_party", "max_in_flight_process": 100, "mode": "callback"},
+        {"name": "research", "type": "openai_responses", "model": "operator-choice", "api_key_env": "OPENAI_API_KEY", "speculative_start": "off", "answer_stream": "marker"}
+      ],
+      "allow_client_backends": true,
+      "allow_client_tools": false,
+      "allow_client_push": false,
+      "phone_continuation": "off"
+    },
+    "duplex": {"compute": {"pool_threads": "auto", "smart_turn_queue": 64, "analyser_ring_frames": 64, "event_channel": 64}}
+  },
+  "front_model": {
+    "enabled": true,
+    "mode": "managed",
+    "profile": "auto",
+    "licence": "lfm_open_eligible",
+    "profiles_enabled": ["auto", "scripted"],
+    "device": "cpu",
+    "threads": 6,
+    "parallel_slots": 2,
+    "admission_permits": 1,
+    "personas": [
+      {"id": "acme-support", "version": 3, "display_name": "Ava from Acme support"},
+      {"id": "rosa-concierge", "version": 2, "display_name": "Rosa's concierge"}
+    ],
+    "default_persona": "acme-support",
+    "memory": {"enabled": false, "retention_days": 90, "read_budget_ms": 150, "max_facts_read": 3},
+    "tenant_personas": {"enabled": false, "max_per_tenant": 20, "max_versions": 5, "writes_per_minute": 10}
+  },
+  "aliases": {
+    "support-interactive": {
+      "kind": "agent",
+      "interaction": {"events": {"floor": false}, "hitl": {"channels": ["voice", "client"]}}
+    }
+  }
+}

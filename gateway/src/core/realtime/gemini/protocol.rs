@@ -39,7 +39,7 @@ use serde_json::{Value, json};
 
 use crate::core::realtime::base::{
     FunctionCallRequest, RealtimeConfig, RealtimeError, RealtimeResponseOverride, RealtimeResult,
-    TranscriptRole,
+    RealtimeVerb, SpeechEvent, TranscriptRole, TurnDetectionConfig,
 };
 use crate::core::realtime::scaffold::{
     ConnectSpec, Inbound, OutFrame, ProtocolCaps, RealtimeProtocol, S2sEvent, UsageReport,
@@ -78,6 +78,88 @@ pub struct GeminiProtocol {
     /// The resolved Gemini Live model (e.g. `gemini-2.0-flash-live-001`). The
     /// `setup.model` field carries it as `models/<model>`.
     model: String,
+    /// Provider fix `gemini_tool_call_cancellation`: `toolCallCancellation` is mapped.
+    map_cancellation: bool,
+    /// Provider fix `gemini_interaction_status`: `serverContent.interactionStatus` is mapped.
+    map_status: bool,
+    /// Provider fix `gemini_realtime_audio`: the caller's audio is `realtimeInput.audio`
+    /// (`mediaChunks` is deprecated in the Live API).
+    audio_input: bool,
+    /// Provider fix `gemini_response_name`: a function response names its function.
+    response_name: bool,
+    /// Provider fix `setup_once`: a changed setup is refused, never sent on the open socket
+    /// (the Live API takes `setup` only as its first message).
+    setup_once: bool,
+    /// The name of each open function call, by id (`gemini_response_name`).
+    calls: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    /// Provider fix `gemini_response_scheduling`: an interaction session's delegate result
+    /// names its delivery (`waav_scheduling` in the result becomes `scheduling`).
+    scheduling: bool,
+    /// Provider fix `gemini_turn_transcripts`: each turn's transcripts end in one final per
+    /// role (`turn` holds the caller's and the model's words of the turn so far).
+    turn_transcripts: bool,
+    turn: std::sync::Mutex<(String, String)>,
+    /// Provider fix `gemini_context_compression`: `setup.contextWindowCompression`.
+    compression: bool,
+    /// Provider fix `gemini_turn_detection`: the session's turn detection is
+    /// `realtimeInputConfig`; `manual` turns are the client's `activityStart` / `activityEnd`.
+    turn_detection: bool,
+    manual: bool,
+    /// Provider fix `gemini_await_setup`: nothing else goes before `setupComplete`.
+    await_setup: bool,
+    /// Provider fix `gemini_update_resume`: an update is a new connection resuming the session.
+    update_resume: bool,
+    /// Provider fix `gemini_max_output_tokens`: `generationConfig.maxOutputTokens`.
+    max_tokens: bool,
+    /// Provider fix `gemini_inbound`: thought parts are not transcripts; `voiceActivity` is
+    /// the caller's speech start and end.
+    inbound: bool,
+}
+
+/// The model name without `models/`, in lower case.
+fn bare_model(model: &str) -> String {
+    model
+        .trim()
+        .trim_start_matches("models/")
+        .to_ascii_lowercase()
+}
+
+/// Whether a function response may carry `scheduling` on `model`: Gemini 3.8 Live has
+/// "Function scheduling (`SILENT`, `WHEN_IDLE`, `INTERRUPTED`)"; on its extended-thinking
+/// variant "Blocking mode and function scheduling are not supported", and older models run
+/// functions sequentially (<https://ai.google.dev/gemini-api/docs/live-api/capabilities>).
+fn scheduling_supported(model: &str) -> bool {
+    let model = bare_model(model);
+    model.starts_with("gemini-3.8-live") && !model.starts_with("gemini-3.8-live-extended-thinking")
+}
+
+/// The `realtimeInput` that opens the client's next turn when Gemini's own activity detection
+/// is off (fix `gemini_turn_detection`, manual turns).
+fn activity_start() -> Value {
+    json!({ "realtimeInput": { "activityStart": {} } })
+}
+
+/// The `behavior` a function declaration carries under the provider fix
+/// `gemini_tool_behavior` (plan W6 Decision 6), by model: on `gemini-3.8-live` a client's
+/// function blocks and the gateway's delegate function does not; on the extended-thinking
+/// model every function is non-blocking (async only); older models get none (synchronous
+/// only). Enum `Behavior` {`BLOCKING`, `NON_BLOCKING`} of google-genai's `FunctionDeclaration`
+/// (<https://raw.githubusercontent.com/googleapis/python-genai/main/google/genai/types.py>).
+fn tool_behavior(model: &str, name: &str) -> Option<&'static str> {
+    let model = bare_model(model);
+    if model.starts_with("gemini-3.8-live-extended-thinking") {
+        Some("NON_BLOCKING")
+    } else if model.starts_with("gemini-3.8-live") {
+        Some(
+            if name == crate::core::interaction::provider::DELEGATE_TOOL {
+                "NON_BLOCKING"
+            } else {
+                "BLOCKING"
+            },
+        )
+    } else {
+        None
+    }
 }
 
 impl GeminiProtocol {
@@ -116,20 +198,37 @@ impl GeminiProtocol {
     /// Build the `tools` array from `cfg.tools` (Gemini groups all function
     /// declarations under a single `{"functionDeclarations":[…]}` tool). Returns
     /// `None` when no tools — the field is then omitted from `setup`.
-    fn tools(cfg: &RealtimeConfig) -> Option<Value> {
+    fn tools(&self, cfg: &RealtimeConfig) -> Option<Value> {
         let tools = cfg.tools.as_ref()?;
         if tools.is_empty() {
             return None;
         }
+        let behavior = cfg.fix("gemini_tool_behavior");
+        // Fix `gemini_json_schema`: the client's JSON Schema is `parametersJsonSchema` ("in JSON
+        // Schema format"), not `parameters` ("a select subset of an OpenAPI 3.0 schema object"),
+        // and the required `description` is never left out.
+        let json_schema = cfg.fix("gemini_json_schema");
         let decls: Vec<Value> = tools
             .iter()
             .map(|t| {
                 let mut decl = json!({ "name": t.function.name });
                 if let Some(desc) = &t.function.description {
                     decl["description"] = json!(desc);
+                } else if json_schema {
+                    decl["description"] = json!("");
                 }
                 if let Some(params) = &t.function.parameters {
-                    decl["parameters"] = params.clone();
+                    let key = if json_schema {
+                        "parametersJsonSchema"
+                    } else {
+                        "parameters"
+                    };
+                    decl[key] = params.clone();
+                }
+                if let Some(value) =
+                    tool_behavior(&self.model, &t.function.name).filter(|_| behavior)
+                {
+                    decl["behavior"] = json!(value);
                 }
                 decl
             })
@@ -142,7 +241,7 @@ impl GeminiProtocol {
     /// (Assistant, `is_final` = `turnComplete`). Then `interrupted` ⇒
     /// `InterruptedByServer` and `turnComplete` ⇒ `ResponseDone` are appended.
     /// THIS is the MULTI-FRAME case: one wire message → a `Vec` of N events.
-    fn map_server_content(sc: &Value) -> Vec<S2sEvent> {
+    fn map_server_content(&self, sc: &Value) -> Vec<S2sEvent> {
         let mut out = Vec::new();
 
         let turn_complete = sc
@@ -161,6 +260,11 @@ impl GeminiProtocol {
             .and_then(Value::as_array)
         {
             for part in parts {
+                // `Part.thought`: "Indicates if the part is thought from the model" (fix
+                // `gemini_inbound`): never audio or a transcript.
+                if self.inbound && part.get("thought").and_then(Value::as_bool) == Some(true) {
+                    continue;
+                }
                 // Audio part: inlineData{mimeType:"audio/pcm;rate=24000",data:b64}.
                 // Gate on an `audio/` mimeType so a future model returning a
                 // non-audio inlineData blob (image / thought-signature) is NOT
@@ -188,12 +292,7 @@ impl GeminiProtocol {
                 if let Some(text) = part.get("text").and_then(Value::as_str)
                     && !text.is_empty()
                 {
-                    out.push(S2sEvent::Transcript {
-                        role: TranscriptRole::Assistant,
-                        text: text.to_string(),
-                        is_final: turn_complete,
-                        item_id: None,
-                    });
+                    out.push(self.heard(TranscriptRole::Assistant, text, turn_complete));
                 }
             }
         }
@@ -206,12 +305,7 @@ impl GeminiProtocol {
             .and_then(Value::as_str)
             && !text.is_empty()
         {
-            out.push(S2sEvent::Transcript {
-                role: TranscriptRole::User,
-                text: text.to_string(),
-                is_final: false,
-                item_id: None,
-            });
+            out.push(self.heard(TranscriptRole::User, text, false));
         }
         if let Some(text) = sc
             .get("outputTranscription")
@@ -219,18 +313,45 @@ impl GeminiProtocol {
             .and_then(Value::as_str)
             && !text.is_empty()
         {
-            out.push(S2sEvent::Transcript {
-                role: TranscriptRole::Assistant,
-                text: text.to_string(),
-                is_final: turn_complete,
-                item_id: None,
-            });
+            out.push(self.heard(TranscriptRole::Assistant, text, turn_complete));
+        }
+        // Fix `gemini_turn_transcripts`: the turn's words, one final per role, when the model's
+        // turn ends or is cut. Transcription carries no end of its own (`text`, `languageCode`,
+        // offsets), and arrives "independently of the other server messages".
+        if self.turn_transcripts && (turn_complete || interrupted) {
+            let (caller, model) =
+                std::mem::take(&mut *self.turn.lock().unwrap_or_else(|p| p.into_inner()));
+            for (role, text) in [
+                (TranscriptRole::User, caller),
+                (TranscriptRole::Assistant, model),
+            ] {
+                if !text.is_empty() {
+                    out.push(S2sEvent::Transcript {
+                        role,
+                        text,
+                        is_final: true,
+                        item_id: None,
+                    });
+                }
+            }
         }
 
         // Barge-in: the server stopped the model turn (user interrupted). The
         // driver runs cancel + clears local playback (Gemini has no truncate).
         if interrupted {
             out.push(S2sEvent::InterruptedByServer);
+        }
+        // Provider fix `gemini_interaction_status`: whether the server still works after its
+        // turn (extended thinking). `turnComplete` keeps producing `ResponseDone`. Values
+        // `IN_PROGRESS` / `IDLE` (`REQUIRES_ACTION` is the deprecated `IDLE`):
+        // <https://ai.google.dev/api/live> `BidiGenerateContentServerContent.interactionStatus`.
+        let status = sc.get("interactionStatus").and_then(Value::as_str);
+        if let Some(status) = status.filter(|_| self.map_status) {
+            match status {
+                "IN_PROGRESS" => out.push(S2sEvent::ProviderBusy(true)),
+                "IDLE" | "REQUIRES_ACTION" => out.push(S2sEvent::ProviderBusy(false)),
+                _ => {}
+            }
         }
         // Generation finished (NOT playout — driver must not clear playback here).
         if turn_complete {
@@ -244,6 +365,63 @@ impl GeminiProtocol {
             out.push(S2sEvent::Ignore);
         }
         out
+    }
+
+    /// One transcript chunk. Under the fix `gemini_turn_transcripts` it is interim and kept
+    /// for the turn's final; without it today's: a user chunk interim, a model chunk final
+    /// when it rides with `turnComplete`.
+    fn heard(&self, role: TranscriptRole, text: &str, turn_complete: bool) -> S2sEvent {
+        let is_final = if self.turn_transcripts {
+            let mut turn = self.turn.lock().unwrap_or_else(|p| p.into_inner());
+            match role {
+                TranscriptRole::User => turn.0.push_str(text),
+                TranscriptRole::Assistant => turn.1.push_str(text),
+            }
+            false
+        } else {
+            role == TranscriptRole::Assistant && turn_complete
+        };
+        S2sEvent::Transcript {
+            role,
+            text: text.to_string(),
+            is_final,
+            item_id: None,
+        }
+    }
+
+    /// `realtimeInputConfig` from the session's turn detection (fix `gemini_turn_detection`):
+    /// manual turns turn `automaticActivityDetection` off; server VAD's `silence_duration_ms`
+    /// is `silenceDurationMs` ("duration of detected non-speech ... before end-of-speech is
+    /// committed"), and `interrupt_response: false` is `activityHandling: NO_INTERRUPTION`.
+    /// OpenAI's `prefix_padding_ms` (audio kept before speech) is not Gemini's `prefixPaddingMs`
+    /// ("duration of detected speech before start-of-speech is committed"), so it is not sent.
+    fn realtime_input_config(cfg: &RealtimeConfig) -> Option<Value> {
+        let mut config = serde_json::Map::new();
+        let interrupt = match cfg.turn_detection.as_ref()? {
+            TurnDetectionConfig::None => {
+                return Some(json!({ "automaticActivityDetection": { "disabled": true } }));
+            }
+            TurnDetectionConfig::ServerVad {
+                silence_duration_ms,
+                interrupt_response,
+                ..
+            } => {
+                if let Some(ms) = silence_duration_ms {
+                    config.insert(
+                        "automaticActivityDetection".into(),
+                        json!({ "silenceDurationMs": ms }),
+                    );
+                }
+                *interrupt_response
+            }
+            TurnDetectionConfig::SemanticVad {
+                interrupt_response, ..
+            } => *interrupt_response,
+        };
+        if interrupt == Some(false) {
+            config.insert("activityHandling".into(), json!("NO_INTERRUPTION"));
+        }
+        (!config.is_empty()).then_some(Value::Object(config))
     }
 
     /// `usageMetadata` → one cumulative [`UsageReport`]. Per modality from the `*TokensDetails`
@@ -306,7 +484,7 @@ impl GeminiProtocol {
     }
 
     /// Everything but `usageMetadata`, which rides on any message.
-    fn map_message(value: &Value) -> Vec<S2sEvent> {
+    fn map_message(&self, value: &Value) -> Vec<S2sEvent> {
         // goAway: the connection closes after `timeLeft`; the driver reconnects with the
         // resumption handle at the next turn boundary (FRD-023 RT7.1, TC-XL-04).
         if let Some(ga) = value.get("goAway") {
@@ -319,12 +497,22 @@ impl GeminiProtocol {
 
         // serverContent — the MULTI-FRAME case (audio + text parts + turn flags).
         if let Some(sc) = value.get("serverContent") {
-            return Self::map_server_content(sc);
+            return self.map_server_content(sc);
         }
 
         // toolCall ⇒ one FunctionCall per functionCalls[] entry.
         if let Some(tc) = value.get("toolCall") {
-            return Self::map_tool_call(tc);
+            let events = Self::map_tool_call(tc);
+            if self.response_name
+                && let Ok(mut calls) = self.calls.lock()
+            {
+                for event in &events {
+                    if let S2sEvent::FunctionCall(call) = event {
+                        calls.insert(call.call_id.clone(), call.name.clone());
+                    }
+                }
+            }
+            return events;
         }
 
         // sessionResumptionUpdate ⇒ ResumptionHandle (driver stores it, feeds it
@@ -344,12 +532,36 @@ impl GeminiProtocol {
             return vec![S2sEvent::Ignore];
         }
 
-        // toolCallCancellation: the server cancelled pending tool calls; nothing
-        // for the gateway to forward (the call ids would already be in flight) ⇒ Ignore.
+        // toolCallCancellation `{"ids":[…]}` (<https://ai.google.dev/api/live>
+        // `BidiGenerateContentToolCallCancellation`): with the provider fix
+        // `gemini_tool_call_cancellation` the withdrawn calls are named; else ⇒ Ignore.
+        if let Some(ids) = value
+            .get("toolCallCancellation")
+            .filter(|_| self.map_cancellation)
+            .and_then(|c| c.get("ids"))
+            .and_then(Value::as_array)
+        {
+            let call_ids: Vec<String> = ids
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect();
+            if !call_ids.is_empty() {
+                return vec![S2sEvent::FunctionCallCancelled { call_ids }];
+            }
+        }
         vec![S2sEvent::Ignore]
     }
 
     fn encode_user_audio_chunk(&self, pcm: &[u8]) -> Value {
+        let blob = json!({
+            "mimeType": format!("audio/pcm;rate={INPUT_SAMPLE_RATE}"),
+            "data": BASE64_STANDARD.encode(pcm),
+        });
+        // `realtimeInput.audio` (<https://ai.google.dev/api/live> `BidiGenerateContentRealtimeInput`).
+        if self.audio_input {
+            return json!({ "realtimeInput": { "audio": blob } });
+        }
         // base64-in-JSON: realtimeInput.mediaChunks[0] with the 16 kHz input mime.
         json!({
             "realtimeInput": {
@@ -416,6 +628,22 @@ impl RealtimeProtocol for GeminiProtocol {
         }
         Ok(Self {
             model: Self::resolve_model(cfg),
+            map_cancellation: cfg.fix("gemini_tool_call_cancellation"),
+            map_status: cfg.fix("gemini_interaction_status"),
+            audio_input: cfg.fix("gemini_realtime_audio"),
+            response_name: cfg.fix("gemini_response_name"),
+            setup_once: cfg.fix("setup_once"),
+            calls: Default::default(),
+            scheduling: cfg.fix("gemini_response_scheduling"),
+            turn_transcripts: cfg.fix("gemini_turn_transcripts"),
+            turn: Default::default(),
+            compression: cfg.fix("gemini_context_compression"),
+            turn_detection: cfg.fix("gemini_turn_detection"),
+            manual: matches!(cfg.turn_detection, Some(TurnDetectionConfig::None)),
+            await_setup: cfg.fix("gemini_await_setup"),
+            update_resume: cfg.fix("gemini_update_resume"),
+            max_tokens: cfg.fix("gemini_max_output_tokens"),
+            inbound: cfg.fix("gemini_inbound"),
         })
     }
 
@@ -430,8 +658,9 @@ impl RealtimeProtocol for GeminiProtocol {
     fn caps(&self) -> ProtocolCaps {
         ProtocolCaps {
             // Gemini runs server-side VAD + turn-taking, so it owns turns and
-            // emits user-turn frames (interrupted, input transcription).
-            emits_user_turn_frames: true,
+            // emits user-turn frames (interrupted, input transcription) — unless the client
+            // takes the turns (fix `gemini_turn_detection`, manual).
+            emits_user_turn_frames: !(self.turn_detection && self.manual),
             output_bytes_per_ms: OUTPUT_BYTES_PER_MS,
             output_sample_rate: OUTPUT_SAMPLE_RATE,
             // Gemini has no client-driven item truncation (barge-in is server-side
@@ -478,6 +707,13 @@ impl RealtimeProtocol for GeminiProtocol {
         if let Some(temp) = cfg.temperature {
             generation_config["temperature"] = json!(temp);
         }
+        // Fix `gemini_max_output_tokens`: the client's cap (`-1`, no cap, sends nothing).
+        if let Some(tokens) = cfg
+            .max_response_output_tokens
+            .filter(|t| *t > 0 && self.max_tokens)
+        {
+            generation_config["maxOutputTokens"] = json!(tokens);
+        }
 
         // setup.model carries `models/<model>` (Gemini's fully-qualified form).
         let mut setup = json!({
@@ -493,7 +729,7 @@ impl RealtimeProtocol for GeminiProtocol {
         }
 
         // tools (skip-if-none): one {"functionDeclarations":[…]} entry.
-        if let Some(tools) = Self::tools(cfg) {
+        if let Some(tools) = self.tools(cfg) {
             setup["tools"] = tools;
         }
 
@@ -519,8 +755,42 @@ impl RealtimeProtocol for GeminiProtocol {
             Some(handle) => json!({ "handle": handle }),
             None => json!({}),
         };
+        // Fix `gemini_context_compression`: "Without compression, audio-only sessions are
+        // limited to 15 minutes" (session management guide); the sliding window with Google's
+        // defaults (trigger at 80% of the context window, keep half of it).
+        if self.compression {
+            setup["contextWindowCompression"] = json!({ "slidingWindow": {} });
+        }
+        if self.turn_detection
+            && let Some(config) = Self::realtime_input_config(cfg)
+        {
+            setup["realtimeInputConfig"] = config;
+        }
 
         vec![json!({ "setup": setup })]
+    }
+
+    fn awaits_session_ready(&self) -> bool {
+        // "Clients should wait for a `BidiGenerateContentSetupComplete` message before sending
+        // any additional messages." (fix `gemini_await_setup`)
+        self.await_setup
+    }
+
+    fn update_by_reconnect(&self, old: &RealtimeConfig, new: &RealtimeConfig) -> bool {
+        // "You cannot update the configuration while the connection is open. However, you can
+        // change the configuration parameters, except the model, when pausing and resuming via
+        // the session resumption mechanism." (fix `gemini_update_resume`)
+        self.update_resume && Self::resolve_model(old) == Self::resolve_model(new)
+    }
+
+    fn session_update(&self, old: &RealtimeConfig, new: &RealtimeConfig) -> Option<Vec<Value>> {
+        // `setup` is the Live API's first message only (fix `setup_once`): a second one
+        // mid-session is refused by the server.
+        if self.setup_once || self.update_resume {
+            return None;
+        }
+        let _ = old;
+        Some(self.build_session_config(new, None))
     }
 
     fn map_server_event(&self, raw: Inbound<'_>) -> Vec<S2sEvent> {
@@ -538,12 +808,44 @@ impl RealtimeProtocol for GeminiProtocol {
 
         // setupComplete ⇒ SessionReady (the session handshake finished).
         if value.get("setupComplete").is_some() {
-            return vec![S2sEvent::SessionReady { session_id: None }];
+            let mut events = vec![S2sEvent::SessionReady { session_id: None }];
+            // Manual turns (fix `gemini_turn_detection`): the client's first turn opens now.
+            if self.turn_detection
+                && self.manual
+                && let Ok(frame) = self.serialize(&activity_start())
+            {
+                events.push(S2sEvent::SendFrame(frame));
+            }
+            return events;
         }
 
         // usageMetadata rides on any server message (usually the turn's last). It goes FIRST,
         // so it lands on the response the same message completes (FRD-023 §5.7, TC-XL-03).
-        let mut events = Self::map_message(&value);
+        let mut events = self.map_message(&value);
+        // `voiceActivity` (fix `gemini_inbound`): `ACTIVITY_START` "Start of sentence signal",
+        // `ACTIVITY_END` "End of sentence signal", at `audioOffset` into the audio stream.
+        if let Some(activity) = value.get("voiceActivity").filter(|_| self.inbound) {
+            let at = activity
+                .get("audioOffset")
+                .and_then(Value::as_str)
+                .and_then(parse_proto_duration)
+                .map_or(0, |d| d.as_millis() as u64);
+            let speech = match activity.get("type").and_then(Value::as_str) {
+                Some("ACTIVITY_START") => Some(SpeechEvent::Started {
+                    audio_start_ms: at,
+                    item_id: None,
+                }),
+                Some("ACTIVITY_END") => Some(SpeechEvent::Stopped {
+                    audio_end_ms: at,
+                    item_id: None,
+                }),
+                _ => None,
+            };
+            if let Some(speech) = speech {
+                events.retain(|e| !matches!(e, S2sEvent::Ignore));
+                events.push(S2sEvent::Speech(speech));
+            }
+        }
         if let Some(u) = value.get("usageMetadata").map(Self::map_usage) {
             events.retain(|e| !matches!(e, S2sEvent::Ignore));
             events.insert(0, u);
@@ -573,7 +875,14 @@ impl RealtimeProtocol for GeminiProtocol {
     }
 
     fn commit_turn(&self) -> Vec<Self::Wire> {
-        // Server VAD owns turn close.
+        // Manual turns (fix `gemini_turn_detection`): "The client then sends activityStart and
+        // activityEnd": this turn ends and the next opens. Else server VAD owns turn close.
+        if self.turn_detection && self.manual {
+            return vec![
+                json!({ "realtimeInput": { "activityEnd": {} } }),
+                activity_start(),
+            ];
+        }
         Vec::new()
     }
 
@@ -588,15 +897,54 @@ impl RealtimeProtocol for GeminiProtocol {
         // response by the function-call `id` and wraps the payload in `response`.
         // The result string is parsed back to JSON when possible (Gemini wants a
         // structured object), falling back to `{"result": <string>}`.
-        let response: Value = serde_json::from_str(result)
+        let mut response: Value = serde_json::from_str(result)
             .ok()
             .filter(Value::is_object)
             .unwrap_or_else(|| json!({ "result": result }));
+        // `FunctionResponse.scheduling` (fix `gemini_response_scheduling`): when the model
+        // tells the caller of a non-blocking call's result. Only interaction mode names it.
+        // Only on a model with function scheduling ([`scheduling_supported`]).
+        let scheduling = response
+            .as_object_mut()
+            .filter(|_| self.scheduling)
+            .and_then(|object| object.remove("waav_scheduling"))
+            .filter(|when| matches!(when.as_str(), Some("INTERRUPT" | "WHEN_IDLE" | "SILENT")))
+            .filter(|_| scheduling_supported(&self.model));
+        let mut function_response = json!({ "id": call_id, "response": response });
+        if let Some(when) = scheduling {
+            function_response["scheduling"] = when;
+        }
+        // `FunctionResponse.name` (fix `gemini_response_name`): the function the call named.
+        let name = self
+            .calls
+            .lock()
+            .ok()
+            .and_then(|mut calls| calls.remove(call_id))
+            .filter(|_| self.response_name);
+        if let Some(name) = name {
+            function_response["name"] = json!(name);
+        }
         vec![json!({
             "toolResponse": {
-                "functionResponses": [{ "id": call_id, "response": response }]
+                "functionResponses": [function_response]
             }
         })]
+    }
+
+    /// `AddContext` is a user turn the model does not answer yet: `clientContent` with
+    /// `turnComplete: false` ("If true, indicates that the server content generation should
+    /// start with the currently accumulated prompt"). The executor sends it only while the
+    /// model is idle. Gemini has no wire for the other verbs.
+    fn verb(&self, verb: &RealtimeVerb<'_>) -> Option<Vec<Self::Wire>> {
+        match *verb {
+            RealtimeVerb::AddContext(text) => Some(vec![json!({
+                "clientContent": {
+                    "turns": [{ "role": "user", "parts": [{ "text": text }] }],
+                    "turnComplete": false,
+                }
+            })]),
+            _ => None,
+        }
     }
 
     fn serialize(&self, msg: &Self::Wire) -> RealtimeResult<OutFrame> {
@@ -804,6 +1152,59 @@ mod tests {
             OutFrame::Text(s) => assert!(s.contains("realtimeInput")),
             OutFrame::Binary(_) => panic!("Gemini audio must be a JSON text frame"),
         }
+    }
+
+    /// The fixes behind the escape flags `gemini_media_chunks`, `gemini_response_id_only` and
+    /// `allow_setup_resend`: off, today's wire; on, audio as `realtimeInput.audio`, a function
+    /// response with the call's `name`, and a mid-session setup refused.
+    #[test]
+    fn audio_function_response_and_setup_follow_their_fixes() {
+        let call = r#"{"toolCall":{"functionCalls":[{"id":"c1","name":"get_weather","args":{}}]}}"#;
+        let today = proto(&base_cfg());
+        assert!(today.encode_user_audio(&[1, 2])["realtimeInput"]["mediaChunks"][0].is_object());
+        today.map_server_event(Inbound::Text(call));
+        let reply = &today.format_tool_result("c1", "{}")[0];
+        assert!(
+            reply["toolResponse"]["functionResponses"][0]
+                .get("name")
+                .is_none()
+        );
+        let cfg = base_cfg();
+        assert!(
+            today
+                .session_update(&cfg, &cfg)
+                .is_some_and(|w| w[0].get("setup").is_some())
+        );
+
+        let mut cfg = base_cfg();
+        cfg.provider_fixes = [
+            "gemini_realtime_audio",
+            "gemini_response_name",
+            "setup_once",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let fixed = proto(&cfg);
+        let audio = fixed.encode_user_audio(&[1, 2]);
+        assert_eq!(
+            audio["realtimeInput"]["audio"]["mimeType"],
+            "audio/pcm;rate=16000"
+        );
+        assert!(audio["realtimeInput"].get("mediaChunks").is_none());
+        fixed.map_server_event(Inbound::Text(call));
+        let reply = &fixed.format_tool_result("c1", "{}")[0];
+        let response = &reply["toolResponse"]["functionResponses"][0];
+        assert_eq!(
+            (response["id"].as_str(), response["name"].as_str()),
+            (Some("c1"), Some("get_weather"))
+        );
+        // A call it did not make has no name to give.
+        assert!(
+            fixed.format_tool_result("c9", "{}")[0]["toolResponse"]["functionResponses"][0]
+                .get("name")
+                .is_none()
+        );
+        assert!(fixed.session_update(&cfg, &cfg).is_none());
     }
 
     /// THE PLURALITY TEST (MULTI-FRAME): a serverContent with TWO parts (one
@@ -1113,5 +1514,489 @@ mod tests {
         assert_eq!(c.output_sample_rate, 24_000);
         assert!(!c.supports_truncate);
         assert!(!c.supports_input_buffer);
+    }
+
+    // ---- Provider fixes (plan section 11 Lifecycle track): built, off until the live probe.
+
+    fn tool(name: &str) -> ToolDefinition {
+        ToolDefinition {
+            tool_type: "function".into(),
+            function: FunctionDefinition {
+                name: name.into(),
+                description: Some(format!("{name} it")),
+                parameters: Some(json!({"type": "object"})),
+            },
+        }
+    }
+
+    fn live38(fixes: &[&str]) -> RealtimeConfig {
+        RealtimeConfig {
+            model: "gemini-3.8-live".into(),
+            tools: Some(vec![tool("book_table"), tool("waav_delegate")]),
+            provider_fixes: fixes.iter().map(|f| (*f).to_owned()).collect(),
+            ..base_cfg()
+        }
+    }
+
+    /// With no fix in force the frames are today's, byte for byte: declarations without
+    /// `behavior`, `toolCallCancellation` and `interactionStatus` unmapped.
+    #[test]
+    fn without_the_fixes_the_gemini_wire_is_todays() {
+        let cfg = live38(&[]);
+        let p = proto(&cfg);
+        let setup = p.serialize(&p.build_session_config(&cfg, None)[0]).unwrap();
+        let today = json!({"setup": {
+            "model": "models/gemini-3.8-live",
+            "generationConfig": {"responseModalities": ["AUDIO"]},
+            "tools": [{"functionDeclarations": [
+                {"name": "book_table", "description": "book_table it", "parameters": {"type": "object"}},
+                {"name": "waav_delegate", "description": "waav_delegate it", "parameters": {"type": "object"}},
+            ]}],
+            "outputAudioTranscription": {},
+            "sessionResumption": {},
+        }});
+        let OutFrame::Text(setup) = setup else {
+            panic!("setup is a text frame")
+        };
+        assert_eq!(setup, serde_json::to_string(&today).unwrap());
+        assert!(matches!(
+            p.map_server_event(Inbound::Text(r#"{"toolCallCancellation":{"ids":["c1"]}}"#))
+                .as_slice(),
+            [S2sEvent::Ignore]
+        ));
+        let busy = r#"{"serverContent":{"turnComplete":true,"interactionStatus":"IN_PROGRESS"}}"#;
+        assert!(matches!(
+            p.map_server_event(Inbound::Text(busy)).as_slice(),
+            [S2sEvent::ResponseDone { .. }]
+        ));
+    }
+
+    /// `gemini_tool_behavior` (W6 Decision 6). Wire per google-genai's `FunctionDeclaration.
+    /// behavior` / enum `Behavior` (`BLOCKING`, `NON_BLOCKING`; types.py, class `Behavior`) and
+    /// the Live tools guide's `{"name": ..., "behavior": "NON_BLOCKING"}`
+    /// (<https://ai.google.dev/gemini-api/docs/live-api/tools>): on 3.8 Live a client's function
+    /// blocks and the gateway's delegate does not; on extended thinking all are non-blocking;
+    /// older models get no field.
+    #[test]
+    fn the_tool_behavior_fix_declares_behavior_per_model() {
+        let behaviors = |cfg: &RealtimeConfig| -> Vec<Value> {
+            let p = proto(cfg);
+            let setup = &p.build_session_config(cfg, None)[0]["setup"];
+            setup["tools"][0]["functionDeclarations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|d| d["behavior"].clone())
+                .collect()
+        };
+        let cfg = live38(&["gemini_tool_behavior"]);
+        assert_eq!(behaviors(&cfg), [json!("BLOCKING"), json!("NON_BLOCKING")]);
+        let thinking = RealtimeConfig {
+            model: "gemini-3.8-live-extended-thinking".into(),
+            ..cfg.clone()
+        };
+        assert_eq!(
+            behaviors(&thinking),
+            [json!("NON_BLOCKING"), json!("NON_BLOCKING")]
+        );
+        let older = RealtimeConfig {
+            model: "gemini-3.1-flash-live-preview".into(),
+            ..cfg.clone()
+        };
+        assert_eq!(behaviors(&older), [Value::Null, Value::Null]);
+        // The rest of the declaration is unchanged.
+        let p = proto(&cfg);
+        let decl =
+            &p.build_session_config(&cfg, None)[0]["setup"]["tools"][0]["functionDeclarations"][0];
+        assert_eq!(
+            *decl,
+            json!({"name": "book_table", "description": "book_table it",
+                   "parameters": {"type": "object"}, "behavior": "BLOCKING"})
+        );
+    }
+
+    /// `gemini_tool_call_cancellation`: `{"toolCallCancellation":{"ids":[...]}}`
+    /// (<https://ai.google.dev/api/live>, `BidiGenerateContentToolCallCancellation.ids`) names
+    /// the withdrawn calls. `gemini_interaction_status`: `serverContent.interactionStatus`
+    /// `IN_PROGRESS` / `IDLE` (`REQUIRES_ACTION`: the deprecated `IDLE`), "always sent alongside
+    /// `turnComplete`" (same page) is the provider's busy edge; `turnComplete` keeps
+    /// producing `ResponseDone`.
+    #[test]
+    fn the_cancellation_and_status_fixes_map_the_server_messages() {
+        let cfg = live38(&["gemini_tool_call_cancellation", "gemini_interaction_status"]);
+        let p = proto(&cfg);
+        match p
+            .map_server_event(Inbound::Text(
+                r#"{"toolCallCancellation":{"ids":["c1","c2"]}}"#,
+            ))
+            .as_slice()
+        {
+            [S2sEvent::FunctionCallCancelled { call_ids }] => assert_eq!(call_ids, &["c1", "c2"]),
+            other => panic!("expected FunctionCallCancelled, got {other:?}"),
+        }
+        assert!(matches!(
+            p.map_server_event(Inbound::Text(r#"{"toolCallCancellation":{"ids":[]}}"#))
+                .as_slice(),
+            [S2sEvent::Ignore]
+        ));
+        let busy = r#"{"serverContent":{"turnComplete":true,"interactionStatus":"IN_PROGRESS"}}"#;
+        assert!(matches!(
+            p.map_server_event(Inbound::Text(busy)).as_slice(),
+            [S2sEvent::ProviderBusy(true), S2sEvent::ResponseDone { .. }]
+        ));
+        for idle in ["IDLE", "REQUIRES_ACTION"] {
+            let raw = format!(
+                r#"{{"serverContent":{{"turnComplete":true,"interactionStatus":"{idle}"}}}}"#
+            );
+            assert!(matches!(
+                p.map_server_event(Inbound::Text(&raw)).as_slice(),
+                [S2sEvent::ProviderBusy(false), S2sEvent::ResponseDone { .. }]
+            ));
+        }
+        // The tool-behavior fix is separate: not listed, no `behavior`.
+        let decls =
+            &p.build_session_config(&cfg, None)[0]["setup"]["tools"][0]["functionDeclarations"];
+        assert!(decls[0].get("behavior").is_none());
+    }
+
+    /// Provider fix `gemini_response_scheduling`: the delivery an interaction session names in
+    /// a result is the response's `scheduling`; off, the result is sent as it came.
+    #[test]
+    fn a_delegate_result_names_its_delivery_with_the_fix() {
+        let result = r#"{"status":"completed","result":"Booked.","waav_scheduling":"SILENT"}"#;
+        let cfg = RealtimeConfig {
+            model: "gemini-3.8-live".into(),
+            provider_fixes: vec!["gemini_response_scheduling".into()],
+            ..base_cfg()
+        };
+        let sent = &proto(&cfg).format_tool_result("c1", result)[0];
+        let response = &sent["toolResponse"]["functionResponses"][0];
+        assert_eq!(response["scheduling"], "SILENT");
+        assert!(response["response"].get("waav_scheduling").is_none());
+        assert_eq!(response["response"]["result"], "Booked.");
+        // An unknown value is dropped, not sent.
+        let odd = r#"{"result":"x","waav_scheduling":"LATER"}"#;
+        let sent = &proto(&cfg).format_tool_result("c2", odd)[0];
+        assert!(
+            sent["toolResponse"]["functionResponses"][0]
+                .get("scheduling")
+                .is_none()
+        );
+        // Off: today's response.
+        let sent = &proto(&base_cfg()).format_tool_result("c1", result)[0];
+        let response = &sent["toolResponse"]["functionResponses"][0];
+        assert!(response.get("scheduling").is_none());
+        assert_eq!(response["response"]["waav_scheduling"], "SILENT");
+    }
+
+    /// `gemini_response_scheduling` only where the model schedules: not on 3.8 Live Extended
+    /// Thinking ("Blocking mode and function scheduling are not supported") nor on older
+    /// models; the gateway's own key never reaches the vendor.
+    #[test]
+    fn scheduling_goes_only_to_a_model_that_schedules() {
+        let result = r#"{"result":"Booked.","waav_scheduling":"SILENT"}"#;
+        for model in [
+            "gemini-3.8-live-extended-thinking",
+            "gemini-3.1-flash-live-preview",
+        ] {
+            let cfg = RealtimeConfig {
+                model: model.into(),
+                provider_fixes: vec!["gemini_response_scheduling".into()],
+                ..base_cfg()
+            };
+            let sent = &proto(&cfg).format_tool_result("c1", result)[0];
+            let response = &sent["toolResponse"]["functionResponses"][0];
+            assert!(response.get("scheduling").is_none(), "{model}: {sent}");
+            assert_eq!(
+                response["response"],
+                json!({"result": "Booked."}),
+                "{model}"
+            );
+        }
+    }
+
+    /// The setup of these fixes with nothing asked of them is today's.
+    fn setup_of(cfg: &RealtimeConfig) -> Value {
+        proto(cfg).build_session_config(cfg, None).remove(0)["setup"].clone()
+    }
+
+    /// `gemini_turn_transcripts`: transcription has no end of its own, so each role's words
+    /// of a turn end in one final when the model's turn completes or is cut, and the next
+    /// turn starts empty. Without it the caller's words are never final.
+    #[test]
+    fn the_turn_transcripts_fix_ends_each_turn_in_one_final_per_role() {
+        let chunks = [
+            r#"{"serverContent":{"inputTranscription":{"text":"Book a "}}}"#,
+            r#"{"serverContent":{"inputTranscription":{"text":"table."}}}"#,
+            r#"{"serverContent":{"outputTranscription":{"text":"Sure, "}}}"#,
+            r#"{"serverContent":{"outputTranscription":{"text":"for when?"}}}"#,
+            r#"{"serverContent":{"turnComplete":true}}"#,
+            r#"{"serverContent":{"inputTranscription":{"text":"Eight."}}}"#,
+            r#"{"serverContent":{"interrupted":true}}"#,
+        ];
+        let finals = |p: &GeminiProtocol| -> Vec<String> {
+            chunks
+                .iter()
+                .flat_map(|c| p.map_server_event(Inbound::Text(c)))
+                .filter_map(|e| match e {
+                    S2sEvent::Transcript {
+                        role,
+                        text,
+                        is_final: true,
+                        ..
+                    } => Some(format!("{role:?}: {text}")),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert!(finals(&proto(&base_cfg())).is_empty());
+        let fixed = RealtimeConfig {
+            provider_fixes: vec!["gemini_turn_transcripts".into()],
+            ..base_cfg()
+        };
+        assert_eq!(
+            finals(&proto(&fixed)),
+            [
+                "User: Book a table.",
+                "Assistant: Sure, for when?",
+                "User: Eight."
+            ]
+        );
+        // The chunks are still interim, as they come.
+        let p = proto(&fixed);
+        assert!(matches!(
+            p.map_server_event(Inbound::Text(chunks[2])).as_slice(),
+            [S2sEvent::Transcript {
+                is_final: false,
+                ..
+            }]
+        ));
+    }
+
+    /// `gemini_context_compression` (`{"slidingWindow":{}}`, the session guide's own config;
+    /// without it audio sessions end at 15 minutes) and `gemini_max_output_tokens`
+    /// (`generationConfig.maxOutputTokens`): off, the setup is today's.
+    #[test]
+    fn the_compression_and_token_fixes_add_their_setup_fields() {
+        let cfg = RealtimeConfig {
+            max_response_output_tokens: Some(256),
+            ..base_cfg()
+        };
+        let today = setup_of(&cfg);
+        assert!(today.get("contextWindowCompression").is_none());
+        assert!(today["generationConfig"].get("maxOutputTokens").is_none());
+        let fixed = RealtimeConfig {
+            provider_fixes: vec![
+                "gemini_context_compression".into(),
+                "gemini_max_output_tokens".into(),
+            ],
+            ..cfg.clone()
+        };
+        let setup = setup_of(&fixed);
+        assert_eq!(
+            setup["contextWindowCompression"],
+            json!({"slidingWindow": {}})
+        );
+        assert_eq!(setup["generationConfig"]["maxOutputTokens"], 256);
+        let unlimited = RealtimeConfig {
+            max_response_output_tokens: Some(-1),
+            ..fixed
+        };
+        assert!(
+            setup_of(&unlimited)["generationConfig"]
+                .get("maxOutputTokens")
+                .is_none()
+        );
+    }
+
+    /// `gemini_turn_detection`: manual turns turn Gemini's activity detection off
+    /// (`realtimeInputConfig.automaticActivityDetection.disabled`), open a turn with
+    /// `activityStart` once `setupComplete` arrives, and a commit is `activityEnd` then the next
+    /// `activityStart`; server VAD's silence is `silenceDurationMs` and "do not interrupt" is
+    /// `NO_INTERRUPTION`. Off: no `realtimeInputConfig`, a commit sends nothing.
+    #[test]
+    fn the_turn_detection_fix_maps_the_sessions_turns() {
+        let with = |turns: TurnDetectionConfig, fixes: &[&str]| RealtimeConfig {
+            turn_detection: Some(turns),
+            provider_fixes: fixes.iter().map(|f| (*f).to_owned()).collect(),
+            ..base_cfg()
+        };
+        let manual = with(TurnDetectionConfig::None, &[]);
+        assert!(setup_of(&manual).get("realtimeInputConfig").is_none());
+        assert!(proto(&manual).commit_turn().is_empty());
+        assert!(proto(&manual).caps().emits_user_turn_frames);
+
+        let manual = with(TurnDetectionConfig::None, &["gemini_turn_detection"]);
+        let p = proto(&manual);
+        assert_eq!(
+            setup_of(&manual)["realtimeInputConfig"],
+            json!({"automaticActivityDetection": {"disabled": true}})
+        );
+        assert!(!p.caps().emits_user_turn_frames);
+        assert_eq!(
+            p.commit_turn(),
+            [
+                json!({"realtimeInput": {"activityEnd": {}}}),
+                json!({"realtimeInput": {"activityStart": {}}})
+            ]
+        );
+        match p
+            .map_server_event(Inbound::Text(r#"{"setupComplete":{}}"#))
+            .as_slice()
+        {
+            [
+                S2sEvent::SessionReady { .. },
+                S2sEvent::SendFrame(OutFrame::Text(frame)),
+            ] => {
+                assert_eq!(frame, r#"{"realtimeInput":{"activityStart":{}}}"#);
+            }
+            other => panic!("expected SessionReady then activityStart, got {other:?}"),
+        }
+
+        let vad = with(
+            TurnDetectionConfig::ServerVad {
+                threshold: Some(0.5),
+                prefix_padding_ms: Some(300),
+                silence_duration_ms: Some(800),
+                create_response: Some(true),
+                interrupt_response: Some(false),
+            },
+            &["gemini_turn_detection"],
+        );
+        assert_eq!(
+            setup_of(&vad)["realtimeInputConfig"],
+            json!({"automaticActivityDetection": {"silenceDurationMs": 800},
+                   "activityHandling": "NO_INTERRUPTION"})
+        );
+        assert!(proto(&vad).commit_turn().is_empty());
+        let unset = RealtimeConfig {
+            provider_fixes: vec!["gemini_turn_detection".into()],
+            ..base_cfg()
+        };
+        assert!(setup_of(&unset).get("realtimeInputConfig").is_none());
+    }
+
+    /// `gemini_update_resume`: an update is made by resuming on a new connection (the model
+    /// cannot change), never a second `setup` on the open one; `gemini_await_setup` holds
+    /// every other message until `setupComplete`. The scaffold side is in `scaffold/mock.rs`.
+    #[test]
+    fn the_update_and_setup_fixes_tell_the_driver() {
+        let p = proto(&base_cfg());
+        assert!(!p.awaits_session_ready());
+        assert!(!p.update_by_reconnect(&base_cfg(), &base_cfg()));
+        let fixed = RealtimeConfig {
+            provider_fixes: vec!["gemini_update_resume".into(), "gemini_await_setup".into()],
+            ..base_cfg()
+        };
+        let p = proto(&fixed);
+        assert!(p.awaits_session_ready());
+        let mut new = fixed.clone();
+        new.instructions = Some("Answer in French.".into());
+        assert!(p.update_by_reconnect(&fixed, &new));
+        assert!(p.session_update(&fixed, &new).is_none());
+        new.model = "gemini-3.8-live".into();
+        assert!(!p.update_by_reconnect(&fixed, &new));
+        // The new connection's setup: the stored handle and the new instructions.
+        let mut new = fixed.clone();
+        new.instructions = Some("Answer in French.".into());
+        let setup = p.build_session_config(&new, Some("h-1")).remove(0);
+        assert_eq!(
+            setup["setup"]["sessionResumption"],
+            json!({"handle": "h-1"})
+        );
+        assert_eq!(
+            setup["setup"]["systemInstruction"],
+            json!({"parts": [{"text": "Answer in French."}]})
+        );
+    }
+
+    /// `gemini_json_schema`: a client's JSON Schema is `parametersJsonSchema` and the required
+    /// `description` is sent (empty when the client gave none). Off: today's `parameters`.
+    #[test]
+    fn the_json_schema_fix_declares_parameters_as_json_schema() {
+        let schema = json!({"type": "object", "additionalProperties": false,
+                            "properties": {"time": {"type": "string"}}});
+        let cfg = |fixes: &[&str]| RealtimeConfig {
+            tools: Some(vec![ToolDefinition {
+                tool_type: "function".into(),
+                function: FunctionDefinition {
+                    name: "book_table".into(),
+                    description: None,
+                    parameters: Some(schema.clone()),
+                },
+            }]),
+            provider_fixes: fixes.iter().map(|f| (*f).to_owned()).collect(),
+            ..base_cfg()
+        };
+        let decl =
+            |fixes: &[&str]| setup_of(&cfg(fixes))["tools"][0]["functionDeclarations"][0].clone();
+        assert_eq!(
+            decl(&[]),
+            json!({"name": "book_table", "parameters": schema})
+        );
+        assert_eq!(
+            decl(&["gemini_json_schema"]),
+            json!({"name": "book_table", "description": "", "parametersJsonSchema": schema})
+        );
+    }
+
+    /// `gemini_inbound`: a `thought` part is neither audio nor a transcript, and
+    /// `voiceActivity` is the caller's speech start and end. Off: today's mapping.
+    #[test]
+    fn the_inbound_fix_skips_thoughts_and_maps_voice_activity() {
+        let thought = r#"{"serverContent":{"modelTurn":{"parts":[{"text":"Plan: ask the time.","thought":true},{"text":"For when?"}]}}}"#;
+        let start = r#"{"voiceActivity":{"type":"ACTIVITY_START","audioOffset":"1.5s"}}"#;
+        let end = r#"{"voiceActivity":{"type":"ACTIVITY_END"}}"#;
+        let texts = |p: &GeminiProtocol| -> Vec<String> {
+            p.map_server_event(Inbound::Text(thought))
+                .into_iter()
+                .filter_map(|e| match e {
+                    S2sEvent::Transcript { text, .. } => Some(text),
+                    _ => None,
+                })
+                .collect()
+        };
+        let today = proto(&base_cfg());
+        assert_eq!(texts(&today), ["Plan: ask the time.", "For when?"]);
+        assert!(matches!(
+            today.map_server_event(Inbound::Text(start)).as_slice(),
+            [S2sEvent::Ignore]
+        ));
+        let p = proto(&RealtimeConfig {
+            provider_fixes: vec!["gemini_inbound".into()],
+            ..base_cfg()
+        });
+        assert_eq!(texts(&p), ["For when?"]);
+        assert!(matches!(
+            p.map_server_event(Inbound::Text(start)).as_slice(),
+            [S2sEvent::Speech(SpeechEvent::Started {
+                audio_start_ms: 1500,
+                ..
+            })]
+        ));
+        assert!(matches!(
+            p.map_server_event(Inbound::Text(end)).as_slice(),
+            [S2sEvent::Speech(SpeechEvent::Stopped { .. })]
+        ));
+    }
+
+    /// `AddContext` is a user turn the model does not answer yet (`turnComplete: false`); the
+    /// other verbs have no Gemini wire.
+    #[test]
+    fn add_context_is_client_content_without_turn_complete() {
+        let p = proto(&base_cfg());
+        assert_eq!(
+            p.verb(&RealtimeVerb::AddContext("The booking is confirmed.")),
+            Some(vec![json!({"clientContent": {
+                "turns": [{"role": "user", "parts": [{"text": "The booking is confirmed."}]}],
+                "turnComplete": false}})])
+        );
+        for verb in [
+            RealtimeVerb::SayExact("x"),
+            RealtimeVerb::SayGuided("x"),
+            RealtimeVerb::StopOutput,
+        ] {
+            assert!(p.verb(&verb).is_none());
+        }
     }
 }

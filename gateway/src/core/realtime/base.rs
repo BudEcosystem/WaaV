@@ -47,6 +47,20 @@ pub enum RealtimeError {
     #[error("Provider error: {0}")]
     ProviderError(String),
 
+    /// The provider warned about something it did not do (Deepgram `Warning`); the session
+    /// goes on. `code` is the provider's own, when it gave one.
+    #[error("Provider warning: {message}")]
+    ProviderWarning {
+        code: Option<String>,
+        message: String,
+    },
+
+    /// The provider refused this session's configuration (an agent it does not have, settings
+    /// it does not take). The same configuration is refused again on every retry, and it says
+    /// nothing about the credentials.
+    #[error("Refused by the provider: {0}")]
+    Refused(String),
+
     /// Serialization error
     #[error("Serialization error: {0}")]
     SerializationError(String),
@@ -296,12 +310,46 @@ pub struct RealtimeConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trace: Option<String>,
 
+    /// The caller's language (Deepgram Voice Agent `agent.language`; `en` when unset). Other
+    /// providers ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+
+    /// The vendor of the model that thinks behind a voice agent (Deepgram Voice Agent
+    /// `think.provider.type`). Unset: taken from the model name. Other providers ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub think_provider: Option<String>,
+
+    /// The vendor region to dial (Deepgram Voice Agent: `us` or `eu`). A server endpoint
+    /// override wins. Other providers ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+
     /// SERVER-SET: reconnect proactively after a connection has lived this long (a vendor's
     /// connection cap — Nova Sonic's 8 minutes). `None` ⇒ the protocol's own cap
     /// ([`RealtimeProtocol::max_connection`](crate::core::realtime::scaffold::RealtimeProtocol::max_connection)).
     /// Never read from a client message (`serde(skip)`).
     #[serde(skip)]
     pub max_connection: Option<std::time::Duration>,
+
+    /// SERVER-SET: the provider wire fixes in force (the operator's `interaction.provider_fixes`
+    /// less its escape flags, `core::interaction::config::PROVIDER_FIXES`), stamped by the
+    /// provider registry at creation. Empty ⇒ every protocol sends today's wire. Never read from
+    /// a client message (`serde(skip)`).
+    #[serde(skip)]
+    pub provider_fixes: Vec<String>,
+
+    /// SERVER-SET: `provider_fixes` was decided for this session (its own switches over the
+    /// operator's, `/realtime`): the registry leaves it as it is, also when it is empty.
+    #[serde(skip)]
+    pub provider_fixes_decided: bool,
+}
+
+impl RealtimeConfig {
+    /// Whether the provider fix `fix` is in force for this session.
+    pub fn fix(&self, fix: &str) -> bool {
+        self.provider_fixes.iter().any(|on| on == fix)
+    }
 }
 
 /// A static AWS key pair from a Bud deployment's credential (FRD-023 RT7.2: Nova Sonic signs with
@@ -683,6 +731,28 @@ pub struct RealtimeResponseOverride {
     pub metadata: Option<serde_json::Value>,
 }
 
+/// One instruction an interaction session gives a provider that speaks for itself (the
+/// capability table is `core::interaction::regime`). A provider implements the verbs its
+/// wire has and refuses the rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RealtimeVerb<'a> {
+    /// Speak exactly these words.
+    SayExact(&'a str),
+    /// Speak now, following this guidance.
+    SayGuided(&'a str),
+    /// Add this to the conversation without asking for a reply.
+    AddContext(&'a str),
+    /// Stop the speech in flight.
+    StopOutput,
+}
+
+/// The refusal of a verb the provider has no wire for.
+pub(crate) fn unsupported_verb() -> RealtimeError {
+    RealtimeError::InvalidConfiguration(
+        "this realtime provider does not support that interaction verb".to_string(),
+    )
+}
+
 #[async_trait]
 pub trait BaseRealtime: Send + Sync {
     /// Create a new realtime provider instance.
@@ -780,6 +850,12 @@ pub trait BaseRealtime: Send + Sync {
 
     /// Submit a function call result.
     async fn submit_function_result(&mut self, call_id: &str, result: &str) -> RealtimeResult<()>;
+
+    /// Apply one interaction verb. Default: refused, so a provider without the wire for it
+    /// never passes for having spoken.
+    async fn apply_verb(&mut self, _verb: RealtimeVerb<'_>) -> RealtimeResult<()> {
+        Err(unsupported_verb())
+    }
 
     /// Get provider information.
     fn get_provider_info(&self) -> serde_json::Value;

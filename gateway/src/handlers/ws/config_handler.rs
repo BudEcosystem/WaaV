@@ -58,7 +58,7 @@ const LIVEKIT_POLL_INTERVAL_MS: u64 = 100;
 /// Lock timeout for LiveKit operations (in milliseconds)
 const LIVEKIT_LOCK_TIMEOUT_MS: u64 = 100;
 
-async fn send_critical(message_tx: &mpsc::Sender<MessageRoute>, route: MessageRoute) {
+pub(super) async fn send_critical(message_tx: &mpsc::Sender<MessageRoute>, route: MessageRoute) {
     send_with_policy(message_tx, route, MessageClass::Critical).await;
 }
 
@@ -72,7 +72,7 @@ async fn send_error(message_tx: &mpsc::Sender<MessageRoute>, message: impl Into<
     .await;
 }
 
-async fn send_config_warning(
+pub(super) async fn send_config_warning(
     message_tx: &mpsc::Sender<MessageRoute>,
     code: impl Into<String>,
     message: impl Into<String>,
@@ -90,7 +90,7 @@ async fn send_config_warning(
 }
 
 /// Resolve the stream identifier for the current session
-fn resolve_stream_id(stream_id: Option<String>) -> String {
+pub(super) fn resolve_stream_id(stream_id: Option<String>) -> String {
     stream_id.unwrap_or_else(|| {
         let generated = Uuid::new_v4().to_string();
         debug!("Generated stream_id: {}", generated);
@@ -201,6 +201,22 @@ pub async fn handle_config_message(
         return true;
     }
 
+    // `interaction.speech.realtime`: the session's voice is a speech-to-speech provider in a
+    // LiveKit room, and nothing below is built for it.
+    if let Some(done) = super::realtime_voice::handle(
+        stream_id.clone(),
+        livekit_ws_config.as_ref(),
+        conversation_ws_config.as_ref(),
+        agent_ws_config.is_some(),
+        state,
+        message_tx,
+        app_state,
+    )
+    .await
+    {
+        return done;
+    }
+
     // Spec 025: a voice agent decides its own legs and runs its own turns.
     if let Some(agent) = agent_ws_config.as_ref() {
         if let Some(refusal) = agent_config_refusal(
@@ -232,9 +248,12 @@ pub async fn handle_config_message(
     // SAME config-message layer the `dag_config.template` already resolves at, and
     // composes with the P2 canonical language/emotion mappers downstream (they map
     // whatever provider the alias resolved to).
+    // The `interaction` block of the session's alias, when the definition has one.
+    let mut alias_interaction = None;
     let resolved_alias = if let Some(alias_name) = alias.as_deref() {
         match crate::core::alias::global_aliases().resolve(alias_name) {
             Some(def) => {
+                alias_interaction = def.interaction.clone();
                 let echo = crate::core::alias::splice_alias(
                     alias_name,
                     &def,
@@ -400,6 +419,45 @@ pub async fn handle_config_message(
     let audio_in_codec = uplink_codec.echo_value();
     let audio_out_codec = downlink_codec.echo_value();
 
+    // A session that may run interaction mode: its analyser loads the turn models, so the
+    // voice manager's own smart-turn processor waits for the decision below.
+    let may_interact = state.read().await.interaction_request.is_some()
+        || alias_interaction.is_some()
+        || resolved_agent.is_some();
+    // A model its provider serves for files only (Deepgram's Whisper) is refused before the
+    // voice manager dials it: the session runs as it would without the mode.
+    let file_only = may_interact
+        && stt_ws_config
+            .as_ref()
+            .is_some_and(|stt| super::interaction::file_only_stt(&stt.provider, &stt.model));
+    if file_only {
+        let asked = state
+            .read()
+            .await
+            .interaction_request
+            .as_ref()
+            .is_some_and(|(_, asked)| *asked)
+            || alias_interaction.is_some()
+            || resolved_agent.is_some();
+        super::interaction::refuse_file_only(asked, message_tx).await;
+    }
+    let may_interact = may_interact && !file_only;
+    // A model its provider serves for files only cannot stream: refused here with what to use
+    // instead, never dialled (Deepgram answered 405 to the streaming endpoint).
+    if audio_enabled
+        && let Some(stt) = stt_ws_config
+            .as_ref()
+            .filter(|stt| super::interaction::file_only_stt(&stt.provider, &stt.model))
+    {
+        let message = format!(
+            "STT model '{}' of provider '{}' transcribes files only and cannot stream on /ws: \
+             send files to POST /transcribe/batch, or choose a streaming model (e.g. nova-3)",
+            stt.model, stt.provider
+        );
+        warn!("{message}");
+        send_error(message_tx, message).await;
+        return true;
+    }
     // Initialize voice manager if audio is enabled
     let voice_manager = if audio_enabled {
         let (Some(stt_config), Some(tts_config)) = (stt_ws_config.as_ref(), tts_ws_config.as_ref())
@@ -416,6 +474,7 @@ pub async fn handle_config_message(
             app_state,
             message_tx,
             bud_legs.as_ref(),
+            may_interact,
         )
         .await
         {
@@ -500,6 +559,102 @@ pub async fn handle_config_message(
         None
     };
 
+    // Interaction mode, for a session that asked for it: decided before the egress callbacks
+    // are registered, because they must be built over the metered pump.
+    let interaction_request = state.read().await.interaction_request.clone();
+    // The session's DAG, when interaction mode had to read it: its own start reuses it.
+    #[cfg(feature = "dag-routing")]
+    let mut compiled_dag = None;
+    // The alias's block stands in for a session that sent none of its own (client wins, as
+    // for every alias default). The operator wrote it, so its tools are the operator's.
+    let agent_session = match (resolved_agent.as_ref(), agent_ws_config.as_ref()) {
+        (Some(resolved), Some(config)) => {
+            Some(super::interaction::AgentSession { resolved, config })
+        }
+        _ => None,
+    };
+    let (interaction_request, operator) =
+        match (agent_session, interaction_request, alias_interaction) {
+            // A voice agent's block is its author's or the operator's, never the server's
+            // general default; a session's own value needs the agent's leave.
+            (Some(agent), request, _) => {
+                let sent = request.filter(|(_, asked)| *asked).map(|(sent, _)| sent);
+                let server = crate::core::interaction::config::server();
+                let entry = &agent.resolved.entry;
+                let (request, refused) = super::interaction::agent_request(entry, sent, &server);
+                if refused {
+                    send_config_warning(
+                    message_tx,
+                    "interaction_override_refused",
+                    "This agent does not let a session set `interaction`; the value is ignored."
+                        .to_string(),
+                    Some(serde_json::json!({ "path": "interaction" })),
+                )
+                .await;
+                }
+                match request {
+                    Some((block, asked, operator)) => (Some((block, asked)), operator),
+                    None => (None, false),
+                }
+            }
+            (None, Some((request, true)), _) => (Some((request, true)), false),
+            (None, _, Some(block)) => (Some((block, true)), true),
+            (None, request, None) => (request, false),
+        };
+    let interaction = match interaction_request.filter(|_| !file_only) {
+        Some((request, asked)) => {
+            // A DAG that ends in text is the background; one that speaks itself is not.
+            #[cfg(feature = "dag-routing")]
+            let graph = match dag_ws_config.as_ref() {
+                Some(dag) => {
+                    let compiled =
+                        compile_session_dag(dag, &stream_id, state, message_tx, app_state).await;
+                    let auth_id = state.read().await.auth.id.clone();
+                    let graph = dag_background(&compiled, dag, &stream_id, auth_id);
+                    compiled_dag = Some(compiled);
+                    Some(graph)
+                }
+                None => None,
+            };
+            #[cfg(not(feature = "dag-routing"))]
+            let graph = dag_ws_config.as_ref().map(|_| Err("dag_config"));
+            let surface = super::interaction::Surface {
+                audio: voice_manager.is_some(),
+                livekit: livekit_ws_config.is_some(),
+                dag: graph
+                    .as_ref()
+                    .and_then(|graph| graph.as_ref().err().copied()),
+                agent: agent_ws_config.is_some() && agent_session.is_none_or(|agent| agent.unfit()),
+            };
+            super::interaction::prepare(
+                &request,
+                asked,
+                operator,
+                surface,
+                conversation_ws_config.as_ref(),
+                agent_session,
+                graph.and_then(Result::ok),
+                &stream_id,
+                voice_manager.as_ref(),
+                state,
+                message_tx,
+                app_state,
+            )
+            .await
+        }
+        None => None,
+    };
+    // Without the mode the session's turn detection is the voice manager's, as always.
+    if may_interact
+        && interaction.is_none()
+        && let Some(vm) = voice_manager.as_ref()
+        && let Err(e) = vm.start_smart_turn().await
+    {
+        error!("Failed to start voice manager: {}", e);
+        send_error(message_tx, format!("Failed to start voice manager: {e}")).await;
+        return true;
+    }
+
     // C-G5: one egress-resampling context for the whole session (None when
     // the client didn't ask for a playback rate — zero cost).
     let egress_audio = EgressAudio::from_tts_config(tts_ws_config.as_ref());
@@ -568,6 +723,10 @@ pub async fn handle_config_message(
                 &stream_id,
                 auth_id.as_deref(),
                 &task_tracker,
+                interaction
+                    .as_ref()
+                    .and_then(|prepared| prepared.caller_tap()),
+                interaction.is_some().then(|| state.clone()),
             )
             .await
             {
@@ -622,6 +781,13 @@ pub async fn handle_config_message(
         }
     }
 
+    // In interaction mode a DAG runs once per task, started by the actor: its own per-turn
+    // driver and output drain are not set up.
+    let runs_graph = interaction
+        .as_ref()
+        .is_some_and(|prepared| prepared.runs_graph());
+    let dag_ws_config = dag_ws_config.filter(|_| !runs_graph);
+
     // Initialize DAG routing if configured
     #[cfg(feature = "dag-routing")]
     let dag_enabled = if let Some(dag_config) = dag_ws_config {
@@ -644,6 +810,7 @@ pub async fn handle_config_message(
             egress_audio.clone(),
             Some(app_state.core_state.resilience().clone()),
             app_state,
+            compiled_dag.take(),
         )
         .await
         {
@@ -678,6 +845,28 @@ pub async fn handle_config_message(
         false
     };
 
+    // Interaction mode runs the session's turns itself: neither the agent engine nor the
+    // conversation loop below is started for it (`prepare` ruled out a DAG).
+    let mut greeting = None;
+    let interaction = match interaction {
+        Some(prepared) => {
+            greeting = prepared.greeting();
+            match super::interaction::start(prepared, &stream_id, state, message_tx).await {
+                Ok(handle) => Some(handle),
+                Err(e) => {
+                    error!("Interaction mode initialization failed: {}", e);
+                    send_error(
+                        message_tx,
+                        format!("Interaction mode initialization failed: {e}"),
+                    )
+                    .await;
+                    return true;
+                }
+            }
+        }
+        None => None,
+    };
+
     // Initialize the built-in conversation loop if configured (plan W-O2).
     //
     // Mutually exclusive with the DAG: the DAG owns the post-STT pipeline when
@@ -689,6 +878,11 @@ pub async fn handle_config_message(
         voice_manager.as_ref(),
         agent_ws_config.as_ref(),
     ) {
+        // The agent is the background of the session's tasks: only its length limit is kept.
+        (Some(agent), _, _) if interaction.is_some() => {
+            super::agent::limit_session(&agent.entry, None, state, message_tx, app_state).await;
+            false
+        }
         (Some(agent), Some(vm), Some(agent_cfg)) => {
             match initialize_agent_loop(
                 agent, agent_cfg, &stream_id, vm, state, message_tx, app_state,
@@ -710,7 +904,7 @@ pub async fn handle_config_message(
         _ => false,
     };
 
-    let conversation_enabled = if agent_enabled {
+    let conversation_enabled = if agent_enabled || interaction.is_some() {
         false
     } else if dag_enabled {
         if conversation_ws_config.is_some() {
@@ -725,16 +919,7 @@ pub async fn handle_config_message(
     {
         let (credential, attribution) = {
             let guard = state.read().await;
-            let attribution = guard.leg_meter.as_ref().map(|m| {
-                let p = &m.caller().principal;
-                crate::core::conversation::TurnAttribution {
-                    project_id: p.project_id.clone(),
-                    api_key_id: p.api_key_id.clone(),
-                    api_key_project_id: p.project_id.clone(),
-                    user_id: p.user_id.clone(),
-                    endpoint_name: Some(conv_config.model.clone()),
-                }
-            });
+            let attribution = turn_attribution(&guard, &conv_config.model);
             (guard.credential.clone(), attribution)
         };
         match initialize_conversation_loop(
@@ -776,7 +961,12 @@ pub async fn handle_config_message(
     send_critical(
         message_tx,
         MessageRoute::Outgoing(OutgoingMessage::Ready {
-            protocol_version: crate::handlers::ws::messages::PROTOCOL_VERSION.to_string(),
+            protocol_version: if interaction.is_some() {
+                crate::handlers::ws::messages::INTERACTION_PROTOCOL_VERSION
+            } else {
+                crate::handlers::ws::messages::PROTOCOL_VERSION
+            }
+            .to_string(),
             stream_id: stream_id.clone(),
             livekit_room_name: livekit_room_name.clone(),
             livekit_url: Some(app_state.config.livekit_public_url.clone()),
@@ -785,6 +975,7 @@ pub async fn handle_config_message(
             resolved_alias: resolved_alias.map(Box::new),
             audio_in_codec,
             audio_out_codec,
+            interaction: interaction.as_ref().map(|handle| handle.echo()),
         }),
     )
     .await;
@@ -799,12 +990,39 @@ pub async fn handle_config_message(
         "Connection configured and ready"
     );
 
+    // Interaction mode: the client is listening, so the warm-up may start, and a voice
+    // agent's greeting is said.
+    if let Some(handle) = interaction {
+        handle.send(crate::core::interaction::Msg::Ready).await;
+        if let Some(greeting) = greeting {
+            let greet = crate::core::interaction::Msg::ClientSpeak(greeting);
+            handle.send(greet).await;
+        }
+    }
+
     // Spec 025: the greeting goes after `ready`, so the client is listening when it starts.
     if agent_enabled && let Some(engine) = state.read().await.agent.clone() {
         tokio::spawn(async move { engine.greet().await });
     }
 
     true
+}
+
+/// A Bud-mode session's caller, for the `voice.turn` record of each turn its chat deployment
+/// `model` answers. `None` outside Bud mode, where a session has no metered legs.
+pub(super) fn turn_attribution(
+    state: &ConnectionState,
+    model: &str,
+) -> Option<crate::core::conversation::TurnAttribution> {
+    let caller = state.leg_meter.as_ref()?.caller();
+    let p = &caller.principal;
+    Some(crate::core::conversation::TurnAttribution {
+        project_id: p.project_id.clone(),
+        api_key_id: p.api_key_id.clone(),
+        api_key_project_id: p.project_id.clone(),
+        user_id: p.user_id.clone(),
+        endpoint_name: Some(model.to_owned()),
+    })
 }
 
 /// What a voice-agent `/ws` config may not carry (spec 025 §5.6), or `None`.
@@ -1047,7 +1265,7 @@ async fn bind_bud_dag(
 /// `model` (and `reasoning_model`) name Bud chat deployments; the address is the operator's
 /// `WAAV_LLM_BASE_URL` and the credential is the caller's own, read per call so an `auth` refresh
 /// reaches the next one. The client's endpoint and key were refused earlier (RT0).
-fn bud_llm_leg(
+pub(super) fn bud_llm_leg(
     config: &mut crate::core::conversation::ConversationConfig,
     credential: Option<crate::auth::SessionCredential>,
 ) -> Result<(), String> {
@@ -1199,6 +1417,74 @@ async fn emit_reasoning_config_warnings(
             .await;
         }
     }
+}
+
+/// Lifecycle track: one `config_warning` per leg whose provider or model is retiring. A retired
+/// one refuses the session with an `error` that carries its code; `false` then. Only traffic to
+/// the vendor's own host is affected: `extras.endpoint_override`, `OPENAI_BASE_URL` or a Bud
+/// deployment's `api_base` elsewhere leaves the leg alone.
+async fn apply_lifecycle(
+    stt: &STTWebSocketConfig,
+    tts: &TTSWebSocketConfig,
+    bud_legs: Option<&super::bud_legs::PreparedLegs>,
+    message_tx: &mpsc::Sender<MessageRoute>,
+) -> bool {
+    use crate::core::interaction::config::provider_fix;
+    use crate::core::interaction::lifecycle::{self, Leg};
+    use crate::core::stt::openai::{OpenAISTTConfig, OpenAISTTModel};
+    use crate::core::tts::openai::OpenAITTSModel;
+    let openai = |provider: &str| provider.trim().eq_ignore_ascii_case("openai");
+    let openai_base = std::env::var("OPENAI_BASE_URL").ok();
+    // The id each provider sends: OpenAI's defaults and aliases applied, anything else as is.
+    let stt_model = match stt.model.trim() {
+        model if !openai(&stt.provider) => model.to_owned(),
+        "" => OpenAISTTConfig::default_model_id(provider_fix("openai_stt_default")).to_owned(),
+        model => OpenAISTTModel::parse_known(model).map_or(model.to_owned(), |m| m.as_str().into()),
+    };
+    let tts_model = match tts.model.trim() {
+        model if !openai(&tts.provider) => model.to_owned(),
+        "" => OpenAITTSModel::default().as_str().to_owned(),
+        model => OpenAITTSModel::parse(model).map_or(model.to_owned(), |m| m.as_str().into()),
+    };
+    // `extras.endpoint_override` is where OpenAI speech-to-text and Hume send their traffic
+    // (OpenAI's text-to-speech does not read it).
+    let overridden = |extras: &serde_json::Map<String, serde_json::Value>| {
+        extras
+            .get(crate::core::stt::standard::ENDPOINT_OVERRIDE_KEY)
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+    };
+    let stt_base =
+        overridden(&stt.extras.0).or_else(|| openai_base.clone().filter(|_| openai(&stt.provider)));
+    let tts_base = overridden(&tts.extras.0)
+        .filter(|_| !openai(&tts.provider))
+        .or_else(|| bud_legs.and_then(|legs| legs.tts_api_base.clone()))
+        .or(openai_base.filter(|_| openai(&tts.provider)));
+    let today = crate::core::interaction::regime::today();
+    for (leg, provider, model, base) in [
+        (Leg::Stt, &stt.provider, stt_model, stt_base),
+        (Leg::Tts, &tts.provider, tts_model, tts_base),
+    ] {
+        let Some(notice) = lifecycle::cascade(leg, provider, &model, base.as_deref(), &today)
+        else {
+            continue;
+        };
+        warn!(code = notice.code, leg = leg.as_str(), %provider, %model, "{}", notice.message);
+        if notice.fatal {
+            let error = crate::core::interaction::WireEvent::Error {
+                message: notice.message,
+                code: notice.code.to_owned(),
+            };
+            if let Ok(json) = serde_json::to_string(&error) {
+                send_critical(message_tx, MessageRoute::Json(json)).await;
+            }
+            return false;
+        }
+        let mut detail = notice.detail;
+        detail["side"] = leg.as_str().into();
+        send_config_warning(message_tx, notice.code, notice.message, Some(detail)).await;
+    }
+    true
 }
 
 /// P2 language standardization (SDK_STANDARDIZATION_PLAN.md): emit a non-fatal `config_warning` for
@@ -1611,6 +1897,7 @@ async fn initialize_conversation_loop(
                         confidence: stt.confidence,
                         segment_transcript: stt.segment_transcript.clone(),
                         translations: stt.translations.clone(),
+                        detected_language: stt.detected_language.clone(),
                     }),
                     MessageClass::Transcript,
                 )
@@ -1807,11 +2094,16 @@ async fn initialize_voice_manager(
     app_state: &Arc<AppState>,
     message_tx: &mpsc::Sender<MessageRoute>,
     bud_legs: Option<&super::bud_legs::PreparedLegs>,
+    defer_turn_models: bool,
 ) -> Option<Arc<VoiceManager>> {
     info!(
         "Initializing voice manager with STT provider: {} and TTS provider: {}",
         stt_ws_config.provider, tts_ws_config.provider
     );
+
+    if !apply_lifecycle(stt_ws_config, tts_ws_config, bud_legs, message_tx).await {
+        return None;
+    }
 
     // Get API keys - prefer client-provided keys where the deployment allows them, fall back to
     // server config
@@ -1931,6 +2223,26 @@ async fn initialize_voice_manager(
     // requested where the provider can't detect, an unrecognized token passed through verbatim) as
     // non-fatal `config_warning`s — NEVER a hard 400. Identity mappings are silent.
     emit_language_config_warnings(stt_ws_config, tts_ws_config, message_tx).await;
+    // `features.streaming` on a provider with no streaming variant: synthesised over HTTP.
+    if standard_tts.features.streaming == Some(true)
+        && !crate::core::tts::standard::has_streaming_variant(&standard_tts.base.provider)
+    {
+        send_config_warning(
+            message_tx,
+            "tts_streaming_unsupported_or_degraded",
+            format!(
+                "{} has no streaming (WebSocket) text-to-speech in this gateway; \
+                 features.streaming is ignored and audio is synthesised over its HTTP API",
+                standard_tts.base.provider
+            ),
+            Some(serde_json::json!({
+                "side": "tts",
+                "provider": standard_tts.base.provider,
+                "feature": "streaming",
+            })),
+        )
+        .await;
+    }
     // The TTS cache key is computed HERE from the FULL standardized config — base + advanced
     // features + extras — before `standard_tts` is moved into the manager, so audio-changing
     // features (voice settings, emotion, ssml, seed, …) are part of the key and cannot collide.
@@ -2049,6 +2361,9 @@ async fn initialize_voice_manager(
         return None;
     }
 
+    if defer_turn_models {
+        voice_manager.defer_smart_turn();
+    }
     // Start voice manager (callbacks above are live for any connect-time error)
     if let Err(e) = voice_manager.start().await {
         error!("Failed to start voice manager: {}", e);
@@ -2081,6 +2396,7 @@ async fn register_stt_callback(
                     confidence: result.confidence,
                     segment_transcript: result.segment_transcript,
                     translations: result.translations,
+                    detected_language: result.detected_language,
                 };
                 send_with_policy(
                     &message_tx,
@@ -2736,7 +3052,7 @@ async fn register_final_tts_callback(
 
 /// Initialize LiveKit client and set up callbacks
 #[allow(clippy::too_many_arguments)]
-async fn initialize_livekit_client(
+pub(super) async fn initialize_livekit_client(
     livekit_ws_config: LiveKitWebSocketConfig,
     tts_config: Option<&TTSWebSocketConfig>,
     ingress_sample_rate: u32,
@@ -2747,6 +3063,11 @@ async fn initialize_livekit_client(
     stream_id: &str,
     auth_id: Option<&str>,
     task_tracker: &Arc<crate::core::observability::SessionTaskTracker>,
+    // Interaction mode: the session hears one caller of the room.
+    caller_tap: Option<crate::livekit::CallerTap>,
+    // Interaction mode: the connection, whose actor takes the room's `control` and
+    // `task_seen` messages on the interaction data topic.
+    interaction_state: Option<Arc<RwLock<ConnectionState>>>,
 ) -> Option<(
     Arc<RwLock<LiveKitClient>>,
     Option<crate::livekit::OperationQueue>,
@@ -2861,21 +3182,29 @@ async fn initialize_livekit_client(
     };
 
     let tts_config_for_livekit = tts_config.unwrap_or(&default_tts_config);
-    let livekit_config = livekit_ws_config.to_livekit_config(
+    let mut livekit_config = livekit_ws_config.to_livekit_config(
         agent_token,
         tts_config_for_livekit,
         ingress_sample_rate,
         livekit_url,
     );
+    // A session with no VoiceManager (a realtime voice) hears the caller through its tap only:
+    // the room's own copy, behind the noise filter, has nobody to go to.
+    let tap_only = voice_manager.is_none() && caller_tap.is_some();
+    livekit_config.enable_noise_filter &= !tap_only;
+    livekit_config.caller_tap = caller_tap;
     let mut livekit_client = LiveKitClient::new(livekit_config);
 
     // Set up audio callback to forward to STT processing
     if let Some(vm) = voice_manager {
         setup_livekit_audio_callback(&mut livekit_client, vm, message_tx, task_tracker);
+    } else if tap_only {
+        // The room reads a participant's track only for a callback.
+        livekit_client.set_audio_callback(|_: Vec<u8>| {});
     }
 
     // Set up data callback
-    setup_livekit_data_callback(&mut livekit_client, message_tx);
+    setup_livekit_data_callback(&mut livekit_client, message_tx, interaction_state);
 
     // Set up participant disconnect callback
     setup_livekit_disconnect_callback(&mut livekit_client, message_tx);
@@ -2978,11 +3307,13 @@ fn setup_livekit_audio_callback(
 fn setup_livekit_data_callback(
     livekit_client: &mut LiveKitClient,
     message_tx: &mpsc::Sender<MessageRoute>,
+    interaction_state: Option<Arc<RwLock<ConnectionState>>>,
 ) {
     let message_tx_clone = message_tx.clone();
 
     livekit_client.set_data_callback(move |data_message| {
         let message_tx = message_tx_clone.clone();
+        let interaction_state = interaction_state.clone();
 
         // Spawn task for async send to ensure delivery; observe panics even though this callback has no
         // retained JoinHandle owner.
@@ -2992,6 +3323,17 @@ fn setup_livekit_data_callback(
                 data_message.participant_identity,
                 data_message.data.len()
             );
+
+            // Interaction mode: a control or a `task_seen` on the interaction topic is the
+            // session's, not a message for the client.
+            if let Some(state) = &interaction_state
+                && data_message.topic.as_deref()
+                    == Some(crate::core::interaction::actor::ROOM_TOPIC)
+                && let Ok(text) = std::str::from_utf8(&data_message.data)
+                && super::processor::room_message(text, state, &message_tx).await
+            {
+                return;
+            }
 
             // Create unified message structure for LiveKit data
             // Extract fields upfront to avoid borrow checker issues with if/else branches
@@ -3211,43 +3553,16 @@ async fn initialize_dag_routing(
     egress_audio: Option<Arc<EgressAudio>>,
     resilience: Option<Arc<crate::core::resilience::ResilienceRegistry>>,
     app_state: &Arc<AppState>,
+    compiled: Option<CompiledSessionDag>,
 ) -> Result<bool, String> {
-    // Get DAG definition from template or inline
-    let mut dag_definition: DAGDefinition = if let Some(ref def) = dag_config.definition {
-        // Parse inline definition
-        serde_json::from_value(def.clone()).map_err(|e| format!("Invalid DAG definition: {}", e))?
-    } else if let Some(ref template_name) = dag_config.template {
-        // Load from template registry
-        let templates = global_templates();
-        templates
-            .get(template_name)
-            .ok_or_else(|| format!("DAG template '{}' not found", template_name))?
-    } else {
+    let compiled = match compiled {
+        Some(compiled) => compiled,
+        None => compile_session_dag(dag_config, stream_id, state, message_tx, app_state).await,
+    };
+    let Some((_, compiled_dag)) = compiled? else {
         // No DAG specified
         return Ok(false);
     };
-
-    // FRD-023 WP-RT6.3: under the Bud control plane the template's provider and LLM nodes address
-    // Bud deployments as the caller (inline definitions were refused before this, RT0).
-    if app_state.bud_mode.is_some() {
-        bind_bud_dag(app_state, state, message_tx, &mut dag_definition, stream_id).await?;
-    }
-
-    info!(
-        dag_id = %dag_definition.id,
-        dag_name = %dag_definition.name,
-        nodes = dag_definition.nodes.len(),
-        edges = dag_definition.edges.len(),
-        "Compiling DAG for session"
-    );
-
-    // Compile the DAG
-    let compiler = DAGCompiler::new();
-    let compiled_dag = compiler
-        .compile(dag_definition)
-        .map_err(|e| format!("DAG compilation failed: {}", e))?;
-
-    let compiled_dag = Arc::new(compiled_dag);
 
     // Determine the "post-STT node": the node directly downstream of the STT provider
     // node. The StreamDriver injects the finalized transcript there and runs the rest
@@ -3403,6 +3718,174 @@ async fn initialize_dag_routing(
     Ok(true)
 }
 
+/// What interaction mode asks of a session's DAG before it takes it for its background.
+#[cfg(feature = "dag-routing")]
+#[derive(Debug, Clone, Copy)]
+struct DagShape {
+    audio_output: bool,
+    text_output: bool,
+    endpoints: bool,
+}
+
+/// What [`compile_session_dag`] gives: `None` when the config names no DAG.
+#[cfg(feature = "dag-routing")]
+type CompiledSessionDag =
+    Result<Option<(DagShape, Arc<crate::dag::compiler::CompiledDAG>)>, String>;
+
+/// The session's DAG, compiled: its inline definition or its template, bound to the caller's
+/// Bud deployments under the control plane. `None` when the config names neither. Binding
+/// admits the session to those deployments, so a session's DAG is compiled once.
+#[cfg(feature = "dag-routing")]
+async fn compile_session_dag(
+    dag_config: &DAGWebSocketConfig,
+    stream_id: &str,
+    state: &Arc<RwLock<ConnectionState>>,
+    message_tx: &mpsc::Sender<MessageRoute>,
+    app_state: &Arc<AppState>,
+) -> CompiledSessionDag {
+    // Get DAG definition from template or inline
+    let mut dag_definition: DAGDefinition = if let Some(ref def) = dag_config.definition {
+        // Parse inline definition
+        serde_json::from_value(def.clone()).map_err(|e| format!("Invalid DAG definition: {}", e))?
+    } else if let Some(ref template_name) = dag_config.template {
+        // Load from template registry
+        let templates = global_templates();
+        templates
+            .get(template_name)
+            .ok_or_else(|| format!("DAG template '{}' not found", template_name))?
+    } else {
+        // No DAG specified
+        return Ok(None);
+    };
+
+    // FRD-023 WP-RT6.3: under the Bud control plane the template's provider and LLM nodes address
+    // Bud deployments as the caller (inline definitions were refused before this, RT0).
+    if app_state.bud_mode.is_some() {
+        bind_bud_dag(app_state, state, message_tx, &mut dag_definition, stream_id).await?;
+    }
+
+    info!(
+        dag_id = %dag_definition.id,
+        dag_name = %dag_definition.name,
+        nodes = dag_definition.nodes.len(),
+        edges = dag_definition.edges.len(),
+        "Compiling DAG for session"
+    );
+
+    let shape = DagShape {
+        audio_output: dag_definition.has_audio_output(),
+        text_output: dag_definition.has_text_output(),
+        endpoints: dag_definition.has_endpoints(),
+    };
+
+    // Compile the DAG
+    let compiler = DAGCompiler::new();
+    let compiled_dag = compiler
+        .compile(dag_definition)
+        .map_err(|e| format!("DAG compilation failed: {}", e))?;
+
+    Ok(Some((shape, Arc::new(compiled_dag))))
+}
+
+/// A text-output DAG as the background of interaction mode: the graph runs once per task,
+/// from the node after its speech-to-text, and the text its output nodes emit is the answer.
+#[cfg(feature = "dag-routing")]
+struct DagBackground {
+    dag: Arc<crate::dag::compiler::CompiledDAG>,
+    executor: DAGExecutor,
+    context: DAGContext,
+    start: String,
+    timeout: Option<Duration>,
+    endpoints: bool,
+}
+
+#[cfg(feature = "dag-routing")]
+#[async_trait::async_trait]
+impl crate::core::interaction::background::TextBackend for DagBackground {
+    fn label(&self) -> &str {
+        "dag"
+    }
+
+    fn side_effects(&self) -> bool {
+        self.endpoints
+    }
+
+    async fn run(
+        &self,
+        request: String,
+        out: mpsc::Sender<String>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<(), String> {
+        let (output_tx, mut outputs) = mpsc::channel::<DagOutput>(64);
+        // A context of its own per run: the LLM node keeps the history, by stream id.
+        let mut ctx = self
+            .context
+            .clone_for_branch()
+            .with_output_tx(output_tx)
+            .with_cancel_token(cancel);
+        if let Some(timeout) = self.timeout {
+            ctx = ctx.with_timeout(timeout);
+        }
+        let input = crate::dag::nodes::DAGData::STTResult(STTResultData {
+            transcript: request,
+            is_final: true,
+            is_speech_final: true,
+            confidence: 1.0,
+            speech_detected: true,
+            ..Default::default()
+        });
+        let text = async |output| {
+            if let DagOutput::Text(text) = output {
+                let _ = out.send(text).await;
+            }
+        };
+        let run = self
+            .executor
+            .execute_from(&self.dag, &self.start, input, &mut ctx);
+        tokio::pin!(run);
+        let result = loop {
+            tokio::select! {
+                biased;
+                Some(output) = outputs.recv() => text(output).await,
+                result = &mut run => break result,
+            }
+        };
+        while let Ok(output) = outputs.try_recv() {
+            text(output).await;
+        }
+        result.map(|_| ()).map_err(|e| e.to_string())
+    }
+}
+
+/// The session's DAG as the background of interaction mode, or why it cannot be one: it
+/// produces audio itself, it has no text to speak, or it could not be read (the DAG's own
+/// start then reports that).
+#[cfg(feature = "dag-routing")]
+fn dag_background(
+    compiled: &CompiledSessionDag,
+    dag_config: &DAGWebSocketConfig,
+    stream_id: &str,
+    auth_id: Option<String>,
+) -> Result<Arc<dyn crate::core::interaction::background::TextBackend>, &'static str> {
+    let Ok(Some((shape, dag))) = compiled else {
+        return Err("dag_config");
+    };
+    if shape.audio_output {
+        return Err("dag_audio_output");
+    }
+    if !shape.text_output {
+        return Err("dag_no_text_output");
+    }
+    Ok(Arc::new(DagBackground {
+        start: find_post_stt_node(dag),
+        dag: dag.clone(),
+        executor: DAGExecutor::new(),
+        context: DAGContext::with_auth(stream_id.to_string(), None, auth_id),
+        timeout: dag_config.timeout_ms.map(Duration::from_millis),
+        endpoints: shape.endpoints,
+    }))
+}
+
 /// Find the node directly downstream of the STT provider node (the "post-STT" node),
 /// which is where the StreamDriver injects each finalized transcript.
 ///
@@ -3483,6 +3966,7 @@ async fn register_dag_stream_driver(
                         confidence: stt.confidence,
                         segment_transcript: stt.segment_transcript.clone(),
                         translations: stt.translations.clone(),
+                        detected_language: stt.detected_language.clone(),
                     }),
                     MessageClass::Transcript,
                 )
@@ -3911,6 +4395,31 @@ mod tests {
             Ok(MessageRoute::Outgoing(OutgoingMessage::Error { message })) => Some(message),
             _ => None,
         }
+    }
+
+    /// A leg whose `extras.endpoint_override` points away from the vendor is not the vendor's
+    /// traffic: no lifecycle notice. The same leg on the vendor's own host is told.
+    #[tokio::test]
+    async fn lifecycle_leaves_a_leg_with_an_endpoint_override_elsewhere_alone() {
+        let stt = |extras: serde_json::Value| -> STTWebSocketConfig {
+            serde_json::from_value(serde_json::json!({
+                "provider": "openai", "model": "whisper-1", "language": "en", "sample_rate": 16000,
+                "channels": 1, "punctuation": true, "extras": extras}))
+            .unwrap()
+        };
+        let tts = |extras: serde_json::Value| -> TTSWebSocketConfig {
+            serde_json::from_value(serde_json::json!({"provider": "hume", "extras": extras}))
+                .unwrap()
+        };
+        let away = serde_json::json!({"endpoint_override": "https://speech-proxy.internal"});
+        let (tx, mut rx) = mpsc::channel(8);
+        assert!(apply_lifecycle(&stt(away.clone()), &tts(away), None, &tx).await);
+        assert!(rx.try_recv().is_err(), "nothing reaches the vendor");
+
+        let own = serde_json::json!({"endpoint_override": "https://api.hume.ai"});
+        let (tx, mut rx) = mpsc::channel(8);
+        apply_lifecycle(&stt(own.clone()), &tts(own), None, &tx).await;
+        assert!(rx.try_recv().is_ok(), "Hume's own host is told it retires");
     }
 
     #[tokio::test]

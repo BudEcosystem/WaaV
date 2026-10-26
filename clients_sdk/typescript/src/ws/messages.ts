@@ -24,6 +24,7 @@ import type { STTConfig, TTSConfig, LiveKitConfig, DAGConfig, ConversationConfig
 import { conversationConfigToWire } from '../types/conversation.js';
 import { serializeDAGConfig } from '../types/dag.js';
 import type { FeatureFlags } from '../types/features.js';
+import type { InteractionConfig, InteractionEcho, InteractionClientMessage } from '../types/interaction.js';
 
 // ============================================================================
 // Type validation helpers - provide runtime safety for wire data
@@ -132,6 +133,12 @@ export interface SDKConfigMessage {
    */
   alias?: string;
   /**
+   * Interaction mode (protocol 1.1): `true` for the defaults, an object of settings, or `false`
+   * to turn off an alias's or the server's default block. Sent as-is under `interaction`
+   * (snake_case wire keys: nothing in it is renamed).
+   */
+  interaction?: boolean | InteractionConfig;
+  /**
    * Legacy client feature flags. These are folded into the nested
    * `stt_config.features{}` block (NOT emitted as a top-level `features` key,
    * which the gateway does not recognize and silently drops).
@@ -183,6 +190,13 @@ function toWireFormat(message: SDKOutgoingMessage): Record<string, unknown> {
         type: 'sip_transfer',
         transfer_to: (message as { transfer_to: string }).transfer_to,
       };
+    case 'task_answer':
+    case 'task_cancel':
+    case 'task_seen':
+    case 'interaction_update':
+    case 'playback_position':
+      // Interaction mode: already in the gateway's wire shape.
+      return { ...(message as InteractionClientMessage) };
     default:
       return { type: (message as { type: string }).type };
   }
@@ -250,6 +264,11 @@ function configToWire(message: SDKConfigMessage): Record<string, unknown> {
 
   if (message.conversation) {
     wire.conversation_config = conversationConfigToWire(message.conversation);
+  }
+
+  // Interaction mode: `false` is sent too (it turns off an alias's or the server's default).
+  if (message.interaction !== undefined) {
+    wire.interaction = message.interaction;
   }
 
   return wire;
@@ -569,6 +588,9 @@ function readyFromWire(wire: Record<string, unknown>): ReadyMessage {
   if (audioInCodec !== undefined) msg.audio_in_codec = audioInCodec;
   const audioOutCodec = asString(wire.audio_out_codec);
   if (audioOutCodec !== undefined) msg.audio_out_codec = audioOutCodec;
+  // Interaction mode: the resolved settings (present only when the session runs the mode).
+  const interaction = asRecord(wire.interaction);
+  if (interaction !== undefined) msg.interaction = interaction as unknown as InteractionEcho;
   return msg;
 }
 
@@ -703,6 +725,7 @@ export function createConfigMessage(
     alias?: string;
     streamId?: string;
     audio?: boolean;
+    interaction?: boolean | InteractionConfig;
   }
 ): SDKConfigMessage {
   const msg: SDKConfigMessage = {
@@ -718,6 +741,7 @@ export function createConfigMessage(
   if (extra?.alias !== undefined) msg.alias = extra.alias;
   if (extra?.streamId !== undefined) msg.streamId = extra.streamId;
   if (extra?.audio !== undefined) msg.audio = extra.audio;
+  if (extra?.interaction !== undefined) msg.interaction = extra.interaction;
   return msg;
 }
 

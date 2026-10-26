@@ -52,8 +52,9 @@ use super::messages::SessionConfig;
 use super::protocol::OpenAiProtocol;
 use crate::core::realtime::base::{
     AudioOutputCallback, BaseRealtime, ConnectionState, FunctionCallCallback, RealtimeConfig,
-    RealtimeErrorCallback, RealtimeResponseOverride, RealtimeResult, ReconnectionCallback,
-    ReplayConversationItem, ResponseDoneCallback, SpeechEventCallback, TranscriptCallback,
+    RealtimeErrorCallback, RealtimeResponseOverride, RealtimeResult, RealtimeVerb,
+    ReconnectionCallback, ReplayConversationItem, ResponseDoneCallback, SpeechEventCallback,
+    TranscriptCallback,
 };
 use crate::core::realtime::scaffold::RealtimeSession;
 
@@ -107,13 +108,18 @@ impl OpenAIRealtime {
     /// Build the initial session configuration (delegates to the protocol;
     /// retained as an inherent method for the existing GA wire-shape tests).
     fn build_session_config(&self) -> SessionConfig {
-        self.0.protocol().session_config(self.0.config())
+        self.0.protocol().session_config(&self.0.config())
     }
 }
 
 #[async_trait]
 impl BaseRealtime for OpenAIRealtime {
-    fn new(config: RealtimeConfig) -> RealtimeResult<Self> {
+    fn new(mut config: RealtimeConfig) -> RealtimeResult<Self> {
+        // OpenAI's own provider only (the protocol clones keep their defaults): the provider
+        // fix `openai_realtime_default` moves an empty model off the retiring `gpt-realtime`.
+        if config.model.trim().is_empty() && config.fix("openai_realtime_default") {
+            config.model = super::openai_realtime_default(true).to_owned();
+        }
         Ok(Self(RealtimeSession::<OpenAiProtocol>::new(config)?))
     }
 
@@ -194,6 +200,10 @@ impl BaseRealtime for OpenAIRealtime {
 
     async fn update_session(&mut self, config: RealtimeConfig) -> RealtimeResult<()> {
         self.0.update_session(config).await
+    }
+
+    async fn apply_verb(&mut self, verb: RealtimeVerb<'_>) -> RealtimeResult<()> {
+        self.0.apply_verb(verb).await
     }
 
     async fn submit_function_result(&mut self, call_id: &str, result: &str) -> RealtimeResult<()> {
@@ -506,5 +516,34 @@ mod tests {
         let cfg = realtime.0.config().reconnection.clone().unwrap();
         assert!(!cfg.enabled);
         assert!(!cfg.should_retry(0));
+    }
+
+    /// Provider fix `openai_realtime_default`: off, an empty model is today's `gpt-realtime`;
+    /// on, it is the capability data's replacement `gpt-realtime-2.1` (the id reaches OpenAI
+    /// in the connect URL's `?model=`, <https://platform.openai.com/docs/api-reference/realtime>).
+    /// A named model is never changed.
+    #[test]
+    fn the_default_model_fix_moves_only_an_empty_model() {
+        let make = |model: &str, fixes: &[&str]| {
+            OpenAIRealtime::new(RealtimeConfig {
+                provider: "openai".into(),
+                api_key: "k".into(),
+                model: model.into(),
+                provider_fixes: fixes.iter().map(|f| (*f).to_owned()).collect(),
+                ..Default::default()
+            })
+            .unwrap()
+            .model()
+        };
+        assert_eq!(make("", &[]).as_str(), "gpt-realtime");
+        assert_eq!(
+            make("", &["openai_realtime_default"]).as_str(),
+            "gpt-realtime-2.1"
+        );
+        assert_eq!(
+            make("gpt-realtime-mini", &["openai_realtime_default"]).as_str(),
+            "gpt-realtime-mini"
+        );
+        assert_eq!(super::super::openai_realtime_default(false), "gpt-realtime");
     }
 }

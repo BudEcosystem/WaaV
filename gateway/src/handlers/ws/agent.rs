@@ -77,6 +77,19 @@ pub fn agent_signal_message(signal: &AgentSignal) -> Option<OutgoingMessage> {
             name,
             status: status.into(),
         },
+        AgentSignal::FunctionCall {
+            turn,
+            item_id,
+            call_id,
+            name,
+            arguments,
+        } => OutgoingMessage::AgentFunctionCall {
+            turn_index: turn,
+            item_id,
+            call_id,
+            name,
+            arguments,
+        },
         AgentSignal::Output {
             turn,
             response_id,
@@ -219,39 +232,7 @@ pub(super) async fn initialize_agent_loop(
         tracker.track("agent-signals", handle);
     }
 
-    // The session's length is the agent's limit, capped by the gateway's.
-    {
-        let cap = app_state.realtime.timings.max_session;
-        let limit = Duration::from_secs(entry.limits.max_session_seconds.max(60)).min(cap);
-        let tx = message_tx.clone();
-        let weak = Arc::downgrade(&engine);
-        let tracker = state.read().await.task_tracker.clone();
-        let handle = tokio::spawn(async move {
-            tokio::time::sleep(limit).await;
-            if let Some(engine) = weak.upgrade() {
-                engine.shutdown().await;
-            }
-            let _ = send_with_policy(
-                &tx,
-                MessageRoute::Outgoing(OutgoingMessage::AgentError {
-                    code: "session_limit".into(),
-                    message: format!("The session reached its {} s limit.", limit.as_secs()),
-                }),
-                MessageClass::Critical,
-            )
-            .await;
-            let _ = send_with_policy(
-                &tx,
-                MessageRoute::CloseWith {
-                    code: CLOSE_NORMAL,
-                    reason: "session_limit".into(),
-                },
-                MessageClass::Critical,
-            )
-            .await;
-        });
-        tracker.track("agent-session-limit", handle);
-    }
+    limit_session(&entry, Some(&engine), state, message_tx, app_state).await;
 
     // Turn-taking: the same controller the conversation loop uses, with the agent's settings.
     let start_strategy = start_strategy(&entry);
@@ -318,6 +299,7 @@ pub(super) async fn initialize_agent_loop(
                     confidence: stt.confidence,
                     segment_transcript: stt.segment_transcript.clone(),
                     translations: stt.translations.clone(),
+                    detected_language: stt.detected_language.clone(),
                 }),
                 MessageClass::Transcript,
             )
@@ -371,6 +353,47 @@ pub(super) async fn initialize_agent_loop(
         "voice agent session started"
     );
     Ok(())
+}
+
+/// End the session when it reaches the agent's length limit, capped by the gateway's. `engine`
+/// is absent on a session that runs interaction mode, whose teardown ends its tasks.
+pub(super) async fn limit_session(
+    entry: &bud_auth::voice_agent::VoiceAgentEntry,
+    engine: Option<&Arc<AgentEngine>>,
+    state: &Arc<RwLock<ConnectionState>>,
+    message_tx: &mpsc::Sender<MessageRoute>,
+    app_state: &Arc<AppState>,
+) {
+    let cap = app_state.realtime.timings.max_session;
+    let limit = Duration::from_secs(entry.limits.max_session_seconds.max(60)).min(cap);
+    let tx = message_tx.clone();
+    let weak = engine.map(Arc::downgrade);
+    let tracker = state.read().await.task_tracker.clone();
+    let handle = tokio::spawn(async move {
+        tokio::time::sleep(limit).await;
+        if let Some(engine) = weak.and_then(|weak| weak.upgrade()) {
+            engine.shutdown().await;
+        }
+        let _ = send_with_policy(
+            &tx,
+            MessageRoute::Outgoing(OutgoingMessage::AgentError {
+                code: "session_limit".into(),
+                message: format!("The session reached its {} s limit.", limit.as_secs()),
+            }),
+            MessageClass::Critical,
+        )
+        .await;
+        let _ = send_with_policy(
+            &tx,
+            MessageRoute::CloseWith {
+                code: CLOSE_NORMAL,
+                reason: "session_limit".into(),
+            },
+            MessageClass::Critical,
+        )
+        .await;
+    });
+    tracker.track("agent-session-limit", handle);
 }
 
 /// What starts a caller's turn, and so interrupts the agent while it speaks. The words needed

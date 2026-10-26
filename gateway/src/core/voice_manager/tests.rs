@@ -224,6 +224,43 @@ async fn ag6_in_flight_uninterruptible_survives_barge_in() {
     );
 }
 
+/// A session that may run interaction mode leaves its turn models to the decision: `start`
+/// loads none, and the processor is loaded once, only when asked.
+#[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
+#[tokio::test]
+async fn a_deferred_smart_turn_processor_loads_once_and_only_when_asked() {
+    let stt_config = STTConfig {
+        provider: "deepgram".to_string(),
+        api_key: "test_key".to_string(),
+        ..Default::default()
+    };
+    let tts_config = TTSConfig {
+        provider: "deepgram".to_string(),
+        api_key: "test_key".to_string(),
+        ..Default::default()
+    };
+    let mut config = VoiceManagerConfig::new(stt_config.clone(), tts_config.clone());
+    config.smart_turn_config =
+        Some(crate::core::smart_turn::SmartTurnProcessorConfig::new().with_sample_rate(16_000));
+    let vm = VoiceManager::new(config, None).unwrap();
+    vm.defer_smart_turn();
+    // `start` would fail here on its providers' connections before it got that far; the
+    // processor is not loaded by anything but `start_smart_turn`.
+    assert!(!vm.smart_turn_loaded().await);
+    vm.start_smart_turn().await.expect("the models load");
+    assert!(vm.smart_turn_loaded().await);
+    // Asked again: the processor there stays, nothing is loaded twice.
+    vm.start_smart_turn().await.expect("idempotent");
+    assert!(vm.smart_turn_loaded().await);
+    vm.disable_smart_turn_processor().await;
+    assert!(!vm.smart_turn_loaded().await);
+
+    // No turn detection asked for: nothing to load.
+    let plain = VoiceManager::new(VoiceManagerConfig::new(stt_config, tts_config), None).unwrap();
+    plain.start_smart_turn().await.unwrap();
+    assert!(!plain.smart_turn_loaded().await);
+}
+
 #[tokio::test]
 async fn test_voice_manager_creation() {
     let stt_config = STTConfig {

@@ -73,9 +73,10 @@ mod config_tests {
             ..Default::default()
         };
 
-        let url = config.build_websocket_url("test_api_key");
-        assert!(url.starts_with("wss://api.cartesia.ai/stt/websocket?"));
-        assert!(url.contains("api_key=test_api_key"));
+        let url = config.build_websocket_url();
+        assert!(url.starts_with("wss://api.cartesia.ai/stt/websocket?model="));
+        // The key is never in the URL.
+        assert!(!url.contains("api_key"), "{url}");
         assert!(url.contains("model=ink-whisper"));
         assert!(url.contains("language=en"));
         assert!(url.contains("encoding=pcm_s16le"));
@@ -103,8 +104,8 @@ mod config_tests {
             endpoint_override: None,
         };
 
-        let url = config.build_websocket_url("my_api_key");
-        assert!(url.contains("api_key=my_api_key"));
+        let url = config.build_websocket_url();
+        assert!(!url.contains("api_key"), "{url}");
         assert!(url.contains("model=ink-whisper"));
         assert!(url.contains("language=fr"));
         assert!(url.contains("encoding=pcm_s16le"));
@@ -250,9 +251,9 @@ mod config_tests {
         assert!(config.validate().is_ok());
 
         // And the wire carries no `language` at all — not an empty one, not a substituted `en`.
-        let url = config.build_websocket_url("test");
+        let url = config.build_websocket_url();
         assert!(!url.contains("language="), "url: {url}");
-        assert!(url.contains("&model="), "url: {url}");
+        assert!(url.contains("?model="), "url: {url}");
         assert!(url.contains("&encoding="), "url: {url}");
     }
 

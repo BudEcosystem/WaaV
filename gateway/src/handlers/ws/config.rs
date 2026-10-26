@@ -597,6 +597,7 @@ impl LiveKitWebSocketConfig {
             channels: 1,
             // Enable noise filter by default when compiled with the optional feature
             // Can be disabled via config if lower latency is needed
+            caller_tap: None,
             enable_noise_filter: cfg!(feature = "noise-filter"),
             // Pass through the participant filter list
             listen_participants: self.listen_participants.clone(),

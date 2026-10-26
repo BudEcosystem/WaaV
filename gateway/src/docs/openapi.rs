@@ -67,6 +67,15 @@ use crate::handlers::{
         crate::handlers::sip::update_sip_hooks,
         crate::handlers::sip::delete_sip_hooks,
         crate::handlers::sip::sip_transfer,
+        crate::handlers::tasks::list_tasks,
+        crate::handlers::tasks::task_events,
+        crate::handlers::tasks::get_task,
+        crate::handlers::tasks::task_callback,
+        crate::handlers::tasks::put_persona,
+        crate::handlers::tasks::get_persona,
+        crate::handlers::tasks::delete_persona,
+        crate::handlers::tasks::put_memory,
+        crate::handlers::tasks::get_memory,
     ),
     components(schemas(
         // REST API types
@@ -150,6 +159,7 @@ use crate::handlers::{
         (name = "livekit", description = "LiveKit room and token management"),
         (name = "recordings", description = "Recording download operations"),
         (name = "sip", description = "SIP webhook configuration management"),
+        (name = "tasks", description = "Interaction-mode background tasks"),
         (name = "websocket", description = "WebSocket API for real-time communication")
     )
 )]

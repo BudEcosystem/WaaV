@@ -56,6 +56,11 @@ pub struct ResilienceRegistry {
     breakers: RwLock<HashMap<String, Arc<CircuitBreaker>>>,
 }
 
+/// At most this many breakers are made for client-named models (see `realtime_handles`).
+const MAX_BREAKERS: usize = 256;
+/// A model name in a breaker key is cut to this many characters.
+const MAX_MODEL_KEY: usize = 64;
+
 impl ResilienceRegistry {
     /// Create a registry with the given process-wide reconnect concurrency cap.
     pub fn new(max_concurrent_reconnects: usize) -> Self {
@@ -108,6 +113,42 @@ impl ResilienceRegistry {
         }))
     }
 
+    /// The breaker key of a vendor's speech-to-speech product and model
+    /// (`deepgram-realtime/gpt-4o-mini`, `deepgram-realtime` with no model): its own breaker,
+    /// apart from the one the vendor's speech-to-text and text-to-speech sessions share and
+    /// from the product's other models, so a model the vendor keeps refusing (a think model
+    /// its voice agent does not serve) never stops the other products or models.
+    pub fn realtime_key(provider: &str, model: &str) -> String {
+        let model: String = model
+            .trim()
+            .to_lowercase()
+            .chars()
+            .take(MAX_MODEL_KEY)
+            .collect();
+        match model.is_empty() {
+            true => format!("{}-realtime", provider.to_lowercase()),
+            false => format!("{}-realtime/{model}", provider.to_lowercase()),
+        }
+    }
+
+    /// The handles of a speech-to-speech session (see [`Self::realtime_key`]). Model names come
+    /// from clients, so once the registry holds [`MAX_BREAKERS`] breakers a model not seen yet
+    /// shares the product's breaker instead of adding one.
+    pub fn realtime_handles(&self, provider: &str, model: &str) -> ResilienceHandles {
+        let key = Self::realtime_key(provider, model);
+        let known = match self.breakers.read() {
+            Ok(map) => map.contains_key(&key) || map.len() < MAX_BREAKERS,
+            Err(poisoned) => {
+                let map = poisoned.into_inner();
+                map.contains_key(&key) || map.len() < MAX_BREAKERS
+            }
+        };
+        match known {
+            true => self.handles_for(&key),
+            false => self.handles_for(&Self::realtime_key(provider, "")),
+        }
+    }
+
     /// The bundled shared handles (governor + per-provider breaker) for `provider`, ready to be
     /// threaded into that provider's connect path.
     pub fn handles_for(&self, provider: &str) -> ResilienceHandles {
@@ -146,6 +187,53 @@ mod tests {
             !Arc::ptr_eq(&dg, &aai),
             "distinct providers must have independent breakers"
         );
+    }
+
+    /// A voice agent the vendor keeps refusing (a think model it does not serve) opens its
+    /// own breaker, never the one the vendor's speech-to-text sessions dial through.
+    #[test]
+    fn a_realtime_product_trips_apart_from_the_vendors_speech_to_text() {
+        let reg = ResilienceRegistry::new(8);
+        assert_eq!(
+            ResilienceRegistry::realtime_key("Deepgram", ""),
+            "deepgram-realtime"
+        );
+        assert_eq!(
+            ResilienceRegistry::realtime_key("Deepgram", " GPT-5.6-luna "),
+            "deepgram-realtime/gpt-5.6-luna"
+        );
+        let agent = reg.realtime_handles("deepgram", "gpt-5.6-luna");
+        for _ in 0..10 {
+            agent.breaker.record_failure();
+        }
+        assert!(
+            !reg.realtime_handles("deepgram", "gpt-5.6-luna")
+                .breaker
+                .allow_request()
+        );
+        // The vendor's other think models and its speech-to-text are not blocked.
+        assert!(
+            reg.realtime_handles("deepgram", "gpt-4o-mini")
+                .breaker
+                .allow_request()
+        );
+        assert!(reg.handles_for("deepgram").breaker.allow_request());
+    }
+
+    /// Client-named models add breakers only up to the cap; past it a new model shares the
+    /// product's.
+    #[test]
+    fn model_breakers_are_bounded() {
+        let reg = ResilienceRegistry::new(8);
+        for n in 0..MAX_BREAKERS {
+            reg.realtime_handles("openai", &format!("model-{n}"));
+        }
+        let overflow = reg.realtime_handles("openai", "one-more");
+        let product = reg.handles_for("openai-realtime");
+        assert!(Arc::ptr_eq(&overflow.breaker, &product.breaker));
+        // A model already known keeps its own.
+        let known = reg.realtime_handles("openai", "model-0");
+        assert!(!Arc::ptr_eq(&known.breaker, &product.breaker));
     }
 
     #[test]

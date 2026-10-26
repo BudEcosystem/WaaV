@@ -149,6 +149,13 @@ fn rich_config_for(name: &str) -> RealtimeConfig {
         trace: None,
         // SERVER-SET connection cap (FRD-023 RT7); the protocol's own when unset.
         max_connection: None,
+        // SERVER-SET provider wire fixes; none ⇒ today's wire.
+        provider_fixes: Vec::new(),
+        provider_fixes_decided: false,
+        // Voice-agent choices (Deepgram reads them; every other provider ignores them).
+        language: Some("en".to_string()),
+        think_provider: None,
+        region: None,
     };
 
     match name {
@@ -402,6 +409,12 @@ fn session_config_to_realtime_config_carries_every_feature_field() {
         reasoning_effort: Some(ReasoningEffort::Medium),
         input_audio_noise_reduction: Some("far_field".to_string()),
         alias: None,
+        interaction: None,
+        language: Some("fr".to_string()),
+        think_provider: Some("google".to_string()),
+        region: Some("us".to_string()),
+        provider_fixes: None,
+        text_only: false,
     };
 
     // Convert via the handler's REAL converter (the exact fn the live
@@ -411,6 +424,21 @@ fn session_config_to_realtime_config_carries_every_feature_field() {
 
     // Now assert EVERY feature field survived the conversion.
     assert_eq!(realtime_config.model, "gpt-realtime", "model dropped");
+    assert_eq!(
+        realtime_config.language.as_deref(),
+        Some("fr"),
+        "language dropped"
+    );
+    assert_eq!(
+        realtime_config.think_provider.as_deref(),
+        Some("google"),
+        "think_provider dropped"
+    );
+    assert_eq!(
+        realtime_config.region.as_deref(),
+        Some("us"),
+        "region dropped"
+    );
     assert_eq!(
         realtime_config.voice.as_deref(),
         Some("verse"),

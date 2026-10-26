@@ -376,6 +376,19 @@ mod tests {
     }
 
     #[test]
+    fn the_interaction_block_is_not_linted_here() {
+        // Its keys are checked by the interaction parser, which reports them itself.
+        let json = r#"{
+            "type": "config",
+            "stt_config": {"provider":"deepgram","language":"en-US","sample_rate":16000,"channels":1,"punctuation":true},
+            "interaction": {"duplex": {"eager": false}, "no_such_key": 1}
+        }"#;
+        assert!(lint(json).is_empty(), "{:?}", lint(json));
+        let json = r#"{"type": "config", "interaction": true}"#;
+        assert!(lint(json).is_empty(), "{:?}", lint(json));
+    }
+
+    #[test]
     fn deprecated_audio_disabled_alias_is_not_flagged() {
         // `audio_disabled` is a real (deprecated) field; it round-trips and must
         // not be reported.

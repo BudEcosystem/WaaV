@@ -9,10 +9,12 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::time::{Instant, interval, timeout};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+use tokio_tungstenite::{connect_async_with_config, tungstenite::protocol::Message};
 use tracing::{debug, error, info, warn};
 
-use super::base::{BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback};
+use super::base::{
+    BaseSTT, STTConfig, STTError, STTErrorCallback, STTResult, STTResultCallback, SttTurnEvent,
+};
 use crate::core::resilience::connect::{WS_CONNECT_TIMEOUT, with_timeout};
 use crate::core::resilience::{CircuitBreaker, ReconnectGovernor};
 use crate::core::websocket::{ReconnectionConfig, ReconnectionManager};
@@ -137,6 +139,13 @@ pub struct DeepgramSTTConfig {
     pub extra: Vec<String>,
     /// Pin a specific model version (`version=ID`). Streaming-supported.
     pub version: Option<String>,
+    /// Flux (`/v2/listen`): the end-of-turn confidence that ends a turn (`eot_threshold`).
+    pub eot_threshold: Option<f64>,
+    /// Flux: the confidence of an early end-of-turn guess (`eager_eot_threshold`). Unset, Flux
+    /// sends no `EagerEndOfTurn` (the plan keeps eager mode off until it is measured).
+    pub eager_eot_threshold: Option<f64>,
+    /// Flux: the silence after which a turn ends whatever its confidence (`eot_timeout_ms`).
+    pub eot_timeout_ms: Option<u64>,
 }
 
 impl Default for DeepgramSTTConfig {
@@ -168,6 +177,9 @@ impl Default for DeepgramSTTConfig {
             mip_opt_out: false,
             extra: Vec::new(),
             version: None,
+            eot_threshold: None,
+            eager_eot_threshold: None,
+            eot_timeout_ms: None,
         }
     }
 }
@@ -240,6 +252,9 @@ impl DeepgramSTTConfig {
                 .get("version")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
+            eot_threshold: ex.get("eot_threshold").and_then(|v| v.as_f64()),
+            eager_eot_threshold: ex.get("eager_eot_threshold").and_then(|v| v.as_f64()),
+            eot_timeout_ms: ex.get("eot_timeout_ms").and_then(|v| v.as_u64()),
             // CAPABILITY GAP — intentionally NOT mapped to the wire:
             //   * `alternatives` (N-best): absent from Deepgram's streaming AsyncAPI
             //     query-parameter schema and from the streaming feature overview — it is a
@@ -283,6 +298,32 @@ pub struct DeepgramAlternative {
     pub transcript: String,
     pub confidence: f32,
     pub words: Option<Vec<DeepgramWord>>,
+    /// The languages a multilingual model (`language=multi`) heard, the main one first.
+    #[serde(default)]
+    pub languages: Option<Vec<String>>,
+}
+
+/// A Flux (`/v2/listen`) turn message: the turn's whole transcript so far and what the
+/// provider's turn model decided (`Update`, `StartOfTurn`, `EagerEndOfTurn`, `TurnResumed`,
+/// `EndOfTurn`).
+#[derive(Debug, Deserialize)]
+struct FluxTurnInfo {
+    event: String,
+    #[serde(default)]
+    transcript: String,
+    #[serde(default)]
+    words: Vec<FluxWord>,
+    #[serde(default)]
+    request_id: Option<String>,
+    /// The languages a multilingual Flux model (`flux-general-multi`) heard, the main one first.
+    #[serde(default)]
+    languages: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FluxWord {
+    #[serde(default)]
+    confidence: Option<f32>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -321,6 +362,8 @@ pub struct DeepgramError {
     #[serde(rename = "type")]
     pub error_type: String,
     pub description: String,
+    /// Absent on Flux errors, which carry a `code` instead.
+    #[serde(default)]
     pub message: String,
     pub variant: Option<String>,
 }
@@ -367,6 +410,8 @@ pub struct DeepgramSTT {
     /// words spoken around the drop aren't lost — Deepgram is stateless
     /// across connections.
     replay: Arc<crate::core::websocket::AudioReplayBuffer>,
+    /// Text control messages for the open socket (Flux `ForceEndTurn`, `/v1` `Finalize`).
+    control_tx: Option<mpsc::Sender<&'static str>>,
 }
 
 /// Constants for Deepgram regional endpoints
@@ -378,6 +423,23 @@ pub const DEEPGRAM_EU_ENDPOINT: &str = "wss://api.eu.deepgram.com";
 /// reserved characters are escaped.
 fn encode_query_value(s: &str) -> String {
     url::form_urlencoded::byte_serialize(s.as_bytes()).collect()
+}
+
+/// Deepgram Flux (`flux-general-en`): streamed on `/v2/listen`, with its own turn model.
+pub fn is_flux(model: &str) -> bool {
+    model.trim().to_ascii_lowercase().starts_with("flux")
+}
+
+/// A model Deepgram serves for files only: its streaming endpoint refuses it (405). Deepgram's
+/// Whisper models (`whisper-tiny` to `whisper-large`).
+pub fn is_file_only(model: &str) -> bool {
+    model.trim().to_ascii_lowercase().starts_with("whisper")
+}
+
+/// The mean confidence of a Flux turn's words, when it has any.
+fn flux_confidence(words: &[FluxWord]) -> Option<f32> {
+    let sure: Vec<f32> = words.iter().filter_map(|w| w.confidence).collect();
+    (!sure.is_empty()).then(|| sure.iter().sum::<f32>() / sure.len() as f32)
 }
 
 fn validate_deepgram_streaming_callback_url(callback: &str) -> Result<String, STTError> {
@@ -434,6 +496,7 @@ impl DeepgramSTT {
             resilience: None,
             intentional_disconnect: Arc::new(AtomicBool::new(false)),
             replay: Arc::new(crate::core::websocket::AudioReplayBuffer::default()),
+            control_tx: None,
         }
     }
 
@@ -477,6 +540,9 @@ impl DeepgramSTT {
         };
 
         url.push_str(endpoint);
+        if is_flux(&config.base.model) {
+            return Ok(Self::flux_url(url, config));
+        }
         url.push_str("/v1/listen?");
         // Vendor contract: `model` and `language` are both OPTIONAL on `/v1/listen`, and Deepgram
         // applies its own default when either is absent. So an unset value is OMITTED — never
@@ -663,6 +729,64 @@ impl DeepgramSTT {
         Ok(url)
     }
 
+    /// Flux's `/v2/listen` query: the model, the audio format and the turn model's settings.
+    /// Flux takes no language (English only), and the `/v1` features (interim results,
+    /// endpointing, smart formatting, redaction, ...) are not on its wire.
+    fn flux_url(mut url: String, config: &DeepgramSTTConfig) -> String {
+        url.push_str("/v2/listen?model=");
+        url.push_str(&encode_query_value(config.base.model.trim()));
+        url.push_str("&encoding=");
+        url.push_str(&encode_query_value(&config.base.encoding));
+        url.push_str("&sample_rate=");
+        url.push_str(&config.base.sample_rate.to_string());
+        let thresholds = [
+            ("eot_threshold", config.eot_threshold),
+            ("eager_eot_threshold", config.eager_eot_threshold),
+        ];
+        for (name, value) in thresholds {
+            if let Some(value) = value {
+                url.push_str(&format!("&{name}={value}"));
+            }
+        }
+        if let Some(ms) = config.eot_timeout_ms {
+            url.push_str(&format!("&eot_timeout_ms={ms}"));
+        }
+        for term in &config.keywords {
+            url.push_str("&keyterm=");
+            url.push_str(&encode_query_value(term));
+        }
+        if let Some(tag) = &config.tag {
+            url.push_str("&tag=");
+            url.push_str(&encode_query_value(tag));
+        }
+        if config.mip_opt_out {
+            url.push_str("&mip_opt_out=true");
+        }
+        url
+    }
+
+    /// A Flux turn message as a result: `Update` and `StartOfTurn` are interim results of the
+    /// whole turn so far, `EndOfTurn` its one final (also speech-final), and the eager guess
+    /// and its withdrawal interim results that carry the turn event. `None`: nothing to say.
+    fn flux_result(info: FluxTurnInfo) -> Option<STTResult> {
+        let (is_final, turn_event) = match info.event.as_str() {
+            "EndOfTurn" => (true, None),
+            "EagerEndOfTurn" => (false, Some(SttTurnEvent::EagerEndOfTurn)),
+            "TurnResumed" => (false, Some(SttTurnEvent::TurnResumed)),
+            _ => (false, None),
+        };
+        if info.transcript.trim().is_empty() && turn_event.is_none() && !is_final {
+            return None;
+        }
+        let sure = flux_confidence(&info.words);
+        let mut result = STTResult::new(info.transcript, is_final, is_final, sure.unwrap_or(1.0));
+        result.vendor_confidence = sure;
+        result.vendor_request_id = info.request_id;
+        result.turn_event = turn_event;
+        result.detected_language = info.languages.into_iter().next();
+        Some(result)
+    }
+
     /// Handle incoming WebSocket messages (optimized for hot path)
     fn handle_websocket_message(
         message: Message,
@@ -688,10 +812,25 @@ impl DeepgramSTT {
                                         response.speech_final.unwrap_or(false),
                                         alternative.confidence,
                                     );
+                                    // A multilingual model names what it heard.
+                                    stt_result.detected_language = alternative
+                                        .languages
+                                        .as_ref()
+                                        .and_then(|languages| languages.first().cloned());
                                     // A Finalize-ack means Deepgram has nothing
                                     // more for this segment (A-G1): downstream
-                                    // EoT logic may stop waiting on STT.
+                                    // EoT logic may stop waiting on STT. The gateway
+                                    // sends `Finalize` only to end the caller's
+                                    // segment now (`end_turn`): its final is the
+                                    // segment's speech-final.
                                     if is_final && response.from_finalize == Some(true) {
+                                        // An empty one says the segment's final had come
+                                        // already (the `Finalize` raced it): nothing to send.
+                                        if alternative.transcript.trim().is_empty() {
+                                            replay.clear();
+                                            return Ok(());
+                                        }
+                                        stt_result.is_speech_final = true;
                                         stt_result = stt_result.finalized();
                                     }
 
@@ -717,6 +856,22 @@ impl DeepgramSTT {
                             "Metadata" => {
                                 // Log metadata for debugging but don't process
                                 debug!("Received metadata response");
+                            }
+                            "TurnInfo" => {
+                                let result = serde_json::from_str::<FluxTurnInfo>(&text)
+                                    .ok()
+                                    .and_then(Self::flux_result);
+                                if let Some(result) = result {
+                                    // The turn is transcribed: drop the replay tail.
+                                    if result.is_final {
+                                        replay.clear();
+                                    }
+                                    if result_tx.try_send(result).is_err() {
+                                        warn!(
+                                            "STT result channel full or closed - dropping result"
+                                        );
+                                    }
+                                }
                             }
                             "Error" => {
                                 // Try to parse as error for better message
@@ -773,9 +928,14 @@ impl DeepgramSTT {
         let (result_tx, mut result_rx) = mpsc::channel::<STTResult>(256);
         let (error_tx, mut error_rx) = mpsc::channel::<STTError>(64);
         let (connected_tx, connected_rx) = oneshot::channel::<()>();
+        let (control_tx, mut control_rx) = mpsc::channel::<&'static str>(4);
+        // Flux refuses `KeepAlive` (it takes only `CloseStream`, `ForceEndTurn` and
+        // `Configure`): its socket stays open on the session's continuous audio.
+        let keepalive = !is_flux(&config.base.model);
 
         // Store channels
         self.ws_sender = Some(ws_tx);
+        self.control_tx = Some(control_tx);
         self.shutdown_tx = Some(shutdown_tx);
         self.result_tx = Some(result_tx.clone());
         self.error_tx = Some(error_tx.clone());
@@ -865,7 +1025,13 @@ impl DeepgramSTT {
 
                 // Deadline-bounded dial: flatten timeout + connect error into one
                 // message so both take the same reconnect-eligible path below.
-                let dial = match with_timeout(WS_CONNECT_TIMEOUT, connect_async(request)).await {
+                // No Nagle: a small control message (`Finalize`, `ForceEndTurn`) leaves at once.
+                let dial = match with_timeout(
+                    WS_CONNECT_TIMEOUT,
+                    connect_async_with_config(request, None, true),
+                )
+                .await
+                {
                     Ok(res) => res.map_err(|e| format!("Failed to connect to Deepgram: {e}")),
                     Err(_) => Err(format!(
                         "connect to Deepgram timed out after {}s",
@@ -1010,8 +1176,15 @@ impl DeepgramSTT {
                             }
                         }
 
+                        // A control message (Flux `ForceEndTurn`, `/v1` `Finalize`).
+                        Some(control) = control_rx.recv() => {
+                            if let Err(e) = ws_sink.send(Message::Text(control.into())).await {
+                                warn!("Deepgram: control message send failed: {e}");
+                            }
+                        }
+
                         // Handle keep-alive timer
-                        _ = keepalive_timer.tick() => {
+                        _ = keepalive_timer.tick(), if keepalive => {
                             // Check if we need to send a keep-alive message
                             // Only send if no audio was sent in the last second
                             if last_activity.elapsed() >= Duration::from_secs(1) {
@@ -1235,6 +1408,7 @@ impl Default for DeepgramSTT {
             resilience: None,
             intentional_disconnect: Arc::new(AtomicBool::new(false)),
             replay: Arc::new(crate::core::websocket::AudioReplayBuffer::default()),
+            control_tx: None,
         }
     }
 }
@@ -1324,6 +1498,7 @@ impl BaseSTT for DeepgramSTT {
         // Clean up channels but PRESERVE callbacks
         // Callbacks should persist across reconnections so they work when we reconnect
         self.ws_sender = None;
+        self.control_tx = None;
         self.result_tx = None;
         self.error_tx = None;
         // NOTE: Do NOT clear result_callback and error_callback here
@@ -1429,6 +1604,34 @@ impl BaseSTT for DeepgramSTT {
         // Store the shared process-global handles; the next `start_connection` will use them so
         // every Deepgram session trips the same breaker and shares the one reconnect cap (W-D2).
         self.resilience = Some(resilience);
+    }
+
+    fn has_turn_events(&self) -> bool {
+        self.config.as_ref().is_some_and(|c| is_flux(&c.base.model))
+    }
+
+    /// Deepgram's own default endpointing is 10 ms.
+    fn end_turn_after_ms(&self) -> Option<u32> {
+        self.config
+            .as_ref()
+            .filter(|c| !is_file_only(&c.base.model))
+            .map(|c| c.endpointing.unwrap_or(10))
+    }
+
+    /// Flux: `ForceEndTurn`. The `/v1` models: `Finalize`, which makes Deepgram return the
+    /// segment's final at once; its final is the segment's speech-final (see the `Results`
+    /// handling). Deepgram's own endpointing sometimes held a finished English sentence for
+    /// 4-5 s (2026-10-15 matrix, nova-3 and nova-2 `slow_lookup`).
+    fn end_turn(&mut self) -> bool {
+        let message = match self.has_turn_events() {
+            true => r#"{"type":"ForceEndTurn"}"#,
+            false => r#"{"type":"Finalize"}"#,
+        };
+        self.end_turn_after_ms().is_some()
+            && self
+                .control_tx
+                .as_ref()
+                .is_some_and(|tx| tx.try_send(message).is_ok())
     }
 }
 
@@ -2332,5 +2535,209 @@ mod tests {
         let _permit = gov_a.acquire().await;
         assert_eq!(gov_b.in_flight(), 1, "in-flight is shared across sessions");
         assert_eq!(gov_b.available_permits(), 2);
+    }
+
+    fn flux_config(extras: serde_json::Value) -> DeepgramSTTConfig {
+        let std = crate::core::stt::standard::StandardSTTConfig {
+            base: STTConfig {
+                model: "flux-general-en".to_string(),
+                provider: "deepgram".to_string(),
+                api_key: "k".to_string(),
+                language: "en-US".to_string(),
+                sample_rate: 16000,
+                channels: 1,
+                punctuation: true,
+                encoding: "linear16".to_string(),
+            },
+            features: Default::default(),
+            extras: serde_json::from_value(extras).unwrap(),
+            translation: None,
+        };
+        DeepgramSTTConfig::from_standard(&std)
+    }
+
+    /// Flux streams on `/v2/listen` with only the parameters its wire has: no language, no
+    /// `/v1` features; the turn-model settings come from `extras`, and eager mode is off
+    /// unless asked for.
+    #[tokio::test]
+    async fn flux_dials_v2_listen_with_its_own_parameters() {
+        let stt = DeepgramSTT::default();
+        let url = stt
+            .build_websocket_url(&flux_config(serde_json::json!({})))
+            .unwrap();
+        assert_eq!(
+            url,
+            "wss://api.deepgram.com/v2/listen?model=flux-general-en&encoding=linear16&sample_rate=16000"
+        );
+        let tuned = flux_config(serde_json::json!({
+            "eot_threshold": 0.8, "eager_eot_threshold": 0.5, "eot_timeout_ms": 3000,
+        }));
+        let url = stt.build_websocket_url(&tuned).unwrap();
+        assert!(url.ends_with("&eot_threshold=0.8&eager_eot_threshold=0.5&eot_timeout_ms=3000"));
+        // Any other model keeps `/v1/listen`.
+        let mut nova = tuned;
+        nova.base.model = "nova-3".to_string();
+        let url = stt.build_websocket_url(&nova).unwrap();
+        assert!(
+            url.contains("/v1/listen?model=nova-3&language=en-US&"),
+            "{url}"
+        );
+        assert!(!url.contains("eot_"), "{url}");
+    }
+
+    /// The Flux turn messages as results: the whole turn so far as an interim, the eager guess
+    /// and the resumption as interims with their event, `EndOfTurn` as the one final and
+    /// speech-final; an empty update is nothing. The words' mean confidence is the vendor's.
+    #[tokio::test]
+    async fn flux_turn_messages_map_to_results_and_turn_events() {
+        let (tx, mut rx) = mpsc::channel::<STTResult>(8);
+        let replay = crate::core::websocket::AudioReplayBuffer::default();
+        let turn = |event: &str, text: &str| {
+            format!(
+                r#"{{"type":"TurnInfo","event":"{event}","turn_index":0,"transcript":"{text}","request_id":"r1",
+                "words":[{{"word":"a","confidence":0.5}},{{"word":"b","confidence":1.0}}],"end_of_turn_confidence":0.6}}"#
+            )
+        };
+        let frames = [
+            r#"{"type":"Connected","request_id":"r1","sequence_id":0}"#.to_string(),
+            r#"{"type":"TurnInfo","event":"Update","turn_index":0,"transcript":"","words":[]}"#
+                .to_string(),
+            turn("StartOfTurn", "What is"),
+            turn("EagerEndOfTurn", "What is it?"),
+            turn("TurnResumed", "What is it"),
+            turn("EndOfTurn", "What is it now?"),
+        ];
+        for frame in frames {
+            DeepgramSTT::handle_websocket_message(Message::Text(frame.into()), &tx, &replay)
+                .unwrap();
+        }
+        drop(tx);
+        let mut results = Vec::new();
+        while let Some(result) = rx.recv().await {
+            results.push(result);
+        }
+        let seen: Vec<_> = results
+            .iter()
+            .map(|r| {
+                (
+                    r.transcript.as_str(),
+                    r.is_final,
+                    r.is_speech_final,
+                    r.turn_event,
+                )
+            })
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                ("What is", false, false, None),
+                (
+                    "What is it?",
+                    false,
+                    false,
+                    Some(SttTurnEvent::EagerEndOfTurn)
+                ),
+                ("What is it", false, false, Some(SttTurnEvent::TurnResumed)),
+                ("What is it now?", true, true, None),
+            ]
+        );
+        assert_eq!(results[3].vendor_confidence, Some(0.75));
+        assert_eq!(results[3].vendor_request_id.as_deref(), Some("r1"));
+        // A Flux error has a code and no `message`: its description still reaches the caller.
+        let (tx, _rx) = mpsc::channel::<STTResult>(1);
+        let error = r#"{"type":"Error","code":"UNPARSABLE_CLIENT_MESSAGE","description":"unknown variant"}"#;
+        let err = DeepgramSTT::handle_websocket_message(Message::Text(error.into()), &tx, &replay)
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown variant"), "{err}");
+    }
+
+    /// The final Deepgram returns for the gateway's `Finalize` ends the segment: it is the
+    /// segment's speech-final.
+    #[tokio::test]
+    async fn the_final_of_a_finalize_is_the_segments_speech_final() {
+        let (tx, mut rx) = mpsc::channel::<STTResult>(2);
+        let replay = crate::core::websocket::AudioReplayBuffer::default();
+        let frame = r#"{"type":"Results","is_final":true,"speech_final":false,"from_finalize":true,
+            "channel":{"alternatives":[{"transcript":"a table for two","confidence":0.9}]}}"#;
+        DeepgramSTT::handle_websocket_message(Message::Text(frame.into()), &tx, &replay).unwrap();
+        let result = rx.recv().await.unwrap();
+        assert!(result.is_final && result.is_speech_final && result.is_finalized);
+        let plain = r#"{"type":"Results","is_final":true,"speech_final":false,
+            "channel":{"alternatives":[{"transcript":"a table","confidence":0.9}]}}"#;
+        DeepgramSTT::handle_websocket_message(Message::Text(plain.into()), &tx, &replay).unwrap();
+        assert!(!rx.recv().await.unwrap().is_speech_final);
+        // An empty reply (the segment's final had come already) is not passed on.
+        let empty = r#"{"type":"Results","is_final":true,"speech_final":false,"from_finalize":true,
+            "channel":{"alternatives":[{"transcript":"","confidence":0.0}]}}"#;
+        DeepgramSTT::handle_websocket_message(Message::Text(empty.into()), &tx, &replay).unwrap();
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// A multilingual model's language list: the first is the detected language.
+    #[tokio::test]
+    async fn a_multilingual_result_carries_its_detected_language() {
+        let (tx, mut rx) = mpsc::channel::<STTResult>(2);
+        let replay = crate::core::websocket::AudioReplayBuffer::default();
+        let frame = r#"{"type":"Results","is_final":true,"speech_final":true,
+            "channel":{"alternatives":[{"transcript":"hallo","confidence":0.9,"languages":["de","en"]}]}}"#;
+        DeepgramSTT::handle_websocket_message(Message::Text(frame.into()), &tx, &replay).unwrap();
+        assert_eq!(
+            rx.recv().await.unwrap().detected_language.as_deref(),
+            Some("de")
+        );
+        let plain = r#"{"type":"Results","is_final":true,"speech_final":true,
+            "channel":{"alternatives":[{"transcript":"hello","confidence":0.9}]}}"#;
+        DeepgramSTT::handle_websocket_message(Message::Text(plain.into()), &tx, &replay).unwrap();
+        assert_eq!(rx.recv().await.unwrap().detected_language, None);
+        // Flux multi names them on its turn messages; an empty list names none.
+        let turn = |languages: &str| {
+            format!(
+                r#"{{"type":"TurnInfo","event":"EndOfTurn","transcript":"hola","words":[],"languages":{languages}}}"#
+            )
+        };
+        for (languages, want) in [(r#"["es","en"]"#, Some("es")), ("[]", None)] {
+            DeepgramSTT::handle_websocket_message(
+                Message::Text(turn(languages).into()),
+                &tx,
+                &replay,
+            )
+            .unwrap();
+            assert_eq!(rx.recv().await.unwrap().detected_language.as_deref(), want);
+        }
+    }
+
+    /// Only Flux runs its own turn model; `end_turn` has nothing to send on another model or
+    /// before the socket is open.
+    #[test]
+    fn only_flux_has_turn_events_and_whisper_is_file_only() {
+        let mut flux = DeepgramSTT::from_deepgram_config(flux_config(serde_json::json!({})));
+        assert!(flux.has_turn_events());
+        assert!(!flux.end_turn(), "no socket yet");
+        let (tx, mut rx) = mpsc::channel(1);
+        flux.control_tx = Some(tx);
+        assert!(flux.end_turn());
+        assert_eq!(rx.try_recv().unwrap(), r#"{"type":"ForceEndTurn"}"#);
+        // A `/v1` model ends the caller's turn with `Finalize`; Whisper has no socket to ask.
+        let mut nova = flux_config(serde_json::json!({}));
+        nova.base.model = "nova-3".to_string();
+        let mut nova = DeepgramSTT::from_deepgram_config(nova);
+        assert!(!nova.has_turn_events());
+        assert_eq!(
+            nova.end_turn_after_ms(),
+            Some(200),
+            "the configured endpointing"
+        );
+        let (tx, mut rx) = mpsc::channel(1);
+        nova.control_tx = Some(tx);
+        assert!(nova.end_turn());
+        assert_eq!(rx.try_recv().unwrap(), r#"{"type":"Finalize"}"#);
+        let mut whisper = flux_config(serde_json::json!({}));
+        whisper.base.model = "whisper-large".to_string();
+        assert_eq!(
+            DeepgramSTT::from_deepgram_config(whisper).end_turn_after_ms(),
+            None
+        );
+        assert!(is_file_only("whisper-large") && is_file_only("Whisper-tiny"));
+        assert!(!is_file_only("nova-3") && !is_file_only("flux-general-en"));
     }
 }

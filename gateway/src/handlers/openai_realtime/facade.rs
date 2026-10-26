@@ -1370,6 +1370,14 @@ impl Translator {
                 self.finish_response("cancelled", &mut out);
             }
             S2sEvent::Usage(report) => self.usage(report, &mut out),
+            // A vendor's warning is not an error: the session goes on, and a GA client has no
+            // warning event, so it is logged and nothing is sent.
+            S2sEvent::Error(crate::core::realtime::RealtimeError::ProviderWarning {
+                code,
+                message,
+            }) => {
+                warn!(vendor = self.vendor.vendor, ?code, %message, "vendor warning");
+            }
             S2sEvent::Error(e) => {
                 out.push(Act::Client(gateway_error(
                     "vendor_error",
@@ -1384,6 +1392,9 @@ impl Translator {
             | S2sEvent::ItemDone { .. }
             | S2sEvent::ResumptionHandle(_)
             | S2sEvent::GoAway { .. }
+            | S2sEvent::FunctionCallCancelled { .. }
+            | S2sEvent::ProviderBusy(_)
+            | S2sEvent::InjectionRefused
             | S2sEvent::SendFrame(_)
             | S2sEvent::Ignore => {}
         }

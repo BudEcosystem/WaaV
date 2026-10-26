@@ -43,7 +43,7 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tokio_tungstenite::connect_async;
+use tokio_tungstenite::connect_async_with_config;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
@@ -287,7 +287,11 @@ impl WebSocketTtsClient {
             .spec
             .connect_timeout
             .unwrap_or(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECS));
-        let ws_stream = match tokio::time::timeout(timeout, connect_async(request)).await {
+        // No Nagle (TCP_NODELAY): `Flush` follows `Speak` at once, and with Nagle on it waited
+        // for the vendor's delayed ACK of `Speak` before it left (+~340 ms first audio through
+        // the gateway against a client with no Nagle, 2026-10-15 matrix).
+        let dial = connect_async_with_config(request, None, true);
+        let ws_stream = match tokio::time::timeout(timeout, dial).await {
             Ok(Ok((stream, _response))) => stream,
             Ok(Err(e)) => {
                 let reason = format!(

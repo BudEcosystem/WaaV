@@ -168,6 +168,12 @@ pub struct AliasDefinition {
     /// `dag_config.template`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dag_template: Option<String>,
+    /// Interaction mode for the sessions of this alias: the `interaction` block a session
+    /// could send itself. A session's own block (or `false`) wins. Its tools are the
+    /// operator's, like those of the server's default block.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(value_type = Option<Object>))]
+    pub interaction: Option<serde_json::Value>,
 }
 
 /// Configuration for the alias registry, assembled at server-config load.

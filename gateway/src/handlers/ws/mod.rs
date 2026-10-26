@@ -425,8 +425,10 @@ pub mod config_handler;
 pub mod config_lint;
 pub mod error;
 pub mod handler;
+mod interaction;
 pub mod messages;
 pub mod processor;
+mod realtime_voice;
 pub mod state;
 
 #[cfg(test)]

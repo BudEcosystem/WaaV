@@ -11,7 +11,9 @@ pub mod engine;
 pub mod spoken;
 pub mod text;
 
-pub use brain::{AgentBrain, AgentEvent, AgentTurnRequest, Truncate, TurnFailure};
+pub use brain::{
+    AgentBrain, AgentEvent, AgentTurnRequest, ClientExtras, Truncate, TurnFailure,
+};
 pub use engine::{
     AgentEngine, AgentSessionConfig, AgentSignal, SpeechOut, TurnBackend, TurnKind, TurnStatus,
     is_ignored_phrase,

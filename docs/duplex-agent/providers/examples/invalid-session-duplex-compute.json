@@ -1,0 +1,5 @@
+{
+  "type": "config",
+  "conversation_config": {"base_url": "https://llm.internal.example/v1", "model": "concierge-70b"},
+  "interaction": {"duplex": {"compute": {"pool_threads": 16}}, "tasks": {"allow_client_push": true}}
+}

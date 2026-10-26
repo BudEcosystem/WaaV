@@ -74,6 +74,19 @@ impl VoiceSettings {
 
 pub const ELEVENLABS_TTS_URL: &str = "https://api.elevenlabs.io/v1/text-to-speech";
 
+/// The text-to-speech address: `ELEVENLABS_TTS_URL` in the server's environment (a proxy or a
+/// local stand-in; never from a session), else [`ELEVENLABS_TTS_URL`]. Read once.
+fn tts_url() -> &'static str {
+    static URL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    URL.get_or_init(|| {
+        std::env::var("ELEVENLABS_TTS_URL")
+            .ok()
+            .map(|url| url.trim().trim_end_matches('/').to_owned())
+            .filter(|url| url.starts_with("http://") || url.starts_with("https://"))
+            .unwrap_or_else(|| ELEVENLABS_TTS_URL.to_owned())
+    })
+}
+
 /// Whether a model takes context continuity: `previous_text` / `next_text` and request stitching
 /// (`previous_request_ids` / `next_request_ids`).
 ///
@@ -192,6 +205,13 @@ struct ElevenLabsRequestBuilder {
     /// runs the request in zero-retention mode (history/logging disabled). Confirmed QUERY param on
     /// the convert + stream endpoints (https://elevenlabs.io/docs/api-reference/text-to-speech/convert).
     enable_logging: Option<bool>,
+    /// `features.streaming`: synthesise on `/v1/text-to-speech/{voice}/stream`, which sends the
+    /// audio as it is made (chunked) instead of when the whole line is done. The request is
+    /// the convert endpoint's: same query and body.
+    /// (https://elevenlabs.io/docs/api-reference/text-to-speech/stream)
+    stream: bool,
+    /// The text-to-speech address ([`tts_url`]).
+    url: String,
 }
 
 impl TTSRequestBuilder for ElevenLabsRequestBuilder {
@@ -212,8 +232,9 @@ impl TTSRequestBuilder for ElevenLabsRequestBuilder {
         let default_voice = DEFAULT_VOICE_ID.to_string();
         let voice_id = self.config.voice_id.as_ref().unwrap_or(&default_voice);
 
-        // Build the URL with voice_id
-        let url = format!("{ELEVENLABS_TTS_URL}/{voice_id}");
+        // Build the URL with voice_id; the streaming endpoint takes the same request.
+        let stream = if self.stream { "/stream" } else { "" };
+        let url = format!("{}/{voice_id}{stream}", self.url);
 
         // Build query parameters
         let mut query_params = Vec::new();
@@ -393,6 +414,8 @@ impl ElevenLabsTTS {
             apply_language_text_normalization: None,
             use_pvc_as_ivc: None,
             enable_logging: None,
+            stream: false,
+            url: tts_url().to_owned(),
         };
 
         Ok(Self {
@@ -429,8 +452,9 @@ impl ElevenLabsTTS {
     ///   - extras `use_pvc_as_ivc` (bool) → BODY `use_pvc_as_ivc` (use IVC instead of PVC).
     ///   - extras `enable_logging` (bool) → URL QUERY `enable_logging` (zero-retention when false).
     ///
-    /// Emotion, instructions, SSML, word timestamps and streaming have no ElevenLabs request
-    /// parameter on this synth path and are skipped (capability gaps).
+    /// `features.streaming` selects the HTTP streaming endpoint (`.../{voice}/stream`). Emotion,
+    /// instructions, SSML and word timestamps have no ElevenLabs request parameter on this
+    /// synth path and are skipped (capability gaps).
     ///
     /// Cache note: `language_code`, `next_text`, the stitching IDs, the two normalization knobs and
     /// `use_pvc_as_ivc` all change the produced audio. ElevenLabs uses the generic [`TTSProvider`],
@@ -448,6 +472,8 @@ impl ElevenLabsTTS {
         tts.request_builder.voice_settings = voice_settings;
         tts.request_builder.seed = std.features.seed;
         tts.request_builder.optimize_streaming_latency = std.features.optimize_streaming_latency;
+        // `features.streaming`: the HTTP streaming endpoint.
+        tts.request_builder.stream = std.features.streaming == Some(true);
 
         // Language enforcement → BODY `language_code` (the typed feature).
         tts.request_builder.language_code = std.features.language.clone();
@@ -528,6 +554,8 @@ impl Default for ElevenLabsTTS {
                     apply_language_text_normalization: None,
                     use_pvc_as_ivc: None,
                     enable_logging: None,
+                    stream: false,
+                    url: tts_url().to_owned(),
                 },
             },
         }
@@ -545,9 +573,10 @@ impl BaseTTS for ElevenLabsTTS {
     }
 
     async fn connect(&mut self) -> TTSResult<()> {
-        // Use the base URL for ElevenLabs API with config-based request manager
+        // Warm the connection to the address the requests go to (a server's stand-in too).
+        let url = self.request_builder.url.clone();
         self.provider
-            .generic_connect_with_config("https://api.elevenlabs.io", &self.request_builder.config)
+            .generic_connect_with_config(&url, &self.request_builder.config)
             .await
     }
 
@@ -752,6 +781,68 @@ mod tests {
         );
     }
 
+    /// `features.streaming` sends the same request to the streaming endpoint, at the address
+    /// the server names (a local stand-in here).
+    #[test]
+    fn streaming_sends_the_same_request_to_the_stream_endpoint() {
+        let std = crate::core::tts::standard::StandardTTSConfig {
+            base: TTSConfig {
+                provider: "elevenlabs".to_string(),
+                voice_id: Some("JBFqnCBsd6RMkjVDRZzb".to_string()),
+                audio_format: Some("linear16".to_string()),
+                sample_rate: Some(16000),
+                api_key: "test_key".to_string(),
+                model: "eleven_flash_v2_5".to_string(),
+                ..Default::default()
+            },
+            features: crate::core::tts::standard::TtsFeatures {
+                streaming: Some(true),
+                ..Default::default()
+            },
+            extras: Default::default(),
+        };
+        let mut tts = ElevenLabsTTS::from_standard(&std).expect("built");
+        assert!(tts.request_builder.stream);
+        tts.request_builder.url = "http://127.0.0.1:9/v1/text-to-speech".to_string();
+        let client = reqwest::Client::new();
+        let request = tts
+            .request_builder
+            .build_http_request(&client, "Hello there.")
+            .build()
+            .expect("a request");
+        assert_eq!(
+            request.url().as_str(),
+            "http://127.0.0.1:9/v1/text-to-speech/JBFqnCBsd6RMkjVDRZzb/stream?output_format=pcm_16000"
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(request.body().and_then(|b| b.as_bytes()).expect("a body"))
+                .expect("JSON");
+        assert_eq!(
+            body,
+            serde_json::json!({"text": "Hello there.", "model_id": "eleven_flash_v2_5"})
+        );
+
+        // Without the feature: the convert endpoint, as before.
+        let plain = crate::core::tts::standard::StandardTTSConfig {
+            features: Default::default(),
+            ..std
+        };
+        let tts = ElevenLabsTTS::from_standard(&plain).expect("built");
+        assert!(!tts.request_builder.stream);
+        let request = tts
+            .request_builder
+            .build_http_request(&client, "Hello there.")
+            .build()
+            .expect("a request");
+        assert_eq!(
+            request.url().as_str(),
+            format!("{ELEVENLABS_TTS_URL}/JBFqnCBsd6RMkjVDRZzb?output_format=pcm_16000")
+        );
+        assert!(crate::core::tts::standard::has_streaming_variant(
+            "elevenlabs"
+        ));
+    }
+
     #[tokio::test]
     async fn test_http_request_building() {
         let config = TTSConfig {
@@ -777,6 +868,8 @@ mod tests {
             apply_language_text_normalization: None,
             use_pvc_as_ivc: None,
             enable_logging: None,
+            stream: false,
+            url: ELEVENLABS_TTS_URL.to_owned(),
         };
         let client = reqwest::Client::new();
         let request = builder.build_http_request(&client, "Test text");
@@ -823,6 +916,8 @@ mod tests {
             apply_language_text_normalization: None,
             use_pvc_as_ivc: None,
             enable_logging: None,
+            stream: false,
+            url: ELEVENLABS_TTS_URL.to_owned(),
         };
         let client = reqwest::Client::new();
         let built_request = builder
@@ -860,6 +955,8 @@ mod tests {
             apply_language_text_normalization: None,
             use_pvc_as_ivc: None,
             enable_logging: None,
+            stream: false,
+            url: ELEVENLABS_TTS_URL.to_owned(),
         };
         let built = builder
             .build_http_request(&reqwest::Client::new(), "hi")
@@ -893,6 +990,8 @@ mod tests {
             apply_language_text_normalization: None,
             use_pvc_as_ivc: None,
             enable_logging: None,
+            stream: false,
+            url: ELEVENLABS_TTS_URL.to_owned(),
         }
     }
 
@@ -969,6 +1068,8 @@ mod tests {
             apply_language_text_normalization: None,
             use_pvc_as_ivc: None,
             enable_logging: None,
+            stream: false,
+            url: ELEVENLABS_TTS_URL.to_owned(),
         };
         let client = reqwest::Client::new();
         let request = builder.build_http_request(&client, "Test text");
@@ -1027,6 +1128,8 @@ mod tests {
             apply_language_text_normalization: None,
             use_pvc_as_ivc: None,
             enable_logging: None,
+            stream: false,
+            url: ELEVENLABS_TTS_URL.to_owned(),
         };
         let client = reqwest::Client::new();
 
@@ -1077,6 +1180,8 @@ mod tests {
             apply_language_text_normalization: None,
             use_pvc_as_ivc: None,
             enable_logging: None,
+            stream: false,
+            url: ELEVENLABS_TTS_URL.to_owned(),
         };
         let client = reqwest::Client::new();
 
@@ -1122,6 +1227,8 @@ mod tests {
             apply_language_text_normalization: None,
             use_pvc_as_ivc: None,
             enable_logging: None,
+            stream: false,
+            url: ELEVENLABS_TTS_URL.to_owned(),
         };
         let client = reqwest::Client::new();
         let built = builder
@@ -1161,6 +1268,8 @@ mod tests {
             apply_language_text_normalization: None,
             use_pvc_as_ivc: None,
             enable_logging: None,
+            stream: false,
+            url: ELEVENLABS_TTS_URL.to_owned(),
         };
         let client = reqwest::Client::new();
         let built = builder.build_http_request(&client, "x").build().unwrap();
@@ -1191,6 +1300,8 @@ mod tests {
             apply_language_text_normalization: None,
             use_pvc_as_ivc: None,
             enable_logging: None,
+            stream: false,
+            url: ELEVENLABS_TTS_URL.to_owned(),
         };
         let client = reqwest::Client::new();
         let built = builder.build_http_request(&client, "x").build().unwrap();
@@ -1223,6 +1334,8 @@ mod tests {
             apply_language_text_normalization: None,
             use_pvc_as_ivc: None,
             enable_logging: None,
+            stream: false,
+            url: ELEVENLABS_TTS_URL.to_owned(),
         };
         let client = reqwest::Client::new();
         let built = builder.build_http_request(&client, "hi").build().unwrap();
@@ -1254,6 +1367,8 @@ mod tests {
             apply_language_text_normalization: None,
             use_pvc_as_ivc: None,
             enable_logging: None,
+            stream: false,
+            url: ELEVENLABS_TTS_URL.to_owned(),
         };
         let client = reqwest::Client::new();
         let built = builder.build_http_request(&client, "x").build().unwrap();
@@ -1285,6 +1400,8 @@ mod tests {
             apply_language_text_normalization: None,
             use_pvc_as_ivc: None,
             enable_logging: None,
+            stream: false,
+            url: ELEVENLABS_TTS_URL.to_owned(),
         };
         let client = reqwest::Client::new();
         let built = builder.build_http_request(&client, "x").build().unwrap();

@@ -18,12 +18,15 @@
 //! WebSocket message reference (<https://developers.deepgram.com/docs/voice-agent-v1-migration>
 //! / agent settings + server messages).
 
+use std::collections::HashMap;
+use std::sync::Mutex;
+
 use bytes::Bytes;
 use serde_json::{Value, json};
 
 use crate::core::realtime::base::{
     FunctionCallRequest, RealtimeConfig, RealtimeError, RealtimeResponseOverride, RealtimeResult,
-    SpeechEvent, TranscriptRole,
+    RealtimeVerb, SpeechEvent, TranscriptRole,
 };
 use crate::core::realtime::scaffold::{
     ConnectSpec, Inbound, OutFrame, ProtocolCaps, RealtimeProtocol, S2sEvent,
@@ -32,6 +35,28 @@ use crate::core::realtime::scaffold::{
 /// Deepgram Voice Agent WebSocket endpoint. Single bidi socket for the whole
 /// STT→LLM→TTS loop. LIVE-CAPTURED working endpoint.
 pub(crate) const DEEPGRAM_AGENT_URL: &str = "wss://agent.deepgram.com/v1/agent/converse";
+
+/// The Voice Agent in Deepgram's EU region (probed live 2026-10-15: `agent.eu.deepgram.com`
+/// does not resolve; the EU API host serves the agent path).
+pub(crate) const DEEPGRAM_AGENT_EU_URL: &str = "wss://api.eu.deepgram.com/v1/agent/converse";
+
+/// The warning code of an `InjectAgentMessage` the agent ignored because it was replying.
+const INJECT_DURING_SPEECH: &str = "INJECT_AGENT_MESSAGE_DURING_AGENT_SPEECH";
+
+/// The error code of a `Settings` message the agent refused (a field it does not take with the
+/// chosen models): the same settings are refused on every reconnect.
+const INVALID_SETTINGS: &str = "INVALID_SETTINGS";
+
+/// Who sent the latest injected line: the client's typed text (`send_text`), which this
+/// protocol sends again when the agent ignored it, or the gateway's own verb, which the
+/// interaction executor sends again (`S2sEvent::InjectionRefused`).
+#[derive(Debug, Default)]
+enum Injected {
+    #[default]
+    None,
+    Client(String),
+    Gateway,
+}
 
 /// Linear16 @ 24 kHz: WaaV's canonical realtime PCM rate (matches the OpenAI
 /// family) — keeps the gateway audio path uniform across S2S providers. Used for
@@ -45,9 +70,38 @@ const DEFAULT_SPEAK_MODEL: &str = "aura-2-thalia-en";
 /// Default STT model for the `listen` leg (Deepgram's current flagship).
 const DEFAULT_LISTEN_MODEL: &str = "nova-3";
 
-/// Default `think` LLM. Deepgram-managed `open_ai` provider (server holds the
-/// creds) — fine for now; an env/cfg think-provider override can land later.
+/// Default `think` LLM, on Deepgram's managed `open_ai` provider (Deepgram holds the creds).
 const DEFAULT_THINK_MODEL: &str = "gpt-4o-mini";
+
+/// The think provider of a model Deepgram runs for the agent, by its name (Deepgram's
+/// think-model catalogue): Anthropic's Claude, Google's Gemini, the open models Groq and NVIDIA
+/// serve, OpenAI's otherwise.
+fn think_provider_of(model: &str) -> &'static str {
+    let model = model.trim().to_ascii_lowercase();
+    if model.starts_with("claude") {
+        "anthropic"
+    } else if model.starts_with("gemini") {
+        "google"
+    } else if model.starts_with("openai/gpt-oss") {
+        "groq"
+    } else if model.starts_with("nvidia/") {
+        "nvidia"
+    } else {
+        "open_ai"
+    }
+}
+
+/// `agent.language`: the language subtag of the code Deepgram takes for it (`de-DE` and `de`
+/// are `de`, Mandarin `zh`, `auto` `multi`); `en` when unset.
+fn agent_language(language: Option<&str>) -> String {
+    match language.map(str::trim).filter(|l| !l.is_empty()) {
+        None => "en".to_owned(),
+        Some(language) => {
+            let native = crate::core::lang::map_language(language, "deepgram", "").native;
+            native.split('-').next().unwrap_or_default().to_owned()
+        }
+    }
+}
 
 /// linear16 @ 24 kHz is mono 16-bit ⇒ 2 bytes/sample × 24 samples/ms = 48 B/ms.
 const OUTPUT_BYTES_PER_MS: u64 = 48;
@@ -70,6 +124,18 @@ pub enum DeepgramClientMsg {
 pub struct DeepgramProtocol {
     /// Cached for `caps()`; the live output rate the server is told to emit.
     output_sample_rate: u32,
+    /// Provider fix `deepgram_user_text`: typed text is the user's (`InjectUserMessage`).
+    user_text: bool,
+    /// Provider fix `deepgram_tools`: the session's functions go to the agent's `think`.
+    tools: bool,
+    /// Provider fix `deepgram_update_prompt`: a mid-session update is `UpdatePrompt` and
+    /// `UpdateSpeak`, never a second `Settings`.
+    update_prompt: bool,
+    /// The name of each open function call, by id: Deepgram refuses a
+    /// `FunctionCallResponse` without it (`UNPARSABLE_CLIENT_MESSAGE`, probed 2026-10-15).
+    calls: Mutex<HashMap<String, String>>,
+    /// The latest injected line, and the client's line the agent ignored, owed after its reply.
+    injected: Mutex<(Injected, Option<String>)>,
 }
 
 impl DeepgramProtocol {
@@ -83,9 +149,20 @@ impl DeepgramProtocol {
         DEFAULT_SAMPLE_RATE
     }
 
+    /// The client's injected line, remembered in case the agent ignores it while replying.
+    fn client_line(&self, wire: Value) -> DeepgramClientMsg {
+        if let Ok(mut injected) = self.injected.lock() {
+            injected.0 = Injected::Client(wire.to_string());
+        }
+        DeepgramClientMsg::Json(wire)
+    }
+
     /// Build the LIVE-CAPTURED `Settings` JSON from the generic config:
-    /// model → `think` LLM, voice → `speak` TTS, instructions → `think.prompt`,
-    /// audio in/out linear16 @ rate. Shape matches the capture exactly.
+    /// model → `think` LLM (its vendor `think_provider`, else by its name), voice → `speak`
+    /// TTS, the transcription model → `listen` (nova-3 when unset or OpenAI's `whisper-1`),
+    /// language → `agent.language`, instructions → `think.prompt`, audio in/out linear16 @
+    /// rate. The session's tools go to `think.functions` with the `deepgram_tools` fix, and
+    /// always in interaction mode (the delegate function is among them).
     pub fn settings(&self, cfg: &RealtimeConfig) -> Value {
         let rate = Self::sample_rate(cfg);
 
@@ -95,34 +172,71 @@ impl DeepgramProtocol {
         } else {
             cfg.model.trim()
         };
-        // Deepgram's `agent.language` is a bare BCP-47 tag; default "en". WaaV's
-        // RealtimeConfig has no dedicated language field, so default for now.
-        let language = "en";
+        let think_type = cfg
+            .think_provider
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| think_provider_of(think_model));
+        let language = agent_language(cfg.language.as_deref());
+        // The handler fills an unset transcription model with OpenAI's `whisper-1`.
+        let listen_model = cfg
+            .input_audio_transcription
+            .as_ref()
+            .map(|t| t.model.trim())
+            .filter(|m| !m.is_empty() && *m != "whisper-1")
+            .unwrap_or(DEFAULT_LISTEN_MODEL);
 
         // `think.prompt` is the system prompt. Deepgram is lenient, but only emit
         // the key when we actually have instructions (skip-if-none discipline).
         let mut think = json!({
-            "provider": { "type": "open_ai", "model": think_model },
+            "provider": { "type": think_type, "model": think_model },
         });
         if let Some(instr) = cfg.instructions.as_deref()
             && !instr.is_empty()
         {
             think["prompt"] = json!(instr);
         }
+        let tools = cfg.tools.as_deref().unwrap_or_default();
+        let delegate = tools
+            .iter()
+            .any(|t| t.function.name == crate::core::interaction::provider::DELEGATE_TOOL);
+        if (self.tools || delegate) && !tools.is_empty() {
+            let functions: Vec<Value> = tools
+                .iter()
+                .map(|t| {
+                    let mut function = json!({
+                        "name": t.function.name,
+                        "parameters": t.function.parameters.clone()
+                            .unwrap_or_else(|| json!({"type": "object", "properties": {}})),
+                    });
+                    if let Some(description) = &t.function.description {
+                        function["description"] = json!(description);
+                    }
+                    function
+                })
+                .collect();
+            think["functions"] = json!(functions);
+        }
 
-        json!({
+        let mut settings = json!({
             "type": "Settings",
             "audio": {
                 "input": { "encoding": "linear16", "sample_rate": rate },
                 "output": { "encoding": "linear16", "sample_rate": rate, "container": "none" },
             },
             "agent": {
-                "language": language,
-                "listen": { "provider": { "type": "deepgram", "model": DEFAULT_LISTEN_MODEL } },
+                "listen": { "provider": { "type": "deepgram", "model": listen_model } },
                 "think": think,
                 "speak": { "provider": { "type": "deepgram", "model": speak_model } },
             },
-        })
+        });
+        // A Flux (`/v2/listen`) listen model refuses `agent.language` (`INVALID_SETTINGS`,
+        // probed 2026-10-15): it is sent for the other listen models only.
+        if !crate::core::stt::deepgram::is_flux(listen_model) {
+            settings["agent"]["language"] = json!(language);
+        }
+        settings
     }
 }
 
@@ -138,6 +252,11 @@ impl RealtimeProtocol for DeepgramProtocol {
         }
         Ok(Self {
             output_sample_rate: Self::sample_rate(cfg),
+            user_text: cfg.fix("deepgram_user_text"),
+            tools: cfg.fix("deepgram_tools"),
+            update_prompt: cfg.fix("deepgram_update_prompt"),
+            calls: Mutex::new(HashMap::new()),
+            injected: Mutex::new((Injected::None, None)),
         })
     }
 
@@ -173,8 +292,18 @@ impl RealtimeProtocol for DeepgramProtocol {
         // SERVER-CONFIG `realtime_endpoint_override` (proxy / self-hosted / gov-cloud
         // / local mock) WINS over the Voice Agent host when set — the `Token` header
         // rides along unchanged. SSRF-safe: never client-settable.
+        let host = match cfg.region.as_deref().map(|r| r.trim().to_ascii_lowercase()) {
+            None => DEEPGRAM_AGENT_URL,
+            Some(region) if region.is_empty() || region == "us" => DEEPGRAM_AGENT_URL,
+            Some(region) if region == "eu" => DEEPGRAM_AGENT_EU_URL,
+            Some(region) => {
+                return Err(RealtimeError::InvalidConfiguration(format!(
+                    "Deepgram Voice Agent region {region:?} is not known; use \"us\" or \"eu\""
+                )));
+            }
+        };
         let url = crate::core::realtime::scaffold::apply_endpoint_override(
-            DEEPGRAM_AGENT_URL,
+            host,
             cfg.realtime_endpoint_override.as_deref(),
             None,
         );
@@ -195,6 +324,32 @@ impl RealtimeProtocol for DeepgramProtocol {
         // The single `Settings` message, sent on connect (and re-sent on
         // reconnect — Deepgram re-applies it on a fresh socket).
         vec![DeepgramClientMsg::Json(self.settings(cfg))]
+    }
+
+    fn session_update(
+        &self,
+        old: &RealtimeConfig,
+        new: &RealtimeConfig,
+    ) -> Option<Vec<Self::Wire>> {
+        if !self.update_prompt {
+            return Some(self.build_session_config(new, None));
+        }
+        // `Settings` is taken once per connection: a changed prompt is `UpdatePrompt`, a
+        // changed voice `UpdateSpeak` (<https://developers.deepgram.com/docs/voice-agent-update-prompt>,
+        // `.../voice-agent-update-speak`). Anything else cannot change on the open socket.
+        let (mut before, mut after) = (self.settings(old), self.settings(new));
+        let mut wires = Vec::new();
+        let prompt = after["agent"]["think"]["prompt"].take();
+        if before["agent"]["think"]["prompt"].take() != prompt
+            && let Some(prompt) = prompt.as_str()
+        {
+            wires.push(json!({ "type": "UpdatePrompt", "prompt": prompt }));
+        }
+        let speak = after["agent"]["speak"].take();
+        if before["agent"]["speak"].take() != speak {
+            wires.push(json!({ "type": "UpdateSpeak", "speak": speak }));
+        }
+        (before == after).then(|| wires.into_iter().map(DeepgramClientMsg::Json).collect())
     }
 
     fn map_server_event(&self, raw: Inbound<'_>) -> Vec<S2sEvent> {
@@ -226,7 +381,7 @@ impl RealtimeProtocol for DeepgramProtocol {
                     .map(str::to_string),
             }],
             // Config ack — nothing actionable.
-            "SettingsApplied" => vec![S2sEvent::Ignore],
+            "SettingsApplied" | "PromptUpdated" | "SpeakUpdated" => vec![S2sEvent::Ignore],
             // FINAL transcript, per role:
             // `{"type":"ConversationText","role":"assistant"|"user","content":"…"}`.
             "ConversationText" => {
@@ -252,9 +407,16 @@ impl RealtimeProtocol for DeepgramProtocol {
             "History" => vec![S2sEvent::Ignore],
             // Agent finished THIS response's audio (generation done, NOT a
             // playout/clear signal). Deepgram gives no response id.
-            "AgentAudioDone" => vec![S2sEvent::ResponseDone {
-                response_id: String::new(),
-            }],
+            // A client line the agent ignored during this reply goes out again now.
+            "AgentAudioDone" => {
+                let mut events = vec![S2sEvent::ResponseDone {
+                    response_id: String::new(),
+                }];
+                if let Some(line) = self.injected.lock().ok().and_then(|mut i| i.1.take()) {
+                    events.push(S2sEvent::SendFrame(OutFrame::Text(line)));
+                }
+                events
+            }
             // Barge-in: the user interrupted; the server already stopped agent
             // audio. Emit a Speech(Started) edge + InterruptedByServer so the
             // driver clears local playback. NO truncate — Voice Agent has none.
@@ -288,17 +450,16 @@ impl RealtimeProtocol for DeepgramProtocol {
                                 .unwrap_or(true)
                         })
                         .map(|f| {
+                            let text = |key: &str| {
+                                f.get(key).and_then(Value::as_str).unwrap_or("").to_string()
+                            };
+                            let (call_id, name) = (text("id"), text("name"));
+                            if let Ok(mut calls) = self.calls.lock() {
+                                calls.insert(call_id.clone(), name.clone());
+                            }
                             S2sEvent::FunctionCall(FunctionCallRequest {
-                                call_id: f
-                                    .get("id")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("")
-                                    .to_string(),
-                                name: f
-                                    .get("name")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("")
-                                    .to_string(),
+                                call_id,
+                                name,
                                 // `arguments` is documented as a JSON string; if a
                                 // server ever sends an object, re-stringify it.
                                 arguments: match f.get("arguments") {
@@ -312,7 +473,10 @@ impl RealtimeProtocol for DeepgramProtocol {
                         .collect()
                 })
                 .unwrap_or_else(|| vec![S2sEvent::Ignore]),
-            // Error / Warning (docs): surface the description/message.
+            // Error / Warning (docs): surface the description/message. A `Warning` is not an
+            // error: the agent goes on. Refused settings are a refusal (no retry helps). An
+            // injected line the agent ignored while replying goes out again after the reply:
+            // the client's from here, the gateway's from the interaction executor.
             "Error" | "Warning" => {
                 let detail = value
                     .get("description")
@@ -320,7 +484,24 @@ impl RealtimeProtocol for DeepgramProtocol {
                     .or_else(|| value.get("message").and_then(Value::as_str))
                     .unwrap_or("unknown Deepgram agent error")
                     .to_string();
-                vec![S2sEvent::Error(RealtimeError::ProviderError(detail))]
+                let code = value.get("code").and_then(Value::as_str);
+                let error = match (msg_type, code) {
+                    ("Warning", _) => RealtimeError::ProviderWarning {
+                        code: code.map(str::to_owned),
+                        message: detail,
+                    },
+                    (_, Some(INVALID_SETTINGS)) => RealtimeError::Refused(detail),
+                    _ => RealtimeError::ProviderError(detail),
+                };
+                let mut events = vec![S2sEvent::Error(error)];
+                if code == Some(INJECT_DURING_SPEECH) {
+                    let mut injected = self.injected.lock().unwrap_or_else(|e| e.into_inner());
+                    match &injected.0 {
+                        Injected::Client(line) => injected.1 = Some(line.clone()),
+                        _ => events.push(S2sEvent::InjectionRefused),
+                    }
+                }
+                events
             }
             // Unknown/unhandled (e.g. keepalive acks) ⇒ nothing actionable.
             _ => vec![S2sEvent::Ignore],
@@ -333,11 +514,21 @@ impl RealtimeProtocol for DeepgramProtocol {
     }
 
     fn send_text(&self, text: &str) -> Vec<Self::Wire> {
+        // Provider fix `deepgram_user_text` (plan W6 Decision 4): the user typed this, so it
+        // is a user message the agent answers (`InjectUserMessage{content}`), not words the
+        // agent reads aloud. Off until Deepgram's live probe; the escape flag
+        // `deepgram_text_as_agent_message` keeps the line below.
+        if self.user_text {
+            return vec![self.client_line(json!({
+                "type": "InjectUserMessage",
+                "content": text,
+            }))];
+        }
         // Best-effort: Voice Agent has no "user text turn" event; the closest
         // documented control is `InjectAgentMessage`, which makes the AGENT SPEAK
         // the given text (not a user message). Used here as the text-injection
         // surface. (Docs: `InjectAgentMessage`.)
-        vec![DeepgramClientMsg::Json(json!({
+        vec![self.client_line(json!({
             "type": "InjectAgentMessage",
             "content": text,
         }))]
@@ -360,13 +551,41 @@ impl RealtimeProtocol for DeepgramProtocol {
     }
 
     fn format_tool_result(&self, call_id: &str, result: &str) -> Vec<Self::Wire> {
-        // Tool result → `FunctionCallResponse` (docs). The `id` echoes the
-        // request's function id; `content` carries the result string.
+        // Tool result → `FunctionCallResponse` (docs). The `id` echoes the request's function
+        // id, `name` its function (required: without it Deepgram answers
+        // `UNPARSABLE_CLIENT_MESSAGE`), `content` carries the result string.
+        let name = self
+            .calls
+            .lock()
+            .ok()
+            .and_then(|mut calls| calls.remove(call_id))
+            .unwrap_or_default();
         vec![DeepgramClientMsg::Json(json!({
             "type": "FunctionCallResponse",
             "id": call_id,
+            "name": name,
             "content": result,
         }))]
+    }
+
+    fn verb(&self, verb: &RealtimeVerb<'_>) -> Option<Vec<Self::Wire>> {
+        // The documented injection wires. (`send_text` keeps its own, older shape.)
+        let wire = match *verb {
+            RealtimeVerb::SayExact(words) => json!({
+                "type": "InjectAgentMessage",
+                "message": words,
+            }),
+            RealtimeVerb::SayGuided(guidance) => json!({
+                "type": "InjectUserMessage",
+                "content": guidance,
+            }),
+            // No context-only message and no client-driven cancel on this wire.
+            RealtimeVerb::AddContext(_) | RealtimeVerb::StopOutput => return None,
+        };
+        if let Ok(mut injected) = self.injected.lock() {
+            injected.0 = Injected::Gateway;
+        }
+        Some(vec![DeepgramClientMsg::Json(wire)])
     }
 
     fn serialize(&self, msg: &Self::Wire) -> RealtimeResult<OutFrame> {
@@ -724,9 +943,10 @@ mod tests {
         assert!(p.map_server_event(Inbound::Text(all_srv)).is_empty());
     }
 
-    /// map_server_event: Error / Warning ⇒ Error(ProviderError) with the description.
+    /// map_server_event: an Error is a provider error (refused settings a refusal), a Warning
+    /// a warning, each with the description.
     #[test]
-    fn error_and_warning_map_to_error() {
+    fn errors_warnings_and_refused_settings() {
         let p = proto(&base_cfg());
         let err = r#"{"type":"Error","description":"bad audio encoding"}"#;
         match p.map_server_event(Inbound::Text(err)).as_slice() {
@@ -735,14 +955,76 @@ mod tests {
             }
             other => panic!("expected Error(ProviderError), got {other:?}"),
         }
+        let refused = r#"{"type":"Error","description":"Cannot specify agent.language when using the Deepgram V2 (Flux) listen API.","code":"INVALID_SETTINGS"}"#;
+        match p.map_server_event(Inbound::Text(refused)).as_slice() {
+            [S2sEvent::Error(RealtimeError::Refused(d))] => assert!(d.contains("agent.language")),
+            other => panic!("expected Error(Refused), got {other:?}"),
+        }
         // Warning uses a `message` field instead of `description`.
         let warn = r#"{"type":"Warning","message":"deprecated model"}"#;
         match p.map_server_event(Inbound::Text(warn)).as_slice() {
-            [S2sEvent::Error(RealtimeError::ProviderError(d))] => {
-                assert_eq!(d, "deprecated model");
+            [
+                S2sEvent::Error(RealtimeError::ProviderWarning {
+                    code: None,
+                    message,
+                }),
+            ] => {
+                assert_eq!(message, "deprecated model");
             }
-            other => panic!("expected Error(ProviderError), got {other:?}"),
+            other => panic!("expected Error(ProviderWarning), got {other:?}"),
         }
+    }
+
+    /// The probed warning of an injected line the agent ignored while replying: the client
+    /// gets the warning; the gateway's own line is said refused (the interaction executor sends
+    /// it again), the client's line goes out again from here when the agent's reply is done.
+    #[test]
+    fn a_line_the_agent_ignored_goes_out_again_after_its_reply() {
+        let p = proto(&base_cfg());
+        let ignored = r#"{"type":"Warning","description":"Ignored InjectAgentMessage because the agent is already in the middle of a reply.","code":"INJECT_AGENT_MESSAGE_DURING_AGENT_SPEECH"}"#;
+        let done = r#"{"type":"AgentAudioDone"}"#;
+        // The gateway's verb.
+        p.verb(&RealtimeVerb::SayExact("One moment.")).unwrap();
+        match p.map_server_event(Inbound::Text(ignored)).as_slice() {
+            [
+                S2sEvent::Error(RealtimeError::ProviderWarning {
+                    code: Some(code),
+                    message,
+                }),
+                S2sEvent::InjectionRefused,
+            ] => {
+                assert_eq!(code, INJECT_DURING_SPEECH);
+                assert!(message.contains("middle of a reply"));
+            }
+            other => panic!("expected the warning and the refusal, got {other:?}"),
+        }
+        assert!(matches!(
+            p.map_server_event(Inbound::Text(done)).as_slice(),
+            [S2sEvent::ResponseDone { .. }]
+        ));
+        // The client's typed line.
+        let sent = match p.send_text("Our kitchen closes at ten.").as_slice() {
+            [DeepgramClientMsg::Json(v)] => v.to_string(),
+            other => panic!("expected one JSON frame, got {other:?}"),
+        };
+        assert!(matches!(
+            p.map_server_event(Inbound::Text(ignored)).as_slice(),
+            [S2sEvent::Error(RealtimeError::ProviderWarning { .. })]
+        ));
+        match p.map_server_event(Inbound::Text(done)).as_slice() {
+            [
+                S2sEvent::ResponseDone { .. },
+                S2sEvent::SendFrame(OutFrame::Text(again)),
+            ] => {
+                assert_eq!(again, &sent);
+            }
+            other => panic!("expected the reply's end and the line again, got {other:?}"),
+        }
+        // Owed once: the next reply's end sends nothing.
+        assert!(matches!(
+            p.map_server_event(Inbound::Text(done)).as_slice(),
+            [S2sEvent::ResponseDone { .. }]
+        ));
     }
 
     /// Unknown JSON + unparseable text ⇒ Ignore.
@@ -787,17 +1069,246 @@ mod tests {
         );
     }
 
+    /// The interaction verbs use the documented injection wires: `SayExact` makes the agent
+    /// speak the words (`InjectAgentMessage.message`), `SayGuided` is a user message the agent
+    /// answers (`InjectUserMessage.content`). No wire for the other two.
+    #[test]
+    fn verbs_say_exact_and_say_guided_have_wires() {
+        let p = proto(&base_cfg());
+        match p.verb(&RealtimeVerb::SayExact("One moment.")).as_deref() {
+            Some([DeepgramClientMsg::Json(v)]) => assert_eq!(
+                *v,
+                json!({"type": "InjectAgentMessage", "message": "One moment."})
+            ),
+            other => panic!("expected one InjectAgentMessage, got {other:?}"),
+        }
+        match p
+            .verb(&RealtimeVerb::SayGuided("Say you are checking."))
+            .as_deref()
+        {
+            Some([DeepgramClientMsg::Json(v)]) => assert_eq!(
+                *v,
+                json!({"type": "InjectUserMessage", "content": "Say you are checking."})
+            ),
+            other => panic!("expected one InjectUserMessage, got {other:?}"),
+        }
+        assert!(p.verb(&RealtimeVerb::AddContext("x")).is_none());
+        assert!(p.verb(&RealtimeVerb::StopOutput).is_none());
+    }
+
     /// format_tool_result ⇒ FunctionCallResponse echoing the call id + content.
     #[test]
     fn format_tool_result_builds_function_call_response() {
         let p = proto(&base_cfg());
-        match p.format_tool_result("fc1", "72F sunny").as_slice() {
-            [DeepgramClientMsg::Json(v)] => {
-                assert_eq!(v["type"], "FunctionCallResponse");
-                assert_eq!(v["id"], "fc1");
-                assert_eq!(v["content"], "72F sunny");
-            }
-            other => panic!("expected FunctionCallResponse, got {other:?}"),
+        let call = r#"{"type":"FunctionCallRequest","functions":[{"id":"fc1","name":"get_weather","arguments":"{}","client_side":true}]}"#;
+        p.map_server_event(Inbound::Text(call));
+        // The probed wire: `name` is required (without it Deepgram answers
+        // UNPARSABLE_CLIENT_MESSAGE), and an answered call is forgotten.
+        let response =
+            |p: &DeepgramProtocol| match p.format_tool_result("fc1", "72F sunny").as_slice() {
+                [DeepgramClientMsg::Json(v)] => v.clone(),
+                other => panic!("expected FunctionCallResponse, got {other:?}"),
+            };
+        assert_eq!(
+            response(&p),
+            json!({"type": "FunctionCallResponse", "id": "fc1", "name": "get_weather", "content": "72F sunny"})
+        );
+        assert_eq!(response(&p)["name"], "");
+    }
+
+    /// The session config names the think model's vendor (given, or by the model's name), the
+    /// listen model, the language and, with the `deepgram_tools` fix or in interaction mode,
+    /// the functions; the region picks the host.
+    /// Fix `deepgram_update_prompt` (escape flag `deepgram_settings_resend`): a changed prompt
+    /// or voice mid-session is `UpdatePrompt` / `UpdateSpeak`; a change `Settings` alone could
+    /// make is refused; without the fix the whole `Settings` goes again (today).
+    #[test]
+    fn a_mid_session_update_is_update_prompt_and_update_speak_with_the_fix() {
+        let old = base_cfg();
+        let mut new = base_cfg();
+        new.instructions = Some("Answer in French.".into());
+        new.voice = Some("aura-2-luna-en".into());
+        let json = |wires: Vec<DeepgramClientMsg>| -> Vec<Value> {
+            wires
+                .into_iter()
+                .map(|wire| match wire {
+                    DeepgramClientMsg::Json(v) => v,
+                    DeepgramClientMsg::Audio(_) => panic!("no audio"),
+                })
+                .collect()
+        };
+        let today = json(proto(&old).session_update(&old, &new).unwrap());
+        assert_eq!(today.len(), 1);
+        assert_eq!(today[0]["type"], "Settings");
+
+        let mut fixed_cfg = base_cfg();
+        fixed_cfg.provider_fixes = vec!["deepgram_update_prompt".into()];
+        let fixed = proto(&fixed_cfg);
+        assert_eq!(
+            json(fixed.session_update(&old, &new).unwrap()),
+            [
+                json!({ "type": "UpdatePrompt", "prompt": "Answer in French." }),
+                json!({ "type": "UpdateSpeak",
+                        "speak": { "provider": { "type": "deepgram", "model": "aura-2-luna-en" } } }),
+            ]
+        );
+        assert!(fixed.session_update(&old, &old).unwrap().is_empty());
+        let mut other = base_cfg();
+        other.model = "gpt-4.1".into();
+        assert!(fixed.session_update(&old, &other).is_none());
+        let acked = fixed.map_server_event(Inbound::Text(r#"{"type":"PromptUpdated"}"#));
+        assert!(matches!(acked.as_slice(), [S2sEvent::Ignore]));
+    }
+
+    #[test]
+    fn the_session_config_chooses_think_listen_language_functions_and_region() {
+        let think = |model: &str, given: Option<&str>| {
+            let cfg = RealtimeConfig {
+                model: model.into(),
+                think_provider: given.map(Into::into),
+                ..base_cfg()
+            };
+            proto(&cfg).settings(&cfg)["agent"]["think"]["provider"].clone()
+        };
+        assert_eq!(
+            think("claude-haiku-4-5", None),
+            json!({"type": "anthropic", "model": "claude-haiku-4-5"})
+        );
+        assert_eq!(think("gemini-2.5-flash", None)["type"], "google");
+        assert_eq!(think("openai/gpt-oss-20b", None)["type"], "groq");
+        assert_eq!(
+            think("nvidia/nemotron-3.5-lightning-30b-a3b", None)["type"],
+            "nvidia"
+        );
+        assert_eq!(think("gpt-4.1-mini", None)["type"], "open_ai");
+        assert_eq!(
+            think("my-model", Some("aws_bedrock"))["type"],
+            "aws_bedrock"
+        );
+        let listen = |model: &str| {
+            let cfg = RealtimeConfig {
+                language: Some("de-DE".into()),
+                input_audio_transcription: Some(crate::core::realtime::InputTranscriptionConfig {
+                    model: model.into(),
+                }),
+                ..base_cfg()
+            };
+            proto(&cfg).settings(&cfg)["agent"].clone()
+        };
+        let v = listen("nova-3");
+        assert_eq!(v["language"], "de");
+        assert_eq!(v["listen"]["provider"]["model"], "nova-3");
+        // A Flux listen model takes no `agent.language` (Deepgram: INVALID_SETTINGS).
+        for flux in ["flux-general-en", "flux-general-multi"] {
+            let v = listen(flux);
+            assert_eq!(v["listen"]["provider"]["model"], flux);
+            assert!(v.get("language").is_none(), "{flux}: {v}");
         }
+        // OpenAI's default transcription model the handler fills in is no listen model.
+        let cfg = RealtimeConfig {
+            language: Some("auto".into()),
+            input_audio_transcription: Some(crate::core::realtime::InputTranscriptionConfig {
+                model: "whisper-1".into(),
+            }),
+            ..base_cfg()
+        };
+        let v = proto(&cfg).settings(&cfg);
+        assert_eq!(v["agent"]["listen"]["provider"]["model"], "nova-3");
+        assert_eq!(v["agent"]["language"], "multi");
+        // Functions: off by default, on with the fix, on when the delegate is among them.
+        let tool = |name: &str| crate::core::realtime::ToolDefinition {
+            tool_type: "function".into(),
+            function: crate::core::realtime::FunctionDefinition {
+                name: name.into(),
+                description: Some("Check a table.".into()),
+                parameters: None,
+            },
+        };
+        let with = |names: &[&str], fixes: &[&str]| {
+            let cfg = RealtimeConfig {
+                tools: Some(names.iter().map(|n| tool(n)).collect()),
+                provider_fixes: fixes.iter().map(|f| (*f).into()).collect(),
+                ..base_cfg()
+            };
+            proto(&cfg).settings(&cfg)["agent"]["think"]
+                .get("functions")
+                .cloned()
+        };
+        assert_eq!(with(&["check_table"], &[]), None);
+        assert_eq!(
+            with(&["check_table"], &["deepgram_tools"]),
+            Some(
+                json!([{"name": "check_table", "description": "Check a table.",
+                         "parameters": {"type": "object", "properties": {}}}])
+            )
+        );
+        let delegate = crate::core::interaction::provider::DELEGATE_TOOL;
+        assert_eq!(
+            with(&["check_table", delegate], &[])
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        // Region.
+        let url = |region: Option<&str>| {
+            let cfg = RealtimeConfig {
+                region: region.map(Into::into),
+                ..base_cfg()
+            };
+            match proto(&cfg).connect_spec(&cfg) {
+                Ok(ConnectSpec::WebSocket { url, .. }) => url,
+                Ok(_) => panic!("expected WebSocket"),
+                Err(e) => e.to_string(),
+            }
+        };
+        assert_eq!(url(None), DEEPGRAM_AGENT_URL);
+        assert_eq!(url(Some("US")), DEEPGRAM_AGENT_URL);
+        assert_eq!(
+            url(Some("eu")),
+            "wss://api.eu.deepgram.com/v1/agent/converse"
+        );
+        assert!(url(Some("mars")).contains("not known"));
+    }
+
+    /// Provider fix `deepgram_user_text`. Off (no fix in force): today's frame, byte for byte.
+    /// On: Deepgram's documented user injection, `{"type":"InjectUserMessage","content":"..."}`
+    /// (<https://developers.deepgram.com/docs/voice-agent-inject-user-message>), so the agent
+    /// answers the typed text instead of reading it aloud. The verbs do not change.
+    #[test]
+    fn the_user_text_fix_sends_typed_text_as_the_users() {
+        let text = |p: &DeepgramProtocol| match p.serialize(&p.send_text("Is it open?")[0]) {
+            Ok(OutFrame::Text(s)) => s,
+            other => panic!("expected a text frame, got {other:?}"),
+        };
+        let off = proto(&base_cfg());
+        assert_eq!(
+            text(&off),
+            serde_json::to_string(&json!({"type": "InjectAgentMessage", "content": "Is it open?"}))
+                .unwrap()
+        );
+        let cfg = RealtimeConfig {
+            provider_fixes: vec!["deepgram_user_text".into()],
+            ..base_cfg()
+        };
+        let on = proto(&cfg);
+        assert_eq!(
+            text(&on),
+            serde_json::to_string(&json!({"type": "InjectUserMessage", "content": "Is it open?"}))
+                .unwrap()
+        );
+        assert_eq!(on.send_text("x").len(), 1);
+        for verb in [RealtimeVerb::SayExact("a"), RealtimeVerb::SayGuided("b")] {
+            let wire = |p: &DeepgramProtocol| format!("{:?}", p.verb(&verb));
+            assert_eq!(wire(&off), wire(&on));
+        }
+        // The session config is unchanged by the fix.
+        let settings = |p: &DeepgramProtocol, cfg: &RealtimeConfig| {
+            p.serialize(&p.build_session_config(cfg, None)[0])
+                .map(|f| format!("{f:?}"))
+                .unwrap()
+        };
+        assert_eq!(settings(&off, &base_cfg()), settings(&on, &cfg));
     }
 }

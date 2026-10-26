@@ -1026,6 +1026,35 @@ impl BaseSTT for OpenAISTT {
         true
     }
 
+    fn has_utterance_flush(&self) -> bool {
+        true
+    }
+
+    /// The buffer moves into a detached client that shares this one's callbacks, HTTP client and
+    /// breaker; the upload runs on it, so `send_audio` never waits for a transcription.
+    fn take_utterance(
+        &mut self,
+    ) -> Option<std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), STTError>> + Send>>>
+    {
+        if self.audio_buffer.is_empty() {
+            return None;
+        }
+        let mut detached = OpenAISTT {
+            config: self.config.clone(),
+            http_client: self.http_client.clone(),
+            audio_buffer: std::mem::take(&mut self.audio_buffer),
+            connected: AtomicBool::new(true),
+            result_callback: self.result_callback.clone(),
+            error_callback: self.error_callback.clone(),
+            total_bytes_received: 0,
+            first_audio_time: None,
+            silence_start_time: None,
+            last_was_silent: false,
+            resilience: self.resilience.clone(),
+        };
+        Some(Box::pin(async move { detached.flush_buffer().await }))
+    }
+
     /// W-D2: attach the shared per-provider circuit breaker so every OpenAI STT session trips
     /// (and observes) the SAME breaker, uniform with the WS fleet. The REST transport consults
     /// it before each upstream call and feeds it the unified HTTP status classification.
@@ -1521,6 +1550,97 @@ mod tests {
             other => panic!("expected typed ConnectionFailed refusal, got {other:?}"),
         }
         mock.assert_async().await; // zero upstream hits
+
+        // SAFETY: restore the process env before releasing the test env lock.
+        unsafe {
+            if let Some(previous) = previous {
+                std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", previous);
+            } else {
+                std::env::remove_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    // The env-lock guard must span the mock round-trips: `try_api_url` re-reads
+    // WAAV_ALLOW_LOOPBACK_ENDPOINTS at flush time (same accepted pattern as the
+    // redirect-policy tests above, which also hold the guard across awaits).
+    #[allow(clippy::await_holding_lock)]
+    async fn take_utterance_flushes_every_turn_on_the_same_callback() {
+        // The per-utterance flush of a live session: three turns in a row each deliver their
+        // final on the callback registered once, and the provider stays ready and keeps taking
+        // audio while an upload is pending (`disconnect` drops the callbacks after one).
+        let _guard = crate::core::net::test_env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let previous = std::env::var_os("WAAV_ALLOW_LOOPBACK_ENDPOINTS");
+        // SAFETY: test-only env mutation, serialized by core::net::test_env_lock.
+        unsafe { std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1") };
+
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/v1/audio/transcriptions")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"text":"book a flight"}"#)
+            .expect(3)
+            .create_async()
+            .await;
+
+        let config = OpenAISTTConfig {
+            base: STTConfig {
+                api_key: "test_key".to_string(),
+                ..Default::default()
+            },
+            endpoint_override: Some(server.url()),
+            response_format: ResponseFormat::Json,
+            ..Default::default()
+        };
+        let mut stt = OpenAISTT::with_config(config).expect("construct OpenAI STT");
+        let finals = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = finals.clone();
+        stt.on_result(Arc::new(move |result: STTResult| {
+            let seen = seen.clone();
+            Box::pin(async move {
+                assert!(result.is_final && result.is_speech_final);
+                seen.lock().unwrap().push(result.transcript);
+            }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        }))
+        .await
+        .expect("register the callback once");
+        stt.connect().await.expect("connect");
+        assert!(stt.take_utterance().is_none(), "nothing is buffered yet");
+
+        for turn in 1..=3 {
+            stt.send_audio(Bytes::from(vec![0u8; 3200]))
+                .await
+                .expect("send_audio buffers");
+            let upload = stt.take_utterance().expect("the buffer is one utterance");
+
+            // The upload is pending: the provider is ready and takes the next turn's audio.
+            assert!(stt.is_ready());
+            stt.send_audio(Bytes::from(vec![0u8; 320]))
+                .await
+                .expect("send_audio during an upload");
+            assert_eq!(finals.lock().unwrap().len(), turn - 1);
+
+            upload.await.expect("upload");
+            assert_eq!(finals.lock().unwrap().len(), turn, "one final per flush");
+            assert!(stt.is_ready(), "still connected after flush {turn}");
+            // What arrived during the upload belongs to the next utterance.
+            assert_eq!(stt.audio_buffer.len(), 320);
+            stt.audio_buffer.clear();
+        }
+        assert_eq!(*finals.lock().unwrap(), ["book a flight"; 3]);
+        mock.assert_async().await;
+
+        // A dropped upload discards the utterance: nothing more reaches the vendor.
+        stt.send_audio(Bytes::from(vec![0u8; 3200]))
+            .await
+            .expect("send_audio buffers");
+        drop(stt.take_utterance().expect("the buffer is one utterance"));
+        assert!(stt.audio_buffer.is_empty() && stt.is_ready());
+        mock.assert_async().await;
 
         // SAFETY: restore the process env before releasing the test env lock.
         unsafe {

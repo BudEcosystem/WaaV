@@ -14,6 +14,7 @@ fn create_test_config() -> LiveKitConfig {
         channels: 1,
         enable_noise_filter: cfg!(feature = "noise-filter"),
         listen_participants: vec![],
+        caller_tap: None,
     }
 }
 

@@ -1,0 +1,5 @@
+{
+  "type": "config",
+  "provider": "grok",
+  "interaction": {"speech": {"truth_ack": ["grok"], "fallback": {"provider": "openai"}}, "regime": "native"}
+}

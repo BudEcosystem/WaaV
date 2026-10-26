@@ -775,6 +775,9 @@ pub fn build_elevenlabs_transcription_with(
 
     let mut cfg = crate::core::stt::elevenlabs::ElevenLabsBatchConfig::from_standard(&req.config);
     cfg.endpoint_override = Some(base_url.trim_end_matches('/').to_string());
+    // The key resolved for this request (the caller's, else the server's), not the request's
+    // own field: an empty one there means "use the server key".
+    cfg.base.api_key = api_key.to_string();
     cfg.validate()?;
 
     // `detect_language` is a batch-only knob here as well as a canonical feature; either asking
@@ -1746,5 +1749,29 @@ mod tests {
         );
         r.config.base.model = "scribe_v2".into();
         assert!(build_elevenlabs_transcription(&r, "k", "https://api.elevenlabs.io").is_err());
+    }
+
+    /// A request that leaves its key empty (use the server's) goes out with the key resolved
+    /// for it; it was refused as "API key is required" before the server key was looked at.
+    #[test]
+    fn elevenlabs_uses_the_resolved_key_when_the_request_names_none() {
+        let mut r = eleven_req(
+            BatchAudioSource::Url {
+                url: "https://example.com/a.wav".into(),
+            },
+            SttFeatures::default(),
+        );
+        r.config.base.api_key = String::new();
+        let sub =
+            build_elevenlabs_transcription(&r, "server-key", "https://api.elevenlabs.io").unwrap();
+        assert_eq!(
+            sub.request.headers,
+            vec![("xi-api-key".to_string(), "server-key".to_string())]
+        );
+        // The realtime-model refusal is reached now.
+        r.config.base.model = "scribe_v2_realtime".into();
+        let err = build_elevenlabs_transcription(&r, "server-key", "https://api.elevenlabs.io")
+            .unwrap_err();
+        assert!(err.contains("realtime-only"), "{err}");
     }
 }

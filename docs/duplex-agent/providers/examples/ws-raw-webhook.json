@@ -1,0 +1,15 @@
+{
+  "type": "config",
+  "stt_config": {"provider": "deepgram", "language": "en-US", "sample_rate": 16000, "channels": 1, "punctuation": true, "encoding": "linear16"},
+  "tts_config": {"provider": "deepgram", "voice_id": "aura-2-thalia-en", "sample_rate": 24000},
+  "interaction": {
+    "tasks": {
+      "default_backend": "crm",
+      "backends": ["crm"],
+      "speculative_start": "auto",
+      "deadlines_s": {"lookup": 60, "action": 300}
+    },
+    "front": {"persona": "acme-support@3"},
+    "hitl": {"channels": ["voice", "client"]}
+  }
+}

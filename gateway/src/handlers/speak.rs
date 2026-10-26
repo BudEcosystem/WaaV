@@ -3,6 +3,7 @@ use axum::{
     http::{HeaderName, StatusCode, header},
     response::{IntoResponse, Json, Response},
 };
+use bytes::Bytes;
 use serde::Deserialize;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -17,7 +18,7 @@ const DEFAULT_SPEAK_TIMEOUT_SECS: u64 = 30;
 /// This prevents DoS attacks via very long text inputs
 const MAX_TEXT_LENGTH: usize = 10 * 1024;
 
-use crate::core::tts::{AudioCallback, AudioData, TTSError, create_tts_provider};
+use crate::core::tts::{AudioCallback, AudioData, TTSError};
 use crate::core::voice_error::{VoiceErrorType, VoiceFailure};
 use crate::handlers::ws::config::{TTSWebSocketConfig, client_api_key};
 use crate::state::AppState;
@@ -82,6 +83,9 @@ struct AudioCollector {
     /// TTFB in nanoseconds since `start`, set when the first audio chunk arrives
     /// (`u64::MAX` = not yet observed). Lock-free so the audio callback stays cheap.
     first_byte_ns: Arc<std::sync::atomic::AtomicU64>,
+    /// A streamed `/speak`: each chunk goes to the response as it comes instead of the buffer,
+    /// then an error (if any) and the end of the stream (the sender dropped).
+    stream: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<Result<Bytes, TTSError>>>>,
 }
 
 impl AudioCollector {
@@ -95,6 +99,22 @@ impl AudioCollector {
             notify: Arc::new(Notify::new()),
             start: std::time::Instant::now(),
             first_byte_ns: Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX)),
+            stream: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// A collector that streams its chunks to `tx` (see [`Self::stream`](AudioCollector)).
+    fn streaming(tx: tokio::sync::mpsc::UnboundedSender<Result<Bytes, TTSError>>) -> Self {
+        let collector = Self::new();
+        *collector.stream.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
+        collector
+    }
+
+    /// End a streamed response: with the error, when there is one.
+    fn end_stream(&self, error: Option<TTSError>) {
+        let tx = self.stream.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let (Some(tx), Some(error)) = (tx, error) {
+            let _ = tx.send(Err(error));
         }
     }
 
@@ -121,6 +141,10 @@ impl AudioCollector {
     /// * `Ok(())` - Synthesis completed within timeout
     /// * `Err(&'static str)` - Timeout elapsed before completion
     async fn wait_for_completion(&self, timeout_secs: u64) -> Result<(), &'static str> {
+        // Registered before the check, so a completion between the two is not missed.
+        let notified = self.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
         // Check if already completed (avoids unnecessary wait)
         if *self.completed.lock().await {
             return Ok(());
@@ -128,7 +152,7 @@ impl AudioCollector {
 
         // Wait for notification with timeout (efficient, no polling)
         let timeout = Duration::from_secs(timeout_secs);
-        match tokio::time::timeout(timeout, self.notify.notified()).await {
+        match tokio::time::timeout(timeout, notified).await {
             Ok(()) => Ok(()),
             Err(_elapsed) => {
                 warn!("TTS synthesis timeout after {}s", timeout_secs);
@@ -159,6 +183,7 @@ impl AudioCollector {
     }
 
     async fn fail(&self, error: TTSError) {
+        self.end_stream(Some(error.clone()));
         *self.error.lock().await = Some(error);
         *self.completed.lock().await = true;
         self.notify.notify_waiters();
@@ -237,7 +262,16 @@ impl AudioCallback for AudioCollector {
             drop(sample_rate);
             drop(format);
 
-            // Accumulate audio data
+            // A streamed response gets the chunk now; otherwise it is kept for the whole one.
+            if let Some(tx) = self
+                .stream
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+            {
+                let _ = tx.send(Ok(Bytes::from(audio_data.data)));
+                return;
+            }
             self.audio_data
                 .lock()
                 .await
@@ -250,6 +284,7 @@ impl AudioCallback for AudioCollector {
         error: TTSError,
     ) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
+            self.end_stream(Some(error.clone()));
             *self.error.lock().await = Some(error);
             *self.completed.lock().await = true;
             // Wake up any waiting task
@@ -259,6 +294,7 @@ impl AudioCallback for AudioCollector {
 
     fn on_complete(&self) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
+            // A streamed response ends once the outcome is counted (`streamed_speech`).
             *self.completed.lock().await = true;
             // Wake up any waiting task
             self.notify.notify_waiters();
@@ -274,15 +310,19 @@ impl AudioCallback for AudioCollector {
         path = "/speak",
         request_body = SpeakRequest,
         responses(
-            (status = 200, description = "Audio generated successfully",
+            (status = 200, description = "Audio, sent as it is synthesised (chunked, no Content-Length), so the first bytes do not wait for the whole synthesis; a `wav` request is answered whole, with Content-Length. An error after the first bytes ends the response early",
                 content_type = "audio/pcm",
                 headers(
                     ("x-audio-format" = String, description = "Audio format (linear16, mp3, etc.)"),
                     ("x-sample-rate" = u32, description = "Sample rate in Hz")
                 )
             ),
-            (status = 400, description = "Invalid request (empty text)"),
-            (status = 500, description = "TTS synthesis failed")
+            (status = 400, description = "Invalid request (empty text), or the vendor refused it (an unknown voice): the vendor's message"),
+            (status = 401, description = "The vendor refused the key (its message); also 403"),
+            (status = 429, description = "The vendor rate-limited the request: its message, and `Retry-After` when the vendor gave one"),
+            (status = 500, description = "TTS synthesis failed"),
+            (status = 502, description = "The vendor failed (a 5xx): its message"),
+            (status = 503, description = "This replica's vendor connections stayed busy past the bounded wait; `Retry-After: 1`")
         ),
         security(
             ("bearer_auth" = [])
@@ -372,15 +412,18 @@ pub async fn speak_handler(
         }
     };
 
-    // Convert WebSocket config to full TTSConfig with API key
-    let tts_config = request.tts_config.to_tts_config(api_key);
+    // The request's `features` and `extras` reach the provider as on `/ws` (`from_standard`):
+    // ElevenLabs' `features.streaming` uses its streaming endpoint here too.
+    let standard = request.tts_config.to_standard_tts(api_key);
+    let tts_config = standard.base.clone();
 
     // Apply pronunciation replacements — whole words only, via the same matcher the streaming
     // providers use. A plain substring replace turned "Bud -> Buddy" into "Buddyget".
     let processed_text = apply_pronunciations(&request.text, &tts_config.pronunciations);
 
     // Create TTS provider
-    let mut tts_provider = match create_tts_provider(&tts_config.provider, tts_config.clone()) {
+    let created = crate::core::tts::standard::create_tts_standard(&tts_config.provider, standard);
+    let mut tts_provider = match created {
         Ok(provider) => provider,
         Err(e) => {
             error!("Failed to create TTS provider: {:?}", e);
@@ -417,6 +460,22 @@ pub async fn speak_handler(
             .into_response();
     }
 
+    // The audio goes out as it is synthesised (chunked), except where the format needs the
+    // whole file (WAV keeps its Content-Length).
+    let whole_file = tts_config
+        .audio_format
+        .as_deref()
+        .is_some_and(|format| format.trim().eq_ignore_ascii_case("wav"));
+    if !whole_file {
+        return streamed_speech(
+            state,
+            tts_provider,
+            tts_config.provider.clone(),
+            processed_text,
+        )
+        .await;
+    }
+
     // Create audio collector
     let collector = Arc::new(AudioCollector::new());
 
@@ -440,13 +499,7 @@ pub async fn speak_handler(
             .metrics
             .provider(&tts_config.provider, crate::core::metrics::channel::TTS)
             .record_outcome(false, collector.ttfb(), collector.start.elapsed());
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": format!("Failed to synthesize speech: {}", e)
-            })),
-        )
-            .into_response();
+        return synthesis_failure("Failed to synthesize speech", e);
     }
 
     // Wait for completion with timeout
@@ -473,13 +526,7 @@ pub async fn speak_handler(
         Ok(result) => result,
         Err(e) => {
             error!("TTS synthesis error: {:?}", e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": format!("TTS synthesis error: {}", e)
-                })),
-            )
-                .into_response();
+            return synthesis_failure("TTS synthesis error", e);
         }
     };
 
@@ -499,15 +546,7 @@ pub async fn speak_handler(
         .provider(&tts_config.provider, crate::core::metrics::channel::TTS)
         .record_outcome(true, collector.ttfb(), collector.start.elapsed());
 
-    // Determine content type
-    let content_type = match format.as_str() {
-        "wav" => "audio/wav",
-        "mp3" | "mpeg" => "audio/mpeg",
-        "ogg" | "opus" => "audio/ogg",
-        "linear16" | "pcm" => "audio/pcm",
-        "mulaw" => "audio/basic",
-        _ => "application/octet-stream",
-    };
+    let content_type = content_type_of(&format);
 
     // Return binary audio with headers
     (
@@ -525,6 +564,172 @@ pub async fn speak_handler(
             ),
         ],
         audio_data,
+    )
+        .into_response()
+}
+
+/// The answer to a synthesis that failed, always with the vendor's message: a vendor's rate
+/// limit is a 429 (with its `Retry-After` when it gave one); a request the vendor refused (an
+/// unknown voice: 400) or a key it refused (401, 403) keeps that client-error status; a vendor
+/// 5xx is a 502; WaaV's own full pool a 503 with `Retry-After: 1`; anything else a 500.
+fn synthesis_failure(context: &str, e: TTSError) -> Response {
+    let body = Json(serde_json::json!({ "error": format!("{context}: {e}") }));
+    let status = |code: u16| StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_REQUEST);
+    match SynthesisError::from(e) {
+        SynthesisError::Rejected(f) => (
+            status(
+                f.vendor_status
+                    .filter(|c| (400..500).contains(c))
+                    .unwrap_or(400),
+            ),
+            body,
+        )
+            .into_response(),
+        SynthesisError::Vendor { status: code, .. }
+            if (400..500).contains(&code) && code != 429 =>
+        {
+            (status(code), body).into_response()
+        }
+        SynthesisError::Vendor { status: code, .. } if code >= 500 => {
+            (StatusCode::BAD_GATEWAY, body).into_response()
+        }
+        SynthesisError::Vendor {
+            status: 429,
+            retry_after,
+            ..
+        } => {
+            let mut resp = (StatusCode::TOO_MANY_REQUESTS, body).into_response();
+            if let Some(wait) = retry_after {
+                resp.headers_mut().insert(
+                    header::RETRY_AFTER,
+                    header::HeaderValue::from(wait.as_secs().max(1)),
+                );
+            }
+            resp
+        }
+        SynthesisError::Saturated(_) => {
+            let mut resp = (StatusCode::SERVICE_UNAVAILABLE, body).into_response();
+            resp.headers_mut()
+                .insert(header::RETRY_AFTER, header::HeaderValue::from(1u64));
+            resp
+        }
+        _ => (StatusCode::INTERNAL_SERVER_ERROR, body).into_response(),
+    }
+}
+
+/// The HTTP content type of an audio format a provider reports.
+fn content_type_of(format: &str) -> &'static str {
+    match format {
+        "wav" => "audio/wav",
+        "mp3" | "mpeg" => "audio/mpeg",
+        "ogg" | "opus" => "audio/ogg",
+        "linear16" | "pcm" => "audio/pcm",
+        "mulaw" => "audio/basic",
+        _ => "application/octet-stream",
+    }
+}
+
+/// `/speak` with the audio streamed as it is synthesised: the status and headers go out with
+/// the first chunk (an error before it is answered as before, with its status), the rest as
+/// chunks of the same response. An error after the first chunk ends the response early. The
+/// provider is let go, and the outcome counted, when the synthesis is over; then the response
+/// ends.
+async fn streamed_speech(
+    state: Arc<AppState>,
+    mut tts_provider: Box<dyn crate::core::tts::BaseTTS>,
+    provider: String,
+    text: String,
+) -> Response {
+    let fail = |status: StatusCode, error: String| {
+        (status, Json(serde_json::json!({ "error": error }))).into_response()
+    };
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let collector = Arc::new(AudioCollector::streaming(tx));
+    if let Err(e) = tts_provider.on_audio(collector.clone()) {
+        error!("Failed to register audio callback: {:?}", e);
+        let _ = tts_provider.disconnect().await;
+        return fail(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to register audio callback: {e}"),
+        );
+    }
+    let record = |state: &AppState, provider: &str, collector: &AudioCollector, ok: bool| {
+        state
+            .core_state
+            .metrics
+            .provider(provider, crate::core::metrics::channel::TTS)
+            .record_outcome(ok, collector.ttfb(), collector.start.elapsed());
+    };
+    if let Err(e) = tts_provider.speak(&text, true).await {
+        error!("Failed to synthesize speech: {:?}", e);
+        record(&state, &provider, &collector, false);
+        let _ = tts_provider.disconnect().await;
+        return synthesis_failure("Failed to synthesize speech", e);
+    }
+
+    // The first chunk, an error, or the end of a synthesis that made no audio.
+    let first = tokio::select! {
+        biased;
+        item = rx.recv() => Ok(item),
+        done = collector.wait_for_completion(DEFAULT_SPEAK_TIMEOUT_SECS) => done.map(|()| rx.try_recv().ok()),
+    };
+    let first = match first {
+        Ok(Some(Ok(chunk))) => chunk,
+        outcome => {
+            let _ = tts_provider.disconnect().await;
+            return match outcome {
+                Err(_) => fail(StatusCode::GATEWAY_TIMEOUT, "TTS synthesis timeout".into()),
+                Ok(Some(Err(e))) => {
+                    error!("TTS synthesis error: {:?}", e);
+                    record(&state, &provider, &collector, false);
+                    synthesis_failure("TTS synthesis error", e)
+                }
+                _ => fail(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "TTS synthesis error: TTS synthesis completed without audio".into(),
+                ),
+            };
+        }
+    };
+    // Set by the callback before it sent the chunk.
+    let format = collector.format.lock().await.clone().unwrap_or_default();
+    let sample_rate = collector.sample_rate.lock().await.unwrap_or_default();
+
+    let rest = collector.clone();
+    tokio::spawn(async move {
+        if rest
+            .wait_for_completion(DEFAULT_SPEAK_TIMEOUT_SECS)
+            .await
+            .is_err()
+        {
+            rest.fail(TTSError::TimeoutError("TTS synthesis timeout".into()))
+                .await;
+        }
+        let _ = tts_provider.disconnect().await;
+        let ok = rest.error.lock().await.is_none();
+        record(&state, &provider, &rest, ok);
+        info!(provider = %provider, ok, "TTS synthesis streamed");
+        // The response ends here: its last byte comes after the outcome is counted.
+        rest.end_stream(None);
+    });
+
+    let body = futures_util::stream::unfold((Some(first), rx), |(first, mut rx)| async move {
+        match first {
+            Some(chunk) => Some((Ok(chunk), (None, rx))),
+            None => rx.recv().await.map(|item| (item, (None, rx))),
+        }
+    });
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, content_type_of(&format).to_string()),
+            (HeaderName::from_static("x-audio-format"), format.clone()),
+            (
+                HeaderName::from_static("x-sample-rate"),
+                sample_rate.to_string(),
+            ),
+        ],
+        axum::body::Body::from_stream(body),
     )
         .into_response()
 }
@@ -1112,5 +1317,62 @@ mod tests {
             &[1, 2],
             "the invalid second chunk must not be appended"
         );
+    }
+
+    /// A vendor's 429 reaches the caller as a 429 with the vendor's own words and its
+    /// `Retry-After` when it gave one (none is made up); a full local pool is a 503; anything
+    /// else stays a 500.
+    #[tokio::test]
+    async fn a_vendor_rate_limit_is_answered_429_with_its_message() {
+        let limited = |retry_after_secs| TTSError::VendorStatus {
+            status: 429,
+            error: Box::new(TTSError::RateLimited {
+                retry_after_secs,
+                message: "Too many concurrent requests. Current limit: 2".into(),
+            }),
+        };
+        let resp = synthesis_failure("TTS synthesis error", limited(None));
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(resp.headers().get(header::RETRY_AFTER).is_none());
+        let resp = synthesis_failure("TTS synthesis error", limited(Some(3)));
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(resp.headers()[header::RETRY_AFTER], "3");
+        let body = axum::body::to_bytes(resp.into_body(), 4096)
+            .await
+            .expect("body");
+        assert!(
+            String::from_utf8_lossy(&body).contains("Current limit: 2"),
+            "the vendor's message is kept: {body:?}"
+        );
+        let resp = synthesis_failure("x", TTSError::Saturated("cartesia".into()));
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(resp.headers()[header::RETRY_AFTER], "1");
+        let resp = synthesis_failure("x", TTSError::ProviderError("down".into()));
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let refused = |status, error| TTSError::VendorStatus {
+            status,
+            error: Box::new(error),
+        };
+        let resp = synthesis_failure(
+            "x",
+            refused(
+                400,
+                TTSError::RequestRejected("cartesia rejected the request (400): voice".into()),
+            ),
+        );
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let resp = synthesis_failure(
+            "x",
+            refused(
+                401,
+                TTSError::AuthenticationFailed("cartesia API error (401 Unauthorized)".into()),
+            ),
+        );
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let resp = synthesis_failure(
+            "x",
+            TTSError::ProviderError("API error (503 Service Unavailable): overloaded".into()),
+        );
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 }

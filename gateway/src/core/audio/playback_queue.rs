@@ -32,6 +32,9 @@ pub struct PlaybackUnit {
     pub audio: AudioData,
     /// `false` ⇒ this unit survives a barge-in clear (e.g. a legal disclaimer).
     pub interruptible: bool,
+    /// The utterance this audio belongs to on the metered pump (interaction
+    /// mode, set by `PumpControl::route`); 0 everywhere else.
+    pub tag: u64,
 }
 
 impl PlaybackUnit {
@@ -40,6 +43,7 @@ impl PlaybackUnit {
         Self {
             audio,
             interruptible: true,
+            tag: 0,
         }
     }
 
@@ -48,6 +52,7 @@ impl PlaybackUnit {
         Self {
             audio,
             interruptible: false,
+            tag: 0,
         }
     }
 }

@@ -12,8 +12,11 @@
 //! every mapping is trivially unit-testable (serialize a config, parse a
 //! captured server event).
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use base64::prelude::*;
 use bytes::Bytes;
+use serde_json::{Map, Value, json};
 
 use super::config::{
     OPENAI_REALTIME_URL, OpenAIRealtimeAudioFormat, OpenAIRealtimeModel, OpenAIRealtimeVoice,
@@ -25,7 +28,7 @@ use super::messages::{
 };
 use crate::core::realtime::base::{
     FunctionCallRequest, RealtimeConfig, RealtimeError, RealtimeResponseOverride, RealtimeResult,
-    ReplayConversationItem, SpeechEvent, TranscriptRole,
+    RealtimeVerb, ReplayConversationItem, SpeechEvent, TranscriptRole,
 };
 use crate::core::realtime::scaffold::{
     ConnectSpec, Inbound, OutFrame, ProtocolCaps, RealtimeProtocol, S2sEvent,
@@ -49,6 +52,85 @@ pub struct OpenAiProtocol {
     /// frames. Server VAD is therefore on UNLESS the config explicitly selects the
     /// `None` (manual) variant. Computed once at `from_config`.
     pub(crate) emits_user_turn_frames: bool,
+    /// The provider fixes of this wire in force for the session.
+    pub(crate) fixes: OpenAiFixes,
+    /// The server has sent audio: OpenAI then refuses a new voice (fix `openai_update_delta`).
+    audio_out: AtomicBool,
+}
+
+/// The provider fixes of the OpenAI GA wire, read once from the session's config. Azure, Grok
+/// and Inworld embed this protocol, so they take them too (Grok's `grok_session` replaces its
+/// session and response frames).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct OpenAiFixes {
+    /// `openai_manual_turn_null`: manual turns are `turn_detection: null`, not `{"type":"none"}`.
+    pub(crate) manual_turn_null: bool,
+    /// `openai_replay_output_text`: a replayed assistant line is `output_text` content.
+    pub(crate) replay_output_text: bool,
+    /// `openai_update_delta`: a mid-session update names only what changed.
+    pub(crate) update_delta: bool,
+    /// `openai_modalities`: the session's `modalities` choose `output_modalities`.
+    pub(crate) modalities: bool,
+    /// `openai_inbound`: a function's name is read from `response.function_call_arguments.done`,
+    /// and the error of a `response.cancel` with nothing to cancel is not passed on.
+    pub(crate) inbound: bool,
+}
+
+impl OpenAiFixes {
+    pub(crate) fn of(cfg: &RealtimeConfig) -> Self {
+        Self {
+            manual_turn_null: cfg.fix("openai_manual_turn_null"),
+            replay_output_text: cfg.fix("openai_replay_output_text"),
+            update_delta: cfg.fix("openai_update_delta"),
+            modalities: cfg.fix("openai_modalities"),
+            inbound: cfg.fix("openai_inbound"),
+        }
+    }
+}
+
+/// The members of `after` that differ from `before`. The `audio` block and its `input` and
+/// `output` are compared member by member; any other member (instructions, tools, a turn
+/// detection object) goes whole when it changed. A member `after` lacks is not named.
+pub(crate) fn changed_fields(before: &Value, after: &Value) -> Map<String, Value> {
+    let mut changed = Map::new();
+    let Some(after) = after.as_object() else {
+        return changed;
+    };
+    for (key, value) in after {
+        match before.get(key) {
+            Some(old) if old == value => {}
+            Some(old)
+                if matches!(key.as_str(), "audio" | "input" | "output")
+                    && old.is_object()
+                    && value.is_object() =>
+            {
+                let inner = changed_fields(old, value);
+                if !inner.is_empty() {
+                    changed.insert(key.clone(), Value::Object(inner));
+                }
+            }
+            _ => {
+                changed.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    changed
+}
+
+/// A `session.update` naming the changed fields of `session` (a realtime session's `type`
+/// rides along, as GA requires it); none when nothing changed.
+pub(crate) fn session_patch(before: &Value, after: &Value) -> Vec<ClientEvent> {
+    let mut changed = changed_fields(before, after);
+    changed.remove("type");
+    if changed.is_empty() {
+        return Vec::new();
+    }
+    if let Some(kind) = after.get("type") {
+        changed.insert("type".to_owned(), kind.clone());
+    }
+    vec![ClientEvent::Raw(
+        json!({ "type": "session.update", "session": Value::Object(changed) }),
+    )]
 }
 
 impl OpenAiProtocol {
@@ -96,24 +178,50 @@ impl OpenAiProtocol {
                 silence_duration_ms,
                 create_response,
                 interrupt_response,
-            } => TurnDetection::ServerVad {
+            } => Some(TurnDetection::ServerVad {
                 threshold: *threshold,
                 prefix_padding_ms: *prefix_padding_ms,
                 silence_duration_ms: *silence_duration_ms,
                 create_response: *create_response,
                 interrupt_response: *interrupt_response,
-            },
+            }),
             crate::core::realtime::base::TurnDetectionConfig::SemanticVad {
                 eagerness,
                 create_response,
                 interrupt_response,
-            } => TurnDetection::SemanticVad {
+            } => Some(TurnDetection::SemanticVad {
                 eagerness: eagerness.clone(),
                 create_response: *create_response,
                 interrupt_response: *interrupt_response,
-            },
-            crate::core::realtime::base::TurnDetectionConfig::None => TurnDetection::None {},
+            }),
+            // GA types turn detection as `server_vad` or `semantic_vad` only; manual turns
+            // clear it with `null` (fix `openai_manual_turn_null`).
+            crate::core::realtime::base::TurnDetectionConfig::None => {
+                (!self.fixes.manual_turn_null).then_some(TurnDetection::None {})
+            }
         });
+        // A voice a mid-session update names is the session's from then on (fix
+        // `openai_update_delta`); without it the voice of the first connect stays.
+        let voice = match cfg.voice.as_deref() {
+            Some(voice) if self.fixes.update_delta => {
+                OpenAIRealtimeVoice::from_str_or_default(voice)
+            }
+            _ => self.voice,
+        };
+        // GA answers in one modality: `["audio"]` (with its transcript) or `["text"]`.
+        let modality = if cfg.fix(crate::core::realtime::HALF_CASCADE_TEXT) {
+            "text"
+        } else {
+            match cfg.modalities.as_deref().filter(|_| self.fixes.modalities) {
+                Some(asked)
+                    if !asked.iter().any(|m| m.eq_ignore_ascii_case("audio"))
+                        && asked.iter().any(|m| m.eq_ignore_ascii_case("text")) =>
+                {
+                    "text"
+                }
+                _ => "audio",
+            }
+        };
 
         // GA nests the Beta-era flat audio fields under audio.input / audio.output.
         let audio = AudioConfig {
@@ -131,7 +239,7 @@ impl OpenAiProtocol {
             }),
             output: Some(AudioOutput {
                 format: Some(ga_format()),
-                voice: Some(self.voice.as_str().to_string()),
+                voice: Some(voice.as_str().to_string()),
                 speed: None,
             }),
         };
@@ -144,7 +252,8 @@ impl OpenAiProtocol {
         // exposing the field.
         SessionConfig {
             session_type: "realtime".to_string(),
-            output_modalities: Some(vec!["audio".to_string()]),
+            // The half-cascade's provider writes its replies; WaaV's voice says them.
+            output_modalities: Some(vec![modality.to_string()]),
             instructions: cfg.instructions.clone(),
             audio: Some(audio),
             tools: cfg.tools.as_ref().map(|tools| {
@@ -169,13 +278,18 @@ impl OpenAiProtocol {
         }
     }
 
-    /// Map a replay-log item to the wire conversation item. EXTRACTED verbatim
-    /// from `OpenAIRealtime::replay_item_to_conversation_item`: `input_text` for
-    /// user, `text` for assistant; a completed message (never a response).
-    fn replay_item_to_conversation_item(item: &ReplayConversationItem) -> ConversationItem {
+    /// Map a replay-log item to the wire conversation item: `input_text` for user, `text`
+    /// for assistant (GA's `output_text` under the fix `openai_replay_output_text`); a
+    /// completed message (never a response).
+    fn replay_item_to_conversation_item(&self, item: &ReplayConversationItem) -> ConversationItem {
+        let assistant = if self.fixes.replay_output_text {
+            "output_text"
+        } else {
+            "text"
+        };
         let (role, content_type) = match item.role {
             TranscriptRole::User => ("user", "input_text"),
-            TranscriptRole::Assistant => ("assistant", "text"),
+            TranscriptRole::Assistant => ("assistant", assistant),
         };
         ConversationItem {
             id: None,
@@ -240,6 +354,8 @@ impl RealtimeProtocol for OpenAiProtocol {
             voice,
             audio_format,
             emits_user_turn_frames,
+            fixes: OpenAiFixes::of(cfg),
+            audio_out: AtomicBool::new(false),
         })
     }
 
@@ -295,6 +411,34 @@ impl RealtimeProtocol for OpenAiProtocol {
         }]
     }
 
+    fn session_update(
+        &self,
+        old: &RealtimeConfig,
+        new: &RealtimeConfig,
+    ) -> Option<Vec<Self::Wire>> {
+        if !self.fixes.update_delta {
+            return Some(self.build_session_config(new, None));
+        }
+        // `session.update`: "update any field except for `voice` and `model`. `voice` can be
+        // updated only if there have been no other audio outputs yet." "Only the fields that
+        // are present in the `session.update` are updated."
+        let voice = |cfg: &RealtimeConfig| {
+            cfg.voice
+                .as_deref()
+                .map(str::trim)
+                .map(str::to_ascii_lowercase)
+        };
+        if old.model.trim() != new.model.trim()
+            || (voice(old) != voice(new) && self.audio_out.load(Ordering::Relaxed))
+        {
+            return None;
+        }
+        let as_json = |cfg: &RealtimeConfig| {
+            serde_json::to_value(self.session_config(cfg)).unwrap_or_default()
+        };
+        Some(session_patch(&as_json(old), &as_json(new)))
+    }
+
     fn map_server_event(&self, raw: Inbound<'_>) -> Vec<S2sEvent> {
         let text = match raw {
             Inbound::Text(t) => t,
@@ -311,6 +455,15 @@ impl RealtimeProtocol for OpenAiProtocol {
                 session_id: Some(session.id),
             }],
             ServerEvent::SessionUpdated { .. } => vec![S2sEvent::Ignore],
+            // "It's safe to call `response.cancel` even if no response is in progress, an error
+            // will be returned the session will remain unaffected" (fix `openai_inbound`).
+            ServerEvent::Error { error }
+                if self.fixes.inbound
+                    && error.code.as_deref() == Some("response_cancel_not_active") =>
+            {
+                tracing::debug!(message = %error.message, "response.cancel with no response");
+                vec![S2sEvent::Ignore]
+            }
             ServerEvent::Error { error } => vec![S2sEvent::Error(RealtimeError::ProviderError(
                 format!("{}: {}", error.error_type, error.message),
             ))],
@@ -382,11 +535,14 @@ impl RealtimeProtocol for OpenAiProtocol {
                 response_id,
                 ..
             } => match BASE64_STANDARD.decode(&delta) {
-                Ok(audio_bytes) => vec![S2sEvent::Audio {
-                    data: Bytes::from(audio_bytes),
-                    item_id: Some(item_id),
-                    response_id: Some(response_id),
-                }],
+                Ok(audio_bytes) => {
+                    self.audio_out.store(true, Ordering::Relaxed);
+                    vec![S2sEvent::Audio {
+                        data: Bytes::from(audio_bytes),
+                        item_id: Some(item_id),
+                        response_id: Some(response_id),
+                    }]
+                }
                 Err(_) => vec![S2sEvent::Ignore],
             },
             ServerEvent::OutputItemAdded { item, .. } => {
@@ -405,11 +561,13 @@ impl RealtimeProtocol for OpenAiProtocol {
                 call_id,
                 arguments,
                 item_id,
+                name,
                 ..
             } => vec![S2sEvent::FunctionCall(FunctionCallRequest {
                 call_id,
-                // The scaffold resolves the name from its pending_calls map.
-                name: String::new(),
+                // The event's own name (fix `openai_inbound`); else the scaffold resolves it
+                // from its pending_calls map.
+                name: name.filter(|_| self.fixes.inbound).unwrap_or_default(),
                 arguments,
                 item_id: Some(item_id),
             })],
@@ -530,9 +688,43 @@ impl RealtimeProtocol for OpenAiProtocol {
         // EXTRACTED verbatim from `OpenAIRealtime::replay_conversation`: a
         // ConversationItemCreate WITHOUT a response (no duplicate inference).
         vec![ClientEvent::ConversationItemCreate {
-            item: Self::replay_item_to_conversation_item(item),
+            item: self.replay_item_to_conversation_item(item),
             previous_item_id: None,
         }]
+    }
+
+    fn verb(&self, verb: &RealtimeVerb<'_>) -> Option<Vec<Self::Wire>> {
+        match *verb {
+            // No wire speaks given words verbatim.
+            RealtimeVerb::SayExact(_) => None,
+            // A line of the gateway's, never a turn of the model's own: no function call.
+            RealtimeVerb::SayGuided(guidance) => {
+                let mut wires = self.create_response(Some(&RealtimeResponseOverride {
+                    instructions: Some(guidance.to_string()),
+                    ..Default::default()
+                }));
+                for wire in &mut wires {
+                    if let ClientEvent::ResponseCreate {
+                        response: Some(response),
+                    } = wire
+                    {
+                        response.tool_choice = Some("none".to_string());
+                    }
+                }
+                Some(wires)
+            }
+            // The `send_text` item as a system message: context, and no response is asked.
+            RealtimeVerb::AddContext(text) => {
+                let mut wires = self.send_text(text);
+                for wire in &mut wires {
+                    if let ClientEvent::ConversationItemCreate { item, .. } = wire {
+                        item.role = Some("system".to_string());
+                    }
+                }
+                Some(wires)
+            }
+            RealtimeVerb::StopOutput => Some(self.cancel_response()),
+        }
     }
 
     fn serialize(&self, msg: &Self::Wire) -> RealtimeResult<OutFrame> {
@@ -863,6 +1055,70 @@ mod tests {
         ));
     }
 
+    /// One verb's wires as JSON values.
+    fn verb_json(p: &OpenAiProtocol, verb: RealtimeVerb<'_>) -> Vec<serde_json::Value> {
+        let wires = p.verb(&verb).expect("the verb has a wire");
+        wires
+            .iter()
+            .map(|wire| match p.serialize(wire).unwrap() {
+                OutFrame::Text(s) => serde_json::from_str(&s).unwrap(),
+                OutFrame::Binary(_) => panic!("a verb must be a text frame"),
+            })
+            .collect()
+    }
+
+    /// `SayGuided` = `response.create` with the instructions, and no function call.
+    #[test]
+    fn verb_say_guided_is_response_create_with_instructions() {
+        let wires = verb_json(
+            &proto(&base_cfg()),
+            RealtimeVerb::SayGuided("Say you are checking."),
+        );
+        assert_eq!(
+            wires,
+            [serde_json::json!({
+                "type": "response.create",
+                "response": {"instructions": "Say you are checking.", "tool_choice": "none"},
+            })]
+        );
+    }
+
+    /// `AddContext` = the `send_text` item with role `system`, and no `response.create`;
+    /// `send_text` itself stays a user message.
+    #[test]
+    fn verb_add_context_is_a_system_item_and_asks_for_no_response() {
+        let p = proto(&base_cfg());
+        let wires = verb_json(&p, RealtimeVerb::AddContext("The booking is confirmed."));
+        assert_eq!(
+            wires,
+            [serde_json::json!({
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "message",
+                    "role": "system",
+                    "content": [{"type": "input_text", "text": "The booking is confirmed."}],
+                },
+            })]
+        );
+        match p.send_text("hello").as_slice() {
+            [ClientEvent::ConversationItemCreate { item, .. }] => {
+                assert_eq!(item.role.as_deref(), Some("user"));
+            }
+            _ => panic!("send_text must be one conversation.item.create"),
+        }
+    }
+
+    /// `StopOutput` = `response.cancel`; `SayExact` has no wire on this protocol.
+    #[test]
+    fn verb_stop_output_is_response_cancel_and_say_exact_has_no_wire() {
+        let p = proto(&base_cfg());
+        assert_eq!(
+            verb_json(&p, RealtimeVerb::StopOutput),
+            [serde_json::json!({"type": "response.cancel"})]
+        );
+        assert!(p.verb(&RealtimeVerb::SayExact("One moment.")).is_none());
+    }
+
     /// replay_item renders a completed message (input_text user / text assistant)
     /// and NEVER a response — the reconnect-context contract.
     #[test]
@@ -879,5 +1135,185 @@ mod tests {
         assert!(json.contains("conversation.item.create"));
         assert!(!json.contains("response.create"));
         assert!(json.contains("\"type\":\"text\""), "assistant side: text");
+    }
+
+    /// A config with these provider fixes on.
+    fn fixed(fixes: &[&str]) -> RealtimeConfig {
+        RealtimeConfig {
+            provider_fixes: fixes.iter().map(|f| (*f).to_owned()).collect(),
+            ..base_cfg()
+        }
+    }
+
+    /// Every wire as JSON.
+    fn wires(p: &OpenAiProtocol, wires: &[ClientEvent]) -> Vec<Value> {
+        wires
+            .iter()
+            .map(|wire| match p.serialize(wire).unwrap() {
+                OutFrame::Text(s) => serde_json::from_str(&s).unwrap(),
+                OutFrame::Binary(_) => panic!("a text frame"),
+            })
+            .collect()
+    }
+
+    /// Fix `openai_manual_turn_null`: manual turns clear `turn_detection` with `null`
+    /// (`session.update`: "To clear a field like `turn_detection`, pass `null`"; GA types it
+    /// `server_vad` or `semantic_vad` only). Without it today's `{"type":"none"}`.
+    #[test]
+    fn manual_turns_are_turn_detection_null_with_the_fix() {
+        use crate::core::realtime::base::TurnDetectionConfig;
+        let manual = |fixes: &[&str]| {
+            let cfg = RealtimeConfig {
+                turn_detection: Some(TurnDetectionConfig::None),
+                ..fixed(fixes)
+            };
+            let p = proto(&cfg);
+            wires(&p, &p.build_session_config(&cfg, None)).remove(0)
+        };
+        let today = manual(&[]);
+        assert_eq!(
+            today["session"]["audio"]["input"]["turn_detection"],
+            json!({"type": "none"})
+        );
+        let nulled = manual(&["openai_manual_turn_null"]);
+        let input = nulled["session"]["audio"]["input"].as_object().unwrap();
+        assert_eq!(input.get("turn_detection"), Some(&Value::Null), "{nulled}");
+        // Server VAD and an unset turn detection are the same either way.
+        let cfg = fixed(&["openai_manual_turn_null"]);
+        let p = proto(&cfg);
+        let unset = wires(&p, &p.build_session_config(&cfg, None)).remove(0);
+        assert!(
+            unset["session"]["audio"]["input"]
+                .get("turn_detection")
+                .is_none()
+        );
+    }
+
+    /// Fix `openai_replay_output_text`: a replayed assistant line is `output_text` (GA:
+    /// "The content type, `output_text` or `output_audio`"); without it today's `text`.
+    #[test]
+    fn a_replayed_assistant_line_is_output_text_with_the_fix() {
+        let line = ReplayConversationItem {
+            role: TranscriptRole::Assistant,
+            text: "Your table is booked.".into(),
+        };
+        let content = |fixes: &[&str]| {
+            let p = proto(&fixed(fixes));
+            wires(&p, &p.replay_item(&line)).remove(0)["item"]["content"].clone()
+        };
+        assert_eq!(
+            content(&[]),
+            json!([{"type": "text", "text": "Your table is booked."}])
+        );
+        assert_eq!(
+            content(&["openai_replay_output_text"]),
+            json!([{"type": "output_text", "text": "Your table is booked."}])
+        );
+        let user = ReplayConversationItem {
+            role: TranscriptRole::User,
+            text: "Book a table.".into(),
+        };
+        let p = proto(&fixed(&["openai_replay_output_text"]));
+        assert_eq!(
+            wires(&p, &p.replay_item(&user)).remove(0)["item"]["content"][0]["type"],
+            "input_text"
+        );
+    }
+
+    /// Fix `openai_update_delta` (escape flag `openai_session_resend`): an update sends only
+    /// what changed ("Only the fields that are present in the `session.update` are
+    /// updated"); a new voice once the model has spoken, or a new model, is refused. Without
+    /// it the whole session again (today).
+    #[test]
+    fn a_mid_session_update_names_only_what_changed_with_the_fix() {
+        let old = base_cfg();
+        let mut new = base_cfg();
+        new.instructions = Some("Answer in French.".into());
+        let today = proto(&old);
+        let sent = wires(&today, &today.session_update(&old, &new).unwrap());
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0]["session"]["audio"]["output"]["voice"], "alloy");
+        assert_eq!(sent[0]["session"]["instructions"], "Answer in French.");
+
+        let fix = fixed(&["openai_update_delta"]);
+        let (old, mut new) = (fix.clone(), fix.clone());
+        new.instructions = Some("Answer in French.".into());
+        let p = proto(&old);
+        assert_eq!(
+            wires(&p, &p.session_update(&old, &new).unwrap()),
+            [json!({"type": "session.update",
+                    "session": {"type": "realtime", "instructions": "Answer in French."}})]
+        );
+        assert!(p.session_update(&old, &old).unwrap().is_empty());
+        // A new voice before the first audio goes; after it, it is refused.
+        new.voice = Some("verse".into());
+        assert_eq!(
+            wires(&p, &p.session_update(&old, &new).unwrap()),
+            [json!({"type": "session.update",
+                    "session": {"type": "realtime", "instructions": "Answer in French.",
+                                "audio": {"output": {"voice": "verse"}}}})]
+        );
+        let audio = r#"{"type":"response.output_audio.delta","response_id":"r","item_id":"i","output_index":0,"content_index":0,"delta":"AAA="}"#;
+        p.map_server_event(Inbound::Text(audio));
+        assert!(p.session_update(&old, &new).is_none());
+        new.voice = old.voice.clone();
+        assert_eq!(wires(&p, &p.session_update(&old, &new).unwrap()).len(), 1);
+        new.model = "gpt-realtime-2.1".into();
+        assert!(p.session_update(&old, &new).is_none());
+    }
+
+    /// Fix `openai_modalities`: the session's `modalities` choose `output_modalities` (GA:
+    /// "`["text"]` can be used to make the model respond with text only. It is not possible
+    /// to request both"); without it always `["audio"]`.
+    #[test]
+    fn the_sessions_modalities_choose_the_output_modality_with_the_fix() {
+        let modality = |fixes: &[&str], asked: &[&str]| {
+            let cfg = RealtimeConfig {
+                modalities: Some(asked.iter().map(|m| (*m).to_owned()).collect()),
+                ..fixed(fixes)
+            };
+            let p = proto(&cfg);
+            wires(&p, &p.build_session_config(&cfg, None)).remove(0)["session"]["output_modalities"]
+                .clone()
+        };
+        assert_eq!(modality(&[], &["text"]), json!(["audio"]));
+        assert_eq!(modality(&["openai_modalities"], &["text"]), json!(["text"]));
+        assert_eq!(
+            modality(&["openai_modalities"], &["text", "audio"]),
+            json!(["audio"])
+        );
+    }
+
+    /// Fix `openai_inbound`: the error of a `response.cancel` with nothing to cancel ("the
+    /// session will remain unaffected") is not passed on, and a function's name comes from
+    /// `response.function_call_arguments.done` (its `name` field). Without it today's mapping.
+    #[test]
+    fn the_inbound_fix_reads_the_name_and_drops_the_harmless_cancel_error() {
+        let cancel = r#"{"type":"error","event_id":"e1","error":{"type":"invalid_request_error","code":"response_cancel_not_active","message":"Cancellation failed: no active response found"}}"#;
+        let done = r#"{"type":"response.function_call_arguments.done","event_id":"e2","response_id":"r1","item_id":"i1","output_index":0,"call_id":"c1","name":"get_weather","arguments":"{}"}"#;
+        let today = proto(&base_cfg());
+        assert!(matches!(
+            today.map_server_event(Inbound::Text(cancel)).as_slice(),
+            [S2sEvent::Error(RealtimeError::ProviderError(_))]
+        ));
+        match today.map_server_event(Inbound::Text(done)).as_slice() {
+            [S2sEvent::FunctionCall(call)] => assert!(call.name.is_empty()),
+            other => panic!("{other:?}"),
+        }
+        let p = proto(&fixed(&["openai_inbound"]));
+        assert!(matches!(
+            p.map_server_event(Inbound::Text(cancel)).as_slice(),
+            [S2sEvent::Ignore]
+        ));
+        match p.map_server_event(Inbound::Text(done)).as_slice() {
+            [S2sEvent::FunctionCall(call)] => assert_eq!(call.name, "get_weather"),
+            other => panic!("{other:?}"),
+        }
+        // Any other error still reaches the client.
+        let other = r#"{"type":"error","error":{"type":"invalid_request_error","code":"invalid_value","message":"bad"}}"#;
+        assert!(matches!(
+            p.map_server_event(Inbound::Text(other)).as_slice(),
+            [S2sEvent::Error(_)]
+        ));
     }
 }

@@ -58,6 +58,26 @@ impl MelExtractor {
     pub fn reset(&mut self) {}
 }
 
+/// Stub MelStream: keeps nothing.
+pub struct MelStream;
+
+impl MelStream {
+    /// Stub constructor.
+    pub fn new(_max_frames: usize) -> Self {
+        Self
+    }
+
+    /// Stub push method.
+    pub fn push(&mut self, _samples: &[f32]) -> anyhow::Result<()> {
+        anyhow::bail!("Smart Turn feature is not enabled")
+    }
+
+    /// Stub frames method.
+    pub fn frames(&self) -> Vec<Vec<f32>> {
+        Vec::new()
+    }
+}
+
 // =============================================================================
 // Smart Turn Detector Constants and Types
 // =============================================================================

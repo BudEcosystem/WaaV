@@ -1167,3 +1167,145 @@ async fn a_refusal_is_not_retried() {
     assert_eq!(done_of(&signals).0, TurnStatus::Failed);
     assert_eq!(h.backend.requests.lock().len(), 1);
 }
+
+// ---------------------------------------------------------------------------------------------
+// A session's own function tools and instructions (the GA cascade)
+// ---------------------------------------------------------------------------------------------
+
+fn function_call(name: &str, call_id: &str) -> Vec<Step> {
+    vec![
+        Step::Ev(AgentEvent::ToolStarted {
+            item_id: "fc_1".into(),
+            name: name.into(),
+            kind: "function_call".into(),
+        }),
+        Step::Ev(AgentEvent::FunctionCall {
+            item_id: "fc_1".into(),
+            name: name.into(),
+            ok: true,
+            call_id: call_id.into(),
+            arguments: "{\"order_number\":\"4417\"}".into(),
+        }),
+    ]
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_call_to_the_sessions_function_goes_to_the_client_and_its_output_to_the_next_run() {
+    let mut h = harness(
+        entry(json!({"fillers": {"tool_call_after_ms": 500, "messages": ["One moment."]}})),
+        None,
+        false,
+    );
+    let tool = json!({"type": "function", "name": "lookup_order"});
+    h.engine.set_client_tools(vec![tool.clone()]);
+    h.engine.set_instructions(Some("Be brief.".into()));
+    let mut run = vec![created("resp_1")];
+    run.extend(function_call("lookup_order", "call_1"));
+    run.push(completed());
+    h.backend.push(Ok(run));
+    h.engine.start_turn("where is order 4417".into()).await;
+    let signals = until_done(&mut h, 0).await;
+    // The call is the client's to run: no tool progress of the agent's, and no filler for it.
+    assert!(
+        !signals
+            .iter()
+            .any(|s| matches!(s, AgentSignal::Tool { .. }))
+    );
+    assert!(signals.contains(&AgentSignal::FunctionCall {
+        turn: 0,
+        item_id: "fc_1".into(),
+        call_id: "call_1".into(),
+        name: "lookup_order".into(),
+        arguments: "{\"order_number\":\"4417\"}".into(),
+    }));
+    assert!(h.speech.spoken().is_empty());
+    assert_eq!(done_of(&signals).0, TurnStatus::Completed);
+    {
+        let requests = h.backend.requests.lock();
+        assert_eq!(requests[0].extras.tools, vec![tool.clone()]);
+        assert_eq!(
+            requests[0].extras.instructions.as_deref(),
+            Some("Be brief.")
+        );
+        assert!(requests[0].extras.items.is_empty());
+    }
+
+    // Its output, then a run the client asks for with no words of the caller.
+    let output = json!({"type": "function_call_output", "call_id": "call_1", "output": "shipped"});
+    h.engine.add_input(output.clone());
+    h.backend.push(Ok(vec![
+        created("resp_2"),
+        delta("It has shipped."),
+        completed(),
+    ]));
+    h.engine.respond(String::new(), None).await;
+    let signals = until_done(&mut h, 1).await;
+    assert!(signals.contains(&AgentSignal::ResponseStarted {
+        turn: 1,
+        kind: TurnKind::Agent,
+        input: None,
+    }));
+    assert_eq!(h.speech.spoken(), vec!["It has shipped."]);
+    {
+        let requests = h.backend.requests.lock();
+        assert_eq!(requests[1].input, "");
+        assert_eq!(requests[1].extras.items, vec![output]);
+        assert_eq!(requests[1].body()["input"][0]["call_id"], "call_1");
+    }
+
+    // The item went with that run only; instructions for one response replace the session's.
+    h.backend.push(Ok(vec![
+        created("resp_3"),
+        delta("Your table is booked."),
+        completed(),
+    ]));
+    h.engine
+        .respond(
+            String::new(),
+            Some("Say exactly: Your table is booked.".into()),
+        )
+        .await;
+    until_done(&mut h, 2).await;
+    let requests = h.backend.requests.lock();
+    assert!(requests[2].extras.items.is_empty());
+    assert_eq!(
+        requests[2].extras.instructions.as_deref(),
+        Some("Say exactly: Your table is booked.")
+    );
+    assert_eq!(requests[2].body()["input"], json!([]));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_function_call_of_the_agents_own_is_still_its_tool() {
+    let mut h = harness(entry(json!({})), None, false);
+    // The session declared another function: this one is budprompt's.
+    h.engine
+        .set_client_tools(vec![json!({"type": "function", "name": "lookup_order"})]);
+    let mut run = vec![created("resp_1")];
+    run.extend(function_call("refund", "call_9"));
+    run.extend([delta("Done."), completed()]);
+    h.backend.push(Ok(run));
+    h.engine.start_turn("refund it".into()).await;
+    let signals = until_done(&mut h, 0).await;
+    let statuses: Vec<_> = signals
+        .iter()
+        .filter_map(|s| match s {
+            AgentSignal::Tool { status, name, .. } if name == "refund" => Some(*status),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(statuses, vec!["in_progress", "completed"]);
+    assert!(
+        !signals
+            .iter()
+            .any(|s| matches!(s, AgentSignal::FunctionCall { .. }))
+    );
+    // A session that declared nothing sends nothing of its own.
+    let plain = harness(entry(json!({})), None, false);
+    plain.backend.push(Ok(vec![created("resp_1"), completed()]));
+    plain.engine.start_turn("hello".into()).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let requests = plain.backend.requests.lock();
+    assert_eq!(requests[0].extras, ClientExtras::default());
+    assert_eq!(requests[0].body()["input"], "hello");
+}

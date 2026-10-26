@@ -354,6 +354,39 @@ impl BaseTTS for OpenAITTS {
         Some(&mut self.provider)
     }
 
+    /// The request's `speed` (OpenAI and OpenAI-compatible servers, 0.25 to 4.0). The cache
+    /// key follows it, so audio cached at another rate is not reused.
+    fn set_speaking_rate(&mut self, rate: f32) -> bool {
+        let builder = &mut self.request_builder;
+        builder.config.speaking_rate = Some(rate);
+        builder.speed = rate.clamp(0.25, 4.0);
+        self.config_hash = compute_tts_config_hash(
+            &builder.config,
+            &builder.model,
+            &builder.voice,
+            builder.instructions.as_deref(),
+        );
+        true
+    }
+
+    fn takes_rate(&self) -> bool {
+        true
+    }
+
+    /// The request's `voice`, verbatim. The cache key follows it.
+    fn set_voice(&mut self, voice: &str) -> bool {
+        let builder = &mut self.request_builder;
+        builder.config.voice_id = Some(voice.to_owned());
+        builder.voice = voice.to_owned();
+        self.config_hash = compute_tts_config_hash(
+            &builder.config,
+            &builder.model,
+            &builder.voice,
+            builder.instructions.as_deref(),
+        );
+        true
+    }
+
     async fn connect(&mut self) -> TTSResult<()> {
         self.provider
             .generic_connect_with_config(

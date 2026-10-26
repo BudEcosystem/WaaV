@@ -237,6 +237,24 @@ impl CircuitBreaker {
         }
     }
 
+    /// Whether requests are refused now: open with its cooldown still running, or half-open
+    /// with its one probe out. A caller with somewhere else to go goes there. A pure read,
+    /// like [`state`](Self::state): it never claims the probe.
+    pub fn is_open(&self) -> bool {
+        if self.permanently_failed.load(Ordering::Acquire) {
+            let opened = self.fatal_opened_at_ns.load(Ordering::Acquire);
+            return now_ns().saturating_sub(opened) < self.config.fatal_cooldown.as_nanos() as u64;
+        }
+        match self.state.load(Ordering::Acquire) {
+            STATE_HALF_OPEN => true,
+            STATE_OPEN => {
+                let opened = self.opened_at_ns.load(Ordering::Acquire);
+                now_ns().saturating_sub(opened) < self.config.cooldown.as_nanos() as u64
+            }
+            _ => false,
+        }
+    }
+
     /// Whether a request (e.g. a reconnect attempt) may proceed *now*.
     ///
     /// - Closed → always `true`.

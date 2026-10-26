@@ -1,0 +1,7 @@
+{
+  "interaction": {
+    "enabled": true,
+    "memory": {"enabled": true, "identity": {"token_secret_file": "/run/secrets/memory", "max_age_s": 300}},
+    "personas_api": {"enabled": true}
+  }
+}

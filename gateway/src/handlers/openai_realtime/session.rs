@@ -15,6 +15,7 @@ use axum::extract::{Extension, State};
 use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use futures_util::{SinkExt, StreamExt};
+use serde_json::json;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message as UpMessage;
@@ -653,6 +654,8 @@ struct Relay<'a> {
     last_activity: Instant,
     client_missed: u32,
     vendor_missed: u32,
+    /// Interaction mode, when the operator's realtime block applies.
+    ix: Option<super::interaction::RelayIx>,
 }
 
 impl Relay<'_> {
@@ -752,6 +755,18 @@ impl Relay<'_> {
 
     async fn on_client_text(&mut self, raw: &str) -> Result<(), End> {
         self.last_activity = Instant::now();
+        // Interaction mode takes its own messages and keeps its function in session updates.
+        let owned = match self.ix.as_mut().map(|ix| ix.client(raw)) {
+            Some(Err(why)) => {
+                return self
+                    .refuse("invalid_event", why, Some("outcome"), None)
+                    .await;
+            }
+            Some(Ok(None)) => return Ok(()),
+            Some(Ok(Some(text))) => Some(text),
+            None => None,
+        };
+        let raw = owned.as_deref().unwrap_or(raw);
         match policy::client_event(raw, &self.p.rules) {
             ClientOutcome::Invalid(why) => {
                 self.refuse(
@@ -806,11 +821,17 @@ impl Relay<'_> {
         self.started = true;
         self.meter.set_vendor_session_id(vendor_session_id);
         let event_id = format!("evt_bud_defaults_{}", uuid::Uuid::new_v4().simple());
-        match policy::defaults_update(
+        let update = policy::defaults_update(
             self.p.settings.as_ref(),
             self.p.endpoint.model.as_deref(),
             &event_id,
-        ) {
+        );
+        // Interaction mode's function and instructions go in with the defaults.
+        let update = match &self.ix {
+            Some(ix) => Some(ix.defaults(update, &event_id)),
+            None => update,
+        };
+        match update {
             Some(update) => {
                 self.send_to_vendor(update).await?;
                 self.awaiting_defaults = Some(event_id);
@@ -823,6 +844,13 @@ impl Relay<'_> {
 
     async fn on_vendor_text(&mut self, raw: &str) -> Result<(), End> {
         self.last_activity = Instant::now();
+        // Interaction mode reads the vendor's words and keeps its function's frames.
+        let owned = match self.ix.as_mut().map(|ix| ix.vendor(raw)) {
+            Some(None) => return Ok(()),
+            Some(Some(text)) => Some(text),
+            None => None,
+        };
+        let raw = owned.as_deref().unwrap_or(raw);
         match policy::vendor_event(raw, &self.p.endpoint_name) {
             VendorOutcome::Drop => Ok(()),
             VendorOutcome::Invalid => self.to_client(raw.to_string()).await,
@@ -831,6 +859,11 @@ impl Relay<'_> {
                 match tap {
                     Tap::SessionCreated { vendor_session_id } => {
                         self.to_client(text).await?;
+                        if let Some(ix) = &self.ix {
+                            let state = json!({ "interaction": ix.echo });
+                            self.to_client(super::cascade::event("bud.interaction.state", state))
+                                .await?;
+                        }
                         self.session_started(vendor_session_id).await
                     }
                     Tap::ConversationCreated { vendor_session_id } => {
@@ -1013,6 +1046,23 @@ async fn run(state: Arc<AppState>, p: Prepared, socket: WebSocket, slot: Option<
         last_activity: now,
         client_missed: 0,
         vendor_missed: 0,
+        ix: None,
+    };
+    // Interaction mode: the session's verbs to the vendor, its events to the client.
+    // The id `GET /v1/tasks` reads them under.
+    let owner = crate::auth::bud_mode::auth_id(&p.caller.principal);
+    let (mut to_vendor, mut to_client) = match super::interaction::prepare(
+        &vendor,
+        p.endpoint.model.as_deref(),
+        &session_id,
+        &owner,
+        &state,
+    ) {
+        Some((ix, channels)) => {
+            relay.ix = Some(ix);
+            (Some(channels.to_vendor), Some(channels.to_client))
+        }
+        None => (None, None),
     };
     let mut ping = tokio::time::interval_at(now + timings.ping, timings.ping);
     let mut revalidate = tokio::time::interval_at(now + timings.revalidate, timings.revalidate);
@@ -1064,6 +1114,16 @@ async fn run(state: Arc<AppState>, p: Prepared, socket: WebSocket, slot: Option<
                     }
                 }
             }
+            Some(frame) = recv(&mut to_vendor) => relay.send_to_vendor(frame).await,
+            Some(frame) = recv(&mut to_client) => {
+                // Interaction mode's `bud.session.failed` (the vendor stayed down, chapter 10)
+                // is the session's last event.
+                let failed = super::interaction::is_session_failed(&frame);
+                match relay.to_client(frame).await {
+                    Ok(()) if failed => Err(End::new("session_failed", 1011)),
+                    other => other,
+                }
+            }
             _ = revalidate.tick() => relay.revalidate().await,
             _ = tokio::time::sleep_until(idle_at) => Err(End::new("idle", 1000)
                 .with_error("session_expired", format!("The session was idle for {} s.", idle.as_secs()))),
@@ -1098,6 +1158,9 @@ async fn run(state: Arc<AppState>, p: Prepared, socket: WebSocket, slot: Option<
             relay.meter.duration_segment(secs);
         }
     }
+    if let Some(ix) = relay.ix.take() {
+        ix.shutdown();
+    }
     let Relay {
         meter, mut up_tx, ..
     } = relay;
@@ -1113,6 +1176,14 @@ async fn run(state: Arc<AppState>, p: Prepared, socket: WebSocket, slot: Option<
     .await;
     finish(meter, end, &client_tx, writer, Some(&session_id), &vendor).await;
     drop(p);
+}
+
+/// The next message of an optional channel; never, without one.
+async fn recv<T>(rx: &mut Option<mpsc::UnboundedReceiver<T>>) -> Option<T> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
 }
 
 /// The common teardown: the error event and close, the session record, the metrics.

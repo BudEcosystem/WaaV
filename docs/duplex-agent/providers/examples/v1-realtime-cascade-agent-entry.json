@@ -1,0 +1,10 @@
+{
+  "id": "support",
+  "session_overrides": ["interaction.front.caller.verbosity", "interaction.front.caller.pace", "interaction.events.floor"],
+  "interaction": {
+    "front": {"profile": "auto", "persona": "acme-support@3", "say_mode": "compose"},
+    "tasks": {"default_backend": "bud_agent", "speculative_start": "auto"},
+    "policy": {"ack_due_ms": 300, "agreed_wait_max_ms": 600000},
+    "events": {"ga_mcp_approvals": true}
+  }
+}

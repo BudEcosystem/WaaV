@@ -6,6 +6,7 @@
 import type { STTResultMessage, ErrorMessage, TTSAudioMessage, ReadyMessage, ResolvedAlias, ConfigWarningMessage } from '../types/messages.js';
 import type { MetricsSummary } from '../types/metrics.js';
 import type { ReconnectState } from './reconnect.js';
+import type { InteractionEcho, InteractionEvent } from '../types/interaction.js';
 
 export type { ConfigWarningEvent, ConfigWarningCode } from '../types/warnings.js';
 import type { ConfigWarningEvent } from '../types/warnings.js';
@@ -113,6 +114,12 @@ export interface ReadyEvent {
    * {@link audioInCodec} — decode opus only when this is `'opus'`.
    */
   audioOutCodec?: string;
+  /**
+   * Interaction mode: the resolved settings (wire names). Present only when the session runs
+   * the mode; `protocolVersion` is then `1.1`. Absent when it was refused (a `configWarning`
+   * says why).
+   */
+  interaction?: InteractionEcho;
   /** Original message for advanced use */
   raw: ReadyMessage;
 }
@@ -220,6 +227,11 @@ export interface SessionEventMap {
    * developer can see and fix it.
    */
   configWarning: ConfigWarningEvent;
+  /**
+   * Interaction mode (protocol 1.1): one task, floor, audio, settings or transcript event per
+   * frame, in the gateway's wire shape. Switch on `event.type`.
+   */
+  interaction: InteractionEvent;
   /** Connection state changed */
   connectionState: ConnectionStateEvent;
   /** Metrics updated */

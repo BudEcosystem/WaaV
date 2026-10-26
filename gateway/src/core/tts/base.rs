@@ -143,6 +143,12 @@ impl AudioData {
     }
 }
 
+/// The `Retry-After` part of a rate-limit message, when the vendor sent one.
+fn retry_after(secs: Option<u64>) -> String {
+    secs.map(|s| format!(" (retry after {s} s)"))
+        .unwrap_or_default()
+}
+
 /// TTS-specific error types
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum TTSError {
@@ -170,7 +176,7 @@ pub enum TTSError {
     #[error("Internal error: {0}")]
     InternalError(String),
 
-    #[error("Rate limited: retry after {retry_after_secs:?} seconds")]
+    #[error("Rate limited: {message}{}", retry_after(*.retry_after_secs))]
     RateLimited {
         /// Seconds to wait before retrying (from Retry-After header)
         retry_after_secs: Option<u64>,
@@ -548,6 +554,32 @@ pub trait BaseTTS: Send + Sync {
     async fn set_req_manager(&mut self, _req_manager: Arc<ReqManager>) {
         // Default no-op for providers that don't use HTTP pooling
     }
+
+    /// Change the speaking rate (1.0 is normal) for the syntheses that follow, mid-session.
+    /// Returns `false` when the provider takes no rate this way (the default).
+    fn set_speaking_rate(&mut self, _rate: f32) -> bool {
+        false
+    }
+
+    /// Whether [`Self::set_speaking_rate`] takes a rate (the default: no).
+    fn takes_rate(&self) -> bool {
+        false
+    }
+
+    /// Whether `text`'s audio is in the speech cache, so speaking it asks the vendor nothing
+    /// (the generic provider's cache; `false` without one).
+    async fn has_cached(&mut self, text: &str) -> bool {
+        match self.get_provider() {
+            Some(provider) => provider.has_cached(text).await,
+            None => false,
+        }
+    }
+
+    /// Change the voice for the syntheses that follow, mid-session (a language switch).
+    /// Returns `false` when the provider takes no voice this way (the default).
+    fn set_voice(&mut self, _voice: &str) -> bool {
+        false
+    }
 }
 
 /// Helper function to create a boxed TTS trait object
@@ -577,6 +609,23 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use tokio::time::{Duration, sleep};
+
+    /// The vendor's message reaches the client; the wait only when the vendor named one.
+    #[test]
+    fn a_rate_limit_names_the_vendors_message_and_any_wait() {
+        let limited = |retry_after_secs| TTSError::RateLimited {
+            retry_after_secs,
+            message: "Too many concurrent requests. Current limit: 2".into(),
+        };
+        assert_eq!(
+            limited(None).to_string(),
+            "Rate limited: Too many concurrent requests. Current limit: 2"
+        );
+        assert_eq!(
+            limited(Some(3)).to_string(),
+            "Rate limited: Too many concurrent requests. Current limit: 2 (retry after 3 s)"
+        );
+    }
 
     struct MockTTS {
         state: ConnectionState,

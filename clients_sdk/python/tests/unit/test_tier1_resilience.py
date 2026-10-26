@@ -279,7 +279,8 @@ class TestD1StaleInboundWatchdog:
 
     @pytest.mark.asyncio
     async def test_watchdog_closes_on_stale_inbound(self):
-        # No inbound frames at all after ready -> the watchdog should fire fast.
+        # No inbound frames at all after ready -> the watchdog should fire fast, even though
+        # the transport still answers pings (a plain session is not given the pong exemption).
         ws = FakeWS(inbound=[])
         session = WebSocketSession(
             url="ws://localhost:3009/ws",
@@ -302,6 +303,29 @@ class TestD1StaleInboundWatchdog:
         assert ws.close_calls >= 1
         assert session._reconnecting_due_to_stale is True
         assert len(zombies) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_silent_socket_that_answers_a_ping_is_not_a_zombie(self):
+        # An interaction-mode session can be silent for longer than the window (its warm-up,
+        # an agreed wait): a pong on the same socket proves it alive.
+        ws = FakeWS(inbound=[])
+        session = WebSocketSession(
+            url="ws://localhost:3009/ws",
+            reconnect=ReconnectConfig(enabled=False),
+            stale_inbound_timeout=0.3,
+        )
+        session._ws = ws
+        session._connected = True
+        session._interaction_echo = {"regime": "A"}
+        session._last_inbound_monotonic = time.monotonic() - 5.0
+        zombies = []
+        session.on("zombie_detected", lambda d: zombies.append(d))
+        session._start_watchdog()
+        await asyncio.sleep(0.6)
+        still_watching = session._watchdog_task is not None and not session._watchdog_task.done()
+        session._stop_watchdog()
+        assert zombies == [] and ws.close_calls == 0 and ws.ping_calls >= 1
+        assert still_watching
 
     @pytest.mark.asyncio
     async def test_watchdog_quiet_when_inbound_fresh(self):
