@@ -309,7 +309,12 @@ impl DynamicPluginLoader {
             ))
         })?;
 
-        if !version_req.matches(&self.gateway_version) {
+        // A pre-release gateway (`1.0.0-rc.1`) is checked as the release it previews (`1.0.0`):
+        // a plugin built for 1.0.0 is what the rc exists to test, and semver alone refuses every
+        // `>=1.0.0` requirement for a pre-release.
+        let mut release = self.gateway_version.clone();
+        release.pre = semver::Prerelease::EMPTY;
+        if !version_req.matches(&release) {
             return Err(PluginLoadError::VersionIncompatible {
                 required: version_req_str.to_string(),
                 actual: self.gateway_version.to_string(),
@@ -612,6 +617,18 @@ mod tests {
                 None
             );
         }
+    }
+
+    #[test]
+    fn a_pre_release_gateway_loads_plugins_built_for_its_release() {
+        let loader = DynamicPluginLoader {
+            loaded_plugins: HashMap::new(),
+            gateway_version: semver::Version::parse("1.0.0-rc.1").unwrap(),
+        };
+        let manifest = PluginManifest::new("test", "Test", "1.0.0").with_gateway_version(">=1.0.0");
+        assert!(loader.check_version_compatibility(&manifest).is_ok());
+        let manifest = PluginManifest::new("test", "Test", "1.0.0").with_gateway_version(">=1.1.0");
+        assert!(loader.check_version_compatibility(&manifest).is_err());
     }
 
     #[test]
