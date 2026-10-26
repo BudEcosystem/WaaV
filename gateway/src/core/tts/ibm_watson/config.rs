@@ -733,6 +733,8 @@ impl IbmWatsonTTSConfig {
         if self.instance_id.is_empty() {
             return Err("Instance ID is required".to_string());
         }
+        // The instance id is the synthesize URL's path segment (`/instances/{id}/v1/synthesize`).
+        crate::core::net::validate_path_segment("instance_id", &self.instance_id)?;
 
         // API key is required
         if self.base.api_key.is_empty() {
@@ -950,6 +952,21 @@ mod tests {
         let cfg = IbmWatsonTTSConfig::from_standard(&std).unwrap();
         assert_eq!(cfg.rate_percentage, Some(-15)); // native knob, not speed-derived
         assert_eq!(cfg.pitch_percentage, Some(40)); // native knob, not pitch-derived
+    }
+
+    #[test]
+    fn an_instance_id_cannot_leave_its_path_segment() {
+        let mut config = IbmWatsonTTSConfig {
+            instance_id: "0f9c-4e2b".to_string(),
+            base: TTSConfig {
+                api_key: "k".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+        config.instance_id = "../../other/v1/customizations".to_string();
+        assert!(config.validate().unwrap_err().contains("instance_id"));
     }
 
     #[test]

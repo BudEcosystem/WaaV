@@ -247,6 +247,22 @@ pub fn shared_http_client(
 /// `allowed_schemes` must be lowercase (the URL's scheme is lowercased before
 /// comparison). Returns `Ok(())` for safe URLs, or a human-readable reason why
 /// the URL was rejected. See the module docs for the full rule set.
+/// A client value a provider puts into its URL's PATH (a voice id, an instance id) must be one
+/// segment of plain identifier characters. Unchecked, `../../voices/<id>/edit` or a `?` aims the
+/// request (carrying the operator's key) at another endpoint of the same vendor. Percent-encoding
+/// is not enough: URL parsers treat `%2e%2e` as `..`. `field` names the value in the error.
+pub fn validate_path_segment(field: &str, value: &str) -> Result<(), String> {
+    let plain = value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~'));
+    if value.is_empty() || !plain || value.chars().all(|c| c == '.') {
+        return Err(format!(
+            "{field} must be an identifier (letters, digits, '-', '_', '.', '~'), got {value:?}"
+        ));
+    }
+    Ok(())
+}
+
 pub fn validate_url_for_ssrf(url: &str, allowed_schemes: &[&str]) -> Result<(), String> {
     validate_url_for_ssrf_inner(
         url,
@@ -1005,5 +1021,30 @@ mod tests {
     fn url_without_host_rejected() {
         let _guard = env_guard();
         assert!(validate_url_for_ssrf("unix:/tmp/x.sock", &["unix"]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod path_segment_tests {
+    use super::validate_path_segment;
+
+    #[test]
+    fn a_path_segment_is_a_plain_identifier() {
+        for ok in ["21m00Tcm4TlvDq8ikWAM", "0f9c-4e2b_x", "v1.2~a"] {
+            assert!(validate_path_segment("voice_id", ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "",
+            ".",
+            "..",
+            "../../voices/x/edit",
+            "a/b",
+            "a?b=c",
+            "a#b",
+            "%2e%2e",
+            "a b",
+        ] {
+            assert!(validate_path_segment("voice_id", bad).is_err(), "{bad}");
+        }
     }
 }
