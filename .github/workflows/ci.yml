@@ -384,14 +384,29 @@ jobs:
       CARTESIA_API_KEY: ${{ secrets.CARTESIA_API_KEY }}
       HUME_API_KEY: ${{ secrets.HUME_API_KEY }}
       GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+      AZURE_SPEECH_SUBSCRIPTION_KEY: ${{ secrets.AZURE_SPEECH_SUBSCRIPTION_KEY }}
+      AZURE_SPEECH_REGION: ${{ secrets.AZURE_SPEECH_REGION }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with: { workspaces: gateway }
       - uses: ./.github/actions/native-deps
-      - name: run #[ignore]d real-provider tests for providers whose secret is present
-        run: cargo test --release --test real_provider_tests -- --ignored --test-threads=1
+      - name: "run the #[ignore]d real-provider tests for providers whose secret is present"
+        # A provider without its secret is skipped by name (every test names its provider) and
+        # listed in the log. Its tests used to panic instead, so this job failed on every main
+        # run and hid real regressions behind a missing Azure secret.
+        run: |
+          skip=()
+          for pair in deepgram:DEEPGRAM_API_KEY elevenlabs:ELEVENLABS_API_KEY openai:OPENAI_API_KEY \
+                      cartesia:CARTESIA_API_KEY azure:AZURE_SPEECH_SUBSCRIPTION_KEY azure:AZURE_SPEECH_REGION; do
+            provider=${pair%%:*}; var=${pair#*:}
+            if [ -z "${!var}" ]; then
+              echo "::notice::skipping $provider real-provider tests: secret $var is not set"
+              skip+=(--skip "$provider")
+            fi
+          done
+          cargo test --release --test real_provider_tests -- --ignored --test-threads=1 "${skip[@]}"
 
   # ---------------------------------------------------------------------------------------
   # required: single aggregate context for branch protection. It fails if ANY gating job
