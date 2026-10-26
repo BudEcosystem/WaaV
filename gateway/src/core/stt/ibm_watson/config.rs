@@ -672,6 +672,10 @@ impl IbmWatsonSTTConfig {
         if let Some(endpoint) = self.endpoint_override.as_deref() {
             validate_ibm_stt_endpoint("endpoint_override", endpoint)?;
         }
+        // The instance id is the recognize URL's path segment (`/instances/{id}/v1/recognize`).
+        if !self.instance_id.is_empty() {
+            crate::core::net::validate_path_segment("instance_id", &self.instance_id)?;
+        }
         Ok(())
     }
 
@@ -1082,6 +1086,22 @@ mod tests {
             IbmModel::Custom("en-US_Telephony".to_string())
         );
         assert_eq!(config.model.as_str(), "en-US_Telephony");
+    }
+
+    #[test]
+    fn an_instance_id_cannot_leave_its_path_segment() {
+        let mut config = IbmWatsonSTTConfig {
+            instance_id: "test-instance-123".to_string(),
+            ..Default::default()
+        };
+        assert!(config.validate_endpoint_override().is_ok());
+        config.instance_id = "x/../../v1/models?y=".to_string();
+        assert!(
+            config
+                .validate_endpoint_override()
+                .unwrap_err()
+                .contains("instance_id")
+        );
     }
 
     #[test]
