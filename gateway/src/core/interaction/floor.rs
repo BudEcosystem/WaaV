@@ -20,6 +20,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use super::config::InteractionConfig;
+use super::guard;
 use super::persona::Persona;
 use super::policy::GOING_ON_MS;
 use super::types::{
@@ -52,6 +53,16 @@ const PREEMPT_MAX_MS: Ms = 400;
 const URGENT_PAUSE_MS: Ms = 250;
 /// Agent lines kept for the echo filter.
 const LINES_KEPT: usize = 8;
+/// A bank line that shares a phrase with a line the agent said this recently is passed over
+/// for another of its bank ([`FloorMachine::fresh`]): "a few seconds", longer than the
+/// holding line's silence (`hold_after_silence_ms`, 8 s).
+const SAID_LATELY_MS: Ms = 10_000;
+/// A relayed sentence that an urgent question cut once the caller had heard this share of
+/// its characters is not said again after the question ([`FloorMachine::finish_cut`]). Just
+/// under half: the heard estimate ends at the last whole word before the playout position
+/// less the pump's lead, so it trails what was played. Live (take 15) 3.9 s of a 6.9 s
+/// sentence had played, about 61 of its 123 characters by that estimate.
+const MOSTLY_HEARD_PERCENT: usize = 45;
 /// What the agent says to "say that again" when the caller has heard nothing yet.
 const NOTHING_TO_REPEAT: Say = Say::Bank {
     group: "clarify",
@@ -494,7 +505,7 @@ impl FloorMachine {
                 .clone()
                 .or_else(|| self.last_heard.clone())
                 .or_else(|| self.persona.resolve(&NOTHING_TO_REPEAT, utt.0)),
-            say => self.persona.resolve(say, utt.0),
+            say => self.fresh(now, say, utt.0),
         };
         let text = said.unwrap_or_default();
         let cmd = FloorCmd::Submit {
@@ -552,15 +563,28 @@ impl FloorMachine {
         self.last_line_at().filter(|_| !self.last_interrupted)
     }
 
-    pub fn snapshot(&self) -> FloorSnapshot {
+    /// The agent's recent lines, each with when it ended; a line still playing ends "now".
+    pub fn recent_agent_lines(&self) -> Vec<(Ms, String)> {
         let mut recent_agent_lines: Vec<(Ms, String)> = self.lines.iter().cloned().collect();
-        // A line still playing ends "now".
         recent_agent_lines.extend(
             self.active
                 .iter()
                 .filter(|active| active.started)
                 .map(|active| (self.clock, active.text.clone())),
         );
+        recent_agent_lines
+    }
+
+    /// A line the agent said apart from the floor (a failure line the pump played, chapter
+    /// 10), which ended at `at`: it joins the heard timeline, so a line said next does not
+    /// repeat its words ([`FloorMachine::fresh`]) and the echo filter knows it.
+    pub fn said_apart(&mut self, at: Ms, line: String) {
+        self.clock = self.clock.max(at);
+        self.remember(at, line, false);
+    }
+
+    pub fn snapshot(&self) -> FloorSnapshot {
+        let recent_agent_lines = self.recent_agent_lines();
         FloorSnapshot {
             floor: self.floor(),
             agent_audible: self.active.iter().any(Active::audible),
@@ -1005,14 +1029,25 @@ impl FloorMachine {
             if active.utterance.discard {
                 continue;
             }
-            if owed(active.utterance.kind) {
+            let heard_chars = heard
+                .iter()
+                .find(|(utt, _)| *utt == active.utt)
+                .map_or(0, |(_, chars)| *chars);
+            // A relayed sentence the caller heard most of is not said again whole after the
+            // question that cut it; one cut early is. Live (take 15): "One's checking the
+            // GitHub release, one's pulling the download numbers in the terminal, and one's
+            // drafting the announcement." played from 30.2 s until a confirmation cut it at
+            // 34.05 s (3.9 s of its 6.9 s), and was said again in full at 45.5 s after "Okay.
+            // Anyway,".
+            let total = active.text.chars().count();
+            let mostly = active.started
+                && requeue
+                && active.utterance.kind == Kind::Relay
+                && heard_chars * 100 >= total * MOSTLY_HEARD_PERCENT;
+            if owed(active.utterance.kind) && !mostly {
                 back.push(active.utterance.clone());
             }
             if active.started {
-                let heard_chars = heard
-                    .iter()
-                    .find(|(utt, _)| *utt == active.utt)
-                    .map_or(0, |(_, chars)| *chars);
                 self.out.push(LaneEvent::Dropped {
                     item,
                     heard_chars,
@@ -1084,6 +1119,29 @@ impl FloorMachine {
         if self.parked == Some(item) {
             self.parked = None;
         }
+    }
+
+    /// The words of `say`, the `n`th in its bank's rotation, unless that line shares a phrase
+    /// with a line the agent said in the last [`SAID_LATELY_MS`]: then the next in the
+    /// rotation that does not (the rotation's own pick when every one does). Live (take 15):
+    /// "Thanks for waiting, I'm back." at 20.2 s, then the holding line "Still working on it,
+    /// thanks for waiting." at 22.3 s.
+    fn fresh(&self, now: Ms, say: &Say, n: u64) -> Option<String> {
+        let lately: Vec<&str> = self
+            .lines
+            .iter()
+            .filter(|(at, _)| *at + SAID_LATELY_MS > now)
+            .map(|(_, line)| line.as_str())
+            .collect();
+        let count = self.persona.bank_choices(say) as u64;
+        if lately.is_empty() || count < 2 {
+            return self.persona.resolve(say, n);
+        }
+        let repeats = |line: &String| lately.iter().any(|said| guard::shares_phrase(line, said));
+        (n..n + count)
+            .filter_map(|n| self.persona.resolve(say, n))
+            .find(|line| !repeats(line))
+            .or_else(|| self.persona.resolve(say, n))
     }
 
     fn remember(&mut self, at: Ms, line: String, interrupted: bool) {
@@ -1340,6 +1398,133 @@ mod tests {
         let (_, item, text) = submitted(&mut floor, at + 3_000).unwrap();
         assert_eq!((item, text.as_str()), (ItemId(1), first));
         assert_eq!(floor.relay_items(), vec![ItemId(1)]);
+    }
+
+    /// Live (launch demo take 15): a relayed sentence played from 30.2 s until a confirmation
+    /// cut it at 34.05 s, 3.9 s of its 6.9 s heard, and after the question it was said again
+    /// in full ("Okay. Anyway, One's checking the GitHub release, ..."). A sentence the caller
+    /// heard most of is not said again; what had not started yet still resumes.
+    #[test]
+    fn an_urgent_question_does_not_say_again_a_sentence_mostly_heard() {
+        let first = "One's checking the GitHub release, one's pulling the download numbers in \
+                     the terminal, and one's drafting the announcement.";
+        let cut_after = |heard: usize, second: bool| {
+            let mut floor = machine();
+            floor.set_speech_rate(0.015);
+            floor.offer(0, sentence(1, 1, first, !second));
+            if second {
+                floor.offer(
+                    0,
+                    sentence(1, 2, "I'll tell you what each one finds.", true),
+                );
+            }
+            let (playing, ..) = submitted(&mut floor, 0).unwrap();
+            floor.on_pump(0, PumpEvent::SynthDone { utt: playing });
+            floor.on_pump(
+                100,
+                PumpEvent::Started {
+                    utt: playing,
+                    at: 100,
+                },
+            );
+            if second {
+                let (queued, ..) = submitted(&mut floor, 100).unwrap();
+                floor.on_pump(150, PumpEvent::SynthDone { utt: queued });
+            }
+            let question = Utterance {
+                kind: Kind::Confirm,
+                question: Some(HitlId("q1".to_owned())),
+                ..line(9, RANK_URGENT, "To confirm: save the document.")
+            };
+            floor.offer(3_900, question);
+            // Rendered ahead, then cut at the next word end.
+            let mut ahead = None;
+            let at = (3_900..6_000)
+                .find(|now| {
+                    let cmds = floor.next_cmds(*now);
+                    for cmd in &cmds {
+                        if let FloorCmd::Prerender { utt, .. } = cmd {
+                            ahead = Some(*utt);
+                        }
+                    }
+                    cmds.contains(&FloorCmd::Cut(CutCause::PreEmpted))
+                })
+                .expect("cut for the question");
+            let events = floor.on_cut(at, CutCause::PreEmpted, &[(playing, heard)]);
+            if let Some(utt) = ahead {
+                floor.on_pump(at, PumpEvent::SynthDone { utt });
+            }
+            (floor, events)
+        };
+        // 61 of its 123 characters heard: not said again, and nothing of the answer is left
+        // to resume (no "Anyway," then: the policy says it only for a queued relay).
+        let (floor, events) = cut_after(61, false);
+        assert_eq!(
+            events,
+            vec![LaneEvent::Dropped {
+                item: ItemId(1),
+                heard_chars: 61,
+                cause: CutCause::PreEmpted
+            }]
+        );
+        assert_eq!(floor.relay_items(), vec![]);
+        // The sentence after it, not yet heard, still resumes after the question.
+        let (mut floor, _) = cut_after(61, true);
+        assert_eq!(floor.relay_items(), vec![ItemId(1)]);
+        let (_, item, text) = submitted(&mut floor, 6_000).unwrap();
+        assert_eq!(
+            (item, text.as_str()),
+            (ItemId(9), "To confirm: save the document.")
+        );
+        let pending: Vec<&str> = floor
+            .pending
+            .iter()
+            .map(|queued| match &queued.say {
+                Say::Verbatim(text) => text.as_str(),
+                _ => "",
+            })
+            .collect();
+        assert_eq!(pending, ["I'll tell you what each one finds."]);
+        // Cut early, it is said again, as before.
+        let (floor, _) = cut_after(20, false);
+        assert_eq!(floor.relay_items(), vec![ItemId(1)]);
+    }
+
+    /// Live (launch demo take 15): "Thanks for waiting, I'm back." (a failure line, said
+    /// apart from the floor) at 20.2 s, then the holding line "Still working on it, thanks
+    /// for waiting." at 22.3 s. A bank line that shares a phrase with a line said lately gives
+    /// way to the next of its bank.
+    #[test]
+    fn a_bank_line_does_not_repeat_a_phrase_just_said() {
+        let hold = |floor: &mut FloorMachine, now: Ms| {
+            let utterance = Utterance {
+                kind: Kind::Hold,
+                say: Say::Bank {
+                    group: "holding",
+                    intent: None,
+                },
+                ..line(1, 8, "")
+            };
+            floor.offer(now, utterance);
+            submitted(floor, now).unwrap().2
+        };
+        // The rotation's own pick for the first utterance.
+        let alone = hold(&mut machine(), 1_000);
+        assert_eq!(alone, "Still working on it, thanks for waiting.");
+        let mut floor = machine();
+        floor.said_apart(20_200, "Thanks for waiting, I'm back.".to_owned());
+        let said = hold(&mut floor, 22_300);
+        assert_eq!(said, "I'm still on it.");
+        assert!(
+            floor
+                .snapshot()
+                .recent_agent_lines
+                .contains(&(20_200, "Thanks for waiting, I'm back.".to_owned()))
+        );
+        // Long enough after it, the rotation's pick again.
+        let mut floor = machine();
+        floor.said_apart(1_000, "Thanks for waiting, I'm back.".to_owned());
+        assert_eq!(hold(&mut floor, 1_000 + SAID_LATELY_MS), alone);
     }
 
     /// An urgent line in synthesis ahead of its cut holds the provider: nothing is submitted

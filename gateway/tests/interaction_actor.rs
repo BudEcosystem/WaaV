@@ -2830,7 +2830,10 @@ async fn a_card_number_is_declined_and_never_reaches_the_background() {
 #[serial]
 async fn a_cut_holding_line_stays_out_of_the_next_tasks_history() {
     let rig = Rig::start(Opts::default()).await;
-    rig.llm.push(Round::text(120_000, 20, &["It shipped."]));
+    // The run's first words come at once (no stall line, whose own lines put the holding
+    // line off) and its sentence ends long after.
+    rig.llm
+        .push(Round::text(300, 120_000, &["It ", "shipped."]));
     rig.llm.push(answer(300));
     rig.ready().await;
     rig.turn("where is my order").await;
@@ -2853,18 +2856,12 @@ async fn a_cut_holding_line_stays_out_of_the_next_tasks_history() {
     rig.until_heard("It closes at six.").await;
 
     // What the second task's run was told of the call: both requests and the acknowledgement
-    // the caller heard in full, not the start of the holding line. The first run's silence
-    // played a stall line (chapter 10), noted in the history.
+    // the caller heard in full, not the start of the holding line.
     let requests = rig.llm.requests();
     let second = requests.last().unwrap();
     assert_eq!(
         ix_mocks::messages(second, "user"),
-        [
-            "where is my order",
-            "[the background failed; the agent said: Sorry, my systems are acting up. Bear with \
-             me a moment.]",
-            "what time does the store open"
-        ]
+        ["where is my order", "what time does the store open"]
     );
     assert_eq!(
         ix_mocks::messages(second, "assistant"),

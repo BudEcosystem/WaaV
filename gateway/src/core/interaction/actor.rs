@@ -1028,7 +1028,8 @@ struct Actor {
     /// plays, the exit under way and whether the session is over for it.
     failure_lines: Vec<FailureEntry>,
     watcher: Watcher,
-    failure_playing: Vec<UttId>,
+    /// The failure lines playing, with their words.
+    failure_playing: Vec<(UttId, String)>,
     failure_next: u64,
     exiting: Option<(Service, Ms)>,
     closed: bool,
@@ -1892,14 +1893,23 @@ impl Actor {
                 return;
             }
             // A line said because a service failed (chapter 10).
-            PumpEvent::Started { utt, .. } if self.failure_playing.contains(&utt) => {
+            PumpEvent::Started { utt, .. } if self.failure_at(utt).is_some() => {
                 self.segment(now, "start", utt, "front", Kind::Failure, None);
+                // The agent is speaking: no holding line is due over it, nor right after it.
+                self.policy.spoke_apart(now);
                 return;
             }
             PumpEvent::Idle { utt, .. } | PumpEvent::Failed { utt }
-                if self.failure_playing.contains(&utt) =>
+                if self.failure_at(utt).is_some() =>
             {
-                self.failure_playing.retain(|playing| *playing != utt);
+                if let Some(at) = self.failure_at(utt) {
+                    let (_, said) = self.failure_playing.remove(at);
+                    // In the heard timeline, so the next line does not say its words again.
+                    if matches!(event, PumpEvent::Idle { .. }) {
+                        self.floor.said_apart(now, said);
+                        self.policy.spoke_apart(now);
+                    }
+                }
                 self.segment(now, "end", utt, "front", Kind::Failure, None);
                 if self.exiting.is_some() && self.failure_playing.is_empty() {
                     self.finish_exit(now);
@@ -2154,13 +2164,24 @@ impl Actor {
                 Some(server) => {
                     let summary = &outcome.summary;
                     let language = persona.language();
-                    front_model::narrate(server, &[], &title, summary, None, language, budget).await
+                    let narrated = front_model::narrate(
+                        server,
+                        &[],
+                        &title,
+                        summary,
+                        None,
+                        language,
+                        None,
+                        budget,
+                    );
+                    narrated.await
                 }
                 None => None,
             };
             // No template (chapter 9): the narrator's line, else the summary alone.
-            let say = policy::spoken_update(&persona, &title, &outcome.summary, "", line, false);
-            outcome.update = say.and_then(|say| persona.resolve(&say, 0));
+            let say =
+                policy::spoken_update(&persona, &title, &outcome.summary, "", line, false, &[]);
+            outcome.update = say.ok().and_then(|say| persona.resolve(&say, 0));
             tasks::store().deliver(&stored, outcome, left, secret);
         });
     }
@@ -2347,7 +2368,9 @@ impl Actor {
         self.policy
             .set_floor(self.floor.quiet(), self.cfg.hitl_client && !phone);
         let left = self.floor.chars_left() as f64 / self.rate.chars_per_ms().max(1e-3);
-        self.policy.set_speech(left as Ms, self.floor.relay_items());
+        let said = self.floor.recent_agent_lines();
+        self.policy
+            .set_speech(left as Ms, self.floor.relay_items(), said);
         let actions = self.policy.step(now, input, &self.registry.board());
         if let Some(event) = task_event {
             // What was not said of a stopped or cancelled answer is never heard.
@@ -2458,6 +2481,12 @@ impl Actor {
         });
         let mut turns: Vec<(bool, String)> = spoken.take(2).collect();
         turns.reverse();
+        // Its last line did not give its own result, and was most likely one of these lines
+        // copied (live, take 15: the writer task's update, said as the browser task's): asked
+        // again, the front sees the task and its result alone.
+        if matches!(narration.retry, Some("repeated" | "no_result")) {
+            turns.clear();
+        }
         // The front's budget, for an update as for a follow-up question: there is no template
         // to fall back to (chapter 9) and an update without a line waits for its next slot. A
         // budget of its own (1.2 s) ran out in 24 of the 53 narrations of the r4-verify runs
@@ -2473,11 +2502,12 @@ impl Actor {
                 title,
                 summary,
                 question,
+                retry,
             } = narration;
             let question = question.as_deref();
             let language = persona.language();
             let line = front_model::narrate(
-                &server, &turns, &title, &summary, question, language, budget,
+                &server, &turns, &title, &summary, question, language, retry, budget,
             )
             .await;
             let ms = u64::try_from(asked.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -4492,7 +4522,7 @@ impl Actor {
         self.failure_next += 1;
         let played = self.ctl.play(audio.clone(), utt);
         if played {
-            self.failure_playing.push(utt);
+            self.failure_playing.push((utt, said.text.clone()));
         }
         info!(
             stream_id = %self.stream_id,
@@ -4526,13 +4556,20 @@ impl Actor {
         self.updated_with(Vec::new(), Vec::new(), Some(failure));
     }
 
+    /// Where failure line `utt` is in [`Actor::failure_playing`], while it plays.
+    fn failure_at(&self, utt: UttId) -> Option<usize> {
+        self.failure_playing
+            .iter()
+            .position(|(playing, _)| *playing == utt)
+    }
+
     /// The caller speaks over a stall or back line: it fades out (never over the caller).
     /// The exit line is not stopped.
     fn stop_failure_line(&mut self, now: Ms) {
         if self.exiting.is_some() {
             return;
         }
-        for utt in std::mem::take(&mut self.failure_playing) {
+        for (utt, _) in std::mem::take(&mut self.failure_playing) {
             self.ctl.fade_out(utt, CLIP_FADE_MS);
             self.segment(now, "end", utt, "front", Kind::Failure, None);
         }

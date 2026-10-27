@@ -350,6 +350,8 @@ struct Update {
     offered: bool,
     /// The narrator gave no line for it this many times.
     tries: u8,
+    /// The rule that refused the narrator's last line for it.
+    refused: Option<&'static str>,
 }
 
 impl Update {
@@ -506,6 +508,9 @@ pub struct Policy {
     /// before each step).
     left_ms: Ms,
     queued: Vec<ItemId>,
+    /// The agent's recent lines and when each ended (the floor's heard timeline, before each
+    /// step): what a task's update may not say again.
+    said: Vec<(Ms, String)>,
     /// The results of finished tasks, for follow-ups.
     results: VecDeque<(TaskId, String)>,
     /// The session has an orchestrator with agents, whose questions may break in.
@@ -567,6 +572,7 @@ impl Policy {
             deferred: None,
             left_ms: 0,
             queued: Vec::new(),
+            said: Vec::new(),
             results: VecDeque::new(),
             orchestrated: cfg.tasks.orchestrator.is_some() && !cfg.tasks.agents.is_empty(),
             last_update: None,
@@ -579,10 +585,20 @@ impl Policy {
         }
     }
 
-    /// What the floor holds still to be heard: how long it lasts and its items, as of now.
-    pub fn set_speech(&mut self, left_ms: Ms, queued: Vec<ItemId>) {
+    /// What the floor holds still to be heard: how long it lasts and its items, and the
+    /// agent's recent lines, as of now.
+    pub fn set_speech(&mut self, left_ms: Ms, queued: Vec<ItemId>, said: Vec<(Ms, String)>) {
         self.left_ms = left_ms;
         self.queued = queued;
+        self.said = said;
+    }
+
+    /// The agent said a line apart from the floor (a failure line the pump played, chapter
+    /// 10), from `at` on: the holding line counts its silence from there. Live (take 15) a
+    /// holding line due from the wait's silence played right after "Thanks for waiting, I'm
+    /// back.": "Still working on it, thanks for waiting." (20.2 s, 22.3 s).
+    pub fn spoke_apart(&mut self, at: Ms) {
+        self.last_speech = self.last_speech.max(at);
     }
 
     /// The registry's board as the floor and the turn rules see it: a question waiting for a
@@ -1985,6 +2001,7 @@ impl Policy {
                     title: title.clone(),
                     summary: summary.clone(),
                     question: Some(text.clone()),
+                    retry: None,
                 }));
                 self.answering.push(Answering {
                     item,
@@ -2703,6 +2720,7 @@ impl Policy {
                     at: now,
                     offered: false,
                     tries: 0,
+                    refused: None,
                 });
             }
             TaskEventKind::Progress { text } => {
@@ -2807,6 +2825,7 @@ impl Policy {
                             at: now,
                             offered: false,
                             tries: 0,
+                            refused: None,
                         });
                     }
                     (true, None) => out.push(PolicyAction::Speak(
@@ -2879,6 +2898,7 @@ impl Policy {
                         at: now,
                         offered: false,
                         tries: 0,
+                        refused: None,
                     });
                     return;
                 }
@@ -3163,6 +3183,7 @@ impl Policy {
                     title: update.title.clone(),
                     summary: update.summary.clone(),
                     question: None,
+                    retry: update.refused,
                 }));
                 self.narrating.push((item, update, reply_to));
             }
@@ -3191,7 +3212,7 @@ impl Policy {
         if let Some(at) = self.answering.iter().position(|asked| asked.item == item) {
             let asked = self.answering.swap_remove(at);
             let source = format!("{} {} {}", asked.title, asked.summary, asked.text);
-            let checked = line.filter(|line| {
+            let checked = line.map(|line| guard::fit_narration(&line)).filter(|line| {
                 guard::narration(line, &source) == GuardOutcome::Pass
                     && carries_result(line, &asked.summary, &asked.text)
             });
@@ -3225,17 +3246,27 @@ impl Policy {
             caller,
             line,
             self.screen,
+            &self.said,
         );
-        let Some(say) = checked else {
-            // No fallback (chapter 9): with no line the front worded and the check passed,
-            // the update waits for the next slot, at most three times; the client has the
-            // result (`task_result`, `task_output`) whatever is said of it.
-            let tries = update.tries + 1;
-            tracing::debug!(task = %update.task.0, tries, "interaction update not worded");
-            if tries < NARRATION_TRIES {
-                self.inbox.push(Update { tries, ..update });
+        let say = match checked {
+            Ok(say) => say,
+            Err(rule) => {
+                // No fallback (chapter 9): with no line the front worded and the check
+                // passed, the update waits for the next slot, at most three times, and the
+                // narrator is told why its line was not used; the client has the result
+                // (`task_result`, `task_output`) whatever is said of it.
+                let tries = update.tries + 1;
+                tracing::debug!(task = %update.task.0, tries, rule, "interaction update not worded");
+                if tries < NARRATION_TRIES {
+                    let refused = Some(rule).filter(|rule| *rule != NO_LINE);
+                    self.inbox.push(Update {
+                        tries,
+                        refused,
+                        ..update
+                    });
+                }
+                return;
             }
-            return;
         };
         let line = Utterance {
             item,
@@ -3492,9 +3523,20 @@ impl Policy {
     }
 }
 
-/// What is said of a task's result: the narrator's `line` when it passes the check against
-/// the title, the result and the caller's latest words; `None` otherwise (there is no template
-/// to fall back to, chapter 9). With a screen the line points at it.
+/// The rule [`spoken_update`] names when the narrator gave no line at all.
+const NO_LINE: &str = "no_line";
+
+/// What is said of a task's result: the narrator's `line`, cut to the narration's length at a
+/// clause boundary when it is longer (`guard::fit_narration`), when it passes the check
+/// against the title, the result and the caller's latest words, says something of its own
+/// result ([`carries_result`]) and does not say again one of the agent's recent lines
+/// (`said`, the floor's heard timeline); otherwise the rule it broke (there is no template to
+/// fall back to, chapter 9). With a screen the line points at it.
+///
+/// Live (launch demo take 15, 27 Oct): the narrator is shown the call's last two lines, and
+/// for the browser task's update the 2B model copied the line just said of the writer task.
+/// Only the fact check applied, the copy passed it, and the writer's result was said a second
+/// time, as the browser task's update.
 pub fn spoken_update(
     persona: &Persona,
     title: &str,
@@ -3502,14 +3544,26 @@ pub fn spoken_update(
     caller: &str,
     line: Option<String>,
     screen: bool,
-) -> Option<Say> {
+    said: &[(Ms, String)],
+) -> Result<Say, &'static str> {
+    let line = guard::fit_narration(&line.ok_or(NO_LINE)?);
     let source = format!("{title} {summary} {caller}");
-    let line = line.filter(|line| guard::narration(line, &source) == GuardOutcome::Pass)?;
+    if let GuardOutcome::Blocked(rule) = guard::narration(&line, &source) {
+        return Err(rule);
+    }
+    // The title is the request: a line made of its words ("I checked the GitHub release")
+    // says nothing of the result.
+    if !carries_result(&line, summary, title) {
+        return Err("no_result");
+    }
+    if said.iter().any(|(_, said)| guard::repeats(&line, said)) {
+        return Err("repeated");
+    }
     if !screen {
-        return Some(Say::Front(line));
+        return Ok(Say::Front(line));
     }
     let more = persona.resolve(&template("update.screen"), 0);
-    Some(Say::Front(
+    Ok(Say::Front(
         format!("{line} {}", more.unwrap_or_default())
             .trim()
             .to_owned(),
@@ -4218,6 +4272,23 @@ mod tests {
         let kinds: Vec<Kind> = spoken(&actions).iter().map(|line| line.kind).collect();
         assert_eq!(kinds, [Kind::ChoiceOffer]);
         assert!(policy.step(30_000, PolicyInput::Tick, &board).is_empty());
+    }
+
+    /// Live (launch demo take 15): "Thanks for waiting, I'm back." (a failure line the pump
+    /// plays, apart from the floor) at 20.2 s, then the holding line due from the wait's
+    /// silence at 22.3 s. A line said apart counts as speech: the hold waits 8 s from its end.
+    #[test]
+    fn a_line_said_apart_from_the_floor_puts_the_holding_line_off() {
+        let mut policy = policy();
+        let board = working();
+        policy.step(1_000, PolicyInput::Tick, &board);
+        assert_eq!(policy.next_wakeup(), Some(9_000));
+        policy.spoke_apart(8_200);
+        policy.spoke_apart(10_300);
+        assert!(policy.step(9_000, PolicyInput::Tick, &board).is_empty());
+        assert!(policy.step(18_299, PolicyInput::Tick, &board).is_empty());
+        let actions = policy.step(18_300, PolicyInput::Tick, &board);
+        assert_eq!(spoken(&actions)[0].kind, Kind::Hold, "{actions:?}");
     }
 
     #[test]
@@ -6963,6 +7034,107 @@ mod tests {
         );
     }
 
+    /// Live (launch demo take 15, 27 Oct): the terminal task's 22-word line was refused for
+    /// its length on all three tries, the same line each time, and the update was never said.
+    #[test]
+    fn a_long_update_is_cut_at_a_clause_and_a_refused_one_is_retried_with_its_reason() {
+        let counts = "I got the counts with no errors: the x86 Linux build has zero downloads, \
+                      the ARM Linux build twelve, and the checksums file fourteen, so the builds \
+                      total twelve.";
+        let title = "Pull the download numbers: Run curl -s";
+        let board = tree(&[("t2", title)]);
+        let mut policy = policy();
+        let done = event_of("t2", true, 10_000, TaskState::Completed, completed(counts));
+        let first = policy.step(10_000, done, &board);
+        let [narration] = narrations(&first)[..] else {
+            panic!("narrated at once");
+        };
+        assert_eq!(narration.retry, None);
+        let item = narration.item;
+        let line = Some(
+            "The x86 Linux build has zero downloads, the ARM Linux build twelve, and the \
+             checksums file fourteen, so the builds total twelve."
+                .to_owned(),
+        );
+        let said = policy.step(10_300, PolicyInput::Narrated { item, line }, &board);
+        assert_eq!(
+            words(&said),
+            [
+                "The x86 Linux build has zero downloads, the ARM Linux build twelve, and the \
+              checksums file fourteen."
+            ]
+        );
+
+        // A line that cannot be cut is refused; at the next slot the narrator is told why.
+        let mut policy = self::policy();
+        let done = event_of("t2", true, 10_000, TaskState::Completed, completed(counts));
+        let item = narrations(&policy.step(10_000, done, &board))[0].item;
+        let line = Some(
+            "The x86 Linux build and the ARM Linux build and the checksums file were all \
+             downloaded twelve or fourteen or zero times in total today."
+                .to_owned(),
+        );
+        let again = policy.step(10_300, PolicyInput::Narrated { item, line }, &board);
+        assert!(spoken(&again).is_empty(), "{again:?}");
+        // The conversation is idle: this is the next slot.
+        let [retry] = narrations(&again)[..] else {
+            panic!("asked again at the next slot, got {again:?}");
+        };
+        assert_eq!(retry.retry, Some("narration_length"));
+        // No line at all is no reason to tell.
+        let item = retry.item;
+        let third = policy.step(10_600, PolicyInput::Narrated { item, line: None }, &board);
+        assert_eq!(narrations(&third)[0].retry, None);
+    }
+
+    /// Live (launch demo take 15): for the browser task's update the narrator copied the
+    /// writer task's update, the call's last line, and it was said again as the browser
+    /// task's (64.4 s). An update must say its own result, and nothing the agent just said.
+    #[test]
+    fn an_update_that_repeats_a_recent_line_or_lacks_its_result_is_not_said() {
+        let release = "Version one point one point oh is published as Latest; highlights include \
+                       interaction mode, eleven more voice vendors, and SDK fixes.";
+        let writer = "The launch announcement has been saved with highlights from the release \
+                      notes instead of a placeholder.";
+        let board = tree(&[("t2", "Check the GitHub release: Open")]);
+        let mut policy = policy();
+        policy.set_speech(
+            0,
+            Vec::new(),
+            vec![(9_000, format!("{writer} The details are on your screen."))],
+        );
+        let done = event_of("t2", true, 10_000, TaskState::Completed, completed(release));
+        let item = narrations(&policy.step(10_000, done, &board))[0].item;
+        // The copy passes the fact check ("highlights" is in both results) but repeats.
+        let copy = Some(writer.to_owned());
+        let again = policy.step(10_300, PolicyInput::Narrated { item, line: copy }, &board);
+        assert!(spoken(&again).is_empty(), "{again:?}");
+        let [retry] = narrations(&again)[..] else {
+            panic!("asked again");
+        };
+        assert_eq!(retry.retry, Some("repeated"));
+        // A line about the task instead of its result says nothing of it either.
+        let item = retry.item;
+        let about = Some("I checked the GitHub release for you.".to_owned());
+        let third = policy.step(10_600, PolicyInput::Narrated { item, line: about }, &board);
+        assert!(spoken(&third).is_empty(), "{third:?}");
+        let [retry] = narrations(&third)[..] else {
+            panic!("asked a third time");
+        };
+        assert_eq!(retry.retry, Some("no_result"));
+        // Its own result is said.
+        let item = retry.item;
+        let own = "Version one point one point oh is published as Latest, with SDK fixes.";
+        let line = Some(own.to_owned());
+        let said = policy.step(10_900, PolicyInput::Narrated { item, line }, &board);
+        assert_eq!(words(&said), [own]);
+        assert!(!super::carries_result(
+            "I checked the GitHub release for you.",
+            release,
+            "Check the GitHub release: Open"
+        ));
+    }
+
     #[test]
     fn tell_screen_and_the_callers_own_word_decide_how_an_update_is_said() {
         let board = tree(&[("t2", FLIGHT)]);
@@ -7102,7 +7274,7 @@ mod tests {
         // Six seconds of the answer are still to be heard: an 8 s deadline cannot wait for
         // the slot after it. The question breaks in, at the urgent rank, with its lead-in.
         policy.set_floor(false, false);
-        policy.set_speech(6_000, vec![lima]);
+        policy.set_speech(6_000, vec![lima], Vec::new());
         let actions = policy.step(2_000, question_event(2_000, &request), &board);
         let lines = spoken(&actions);
         assert_eq!(lines.len(), 2, "{actions:?}");
@@ -7146,7 +7318,7 @@ mod tests {
         let board = seat_asked(&request);
         let lima = answering(&mut policy, 1_000, &board);
         policy.set_floor(false, false);
-        policy.set_speech(3_000, vec![lima]);
+        policy.set_speech(3_000, vec![lima], Vec::new());
         let actions = policy.step(2_000, question_event(2_000, &request), &board);
         let lines = spoken(&actions);
         assert_eq!(lines.len(), 1, "{actions:?}");
@@ -7192,7 +7364,7 @@ mod tests {
         let board = seat_asked(&request);
         let lima = answering(&mut policy, 1_000, &board);
         policy.set_floor(false, false);
-        policy.set_speech(1_000, vec![lima]);
+        policy.set_speech(1_000, vec![lima], Vec::new());
         let actions = policy.step(2_000, question_event(2_000, &request), &board);
         assert!(spoken(&actions).is_empty(), "{actions:?}");
         // The floor and the turn rules do not see it yet; a quiet floor brings a look.
@@ -7212,7 +7384,7 @@ mod tests {
         };
         policy.step(2_600, PolicyInput::Lane(heard), &board);
         policy.set_floor(true, false);
-        policy.set_speech(0, Vec::new());
+        policy.set_speech(0, Vec::new(), Vec::new());
         let actions = policy.step(2_600, PolicyInput::Tick, &board);
         let lines = spoken(&actions);
         assert_eq!(lines.len(), 1, "no lead-in at a slot: {actions:?}");
@@ -7231,7 +7403,7 @@ mod tests {
         let lima = answering(&mut policy, 1_000, &board);
         // The caller speaks the whole time: it never breaks in over them, and expires.
         policy.set_floor(false, false);
-        policy.set_speech(0, vec![lima]);
+        policy.set_speech(0, vec![lima], Vec::new());
         policy.step(1_900, PolicyInput::UserSpeaking { on: true }, &board);
         let actions = policy.step(2_000, question_event(2_000, &request), &board);
         let lines = spoken(&actions);

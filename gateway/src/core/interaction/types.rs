@@ -1226,6 +1226,9 @@ pub struct Narration {
     pub summary: String,
     /// The caller's question the result may answer (a follow-up); `None` for an update.
     pub question: Option<String>,
+    /// The rule that refused the narrator's last line for this update, which it is told on
+    /// this try; `None` on the first.
+    pub retry: Option<&'static str>,
 }
 
 #[cfg(test)]

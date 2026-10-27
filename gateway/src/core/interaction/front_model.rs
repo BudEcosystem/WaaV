@@ -1804,28 +1804,103 @@ pub async fn warm_interims(server: &FrontModelServer, persona: &Persona) {
 
 // ---- the narrator (chapter 8)
 
-const NARRATOR_SYSTEM: &str = "You tell a caller on the phone that one of their tasks has a \
-    result. Write one short sentence of at most 20 words that fits what was just said and gives \
-    the result. Keep every time, date, number and code the result gives, as it gives them. Use \
-    only facts of the result: never add a number, a name, a time or a link it does not have. No \
-    greeting and no question.";
-
-/// One sentence, ended at its first full stop.
-const NARRATOR_GRAMMAR: &str = "root ::= [A-Z] [^\\n.!?]{2,160} [.!]\n";
+/// What the narrator is asked: one sentence of at most [`guard::NARRATION_MAX_WORDS`] words,
+/// the limit the guard keeps too (see [`sentence_grammar`]).
+fn narrator_system() -> String {
+    let max = guard::NARRATION_MAX_WORDS;
+    format!(
+        "You tell a caller on the phone that one of their tasks has a result. Write one short \
+         sentence of at most {max} words that fits what was just said and gives the result. \
+         Keep every time, date, number and code the result gives, as it gives them. Use only \
+         facts of the result: never add a number, a name, a time or a link it does not have. \
+         No greeting and no question."
+    )
+}
 
 /// A follow-up question about a finished task, answered from its result alone.
-const ANSWER_SYSTEM: &str = "You answer a caller's question on the phone from the result of one \
-    of their tasks. Write one short sentence of at most 20 words that answers the question with \
-    facts of the result only: never add a number, a name, a time or a link it does not have. When \
-    the result does not answer the question, write exactly: NONE.";
+fn answer_system() -> String {
+    let max = guard::NARRATION_MAX_WORDS;
+    format!(
+        "You answer a caller's question on the phone from the result of one of their tasks. \
+         Write one short sentence of at most {max} words that answers the question with facts \
+         of the result only: never add a number, a name, a time or a link it does not have. \
+         When the result does not answer the question, write exactly: NONE."
+    )
+}
+
+const NO_ANSWER: &str = "NONE.";
+
+/// One sentence of words, ended at its full stop, as the guard reads it: a point between two
+/// digits ("version 1.1.0", "2.5") is part of a word, not the end of the sentence (live, take
+/// 15: the old grammar, `[A-Z] [^\n.!?]{2,160} [.!]`, ended the browser task's line at "The
+/// GitHub release for version 1."). With `none` the answer narrator's "NONE." too.
+///
+/// The grammar bounds no length: the prompt asks for [`guard::NARRATION_MAX_WORDS`] words,
+/// `guard::fit_narration` cuts a longer line at a clause boundary within them and the guard
+/// refuses what it cannot cut. A bound in the grammar cannot end a sentence well: probed on
+/// the 2B front (take 15's results, a ceiling of 30 words), the model ran its words together
+/// once it reached the bound ("eleven more voice vendors,SDKfixes,allthreeexpectedfiles...")
+/// to end its sentence at the full stop it was forced to; without one it wrote the same
+/// sentences with every word apart.
+fn sentence_grammar(none: bool) -> String {
+    let chars = "[^ \\n.!?]";
+    let dotted = format!("{chars}* [0-9] (\".\" [0-9]+)+ {chars}*");
+    let root = match none {
+        true => format!("\"{NO_ANSWER}\" | sentence"),
+        false => "sentence".to_owned(),
+    };
+    format!(
+        "root ::= {root}\nsentence ::= [A-Z] head (\" \" word)* [.!]\n\
+         head ::= {chars}* | {dotted}\nword ::= {chars}+ | {dotted}\n"
+    )
+}
+
+/// The narrator's grammar: one sentence (see [`sentence_grammar`]).
+fn narrator_grammar() -> &'static str {
+    static GRAMMAR: OnceLock<String> = OnceLock::new();
+    GRAMMAR.get_or_init(|| sentence_grammar(false))
+}
 
 /// One sentence, or the word that says the result does not answer the question.
-const ANSWER_GRAMMAR: &str = "root ::= \"NONE.\" | [A-Z] [^\\n.!?]{2,160} [.!]\n";
-const NO_ANSWER: &str = "NONE.";
+fn answer_grammar() -> &'static str {
+    static GRAMMAR: OnceLock<String> = OnceLock::new();
+    GRAMMAR.get_or_init(|| sentence_grammar(true))
+}
+
+/// Why the narrator's last line for this update was not said, as it is told on the next
+/// try: asked again the same way, the 2B model wrote the same line (live, take 15: the
+/// terminal task's 22-word line on all three tries). Probed on take 15's inputs, a copy of the
+/// call's last line gave way to the task's own result once the note was given and the call's
+/// lines left out (the actor's `narrate`); the 22-word line came back as it was, and
+/// `guard::fit_narration` cuts it. `None` for a rule it is not told about.
+fn retry_note(rule: &str) -> Option<String> {
+    let why = match rule {
+        "narration_length" | "narration_unfinished" => format!(
+            "it was too long; write at most {} words",
+            guard::NARRATION_MAX_WORDS
+        ),
+        "repeated" | "no_result" => {
+            "it did not give this task's own result; give the result above, not a line \
+             already said"
+                .to_owned()
+        }
+        "number_not_given" | "name_not_given" | "link" => {
+            "it had a number, a name or a link the result does not have; keep them as the \
+             result gives them"
+                .to_owned()
+        }
+        "narration_sentences" => "it was more than one sentence".to_owned(),
+        _ => return None,
+    };
+    Some(format!(
+        "Your last sentence for this result was not used: {why}."
+    ))
+}
 
 /// The narrator's request: the last turns of the call (`true`: the caller's), the task's title
 /// and its result. On a pack of another language than English (`language`, the pack's code)
-/// the line is asked for in that language.
+/// the line is asked for in that language. `retry`: the rule that refused its last line for
+/// this update, which it is told ([`retry_note`]).
 fn narration_body(
     server: &FrontModelServer,
     turns: &[(bool, String)],
@@ -1833,6 +1908,7 @@ fn narration_body(
     summary: &str,
     question: Option<&str>,
     language: &str,
+    retry: Option<&str>,
 ) -> Value {
     let lines: Vec<String> = turns
         .iter()
@@ -1853,12 +1929,16 @@ fn narration_body(
             sanitise(question, SAID_MAX_CHARS)
         ));
     }
+    if let Some(note) = retry.and_then(retry_note) {
+        user.push('\n');
+        user.push_str(&note);
+    }
     let (system, grammar) = match question {
-        Some(_) => (ANSWER_SYSTEM, ANSWER_GRAMMAR),
-        None => (NARRATOR_SYSTEM, NARRATOR_GRAMMAR),
+        Some(_) => (answer_system(), answer_grammar()),
+        None => (narrator_system(), narrator_grammar()),
     };
     let system = match language {
-        "en" | "" => system.to_owned(),
+        "en" | "" => system,
         code => format!(
             "{system} Write the sentence in {}.",
             super::controls::language_name(code)
@@ -1875,7 +1955,10 @@ fn narration_body(
             // A model whose template opens a thinking block (Qwen3.5) would write the line as
             // its reasoning: live, every line came back as `reasoning_content`, content empty.
             "chat_template_kwargs": { "enable_thinking": false },
-            "max_tokens": 48,
+            // Room for a sentence somewhat past the limit to end its clause (the 2B front's
+            // longest in take 15 took about 50 tokens): `guard::fit_narration` cuts it at a
+            // clause boundary. A line this budget cuts is cut there too, or refused.
+            "max_tokens": 72,
             "cache_prompt": true,
             "temperature": 0.2,
             "seed": 42,
@@ -1901,7 +1984,9 @@ fn narrating(server: &FrontModelServer) -> Arc<tokio::sync::Mutex<()>> {
 
 /// The front model's wording of a task's update, or with `question` its answer to the
 /// caller's question from the result; `None` when it has none within `budget`, or the result
-/// does not answer the question. The caller checks the line before it is said.
+/// does not answer the question. The caller checks the line before it is said. `retry`: the
+/// rule that refused its last line for this update.
+#[allow(clippy::too_many_arguments)]
 pub async fn narrate(
     server: &FrontModelServer,
     turns: &[(bool, String)],
@@ -1909,12 +1994,13 @@ pub async fn narrate(
     summary: &str,
     question: Option<&str>,
     language: &str,
+    retry: Option<&str>,
     budget: Duration,
 ) -> Option<String> {
     // One at a time on the lane's slot, each with its own budget.
     let turn = narrating(server);
     let _turn = turn.lock().await;
-    let body = narration_body(server, turns, title, summary, question, language);
+    let body = narration_body(server, turns, title, summary, question, language, retry);
     let asked = async {
         let response = post(server, &body).await.ok()?;
         response.json::<Value>().await.ok()
@@ -2822,7 +2908,7 @@ SAID: \u{ab}Okay, I'll look into a flight from Boston to Denver.\u{bb}"
         // the persona's prompt, and the reading does not wait behind the turn's line.
         assert_eq!(reading_body(&server, &reading)["id_slot"], 1);
         assert_eq!(
-            narration_body(&server, &[], "your flight", "Booked.", None, "en")["id_slot"],
+            narration_body(&server, &[], "your flight", "Booked.", None, "en", None)["id_slot"],
             1
         );
         set_slots(&server, 1);
@@ -5151,7 +5237,7 @@ SAID: \u{ab}Okay, I'll look into a flight from Boston to Denver.\u{bb}"
         let budget = Duration::from_millis(600);
         let line = |title: &'static str| {
             let server = server.clone();
-            async move { narrate(&server, &[], title, "Booked.", None, "en", budget).await }
+            async move { narrate(&server, &[], title, "Booked.", None, "en", None, budget).await }
         };
         let (first, second) = tokio::join!(line("your table"), line("your flight"));
         assert_eq!(
@@ -5512,9 +5598,10 @@ SAID: \u{ab}Okay, I'll look into a flight from Boston to Denver.\u{bb}"
             "Booked AI 101 at 9:40.",
             None,
             "en",
+            None,
         );
         assert_eq!(body["model"], "front");
-        assert_eq!(body["grammar"], NARRATOR_GRAMMAR);
+        assert_eq!(body["grammar"], narrator_grammar());
         assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
         let user = body["messages"][1]["content"].as_str().unwrap();
         assert_eq!(
@@ -5541,8 +5628,61 @@ SAID: \u{ab}Okay, I'll look into a flight from Boston to Denver.\u{bb}"
                 .unwrap()
                 .contains("Write the sentence in")
         );
+        // The prompt and the guard keep one limit (live, take 15: the grammar's 160
+        // characters ended a line at a version's point); the grammar lets the line end its
+        // clause, for `guard::fit_narration` to cut.
+        assert_eq!(guard::NARRATION_MAX_WORDS, 20);
+        assert_eq!(
+            narrator_grammar(),
+            "root ::= sentence\nsentence ::= [A-Z] head (\" \" word)* [.!]\n\
+             head ::= [^ \\n.!?]* | [^ \\n.!?]* [0-9] (\".\" [0-9]+)+ [^ \\n.!?]*\n\
+             word ::= [^ \\n.!?]+ | [^ \\n.!?]* [0-9] (\".\" [0-9]+)+ [^ \\n.!?]*\n"
+        );
+        assert!(answer_grammar().starts_with("root ::= \"NONE.\" | sentence\n"));
+        assert!(
+            answer_grammar()
+                .ends_with(narrator_grammar().trim_start_matches("root ::= sentence\n"))
+        );
+        let asked = narration_body(
+            &server,
+            &turns,
+            "your flight",
+            "Booked.",
+            Some("When?"),
+            "en",
+            None,
+        );
+        assert_eq!(asked["grammar"], answer_grammar());
+        assert!(
+            asked["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("at most 20 words")
+        );
+        // Asked again after a refused line, the narrator is told why.
+        let again = narration_body(
+            &server,
+            &[],
+            "your flight",
+            "Booked AI 101 at 9:40.",
+            None,
+            "en",
+            Some("narration_length"),
+        );
+        assert_eq!(
+            again["messages"][1]["content"],
+            "Task: \u{ab}your flight\u{bb}\nResult: \u{ab}Booked AI 101 at 9:40.\u{bb}\n\
+             Your last sentence for this result was not used: it was too long; write at most 20 \
+             words."
+        );
+        assert!(
+            retry_note("repeated")
+                .unwrap()
+                .contains("not a line already said")
+        );
+        assert_eq!(retry_note("no_line"), None);
         // On another pack's session the line is asked for in its language.
-        let hindi = narration_body(&server, &turns, "your flight", "Booked.", None, "hi");
+        let hindi = narration_body(&server, &turns, "your flight", "Booked.", None, "hi", None);
         let system = hindi["messages"][0]["content"].as_str().unwrap();
         assert!(system.ends_with(&format!(
             "Write the sentence in {}.",
