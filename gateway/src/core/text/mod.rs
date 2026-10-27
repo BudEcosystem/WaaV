@@ -2,7 +2,7 @@
 //!
 //! Centralizes text handling that was previously duplicated (and divergent)
 //! between the conversation pump and the DAG LLM node — see
-//! `PIPECAT_FIX_PLAN.md` cluster C.
+//! `docs/plans/PIPECAT_FIX_PLAN.md` cluster C.
 
 pub mod concat;
 pub mod markdown;

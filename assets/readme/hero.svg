@@ -1,0 +1,146 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="460" viewBox="0 0 1280 460" role="img" aria-labelledby="t d">
+  <title id="t">WaaV Gateway</title>
+  <desc id="d">Apps, phones and agents connect to WaaV, which reaches 70+ speech providers and your own models through one API.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#120B32"/>
+      <stop offset="0.55" stop-color="#1A1446"/>
+      <stop offset="1" stop-color="#0A2540"/>
+    </linearGradient>
+    <radialGradient id="glowV" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#8B5CF6" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#8B5CF6" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glowC" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#38BDF8" stop-opacity="0.35"/>
+      <stop offset="1" stop-color="#38BDF8" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="hub" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#B78CF7"/>
+      <stop offset="1" stop-color="#7C4DEB"/>
+    </linearGradient>
+    <linearGradient id="wave" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#7DD3FC"/>
+      <stop offset="0.5" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#7DD3FC"/>
+    </linearGradient>
+    <linearGradient id="line" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#38BDF8" stop-opacity="0.15"/>
+      <stop offset="1" stop-color="#A78BFA" stop-opacity="0.75"/>
+    </linearGradient>
+    <linearGradient id="lineOut" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#A78BFA" stop-opacity="0.75"/>
+      <stop offset="1" stop-color="#38BDF8" stop-opacity="0.15"/>
+    </linearGradient>
+    <filter id="soft" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="6"/>
+    </filter>
+    <clipPath id="card"><rect width="1280" height="460" rx="24"/></clipPath>
+  </defs>
+
+  <g clip-path="url(#card)">
+    <rect width="1280" height="460" fill="url(#bg)"/>
+    <circle cx="930" cy="230" r="260" fill="url(#glowV)"/>
+    <circle cx="160" cy="420" r="260" fill="url(#glowC)"/>
+    <!-- faint grid -->
+    <g stroke="#FFFFFF" stroke-opacity="0.04">
+      <path d="M0 92H1280M0 184H1280M0 276H1280M0 368H1280"/>
+      <path d="M160 0V460M320 0V460M480 0V460M640 0V460M800 0V460M960 0V460M1120 0V460"/>
+    </g>
+  </g>
+
+  <g font-family="Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+    <!-- headline -->
+    <rect x="64" y="72" width="214" height="30" rx="15" fill="#FFFFFF" fill-opacity="0.08" stroke="#A78BFA" stroke-opacity="0.5"/>
+    <circle cx="84" cy="87" r="5" fill="#34D399">
+      <animate attributeName="opacity" values="1;0.35;1" dur="2s" repeatCount="indefinite"/>
+    </circle>
+    <text x="98" y="92" font-size="14" font-weight="600" fill="#E9DDFF">New in 1.1 · Interaction mode</text>
+
+    <text x="64" y="168" font-size="46" font-weight="800" fill="#FFFFFF" letter-spacing="-1">The real-time voice</text>
+    <text x="64" y="222" font-size="46" font-weight="800" fill="#FFFFFF" letter-spacing="-1">gateway for <tspan fill="#C4B5FD">AI agents</tspan></text>
+    <text x="64" y="270" font-size="18" fill="#C7D2FE" fill-opacity="0.9">One API for 70+ speech providers, realtime voice</text>
+    <text x="64" y="296" font-size="18" fill="#C7D2FE" fill-opacity="0.9">models and your own LLMs. Self-hosted, written in Rust.</text>
+
+    <g font-size="14" font-weight="600" fill="#FFFFFF">
+      <rect x="64" y="332" width="140" height="34" rx="10" fill="#FFFFFF" fill-opacity="0.07" stroke="#FFFFFF" stroke-opacity="0.12"/>
+      <text x="134" y="354" text-anchor="middle">31 speech-to-text</text>
+      <rect x="214" y="332" width="140" height="34" rx="10" fill="#FFFFFF" fill-opacity="0.07" stroke="#FFFFFF" stroke-opacity="0.12"/>
+      <text x="284" y="354" text-anchor="middle">35 text-to-speech</text>
+      <rect x="364" y="332" width="160" height="34" rx="10" fill="#FFFFFF" fill-opacity="0.07" stroke="#FFFFFF" stroke-opacity="0.12"/>
+      <text x="444" y="354" text-anchor="middle">11 speech-to-speech</text>
+    </g>
+
+    <!-- clients -->
+    <g font-size="14" font-weight="600" fill="#E2E8F0">
+      <g transform="translate(560 108)">
+        <rect width="150" height="40" rx="12" fill="#0F172A" fill-opacity="0.65" stroke="#38BDF8" stroke-opacity="0.45"/>
+        <text x="75" y="25" text-anchor="middle">Web &amp; mobile apps</text>
+      </g>
+      <g transform="translate(560 168)">
+        <rect width="150" height="40" rx="12" fill="#0F172A" fill-opacity="0.65" stroke="#38BDF8" stroke-opacity="0.45"/>
+        <text x="75" y="25" text-anchor="middle">Phone calls (SIP)</text>
+      </g>
+      <g transform="translate(560 228)">
+        <rect width="150" height="40" rx="12" fill="#0F172A" fill-opacity="0.65" stroke="#38BDF8" stroke-opacity="0.45"/>
+        <text x="75" y="25" text-anchor="middle">LiveKit rooms</text>
+      </g>
+      <g transform="translate(560 288)">
+        <rect width="150" height="40" rx="12" fill="#0F172A" fill-opacity="0.65" stroke="#38BDF8" stroke-opacity="0.45"/>
+        <text x="75" y="25" text-anchor="middle">Agents &amp; LLM apps</text>
+      </g>
+    </g>
+
+    <!-- links into the hub -->
+    <g fill="none" stroke="url(#line)" stroke-width="2">
+      <path d="M710 128 C 770 128, 790 200, 846 216"/>
+      <path d="M710 188 C 770 188, 800 214, 846 224"/>
+      <path d="M710 248 C 770 248, 800 236, 846 236"/>
+      <path d="M710 308 C 770 308, 790 256, 846 244"/>
+    </g>
+    <!-- packets travelling in -->
+    <g fill="#7DD3FC">
+      <circle r="3.5"><animateMotion dur="2.4s" repeatCount="indefinite" path="M710 128 C 770 128, 790 200, 846 216"/></circle>
+      <circle r="3.5"><animateMotion dur="2.4s" begin="0.6s" repeatCount="indefinite" path="M710 248 C 770 248, 800 236, 846 236"/></circle>
+      <circle r="3.5"><animateMotion dur="2.4s" begin="1.2s" repeatCount="indefinite" path="M710 308 C 770 308, 790 256, 846 244"/></circle>
+    </g>
+
+    <!-- hub -->
+    <rect x="836" y="160" width="140" height="140" rx="30" fill="#A78BFA" opacity="0.6" filter="url(#soft)"/>
+    <rect x="840" y="160" width="132" height="132" rx="28" fill="url(#hub)"/>
+    <rect x="840" y="160" width="132" height="132" rx="28" fill="none" stroke="#FFFFFF" stroke-opacity="0.35"/>
+    <path d="M852 226 C 864 226, 868 196, 878 196 S 890 252, 900 252 S 910 196, 920 196 S 932 252, 942 252 S 952 226, 960 226"
+          fill="none" stroke="url(#wave)" stroke-width="5" stroke-linecap="round">
+      <animate attributeName="d" dur="1.6s" repeatCount="indefinite"
+        values="M852 226 C 864 226, 868 196, 878 196 S 890 252, 900 252 S 910 196, 920 196 S 932 252, 942 252 S 952 226, 960 226;
+                M852 226 C 864 226, 868 206, 878 206 S 890 242, 900 242 S 910 186, 920 186 S 932 262, 942 262 S 952 226, 960 226;
+                M852 226 C 864 226, 868 196, 878 196 S 890 252, 900 252 S 910 196, 920 196 S 932 252, 942 252 S 952 226, 960 226"/>
+    </path>
+    <text x="906" y="322" text-anchor="middle" font-size="18" font-weight="800" fill="#FFFFFF">WaaV</text>
+
+    <!-- links out to providers -->
+    <g fill="none" stroke="url(#lineOut)" stroke-width="2">
+      <path d="M972 214 C 1020 200, 1030 104, 1056 98"/>
+      <path d="M972 220 C 1024 214, 1034 152, 1056 148"/>
+      <path d="M972 226 C 1030 226, 1040 198, 1056 198"/>
+      <path d="M972 232 C 1030 232, 1040 248, 1056 248"/>
+      <path d="M972 238 C 1024 244, 1034 296, 1056 298"/>
+      <path d="M972 244 C 1020 258, 1030 344, 1056 348"/>
+    </g>
+    <g fill="#C4B5FD">
+      <circle r="3.5"><animateMotion dur="2.2s" begin="0.3s" repeatCount="indefinite" path="M972 220 C 1024 214, 1034 152, 1056 148"/></circle>
+      <circle r="3.5"><animateMotion dur="2.2s" begin="1.0s" repeatCount="indefinite" path="M972 232 C 1030 232, 1040 248, 1056 248"/></circle>
+      <circle r="3.5"><animateMotion dur="2.2s" begin="1.6s" repeatCount="indefinite" path="M972 244 C 1020 258, 1030 344, 1056 348"/></circle>
+    </g>
+
+    <!-- providers -->
+    <g font-size="14" font-weight="600" fill="#F1F5F9">
+      <g transform="translate(1056 80)"><rect width="176" height="36" rx="11" fill="#FFFFFF" fill-opacity="0.08" stroke="#A78BFA" stroke-opacity="0.45"/><text x="88" y="23" text-anchor="middle">Deepgram</text></g>
+      <g transform="translate(1056 130)"><rect width="176" height="36" rx="11" fill="#FFFFFF" fill-opacity="0.08" stroke="#A78BFA" stroke-opacity="0.45"/><text x="88" y="23" text-anchor="middle">ElevenLabs</text></g>
+      <g transform="translate(1056 180)"><rect width="176" height="36" rx="11" fill="#FFFFFF" fill-opacity="0.08" stroke="#A78BFA" stroke-opacity="0.45"/><text x="88" y="23" text-anchor="middle">OpenAI</text></g>
+      <g transform="translate(1056 230)"><rect width="176" height="36" rx="11" fill="#FFFFFF" fill-opacity="0.08" stroke="#A78BFA" stroke-opacity="0.45"/><text x="88" y="23" text-anchor="middle">Google · Azure · AWS</text></g>
+      <g transform="translate(1056 280)"><rect width="176" height="36" rx="11" fill="#FFFFFF" fill-opacity="0.08" stroke="#A78BFA" stroke-opacity="0.45"/><text x="88" y="23" text-anchor="middle">Your own LLMs</text></g>
+      <g transform="translate(1056 330)"><rect width="176" height="36" rx="11" fill="#FFFFFF" fill-opacity="0.04" stroke="#FFFFFF" stroke-opacity="0.25" stroke-dasharray="4 4"/><text x="88" y="23" text-anchor="middle" fill="#CBD5E1">+ 60 more</text></g>
+    </g>
+  </g>
+</svg>

@@ -1,0 +1,99 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="600" viewBox="0 0 1280 600" role="img" aria-labelledby="t d">
+  <title id="t">WaaV Gateway architecture</title>
+  <desc id="d">Clients connect over WebSocket, WebRTC, SIP and REST endpoints. Inside the gateway: interaction mode, the voice pipeline, DAG pipelines, realtime reasoning, segmented speech-to-text and aliases, on a shared production layer. The gateway reaches speech, speech-to-speech and language model providers, agents and local models.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#120B32"/>
+      <stop offset="0.6" stop-color="#17123F"/>
+      <stop offset="1" stop-color="#0A2540"/>
+    </linearGradient>
+    <linearGradient id="core" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2A1D63"/>
+      <stop offset="1" stop-color="#1B1748"/>
+    </linearGradient>
+    <linearGradient id="star" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#A78BFA"/>
+      <stop offset="1" stop-color="#7C3AED"/>
+    </linearGradient>
+    <clipPath id="card"><rect width="1280" height="600" rx="24"/></clipPath>
+  </defs>
+  <g clip-path="url(#card)"><rect width="1280" height="600" fill="url(#bg)"/></g>
+
+  <g font-family="Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+    <!-- column titles -->
+    <g font-size="12" font-weight="700" fill="#94A3B8" letter-spacing="1.5">
+      <text x="40" y="52">CLIENTS</text>
+      <text x="292" y="52">ENDPOINTS</text>
+      <text x="560" y="52">WAAV GATEWAY</text>
+      <text x="1030" y="52">PROVIDERS</text>
+    </g>
+
+    <!-- clients -->
+    <g font-size="14" font-weight="600" fill="#E2E8F0">
+      <g transform="translate(40 72)"><rect width="226" height="56" rx="12" fill="#0F172A" fill-opacity="0.7" stroke="#38BDF8" stroke-opacity="0.4"/><text x="16" y="25">Python &amp; TypeScript SDKs</text><text x="16" y="43" font-size="12" font-weight="400" fill="#94A3B8">typed events, agent helper</text></g>
+      <g transform="translate(40 140)"><rect width="226" height="56" rx="12" fill="#0F172A" fill-opacity="0.7" stroke="#38BDF8" stroke-opacity="0.4"/><text x="16" y="25">Web widget</text><text x="16" y="43" font-size="12" font-weight="400" fill="#94A3B8">voice in any web page</text></g>
+      <g transform="translate(40 208)"><rect width="226" height="56" rx="12" fill="#0F172A" fill-opacity="0.7" stroke="#38BDF8" stroke-opacity="0.4"/><text x="16" y="25">OpenAI clients</text><text x="16" y="43" font-size="12" font-weight="400" fill="#94A3B8">change the base URL only</text></g>
+      <g transform="translate(40 276)"><rect width="226" height="56" rx="12" fill="#0F172A" fill-opacity="0.7" stroke="#38BDF8" stroke-opacity="0.4"/><text x="16" y="25">LiveKit rooms &amp; SIP</text><text x="16" y="43" font-size="12" font-weight="400" fill="#94A3B8">WebRTC and phone calls</text></g>
+      <g transform="translate(40 344)"><rect width="226" height="56" rx="12" fill="#0F172A" fill-opacity="0.7" stroke="#38BDF8" stroke-opacity="0.4"/><text x="16" y="25">Any WebSocket or HTTP app</text><text x="16" y="43" font-size="12" font-weight="400" fill="#94A3B8">plain JSON protocol</text></g>
+    </g>
+
+    <!-- endpoints -->
+    <g font-family="'SFMono-Regular', Menlo, Consolas, 'DejaVu Sans Mono', monospace" font-size="13" fill="#E9DDFF">
+      <g transform="translate(292 72)"><rect width="244" height="40" rx="10" fill="#FFFFFF" fill-opacity="0.06" stroke="#A78BFA" stroke-opacity="0.45"/><text x="14" y="25">/ws</text><text x="230" y="25" text-anchor="end" font-family="Inter, Helvetica, Arial, sans-serif" font-size="12" fill="#A5B4FC">voice sessions</text></g>
+      <g transform="translate(292 122)"><rect width="244" height="40" rx="10" fill="#FFFFFF" fill-opacity="0.06" stroke="#A78BFA" stroke-opacity="0.45"/><text x="14" y="25">/realtime</text><text x="230" y="25" text-anchor="end" font-family="Inter, Helvetica, Arial, sans-serif" font-size="12" fill="#A5B4FC">speech-to-speech</text></g>
+      <g transform="translate(292 172)"><rect width="244" height="40" rx="10" fill="#FFFFFF" fill-opacity="0.06" stroke="#A78BFA" stroke-opacity="0.45"/><text x="14" y="25">/v1/realtime</text><text x="230" y="25" text-anchor="end" font-family="Inter, Helvetica, Arial, sans-serif" font-size="12" fill="#A5B4FC">OpenAI Realtime</text></g>
+      <g transform="translate(292 222)"><rect width="244" height="40" rx="10" fill="#FFFFFF" fill-opacity="0.06" stroke="#A78BFA" stroke-opacity="0.45"/><text x="14" y="25">/v1/audio/*</text><text x="230" y="25" text-anchor="end" font-family="Inter, Helvetica, Arial, sans-serif" font-size="12" fill="#A5B4FC">OpenAI Audio</text></g>
+      <g transform="translate(292 272)"><rect width="244" height="40" rx="10" fill="#FFFFFF" fill-opacity="0.06" stroke="#A78BFA" stroke-opacity="0.45"/><text x="14" y="25">/speak /voices</text><text x="230" y="25" text-anchor="end" font-family="Inter, Helvetica, Arial, sans-serif" font-size="12" fill="#A5B4FC">TTS &amp; voices</text></g>
+      <g transform="translate(292 322)"><rect width="244" height="40" rx="10" fill="#FFFFFF" fill-opacity="0.06" stroke="#A78BFA" stroke-opacity="0.45"/><text x="14" y="25">/transcribe/batch</text><text x="230" y="25" text-anchor="end" font-family="Inter, Helvetica, Arial, sans-serif" font-size="12" fill="#A5B4FC">files</text></g>
+      <g transform="translate(292 372)"><rect width="244" height="40" rx="10" fill="#FFFFFF" fill-opacity="0.06" stroke="#A78BFA" stroke-opacity="0.45"/><text x="14" y="25">/v1/tasks</text><text x="230" y="25" text-anchor="end" font-family="Inter, Helvetica, Arial, sans-serif" font-size="12" fill="#A5B4FC">agent tasks</text></g>
+    </g>
+
+    <!-- arrows clients to endpoints and endpoints to core -->
+    <g stroke="#38BDF8" stroke-opacity="0.35" stroke-width="2" fill="none">
+      <path d="M270 236 H 284"/>
+      <path d="M540 242 H 552"/>
+    </g>
+    <g fill="#38BDF8">
+      <path d="M284 230 l8 6 l-8 6z"/>
+      <path d="M552 236 l7 6 l-7 6z"/>
+    </g>
+
+    <!-- core -->
+    <rect x="560" y="64" width="440" height="470" rx="20" fill="url(#core)" stroke="#A78BFA" stroke-opacity="0.55"/>
+    <g font-size="15" font-weight="700" fill="#FFFFFF">
+      <g transform="translate(580 84)">
+        <rect width="400" height="92" rx="14" fill="url(#star)"/>
+        <text x="18" y="30" font-size="16">Interaction mode</text>
+        <rect x="312" y="12" width="74" height="24" rx="12" fill="#FFFFFF" fill-opacity="0.22"/>
+        <text x="349" y="29" text-anchor="middle" font-size="12">NEW 1.1</text>
+        <text x="18" y="56" font-size="13" font-weight="500" fill="#F5F3FF">Front model decides every turn · tasks run in the background</text>
+        <text x="18" y="76" font-size="13" font-weight="500" fill="#F5F3FF">barge-in · confirmations · caller controls · LiveKit &amp; phone</text>
+      </g>
+      <g font-weight="700">
+        <g transform="translate(580 192)"><rect width="192" height="84" rx="14" fill="#FFFFFF" fill-opacity="0.07" stroke="#FFFFFF" stroke-opacity="0.12"/><text x="16" y="30">Voice pipeline</text><text x="16" y="52" font-size="12" font-weight="400" fill="#C7D2FE">noise filter · VAD</text><text x="16" y="70" font-size="12" font-weight="400" fill="#C7D2FE">Smart Turn · streaming</text></g>
+        <g transform="translate(788 192)"><rect width="192" height="84" rx="14" fill="#FFFFFF" fill-opacity="0.07" stroke="#FFFFFF" stroke-opacity="0.12"/><text x="16" y="30">DAG pipelines</text><text x="16" y="52" font-size="12" font-weight="400" fill="#C7D2FE">routing · branches</text><text x="16" y="70" font-size="12" font-weight="400" fill="#C7D2FE">webhooks · gRPC · A/B</text></g>
+        <g transform="translate(580 290)"><rect width="192" height="84" rx="14" fill="#FFFFFF" fill-opacity="0.07" stroke="#FFFFFF" stroke-opacity="0.12"/><text x="16" y="30">Realtime reasoning</text><text x="16" y="52" font-size="12" font-weight="400" fill="#C7D2FE">fast + thinking tiers</text><text x="16" y="70" font-size="12" font-weight="400" fill="#C7D2FE">no dead air</text></g>
+        <g transform="translate(788 290)"><rect width="192" height="84" rx="14" fill="#FFFFFF" fill-opacity="0.07" stroke="#FFFFFF" stroke-opacity="0.12"/><text x="16" y="30">Segmented STT</text><text x="16" y="52" font-size="12" font-weight="400" fill="#C7D2FE">file-only models</text><text x="16" y="70" font-size="12" font-weight="400" fill="#C7D2FE">served live</text></g>
+        <g transform="translate(580 388)"><rect width="192" height="84" rx="14" fill="#FFFFFF" fill-opacity="0.07" stroke="#FFFFFF" stroke-opacity="0.12"/><text x="16" y="30">Aliases</text><text x="16" y="52" font-size="12" font-weight="400" fill="#C7D2FE">swap providers on the</text><text x="16" y="70" font-size="12" font-weight="400" fill="#C7D2FE">server, not in the app</text></g>
+        <g transform="translate(788 388)"><rect width="192" height="84" rx="14" fill="#FFFFFF" fill-opacity="0.07" stroke="#FFFFFF" stroke-opacity="0.12"/><text x="16" y="30">Speech-to-speech</text><text x="16" y="52" font-size="12" font-weight="400" fill="#C7D2FE">one protocol for 11</text><text x="16" y="70" font-size="12" font-weight="400" fill="#C7D2FE">realtime providers</text></g>
+      </g>
+      <text x="780" y="508" text-anchor="middle" font-size="12" font-weight="500" fill="#A5B4FC">auth · rate limits · caching · metrics · circuit breakers · egress control</text>
+    </g>
+
+    <!-- core to providers -->
+    <g stroke="#A78BFA" stroke-opacity="0.45" stroke-width="2" fill="none"><path d="M1004 300 H 1022"/></g>
+    <path d="M1022 294 l8 6 l-8 6z" fill="#A78BFA"/>
+
+    <!-- providers -->
+    <g font-size="14" font-weight="700" fill="#F1F5F9">
+      <g transform="translate(1030 72)"><rect width="210" height="62" rx="12" fill="#FFFFFF" fill-opacity="0.07" stroke="#A78BFA" stroke-opacity="0.4"/><text x="16" y="26">Speech-to-text</text><text x="194" y="26" text-anchor="end" fill="#C4B5FD">31</text><text x="16" y="47" font-size="12" font-weight="400" fill="#94A3B8">Deepgram, Google, Azure…</text></g>
+      <g transform="translate(1030 146)"><rect width="210" height="62" rx="12" fill="#FFFFFF" fill-opacity="0.07" stroke="#A78BFA" stroke-opacity="0.4"/><text x="16" y="26">Text-to-speech</text><text x="194" y="26" text-anchor="end" fill="#C4B5FD">35</text><text x="16" y="47" font-size="12" font-weight="400" fill="#94A3B8">ElevenLabs, Cartesia, Hume…</text></g>
+      <g transform="translate(1030 220)"><rect width="210" height="62" rx="12" fill="#FFFFFF" fill-opacity="0.07" stroke="#A78BFA" stroke-opacity="0.4"/><text x="16" y="26">Speech-to-speech</text><text x="194" y="26" text-anchor="end" fill="#C4B5FD">11</text><text x="16" y="47" font-size="12" font-weight="400" fill="#94A3B8">OpenAI, Gemini Live, Nova…</text></g>
+      <g transform="translate(1030 294)"><rect width="210" height="62" rx="12" fill="#FFFFFF" fill-opacity="0.07" stroke="#A78BFA" stroke-opacity="0.4"/><text x="16" y="26">Language models</text><text x="16" y="47" font-size="12" font-weight="400" fill="#94A3B8">OpenAI-compatible, Claude…</text></g>
+      <g transform="translate(1030 368)"><rect width="210" height="62" rx="12" fill="#FFFFFF" fill-opacity="0.07" stroke="#A78BFA" stroke-opacity="0.4"/><text x="16" y="26">Your agents</text><text x="16" y="47" font-size="12" font-weight="400" fill="#94A3B8">A2A, MCP, webhooks</text></g>
+      <g transform="translate(1030 442)"><rect width="210" height="62" rx="12" fill="#FFFFFF" fill-opacity="0.07" stroke="#A78BFA" stroke-opacity="0.4"/><text x="16" y="26">Local models</text><text x="16" y="47" font-size="12" font-weight="400" fill="#94A3B8">llama.cpp, WaaV Infer</text></g>
+    </g>
+
+    <text x="640" y="572" text-anchor="middle" font-size="12.5" fill="#64748B">One Rust binary · no OpenSSL · linux x86-64 and arm64 · Docker image for both</text>
+  </g>
+</svg>

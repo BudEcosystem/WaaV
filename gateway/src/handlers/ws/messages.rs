@@ -556,7 +556,7 @@ pub enum OutgoingMessage {
         #[cfg_attr(feature = "openapi", schema(example = "tts_provider"))]
         node_type: Option<String>,
     },
-    /// Non-fatal configuration advisory (D1 / REALTIME_REASONING.md §7.4).
+    /// Non-fatal configuration advisory (D1 / docs/research/REALTIME_REASONING.md §7.4).
     ///
     /// Sent at config time when a setting is sub-optimal but the session still
     /// starts — e.g. a reasoning model placed on the spoken path (high TTFT),

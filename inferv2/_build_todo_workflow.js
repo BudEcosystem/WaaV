@@ -156,7 +156,7 @@ log(`generated+critiqued ${clean.length}/${AREAS.length} areas, ${allTasks.lengt
 phase('Coherence')
 const MASTER = `The authoritative coverage set the TODO MUST fully cover:
 - INFER_ENGINE_IMPL.md §6 test-gate matrix (every F#/G#/H#/J#/L#/R# catalog gate) + §7 every named v2.1 gate (M2-additions, M2b, M3-additions, M4.1b, M4.2/3/4 additions, M4.5, M4.x) + §8 perf gates + the R-1..R-8 model-implementation contract.
-- INFER_GATEWAY_INTEGRATION.md GW-1..GW-18 (GW-7 done, GW-15 removed).
+- docs/infer/INFER_GATEWAY_INTEGRATION.md GW-1..GW-18 (GW-7 done, GW-15 removed).
 - The validation pyramid (offline-parity + streaming-playback + concurrent-load) + single_stream_edge_pays_nothing + the no-regression gate (16-arm registry + native-parity STT/TTS still pass) + the scenario re-audit CI.
 - The 2 invariants (accuracy sacred; multi-tenant correctness sacred) and GUIDELINES §6 forbidden-list.`
 // ===== PHASE 3: append the 5 explicitly-missing v2.1 gates the audit found =====

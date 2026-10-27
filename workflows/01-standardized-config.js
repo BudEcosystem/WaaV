@@ -6,7 +6,7 @@
  * EVERY provider feature/model/param becomes reachable on the live WS/REST path.
  *
  * Run AFTER: `cargo check` is green on the current tree, and the design in
- * PRODUCTION_PLAN.md §2 (Standardized API) is accepted.
+ * docs/plans/PRODUCTION_PLAN.md §2 (Standardized API) is accepted.
  *
  * Invoke:  Workflow({ scriptPath: ".../workflows/01-standardized-config.js" })
  *

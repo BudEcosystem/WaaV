@@ -5,7 +5,7 @@
 //! `turn_decision/engine.rs` and `conversation/mod.rs`. This module factors
 //! the *policy* into composable strategy objects on one [`TurnController`],
 //! mirroring Pipecat's `turns/` stack — adapted to WaaV per the converged
-//! fix-plan corrections (§6.2 of `PIPECAT_FIX_PLAN.md`):
+//! fix-plan corrections (§6.2 of `docs/plans/PIPECAT_FIX_PLAN.md`):
 //!
 //! - The signal type is **[`ControllerSignal`]** — the name `TurnSignal` is
 //!   already taken by the live `turn_decision::TurnSignal` ensemble input.

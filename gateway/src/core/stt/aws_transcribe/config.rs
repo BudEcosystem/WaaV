@@ -628,7 +628,7 @@ impl Default for AwsTranscribeSTTConfig {
 
 impl AwsTranscribeSTTConfig {
     /// Build from the standardized config (W1 keystone — 4th provider). Unlocks the diarization
-    /// AND content-redaction that the flat factory hardcoded off (BRUTAL_REVIEW.md flagged both),
+    /// AND content-redaction that the flat factory hardcoded off (docs/reports/BRUTAL_REVIEW.md flagged both),
     /// plus partial-results stabilization, through the standardized API.
     ///
     /// Fails on a malformed `region` extra (never a fallback region — see [`AwsRegion`]) and on
@@ -840,7 +840,7 @@ mod tests {
     use super::*;
 
     // W1 keystone (4th provider): unlocks AWS diarization + content redaction — both hardcoded
-    // off by the flat factory per BRUTAL_REVIEW.md.
+    // off by the flat factory per docs/reports/BRUTAL_REVIEW.md.
     #[test]
     fn from_standard_unlocks_aws_diarization_and_redaction() {
         use crate::core::stt::standard::{StandardSTTConfig, SttFeatures};

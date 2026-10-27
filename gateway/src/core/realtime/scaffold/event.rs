@@ -138,7 +138,7 @@ pub enum ConnectSpec {
         /// (`AWS_REGION` / shared config) by the `aws-config` default chain.
         region: Option<String>,
     },
-    /// THE IN-BOX UDS PATTERN (GW-13 UDS half, `INFER_GATEWAY_INTEGRATION.md`
+    /// THE IN-BOX UDS PATTERN (GW-13 UDS half, `docs/infer/INFER_GATEWAY_INTEGRATION.md`
     /// §6.2/§13): a co-located WaaV Infer **sidecar** reached over a **unix domain
     /// socket** instead of loopback TCP/WS. The single-box topology (§7): the
     /// gateway and the Infer engine share a host, so a UDS removes the loopback-TCP

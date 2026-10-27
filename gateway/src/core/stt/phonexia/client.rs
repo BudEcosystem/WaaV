@@ -273,7 +273,7 @@ impl BaseSTT for PhonexiaSTT {
             return Ok(());
         }
 
-        // FAIL CLOSED (BRUTAL_REVIEW.md "Phonexia" / PRODUCTION_PLAN.md W3): the real Phonexia
+        // FAIL CLOSED (docs/reports/BRUTAL_REVIEW.md "Phonexia" / docs/plans/PRODUCTION_PLAN.md W3): the real Phonexia
         // Speech Platform 4 exposes gRPC + a REST async-job API, NOT the generic `/ws` +
         // `X-SessionID` protocol implemented here. That protocol is unverified against any real
         // Phonexia server, so we refuse by default rather than silently "succeed" against a
@@ -284,7 +284,7 @@ impl BaseSTT for PhonexiaSTT {
                 "Phonexia STT is not validated against the real Phonexia API (gRPC/REST). It is \
                  disabled by default to avoid a fabricated-protocol connection. Set \
                  WAAV_PHONEXIA_ALLOW_UNVERIFIED=1 only if your server matches the implemented \
-                 WebSocket protocol. Tracked by PRODUCTION_PLAN.md W3."
+                 WebSocket protocol. Tracked by docs/plans/PRODUCTION_PLAN.md W3."
                     .to_string(),
             ));
         }

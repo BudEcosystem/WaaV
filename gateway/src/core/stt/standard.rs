@@ -2,7 +2,7 @@
 //!
 //! The flat [`STTConfig`] is the only struct that crosses the dispatch/factory boundary, so
 //! every advanced provider feature (diarization, keyterms, redaction, …) is unreachable on the
-//! live path (see `BRUTAL_REVIEW.md` S1). This module introduces the *additive* standardized
+//! live path (see `docs/reports/BRUTAL_REVIEW.md` S1). This module introduces the *additive* standardized
 //! layer the production plan (§2) calls for: a capability-rich [`StandardSTTConfig`] that wraps
 //! the existing flat config plus typed [`SttFeatures`] and an open [`ProviderExtras`] passthrough.
 //!

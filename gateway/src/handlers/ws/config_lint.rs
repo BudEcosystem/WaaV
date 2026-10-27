@@ -9,7 +9,7 @@
 //! the top level instead of under `stt_config`) is **silently dropped**. To a
 //! client that looks exactly like success — the feature simply never takes
 //! effect. This is the single root-cause behind a whole class of SDK bugs (see
-//! `SDK_STANDARDIZATION_PLAN.md` "ENFORCEMENT").
+//! `docs/plans/SDK_STANDARDIZATION_PLAN.md` "ENFORCEMENT").
 //!
 //! We deliberately do **not** add `#[serde(deny_unknown_fields)]`: that would
 //! *hard-reject* the message and break forward-compatibility (an older gateway

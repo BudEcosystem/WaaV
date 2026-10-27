@@ -1,0 +1,104 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="500" viewBox="0 0 1280 500" role="img" aria-labelledby="t d">
+  <title id="t">Interaction mode, one call</title>
+  <desc id="d">The caller asks to book a table. The front model acknowledges at once while a background task books it. The caller changes the time while the agent is talking; the agent stops, confirms the change and the task is updated. The answer is read out when the task finishes.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#120B32"/>
+      <stop offset="0.6" stop-color="#17123F"/>
+      <stop offset="1" stop-color="#0A2540"/>
+    </linearGradient>
+    <linearGradient id="task" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#38BDF8" stop-opacity="0.25"/>
+      <stop offset="1" stop-color="#38BDF8" stop-opacity="0.12"/>
+    </linearGradient>
+    <linearGradient id="cut" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#8B5CF6" stop-opacity="0.9"/>
+      <stop offset="1" stop-color="#8B5CF6" stop-opacity="0.15"/>
+    </linearGradient>
+    <clipPath id="card"><rect width="1280" height="500" rx="24"/></clipPath>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10z" fill="#FBBF24"/>
+    </marker>
+  </defs>
+  <g clip-path="url(#card)">
+    <rect width="1280" height="500" fill="url(#bg)"/>
+  </g>
+
+  <g font-family="Inter, -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif">
+    <text x="40" y="54" font-size="22" font-weight="800" fill="#FFFFFF">One call in interaction mode</text>
+    <text x="40" y="80" font-size="15" fill="#C7D2FE" fill-opacity="0.85">The agent keeps talking with the caller while the real work runs in the background.</text>
+
+    <!-- lanes -->
+    <g>
+      <rect x="24" y="112" width="1232" height="80" rx="14" fill="#FFFFFF" fill-opacity="0.035"/>
+      <rect x="24" y="210" width="1232" height="80" rx="14" fill="#FFFFFF" fill-opacity="0.035"/>
+      <rect x="24" y="308" width="1232" height="80" rx="14" fill="#FFFFFF" fill-opacity="0.035"/>
+      <text x="44" y="148" font-size="15" font-weight="700" fill="#FFFFFF">Caller</text>
+      <text x="44" y="168" font-size="12" fill="#94A3B8">speaks</text>
+      <text x="44" y="246" font-size="15" font-weight="700" fill="#FFFFFF">Front model</text>
+      <text x="44" y="266" font-size="12" fill="#94A3B8">fast, decides each turn</text>
+      <text x="44" y="344" font-size="15" font-weight="700" fill="#FFFFFF">Background</text>
+      <text x="44" y="364" font-size="12" fill="#94A3B8">your LLM or agents</text>
+    </g>
+
+    <!-- caller -->
+    <g font-size="13.5" font-weight="600">
+      <rect x="207" y="134" width="255" height="36" rx="18" fill="#F1F5F9"/>
+      <text x="334.5" y="157" text-anchor="middle" fill="#0F172A">“Book a table for two at seven.”</text>
+      <rect x="726" y="134" width="170" height="36" rx="18" fill="#F1F5F9"/>
+      <text x="811" y="157" text-anchor="middle" fill="#0F172A">“Make it eight instead.”</text>
+    </g>
+
+    <!-- front -->
+    <g font-size="13.5" font-weight="600" fill="#FFFFFF">
+      <rect x="481" y="232" width="146" height="36" rx="18" fill="#8B5CF6"/>
+      <text x="554" y="255" text-anchor="middle">Sure, one moment.</text>
+      <rect x="635" y="232" width="116" height="36" rx="18" fill="url(#cut)"/>
+      <text x="690" y="254.5" text-anchor="middle" font-size="12.5">Checking now…</text>
+      <rect x="921" y="232" width="119" height="36" rx="18" fill="#8B5CF6"/>
+      <text x="980.5" y="255" text-anchor="middle">Okay, eight.</text>
+      <rect x="1100" y="232" width="144" height="36" rx="18" fill="#22C55E"/>
+      <text x="1172" y="255" text-anchor="middle">Booked for 8 pm.</text>
+    </g>
+
+    <!-- barge-in marker -->
+    <g>
+      <path d="M751 222 V 278" stroke="#F87171" stroke-width="2" stroke-dasharray="4 3"/>
+      <circle cx="751" cy="222" r="4" fill="#F87171"/>
+    </g>
+
+    <!-- background task -->
+    <g>
+      <rect x="496" y="330" width="595" height="36" rx="10" fill="url(#task)" stroke="#38BDF8" stroke-opacity="0.6"/>
+      <text x="512" y="353" font-size="13.5" font-weight="600" fill="#E0F2FE">Task t1 · book_table on the restaurant agent</text>
+      <rect x="1000" y="336" width="78" height="24" rx="12" fill="#22C55E" fill-opacity="0.2" stroke="#22C55E"/>
+      <text x="1039" y="352" font-size="12" font-weight="700" fill="#86EFAC" text-anchor="middle">completed</text>
+      <path d="M980 270 C 980 300, 930 300, 930 326" fill="none" stroke="#FBBF24" stroke-width="2" marker-end="url(#arrow)"/>
+      <path d="M1091 348 C 1120 348, 1150 320, 1160 274" fill="none" stroke="#22C55E" stroke-width="2" stroke-dasharray="5 4"/>
+    </g>
+
+    <!-- notes -->
+    <g font-size="12.5" fill="#CBD5E1">
+      <text x="554" y="210" text-anchor="middle">acknowledges at once</text>
+      <text x="751" y="300" text-anchor="middle" fill="#FCA5A5">stops when the caller talks</text>
+      <text x="990" y="306" fill="#FDE68A">task updated</text>
+      <text x="1172" y="210" text-anchor="middle">answer read word for word</text>
+    </g>
+
+    <!-- time axis -->
+    <g font-size="12" fill="#94A3B8">
+      <path d="M190 420 H 1250" stroke="#475569"/>
+      <g stroke="#475569">
+        <path d="M190 415V425M360 415V425M530 415V425M700 415V425M870 415V425M1040 415V425M1210 415V425"/>
+      </g>
+      <text x="190" y="442" text-anchor="middle">0 s</text>
+      <text x="360" y="442" text-anchor="middle">2 s</text>
+      <text x="530" y="442" text-anchor="middle">4 s</text>
+      <text x="700" y="442" text-anchor="middle">6 s</text>
+      <text x="870" y="442" text-anchor="middle">8 s</text>
+      <text x="1040" y="442" text-anchor="middle">10 s</text>
+      <text x="1210" y="442" text-anchor="middle">12 s</text>
+      <text x="1250" y="476" text-anchor="end" font-size="11.5" fill="#64748B">Illustration of the event flow; timings depend on your models and providers.</text>
+    </g>
+  </g>
+</svg>

@@ -2,7 +2,7 @@
 
 WHY THIS EXISTS
 ---------------
-The single highest-leverage SDK fix in ``SDK_STANDARDIZATION_PLAN.md`` is to make
+The single highest-leverage SDK fix in ``docs/plans/SDK_STANDARDIZATION_PLAN.md`` is to make
 the SDK config a complete, *drift-guarded* mirror of the gateway ``/ws`` config
 tree so the failure mode "a feature exists server-side but is unreachable from the
 SDK" can never silently recur. The gateway already keeps its committed OpenAPI

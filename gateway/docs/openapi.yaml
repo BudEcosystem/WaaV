@@ -1432,7 +1432,7 @@ components:
         latency_filler:
           $ref: '#/components/schemas/LatencyFiller'
           description: |-
-            D3 (REALTIME_REASONING.md §4.3): latency-masking mode —
+            D3 (docs/research/REALTIME_REASONING.md §4.3): latency-masking mode —
             `off | auto | aggressive`. `auto` (default) speaks ONE short action phrase
             when first audio is slow (reasoning/RAG/tool), keeping the line alive while
             the real answer streams in behind it — at most one masking utterance per
@@ -1561,7 +1561,7 @@ components:
           - type: 'null'
           - $ref: '#/components/schemas/ReasoningEffort'
             description: |-
-              D1 (REALTIME_REASONING.md §4.1): reasoning/thinking-effort dial —
+              D1 (docs/research/REALTIME_REASONING.md §4.1): reasoning/thinking-effort dial —
               `off | minimal | low | medium | high`. One typed knob, mapped to each
               vendor's native thinking control and clamped to the model's floor (an
               adaptive-only model can't go below its floor; the applied/floor values
@@ -1572,7 +1572,7 @@ components:
           - string
           - 'null'
           description: |-
-            S1/S2 (REALTIME_REASONING.md §5): optional slow REASONING tier. Set this
+            S1/S2 (docs/research/REALTIME_REASONING.md §5): optional slow REASONING tier. Set this
             to a smart-but-slow model (e.g. `o3`, `deepseek-r1`) and keep `model` a
             FAST model — complex turns escalate to the reasoning tier (sharing the
             conversation history) while the fast model handles the rest and the D3
@@ -2343,7 +2343,7 @@ components:
     LatencyFiller:
       type: string
       description: |-
-        D3 (REALTIME_REASONING.md §4.3): the unified latency-masking mode. ONE knob
+        D3 (docs/research/REALTIME_REASONING.md §4.3): the unified latency-masking mode. ONE knob
         covering the action-preamble + pre-rendered gap-filler, deduped to at most one
         masking utterance per turn.
       enum:
@@ -2820,7 +2820,7 @@ components:
             - error
       - type: object
         description: |-
-          Non-fatal configuration advisory (D1 / REALTIME_REASONING.md §7.4).
+          Non-fatal configuration advisory (D1 / docs/research/REALTIME_REASONING.md §7.4).
 
           Sent at config time when a setting is sub-optimal but the session still
           starts — e.g. a reasoning model placed on the spoken path (high TTFT),
@@ -3292,7 +3292,7 @@ components:
     ReasoningEffort:
       type: string
       description: |-
-        D1 (REALTIME_REASONING.md §4.1): the reasoning/thinking-effort dial — ONE
+        D1 (docs/research/REALTIME_REASONING.md §4.1): the reasoning/thinking-effort dial — ONE
         typed knob the adapter maps to each vendor's native control, clamped to the
         model's floor. `Off` *minimizes* thinking; it is not always literally zero,
         because some 2026 models are adaptive-thinking-only and have a floor — the
@@ -3532,7 +3532,7 @@ components:
     RoutingMode:
       type: string
       description: |-
-        S2 (REALTIME_REASONING.md §5): when a `reasoning_model` is configured, how to
+        S2 (docs/research/REALTIME_REASONING.md §5): when a `reasoning_model` is configured, how to
         route each turn between the fast `model` and the slow reasoning tier.
       enum:
       - auto
@@ -3680,7 +3680,7 @@ components:
             Canonical, provider-agnostic advanced STT features (diarization, keyterms, redaction,
             vad_events, …). Defaults to all-unset so existing clients are unaffected; carried across the
             dispatch boundary via [`Self::to_standard_stt`] so providers with a `from_standard` mapping
-            (Deepgram first) honor them END-TO-END (W1 keystone, closing BRUTAL_REVIEW.md S1).
+            (Deepgram first) honor them END-TO-END (W1 keystone, closing docs/reports/BRUTAL_REVIEW.md S1).
         language:
           type: string
           description: Language code for transcription (e.g., "en-US", "es-ES")
@@ -4043,7 +4043,7 @@ components:
             Canonical, provider-agnostic advanced TTS features (voice settings, instructions, SSML,
             streaming, …). Defaults to all-unset so existing clients are unaffected; carried across the
             dispatch boundary via [`Self::to_standard_tts`] so providers with a `from_standard` mapping
-            (Deepgram first) honor them END-TO-END (W1 keystone, closing BRUTAL_REVIEW.md S1/S5).
+            (Deepgram first) honor them END-TO-END (W1 keystone, closing docs/reports/BRUTAL_REVIEW.md S1/S5).
         model:
           type: string
           description: 'Model to use for TTS. Under the Bud control plane: the text-to-speech DEPLOYMENT.'

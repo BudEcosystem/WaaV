@@ -234,7 +234,7 @@ pub struct ConversationWebSocketConfig {
     #[cfg_attr(feature = "openapi", schema(example = 15000))]
     pub user_idle_timeout_ms: u64,
 
-    /// D1 (REALTIME_REASONING.md §4.1): reasoning/thinking-effort dial —
+    /// D1 (docs/research/REALTIME_REASONING.md §4.1): reasoning/thinking-effort dial —
     /// `off | minimal | low | medium | high`. One typed knob, mapped to each
     /// vendor's native thinking control and clamped to the model's floor (an
     /// adaptive-only model can't go below its floor; the applied/floor values
@@ -244,7 +244,7 @@ pub struct ConversationWebSocketConfig {
     #[cfg_attr(feature = "openapi", schema(example = "minimal"))]
     pub reasoning_effort: Option<crate::core::llm::ReasoningEffort>,
 
-    /// D3 (REALTIME_REASONING.md §4.3): latency-masking mode —
+    /// D3 (docs/research/REALTIME_REASONING.md §4.3): latency-masking mode —
     /// `off | auto | aggressive`. `auto` (default) speaks ONE short action phrase
     /// when first audio is slow (reasoning/RAG/tool), keeping the line alive while
     /// the real answer streams in behind it — at most one masking utterance per
@@ -262,7 +262,7 @@ pub struct ConversationWebSocketConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub latency_filler_phrases: Vec<String>,
 
-    /// S1/S2 (REALTIME_REASONING.md §5): optional slow REASONING tier. Set this
+    /// S1/S2 (docs/research/REALTIME_REASONING.md §5): optional slow REASONING tier. Set this
     /// to a smart-but-slow model (e.g. `o3`, `deepseek-r1`) and keep `model` a
     /// FAST model — complex turns escalate to the reasoning tier (sharing the
     /// conversation history) while the fast model handles the rest and the D3
@@ -465,7 +465,7 @@ pub struct STTWebSocketConfig {
     /// Canonical, provider-agnostic advanced STT features (diarization, keyterms, redaction,
     /// vad_events, …). Defaults to all-unset so existing clients are unaffected; carried across the
     /// dispatch boundary via [`Self::to_standard_stt`] so providers with a `from_standard` mapping
-    /// (Deepgram first) honor them END-TO-END (W1 keystone, closing BRUTAL_REVIEW.md S1).
+    /// (Deepgram first) honor them END-TO-END (W1 keystone, closing docs/reports/BRUTAL_REVIEW.md S1).
     #[serde(default)]
     pub features: crate::core::stt::standard::SttFeatures,
 
@@ -784,7 +784,7 @@ pub struct TTSWebSocketConfig {
     /// Canonical, provider-agnostic advanced TTS features (voice settings, instructions, SSML,
     /// streaming, …). Defaults to all-unset so existing clients are unaffected; carried across the
     /// dispatch boundary via [`Self::to_standard_tts`] so providers with a `from_standard` mapping
-    /// (Deepgram first) honor them END-TO-END (W1 keystone, closing BRUTAL_REVIEW.md S1/S5).
+    /// (Deepgram first) honor them END-TO-END (W1 keystone, closing docs/reports/BRUTAL_REVIEW.md S1/S5).
     #[serde(default)]
     pub features: crate::core::tts::standard::TtsFeatures,
 

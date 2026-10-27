@@ -493,7 +493,7 @@ async fn barge_in_interrupts_tts() {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// TEST 2b (REALTIME_REASONING.md §4.4 / critique C3): a barge-in DURING a
+// TEST 2b (docs/research/REALTIME_REASONING.md §4.4 / critique C3): a barge-in DURING a
 // protected (filler/uninterruptible) window must STILL cancel the in-flight LLM —
 // the old `handle_barge_in` early-returned and let a slow reasoning turn keep
 // burning for the clip's whole duration. RED on the pre-fix code.
@@ -1093,7 +1093,7 @@ async fn two_tier_negation_stays_fast() {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// P1 degradation ladder (REALTIME_REASONING.md §8): an LLM tier failure must
+// P1 degradation ladder (docs/research/REALTIME_REASONING.md §8): an LLM tier failure must
 // NEVER be dead air or a dropped session.
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -1249,7 +1249,7 @@ async fn p1_reasoner_over_budget_degrades_to_fast_draft() {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// P2 cost budget (REALTIME_REASONING.md §8): bound the spend multipliers.
+// P2 cost budget (docs/research/REALTIME_REASONING.md §8): bound the spend multipliers.
 // ──────────────────────────────────────────────────────────────────────────────
 
 /// The reasoning-token ceiling clamps the reasoning tier's `max_tokens` (the
@@ -1302,7 +1302,7 @@ async fn p2_reasoning_token_ceiling_clamps_reasoning_tier() {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// S3 async tools (REALTIME_REASONING.md §5): a late async result is recorded to
+// S3 async tools (docs/research/REALTIME_REASONING.md §5): a late async result is recorded to
 // history and turn-id-gated — volunteered while the spawning turn is still the
 // latest, suppressed once the conversation has moved on (M6).
 // ──────────────────────────────────────────────────────────────────────────────
