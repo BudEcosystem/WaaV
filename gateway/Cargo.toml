@@ -245,7 +245,7 @@ livekit = "=0.7.24"
 #
 # These are direct dependencies so the pin is visible and reviewable. The crate calls webrtc-sys
 # for one thing only: the ICE network policy the vendored copy adds (src/livekit/ice.rs). See
-# BUILD_NOTES.md.
+# docs/build/BUILD_NOTES.md.
 libwebrtc = "=0.3.19"
 webrtc-sys = "=0.3.16"
 livekit-api = "=0.4.9"  # patched: see [patch.crates-io] at the end of this file

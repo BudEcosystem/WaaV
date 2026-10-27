@@ -74,7 +74,7 @@ Send `interaction` in the `config` message. `true` takes the defaults:
 ```json
 {
   "type": "config",
-  "stt_config": { "provider": "openai", "model": "whisper-1", "language": "en", "sample_rate": 16000, "channels": 1, "encoding": "linear16" },
+  "stt_config": { "provider": "openai", "model": "whisper-1", "language": "en", "sample_rate": 16000, "channels": 1, "punctuation": true, "encoding": "linear16" },
   "tts_config": { "provider": "openai", "model": "tts-1", "voice_id": "your-voice-id", "audio_format": "pcm", "sample_rate": 24000 },
   "conversation_config": { "base_url": "http://127.0.0.1:18742/v1", "model": "qwen3b-q4_k_m", "api_key": "local-dummy" },
   "interaction": true
@@ -140,7 +140,7 @@ A session with a `dag_config` runs interaction mode when its graph ends in text:
 ```json
 {
   "type": "config",
-  "stt_config": { "provider": "deepgram", "model": "nova-3", "language": "en", "sample_rate": 16000, "channels": 1, "encoding": "linear16" },
+  "stt_config": { "provider": "deepgram", "model": "nova-3", "language": "en", "sample_rate": 16000, "channels": 1, "punctuation": true, "encoding": "linear16" },
   "tts_config": { "provider": "openai", "model": "tts-1", "voice_id": "your-voice-id", "audio_format": "pcm", "sample_rate": 24000 },
   "dag_config": { "template": "support-text" },
   "interaction": true
@@ -174,7 +174,7 @@ A session with speech-to-text and text-to-speech only then needs no LLM of its o
 ```json
 {
   "type": "config",
-  "stt_config": { "provider": "deepgram", "model": "nova-3", "language": "en", "sample_rate": 16000, "channels": 1, "encoding": "linear16" },
+  "stt_config": { "provider": "deepgram", "model": "nova-3", "language": "en", "sample_rate": 16000, "channels": 1, "punctuation": true, "encoding": "linear16" },
   "tts_config": { "provider": "openai", "model": "tts-1", "voice_id": "your-voice-id", "audio_format": "pcm", "sample_rate": 24000 },
   "interaction": { "tasks": { "default_backend": "crm" } }
 }
@@ -996,7 +996,7 @@ A session whose `config` carries a `livekit` block runs interaction mode on the 
 ```json
 {
   "type": "config",
-  "stt_config": { "provider": "deepgram", "model": "nova-3", "language": "en", "sample_rate": 16000, "channels": 1, "encoding": "linear16" },
+  "stt_config": { "provider": "deepgram", "model": "nova-3", "language": "en", "sample_rate": 16000, "channels": 1, "punctuation": true, "encoding": "linear16" },
   "tts_config": { "provider": "openai", "model": "tts-1", "voice_id": "your-voice-id", "audio_format": "pcm", "sample_rate": 24000 },
   "conversation_config": { "base_url": "http://127.0.0.1:18742/v1", "model": "qwen3b-q4_k_m", "api_key": "local-dummy" },
   "livekit": { "room_name": "support-call-1042" },

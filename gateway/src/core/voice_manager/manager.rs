@@ -1159,7 +1159,7 @@ impl VoiceManager {
         !self.interruption_state.can_interrupt()
     }
 
-    /// D3 (REALTIME_REASONING.md §4.3): open a SHORT, auto-expiring barge-in
+    /// D3 (docs/research/REALTIME_REASONING.md §4.3): open a SHORT, auto-expiring barge-in
     /// suppression window so a just-enqueued masking/filler clip isn't instantly
     /// cut by its own VAD tail — while the clip itself stays interruptible in the
     /// queue. Clamped to ≤400 ms (shorter than human reaction + STT-partial

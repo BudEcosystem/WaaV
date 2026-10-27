@@ -1,6 +1,6 @@
 //! WaaV-Infer TTS adapter (`provider = "waav-infer"`) — Regime A, Cascade-over-Infer.
 //!
-//! `INFER_GATEWAY_INTEGRATION.md` §5. Mirror of the STT adapter: Infer's self-hosted cascade
+//! `docs/infer/INFER_GATEWAY_INTEGRATION.md` §5. Mirror of the STT adapter: Infer's self-hosted cascade
 //! TTS plugs in behind [`BaseTTS`] through the `inventory`→registry path with zero handler/route
 //! changes. This T3 slice gives the provider its identity and a typed lifecycle; the native WS v1
 //! `Speak/ChunkMeta→AudioData` transport mapping (and the GW-5 resilience extension to TTS) are

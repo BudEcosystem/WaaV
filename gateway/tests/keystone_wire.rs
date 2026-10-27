@@ -3,7 +3,7 @@
 //! Proves that an advanced STT feature carried on the live WebSocket config (`features.diarization
 //! = true`) survives the SAME conversion the live handler uses and reaches the Deepgram provider
 //! config with `diarize` enabled — closing the gap where the live WS/REST path never reached
-//! `from_standard` and silently dropped advanced features (BRUTAL_REVIEW.md S1).
+//! `from_standard` and silently dropped advanced features (docs/reports/BRUTAL_REVIEW.md S1).
 //!
 //! Before the protocol+wiring change this file does not compile (the WS config can't carry
 //! `features` and has no `to_standard_stt`), which is the intended RED state.

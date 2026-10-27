@@ -3,7 +3,7 @@
 # WaaV Gateway Provider Test Script
 # Tests all 67 providers (31 STT + 34 TTS + 2 Realtime)
 #
-# Usage: ./test_providers.sh [gateway_url]
+# Usage: gateway/scripts/test_providers.sh [gateway_url]
 # Default: http://localhost:3001
 
 set -e

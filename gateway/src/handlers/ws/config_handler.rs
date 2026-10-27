@@ -1653,7 +1653,7 @@ fn is_known_reasoning_model(model: &str) -> bool {
     crate::core::conversation::is_reasoning_model(model)
 }
 
-/// D1 (REALTIME_REASONING.md §7.4): emit non-fatal config advisories — a
+/// D1 (docs/research/REALTIME_REASONING.md §7.4): emit non-fatal config advisories — a
 /// reasoning model on the spoken path (high TTFT) and an effort clamped up to an
 /// adaptive-only model's floor. Active, in-band guidance instead of silent
 /// Grafana-only signals; reuses the `record_degraded` idiom.
@@ -1835,7 +1835,7 @@ async fn apply_lifecycle(
     true
 }
 
-/// P2 language standardization (SDK_STANDARDIZATION_PLAN.md): emit a non-fatal `config_warning` for
+/// P2 language standardization (docs/plans/SDK_STANDARDIZATION_PLAN.md): emit a non-fatal `config_warning` for
 /// each graceful-degrade case the language mapper produced when rendering the client's canonical
 /// `language`/`features.language` to the chosen STT/TTS provider's native notation — an unsupported
 /// language→provider (fell back to the provider default), an `auto` request a provider can't honor,
@@ -2120,7 +2120,7 @@ async fn initialize_conversation_loop(
         super::agent::spawn_signal_forwarder(signal_rx, message_tx.clone(), tracker);
     }
 
-    // S3 (REALTIME_REASONING.md §5): wire the async-tool final sink so an async
+    // S3 (docs/research/REALTIME_REASONING.md §5): wire the async-tool final sink so an async
     // tool's result is recorded to history and (turn-id-gated) volunteered.
     orchestrator.wire_async_sink();
 

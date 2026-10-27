@@ -2,7 +2,7 @@
 //!
 //! The flat `TTSConfig` is the only struct crossing the dispatch/factory boundary, so advanced
 //! TTS features (voice settings, emotion, instructions, SSML, …) are unreachable on the live
-//! path (BRUTAL_REVIEW.md S1/S5). This additive layer wraps the flat config with typed
+//! path (docs/reports/BRUTAL_REVIEW.md S1/S5). This additive layer wraps the flat config with typed
 //! [`TtsFeatures`] + the open [`ProviderExtras`] passthrough. Each provider gains a
 //! `from_standard` mapping (added across the fleet by the migration workflow).
 

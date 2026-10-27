@@ -18,7 +18,7 @@
 //! `/ws` + `X-SessionID` shape), so `connect()` FAILS CLOSED by default (see `client.rs`, opt-in
 //! via `WAAV_PHONEXIA_ALLOW_UNVERIFIED=1`). Adding auto-reconnect to a disabled, fabricated-protocol
 //! path that cannot be validated against a live endpoint would add risk without value. This is an
-//! explicit, documented decision (tracked by PRODUCTION_PLAN.md W3), not a silent gap — when the
+//! explicit, documented decision (tracked by docs/plans/PRODUCTION_PLAN.md W3), not a silent gap — when the
 //! real gRPC client lands it should adopt the supervisor like the rest of the fleet.
 //!
 //! # Authentication

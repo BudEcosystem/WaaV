@@ -1,7 +1,7 @@
 //! GW-3 (breaker half) — classify a WaaV-Infer typed reject-reason against the
 //! per-provider [`CircuitBreaker`].
 //!
-//! `INFER_GATEWAY_INTEGRATION.md` §5.2/§11.2/§12 (GW-3). The native WS v1 wire
+//! `docs/infer/INFER_GATEWAY_INTEGRATION.md` §5.2/§11.2/§12 (GW-3). The native WS v1 wire
 //! surfaces lifecycle/admission errors as `Error(InferError{ code, retry_after_ms })`.
 //! Three of those codes are **typed reject-reasons** the Infer router emits when the
 //! *whole tier* is saturated, warming, or draining — they are NOT a sign that *this*

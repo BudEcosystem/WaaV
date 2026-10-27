@@ -1,1048 +1,265 @@
 <p align="center">
-  <img src="assets/logo.png" alt="WaaV Logo" width="200">
+  <img src="assets/logo.png" width="180" alt="Bud WaaV logo">
 </p>
 
 <h1 align="center">WaaV Gateway</h1>
 
 <p align="center">
-  <strong>Real-Time Voice AI Gateway</strong>
+  <b>The real-time voice gateway for AI agents.</b><br>
+  One API for 70+ speech providers, realtime voice models and your own LLMs.<br>
+  Self-hosted, open source, written in Rust. From <a href="https://github.com/BudEcosystem">Bud Ecosystem</a>.
 </p>
 
 <p align="center">
-  <a href="#quick-start">Quick Start</a> •
-  <a href="#features">Features</a> •
-  <a href="#providers">Providers</a> •
-  <a href="#client-sdks">SDKs</a> •
-  <a href="#api-reference">API</a> •
-  <a href="#configuration">Config</a>
+  <a href="https://github.com/BudEcosystem/WaaV/releases/latest"><img alt="Release" src="https://img.shields.io/github/v/release/BudEcosystem/WaaV?label=release&color=8B5CF6"></a>
+  <a href="https://github.com/BudEcosystem/WaaV/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/BudEcosystem/WaaV/actions/workflows/ci.yml/badge.svg?branch=main"></a>
+  <img alt="License" src="https://img.shields.io/badge/license-Apache--2.0-38BDF8">
+  <img alt="Rust" src="https://img.shields.io/badge/rust-2024-1D1D1F">
+  <img alt="Linux" src="https://img.shields.io/badge/linux-x86--64%20%7C%20arm64-1D1D1F">
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="License">
-  <img src="https://img.shields.io/badge/version-1.0.0-green" alt="Version">
-  <img src="https://img.shields.io/badge/rust-2024-orange" alt="Rust Edition">
-  <img src="https://img.shields.io/badge/build-passing-brightgreen" alt="Build">
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#new-in-11-interaction-mode">What's new</a> ·
+  <a href="#features">Features</a> ·
+  <a href="#providers">Providers</a> ·
+  <a href="#client-sdks">SDKs</a> ·
+  <a href="#documentation">Docs</a>
 </p>
 
----
+<p align="center">
+  <img src="assets/readme/hero.svg" width="100%" alt="Apps, phone calls, LiveKit rooms and agents connect to WaaV, which reaches Deepgram, ElevenLabs, OpenAI, Google, Azure, AWS, your own LLMs and 60 more providers">
+</p>
 
-**WaaV Gateway** is a high-performance, real-time voice processing server built in Rust. It provides a unified interface for Speech-to-Text (STT) and Text-to-Speech (TTS) services across multiple cloud providers, with advanced audio processing capabilities including noise suppression and intelligent turn detection. WaaV features a powerful DAG-based pipeline engine for building custom voice processing workflows with conditional routing and multi-provider orchestration.
+WaaV sits between your app and the speech world. Your app streams audio or text to one endpoint; WaaV
+transcribes it, runs your agent, speaks the answer and streams it back, with whichever providers you
+choose. Swapping Deepgram for ElevenLabs, or a cloud model for your own, is a config change, not a
+rewrite.
 
-WaaV eliminates the complexity of integrating with multiple voice AI providers by providing a single WebSocket and REST API that abstracts away provider-specific implementations. Switch between Deepgram, ElevenLabs, Google Cloud, Azure, Cartesia, OpenAI, Amazon Transcribe, Amazon Polly, IBM Watson, or Groq with a simple configuration change—no code modifications required.
+## Why WaaV
 
-**Key Highlights:**
-- **[70+ Cloud Providers](gateway/docs/SUPPORTED_PROVIDERS.md)** - Global STT/TTS coverage including Deepgram, ElevenLabs, Google Cloud, Azure, OpenAI, plus regional providers for India (Sarvam, Gnani, Bhashini), China (Alibaba, Baidu, Tencent, iFlytek), Southeast Asia (Zalo, FPT, NECTEC), and more
-- **DAG Pipeline Engine** - Build custom voice workflows with conditional routing, multi-provider orchestration, and data transformations
-- **Realtime / Speech-to-Speech (11 providers)** - Full-duplex audio streaming on a shared S2S scaffold: OpenAI `gpt-realtime` (GA), Hume EVI, Azure, Grok, Inworld, Deepgram Voice Agent, ElevenLabs Conversational AI, Gemini Live, Ultravox, AWS Nova Sonic, Yandex — with reconnect/replay resilience and persistent reuse as a DAG node
-- **WebSocket Streaming** - Real-time bidirectional audio with sub-second latency
-- **LiveKit Integration** - WebRTC rooms and SIP telephony support
-- **Advanced Audio Processing** - DeepFilterNet noise suppression, ONNX-based turn detection
-- **Production-Ready** - HTTP/2 connection pooling, intelligent caching, rate limiting, JWT auth
+<table>
+<tr>
+<td width="50%" valign="top">
+<h3>🔌 One API, every provider</h3>
+31 speech-to-text, 35 text-to-speech and 11 speech-to-speech providers behind one WebSocket and REST
+API, plus drop-in OpenAI <code>/v1/audio</code> and <code>/v1/realtime</code> endpoints. Language
+codes, voices and emotions are written once and mapped to each provider's own form.
+</td>
+<td width="50%" valign="top">
+<h3>🗣️ Agents that feel like people</h3>
+Interaction mode answers at once, keeps the conversation going while slow work runs, stops when the
+caller talks over it, and asks before it does anything that matters. Reasoning models stay usable on a
+live call.
+</td>
+</tr>
+<tr>
+<td valign="top">
+<h3>🏭 Built for production</h3>
+A single Rust binary with no OpenSSL. Auth, rate limits, caching, circuit breakers, reconnect and replay,
+Prometheus metrics, and egress control that keeps every key on its own vendor's hosts.
+</td>
+<td valign="top">
+<h3>🧩 Yours to shape</h3>
+Self-hosted and Apache-2.0. Compose pipelines as graphs, rename providers behind aliases, plug in your
+own LLMs, agents (A2A, MCP, webhooks) and local models, and reach phones and rooms through LiveKit and SIP.
+</td>
+</tr>
+</table>
 
----
+## New in 1.1: interaction mode
 
-## Table of Contents
+A voice agent normally goes quiet while it thinks, talks over the caller, and can't take "actually, make it
+eight" in the middle of a booking. **Interaction mode** fixes that. A small, fast **front model** reads every
+caller turn and replies straight away; the real request becomes a **task** that your LLM, an orchestrator or
+your own agents run in the background; the answer is read out word for word when it is ready.
 
-- [Latest Updates](#latest-updates)
-- [Quick Start](#quick-start)
-- [Audio Processing Pipeline](#audio-processing-pipeline)
-- [Realtime & Latency](#realtime--latency)
-- [Realtime Reasoning](#realtime-reasoning)
-- [Features](#features)
-- [DAG Pipeline Engine](#dag-pipeline-engine)
-- [Providers](#providers)
-- [Architecture](#architecture)
-- [Installation](#installation)
-- [Client SDKs](#client-sdks)
-- [API Reference](#api-reference)
-- [Configuration](#configuration)
-- [Performance](#performance)
-- [Roadmap & TODO](#roadmap--todo)
-- [Contributing](#contributing)
-- [License](#license)
+<p align="center">
+  <img src="assets/readme/interaction-mode.svg" width="100%" alt="Timeline of one call: the caller asks to book a table, the front model acknowledges at once while a background task books it, the caller changes the time while the agent talks, the agent stops, confirms, the task is updated and the result is read out">
+</p>
 
----
+- **Answers at once, never dead air.** An acknowledgement, progress lines and honest stall lines while tasks run.
+- **Real turn-taking.** It tracks who has the floor, ducks under a caller who starts speaking, stops on a real interruption, and backchannels during long turns.
+- **Tasks you can follow.** Every request is a task with events on the socket and in `GET /v1/tasks`. Run several at once, follow up on a finished one, or let it finish after the call.
+- **Safe actions.** Tools with side effects are read back and confirmed. The caller can answer by voice, on screen or on a keypad.
+- **Caller controls.** "Stop", "hold on", "repeat that", "slower", "switch to Spanish", "get me a person".
+- **Works where your callers are.** `/ws` sessions, Bud voice agents, speech-to-speech providers, LiveKit rooms and phone calls.
 
-## Latest Updates
+It is opt-in: sessions that don't ask for it behave exactly as before.
+→ [Tutorial](gateway/docs/tutorials/interaction_mode_tutorial.md) · [Reference](gateway/docs/interaction_mode.md) · [Changelog](gateway/CHANGELOG.md)
 
-**June 2026 — SDK performance, resilience & full-duplex Opus codec.** A SOTA pass over the client SDKs (Python / TypeScript / embeddable widget) for **performance, connect-time, network resilience, and super-realtime behaviour** — grounded in a brutal review of the gateway internals and the Pipecat client — plus an end-to-end **Opus transport codec**. Shipped with before/after benchmarks + adversarial multi-agent verification; SDK suites Python **414** / TypeScript **295** / widget **60**, gateway lib **6,498** (default) / **6,504** (with the codec), **0 failing**. Designs: [`PERF_RESILIENCE_PLAN.md`](PERF_RESILIENCE_PLAN.md), [`OPUS_CODEC_PLAN.md`](OPUS_CODEC_PLAN.md).
+## Quick start
 
-- **Resilience.** An app-level zombie/half-open **liveness watchdog** (the gateway never pings clients) — live-proven to detect a frozen socket in **~2.5 s** instead of hanging forever — with verify-after-reconnect (a ping proves the new socket actually carries data), a client-side quick-failure breaker (a doomed config stops after 3 attempts, not an infinite storm), network-change probing (online/offline/visibility), and a bounded close-handshake. The SDK deliberately does **not** duplicate the gateway's heavy upstream resilience (circuit-breaker / reconnect-governor / conversation-replay are upstream-only); on a client↔gateway drop it re-sends config + flushes the queue, which is correct and sufficient.
-- **Realtime audio path.** Off-main-thread **AudioWorklet** capture (20 ms transferable frames), a **20 ms scheduled-chunk playout clock** with true barge-in (truncates within one server chunk via the gateway's `audio_out_chunk_ms`), and zero client-side downlink resampling by setting `tts_config.client_playback_rate` to the sink rate.
-- **Connect-time & pooling.** Fixed a real bug — the connect timeout was **10 s** but `PROVIDER_READY` legitimately takes up to ~30 s for `audio=true`, so a healthy slow-cold-start connect was being aborted (now **35 s**); `prewarm()` to warm DNS/TLS (and the AudioContext) before the first gesture; an STT keepalive-silence frame to keep the upstream stream warm; REST connection pooling (wire-proven **8 calls → 1 TCP/TLS handshake** in Python); 429/503 back-off; and a WS connect-concurrency gate that cooperates with the gateway's per-IP rate bucket.
-- **Bad-network & capture quality.** An adaptive **jitter buffer + packet-loss concealment** that self-bypasses on a clean network (zero added latency) and engages only when it measures arrival jitter — benchmarked **−73 % to −86 %** playout underruns under injected jitter/loss; `getUserMedia` echo-cancellation / noise-suppression / auto-gain defaults with overrides; a mic-silence watchdog for a dead/muted device; and **VAD hysteresis** (two-rail start/stop thresholds) that eliminates the false-segmentation a noisy room caused (**7.8 false starts → 0** in the bench).
-- **Full-duplex Opus codec (paired gateway + SDK).** A negotiated transport codec on `/ws`: `stt_config.audio_in_codec` / `tts_config.audio_out_codec` = `linear16` (default) | `opus`, **one Opus packet per binary frame** each way (uplink the gateway decodes before STT; downlink it encodes the TTS egress, funnelled through one chunker chokepoint). It's a **cargo feature** (`--features opus-codec`) — **off by default so the default build carries zero libopus dependency** — and an Opus request on a build (or browser) without it **gracefully degrades to linear16**, echoing the effective codec back in the `ready` message so the client never mis-frames. The SDKs are negotiation-aware (TypeScript ships a WebCodecs encoder/decoder; Python + widget parse the negotiation and opt in). libopus builds fully offline (vendored, via CMake).
-
-**June 2026 — Provider-agnostic standardization + rebuilt client SDKs (6-phase, live-validated).** WaaV now delivers its core promise — **switch providers/models without changing client code** — across every axis, with three drilled-out client SDKs (Python / TypeScript / embeddable widget). One canonical token maps to each provider's native form **server-side**, so the SDKs stay a thin, drift-guarded mirror. Shipped phase-by-phase with extreme-TDD + multi-agent brutal-review workflows + credential-free live validation against the running gateway (gateway lib **~6,490 tests, 0 failing**; SDKs Python **354** / TS **194** / widget **22**).
-
-- **Canonical mappers (gateway-side, one source of truth).** `language` — one `en-US` works on every provider (`core/lang/`, 49 region-qualified BCP-47 locales + an alias resolver, mapping the 8-way Chinese fork / Sarvam `od-IN` / ElevenLabs ISO-639-1 downgrade / Baidu numeric / … per provider). `emotion`/`style` — a 44-variant canonical set where `emotion="excited"` becomes a Cartesia emotion array, an OpenAI `instructions` string, an ElevenLabs `[excited]` inline tag, or an Azure SSML style. `voice` — a `VoiceDescriptor{gender,locale,age,style}` resolved to a real provider `voice_id` over the unified `/voices` catalog. Unsupported → a typed `config_warning`, never a 400.
-- **`bud.agent(...)` — a full voice agent in ~5 lines.** The flagship helper drives the gateway's built-in STT→LLM→TTS loop with reasoning, barge-in, and latency-filler, yielding one unified `transcript | audio | warning` event stream. Beginner-first DX that beats Pipecat's per-service wiring.
-- **Proxy / alias model names.** A server-config alias maps a logical name to a full `{stt,tts,llm,dag}` bundle — `bud.agent(alias="support-bot")`. Re-point what "support-bot" means (swap providers, A/B, cost-tier) by editing server config; the client never changes (proven live: identical payload, provider swapped).
-- **All call types, one SDK surface.** `bud.realtime(provider=…)` speaks the gateway's provider-agnostic `/realtime` protocol for **all 11 S2S providers**; `bud.transcribe_batch(...)` for async/prerecorded; `bud.voices.clone(...)` for instant + professional voice cloning; canonical in-stream **translation** (`translation={target_languages:[…]}`). 
-- **Drift-guarded mirror.** A CI guard reads the gateway OpenAPI spec and fails the build if any config field is unreachable from the SDK — structurally killing the entire "feature exists server-side but the SDK silently drops it" bug class that had left TS transcripts empty and the whole reasoning loop unreachable.
-
-**June 2026 — Realtime / Speech-to-Speech (S2S) fleet + full WaaV integration (live-validated).** WaaV's full-duplex realtime path grew from **2 providers to 11** on a shared, heavily-reviewed S2S scaffold, then was proven integrated with every relevant gateway subsystem — DAG, noise reduction, VAD, smart-turn, turn detection, the cascade audio sink, and circuit-breaker resilience — end-to-end through the **running gateway**. Shipped with extreme-TDD + multi-agent brutal-review (RCA / integration / impact / adversarial-verify workflows) + credential-free live validation; lib suite **6,400+ tests, 0 failing**.
-
-- **Shared S2S scaffold.** A generic `RealtimeSession<P: RealtimeProtocol>` driver implements the reconnect supervisor, conversation replay, barge-in/truncate, and resilience **once**; each provider is a small pure protocol mapper + a thin newtype. A `RealtimeTransport` seam absorbs all transports — WS-JSON, WS-binary, REST-handshake→WS (Ultravox), and AWS Bedrock bidirectional HTTP/2 (Nova Sonic). The existing OpenAI client was migrated onto it under a byte-identical golden-wire oracle (every pre-existing test unchanged).
-- **11 realtime/S2S providers.** OpenAI `gpt-realtime` (GA), Hume EVI, Azure OpenAI Realtime, xAI Grok, Inworld, Deepgram Voice Agent, ElevenLabs Conversational AI, Google Gemini Live, Ultravox, AWS Nova Sonic, and Yandex. **3 live-validated against real vendors** (OpenAI / Deepgram / ElevenLabs — full audio round-trips through `/realtime`); the other 8 are validated to the byte at the wire level (probe-grounded unit tests + credential-free mock round-trips through the *real* transport code), with the final real-vendor handshake pending a key (one command: `scripts/realtime_vendor_validation.py <provider>`).
-- **Resilience, live-validated end-to-end.** The reconnect supervisor + conversation replay + quick-failure cutoff were validated through the real driver against a mock that drops mid-session — reconnect + session-config re-send + **verbatim conversation-log replay** + bounded no-storm cutoff. The shared per-provider **circuit breaker** now fast-trips on a bad-credential handshake-then-drop signature (cross-session storm control), and a terminally-dead session is surfaced to the client instead of held open silently.
-- **Realtime as a DAG node (persistent S2S).** A `RealtimeProviderNode` now reuses **one** upstream socket across turns (retaining server-side conversation state) with a bounded teardown owner, wired into production and **live-validated credential-free** through the full gateway — a 3-turn DAG with the session reused (not reconnected per turn), audio riding the cascade `DagOutput::Audio` sink, and clean teardown, with anti-fabrication negative controls.
-- **Front-end ↔ realtime, proven together.** A live test drives **real audio** through WaaV's audio front-end — DeepFilterNet noise reduction → silero-VAD → smart-turn → text turn-detector — into a realtime DAG node, asserting (via scraped `/metrics` counters + sink egress) that every optimization actually ran on the bytes. Adversarially verified with three negative controls (disabling the front-end drives smart-turn inference to zero and **fails** the test).
-
-**June 2026 — OpenAI full-surface parity (live-validated).** Every OpenAI voice capability was brought up against the **real OpenAI API** with the full gateway running, end-to-end. Live testing caught two classes of breakage that unit tests (which only ever hit an OpenAI-*compatible* local endpoint) could not:
-
-- **Reasoning models now actually work on the chat path.** OpenAI's o-series + gpt-5 family **reject `max_tokens`** (400: *"use `max_completion_tokens`"*) and reject sampling params — so WaaV's reasoning feature set was silently broken against production OpenAI (it only ever ran against ollama, which accepts `max_tokens`). The adapter now emits `max_completion_tokens` and suppresses temperature/top-p/penalties/logprobs for reasoning models. Live-verified: `gpt-5-mini` round-trips streaming + non-streaming, and the **full cascade** (Whisper STT → `gpt-5-mini` reasoning → TTS) speaks a correct answer end-to-end.
-- **Realtime (S2S) migrated Beta → GA — it was 100 % broken.** WaaV spoke the **retired Realtime Beta API** (rejected outright by OpenAI). Probing the GA contract directly yielded the exact migration: drop the `OpenAI-Beta` header; nest the session under `audio.input`/`audio.output` with `{type:"audio/pcm",rate}` formats, `output_modalities`, and `session.type:"realtime"`; and follow GA's renamed server events (`response.output_audio.delta`, `response.output_audio_transcript.delta`, `conversation.item.added`). Live-verified S2S round-trip through `/realtime`: **`gpt-realtime`** + the new **`marin`/`cedar`** voices + **`near_field`/`far_field` noise reduction** → 170 KB of audio, first-audio ~1.8 s.
-- **Surface refresh + chat-param parity.** New TTS + Realtime voices (`marin`, `cedar`); refreshed Realtime model enum (`gpt-realtime` GA default, `gpt-realtime-mini`); input-audio noise reduction; and `parallel_tool_calls` + `seed` + `presence_penalty` + `frequency_penalty` + `logprobs` + `user` first-classed on both the cascade **and** DAG LLM nodes (with reasoning-model-aware suppression). TTS validated live across 6 voice/format combos (wav/pcm/mp3/opus).
-- **Streaming STT + per-response Realtime override + GA follow-ups (live-validated).** Streaming OpenAI STT (`gpt-4o-transcribe`/`-mini` `stream=true` SSE) now emits incremental partials → final — live-verified *10 interim partials then the final*; this also fixed a pre-existing bug where those models 400 on WaaV's `verbose_json` default (now coerced to `json`). Per-response Realtime override (`create_response_with` → GA `response.create`: per-turn modalities/instructions/voice/token-cap/out-of-band) — live-verified a text-only out-of-band override returning `ACKNOWLEDGED`. Two more GA misses fixed: the realtime handler default model (`gpt-4o-realtime-preview` → `gpt-realtime`) and the GA **text** output events (`response.output_text.delta`/`.done`), which were dropping text-modality output.
-- **Cross-provider hardening (the same fixes, applied beyond OpenAI).** A multi-agent audit checked whether these fixes recur elsewhere. Fixed: the OpenAI reasoning-model detector no longer false-positives on `gpt-5*-chat-latest` (which *accept* sampling) and now catches `codex`/`computer-use` + future `o5`/`gpt-6..9`; Anthropic now honors `parallel_tool_calls:false` via its native `tool_choice.disable_parallel_tool_use`; Gemini now maps `seed`/`presence_penalty`/`frequency_penalty` into `generationConfig`. (Verified-but-deferred, needing live provider keys: a per-provider request-shape capability table for xAI/grok + DeepSeek-reasoner + Groq-Qwen3, a Cartesia `Cartesia-Version` header bump, and additive feature parity — see roadmap.)
-
-**June 2026 — Realtime Reasoning release.** WaaV now runs **reasoning / "thinking" LLMs in live voice** — a class that was previously unusable on the spoken path (9–18 s to first audio, every trivial turn taxed, a stuck model hangs the call). A full opt-in, flat-configured feature set makes a slow "smart" model *feel instant* while a fast model handles the rest, with a safety net that guarantees the call never goes silent or drops. Shipped with extreme-TDD + multi-agent brutal-review + live validation (lib suite **~6,186 tests, 0 failing**; validated against OpenAI / Anthropic / Gemini-compatible endpoints + a credential-free ollama gate). See **[Realtime Reasoning](#realtime-reasoning)** and [`REALTIME_REASONING.md`](REALTIME_REASONING.md) / [`REASONING_FOLLOWUP_PLAN.md`](REASONING_FOLLOWUP_PLAN.md).
-
-- **Two-tier router** — name a fast `model`; add one field `reasoning_model` to light up automatic escalation (complex / math / multi-turn → the reasoner; chit-chat stays fast), both tiers sharing one conversation history.
-- **Latency masking** — `latency_filler` speaks a short holding phrase while the model thinks, so the caller hears a response in **~0.8 s** instead of seconds of silence; deduped to one utterance per turn, interruptible.
-- **Never dead air, never dropped** — a stuck or stalled reasoner (`reasoning_budget_ms` max-silence-gap watchdog) degrades to the fast draft or a graceful spoken apology; a partial answer is committed, never talked over.
-- **Reasoning-effort dial** — one typed `reasoning_effort` (off/minimal/low/medium/high) maps to each vendor's native control (OpenAI flat effort · Anthropic extended-thinking · Gemini thinking-budget), floor-clamped per model and provider-kind-aware, and emits **nothing** when a model can't reason (never a 400). Drives the cascade LLM path; the S2S mapping is retained for a reasoning-capable Realtime model (GA `gpt-realtime` exposes no session reasoning).
-- **Chain-of-thought never spoken** — `<think>…</think>` reasoning emitted inline by DeepSeek-R1 / QwQ-class models (incl. via ollama) is stripped from TTS on both the conversation and DAG paths.
-- **Cost-bounded** — a per-turn LLM-call ceiling (`max_llm_calls_per_turn`) + a reasoning-token cap (`max_reasoning_tokens`) keep the 2× two-tier spend in check on a billing gateway.
-
-**June 2026 — Realtime & production-hardening release.** A full brutal audit + measured-latency rebuild landed across the gateway. Every change below ships with extreme-TDD coverage and was validated **live against real providers**. Detailed reports live alongside this README: [`AUDIT_REPORT.md`](AUDIT_REPORT.md), [`LATENCY_ANALYSIS.md`](LATENCY_ANALYSIS.md), [`REALTIME_ROADMAP.md`](REALTIME_ROADMAP.md), [`MASTER_PLAN.md`](MASTER_PLAN.md).
-
-**Realtime**
-- **Streaming WebSocket TTS** — Deepgram Aura over `wss://…/v1/speak` with per-utterance cancellation. Live-measured **first-audio ~510 ms vs ~1,510 ms** for the batch/HTTP path. Selected via the standardized `tts_config.features.streaming` flag; HTTP providers keep working unchanged.
-- **Eager end-of-turn** — on a turn-complete *prediction*, the LLM starts speculatively with **staged history** (never mutated); a confirming final commits + speaks, a divergent one cancels with zero history pollution. Opt-in via `conversation_config.eager_eot`.
-- **ML turn detection, standardized** — `stt_config.turn_detection { enabled, threshold, eager }` runs the smart-turn detector on the live frame path for *every* STT provider; feature-less builds degrade loudly.
-- **Live latency profiler** — per-turn timeline (`audio_in → stt_final → llm_first_token → tts_first_audio → audio_out`) with bottleneck attribution, on Prometheus (`waav_turn_*`, `waav_frame_*`) + an auth-gated `GET /debug/profile` (JSON snapshot) and `/debug/profile/stream` (SSE), enabled with `WAAV_DEBUG_PROFILE=1`.
-
-**Correctness & production-readiness**
-- **Audio format truth** — magic-byte container sniffing (WAV/MP3/OGG/FLAC) at every audio boundary (HTTP stream, cache write, cache hit, and the universal egress point) so a container can never be sliced as PCM. Fixes the silent-corruption class fleet-wide.
-- **Credential precedence** — placeholder values in `config.yaml` (e.g. `your-…-api-key`) are treated as unset so the documented `# ENV:` fallback applies; placeholders are never sent to a provider.
-- **Speech-final state machine** — race-free generation-counter fire claims + deadline-rereading hard timeout; all turn-timing decisions use a monotonic clock (immune to NTP/VM clock steps).
-- **Supervised reconnect** — circuit-breaker + storm-controlled reconnect governor across the streaming STT fleet (AssemblyAI migrated this release).
-- **Hardware portability** — single ONNX execution-provider policy (`WAAV_ORT_EP=auto|cpu|cuda|tensorrt|coreml|directml|xnnpack`) with a guaranteed CPU fallback and per-EP availability probing.
-- **Chaos lifecycle** — graceful SIGTERM session drain, per-message-class WebSocket backpressure (audio sheds stale frames, transcripts/errors never dropped), one-config-per-session, and a cached/optionally-token-gated `/metrics`.
-- **Consolidated SSRF guard** — one canonical validator (`core::net`) for all client-supplied URLs (DAG endpoints, LLM base URLs, TTS endpoint overrides), closing IPv6-multicast / decimal-IP / CGNAT gaps.
-
-> ⚠️ Some provider integrations beyond the live-validated set remain protocol-flagged; see [Roadmap & TODO](#roadmap--todo) and `AUDIT_REPORT.md` for the exact status per provider.
-
----
-
-## Quick Start
-
-Get your first transcription running in under 5 minutes:
+**1. Download and run** (Linux, x86-64 or arm64; [all releases](https://github.com/BudEcosystem/WaaV/releases)):
 
 ```bash
-# Clone the repository
-git clone https://github.com/bud-foundry/waav.git
-cd waav/gateway
+ARCH=x86_64   # or aarch64
+curl -fsSLO https://github.com/BudEcosystem/WaaV/releases/download/1.1.0/waav-gateway-1.1.0-linux-$ARCH.tar.gz
+tar xzf waav-gateway-1.1.0-linux-$ARCH.tar.gz && cd waav-gateway-1.1.0-linux-$ARCH
 
-# Configure (add your API key)
-cp config.example.yaml config.yaml
-# Edit config.yaml and set your deepgram_api_key
-
-# Build and run
-cargo run --release
-
-# Test health check
-curl http://localhost:3001/
-# Returns: {"status":"ok"}
-
-# Test TTS
-curl -X POST http://localhost:3001/speak \
-  -H "Content-Type: application/json" \
-  -d '{"text": "Hello from WaaV!", "tts_config": {"provider": "deepgram"}}' \
-  --output hello.pcm
-
-# Play the audio (requires sox)
-play -r 24000 -e signed -b 16 -c 1 hello.pcm
+export DEEPGRAM_API_KEY=your-deepgram-key   # the examples below use Deepgram
+./waav-gateway                              # listens on http://localhost:3001
 ```
 
----
+**2. Make it speak:**
 
-## Audio Processing Pipeline
-
-WaaV provides a complete audio processing pipeline with optional pre-processing and post-processing stages:
-
-```mermaid
-flowchart LR
-    subgraph Input
-        A[Audio Input<br/>16kHz 16-bit PCM]
-    end
-
-    subgraph PreProcess["Pre-Processing"]
-        B[DeepFilterNet<br/>Noise Filter]
-        B1[SNR-adaptive]
-        B2[Echo suppress]
-        B3[40dB max]
-        B4[Thread pool]
-    end
-
-    subgraph Transcription["STT Provider"]
-        C[Multi-Provider]
-        C1[Deepgram]
-        C2[Google gRPC]
-        C3[Azure]
-        C4[ElevenLabs]
-        C5[Cartesia]
-        C6[OpenAI]
-        C7[AWS Transcribe]
-        C8[IBM Watson]
-        C9[Groq]
-    end
-
-    subgraph PostProcess["Post-Processing"]
-        D[Turn Detection<br/>ONNX Model]
-        D1[Probability]
-        D2[Threshold 0.7]
-        D3["<50ms"]
-    end
-
-    subgraph Output
-        E[Text Output]
-    end
-
-    A --> B
-    B --> C
-    C --> D
-    D --> E
-
-    style A fill:#e1f5fe
-    style E fill:#e8f5e9
-    style B fill:#fff3e0
-    style C fill:#fce4ec
-    style D fill:#f3e5f5
+```bash
+curl -s http://localhost:3001/speak -H 'content-type: application/json' \
+  -d '{"text": "Hello from WaaV!", "tts_config": {"provider": "deepgram", "audio_format": "linear16", "sample_rate": 24000}}' \
+  -o hello.pcm
+ffplay -autoexit -f s16le -ar 24000 -ac 1 hello.pcm
 ```
 
-### Pre-Processing: DeepFilterNet Noise Suppression
+**3. Stream a conversation.** Open `ws://localhost:3001/ws`, send one `config` message, then stream audio:
 
-**Feature flag:** `--features noise-filter`
-
-Advanced noise reduction powered by [DeepFilterNet](https://github.com/Rikorose/DeepFilterNet):
-
-| Feature | Description |
-|---------|-------------|
-| **Adaptive Processing** | SNR-based analysis—high SNR audio receives minimal filtering to preserve quality |
-| **Energy Analysis** | Automatic silence detection, skips processing after 5 consecutive silent frames |
-| **Echo Suppression** | Post-filter with 0.02 beta for mobile and conference call optimization |
-| **Attenuation Limiting** | 40dB maximum reduction prevents over-processing artifacts |
-| **Thread Pool** | One worker thread per CPU core for parallel processing |
-| **Short Audio Handling** | Light 80Hz high-pass filter for clips under 1 second |
-
-### Post-Processing: Turn Detection
-
-**Feature flag:** `--features turn-detect`
-
-Intelligent end-of-turn detection using ONNX Runtime with LiveKit's turn-detector model:
-
-| Feature | Description |
-|---------|-------------|
-| **Model** | SmolLM-based from HuggingFace ([livekit/turn-detector](https://huggingface.co/livekit/turn-detector)) |
-| **Threshold** | Configurable (default 0.7), per-language thresholds supported |
-| **Tokenization** | HuggingFace tokenizers with chat template formatting |
-| **Performance** | < 50ms prediction target with warnings for slower inference |
-| **Quantization** | INT8 quantized ONNX model for faster inference |
-| **Graph Optimization** | Level 3 ONNX optimization for maximum performance |
-
----
-
-## Realtime & Latency
-
-WaaV is built for **natural-conversation latency** — the user-perceived metric is *end-of-speech → first response audio*. The gateway's own orchestration overhead is **~12 ms** (measured); the budget is dominated by provider/network cost, which WaaV minimizes through streaming overlap and turn prediction.
-
-**The budget (measured, this host → provider):**
-
-| Stage | Cost | Lever |
-|-------|------|-------|
-| STT finalization | ~250–700 ms (endpointing) | ML turn detection (`turn_detection.enabled`) predicts end-of-turn early |
-| Gateway glue | **~12 ms** | n/a — not the bottleneck |
-| LLM time-to-first-token | provider-dependent | a fast, low-TTFT model — **or** a reasoning model via the two-tier [Realtime Reasoning](#realtime-reasoning) path (masked + routed so it *feels* instant) |
-| TTS first-audio | **~510 ms streaming** / ~1,510 ms batch | `tts_config.features.streaming` |
-
-**Make it realtime:**
-1. `tts_config.features.streaming: true` — WebSocket TTS (Deepgram Aura today).
-2. A low-TTFT LLM in `conversation_config` (or DAG `llm` node) — **or** add a `reasoning_model` for the masked + routed two-tier [Realtime Reasoning](#realtime-reasoning) path.
-3. `stt_config.turn_detection.enabled: true` (+ `eager: true` and `conversation_config.eager_eot: true` for speculative starts).
-4. Watch it live: `WAAV_DEBUG_PROFILE=1` then `GET /debug/profile` — per-turn p50/p90/p99 per stage, bottleneck histogram, and a `realtime_blockers` block.
-
-See [`LATENCY_ANALYSIS.md`](LATENCY_ANALYSIS.md) for the full measured breakdown and [`REALTIME_ROADMAP.md`](REALTIME_ROADMAP.md) for the SOTA-researched path to sub-300 ms.
-
----
-
-## Realtime Reasoning
-
-Reasoning ("thinking") LLMs — OpenAI o-series, DeepSeek-R1, QwQ, Claude / Gemini extended-thinking — give far better answers but are **9–18 s to first user-visible token** (they think before they speak). Naively dropped onto a voice call that is unusable: the caller hears seconds of dead silence, every trivial turn pays the full reasoning tax, and a stuck model hangs the line.
-
-WaaV makes a reasoning LLM **feel instant in voice** — perceived first response **~0.8 s**, a fast model handling everything that doesn't need deep thought, and a safety net so the call never goes silent or drops. Everything is opt-in and flat-configured next to the existing `conversation_config` fields.
-
-**Two fields is the whole mental model:** name a fast `model`; add `reasoning_model` for a smart-but-slow brain.
-
-```jsonc
+```json
 {
-  "conversation": {
-    "model": "gpt-4o-mini",          // fast tier — handles simple turns at ~170 ms
-    "reasoning_model": "o3",         // ← presence lights up two-tier routing + masking
-
-    // ── optional tuning (all flat, all safe-defaulted) ──
-    "reasoning_route": "auto",       // auto (heuristic escalation) | always
-    "reasoning_effort": "low",       // off|minimal|low|medium|high  (vendor-mapped, floor-clamped)
-    "latency_filler": "auto",        // off|auto|aggressive — mask the think-gap
-    "reasoning_budget_ms": 15000,    // max silence (to first audio OR between chunks) → degrade
-    "max_reasoning_tokens": 4096,    // reasoning-tier output ceiling (cost)
-    "max_llm_calls_per_turn": 8,     // per-turn re-inference ceiling (cost)
-    "degradation_message": null      // spoken apology when every tier fails (null = built-in)
-    // reasoning_base_url / reasoning_api_key / reasoning_provider_kind — optional, for a
-    // cross-vendor reasoning tier (e.g. fast = local ollama, reasoning = OpenAI o3)
-  }
+  "type": "config",
+  "stt_config": { "provider": "deepgram", "model": "nova-3", "language": "en",
+                  "sample_rate": 16000, "channels": 1, "punctuation": true, "encoding": "linear16" },
+  "tts_config": { "provider": "deepgram", "model": "aura-asteria-en", "voice_id": "aura-asteria-en",
+                  "audio_format": "linear16", "sample_rate": 24000 }
 }
 ```
 
-**What you get:**
+You get `ready`, then live `stt_result` transcripts as you send 16-bit PCM frames. Add a `conversation_config`
+to have the gateway answer with an LLM, or `"interaction": true` for interaction mode.
 
-| Capability | Config | Behaviour |
+<details>
+<summary><b>Run with Docker or build from source</b></summary>
+
+```bash
+git clone https://github.com/BudEcosystem/WaaV.git && cd WaaV
+
+# Docker (the build context is the repository root)
+docker build -f gateway/Dockerfile -t waav-gateway .
+docker run -p 3001:3001 -e DEEPGRAM_API_KEY=your-deepgram-key waav-gateway
+
+# From source (Rust stable)
+cd gateway && cargo build --release --features dag-routing,turn-ensemble,noise-filter,openapi
+./target/release/waav-gateway -c config.example.yaml
+```
+
+`waav-gateway check` validates your environment and config file without starting the server.
+Build details and gotchas: [docs/build/BUILD.md](docs/build/BUILD.md) · Deployment: [gateway/docs/deployment.md](gateway/docs/deployment.md).
+</details>
+
+## What you can build
+
+| You want to… | Use | Start here |
 |---|---|---|
-| **Two-tier routing** | `reasoning_model`, `reasoning_route` | a word-aware heuristic escalates complex / multi-step-math / multi-turn-follow-up turns to the reasoner and keeps billing/sales chit-chat (`"not interested"`, `"no refund"`) on the fast tier; both tiers share one history |
-| **Latency masking** | `latency_filler` (+ `latency_filler_after_ms`, `latency_filler_phrases`) | one short holding phrase while the model thinks → perceived first audio ~0.8 s; interruptible; one per turn; deduped vs the model's own filler |
-| **Reasoning-effort dial** | `reasoning_effort` | typed enum → OpenAI `reasoning_effort` / Anthropic `thinking{budget}` / Gemini `thinkingBudget`; floor-clamped per model; provider-kind-aware; **emits nothing when a model can't reason** (no 400s); sampling params suppressed when thinking is on |
-| **Stall watchdog + degradation** | `reasoning_budget_ms`, `degradation_message` | a reasoner with no audio — or frozen mid-stream — past the budget degrades to the fast draft / a graceful spoken apology; a partial answer is committed, never restarted-over; the session never drops |
-| **Cost budget** | `max_reasoning_tokens`, `max_llm_calls_per_turn` | bound the reasoning tier's token + call spend (eager/two-tier/escalation all multiply spend on a billing gateway) |
-| **Chain-of-thought stripping** | automatic | `<think>…</think>` is never spoken to the caller (conversation **and** DAG paths) |
-| **Realtime (S2S)** | `reasoning_effort` | mapping is retained for a reasoning-capable Realtime model; GA `gpt-realtime` exposes no session-level reasoning, so the field is omitted there (no 400) — the dial drives the cascade LLM path today |
-
-**Measured (live, ollama; the gateway's own overhead is ~12 ms):**
-
-| | Reasoner naive (single-tier) | WaaV two-tier + masking |
-|---|---|---|
-| Simple turn (`"hi"`) | full reasoning latency (8.9 s+) | **~0.17 s** (routed to the fast tier) |
-| Complex turn — *perceived* first audio | 8.9–18 s of silence | **~0.8 s** (`"one moment"`, then the answer) |
-| Stuck / looping reasoner | hangs to the request timeout | **bounded by `reasoning_budget_ms`** → fast fallback |
-| Chain-of-thought | spoken aloud | **stripped** |
-
-The reasoned *answer* still takes its compute time — masking makes it *feel* responsive, routing keeps it off the cheap turns, and the watchdog guarantees it never hangs. A repeatable harness (`live_reasoning_before_after_measurement`, `#[ignore]`) measures the before/after on your own hardware. Full design + adversarial critique: [`REALTIME_REASONING.md`](REALTIME_REASONING.md), [`REASONING_FOLLOWUP_PLAN.md`](REASONING_FOLLOWUP_PLAN.md).
-
----
+| Put a voice agent on a website or app | `/ws` with `conversation_config` (+ `interaction`) | [Tutorial](gateway/docs/tutorials/interaction_mode_tutorial.md) |
+| Answer phone calls | LiveKit rooms and SIP | [LiveKit](gateway/docs/livekit_integration.md) · [SIP](gateway/docs/sip_routing.md) |
+| Use a speech-to-speech model (OpenAI Realtime, Gemini Live…) | `/realtime` or `/v1/realtime` | [OpenAI Realtime](gateway/docs/openai-realtime.md) |
+| Keep your OpenAI client code, change providers | `/v1/audio/*`, `/v1/realtime` | [API reference](gateway/docs/api-reference.md) |
+| Live captions and transcription | `/ws` streaming STT, `/transcribe/batch` for files | [WebSocket](gateway/docs/websocket.md) |
+| Text-to-speech in any voice | `POST /speak`, `GET /voices` | [API reference](gateway/docs/api-reference.md) |
+| A custom pipeline (route, branch, call webhooks) | DAG configs | [DAG routing](gateway/docs/dag_routing.md) |
 
 ## Features
 
-### Core Capabilities
-
-- **WebSocket Streaming** (`/ws`) - Real-time bidirectional audio/text with provider switching
-- **Realtime Reasoning** - run thinking/reasoning LLMs in live voice: two-tier fast+reasoning routing, latency masking, a stall/degradation safety net, cost budgets, a per-vendor effort dial, and automatic chain-of-thought stripping ([details](#realtime-reasoning))
-- **REST API** - TTS synthesis, voice listing, health checks
-- **LiveKit Integration** - WebRTC rooms, SIP webhooks, participant management
-- **Multi-Provider Support** - Unified interface across [70+ global providers](gateway/docs/SUPPORTED_PROVIDERS.md)
-- **Audio Caching** - Intelligent TTS response caching with XXH3 hashing
-- **Rate Limiting** - Token bucket per-IP rate limiting with configurable limits
-- **JWT Authentication** - Optional API authentication with external validation
-
-### Performance Optimizations
-
-| Feature | Technology | Benefit |
-|---------|------------|---------|
-| HTTP/2 Connection Pooling | ReqManager | Reduced latency, connection reuse |
-| Audio Caching | moka + XXH3 | Sub-millisecond cache lookups |
-| Zero-Copy Pipeline | Bytes crate | 4.1x memory improvement |
-| Rate Limiting | tower-governor | Token bucket per-IP protection |
-| TLS | rustls | No OpenSSL dependency, cross-compilation support |
-
-### Optional Features
-
-| Flag | Description | Use Case |
-|------|-------------|----------|
-| `dag-routing` | DAG-based pipeline engine | Custom voice workflows, multi-provider orchestration |
-| `turn-detect` | ONNX-based turn detection | Conversational AI, voice agents |
-| `noise-filter` | DeepFilterNet noise suppression | Noisy environments, mobile apps |
-| `opus-codec` | Full-duplex Opus transport codec on `/ws` (`audio_in_codec`/`audio_out_codec`) | Bandwidth-constrained / mobile clients; bad-network resilience |
-| `openapi` | OpenAPI 3.1 spec generation | API documentation |
-
-```bash
-# Enable all optional features
-cargo build --release --features dag-routing,turn-detect,noise-filter,openapi
-```
-
----
-
-## Providers
-
-> **[View All 70+ Supported Providers](gateway/docs/SUPPORTED_PROVIDERS.md)** - Complete documentation for STT, TTS, and Realtime providers across all regions.
-
-WaaV Gateway supports **31 STT providers**, **35 TTS providers**, and **11 Realtime / Speech-to-Speech providers** with global coverage including specialized regional providers.
-
-### Speech-to-Text (STT) - 31 Providers
-
-| Category | Providers |
-|----------|-----------|
-| **Global Leaders** | Deepgram, Google Cloud, Azure, OpenAI, ElevenLabs, AssemblyAI, Cartesia, AWS Transcribe, IBM Watson, Groq |
-| **European** | Speechmatics, Gladia, Rev AI, Phonexia, Acapela, Cereproc |
-| **Russia/CIS** | Yandex SpeechKit, Tinkoff VoiceKit, SberDevices |
-| **India** | Sarvam AI, Gnani.ai, Reverie, Bhashini |
-| **China** | iFlytek, Alibaba Cloud, Baidu AI, Tencent Cloud, Huawei Cloud |
-| **East Asia** | NAVER CLOVA (Korea), AmiVoice (Japan) |
-| **Southeast Asia** | Zalo AI, FPT.AI, Viettel AI (Vietnam), NECTEC (Thailand) |
-
-### Text-to-Speech (TTS) - 35 Providers
-
-| Category | Providers |
-|----------|-----------|
-| **Global Leaders** | Deepgram, Google Cloud, Azure, OpenAI, ElevenLabs, Cartesia, AWS Polly, IBM Watson |
-| **Voice Cloning** | Hume AI, Murf.ai, WellSaid Labs, Resemble AI, Speechify, Unreal Speech, Smallest.ai |
-| **Regional** | Yandex, Tinkoff, SberDevices, Sarvam AI, Gnani.ai, Reverie, Bhashini, iFlytek, Alibaba, Baidu, Tencent, Huawei, NAVER CLOVA, Zalo, FPT, Viettel, NECTEC |
-
-### Audio-to-Audio (Realtime / Speech-to-Speech) - 11 Providers
-
-All on a shared `RealtimeSession<P>` scaffold (reconnect + conversation replay + barge-in/truncate + circuit-breaker resilience implemented once); usable via the `/realtime` WebSocket **or** as a persistent `RealtimeProviderNode` inside a DAG. ✅ = live-validated against the real vendor; ◷ = validated to the byte at the wire level (probe-grounded tests + credential-free mock round-trips through the real transport code), real-vendor handshake pending a key.
-
-| Provider | Protocol | Features |
-|----------|----------|----------|
-| **OpenAI Realtime** ✅ | WebSocket (JSON) | `gpt-realtime` (GA) full-duplex, function calling, server-VAD, input-audio noise reduction, per-response override |
-| **Deepgram Voice Agent** ✅ | WebSocket (binary) | STT→LLM→TTS voice agent, barge-in (`UserStartedSpeaking`) |
-| **ElevenLabs Conversational AI** ✅ | WebSocket (base64) | ConvAI agents, ping→pong keepalive |
-| **Hume AI EVI** ◷ | WebSocket | Empathic voice interface, 48 emotion dimensions, prosody analysis |
-| **Azure OpenAI Realtime** ◷ | WebSocket (JSON) | OpenAI GA wire on Azure endpoints/`api-key` auth |
-| **xAI Grok** ◷ | WebSocket (JSON) | OpenAI-compatible realtime |
-| **Inworld** ◷ | WebSocket (JSON) | OpenAI-compatible realtime |
-| **Google Gemini Live** ◷ | WebSocket (JSON) | Multi-frame responses, session resumption |
-| **Ultravox** ◷ | REST → WebSocket | `create-call` handshake then WS, binary audio |
-| **AWS Nova Sonic** ◷ | Bedrock bidirectional HTTP/2 | SigV4 + smithy event-stream framing |
-| **Yandex Realtime** ◷ | WebSocket (JSON) | OpenAI-GA-compatible, dual IAM-token / Api-Key auth |
-
----
-
-## DAG Pipeline Engine
-
-**Feature flag:** `--features dag-routing`
-
-WaaV's DAG (Directed Acyclic Graph) routing system enables flexible, customizable voice processing pipelines with conditional routing, multi-provider orchestration, and parallel processing.
-
-### Capabilities
-
-| Feature | Description |
-|---------|-------------|
-| **Custom Pipelines** | Chain STT, TTS, LLM, and custom processors in any configuration |
-| **External Routing** | Route to HTTP, gRPC, WebSocket, IPC, and LiveKit endpoints |
-| **Conditional Logic** | Use Rhai expressions or switch patterns for dynamic routing |
-| **Parallel Processing** | Split/Join patterns for concurrent branch execution |
-| **A/B Testing** | Route based on API key identity or custom conditions |
-| **Low Latency** | Pre-compiled graphs with lock-free data passing |
-
-### Node Types
-
-- **Input Nodes** - `audio_input`, `text_input`
-- **Provider Nodes** - `stt_provider`, `tts_provider`, `llm_provider`
-- **Processor Nodes** - `transform`, `filter`, `aggregate`
-- **Router Nodes** - `switch`, `conditional`, `split`, `join`
-- **Output Nodes** - `text_output`, `audio_output`, `webhook`
-- **Endpoint Nodes** - `http_endpoint`, `grpc_endpoint`, `websocket_endpoint`
-
-### Quick Example
-
-```json
-{
-  "dag": {
-    "id": "voice-bot",
-    "nodes": [
-      { "id": "input", "type": "audio_input" },
-      { "id": "stt", "type": "stt_provider", "provider": "deepgram" },
-      { "id": "llm", "type": "llm_provider", "provider": "openai" },
-      { "id": "tts", "type": "tts_provider", "provider": "elevenlabs" },
-      { "id": "output", "type": "audio_output" }
-    ],
-    "edges": [
-      { "from": "input", "to": "stt" },
-      { "from": "stt", "to": "llm" },
-      { "from": "llm", "to": "tts" },
-      { "from": "tts", "to": "output" }
-    ],
-    "entry_node": "input",
-    "exit_nodes": ["output"]
-  }
-}
-```
-
-See [docs/dag_routing.md](gateway/docs/dag_routing.md) for complete documentation.
-
----
+| | |
+|---|---|
+| **Interaction mode** | Front model for every turn, background tasks, barge-in, confirmations, caller controls, personas, caller memory, language packs. [Docs](gateway/docs/interaction_mode.md) |
+| **Voice pipeline** | DeepFilterNet noise suppression, Silero VAD, Smart Turn and text turn detection, streaming TTS, Opus transport. |
+| **Realtime reasoning** | A fast model for simple turns and a reasoning model for hard ones, with latency masking, a stall watchdog and chain-of-thought never spoken. [Design](docs/research/REALTIME_REASONING.md) |
+| **Speech-to-speech** | One protocol for 11 realtime providers, with reconnect, conversation replay and barge-in done once for all. |
+| **Segmented speech-to-text** | File-only transcription models served live, turn by turn. [Docs](docs/segmented-stt/customer-contract-reference.md) |
+| **DAG pipelines** | Chain STT, LLM and TTS nodes with routing, splits and joins, and HTTP, gRPC and WebSocket endpoints. [Docs](gateway/docs/dag_routing.md) |
+| **Aliases** | Name a bundle of providers on the server (`support-bot`) and re-point it without touching clients. [Docs](gateway/docs/aliases.md) |
+| **Canonical config** | One language code, one emotion name and one voice description, mapped to each provider's own form. |
+| **OpenAI compatible** | `/v1/audio/speech`, `/v1/audio/transcriptions`, `/v1/audio/translations` and `/v1/realtime`. |
+| **Security** | API secrets or JWT auth, per-IP rate limits, operator credentials and an egress allowlist. [Auth](gateway/docs/authentication.md) · [Egress](gateway/docs/egress-and-credentials.md) |
+| **Operations** | Prometheus metrics, OpenTelemetry tracing, a live latency profiler, recording to S3, graceful drain. |
 
 ## Architecture
 
-```mermaid
-graph TB
-    subgraph Clients["Client Applications"]
-        TS[TypeScript SDK]
-        PY[Python SDK]
-        DASH[Dashboard]
-        WIDG[Widget]
-        MOB[Mobile Apps]
-    end
+<p align="center">
+  <img src="assets/readme/architecture.svg" width="100%" alt="Clients (SDKs, widget, OpenAI clients, LiveKit and SIP) reach endpoints (/ws, /realtime, /v1/realtime, /v1/audio, /speak, /voices, /transcribe/batch, /v1/tasks). Inside the gateway: interaction mode, the voice pipeline, DAG pipelines, realtime reasoning, segmented STT, aliases and speech-to-speech. Outside: speech-to-text, text-to-speech, speech-to-speech, language models, your agents and local models">
+</p>
 
-    subgraph Gateway["WaaV Gateway (Rust)"]
-        subgraph Handlers["Request Handlers"]
-            WS[WebSocket Handler]
-            REST[REST API<br/>Axum]
-            LK[LiveKit Integration]
-            RL[Rate Limiter<br/>tower-governor]
-        end
+## Providers
 
-        subgraph VM["VoiceManager (Central Coordinator)"]
-            STT[STT Manager<br/>BaseSTT]
-            TTS[TTS Manager<br/>TTSProvider]
-            CACHE[Audio Cache<br/>moka+XXH3]
-            TURN[Turn Detector<br/>ONNX Runtime]
-            NF[Noise Filter<br/>DeepFilterNet]
-        end
+| Kind | Count | Including |
+|---|---|---|
+| Speech-to-text | 31 | Deepgram, Google, Azure, OpenAI, ElevenLabs, AssemblyAI, Cartesia, AWS Transcribe, Speechmatics, Gladia, Sarvam, iFlytek… |
+| Text-to-speech | 35 | ElevenLabs, Deepgram, Cartesia, OpenAI, Google, Azure, AWS Polly, Hume, Murf, Resemble, Smallest.ai… |
+| Speech-to-speech | 11 | OpenAI Realtime, Gemini Live, Deepgram Voice Agent, ElevenLabs agents, Hume EVI, AWS Nova Sonic, Azure, Grok, Inworld, Ultravox, Yandex |
+| Language models | any | OpenAI-compatible servers (vLLM, llama.cpp, Ollama…), OpenAI, Anthropic, Gemini |
 
-        subgraph Providers["Provider Layer"]
-            DG[Deepgram<br/>WS + HTTP]
-            EL[ElevenLabs<br/>WebSocket]
-            GC[Google<br/>gRPC]
-            AZ[Azure<br/>WebSocket]
-            CA[Cartesia<br/>WebSocket]
-            OAI[OpenAI<br/>STT/TTS/Realtime]
-            AWS[AWS<br/>Transcribe/Polly]
-            IBM[IBM Watson<br/>STT/TTS]
-            GRQ[Groq<br/>REST]
-            HUM[Hume AI<br/>TTS/EVI]
-        end
-    end
-
-    Clients -->|WebSocket / REST / WebRTC| Handlers
-    WS --> VM
-    REST --> VM
-    LK --> VM
-    STT --> NF
-    TTS --> NF
-    STT --> Providers
-    TTS --> Providers
-
-    style Clients fill:#e3f2fd
-    style Gateway fill:#f5f5f5
-    style VM fill:#fff3e0
-    style Providers fill:#e8f5e9
-```
-
----
-
-## Installation
-
-### From Source (Recommended)
-
-```bash
-# Clone and build
-git clone https://github.com/bud-foundry/waav.git
-cd waav/gateway
-cargo build --release
-
-# Run with config
-./target/release/waav-gateway -c config.yaml
-```
-
-### Docker
-
-```bash
-# Build image
-docker build -t waav-gateway .
-
-# Run container
-docker run -p 3001:3001 \
-  -v $(pwd)/config.yaml:/config.yaml \
-  -e DEEPGRAM_API_KEY=your-key \
-  waav-gateway
-```
-
-### With Feature Flags
-
-```bash
-# Enable noise filtering and turn detection
-cargo build --release --features turn-detect,noise-filter
-
-# Enable OpenAPI documentation generation
-cargo build --release --features openapi
-cargo run --features openapi -- openapi -o docs/openapi.yaml
-```
-
-### Download Turn Detection Assets
-
-If using the `turn-detect` feature, download the required model and tokenizer:
-
-```bash
-cargo run --features turn-detect -- init
-```
-
----
+Regional coverage includes India, China, Japan, Korea, South-East Asia, Russia and Europe.
+→ [Every provider, with models and features](gateway/docs/SUPPORTED_PROVIDERS.md)
 
 ## Client SDKs
 
-### TypeScript SDK
+| SDK | Install | Docs |
+|---|---|---|
+| Python | `pip install "git+https://github.com/BudEcosystem/WaaV#subdirectory=clients_sdk/python"` | [clients_sdk/python](clients_sdk/python/README.md) |
+| TypeScript | from a clone: `cd clients_sdk/typescript && npm ci && npm run build`, then `npm install <path-to>/clients_sdk/typescript` | [clients_sdk/typescript](clients_sdk/typescript/README.md) |
+| Web widget | a drop-in voice button for any page | [clients_sdk/widget](clients_sdk/widget/README.md) |
 
-```bash
-npm install @bud-foundry/sdk
-```
-
-```typescript
-import { BudClient } from '@bud-foundry/sdk';
-
-const bud = new BudClient({
-  baseUrl: 'http://localhost:3001',
-  apiKey: 'your-api-key'  // Optional if auth not required
-});
-
-// Speech-to-Text
-const stt = await bud.stt.connect({ provider: 'deepgram' });
-stt.on('transcript', (result) => {
-  console.log(result.is_final ? `Final: ${result.text}` : `Interim: ${result.text}`);
-});
-await stt.startListening();
-
-// Text-to-Speech
-const tts = await bud.tts.connect({ provider: 'elevenlabs' });
-await tts.speak('Hello from WaaV!');
-
-// ── Flagship: a full voice AGENT in ~5 lines (STT → built-in LLM → TTS,
-//    with reasoning + barge-in + latency-filler) ──
-const agent = bud.agent({
-  stt: { provider: 'deepgram', language: 'en-US' },   // one canonical language token
-  tts: { provider: 'elevenlabs', voiceDescriptor: { gender: 'female', locale: 'en-US', style: 'warm' } },
-  llm: { baseUrl: 'http://localhost:11434/v1', model: 'qwen2.5', reasoningEffort: 'minimal', latencyFiller: 'auto' },
-  turn: { eagerEot: true }, interrupt: true,
-});
-agent.on('transcript', (t) => console.log('user:', t.text));
-agent.on('audio', (a) => playback(a.audio));          // bot speech
-await agent.connect();
-
-// Proxy / alias model name — re-point providers server-side, client never changes
-const bot = bud.agent({ alias: 'support-bot' });       // a complete agent from one name
-
-// Provider-agnostic realtime (S2S) — same surface for ALL 11 providers
-const rt = bud.realtime({ provider: 'openai', voice: 'alloy', instructions: 'Be concise.' });
-
-// Bidirectional Voice (low-level STT+TTS, no LLM loop)
-const talk = await bud.talk.connect({
-  stt: { provider: 'deepgram' },
-  tts: { provider: 'elevenlabs' }
-});
-await talk.startListening();
-
-// OpenAI STT/TTS
-const sttOpenAI = await bud.stt.connect({
-  provider: 'openai',
-  model: 'whisper-1'
-});
-
-const ttsOpenAI = await bud.tts.connect({
-  provider: 'openai',
-  model: 'tts-1-hd',
-  voice: 'nova'
-});
-await ttsOpenAI.speak('Hello from OpenAI!');
-
-// Hume AI TTS with emotion control
-const ttsHume = await bud.tts.connect({
-  provider: 'hume',
-  voice: 'Kora',
-  emotion: 'happy',
-  emotionIntensity: 0.8,
-  deliveryStyle: 'cheerful'
-});
-await ttsHume.speak('Hello from Hume AI with emotion!');
-```
-
-**Features:**
-- Full STT/TTS streaming with typed events
-- MetricsCollector for latency tracking (TTFT, connection time)
-- Automatic reconnection with exponential backoff
-- Browser and Node.js support
-
-### Python SDK
-
-```bash
-pip install bud-waav
-```
+A voice agent in Python:
 
 ```python
+import asyncio
 from bud_waav import BudClient
 
-bud = BudClient(base_url="http://localhost:3009", api_key="your-api-key")
+async def main():
+    bud = BudClient(base_url="http://localhost:3001")
+    agent = bud.agent(
+        stt={"provider": "deepgram", "model": "nova-3", "language": "en"},
+        tts={"provider": "deepgram", "voice_id": "aura-asteria-en"},
+        llm={"base_url": "http://localhost:8000/v1", "model": "your-fast-model"},
+        interaction=True,          # the 1.1 interaction mode (needs the server switch)
+    )
+    async with agent:
+        async for event in agent:  # transcripts, audio, interaction events, warnings
+            print(event.type)
 
-# ── Flagship: a full voice AGENT in ~5 lines (STT → built-in LLM → TTS,
-#    with reasoning + barge-in + latency-filler) ──
-async with bud.agent(
-    stt={"provider": "deepgram", "language": "en-US"},   # one canonical language token
-    tts={"provider": "elevenlabs",
-         "voice_descriptor": {"gender": "female", "locale": "en-US", "style": "warm"}},
-    llm={"base_url": "http://localhost:11434/v1", "model": "qwen2.5",
-         "reasoning_effort": "minimal", "latency_filler": "auto"},
-    turn={"eager": True}, interrupt=True,
-) as call:
-    await call.send_audio(pcm)
-    async for ev in call:                # one unified stream
-        if ev.type == "transcript": print("user:", ev.text)
-        elif ev.type == "audio":    play(ev.audio.audio)   # bot speech
-        elif ev.type == "warning":  print("ignored by provider:", ev.warning.code)
-
-# Proxy / alias model name — re-point providers server-side, client never changes
-call = bud.agent(alias="support-bot")          # a complete agent from one name
-
-# Provider-agnostic realtime (S2S) — same surface for ALL 11 providers
-rt = bud.realtime(provider="openai", voice="alloy", instructions="Be concise.")
-
-# Voice cloning + batched/async transcription + standardized translation
-cloned = await bud.voices.clone(provider="elevenlabs", name="My Voice", samples=[wav_bytes])
-job = await bud.transcribe_batch(audio=url, config={"provider": "deepgram"})
-async with bud.transcribe(stt={"provider": "deepgram",
-        "translation": {"target_languages": ["hi-IN"]}}) as s:    # transcribe + translate
-    async for r in s:
-        print(r.text, [t.text for t in r.translations])
-
-# Low-level Speech-to-Text
-async with bud.stt.connect(provider="deepgram") as session:
-    async for result in session.transcribe_stream(audio_generator()):
-        print(f"Transcript: {result.text}")
-
-# Low-level Text-to-Speech (emotion is one canonical token across providers)
-async with bud.tts.connect(provider="elevenlabs") as session:
-    await session.speak("Hello from WaaV!")
-
-# OpenAI STT/TTS
-async with bud.stt.connect(provider="openai", model="whisper-1") as session:
-    async for result in session.transcribe_stream(audio_generator()):
-        print(f"Transcript: {result.text}")
-
-async with bud.tts.connect(provider="openai", model="tts-1-hd", voice="nova") as session:
-    await session.speak("Hello from OpenAI!")
-
-# Hume AI TTS with emotion control
-async with bud.tts.connect(
-    provider="hume",
-    voice="Kora",
-    emotion="happy",
-    emotion_intensity=0.8,
-    delivery_style="cheerful"
-) as session:
-    await session.speak("Hello from Hume AI with emotion!")
+asyncio.run(main())
 ```
 
-**Features:**
-- Async/await native support
-- Context manager for automatic cleanup
-- Streaming iterators
-- Type hints (PEP 484)
+## API at a glance
 
-### Dashboard (Testing UI)
+| Endpoint | What it does |
+|---|---|
+| `GET /ws` | Streaming voice session: STT, TTS, LLM loop, DAGs, interaction mode |
+| `GET /realtime` · `GET /v1/realtime` | Speech-to-speech, in WaaV's protocol or OpenAI's |
+| `POST /speak` · `GET /voices` · `POST /voices/clone` | Synthesis, voice catalogue, voice cloning |
+| `POST /v1/audio/speech` · `/transcriptions` · `/translations` | OpenAI Audio API |
+| `POST /transcribe/batch` | Transcribe files |
+| `GET /v1/tasks` · `GET /v1/tasks/events` | Interaction-mode tasks and their live events |
+| `/livekit/*` · `/sip/*` | Rooms, tokens, participants, call transfer |
+| `/dag/*` · `/capabilities/*` | Pipeline templates and validation, provider capabilities |
+| `GET /livez` · `GET /metrics` | Health and Prometheus metrics |
 
-A web-based testing interface for development:
+Full reference: [gateway/docs/api-reference.md](gateway/docs/api-reference.md) · OpenAPI spec: [gateway/docs/openapi.yaml](gateway/docs/openapi.yaml)
 
-```bash
-cd clients_sdk/dashboard
-npm install && npm run dev
-```
+## Documentation
 
-**Features:**
-- Real-time transcription display
-- TTS synthesis panel with voice selection
-- Metrics visualization (latency charts)
-- WebSocket message inspector
-- Provider switching
-
-### Embeddable Widget
-
-Drop-in voice widget for web applications:
-
-```html
-<script type="module">
-  import { BudWidget } from '@bud-foundry/widget';
-</script>
-
-<bud-widget
-  server="ws://localhost:3001/ws"
-  provider="deepgram"
-  mode="push-to-talk"
-  theme="dark">
-</bud-widget>
-```
-
----
-
-## API Reference
-
-### REST Endpoints
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/` | GET | Health check (returns `{"status":"ok"}`) |
-| `/voices` | GET | List available TTS voices for a provider |
-| `/speak` | POST | Synthesize speech from text |
-| `/livekit/token` | POST | Generate LiveKit participant token |
-| `/recording/{stream_id}` | GET | Download recording from S3 |
-| `/sip/hooks` | GET/POST | Manage SIP webhook hooks |
-| `/realtime` | WebSocket | OpenAI Realtime audio-to-audio streaming |
-
-### WebSocket Protocol
-
-Connect to `ws://host:3001/ws` for real-time voice processing.
-
-**Configuration Message (JSON):**
-```json
-{
-  "action": "configure",
-  "provider": "deepgram",
-  "model": "nova-3",
-  "stt_config": {
-    "interim_results": true,
-    "punctuation": true,
-    "language": "en-US"
-  }
-}
-```
-
-**Audio Data:** Send raw PCM audio as binary WebSocket frames (16-bit signed LE, mono).
-
-**Response Messages:**
-```json
-// Ready message (after configuration)
-{"type": "ready", "stream_id": "abc123"}
-
-// Transcript message
-{"type": "transcript", "text": "Hello world", "is_final": true}
-
-// TTS audio (binary frame with header)
-[binary audio data]
-
-// Error message
-{"type": "error", "message": "Provider connection failed"}
-```
-
-**Interaction mode** (opt-in, protocol 1.1): a fast front model keeps the conversation going while tasks run on your LLM or agents. Start with the [Interaction Mode Tutorial](gateway/docs/tutorials/interaction_mode_tutorial.md); the full reference is [Interaction Mode](gateway/docs/interaction_mode.md).
-
-### TTS Request Example
-
-```bash
-curl -X POST http://localhost:3001/speak \
-  -H "Content-Type: application/json" \
-  -d '{
-    "text": "Welcome to WaaV Gateway!",
-    "tts_config": {
-      "provider": "deepgram",
-      "voice": "aura-asteria-en",
-      "sample_rate": 24000
-    }
-  }' \
-  --output speech.pcm
-```
-
-**Response Headers:**
-- `Content-Type: audio/pcm`
-- `X-Audio-Format: linear16`
-- `X-Sample-Rate: 24000`
-
----
-
-## Configuration
-
-WaaV uses YAML configuration with environment variable overrides. Create `config.yaml`:
-
-```yaml
-# Server configuration
-server:
-  host: "0.0.0.0"
-  port: 3001
-  tls:
-    enabled: false
-    cert_path: "/path/to/cert.pem"
-    key_path: "/path/to/key.pem"
-
-# Security settings
-security:
-  rate_limit_requests_per_second: 60    # ENV: RATE_LIMIT_REQUESTS_PER_SECOND
-  rate_limit_burst_size: 10             # ENV: RATE_LIMIT_BURST_SIZE
-  max_connections_per_ip: 100
-
-# Provider API keys
-providers:
-  deepgram_api_key: ""                  # ENV: DEEPGRAM_API_KEY
-  elevenlabs_api_key: ""                # ENV: ELEVENLABS_API_KEY
-  google_credentials: ""                # ENV: GOOGLE_APPLICATION_CREDENTIALS
-  azure_speech_subscription_key: ""     # ENV: AZURE_SPEECH_SUBSCRIPTION_KEY
-  azure_speech_region: "eastus"         # ENV: AZURE_SPEECH_REGION
-  cartesia_api_key: ""                  # ENV: CARTESIA_API_KEY
-  openai_api_key: ""                    # ENV: OPENAI_API_KEY
-  aws_access_key_id: ""                 # ENV: AWS_ACCESS_KEY_ID
-  aws_secret_access_key: ""             # ENV: AWS_SECRET_ACCESS_KEY
-  aws_region: "us-east-1"               # ENV: AWS_REGION
-  ibm_watson_api_key: ""                # ENV: IBM_WATSON_API_KEY
-  ibm_watson_instance_id: ""            # ENV: IBM_WATSON_INSTANCE_ID
-  ibm_watson_region: "us-south"         # ENV: IBM_WATSON_REGION
-  groq_api_key: ""                      # ENV: GROQ_API_KEY
-  hume_api_key: ""                      # ENV: HUME_API_KEY
-
-# LiveKit configuration (optional)
-livekit:
-  url: "ws://localhost:7880"            # ENV: LIVEKIT_URL
-  public_url: "http://localhost:7880"   # ENV: LIVEKIT_PUBLIC_URL
-  api_key: "devkey"                     # ENV: LIVEKIT_API_KEY
-  api_secret: "secret"                  # ENV: LIVEKIT_API_SECRET
-
-# Authentication (optional)
-auth:
-  required: false                       # ENV: AUTH_REQUIRED
-  service_url: ""                       # ENV: AUTH_SERVICE_URL
-  signing_key_path: ""                  # ENV: AUTH_SIGNING_KEY_PATH
-
-# Caching
-cache:
-  path: "/var/cache/waav-gateway"       # ENV: CACHE_PATH
-  ttl_seconds: 2592000                  # ENV: CACHE_TTL_SECONDS (30 days)
-
-# Recording storage (S3)
-recording:
-  s3_bucket: "my-recordings"            # ENV: RECORDING_S3_BUCKET
-  s3_region: "us-west-2"                # ENV: RECORDING_S3_REGION
-```
-
-**Priority:** Environment Variables > YAML File > Defaults
-
----
-
-## Performance
-
-### Gateway Overhead Benchmarks
-
-Tested with mock providers (0ms provider latency) to measure pure gateway overhead:
-
-| Metric | Value | Target | Status |
-|--------|-------|--------|--------|
-| Peak RPS | 112,528 | 10,000 | 11x exceeded |
-| Gateway P50 | 0.343ms | - | Excellent |
-| Gateway P99 | 1.384ms | <3-5ms | PASS |
-| Memory (RSS) | 38MB | - | Very efficient |
-| Max Concurrent Users | 28,000 | 10,000 | 2.8x exceeded |
-| Breaking Point | 28,500 VUs | - | Identified |
-| Error Rate | 0.00% | <1% | PASS |
-
-> **Note:** Total end-to-end latency = Gateway overhead + Provider latency. Provider latency varies by cloud provider.
-
-### Scaling Characteristics
-
-| Concurrent Users | RPS | P99 Latency | Error Rate |
-|------------------|-----|-------------|------------|
-| 50 (optimal) | 104,462 | 1.65ms | 0.00% |
-| 1,000 | 41,401 | 28.66ms | 0.00% |
-| 5,000 | 32,273 | 130ms | 0.00% |
-| 10,000 | 34,253 | 288ms | 0.00% |
-| 28,000 | 2,618 | 28.7s | 0.00% |
-
-### Chaos Engineering (All Passed)
-
-| Test | Result |
-|------|--------|
-| SIGSTOP/SIGCONT (3s freeze) | Recovered immediately |
-| Concurrency Spike (10→500→10 VUs) | 100% success |
-| Rapid Connections (1000/sec) | No FD leaks |
-| Malformed JSON injection | Properly rejected |
-| Oversized payload (1MB) | Properly rejected |
-
-### Optimization Techniques
-
-- **HTTP/2 Connection Pooling** - Persistent connections with automatic warmup
-- **Audio Response Caching** - XXH3 content hashing for intelligent cache keys
-- **Zero-Copy Pipeline** - `Bytes` crate for 4.1x memory improvement
-- **Token Bucket Rate Limiting** - Per-IP protection with configurable limits
-- **AtomicU64 Cache Metrics** - 2.13x faster under concurrent load
-- **Release Profile** - LTO, single codegen unit, stripped binaries
-
-```toml
-# Cargo.toml release profile
-[profile.release]
-opt-level = 3
-lto = "thin"
-codegen-units = 1
-strip = true
-panic = "unwind"   # per-session panic isolation: a bad frame kills one
-                   # connection (caught by catch_unwind), never the process
-```
-
----
-
-## Roadmap & TODO
-
-Tracked, well-scoped follow-ups from the production-hardening audit (full detail in [`MASTER_PLAN.md`](MASTER_PLAN.md) §8 and [`AUDIT_REPORT.md`](AUDIT_REPORT.md)):
-
-**Realtime**
-- [ ] Sub-sentence token streaming to WS TTS (`flush=false` deltas) to recover the full overlap window
-- [ ] WebSocket TTS for more providers (Cartesia, ElevenLabs streaming) behind the same `features.streaming` flag
-- [ ] Supervised reconnect for WebSocket TTS (currently lazy reconnect-on-next-speak)
-- [ ] Speech-to-speech (S2S) DAG node — native audio-in/audio-out models (gpt-realtime / Gemini Live / Nova Sonic / self-hosted Moshi)
-- [ ] Smart Turn v3 model swap pending the accuracy gate + GPU execution-provider numbers
-
-**Standardization & accuracy**
-- [ ] Canonical `is_final` / `is_speech_final` semantics + a fleet conformance test (fix ElevenLabs interim flags, Google `SpeechActivityEnd`)
-- [ ] Warn-on-unknown for WebSocket config fields (surface typo'd keys instead of silently ignoring them)
-- [ ] OpenAI realtime STT WebSocket path (currently batch-only)
-- [ ] Provider long-tail verification — several integrations remain protocol-flagged (see `AUDIT_REPORT.md` per-provider table)
-
-**Chaos & ops**
-- [ ] LiveKit operation-queue shutdown handshake + depth wiring into the profiler
-- [ ] Migrate the Deepgram STT client off its legacy reconnect loop onto `ReconnectableStream`
-- [ ] Re-bless `docs/openapi.yaml` when the wire enums next change
-
----
+| | |
+|---|---|
+| **Start** | [Interaction mode tutorial](gateway/docs/tutorials/interaction_mode_tutorial.md) · [WebSocket protocol](gateway/docs/websocket.md) · [API reference](gateway/docs/api-reference.md) |
+| **Features** | [Interaction mode](gateway/docs/interaction_mode.md) · [DAG routing](gateway/docs/dag_routing.md) · [Aliases](gateway/docs/aliases.md) · [LiveKit](gateway/docs/livekit_integration.md) · [Plugins](gateway/docs/plugins.md) |
+| **Operate** | [Deployment](gateway/docs/deployment.md) · [Docker](gateway/docs/docker.md) · [Authentication](gateway/docs/authentication.md) · [Egress and credentials](gateway/docs/egress-and-credentials.md) |
+| **Providers** | [Supported providers](gateway/docs/SUPPORTED_PROVIDERS.md) · [Adding a provider](gateway/docs/how_to_add_new_provider.md) |
+| **Project** | [Changelog](gateway/CHANGELOG.md) · [Building](docs/build/BUILD.md) · [Design notes, plans and reports](docs/README.md) |
 
 ## Contributing
 
-### Development Setup
+Issues and pull requests are welcome. Before you open a PR, run what CI runs (the build environment, such as
+`CUDA_HOME=/tmp/nocuda`, is in [docs/build/BUILD.md](docs/build/BUILD.md)):
 
 ```bash
-# Clone and setup
-git clone https://github.com/bud-foundry/waav.git
-cd waav/gateway
-
-# Run development server
-cargo run -- -c config.yaml
-
-# Run tests
-cargo test
-
-# Code style
-cargo fmt && cargo clippy
+cd gateway
+cargo fmt --all --check
+cargo clippy --all-targets --features dag-routing,turn-ensemble,noise-filter,openapi -- -D warnings
+cargo test --lib --features dag-routing,turn-ensemble,noise-filter,openapi
 ```
 
-### Building Documentation
-
-```bash
-# Generate OpenAPI spec
-cargo run --features openapi -- openapi -o docs/openapi.yaml
-
-# View API docs
-open docs/openapi.yaml
-```
-
-### Project Structure
-
-```
-waav/
-├── gateway/                 # Rust gateway server
-│   ├── src/
-│   │   ├── core/           # STT/TTS providers, voice manager
-│   │   ├── dag/            # DAG pipeline engine (conditional routing)
-│   │   ├── handlers/       # WebSocket and REST handlers
-│   │   ├── livekit/        # LiveKit integration
-│   │   └── utils/          # Noise filter, caching, HTTP pooling
-│   ├── docs/               # API documentation
-│   └── tests/              # Integration tests
-├── clients_sdk/
-│   ├── typescript/         # TypeScript SDK
-│   ├── python/             # Python SDK
-│   ├── dashboard/          # Testing dashboard
-│   └── widget/             # Embeddable widget
-└── assets/                 # Logo and static assets
-```
-
----
+CI runs these plus integration tests against mock providers, accuracy gates for voice activity and turn
+detection, an OpenAPI drift check and supply-chain checks.
 
 ## License
 
-WaaV Gateway is licensed under the [Apache License 2.0](LICENSE).
-
----
-
-<p align="center">
-  Built with Rust by <a href="https://bud-foundry.com">Bud Foundry</a>
-</p>
+[Apache-2.0](gateway/LICENSE) © Bud Ecosystem

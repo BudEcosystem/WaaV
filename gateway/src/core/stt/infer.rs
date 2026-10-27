@@ -1,6 +1,6 @@
 //! WaaV-Infer STT adapter (`provider = "waav-infer"`) — Regime A, Cascade-over-Infer.
 //!
-//! `INFER_GATEWAY_INTEGRATION.md` §5 (GW-3 breaker half landed here; the native WS v1
+//! `docs/infer/INFER_GATEWAY_INTEGRATION.md` §5 (GW-3 breaker half landed here; the native WS v1
 //! transport mapping is the sibling GW1 tasks). Infer is "the self-hosted inference tier
 //! behind the gateway's existing provider seams" — so it plugs in behind [`BaseSTT`] like any
 //! other provider, through the `inventory`→registry path, with **zero** handler/route changes.

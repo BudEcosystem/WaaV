@@ -147,7 +147,7 @@ Connect to `ws://localhost:3001/ws` and send the `config` message first:
   "type": "config",
   "stream_id": "tutorial-2",
   "stt_config": { "provider": "deepgram", "model": "nova-3", "language": "en",
-                  "sample_rate": 16000, "channels": 1, "encoding": "linear16" },
+                  "sample_rate": 16000, "channels": 1, "punctuation": true, "encoding": "linear16" },
   "tts_config": { "provider": "deepgram", "model": "aura-asteria-en", "voice_id": "aura-asteria-en",
                   "audio_format": "linear16", "sample_rate": 24000 },
   "conversation_config": { "base_url": "http://127.0.0.1:18742/v1", "model": "your-background-model" },

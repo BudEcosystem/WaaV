@@ -2,7 +2,7 @@
 //!
 //! These run on the audio hot path (~50–100 fps/session) and gate how fast WaaV
 //! can DECIDE the user stopped talking — the budget that precedes `stt_final`
-//! (see LATENCY_ANALYSIS.md §6/§7). Inference must stay well under one frame
+//! (see docs/reports/LATENCY_ANALYSIS.md §6/§7). Inference must stay well under one frame
 //! (~10–20 ms) to run continuously without adding turn-detection lag.
 //!
 //! Models are read from the local cache (`~/.cache/waav/models/*.onnx`); no

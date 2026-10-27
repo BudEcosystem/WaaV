@@ -252,7 +252,7 @@ pub struct RealtimeConfig {
     #[serde(default)]
     pub modalities: Option<Vec<String>>,
 
-    /// S2S (REALTIME_REASONING.md §6): reasoning-effort dial — the ONE default
+    /// S2S (docs/research/REALTIME_REASONING.md §6): reasoning-effort dial — the ONE default
     /// that spans BOTH the cascade and realtime paths. On a reasoning-capable
     /// realtime model it maps to the session's native `reasoning.effort`; `Off`
     /// (or `None`) sends nothing (a non-reasoning realtime model rejects it —

@@ -1,11 +1,11 @@
 name: CI
 
-# Production CI for the WaaV gateway. Closes the "no CI" gap flagged in BRUTAL_REVIEW.md and
+# Production CI for the WaaV gateway. Closes the "no CI" gap flagged in docs/reports/BRUTAL_REVIEW.md and
 # implements the plan W-T1 redesign (exit E8/E9/E12).
 # Design notes:
 #  - No job depends on paid-provider credentials EXCEPT `real-provider-e2e`, which is gated
 #    on repo secrets and only runs on the main branch / manual dispatch.
-#  - Build env follows BUILD.md: CUDA_HOME=/tmp/nocuda makes webrtc-sys skip the NVIDIA video
+#  - Build env follows docs/build/BUILD.md: CUDA_HOME=/tmp/nocuda makes webrtc-sys skip the NVIDIA video
 #    codec (Gotcha 2); ORT_DYLIB_PATH points `ort` (load-dynamic) at ONNX Runtime 1.22 at
 #    RUNTIME (Gotcha 6) — required by every job that actually LOADS a neural model.
 #  - Local neural components (Silero VAD, Smart-Turn, Turn-Detect) run ONNX locally, so their
@@ -34,7 +34,7 @@ env:
   # ort downloads its own ONNX Runtime binaries for the build:
   ORT_STRATEGY: download
   # webrtc-sys build.rs enables the NVIDIA video codec when <CUDA_HOME>/include/cuda.h exists
-  # (BUILD.md Gotcha 2). Point CUDA_HOME at a dir with no cuda.h so the codec is skipped.
+  # (docs/build/BUILD.md Gotcha 2). Point CUDA_HOME at a dir with no cuda.h so the codec is skipped.
   CUDA_HOME: /tmp/nocuda
   # ONNX Runtime version `ort` rc.10 expects, provisioned at runtime for model-loading jobs.
   ORT_VERSION: "1.22.0"

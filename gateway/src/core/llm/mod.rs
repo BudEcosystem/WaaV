@@ -921,7 +921,7 @@ impl LlmClient {
         }
     }
 
-    /// S1/S2 (REALTIME_REASONING.md §5): clone this client as a second TIER —
+    /// S1/S2 (docs/research/REALTIME_REASONING.md §5): clone this client as a second TIER —
     /// a different model/endpoint/effort — while SHARING the per-session history
     /// (the canonical context is vendor-neutral, so the fast tier and the slow
     /// reasoning tier see the SAME conversation; an escalated turn continues it

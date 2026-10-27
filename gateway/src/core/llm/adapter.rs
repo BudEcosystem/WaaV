@@ -57,7 +57,7 @@ impl AdapterKind {
     }
 }
 
-/// D1 (REALTIME_REASONING.md §4.1): the reasoning/thinking-effort dial — ONE
+/// D1 (docs/research/REALTIME_REASONING.md §4.1): the reasoning/thinking-effort dial — ONE
 /// typed knob the adapter maps to each vendor's native control, clamped to the
 /// model's floor. `Off` *minimizes* thinking; it is not always literally zero,
 /// because some 2026 models are adaptive-thinking-only and have a floor — the

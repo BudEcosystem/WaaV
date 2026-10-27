@@ -132,7 +132,7 @@ pub struct ConversationConfig {
     pub latency_filler_after_ms: Option<u64>,
     /// D3: custom masking phrases. Empty = the built-in action-phrase pool.
     pub latency_filler_phrases: Vec<String>,
-    /// S1/S2 (REALTIME_REASONING.md §5): optional slow/reasoning tier. When set,
+    /// S1/S2 (docs/research/REALTIME_REASONING.md §5): optional slow/reasoning tier. When set,
     /// complex turns are escalated to this model (sharing the conversation
     /// history) while the fast `model` handles the rest and the D3 filler masks
     /// the reasoning latency. `None` = single-tier.
@@ -146,7 +146,7 @@ pub struct ConversationConfig {
     pub reasoning_provider_kind: Option<crate::core::llm::AdapterKind>,
     /// S2: how to route turns between the fast and reasoning tiers.
     pub reasoning_route: RoutingMode,
-    /// P1+A7 (REALTIME_REASONING.md §8, FOLLOWUP §2.2): the reasoning tier's
+    /// P1+A7 (docs/research/REALTIME_REASONING.md §8, FOLLOWUP §2.2): the reasoning tier's
     /// MAX-SILENCE-GAP budget, in ms — the longest the line may go silent BEFORE
     /// first audio OR BETWEEN audio chunks. If exceeded, the reasoner is cancelled
     /// and: with audio already played, the partial is committed (no talk-over
@@ -159,7 +159,7 @@ pub struct ConversationConfig {
     /// and nothing else has been said this turn — a graceful apology instead of
     /// dead air or a dropped session. `None` ⇒ [`DEFAULT_DEGRADATION_MESSAGE`].
     pub degradation_message: Option<String>,
-    /// P2 (REALTIME_REASONING.md §8): per-turn ceiling on LLM re-inference rounds
+    /// P2 (docs/research/REALTIME_REASONING.md §8): per-turn ceiling on LLM re-inference rounds
     /// (the tool-call loop — the dominant spend multiplier). Bounds a pathological
     /// call-me-again loop on a billing gateway. Default
     /// [`DEFAULT_MAX_LLM_CALLS_PER_TURN`].
@@ -241,7 +241,7 @@ impl Default for ConversationConfig {
     }
 }
 
-/// D3 (REALTIME_REASONING.md §4.3): the unified latency-masking mode. ONE knob
+/// D3 (docs/research/REALTIME_REASONING.md §4.3): the unified latency-masking mode. ONE knob
 /// covering the action-preamble + pre-rendered gap-filler, deduped to at most one
 /// masking utterance per turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
@@ -275,7 +275,7 @@ impl LatencyFiller {
     }
 }
 
-/// S2 (REALTIME_REASONING.md §5): when a `reasoning_model` is configured, how to
+/// S2 (docs/research/REALTIME_REASONING.md §5): when a `reasoning_model` is configured, how to
 /// route each turn between the fast `model` and the slow reasoning tier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -290,7 +290,7 @@ pub enum RoutingMode {
     Always,
 }
 
-/// S2 (REALTIME_REASONING.md §5 + FOLLOWUP §2.1): cheap per-turn escalation
+/// S2 (docs/research/REALTIME_REASONING.md §5 + FOLLOWUP §2.1): cheap per-turn escalation
 /// heuristic — does this user turn look like it needs the reasoning tier? One
 /// word-aware lowercase scan, no model call (single-digit µs): the design's
 /// fallback when no trained classifier exists. WORD-AWARE (token equality, not
@@ -1155,7 +1155,7 @@ impl ConversationOrchestrator {
         false
     }
 
-    /// S3 (REALTIME_REASONING.md §5): wire the async-tool final sink. When an
+    /// S3 (docs/research/REALTIME_REASONING.md §5): wire the async-tool final sink. When an
     /// async tool (`cancel_on_interruption=false`) delivers its result, it lands
     /// here. Captures a `Weak<Self>` so the detached delivery task can re-enter
     /// the orchestrator without keeping it alive past teardown. The fast and
@@ -1379,7 +1379,7 @@ impl ConversationOrchestrator {
     /// mute gate by emitting `Started { interrupt: true }`): cancel the in-flight
     /// LLM/eager turn and clear queued/playing TTS.
     ///
-    /// CRITICAL (REALTIME_REASONING.md §4.4 / critique C3): the COMPUTE cancel
+    /// CRITICAL (docs/research/REALTIME_REASONING.md §4.4 / critique C3): the COMPUTE cancel
     /// (LLM + eager) happens UNCONDITIONALLY — a barge-in during a protected
     /// (filler/uninterruptible) window must still stop a slow reasoning turn, not
     /// let it burn for the clip's whole duration. The protected-window guard
@@ -1491,7 +1491,7 @@ impl ConversationOrchestrator {
         // preserving the original first-audio (TTFA) degrade.
         let last_progress_at = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
-        // D3 (REALTIME_REASONING.md §4.3): latency masking. Arm a SINGLE timer on
+        // D3 (docs/research/REALTIME_REASONING.md §4.3): latency masking. Arm a SINGLE timer on
         // this CONFIRMED-EoT path (never on the speculative/eager path). If no
         // audio has reached TTS by the wait threshold, speak ONE short action
         // phrase (interruptible) to keep the line alive while the LLM/RAG/tool
@@ -2072,7 +2072,7 @@ impl ConversationOrchestrator {
         if !self.config.eager_eot {
             return;
         }
-        // D5 (REALTIME_REASONING.md §4.5): eager speculation pairs with the FAST
+        // D5 (docs/research/REALTIME_REASONING.md §4.5): eager speculation pairs with the FAST
         // model ONLY. On a reasoning model each speculative fire pays the full
         // multi-second think-time and a supersede-on-resume throws it away — pure
         // cost. Skip eager structurally for a reasoning model (the config-time

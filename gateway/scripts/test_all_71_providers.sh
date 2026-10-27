@@ -3,7 +3,7 @@
 # WaaV Gateway - Complete 67 Provider Test Suite
 # Tests all 31 STT + 34 TTS + 2 Realtime providers
 #
-# Usage: ./test_all_71_providers.sh [gateway_url]
+# Usage: gateway/scripts/test_all_71_providers.sh [gateway_url]
 #
 
 GATEWAY_URL="${1:-http://localhost:3001}"
