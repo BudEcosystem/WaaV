@@ -1,15 +1,15 @@
 //! Smallest.ai Waves TTS Provider Implementation
 //!
 //! This module provides integration with Smallest.ai's Waves Text-to-Speech API,
-//! offering ultra-low latency synthesis with multiple models.
+//! offering low-latency synthesis (~200 ms to first byte) from two Lightning v3.1 voice pools.
 //!
 //! # Features
 //!
-//! - **REST API**: HTTP POST for audio synthesis (Lightning model)
-//! - **WebSocket API**: Real-time streaming TTS (Lightning-V2 model)
-//! - **Voice Cloning**: Custom voice creation (Lightning-Large model)
-//! - **Multiple Models**: Lightning (~100ms), Lightning-Large (~300ms), Lightning-V2 (<200ms)
-//! - **Multi-language**: 16+ languages supported
+//! - **REST API**: one HTTP POST per utterance; the pool is the body's `model`
+//!   (`lightning_v3.1`, the default, or `lightning_v3.1_pro`)
+//! - **Retired models**: `lightning`, `lightning-large`, `lightning-v2` and `thunder` now answer
+//!   `410 MODEL_DEPRECATED`; configs naming them are served by `lightning_v3.1`
+//! - **Voices**: each pool has its own catalog (`/waves/v1/<pool>/get_voices`, public)
 //!
 //! # Example
 //!
@@ -19,8 +19,8 @@
 //!
 //! let config = TTSConfig {
 //!     api_key: "your-api-key".to_string(),
-//!     voice_id: Some("emily".to_string()),
-//!     model: "lightning".to_string(),
+//!     voice_id: Some("olivia".to_string()),
+//!     model: "lightning_v3.1".to_string(),
 //!     audio_format: Some("wav".to_string()),
 //!     sample_rate: Some(24000),
 //!     ..Default::default()
@@ -33,8 +33,9 @@
 //!
 //! # API Reference
 //!
-//! - REST Endpoint: `POST https://waves-api.smallest.ai/api/v1/lightning/get_speech`
-//! - WebSocket: `wss://waves-api.smallest.ai/api/v1/lightning-v2/get_speech/stream`
+//! - REST Endpoint: `POST https://api.smallest.ai/waves/v1/tts`
+//! - WebSocket / SSE: `wss://api.smallest.ai/waves/v1/tts/live` / `POST …/tts/live`
+//! - Docs: <https://docs.smallest.ai/models/text-to-speech/sync-async>
 //!
 //! # Authentication
 //!
@@ -57,22 +58,20 @@ pub use provider::{SmallestRequestBuilder, SmallestTts};
 // =============================================================================
 
 /// Base URL for Smallest.ai Waves API.
-pub const SMALLEST_API_BASE_URL: &str = "https://waves-api.smallest.ai";
+pub const SMALLEST_API_BASE_URL: &str = "https://api.smallest.ai/waves/v1";
 
-/// REST endpoint for Lightning TTS synthesis.
-pub const SMALLEST_TTS_URL: &str = "https://waves-api.smallest.ai/api/v1/lightning/get_speech";
+/// REST synthesis endpoint, shared by both Lightning v3.1 pools (the body's `model` picks one).
+pub const SMALLEST_TTS_URL: &str = "https://api.smallest.ai/waves/v1/tts";
 
-/// WebSocket endpoint for Lightning-V2 streaming TTS.
-pub const SMALLEST_TTS_WS_URL: &str =
-    "wss://waves-api.smallest.ai/api/v1/lightning-v2/get_speech/stream";
+/// WebSocket streaming synthesis endpoint.
+pub const SMALLEST_TTS_WS_URL: &str = "wss://api.smallest.ai/waves/v1/tts/live";
 
-/// Get voices endpoint template (model is inserted).
+/// Voice list endpoint template; `{model}` is the pool's path segment.
 pub const SMALLEST_VOICES_URL_TEMPLATE: &str =
-    "https://waves-api.smallest.ai/api/v1/{model}/get_voices";
+    "https://api.smallest.ai/waves/v1/{model}/get_voices";
 
-/// Voice cloning endpoint (Lightning-Large only).
-pub const SMALLEST_ADD_VOICE_URL: &str =
-    "https://waves-api.smallest.ai/api/v1/lightning-large/add_voice";
+/// Instant voice cloning endpoint (standard pool). WaaV does not clone Smallest voices itself.
+pub const SMALLEST_ADD_VOICE_URL: &str = "https://api.smallest.ai/waves/v1/voice-cloning";
 
 // =============================================================================
 // Limits and Defaults
@@ -81,11 +80,12 @@ pub const SMALLEST_ADD_VOICE_URL: &str =
 /// Maximum characters per TTS request.
 pub const MAX_TEXT_LENGTH: usize = 10000;
 
-/// Default voice ID.
-pub const DEFAULT_VOICE_ID: &str = "emily";
+/// Default voice ID: a standard-pool (Lightning v3.1) voice. The retired models' default,
+/// `emily`, is in neither v3.1 catalog.
+pub const DEFAULT_VOICE_ID: &str = "olivia";
 
 /// Default model.
-pub const DEFAULT_MODEL: SmallestModel = SmallestModel::Lightning;
+pub const DEFAULT_MODEL: SmallestModel = SmallestModel::LightningV31;
 
 /// Default audio format.
 pub const DEFAULT_FORMAT: SmallestOutputFormat = SmallestOutputFormat::Wav;
@@ -96,11 +96,8 @@ pub const DEFAULT_SAMPLE_RATE: u32 = 24000;
 /// Minimum speed value.
 pub const MIN_SPEED: f32 = 0.5;
 
-/// Maximum speed value (REST API limit).
-pub const MAX_SPEED_REST: f32 = 2.0;
-
-/// Maximum speed value (WebSocket API limit).
-pub const MAX_SPEED_WS: f32 = 5.0;
+/// Maximum speed value.
+pub const MAX_SPEED: f32 = 2.0;
 
 /// Default speed value.
 pub const DEFAULT_SPEED: f32 = 1.0;
@@ -143,7 +140,7 @@ pub const MAX_WS_TIMEOUT: u32 = 60;
 // =============================================================================
 
 /// Supported sample rates for Smallest.ai TTS.
-pub const SUPPORTED_SAMPLE_RATES: [u32; 4] = [8000, 16000, 22050, 24000];
+pub const SUPPORTED_SAMPLE_RATES: [u32; 4] = [8000, 16000, 24000, 44100];
 
 /// Check if a sample rate is supported.
 #[inline]
@@ -162,7 +159,7 @@ pub fn nearest_sample_rate(rate: u32) -> u32 {
 
 /// Build the voices URL for a specific model.
 pub fn voices_url(model: &SmallestModel) -> String {
-    SMALLEST_VOICES_URL_TEMPLATE.replace("{model}", model.as_str())
+    SMALLEST_VOICES_URL_TEMPLATE.replace("{model}", model.path_segment())
 }
 
 // =============================================================================
@@ -177,9 +174,9 @@ mod tests {
     fn test_is_valid_sample_rate() {
         assert!(is_valid_sample_rate(8000));
         assert!(is_valid_sample_rate(16000));
-        assert!(is_valid_sample_rate(22050));
         assert!(is_valid_sample_rate(24000));
-        assert!(!is_valid_sample_rate(44100));
+        assert!(is_valid_sample_rate(44100));
+        assert!(!is_valid_sample_rate(22050));
         assert!(!is_valid_sample_rate(48000));
     }
 
@@ -188,25 +185,21 @@ mod tests {
         assert_eq!(nearest_sample_rate(8000), 8000);
         assert_eq!(nearest_sample_rate(10000), 8000);
         assert_eq!(nearest_sample_rate(15000), 16000);
-        assert_eq!(nearest_sample_rate(20000), 22050);
-        assert_eq!(nearest_sample_rate(23000), 22050);
+        assert_eq!(nearest_sample_rate(22050), 24000);
         assert_eq!(nearest_sample_rate(25000), 24000);
-        assert_eq!(nearest_sample_rate(44100), 24000);
+        assert_eq!(nearest_sample_rate(44100), 44100);
+        assert_eq!(nearest_sample_rate(48000), 44100);
     }
 
     #[test]
     fn test_voices_url() {
         assert_eq!(
-            voices_url(&SmallestModel::Lightning),
-            "https://waves-api.smallest.ai/api/v1/lightning/get_voices"
+            voices_url(&SmallestModel::LightningV31),
+            "https://api.smallest.ai/waves/v1/lightning-v3.1/get_voices"
         );
         assert_eq!(
-            voices_url(&SmallestModel::LightningLarge),
-            "https://waves-api.smallest.ai/api/v1/lightning-large/get_voices"
-        );
-        assert_eq!(
-            voices_url(&SmallestModel::LightningV2),
-            "https://waves-api.smallest.ai/api/v1/lightning-v2/get_voices"
+            voices_url(&SmallestModel::LightningV31Pro),
+            "https://api.smallest.ai/waves/v1/lightning-v3.1-pro/get_voices"
         );
     }
 }

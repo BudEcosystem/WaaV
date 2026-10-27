@@ -18,8 +18,8 @@
 //!
 //! let config = TTSConfig {
 //!     api_key: "your-api-key".to_string(),
-//!     voice_id: Some("emily".to_string()),
-//!     model: "lightning".to_string(),
+//!     voice_id: Some("olivia".to_string()),
+//!     model: "lightning_v3.1".to_string(),
 //!     ..Default::default()
 //! };
 //!
@@ -92,7 +92,7 @@ impl SmallestRequestBuilder {
         SMALLEST_TTS_URL
     }
 
-    /// Get the lightning-v2 streaming WebSocket endpoint URL.
+    /// Get the streaming WebSocket endpoint URL (`/waves/v1/tts/live`).
     pub fn ws_url(&self) -> &str {
         SMALLEST_TTS_WS_URL
     }
@@ -102,12 +102,10 @@ impl SmallestRequestBuilder {
         &self.config
     }
 
-    /// Build the lightning-v2 streaming WebSocket request body for the
-    /// `wss://waves-api.smallest.ai/api/v1/lightning-v2/get_speech/stream` endpoint.
+    /// Build a streaming WebSocket request body: the voice params plus the `max_buffer_flush_ms`
+    /// buffer-flush latency knob (omitted when unset so the server default applies).
     ///
-    /// This is the wire body the streaming path sends; it carries the voice params plus the
-    /// `max_buffer_flush_ms` buffer-flush latency knob (omitted when unset so the server default
-    /// applies). Mirrors [`Self::build_http_request`] for the REST path.
+    /// Synthesis does not use it: [`Self::build_http_request`] (the REST path) is what speaks.
     pub fn build_ws_request(&self, text: &str) -> SmallestWsRequest {
         let mut request = SmallestWsRequest::new(text, &self.config.voice_id)
             .with_language(self.config.language.as_code())
@@ -129,6 +127,7 @@ impl TTSRequestBuilder for SmallestRequestBuilder {
     fn build_http_request(&self, client: &reqwest::Client, text: &str) -> reqwest::RequestBuilder {
         // Build request body
         let request_body = SmallestTtsRequest::new(text, &self.config.voice_id)
+            .with_model(self.config.model.as_str())
             .with_sample_rate(self.config.sample_rate)
             .with_speed(self.config.speed)
             .with_language(self.config.language.as_code())
@@ -214,7 +213,7 @@ fn compute_smallest_tts_config_hash(
     }
 
     // NOTE: `max_buffer_flush_ms` is deliberately NOT part of this key. It is a streaming
-    // buffer-flush latency/chunking knob (lightning-v2 WS), not an audio-content parameter — the
+    // buffer-flush latency/chunking knob (streaming WS), not an audio-content parameter — the
     // synthesized samples are identical regardless of its value — so folding it in would only
     // fragment the cache without correctness benefit (the cache-collision/over-keying review note).
 
@@ -233,11 +232,10 @@ fn compute_smallest_tts_config_hash(
 ///
 /// # Features
 ///
-/// - **Lightning Model**: Ultra-low latency (~100ms)
-/// - **Lightning-Large**: Voice cloning support (~300ms)
-/// - **Lightning-V2**: WebSocket streaming (<200ms)
-/// - **16+ Languages**: Global language support
-/// - **Voice Cloning**: Quick voice cloning capability
+/// - **Lightning v3.1**: the standard voice pool (~200 ms to first byte), voice cloning
+/// - **Lightning v3.1 Pro**: the premium pool, with its own voices
+/// - **Retired models** (`lightning`, `lightning-large`, `lightning-v2`, `thunder`) are served by
+///   Lightning v3.1, since their endpoints answer 410
 ///
 /// # Example
 ///
@@ -247,7 +245,7 @@ fn compute_smallest_tts_config_hash(
 ///
 /// let config = TTSConfig {
 ///     api_key: "your-api-key".to_string(),
-///     voice_id: Some("emily".to_string()),
+///     voice_id: Some("olivia".to_string()),
 ///     ..Default::default()
 /// };
 ///
@@ -569,7 +567,7 @@ impl BaseTTS for SmallestTts {
             "consistency": self.smallest_config.consistency,
             "similarity": self.smallest_config.similarity,
             "enhancement": self.smallest_config.enhancement,
-            "supported_formats": ["pcm", "wav", "mp3", "mulaw"],
+            "supported_formats": ["pcm", "wav", "mp3", "ulaw"],
             "supported_sample_rates": SUPPORTED_SAMPLE_RATES,
             "features": {
                 "voice_cloning": self.smallest_config.model.supports_voice_cloning(),
@@ -583,23 +581,10 @@ impl BaseTTS for SmallestTts {
                 "en", "hi", "mr", "kn", "ta", "bn", "gu", "de", "fr", "es", "it", "pl", "nl", "ru", "ar", "he"
             ],
             "models": {
-                "lightning": {
-                    "latency_ms": 100,
-                    "api": "REST",
-                    "voice_cloning": false,
-                },
-                "lightning-large": {
-                    "latency_ms": 300,
-                    "api": "REST",
-                    "voice_cloning": true,
-                },
-                "lightning-v2": {
-                    "latency_ms": 200,
-                    "api": "WebSocket",
-                    "voice_cloning": true,
-                },
+                "lightning_v3.1": { "latency_ms": 200, "api": "REST", "voice_cloning": true },
+                "lightning_v3.1_pro": { "latency_ms": 200, "api": "REST", "voice_cloning": false },
             },
-            "documentation": "https://waves-docs.smallest.ai"
+            "documentation": "https://docs.smallest.ai/models/text-to-speech/overview"
         })
     }
 }
@@ -618,8 +603,8 @@ mod tests {
         TTSConfig {
             provider: "smallest".to_string(),
             api_key: "test-api-key".to_string(),
-            voice_id: Some("emily".to_string()),
-            model: "lightning".to_string(),
+            voice_id: Some("olivia".to_string()),
+            model: "lightning_v3.1".to_string(),
             speaking_rate: Some(1.0),
             audio_format: Some("wav".to_string()),
             sample_rate: Some(24000),
@@ -651,10 +636,8 @@ mod tests {
         assert_eq!(tts.smallest_config().speed, 1.5);
     }
 
-    // WIRE-LEVEL: `max_buffer_flush_ms` (from the extras passthrough) must reach the actual
-    // lightning-v2 streaming WS request BODY that is sent to
-    // wss://waves-api.smallest.ai/api/v1/lightning-v2/get_speech/stream — not merely the config
-    // struct. Asserts on the serialized JSON the streaming endpoint receives, guarding the
+    // WIRE-LEVEL: `max_buffer_flush_ms` (from the extras passthrough) must reach the streaming
+    // WS request BODY — not merely the config struct. Asserts on the serialized JSON the streaming endpoint receives, guarding the
     // recurring "config set but never serialized to the wire" bug class.
     #[test]
     fn max_buffer_flush_ms_reaches_streaming_ws_request_body() {
@@ -664,7 +647,7 @@ mod tests {
         let std = StandardTTSConfig {
             base: {
                 let mut c = create_test_config();
-                c.model = "lightning-v2".to_string();
+                c.model = "lightning_v3.1".to_string();
                 c
             },
             features: TtsFeatures::default(),
@@ -675,10 +658,7 @@ mod tests {
 
         // Build the actual streaming WS request body and serialize it to the wire JSON.
         let builder = tts.create_request_builder();
-        assert_eq!(
-            builder.ws_url(),
-            "wss://waves-api.smallest.ai/api/v1/lightning-v2/get_speech/stream"
-        );
+        assert_eq!(builder.ws_url(), "wss://api.smallest.ai/waves/v1/tts/live");
         let ws_request = builder.build_ws_request("Hello streaming");
         let json = serde_json::to_string(&ws_request).unwrap();
         // The exact wire param name with the configured value must be present in the body.
@@ -692,8 +672,7 @@ mod tests {
     // (serde skip_serializing_if) so the server default applies — no spurious value on the wire.
     #[test]
     fn max_buffer_flush_ms_omitted_from_ws_body_when_unset() {
-        let mut config = create_test_config();
-        config.model = "lightning-v2".to_string();
+        let config = create_test_config();
         let tts = SmallestTts::new(config).unwrap();
 
         let builder = tts.create_request_builder();
@@ -783,8 +762,8 @@ mod tests {
         assert!(tts.is_ok());
 
         let tts = tts.unwrap();
-        assert_eq!(tts.smallest_config().voice_id, "emily");
-        assert_eq!(tts.smallest_config().model, SmallestModel::Lightning);
+        assert_eq!(tts.smallest_config().voice_id, "olivia");
+        assert_eq!(tts.smallest_config().model, SmallestModel::LightningV31);
         assert_eq!(tts.smallest_config().format, SmallestOutputFormat::Wav);
         assert!(!tts.is_ready());
     }
@@ -826,19 +805,64 @@ mod tests {
         let smallest_config = SmallestTtsConfig::from_base(config.clone()).unwrap();
         let builder = SmallestRequestBuilder::new(smallest_config, config);
 
-        assert!(builder.rest_url().contains("waves-api.smallest.ai"));
-        assert!(builder.rest_url().contains("lightning"));
+        assert_eq!(builder.rest_url(), "https://api.smallest.ai/waves/v1/tts");
     }
 
     #[test]
     fn test_request_builder_with_model() {
         let mut config = create_test_config();
-        config.model = "lightning-v2".to_string();
+        config.model = "lightning_v3.1_pro".to_string();
 
         let smallest_config = SmallestTtsConfig::from_base(config.clone()).unwrap();
         let builder = SmallestRequestBuilder::new(smallest_config, config);
 
-        assert_eq!(builder.smallest_config().model, SmallestModel::LightningV2);
+        assert_eq!(
+            builder.smallest_config().model,
+            SmallestModel::LightningV31Pro
+        );
+    }
+
+    /// Smallest retired these models (their endpoints answer `410 MODEL_DEPRECATED`); a config
+    /// naming one is served by Lightning v3.1 instead of failing every request.
+    #[test]
+    fn a_retired_model_is_served_by_lightning_v3_1() {
+        for retired in ["lightning", "lightning-large", "lightning-v2", "thunder"] {
+            let mut config = create_test_config();
+            config.model = retired.to_string();
+            let tts = SmallestTts::new(config).unwrap();
+            assert_eq!(
+                tts.smallest_config().model,
+                SmallestModel::LightningV31,
+                "{retired}"
+            );
+        }
+    }
+
+    /// The request the REST path sends: the unified `/waves/v1/tts` endpoint, the pool in the
+    /// body's `model`, and the documented parameter names.
+    #[test]
+    fn the_rest_request_names_the_pool_and_documented_params() {
+        let mut config = create_test_config();
+        config.model = "lightning_v3.1_pro".to_string();
+        config.audio_format = Some("ulaw".to_string());
+        config.sample_rate = Some(8000);
+        let smallest_config = SmallestTtsConfig::from_base(config.clone()).unwrap();
+        let builder = SmallestRequestBuilder::new(smallest_config, config);
+        let request = builder
+            .build_http_request(&reqwest::Client::new(), "Hello")
+            .build()
+            .unwrap();
+        assert_eq!(
+            request.url().as_str(),
+            "https://api.smallest.ai/waves/v1/tts"
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(request.body().unwrap().as_bytes().unwrap()).unwrap();
+        assert_eq!(body["model"], "lightning_v3.1_pro");
+        assert_eq!(body["voice_id"], "olivia");
+        assert_eq!(body["output_format"], "ulaw");
+        assert_eq!(body["sample_rate"], 8000);
+        assert_eq!(body["text"], "Hello");
     }
 
     #[test]
@@ -978,10 +1002,7 @@ mod tests {
         let config = create_test_config();
         let tts = SmallestTts::new(config).unwrap();
 
-        assert_eq!(
-            tts.rest_url(),
-            "https://waves-api.smallest.ai/api/v1/lightning/get_speech"
-        );
+        assert_eq!(tts.rest_url(), "https://api.smallest.ai/waves/v1/tts");
     }
 
     // =========================================================================
@@ -994,8 +1015,8 @@ mod tests {
         let tts = SmallestTts::new(config).unwrap();
 
         let smallest_config = tts.smallest_config();
-        assert_eq!(smallest_config.voice_id, "emily");
-        assert_eq!(smallest_config.model, SmallestModel::Lightning);
+        assert_eq!(smallest_config.voice_id, "olivia");
+        assert_eq!(smallest_config.model, SmallestModel::LightningV31);
         assert_eq!(smallest_config.format, SmallestOutputFormat::Wav);
         assert_eq!(smallest_config.sample_rate, 24000);
     }
