@@ -469,7 +469,10 @@ async fn global_functions_available_at_every_node_and_tools_swap_atomically() {
 #[tokio::test]
 #[ignore = "requires OPENAI_API_KEY (+ optional OPENAI_BASE_URL/OPENAI_MODEL); real billed calls"]
 async fn live_three_node_intake_flow() {
-    let Ok(key) = std::env::var("OPENAI_API_KEY") else {
+    let Some(key) = std::env::var("OPENAI_API_KEY")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+    else {
         eprintln!("[skip] OPENAI_API_KEY not set");
         return;
     };

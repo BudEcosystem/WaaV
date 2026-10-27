@@ -49,6 +49,7 @@ jobs:
   fmt:
     name: rustfmt
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -58,6 +59,7 @@ jobs:
   clippy:
     name: clippy (deny warnings)
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -70,6 +72,7 @@ jobs:
   build-and-unit:
     name: build+unit (${{ matrix.features }})
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -101,6 +104,7 @@ jobs:
   supply-chain:
     name: supply-chain (audit/deny/gitleaks/typos)
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
@@ -114,7 +118,7 @@ jobs:
       - name: install gitleaks
         run: |
           GLV=8.21.2
-          curl -fsSL -o /tmp/gitleaks.tgz \
+          curl -fsSL --retry 5 --connect-timeout 30 --max-time 300 -o /tmp/gitleaks.tgz \
             "https://github.com/gitleaks/gitleaks/releases/download/v${GLV}/gitleaks_${GLV}_linux_x64.tar.gz"
           tar -xzf /tmp/gitleaks.tgz -C /tmp gitleaks
           sudo install /tmp/gitleaks /usr/local/bin/gitleaks
@@ -179,6 +183,7 @@ jobs:
   coverage:
     name: coverage (llvm-cov + ratchet)
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -222,6 +227,7 @@ jobs:
   openapi-drift:
     name: openapi drift (spec committed + unchanged)
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -248,6 +254,7 @@ jobs:
   accuracy-enforced:
     name: VAD/turn accuracy (thresholds enforced, local ONNX)
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -271,6 +278,7 @@ jobs:
   segmented-stt:
     name: segmented speech-to-text (crate, resolver parity)
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     defaults:
       run:
         working-directory: segmented-stt
@@ -296,6 +304,7 @@ jobs:
   integration-mock:
     name: integration (mock providers, no secrets)
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -309,6 +318,7 @@ jobs:
   server-smoke:
     name: server boot + health
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -354,6 +364,7 @@ jobs:
   no-openssl:
     name: no OpenSSL at runtime (rustls only)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -375,6 +386,7 @@ jobs:
   real-provider-e2e:
     name: real-provider e2e (SECRET-GATED)
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
     # Only runs where provider secrets exist. CANNOT run on forks/PRs by design.
     env:
@@ -409,6 +421,31 @@ jobs:
           cargo test --release --test real_provider_tests -- --ignored --test-threads=1 "${skip[@]}"
 
   # ---------------------------------------------------------------------------------------
+  # client-sdks: the TypeScript SDK, the browser widget and the Python SDK. Each carries a drift
+  # test that reads docs/openapi.yaml and fails when the gateway gains a config field the client
+  # cannot send; nothing ran them before, so three fields added to the gateway went unexposed.
+  # ---------------------------------------------------------------------------------------
+  client-sdks:
+    name: client SDKs (TypeScript, widget, Python)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "24" }
+      - name: TypeScript SDK (typecheck + unit tests)
+        working-directory: clients_sdk/typescript
+        run: npm ci --no-audit --no-fund && npm run typecheck && npm test
+      - name: widget (typecheck + tests)
+        working-directory: clients_sdk/widget
+        run: npm ci --no-audit --no-fund && npm run typecheck && npm test
+      - name: Python SDK (unit tests)
+        working-directory: clients_sdk/python
+        run: |
+          pipx install uv==0.11.15
+          uv run --frozen --extra dev pytest tests/unit tests/test_imports.py -q
+
+  # ---------------------------------------------------------------------------------------
   # required: single aggregate context for branch protection. It fails if ANY gating job
   # failed or was skipped (e.g. a cancelled supply-chain), so requiring this one context in
   # branch protection makes fmt/clippy/build-matrix/supply-chain/coverage/openapi-drift/
@@ -418,6 +455,7 @@ jobs:
   required:
     name: required (merge gate)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     if: always()
     # No checkout here, so the workflow-wide `working-directory: gateway` does not exist.
     defaults:
@@ -435,6 +473,7 @@ jobs:
       - segmented-stt
       - server-smoke
       - no-openssl
+      - client-sdks
     steps:
       - name: assert all required jobs succeeded
         env:

@@ -49,23 +49,55 @@ function acceptsHeaders(impl: unknown): boolean {
   return typeof proto?.ping === 'function' && typeof proto?.terminate === 'function';
 }
 
+/** The subprotocol the gateway selects on every WebSocket route (`/ws`, `/realtime`, `/v1/realtime`). */
+export const GATEWAY_SUBPROTOCOL = 'realtime';
+/** Prefix of the subprotocol that carries the API key from a browser (OpenAI's convention). */
+export const KEY_SUBPROTOCOL_PREFIX = 'openai-insecure-api-key.';
+
+/** RFC 7230 `token` characters: what a browser accepts in a subprotocol without throwing. */
+const SUBPROTOCOL_TOKEN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+
+/**
+ * The subprotocols that carry `apiKey` past a WebSocket that can't send headers: `realtime`
+ * (which the gateway selects; Chrome fails a handshake whose offered subprotocols all go
+ * unanswered) and `openai-insecure-api-key.<key>`, which the gateway reads and never echoes.
+ * `undefined` when the key has a character no subprotocol may carry.
+ */
+export function keySubprotocols(
+  apiKey: string,
+  protocols?: string | string[]
+): string[] | undefined {
+  if (!SUBPROTOCOL_TOKEN.test(apiKey)) return undefined;
+  const offered = protocols === undefined ? [] : Array.isArray(protocols) ? [...protocols] : [protocols];
+  if (!offered.includes(GATEWAY_SUBPROTOCOL)) offered.push(GATEWAY_SUBPROTOCOL);
+  offered.push(`${KEY_SUBPROTOCOL_PREFIX}${apiKey}`);
+  return offered;
+}
+
 /**
  * Where the API key goes on the upgrade request. The Node `ws` library sends
- * `Authorization: Bearer`, which every gateway accepts and no access log records. Any other
- * WebSocket can't set headers, so the key goes in `?token=` (refused by a gateway run with
- * `AUTH_QUERY_TOKEN=deny`).
+ * `Authorization: Bearer`. Any other WebSocket (a browser's, Node's built-in) can't set headers,
+ * so the key rides the `openai-insecure-api-key.<key>` subprotocol, which gateways from 1.0.0
+ * accept on every WebSocket route; neither is written to an access log the way a URL is. Only a
+ * key with a character no subprotocol may carry falls back to `?token=` (refused by a gateway run
+ * with `AUTH_QUERY_TOKEN=deny`).
  */
 export function authenticatedUpgrade(
   url: string,
   apiKey: string | undefined,
-  impl: unknown
-): { url: string; headers?: Record<string, string> } {
-  if (!apiKey) return { url };
-  if (acceptsHeaders(impl)) return { url, headers: { Authorization: `Bearer ${apiKey}` } };
-  return { url: withQueryToken(url, apiKey) };
+  impl: unknown,
+  protocols?: string | string[]
+): { url: string; headers?: Record<string, string>; protocols?: string | string[] } {
+  if (!apiKey) return { url, protocols };
+  if (acceptsHeaders(impl)) {
+    return { url, headers: { Authorization: `Bearer ${apiKey}` }, protocols };
+  }
+  const withKey = keySubprotocols(apiKey, protocols);
+  if (withKey) return { url, protocols: withKey };
+  return { url: withQueryToken(url, apiKey), protocols };
 }
 
-/** `url` with `?token=<apiKey>`, for a WebSocket that can't send headers. */
+/** `url` with `?token=<apiKey>`, for a key no subprotocol can carry. */
 export function withQueryToken(url: string, apiKey: string): string {
   const withToken = new URL(url);
   withToken.searchParams.set('token', apiKey);
@@ -99,7 +131,7 @@ export interface WebSocketConnectionOptions {
   WebSocket?: typeof WebSocket;
   /** Protocol to use (default: none) */
   protocols?: string | string[];
-  /** API key, sent as the upgrade's `Authorization` header or `?token=` (see `authenticatedUpgrade`) */
+  /** API key, sent as the upgrade's `Authorization` header or a subprotocol (see `authenticatedUpgrade`) */
   apiKey?: string;
 }
 
@@ -132,8 +164,9 @@ export class WebSocketConnection {
   private url: string;
   private timeout: number;
   private WebSocketImpl: typeof WebSocket;
+  /** The offered subprotocols, the key's among them when it can't ride a header; never logged. */
   private protocols?: string | string[];
-  /** `url` plus `?token=` when the key can't ride a header; never put in messages or errors. */
+  /** `url`, plus `?token=` only for a key no header or subprotocol can carry; never put in messages or errors. */
   private upgradeUrl: string;
   private headers?: Record<string, string>;
   private state: ConnectionState = 'disconnected';
@@ -152,8 +185,13 @@ export class WebSocketConnection {
   constructor(options: WebSocketConnectionOptions) {
     this.timeout = options.timeout ?? DEFAULT_CONNECT_TIMEOUT_MS;
     this.WebSocketImpl = options.WebSocket ?? globalThis.WebSocket;
-    this.protocols = options.protocols;
-    const upgrade = authenticatedUpgrade(options.url, options.apiKey, this.WebSocketImpl);
+    const upgrade = authenticatedUpgrade(
+      options.url,
+      options.apiKey,
+      this.WebSocketImpl,
+      options.protocols
+    );
+    this.protocols = upgrade.protocols;
     this.url = options.url;
     this.upgradeUrl = upgrade.url;
     this.headers = upgrade.headers;

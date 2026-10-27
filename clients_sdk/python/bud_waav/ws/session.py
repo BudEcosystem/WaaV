@@ -1008,7 +1008,6 @@ class WebSocketSession:
             # when requested (absent = auto). The mode the session got comes back on `ready.stt`.
             if getattr(self.stt_config, "transcription_mode", None):
                 stt_dict["transcription_mode"] = self.stt_config.transcription_mode
-            # WaaV's own uplink denoiser; only sent when set (absent = off).
             if getattr(self.stt_config, "noise_suppression", None) is not None:
                 stt_dict["noise_suppression"] = self.stt_config.noise_suppression
             # A VENDOR key only -- never the session's own Bud credential.
@@ -1202,15 +1201,16 @@ class WebSocketSession:
             # gateway apply its own default). Pydantic enum values are already
             # coerced to str via use_enum_values=True on the model.
             optional_fields = (
-                "system_prompt", "api_key", "credential_ref", "temperature", "max_tokens",
+                "system_prompt", "api_key", "temperature", "max_tokens",
                 "streaming", "max_history", "allow_interruption", "eager_eot",
                 "provider_kind", "barge_in_min_words", "summarize_target_tokens",
                 "mute_strategy", "strip_markdown", "user_idle_timeout_ms",
                 "reasoning_effort", "latency_filler", "latency_filler_after_ms",
                 "latency_filler_phrases", "reasoning_model", "reasoning_base_url",
-                "reasoning_api_key", "reasoning_credential_ref", "reasoning_provider_kind",
-                "reasoning_route", "reasoning_budget_ms", "degradation_message",
-                "max_llm_calls_per_turn", "max_reasoning_tokens", "llm_timeout_ms",
+                "reasoning_api_key", "reasoning_provider_kind", "reasoning_route",
+                "reasoning_budget_ms", "degradation_message",
+                "max_llm_calls_per_turn", "max_reasoning_tokens",
+                "credential_ref", "reasoning_credential_ref", "llm_timeout_ms",
             )
             for fname in optional_fields:
                 value = getattr(conv, fname, None)

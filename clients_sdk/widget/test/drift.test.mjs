@@ -102,6 +102,9 @@ test('drift: conversation_config emits every gateway ConversationWebSocketConfig
     degradationMessage: 'd',
     maxLlmCallsPerTurn: 8,
     maxReasoningTokens: 1000,
+    credentialRef: 'LLM_KEY',
+    reasoningCredentialRef: 'REASONING_KEY',
+    llmTimeoutMs: 90000,
   };
   const emitted = Object.keys(buildConversationConfig(fullConv));
   assertSupersetOf(schemas, 'ConversationWebSocketConfig', emitted);
@@ -121,6 +124,8 @@ test('drift: stt_config emits every gateway STTWebSocketConfig field', () => {
       encoding: 'linear16',
       audioInCodec: 'opus',
       translation: { targetLanguages: ['hi-IN'], translateToEnglish: false },
+      transcriptionMode: 'segmented',
+      noiseSuppression: true,
     },
     features: { punctuation: true },
     audioFeatures: { turnDetection: { enabled: true, threshold: 0.5, eager: true } },

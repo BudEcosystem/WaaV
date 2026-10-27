@@ -10,7 +10,7 @@ runs:
     - name: provision ONNX Runtime
       shell: bash
       run: |
-        curl -fsSL --retry 5 -o /tmp/ort.tgz \
+        curl -fsSL --retry 5 --connect-timeout 30 --max-time 600 -o /tmp/ort.tgz \
           "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-${ORT_VERSION}.tgz"
         tar -xzf /tmp/ort.tgz -C /tmp
         echo "ORT_DYLIB_PATH=/tmp/onnxruntime-linux-x64-${ORT_VERSION}/lib/libonnxruntime.so" >> "$GITHUB_ENV"

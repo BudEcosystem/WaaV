@@ -60,6 +60,12 @@ export function parseConfigFromAttributes(element: HTMLElement): WidgetConfig {
         ...(toEnglish ? { translateToEnglish: true } : {}),
       };
     }
+    const mode = element.dataset.sttTranscriptionMode;
+    if (mode === 'auto' || mode === 'streaming' || mode === 'segmented') {
+      config.stt.transcriptionMode = mode;
+    }
+    const noiseSuppression = parseBoolAttr(element.dataset.sttNoiseSuppression);
+    if (noiseSuppression !== undefined) config.stt.noiseSuppression = noiseSuppression;
   }
 
   // Parse TTS config with emotion support.
@@ -176,6 +182,10 @@ function parseConversationFromAttributes(
     );
     conv.apiKey = d.llmApiKey;
   }
+  // The safe alternative: a credential the operator holds on the gateway, named, never shown.
+  if (d.llmCredentialRef !== undefined) conv.credentialRef = d.llmCredentialRef;
+  const llmTimeoutMs = parseIntAttr(d.llmTimeoutMs);
+  if (llmTimeoutMs !== undefined) conv.llmTimeoutMs = llmTimeoutMs;
   const temperature = parseFloatAttr(d.llmTemperature);
   if (temperature !== undefined) conv.temperature = temperature;
   const maxTokens = parseIntAttr(d.llmMaxTokens);
@@ -220,6 +230,8 @@ function parseConversationFromAttributes(
     );
     conv.reasoningApiKey = d.llmReasoningApiKey;
   }
+  if (d.llmReasoningCredentialRef !== undefined)
+    conv.reasoningCredentialRef = d.llmReasoningCredentialRef;
   if (d.llmReasoningProviderKind !== undefined)
     conv.reasoningProviderKind = d.llmReasoningProviderKind as AdapterKind;
   if (d.llmReasoningRoute !== undefined) conv.reasoningRoute = d.llmReasoningRoute as RoutingMode;

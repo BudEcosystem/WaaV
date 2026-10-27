@@ -601,15 +601,15 @@
       "website": "https://smallest.ai",
       "regions": ["Global", "India"],
       "languages": "16+ languages (en, hi, mr, kn, ta, bn, gu, de, fr, es, it, pl, nl, ru, ar, he)",
-      "api_documentation": "https://waves-docs.smallest.ai",
+      "api_documentation": "https://docs.smallest.ai/models/text-to-speech/overview",
       "pricing_page": "https://smallest.ai/pricing",
       "supported_technologies": ["TTS", "Voice Cloning"],
       "opensource_available": "NO",
       "opensource_link": null,
-      "api_base_url": "https://waves-api.smallest.ai",
-      "websocket_url": "wss://waves-api.smallest.ai/api/v1/lightning-v2/get_speech/stream",
+      "api_base_url": "https://api.smallest.ai/waves/v1",
+      "websocket_url": "wss://api.smallest.ai/waves/v1/tts/live",
       "authentication": "Bearer Token",
-      "models": ["lightning", "lightning-large", "lightning-v2", "thunder"],
+      "models": ["lightning_v3.1", "lightning_v3.1_pro"],
       "features": {
         "streaming": true,
         "voice_cloning": true,
@@ -619,9 +619,8 @@
         "pitch_control": false
       },
       "latency": {
-        "lightning": "~100ms",
-        "lightning-large": "~300ms",
-        "lightning-v2": "<200ms"
+        "lightning_v3.1": "~200ms",
+        "lightning_v3.1_pro": "~200ms"
       },
       "pricing_per_10k_chars": {
         "lightning_v1_free": "$0.15",

@@ -766,10 +766,6 @@ class ConversationConfig(BaseModel):
     api_key: Optional[str] = None
     """API key (literal or '${ENV_VAR}'); falls back to OPENAI_API_KEY server-side."""
 
-    credential_ref: Optional[str] = None
-    """Name of an operator credential to authenticate with; sent only to one of its hosts (else the
-    config is refused). Takes precedence over :attr:`api_key`."""
-
     temperature: Optional[float] = None
     """Sampling temperature."""
 
@@ -827,10 +823,6 @@ class ConversationConfig(BaseModel):
     reasoning_api_key: Optional[str] = None
     """Reasoning-tier API key (defaults to api_key)."""
 
-    reasoning_credential_ref: Optional[str] = None
-    """Operator credential for the reasoning tier (bound to ``reasoning_base_url``, else
-    ``base_url``). Takes precedence over :attr:`reasoning_api_key`."""
-
     reasoning_provider_kind: Optional[str] = None
     """Reasoning-tier vendor wire format (defaults to provider_kind)."""
 
@@ -849,9 +841,15 @@ class ConversationConfig(BaseModel):
     max_reasoning_tokens: Optional[int] = None
     """Hard ceiling on the reasoning tier's output tokens."""
 
+    credential_ref: Optional[str] = None
+    """Name of an operator credential on the gateway to authenticate the LLM with. The key stays
+    on the server and is sent only to that credential's hosts. Takes precedence over api_key."""
+
+    reasoning_credential_ref: Optional[str] = None
+    """As credential_ref, for the reasoning tier. Takes precedence over reasoning_api_key."""
+
     llm_timeout_ms: Optional[int] = None
-    """How long one LLM call may take, in ms (gateway default 60000, clamped server-side). Raise it
-    for a self-hosted model that loads on its first request."""
+    """LLM request timeout in ms; None for the gateway default (60000)."""
 
 
 class VoiceAgentConfig(BaseModel):
@@ -974,9 +972,8 @@ class STTConfig(BaseModel):
     gateway reads as ``"auto"``. The mode the session got is reported on ``session.stt``."""
 
     noise_suppression: Optional[bool] = None
-    """Run WaaV's own denoiser on this session's uplink, ahead of turn detection and the STT
-    provider (mono ``linear16`` or opus). Costs CPU and ~30 ms; ``None`` omits the wire field (off).
-    A gateway built without it says so in a ``config_warning`` and continues unfiltered."""
+    """The gateway's own denoiser (DeepFilterNet) on the uplink, ahead of VAD/turn detection and
+    the STT provider. Off unless asked for: it costs gateway CPU and ~30 ms. ``None`` omits it."""
 
     channels: int = 1
     """Number of audio channels"""

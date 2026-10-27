@@ -148,8 +148,10 @@ fn generate_test_audio_wav() -> Vec<u8> {
 // ============================================================================
 
 async fn test_deepgram_stt_api() -> Result<u64, String> {
-    let api_key =
-        env::var("DEEPGRAM_API_KEY").map_err(|_| "DEEPGRAM_API_KEY not set".to_string())?;
+    let api_key = env::var("DEEPGRAM_API_KEY")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .ok_or_else(|| "DEEPGRAM_API_KEY not set".to_string())?;
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -179,8 +181,10 @@ async fn test_deepgram_stt_api() -> Result<u64, String> {
 }
 
 async fn test_deepgram_tts_api() -> Result<u64, String> {
-    let api_key =
-        env::var("DEEPGRAM_API_KEY").map_err(|_| "DEEPGRAM_API_KEY not set".to_string())?;
+    let api_key = env::var("DEEPGRAM_API_KEY")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .ok_or_else(|| "DEEPGRAM_API_KEY not set".to_string())?;
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -218,8 +222,10 @@ async fn test_deepgram_tts_api() -> Result<u64, String> {
 }
 
 async fn test_elevenlabs_stt_api() -> Result<u64, String> {
-    let api_key =
-        env::var("ELEVENLABS_API_KEY").map_err(|_| "ELEVENLABS_API_KEY not set".to_string())?;
+    let api_key = env::var("ELEVENLABS_API_KEY")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .ok_or_else(|| "ELEVENLABS_API_KEY not set".to_string())?;
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -258,8 +264,10 @@ async fn test_elevenlabs_stt_api() -> Result<u64, String> {
 }
 
 async fn test_elevenlabs_tts_api() -> Result<u64, String> {
-    let api_key =
-        env::var("ELEVENLABS_API_KEY").map_err(|_| "ELEVENLABS_API_KEY not set".to_string())?;
+    let api_key = env::var("ELEVENLABS_API_KEY")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .ok_or_else(|| "ELEVENLABS_API_KEY not set".to_string())?;
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -302,7 +310,10 @@ async fn test_elevenlabs_tts_api() -> Result<u64, String> {
 }
 
 async fn test_openai_stt_api() -> Result<u64, String> {
-    let api_key = env::var("OPENAI_API_KEY").map_err(|_| "OPENAI_API_KEY not set".to_string())?;
+    let api_key = env::var("OPENAI_API_KEY")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .ok_or_else(|| "OPENAI_API_KEY not set".to_string())?;
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(60))
@@ -341,7 +352,10 @@ async fn test_openai_stt_api() -> Result<u64, String> {
 }
 
 async fn test_openai_tts_api() -> Result<u64, String> {
-    let api_key = env::var("OPENAI_API_KEY").map_err(|_| "OPENAI_API_KEY not set".to_string())?;
+    let api_key = env::var("OPENAI_API_KEY")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .ok_or_else(|| "OPENAI_API_KEY not set".to_string())?;
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -381,8 +395,10 @@ async fn test_openai_tts_api() -> Result<u64, String> {
 }
 
 async fn test_cartesia_tts_api() -> Result<u64, String> {
-    let api_key =
-        env::var("CARTESIA_API_KEY").map_err(|_| "CARTESIA_API_KEY not set".to_string())?;
+    let api_key = env::var("CARTESIA_API_KEY")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .ok_or_else(|| "CARTESIA_API_KEY not set".to_string())?;
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -432,8 +448,13 @@ async fn test_cartesia_tts_api() -> Result<u64, String> {
 
 async fn test_azure_stt_api() -> Result<u64, String> {
     let api_key = env::var("AZURE_SPEECH_SUBSCRIPTION_KEY")
-        .map_err(|_| "AZURE_SPEECH_SUBSCRIPTION_KEY not set".to_string())?;
-    let region = env::var("AZURE_SPEECH_REGION").unwrap_or_else(|_| "eastus".to_string());
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .ok_or_else(|| "AZURE_SPEECH_SUBSCRIPTION_KEY not set".to_string())?;
+    let region = env::var("AZURE_SPEECH_REGION")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "eastus".to_string());
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -467,8 +488,13 @@ async fn test_azure_stt_api() -> Result<u64, String> {
 
 async fn test_azure_tts_api() -> Result<u64, String> {
     let api_key = env::var("AZURE_SPEECH_SUBSCRIPTION_KEY")
-        .map_err(|_| "AZURE_SPEECH_SUBSCRIPTION_KEY not set".to_string())?;
-    let region = env::var("AZURE_SPEECH_REGION").unwrap_or_else(|_| "eastus".to_string());
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .ok_or_else(|| "AZURE_SPEECH_SUBSCRIPTION_KEY not set".to_string())?;
+    let region = env::var("AZURE_SPEECH_REGION")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "eastus".to_string());
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))

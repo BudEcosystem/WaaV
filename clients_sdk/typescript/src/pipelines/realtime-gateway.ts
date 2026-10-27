@@ -37,7 +37,7 @@
 // =============================================================================
 
 import { EventEmitter } from 'events';
-import { withQueryToken } from '../ws/connection.js';
+import { keySubprotocols, withQueryToken } from '../ws/connection.js';
 
 /**
  * The 11 realtime/S2S providers reachable through the gateway `/realtime`
@@ -349,8 +349,8 @@ export class GatewayRealtime extends EventEmitter {
     return new Promise((resolve, reject) => {
       try {
         // Node's WebSockets take `{ headers }` as the 2nd argument. A browser reads it as a
-        // subprotocol and throws; it then sends the key as `?token=` (it used to reconnect with
-        // no key at all, which every gateway requiring auth refused).
+        // subprotocol and throws; it then sends the key as the `openai-insecure-api-key.<key>`
+        // subprotocol, or as `?token=` only when the key has a character no subprotocol may carry.
         let ws: WebSocket;
         if (this.apiKey) {
           try {
@@ -359,7 +359,10 @@ export class GatewayRealtime extends EventEmitter {
               opts: { headers: Record<string, string> },
             ) => WebSocket)(this.url, { headers: { Authorization: `Bearer ${this.apiKey}` } });
           } catch {
-            ws = new this.WebSocketImpl(withQueryToken(this.url, this.apiKey));
+            const protocols = keySubprotocols(this.apiKey);
+            ws = protocols
+              ? new this.WebSocketImpl(this.url, protocols)
+              : new this.WebSocketImpl(withQueryToken(this.url, this.apiKey));
           }
         } else {
           ws = new this.WebSocketImpl(this.url);
