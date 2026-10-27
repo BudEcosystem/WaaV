@@ -9,8 +9,16 @@ runs:
     - name: install native build deps
       shell: bash
       run: |
-        sudo apt-get update -o Acquire::Retries=5
-        sudo apt-get install -y --no-install-recommends -o Acquire::Retries=5 \
+        # A mirror that accepts the connection and then goes silent once held a job until
+        # GitHub's 6 h limit. Acquire::*::Timeout bounds each connection and read; the outer
+        # `timeout` bounds the whole update, which gets three tries.
+        apt_opts=(-o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
+        for attempt in 1 2 3; do
+          sudo timeout 300 apt-get update "${apt_opts[@]}" && break
+          [ "$attempt" = 3 ] && exit 1
+          echo "::warning::apt-get update attempt $attempt failed; retrying"
+        done
+        sudo timeout 900 apt-get install -y --no-install-recommends "${apt_opts[@]}" \
           clang cmake pkg-config libssl-dev libzstd-dev \
           libva-dev libdrm-dev libglib2.0-dev libgbm-dev \
           libx11-dev libxext-dev libxrandr-dev libxcomposite-dev libxdamage-dev libxfixes-dev
