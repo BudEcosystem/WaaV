@@ -421,6 +421,31 @@ jobs:
           cargo test --release --test real_provider_tests -- --ignored --test-threads=1 "${skip[@]}"
 
   # ---------------------------------------------------------------------------------------
+  # client-sdks: the TypeScript SDK, the browser widget and the Python SDK. Each carries a drift
+  # test that reads docs/openapi.yaml and fails when the gateway gains a config field the client
+  # cannot send; nothing ran them before, so three fields added to the gateway went unexposed.
+  # ---------------------------------------------------------------------------------------
+  client-sdks:
+    name: client SDKs (TypeScript, widget, Python)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "24" }
+      - name: TypeScript SDK (typecheck + unit tests)
+        working-directory: clients_sdk/typescript
+        run: npm ci --no-audit --no-fund && npm run typecheck && npm test
+      - name: widget (typecheck + tests)
+        working-directory: clients_sdk/widget
+        run: npm ci --no-audit --no-fund && npm run typecheck && npm test
+      - name: Python SDK (unit tests)
+        working-directory: clients_sdk/python
+        run: |
+          pipx install uv==0.11.15
+          uv run --frozen --extra dev pytest tests/unit tests/test_imports.py -q
+
+  # ---------------------------------------------------------------------------------------
   # required: single aggregate context for branch protection. It fails if ANY gating job
   # failed or was skipped (e.g. a cancelled supply-chain), so requiring this one context in
   # branch protection makes fmt/clippy/build-matrix/supply-chain/coverage/openapi-drift/
@@ -448,6 +473,7 @@ jobs:
       - segmented-stt
       - server-smoke
       - no-openssl
+      - client-sdks
     steps:
       - name: assert all required jobs succeeded
         env:

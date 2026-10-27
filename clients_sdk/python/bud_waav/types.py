@@ -841,6 +841,16 @@ class ConversationConfig(BaseModel):
     max_reasoning_tokens: Optional[int] = None
     """Hard ceiling on the reasoning tier's output tokens."""
 
+    credential_ref: Optional[str] = None
+    """Name of an operator credential on the gateway to authenticate the LLM with. The key stays
+    on the server and is sent only to that credential's hosts. Takes precedence over api_key."""
+
+    reasoning_credential_ref: Optional[str] = None
+    """As credential_ref, for the reasoning tier. Takes precedence over reasoning_api_key."""
+
+    llm_timeout_ms: Optional[int] = None
+    """LLM request timeout in ms; None for the gateway default (60000)."""
+
 
 class VoiceAgentConfig(BaseModel):
     """A Bud voice agent for the session (spec 025), sent as the config envelope's ``agent``.
@@ -960,6 +970,10 @@ class STTConfig(BaseModel):
     """The kind of speech-to-text wanted: ``"auto"`` | ``"streaming"`` | ``"segmented"``
     (see :data:`TranscriptionMode`). ``None`` (the default) omits the wire field, which the
     gateway reads as ``"auto"``. The mode the session got is reported on ``session.stt``."""
+
+    noise_suppression: Optional[bool] = None
+    """The gateway's own denoiser (DeepFilterNet) on the uplink, ahead of VAD/turn detection and
+    the STT provider. Off unless asked for: it costs gateway CPU and ~30 ms. ``None`` omits it."""
 
     channels: int = 1
     """Number of audio channels"""

@@ -912,9 +912,14 @@ const bud = new BudClient({ baseUrl: 'http://localhost:3001' });
 ## How the API key is sent on a WebSocket
 
 - **Node with the `ws` package:** as the `Authorization: Bearer` header of the upgrade request.
-- **Browsers (and other WebSockets that can't set headers):** as `?token=` on the URL. Query
-  strings end up in proxy access logs, so a gateway can refuse them (`AUTH_QUERY_TOKEN=deny`). In
-  that case use the `ws` package from a server.
+- **Browsers (and other WebSockets that can't set headers):** as the WebSocket subprotocol
+  `openai-insecure-api-key.<key>`, offered beside `realtime` (the one the gateway selects).
+  Gateways from 1.0.0 accept it on `/ws`, `/realtime` and `/v1/realtime`, and it works with
+  `AUTH_QUERY_TOKEN=deny`. Only a key with a character a subprotocol can't carry (a space, `/`,
+  `=`, …) falls back to `?token=` on the URL, which proxy access logs record.
+- A key in a browser is visible to anyone using the page. For `/v1/realtime` on a Bud deployment,
+  have your backend mint a short-lived `ek_bud_…` secret (`POST /v1/realtime/client_secrets`) and
+  give the page that instead of the long-lived key.
 
 The key is never included in the URL that errors and timeouts report.
 

@@ -88,6 +88,7 @@ SDK_CONFIG_REACH: dict[str, set[str]] = {
         "encoding",  # STTConfig.encoding
         "audio_in_codec",  # D8 STTConfig.audio_in_codec (uplink transport codec)
         "transcription_mode",  # segmented STT: STTConfig.transcription_mode (auto|streaming|segmented)
+        "noise_suppression",  # STTConfig.noise_suppression (gateway-side DeepFilterNet)
         "model",  # STTConfig.model
         "api_key",  # session api_key override
         "features",  # nested SttFeatures (see SttFeatures below)
@@ -223,6 +224,9 @@ SDK_CONFIG_REACH: dict[str, set[str]] = {
         "degradation_message",
         "max_llm_calls_per_turn",
         "max_reasoning_tokens",
+        "credential_ref",
+        "reasoning_credential_ref",
+        "llm_timeout_ms",
     },
 }
 
