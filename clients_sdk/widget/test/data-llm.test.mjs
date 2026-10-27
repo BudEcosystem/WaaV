@@ -154,3 +154,27 @@ test('snake_case keys only on conversation_config (no camelCase leak)', () => {
     );
   }
 });
+
+test('credential refs, LLM timeout and server-side STT settings reach the wire', () => {
+  const msg = envelopeFromAttrs({
+    llmBaseUrl: 'https://llm.internal/v1',
+    llmModel: 'm',
+    llmCredentialRef: 'LLM_KEY',
+    llmReasoningCredentialRef: 'REASONING_KEY',
+    llmTimeoutMs: '120000',
+    sttProvider: 'deepgram',
+    sttTranscriptionMode: 'segmented',
+    sttNoiseSuppression: 'true',
+  });
+  assert.equal(msg.conversation_config.credential_ref, 'LLM_KEY');
+  assert.equal(msg.conversation_config.reasoning_credential_ref, 'REASONING_KEY');
+  assert.equal(msg.conversation_config.llm_timeout_ms, 120000);
+  assert.equal(msg.conversation_config.api_key, undefined, 'no raw key when a ref is named');
+  assert.equal(msg.stt_config.transcription_mode, 'segmented');
+  assert.equal(msg.stt_config.noise_suppression, true);
+});
+
+test('an unknown transcription mode is not sent', () => {
+  const msg = envelopeFromAttrs({ sttProvider: 'deepgram', sttTranscriptionMode: 'bogus' });
+  assert.equal(msg.stt_config.transcription_mode, undefined);
+});

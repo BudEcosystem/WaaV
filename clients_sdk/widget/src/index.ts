@@ -19,7 +19,7 @@
 
 import { BudWidget, defineWidget } from './widget';
 import { mergeConfig, parseConfigFromAttributes } from './config';
-import { buildConfigMessage, buildConversationConfig } from './websocket';
+import { authenticatedUpgrade, buildConfigMessage, buildConversationConfig } from './websocket';
 import { AudioPlayer } from './audio/player';
 import { AudioRecorder } from './audio/recorder';
 import { JitterBuffer } from './audio/jitter-buffer';
@@ -64,6 +64,7 @@ export {
   parseConfigFromAttributes,
   buildConfigMessage,
   buildConversationConfig,
+  authenticatedUpgrade,
   // Audio primitives (D2 scheduled player / D3 AudioWorklet recorder / D9 adaptive
   // jitter buffer). Exported so advanced embedders can drive playout/capture
   // directly and for unit testing.

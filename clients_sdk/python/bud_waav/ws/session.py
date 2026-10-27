@@ -977,6 +977,8 @@ class WebSocketSession:
             # when requested (absent = auto). The mode the session got comes back on `ready.stt`.
             if getattr(self.stt_config, "transcription_mode", None):
                 stt_dict["transcription_mode"] = self.stt_config.transcription_mode
+            if getattr(self.stt_config, "noise_suppression", None) is not None:
+                stt_dict["noise_suppression"] = self.stt_config.noise_suppression
             # A VENDOR key only -- never the session's own Bud credential.
             vendor_key = self._vendor_api_key()
             if vendor_key:
@@ -1177,6 +1179,7 @@ class WebSocketSession:
                 "reasoning_api_key", "reasoning_provider_kind", "reasoning_route",
                 "reasoning_budget_ms", "degradation_message",
                 "max_llm_calls_per_turn", "max_reasoning_tokens",
+                "credential_ref", "reasoning_credential_ref", "llm_timeout_ms",
             )
             for fname in optional_fields:
                 value = getattr(conv, fname, None)

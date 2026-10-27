@@ -268,6 +268,19 @@ export interface STTConfig {
    * Serialized under `stt_config.translation`.
    */
   translation?: TranslationConfig;
+  /**
+   * The kind of speech-to-text wanted (wire `transcription_mode`): `streaming` refuses a model
+   * that cannot stream; `segmented` has the gateway cut the audio at pauses and upload each
+   * utterance. Omit for `auto` (whatever the model supports). The session's actual mode comes
+   * back on `ready.stt.transcription_mode`.
+   */
+  transcriptionMode?: 'auto' | 'streaming' | 'segmented';
+  /**
+   * The gateway's own denoiser (DeepFilterNet) on the uplink, ahead of VAD/turn detection and
+   * the STT provider (wire `noise_suppression`). Server-side and off unless asked for: it costs
+   * gateway CPU and ~30 ms. Unrelated to the browser's `features.noiseCancellation`.
+   */
+  noiseSuppression?: boolean;
 }
 
 /** Canonical translation request block (P5). Mirrors the gateway TranslationConfig. */
@@ -427,6 +440,16 @@ export interface ConversationConfig {
   maxLlmCallsPerTurn?: number;
   /** Cap reasoning-tier output tokens. */
   maxReasoningTokens?: number;
+  /**
+   * Name of an operator credential on the gateway to authenticate the LLM with (wire
+   * `credential_ref`). The key stays on the server and is sent only to that credential's hosts,
+   * so unlike {@link apiKey} nothing secret is in the page. Takes precedence over `apiKey`.
+   */
+  credentialRef?: string;
+  /** As {@link credentialRef}, for the reasoning tier. Takes precedence over `reasoningApiKey`. */
+  reasoningCredentialRef?: string;
+  /** LLM request timeout in ms; omit for the gateway default (60000). */
+  llmTimeoutMs?: number;
 }
 
 export interface FeatureFlags {

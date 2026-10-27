@@ -84,6 +84,12 @@ export function buildConfigMessage(config: WidgetConfig): Record<string, unknown
       if (tr.partials !== undefined) trWire.partials = tr.partials;
       sttConfig.translation = trWire;
     }
+    if (config.stt.transcriptionMode !== undefined) {
+      sttConfig.transcription_mode = config.stt.transcriptionMode;
+    }
+    if (config.stt.noiseSuppression !== undefined) {
+      sttConfig.noise_suppression = config.stt.noiseSuppression;
+    }
 
     message.stt_config = sttConfig;
   }
@@ -179,6 +185,8 @@ export function buildConversationConfig(conv: ConversationConfig): Record<string
   // Core LLM
   if (conv.systemPrompt !== undefined) out.system_prompt = conv.systemPrompt;
   if (conv.apiKey !== undefined) out.api_key = conv.apiKey;
+  if (conv.credentialRef !== undefined) out.credential_ref = conv.credentialRef;
+  if (conv.llmTimeoutMs !== undefined) out.llm_timeout_ms = conv.llmTimeoutMs;
   if (conv.temperature !== undefined) out.temperature = conv.temperature;
   if (conv.maxTokens !== undefined) out.max_tokens = conv.maxTokens;
   if (conv.streaming !== undefined) out.streaming = conv.streaming;
@@ -204,6 +212,8 @@ export function buildConversationConfig(conv: ConversationConfig): Record<string
   if (conv.reasoningModel !== undefined) out.reasoning_model = conv.reasoningModel;
   if (conv.reasoningBaseUrl !== undefined) out.reasoning_base_url = conv.reasoningBaseUrl;
   if (conv.reasoningApiKey !== undefined) out.reasoning_api_key = conv.reasoningApiKey;
+  if (conv.reasoningCredentialRef !== undefined)
+    out.reasoning_credential_ref = conv.reasoningCredentialRef;
   if (conv.reasoningProviderKind !== undefined)
     out.reasoning_provider_kind = conv.reasoningProviderKind;
   if (conv.reasoningRoute !== undefined) out.reasoning_route = conv.reasoningRoute;
@@ -212,6 +222,30 @@ export function buildConversationConfig(conv: ConversationConfig): Record<string
   if (conv.maxLlmCallsPerTurn !== undefined) out.max_llm_calls_per_turn = conv.maxLlmCallsPerTurn;
   if (conv.maxReasoningTokens !== undefined) out.max_reasoning_tokens = conv.maxReasoningTokens;
   return out;
+}
+
+/** RFC 7230 `token` characters: what a browser accepts in a subprotocol without throwing. */
+const SUBPROTOCOL_TOKEN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+
+/**
+ * How the widget's API key reaches the gateway. A browser WebSocket can't send headers, so the
+ * key rides the `openai-insecure-api-key.<key>` subprotocol beside `realtime` (the one the
+ * gateway selects; Chrome fails a handshake whose offered subprotocols all go unanswered).
+ * Gateways from 1.0.0 accept it on every WebSocket route, and unlike `?token=` it never reaches
+ * an access log. Only a key with a character no subprotocol may carry is sent as `?token=`.
+ * Mirrors `authenticatedUpgrade` in @bud-foundry/sdk, which this package does not depend on.
+ */
+export function authenticatedUpgrade(
+  gatewayUrl: string,
+  apiKey: string | undefined
+): { url: string; protocols?: string[] } {
+  if (!apiKey) return { url: gatewayUrl };
+  if (SUBPROTOCOL_TOKEN.test(apiKey)) {
+    return { url: gatewayUrl, protocols: ['realtime', `openai-insecure-api-key.${apiKey}`] };
+  }
+  const url = new URL(gatewayUrl);
+  url.searchParams.set('token', apiKey);
+  return { url: url.toString() };
 }
 
 export type MessageHandler = {
@@ -345,14 +379,10 @@ export class WidgetWebSocket {
       }, timeout);
 
       try {
-        const url = new URL(this.config.gatewayUrl);
-
-        // Add auth token as query param if provided
-        if (this.config.apiKey) {
-          url.searchParams.set('token', this.config.apiKey);
-        }
-
-        this.ws = new WebSocket(url.toString());
+        const upgrade = authenticatedUpgrade(this.config.gatewayUrl, this.config.apiKey);
+        this.ws = upgrade.protocols
+          ? new WebSocket(upgrade.url, upgrade.protocols)
+          : new WebSocket(upgrade.url);
 
         this.ws.onopen = () => {
           this.reconnectAttempts = 0;
