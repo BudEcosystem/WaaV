@@ -593,7 +593,7 @@ pub const TTS_FEATURE_SUPPORT: &[FeatureSupport] = &[
         provider: "smallest",
         module: "smallest",
         batch_builder: None,
-        features: &["speed", "stability", "similarity_boost", "sample_rate"],
+        features: &["speed", "sample_rate"],
     },
     FeatureSupport {
         provider: "speechify",

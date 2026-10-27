@@ -870,17 +870,17 @@ fn yandex_tts_metadata() -> ProviderMetadata {
 
 fn smallest_tts_metadata() -> ProviderMetadata {
     ProviderMetadata::tts("smallest", "Smallest.ai Waves TTS")
-        .with_description("Ultra-low latency TTS (~100ms) with voice cloning and 16+ languages")
+        .with_description(
+            "Low-latency TTS (~200ms to first byte), Lightning v3.1 and v3.1 Pro pools",
+        )
         .with_alias("smallest-ai")
         .with_features([
-            "streaming",
             "ultra-low-latency",
             "voice-cloning",
             "multi-language",
-            "websocket",
             "speed-control",
         ])
-        .with_models(["lightning", "lightning-large", "lightning-v2"])
+        .with_models(["lightning_v3.1", "lightning_v3.1_pro"])
         .with_languages([
             "en", "hi", "mr", "kn", "ta", "bn", "gu", "de", "fr", "es", "it", "pl", "nl", "ru",
             "ar", "he",

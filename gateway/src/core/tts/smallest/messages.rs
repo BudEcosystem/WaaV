@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 // REST API Request Types
 // =============================================================================
 
-/// TTS synthesis request body for Smallest.ai REST API (Lightning model).
+/// TTS synthesis request body for Smallest.ai's REST API (`POST /waves/v1/tts`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SmallestTtsRequest {
     /// Text to convert to speech.
@@ -16,6 +16,10 @@ pub struct SmallestTtsRequest {
 
     /// Voice identifier.
     pub voice_id: String,
+
+    /// Voice pool: `lightning_v3.1` (the API's default when absent) or `lightning_v3.1_pro`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 
     /// Audio sample rate in Hz.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -40,11 +44,18 @@ impl SmallestTtsRequest {
         Self {
             text: text.into(),
             voice_id: voice_id.into(),
+            model: None,
             sample_rate: None,
             speed: None,
             language: None,
             output_format: None,
         }
+    }
+
+    /// Sets the voice pool (`SmallestModel::as_str`).
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = Some(model.into());
+        self
     }
 
     /// Sets the sample rate.
@@ -73,10 +84,10 @@ impl SmallestTtsRequest {
 }
 
 // =============================================================================
-// WebSocket Request Types (Lightning-V2)
+// WebSocket Request Types
 // =============================================================================
 
-/// WebSocket TTS request message for Lightning-V2 streaming.
+/// WebSocket TTS request message for streaming synthesis (`/waves/v1/tts/live`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SmallestWsRequest {
     /// Voice identifier.

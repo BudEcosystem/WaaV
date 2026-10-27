@@ -7,8 +7,8 @@ use std::fmt;
 
 use super::{
     DEFAULT_CONSISTENCY, DEFAULT_ENHANCEMENT, DEFAULT_SAMPLE_RATE, DEFAULT_SIMILARITY,
-    DEFAULT_SPEED, DEFAULT_VOICE_ID, MAX_CONSISTENCY, MAX_ENHANCEMENT, MAX_SIMILARITY,
-    MAX_SPEED_REST, MAX_SPEED_WS, MIN_CONSISTENCY, MIN_ENHANCEMENT, MIN_SIMILARITY, MIN_SPEED,
+    DEFAULT_SPEED, DEFAULT_VOICE_ID, MAX_CONSISTENCY, MAX_ENHANCEMENT, MAX_SIMILARITY, MAX_SPEED,
+    MIN_CONSISTENCY, MIN_ENHANCEMENT, MIN_SIMILARITY, MIN_SPEED,
 };
 use crate::core::tts::base::{TTSConfig, TTSError};
 
@@ -25,66 +25,99 @@ fn validate_smallest_tts_endpoint(source: &str, endpoint: &str) -> Result<(), St
 // SmallestModel
 // =============================================================================
 
-/// Smallest.ai TTS models.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-#[derive(Default)]
+/// Smallest.ai TTS models: the two Lightning v3.1 voice pools.
+///
+/// Smallest retired every earlier model (`lightning`, `lightning-large`, `lightning-v2`) — their
+/// endpoints answer `410 MODEL_DEPRECATED`, "Please migrate to lightning-v3.1" — and `thunder`
+/// is gone. Those names still parse, to [`Self::LightningV31`], so a config written for them keeps
+/// working instead of failing every request; [`Self::parse_with_migration`] says when it happens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum SmallestModel {
-    /// Lightning model - fastest, ~100ms latency, REST API.
-    #[serde(alias = "lightning")]
+    /// Lightning v3.1, the standard pool: the larger voice catalog, and voice cloning.
+    #[serde(
+        rename = "lightning_v3.1",
+        alias = "lightning-v3.1",
+        alias = "lightning",
+        alias = "lightning-large",
+        alias = "lightning_large",
+        alias = "lightning-v2",
+        alias = "lightning_v2",
+        alias = "thunder"
+    )]
     #[default]
-    Lightning,
-
-    /// Lightning-Large model - voice cloning support, ~300ms latency.
-    #[serde(alias = "lightning-large", alias = "lightning_large")]
-    LightningLarge,
-
-    /// Lightning-V2 model - WebSocket streaming, <200ms latency.
-    #[serde(alias = "lightning-v2", alias = "lightning_v2")]
-    LightningV2,
-
-    /// Thunder model - deprecated streaming model.
-    #[serde(alias = "thunder")]
-    Thunder,
+    LightningV31,
+    /// Lightning v3.1 Pro: the premium pool, with its own voices (a standard-pool voice id is not
+    /// valid here, nor the reverse).
+    #[serde(rename = "lightning_v3.1_pro", alias = "lightning-v3.1-pro")]
+    LightningV31Pro,
 }
 
+/// Model names Smallest has retired, all served by Lightning v3.1 now.
+const RETIRED_MODELS: &[&str] = &[
+    "lightning",
+    "lightning-large",
+    "lightning_large",
+    "lightninglarge",
+    "lightning-v2",
+    "lightning_v2",
+    "lightningv2",
+    "thunder",
+];
+
 impl SmallestModel {
-    /// Returns the API string representation.
+    /// The `model` value the synthesis request body carries.
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::Lightning => "lightning",
-            Self::LightningLarge => "lightning-large",
-            Self::LightningV2 => "lightning-v2",
-            Self::Thunder => "thunder",
+            Self::LightningV31 => "lightning_v3.1",
+            Self::LightningV31Pro => "lightning_v3.1_pro",
         }
     }
 
-    /// Returns whether this model supports voice cloning.
-    pub fn supports_voice_cloning(&self) -> bool {
-        matches!(self, Self::LightningLarge | Self::LightningV2)
+    /// The model's segment in the voice-list path (`/waves/v1/<segment>/get_voices`).
+    pub fn path_segment(&self) -> &'static str {
+        match self {
+            Self::LightningV31 => "lightning-v3.1",
+            Self::LightningV31Pro => "lightning-v3.1-pro",
+        }
     }
 
-    /// Returns whether this model supports WebSocket streaming.
+    /// Parse a model name, reporting whether it was a retired one mapped onto Lightning v3.1.
+    pub fn parse_with_migration(s: &str) -> Result<(Self, bool), TTSError> {
+        let lowered = s.trim().to_lowercase();
+        if RETIRED_MODELS.contains(&lowered.as_str()) {
+            return Ok((Self::LightningV31, true));
+        }
+        match lowered.as_str() {
+            "lightning_v3.1" | "lightning-v3.1" | "lightning-v3_1" | "lightning_v3_1" => {
+                Ok((Self::LightningV31, false))
+            }
+            "lightning_v3.1_pro" | "lightning-v3.1-pro" | "lightning_v3_1_pro" => {
+                Ok((Self::LightningV31Pro, false))
+            }
+            _ => Err(TTSError::InvalidConfiguration(format!(
+                "Unknown Smallest.ai model: {s}. Valid models: lightning_v3.1, lightning_v3.1_pro"
+            ))),
+        }
+    }
+
+    /// Returns whether this model supports voice cloning (the standard pool only).
+    pub fn supports_voice_cloning(&self) -> bool {
+        matches!(self, Self::LightningV31)
+    }
+
+    /// Returns whether this model supports WebSocket streaming (`/waves/v1/tts/live`).
     pub fn supports_websocket(&self) -> bool {
-        matches!(self, Self::LightningV2 | Self::Thunder)
+        true
     }
 
     /// Returns the maximum speed multiplier for this model.
     pub fn max_speed(&self) -> f32 {
-        match self {
-            Self::Lightning | Self::LightningLarge => MAX_SPEED_REST,
-            Self::LightningV2 | Self::Thunder => MAX_SPEED_WS,
-        }
+        MAX_SPEED
     }
 
-    /// Returns the approximate latency for this model.
+    /// Returns the approximate time to first byte for this model, in ms.
     pub fn latency_ms(&self) -> u32 {
-        match self {
-            Self::Lightning => 100,
-            Self::LightningLarge => 300,
-            Self::LightningV2 => 200,
-            Self::Thunder => 200,
-        }
+        200
     }
 }
 
@@ -98,16 +131,7 @@ impl std::str::FromStr for SmallestModel {
     type Err = TTSError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "lightning" => Ok(Self::Lightning),
-            "lightning-large" | "lightning_large" | "lightninglarge" => Ok(Self::LightningLarge),
-            "lightning-v2" | "lightning_v2" | "lightningv2" => Ok(Self::LightningV2),
-            "thunder" => Ok(Self::Thunder),
-            _ => Err(TTSError::InvalidConfiguration(format!(
-                "Unknown Smallest.ai model: {}. Valid models: lightning, lightning-large, lightning-v2, thunder",
-                s
-            ))),
-        }
+        Self::parse_with_migration(s).map(|(model, _)| model)
     }
 }
 
@@ -129,7 +153,8 @@ pub enum SmallestOutputFormat {
     /// MP3 compressed format.
     Mp3,
 
-    /// µ-law encoded audio.
+    /// µ-law encoded audio (the API's `ulaw`).
+    #[serde(rename = "ulaw", alias = "mulaw")]
     Mulaw,
 }
 
@@ -140,7 +165,7 @@ impl SmallestOutputFormat {
             Self::Pcm => "pcm",
             Self::Wav => "wav",
             Self::Mp3 => "mp3",
-            Self::Mulaw => "mulaw",
+            Self::Mulaw => "ulaw",
         }
     }
 
@@ -181,7 +206,7 @@ impl std::str::FromStr for SmallestOutputFormat {
             "mp3" | "mpeg" => Ok(Self::Mp3),
             "mulaw" | "ulaw" | "mu-law" => Ok(Self::Mulaw),
             _ => Err(TTSError::InvalidConfiguration(format!(
-                "Unknown audio format: {}. Valid formats: pcm, wav, mp3, mulaw",
+                "Unknown audio format: {}. Valid formats: pcm, wav, mp3, ulaw",
                 s
             ))),
         }
@@ -371,16 +396,16 @@ pub struct SmallestTtsConfig {
     /// Speech speed multiplier.
     pub speed: f32,
 
-    /// Voice consistency (0-1, for lightning-large only).
+    /// Voice consistency (0-1; streaming body only, the retired lightning-large knob).
     pub consistency: f32,
 
-    /// Voice similarity to reference (0-1, for lightning-large only).
+    /// Voice similarity to reference (0-1; streaming body only, the retired lightning-large knob).
     pub similarity: f32,
 
-    /// Audio enhancement level (0-2, for lightning-large only).
+    /// Audio enhancement level (0-2; streaming body only, the retired lightning-large knob).
     pub enhancement: u8,
 
-    /// Max wait (ms) before the lightning-v2 streaming WebSocket flushes its output buffer
+    /// Max wait (ms) before the streaming WebSocket flushes its output buffer
     /// (`max_buffer_flush_ms` in the `get_speech/stream` request; 0-1000ms). A latency/chunking
     /// knob, not an audio-content knob, so it stays out of the synthesis cache key. `None` lets
     /// the server default apply.
@@ -406,9 +431,17 @@ impl SmallestTtsConfig {
             ));
         }
 
-        // Parse model
+        // Parse model; a retired one is served by Lightning v3.1 (see `SmallestModel`).
         let model = if !config.model.is_empty() {
-            config.model.parse()?
+            let (model, migrated) = SmallestModel::parse_with_migration(&config.model)?;
+            if migrated {
+                tracing::warn!(
+                    requested = %config.model,
+                    using = model.as_str(),
+                    "Smallest retired this model (its endpoint answers 410); using lightning_v3.1"
+                );
+            }
+            model
         } else {
             SmallestModel::default()
         };
@@ -459,16 +492,16 @@ impl SmallestTtsConfig {
 
     /// Build from the standardized TTS config (W1 keystone).
     ///
-    /// Smallest exposes a speed multiplier plus the lightning-large voice knobs, so this maps
-    /// `speed` -> `speed` (reusing `from_base`'s `MIN_SPEED..=model.max_speed()` clamp so 1.0 stays
-    /// normal), the ElevenLabs-style `stability` -> `consistency` and `similarity_boost` ->
-    /// `similarity` (both direct 0-1 levels, clamped to their valid ranges), `language` -> the
+    /// Maps `speed` -> `speed` (reusing `from_base`'s `MIN_SPEED..=model.max_speed()` clamp so 1.0
+    /// stays normal), `language` -> the
     /// `SmallestLanguage` enum (rejecting unknown non-empty values), and `sample_rate` ->
     /// `sample_rate` (snapped to the nearest supported rate). Smallest's non-standard
     /// `enhancement` level and the
-    /// lightning-v2 streaming `max_buffer_flush_ms` knob are read from the `extras` passthrough.
-    /// Features without a Smallest field (pitch, volume, style, use_speaker_boost, emotion,
-    /// instructions, ssml, word_timestamps, streaming, seed) are skipped.
+    /// streaming `max_buffer_flush_ms` knob are read from the `extras` passthrough.
+    /// Features without a Smallest field (stability, similarity_boost — the retired
+    /// lightning-large's knobs, which Lightning v3.1 has no parameter for — pitch, volume, style,
+    /// use_speaker_boost, emotion, instructions, ssml, word_timestamps, streaming, seed) are
+    /// skipped, so the capability matrix does not claim them.
     pub fn from_standard(
         std: &crate::core::tts::standard::StandardTTSConfig,
     ) -> Result<Self, TTSError> {
@@ -478,14 +511,6 @@ impl SmallestTtsConfig {
         if let Some(speed) = f.speed {
             // Reuse from_base's clamp: a 1.0-is-normal multiplier bounded by the model's max speed.
             cfg.speed = speed.clamp(MIN_SPEED, cfg.model.max_speed());
-        }
-        if let Some(stability) = f.stability {
-            // Smallest voice consistency is a direct 0-1 level (lightning-large only).
-            cfg.consistency = stability.clamp(MIN_CONSISTENCY, MAX_CONSISTENCY);
-        }
-        if let Some(similarity_boost) = f.similarity_boost {
-            // Smallest voice similarity is a direct 0-1 level (lightning-large only).
-            cfg.similarity = similarity_boost.clamp(MIN_SIMILARITY, MAX_SIMILARITY);
         }
         if let Some(language) = f
             .language
@@ -503,7 +528,7 @@ impl SmallestTtsConfig {
         if let Some(enhancement) = std.extras.0.get("enhancement").and_then(|v| v.as_u64()) {
             cfg.enhancement = (enhancement as u8).clamp(MIN_ENHANCEMENT, MAX_ENHANCEMENT);
         }
-        // lightning-v2 streaming buffer-flush latency knob (0-1000ms), reaches the WS request body.
+        // streaming buffer-flush latency knob (0-1000ms), reaches the WS request body.
         if let Some(ms) = std
             .extras
             .0
@@ -609,19 +634,19 @@ impl SmallestTtsConfig {
         self
     }
 
-    /// Sets the consistency parameter (lightning-large only).
+    /// Sets the consistency parameter (the retired lightning-large's knob; streaming body only).
     pub fn with_consistency(mut self, consistency: f32) -> Self {
         self.consistency = consistency.clamp(MIN_CONSISTENCY, MAX_CONSISTENCY);
         self
     }
 
-    /// Sets the similarity parameter (lightning-large only).
+    /// Sets the similarity parameter (the retired lightning-large's knob; streaming body only).
     pub fn with_similarity(mut self, similarity: f32) -> Self {
         self.similarity = similarity.clamp(MIN_SIMILARITY, MAX_SIMILARITY);
         self
     }
 
-    /// Sets the enhancement level (lightning-large only).
+    /// Sets the enhancement level (the retired lightning-large's knob; streaming body only).
     pub fn with_enhancement(mut self, enhancement: u8) -> Self {
         self.enhancement = enhancement.clamp(MIN_ENHANCEMENT, MAX_ENHANCEMENT);
         self
@@ -640,8 +665,8 @@ mod tests {
         TTSConfig {
             provider: "smallest".to_string(),
             api_key: "test-api-key".to_string(),
-            voice_id: Some("emily".to_string()),
-            model: "lightning".to_string(),
+            voice_id: Some("olivia".to_string()),
+            model: "lightning_v3.1".to_string(),
             speaking_rate: Some(1.0),
             audio_format: Some("wav".to_string()),
             sample_rate: Some(24000),
@@ -677,16 +702,17 @@ mod tests {
             extras: ProviderExtras(extras),
         };
         let cfg = SmallestTtsConfig::from_standard(&std).unwrap();
-        // Lightning model max speed is 2.0, so 1.5 passes through the clamp unchanged.
+        // Lightning v3.1's max speed is 2.0, so 1.5 passes through the clamp unchanged.
         assert!((cfg.speed - 1.5).abs() < 0.001);
-        assert!((cfg.consistency - 0.8).abs() < 0.001); // stability -> consistency
-        assert!((cfg.similarity - 0.7).abs() < 0.001); // similarity_boost -> similarity
+        // stability / similarity_boost have no Lightning v3.1 parameter: left at the defaults.
+        assert!((cfg.consistency - DEFAULT_CONSISTENCY).abs() < 0.001);
+        assert!((cfg.similarity - DEFAULT_SIMILARITY).abs() < 0.001);
         assert_eq!(cfg.language, SmallestLanguage::Hindi);
         assert_eq!(cfg.sample_rate, 16000);
         assert_eq!(cfg.enhancement, 2); // from extras passthrough
     }
 
-    // The lightning-v2 streaming `max_buffer_flush_ms` knob arrives via the extras passthrough and
+    // The streaming `max_buffer_flush_ms` knob arrives via the extras passthrough and
     // reaches the config field (clamped to the 0-1000ms documented range).
     #[test]
     fn from_standard_maps_max_buffer_flush_ms_from_extras() {
@@ -768,34 +794,57 @@ mod tests {
 
     #[test]
     fn test_model_as_str() {
-        assert_eq!(SmallestModel::Lightning.as_str(), "lightning");
-        assert_eq!(SmallestModel::LightningLarge.as_str(), "lightning-large");
-        assert_eq!(SmallestModel::LightningV2.as_str(), "lightning-v2");
-        assert_eq!(SmallestModel::Thunder.as_str(), "thunder");
+        assert_eq!(SmallestModel::LightningV31.as_str(), "lightning_v3.1");
+        assert_eq!(
+            SmallestModel::LightningV31Pro.as_str(),
+            "lightning_v3.1_pro"
+        );
+        assert_eq!(SmallestModel::LightningV31.path_segment(), "lightning-v3.1");
+        assert_eq!(
+            SmallestModel::LightningV31Pro.path_segment(),
+            "lightning-v3.1-pro"
+        );
     }
 
     #[test]
     fn test_model_from_str() {
+        for name in ["lightning_v3.1", "lightning-v3.1", "LIGHTNING_V3.1"] {
+            assert_eq!(
+                name.parse::<SmallestModel>().unwrap(),
+                SmallestModel::LightningV31
+            );
+        }
+        for name in ["lightning_v3.1_pro", "lightning-v3.1-pro"] {
+            assert_eq!(
+                name.parse::<SmallestModel>().unwrap(),
+                SmallestModel::LightningV31Pro
+            );
+        }
+    }
+
+    #[test]
+    fn retired_models_parse_to_lightning_v3_1_and_say_so() {
+        for name in [
+            "lightning",
+            "lightning-large",
+            "lightning_large",
+            "lightning-v2",
+            "thunder",
+        ] {
+            assert_eq!(
+                SmallestModel::parse_with_migration(name).unwrap(),
+                (SmallestModel::LightningV31, true),
+                "{name}"
+            );
+        }
         assert_eq!(
-            "lightning".parse::<SmallestModel>().unwrap(),
-            SmallestModel::Lightning
+            SmallestModel::parse_with_migration("lightning_v3.1_pro").unwrap(),
+            (SmallestModel::LightningV31Pro, false)
         );
-        assert_eq!(
-            "lightning-large".parse::<SmallestModel>().unwrap(),
-            SmallestModel::LightningLarge
-        );
-        assert_eq!(
-            "lightning_large".parse::<SmallestModel>().unwrap(),
-            SmallestModel::LightningLarge
-        );
-        assert_eq!(
-            "lightning-v2".parse::<SmallestModel>().unwrap(),
-            SmallestModel::LightningV2
-        );
-        assert_eq!(
-            "thunder".parse::<SmallestModel>().unwrap(),
-            SmallestModel::Thunder
-        );
+        // serde (a config file) takes the same names.
+        let m: SmallestModel = serde_json::from_str("\"lightning-v2\"").unwrap();
+        assert_eq!(m, SmallestModel::LightningV31);
+        assert_eq!(serde_json::to_string(&m).unwrap(), "\"lightning_v3.1\"");
     }
 
     #[test]
@@ -805,18 +854,8 @@ mod tests {
 
     #[test]
     fn test_model_supports_voice_cloning() {
-        assert!(!SmallestModel::Lightning.supports_voice_cloning());
-        assert!(SmallestModel::LightningLarge.supports_voice_cloning());
-        assert!(SmallestModel::LightningV2.supports_voice_cloning());
-        assert!(!SmallestModel::Thunder.supports_voice_cloning());
-    }
-
-    #[test]
-    fn test_model_supports_websocket() {
-        assert!(!SmallestModel::Lightning.supports_websocket());
-        assert!(!SmallestModel::LightningLarge.supports_websocket());
-        assert!(SmallestModel::LightningV2.supports_websocket());
-        assert!(SmallestModel::Thunder.supports_websocket());
+        assert!(SmallestModel::LightningV31.supports_voice_cloning());
+        assert!(!SmallestModel::LightningV31Pro.supports_voice_cloning());
     }
 
     // =========================================================================
@@ -828,7 +867,7 @@ mod tests {
         assert_eq!(SmallestOutputFormat::Pcm.as_str(), "pcm");
         assert_eq!(SmallestOutputFormat::Wav.as_str(), "wav");
         assert_eq!(SmallestOutputFormat::Mp3.as_str(), "mp3");
-        assert_eq!(SmallestOutputFormat::Mulaw.as_str(), "mulaw");
+        assert_eq!(SmallestOutputFormat::Mulaw.as_str(), "ulaw");
     }
 
     #[test]
@@ -896,8 +935,8 @@ mod tests {
         let config = SmallestTtsConfig::from_base(base).unwrap();
 
         assert_eq!(config.api_key, "test-api-key");
-        assert_eq!(config.voice_id, "emily");
-        assert_eq!(config.model, SmallestModel::Lightning);
+        assert_eq!(config.voice_id, "olivia");
+        assert_eq!(config.model, SmallestModel::LightningV31);
         assert_eq!(config.format, SmallestOutputFormat::Wav);
         assert_eq!(config.sample_rate, 24000);
         assert!((config.speed - 1.0).abs() < 0.001);
@@ -951,8 +990,8 @@ mod tests {
         let base = create_test_config();
         let config = SmallestTtsConfig::from_base(base).unwrap().with_speed(10.0);
 
-        // Lightning model max is 2.0
-        assert!((config.speed - MAX_SPEED_REST).abs() < 0.001);
+        // Lightning v3.1's max is 2.0
+        assert!((config.speed - MAX_SPEED).abs() < 0.001);
     }
 
     #[test]
@@ -990,9 +1029,9 @@ mod tests {
         let base = create_test_config();
         let config = SmallestTtsConfig::from_base(base)
             .unwrap()
-            .with_model(SmallestModel::LightningV2);
+            .with_model(SmallestModel::LightningV31Pro);
 
-        assert_eq!(config.model, SmallestModel::LightningV2);
+        assert_eq!(config.model, SmallestModel::LightningV31Pro);
     }
 
     #[test]
@@ -1028,11 +1067,11 @@ mod tests {
     #[test]
     fn test_config_with_sample_rate_nearest() {
         let base = create_test_config();
-        // 20000 is not valid, should snap to nearest (22050)
+        // 22050 is not a Lightning v3.1 rate; it snaps to the nearest (24000)
         let config = SmallestTtsConfig::from_base(base)
             .unwrap()
-            .with_sample_rate(20000);
+            .with_sample_rate(22050);
 
-        assert_eq!(config.sample_rate, 22050);
+        assert_eq!(config.sample_rate, 24000);
     }
 }
