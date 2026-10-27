@@ -140,6 +140,8 @@ const NONE: &str = "none";
 /// A choice answered "any of them": the caller's words go to the agent, which picks.
 const ANY: &str = "any";
 pub(super) const NEW: [(&str, &str); 1] = [("new", "asks for something else")];
+/// A follow-up the front named that asks for nothing: the turn is the persona's thanks line.
+const THANKS: (&str, &str) = ("thanks", "only thanks or says goodbye");
 
 /// The labels the front reads a caller's answer to an open question against (chapter 9: no
 /// phrase list decides what the caller meant): one per option of a choice, then the kind's own.
@@ -210,8 +212,9 @@ enum Asked {
     Which(Repeat),
     /// A request the front delegated that may ask for one of these tasks again.
     Same(ActDecision, Vec<(TaskRef, String)>),
-    /// A follow-up the front named of this finished task (its title): whether it is about it.
-    Follows(ActDecision, TaskRef, String),
+    /// A follow-up the front named of this finished task (its title, and what the agent that
+    /// did it does): whether it is about it.
+    Follows(ActDecision, TaskRef, String, Option<String>),
     /// A request the front delegated while this task (its title) had just started: whether it
     /// is about it (owner, 26 Oct).
     Started(ActDecision, TaskRef, String),
@@ -463,6 +466,8 @@ pub struct Policy {
     step_down: bool,
     /// The agents that are one MCP tool each: a task on one is a single call.
     single_calls: Vec<String>,
+    /// What each agent of the session does (its name, its own description).
+    agent_topics: Vec<(String, String)>,
     /// Stepped down: every turn goes to the background, and only its answer is spoken.
     plain: bool,
     /// The task whose caller was last told that a value is never taken by voice.
@@ -546,6 +551,7 @@ impl Policy {
             foreign_turns: 0,
             step_down: false,
             single_calls: Vec::new(),
+            agent_topics: Vec::new(),
             plain: false,
             declined: None,
             closed: VecDeque::new(),
@@ -628,6 +634,12 @@ impl Policy {
     /// The session's agents that are one MCP tool each (`set_single_calls`).
     pub fn set_single_calls(&mut self, single_calls: Vec<String>) {
         self.single_calls = single_calls;
+    }
+
+    /// What the session's agents do (name, own description): a follow-up is read apart
+    /// against what the agent that did the task does.
+    pub fn set_agent_topics(&mut self, topics: Vec<(String, String)>) {
+        self.agent_topics = topics;
     }
 
     /// The session goes on as the plain path: every turn the background's.
@@ -1140,10 +1152,11 @@ impl Policy {
                 options.extend(labels(&NEW));
                 (ReadingKind::Same, lines.join("\n"), options)
             }
-            Asked::Follows(_, _, title) => {
+            Asked::Follows(_, _, title, topic) => {
                 let mut options = vec![("1".to_owned(), title.clone())];
                 options.extend(labels(&NEW));
-                let context = format!("Task done: {}", front_model::reading_context("1", title));
+                options.extend(labels(&[THANKS]));
+                let context = front_model::follows_context(title, topic.as_deref());
                 (ReadingKind::Follows, context, options)
             }
             Asked::Started(_, _, title) => {
@@ -1195,11 +1208,20 @@ impl Policy {
             if let Some(turn) = &mut self.turn {
                 turn.asked_twice = true;
             }
-            // A follow-up the front named: about something else, it is a new request; with no
-            // reading in time the front's word stands.
+            // A follow-up the front named: about something else, it is a new request, and words
+            // that ask for nothing are thanks (the persona's line, not an answer from the
+            // result: live rehearsal 1, "Thanks, Eva." was answered with the release check);
+            // with no reading in time the front's word stands.
             if let Asked::Follows(decision, ..) = asked {
                 let decision = match label {
                     OTHER | "1" => decision,
+                    label if label == THANKS.0 => ActDecision {
+                        act: Act::Social,
+                        task: None,
+                        say: None,
+                        intent: Some("thanks"),
+                        ..decision
+                    },
                     _ => ActDecision {
                         act: Act::Delegate,
                         task: None,
@@ -1722,14 +1744,20 @@ impl Policy {
         };
         if let Some(task) = follow {
             // Read apart whether the words are about that task (live MA7).
-            let title = done.iter().find(|view| view.task_ref == task);
-            let title = title.map(|view| view.title.clone()).unwrap_or_default();
+            let view = done.iter().find(|view| view.task_ref == task);
+            let title = view.map(|view| view.title.clone()).unwrap_or_default();
+            let agent = view.and_then(|view| view.lineage.agent.as_ref());
+            let topic = agent.and_then(|agent| {
+                let topics = self.agent_topics.iter();
+                topics.into_iter().find(|(name, _)| name == agent)
+            });
+            let topic = topic.map(|(_, what)| what.clone());
             if ask_which && decision.source == ActSource::Model {
                 let pending = Pending {
                     turn: id,
                     eot: None,
                     stage: Stage::Front,
-                    asked: Asked::Follows(decision, task, title),
+                    asked: Asked::Follows(decision, task, title, topic),
                 };
                 return self.read(e, pending, board, out);
             }
@@ -7609,6 +7637,78 @@ mod tests {
         let board = parcel(2_000);
         let actions = decided(&mut policy, 1, 12_000, words, &board, delegate);
         assert_eq!(settled(&actions).0, Act::Delegate, "{actions:?}");
+    }
+
+    /// Live rehearsal 1 of the launch demo (28 Oct): after the browser's release check every
+    /// turn was a follow-up of it, "Thanks, Eva." too, answered from its result. The reading
+    /// apart is shown what the agent that did the task does, and words that ask for nothing
+    /// are the persona's thanks line.
+    #[test]
+    fn a_follow_up_is_read_against_its_agent_and_thanks_are_thanks() {
+        let modelled = |turn: u64| {
+            PolicyInput::Front(FrontEvent::Done {
+                turn: TurnId(turn),
+                decision: ActDecision {
+                    task: Some(TaskRef("t2".to_owned())),
+                    say: Some("Okay, let me check.".to_owned()),
+                    source: ActSource::Model,
+                    ..decision(Act::FollowUp)
+                },
+            })
+        };
+        let mut policy = policy();
+        let board = booked(&mut policy);
+        policy.reader = None;
+        policy.set_agent_topics(vec![(
+            "browser".to_owned(),
+            "Operates airline websites and books flights.".to_owned(),
+        )]);
+        policy.step(10_000, says(3, 10_000, "Thanks, Eva."), &board);
+        let asked = policy.step(10_000, modelled(3), &board);
+        let [PolicyAction::Read(reading)] = &asked[..] else {
+            panic!("a reading, got {asked:?}");
+        };
+        assert_eq!(reading.kind, ReadingKind::Follows);
+        assert!(
+            reading.context.ends_with(
+                "by an agent that \u{ab}Operates airline websites and books flights.\u{bb}"
+            ),
+            "{}",
+            reading.context
+        );
+        let labels: Vec<&str> = reading.labels.iter().map(|(l, _)| l.as_str()).collect();
+        assert_eq!(labels, ["1", "new", "thanks"]);
+        let thanks = PolicyInput::Read {
+            turn: TurnId(3),
+            label: Some("thanks".to_owned()),
+        };
+        let actions = policy.step(10_100, thanks, &board);
+        assert_eq!(settled(&actions).0, Act::Social, "{actions:?}");
+        assert_eq!(words(&actions), ["You're welcome."]);
+        assert!(
+            narrations(&actions).is_empty(),
+            "nothing is answered from the result"
+        );
+        assert!(
+            commands(&actions)
+                .iter()
+                .all(|cmd| !matches!(cmd, TaskCmd::FollowUp { .. } | TaskCmd::Delegate { .. })),
+            "{actions:?}"
+        );
+        // Without a description of the agent the title alone is shown, as before.
+        let mut policy = self::policy();
+        let board = booked(&mut policy);
+        policy.reader = None;
+        policy.step(20_000, says(4, 20_000, "When does it leave?"), &board);
+        let asked = policy.step(20_000, modelled(4), &board);
+        let [PolicyAction::Read(reading)] = &asked[..] else {
+            panic!("a reading, got {asked:?}");
+        };
+        assert!(
+            !reading.context.contains("by an agent"),
+            "{}",
+            reading.context
+        );
     }
 
     /// Live MA7: a follow-up the front named is read apart against the finished task's title;

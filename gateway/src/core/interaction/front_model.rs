@@ -2033,9 +2033,77 @@ pub const REPEAT_SYSTEM: &str = "A caller on a phone call already asked for some
 /// `follow_up` of a hotel search for "Do I have a note about the dentist?" with every prompt
 /// tried (the agent's own description in the task's line included); read apart, as the repeat
 /// reading is, the question is a plain comparison.
-pub const FOLLOW_SYSTEM: &str = "A caller on a phone call had a task done for them. Now they say \
-    something more. If it is about that task (its result, a detail of what it found or did, a \
-    change to it, or more of the same thing), write 1. If it is about something else, write new.";
+///
+/// The reading names the agent that did the task and what it does ([`follows_context`]), has
+/// examples ([`FOLLOW_EXAMPLES`]), and a third label for words that ask for nothing (`thanks`:
+/// the turn is then the persona's thanks line). Live rehearsal 1 of the launch demo (28 Oct,
+/// stream launch-day-1793141908): once the browser's release check had finished the 2B front
+/// named every later turn `follow_up` of it, and this reading, shown the task's title alone,
+/// kept them there: "Oh, and while you're at it, grab the download numbers in the terminal.",
+/// "Let's draft the launch announcement and mention those numbers.", "Thanks, Eva."; no
+/// terminal or writer task started and the answer narrator answered each from the release
+/// check. In the decision's own prompt examples of other work and of thanks after a finished
+/// task moved its requests only part of the way and its thanks not at all (r18). Offline on
+/// Qwen3.5-2B (r18, temperature 0): with the agent, the examples and `thanks`, 29 of 30 cases
+/// right (the rehearsal's turns and held-out ones in other domains; the miss, "Can you check
+/// the download page too?" after the release check, is `new`: a new browser task), against 22
+/// of 30 before. Through the gateway's decision and this reading the finished-task gate set
+/// (`the_finished_task_gate_set_on_a_live_front`, the rehearsal's turns, ten seeds) settles 130
+/// of 130 right (60 before), and the control and reading gate sets read as before (57 of 59,
+/// 46 of 47).
+pub const FOLLOW_SYSTEM: &str = "A caller on a phone call had a task done for them by an agent. \
+    Now they say something more. If it is about that task (its result, a detail of what it found \
+    or did, a change to it, or more of the same work by that agent), write 1. If it asks for \
+    something else, or for work another kind of agent would do, write new. If it only thanks or \
+    says goodbye and asks for nothing, write thanks.";
+
+/// The follow-up reading's examples: the finished task, what its agent does, the caller's words
+/// and the label.
+const FOLLOW_EXAMPLES: [(&str, &str, &str, &str); 5] = [
+    (
+        "Book a table at Rosa's for Friday",
+        "Books restaurant tables.",
+        "Can it be at eight instead?",
+        "1",
+    ),
+    (
+        "Book a table at Rosa's for Friday",
+        "Books restaurant tables.",
+        "Can you also order me a taxi there?",
+        "new",
+    ),
+    (
+        "Find me a flight to Delhi on Monday",
+        "Searches airline websites and books flights.",
+        "Which seat did I get?",
+        "1",
+    ),
+    (
+        "Find me a flight to Delhi on Monday",
+        "Searches airline websites and books flights.",
+        "Now write an email to my boss about the trip.",
+        "new",
+    ),
+    (
+        "Book a table at Rosa's for Friday",
+        "Books restaurant tables.",
+        "Lovely, thank you.",
+        "thanks",
+    ),
+];
+
+/// The context line of a follow-up reading: the finished task and, when an agent the session
+/// describes did it, what that agent does (at most [`TOPIC_CHARS`] of its description).
+pub fn follows_context(title: &str, topic: Option<&str>) -> String {
+    let task = reading_context("1", title);
+    match topic {
+        Some(topic) => format!(
+            "Task done: {task}, by an agent that \u{ab}{}\u{bb}",
+            sanitise(topic, TOPIC_CHARS)
+        ),
+        None => format!("Task done: {task}"),
+    }
+}
 
 /// Whether words the front delegated while a task had just started are about that task (owner,
 /// 26 Oct: live PR2 and PR8, "Where is my parcel? Can you check its delivery status?", started
@@ -2260,6 +2328,14 @@ fn reading_request(reading: &Reading) -> Value {
                     reading_user(reading, "", example, &names),
                     format!("\u{ab}{first}\u{bb} {name}"),
                 )
+            })
+            .collect(),
+        ReadingKind::Follows => FOLLOW_EXAMPLES
+            .iter()
+            .map(|(title, topic, words, label)| {
+                let context = follows_context(title, Some(topic));
+                let user = reading_user(reading, &context, words, &names);
+                (user, (*label).to_owned())
             })
             .collect(),
         ReadingKind::Started => STARTED_EXAMPLES
@@ -4079,14 +4155,29 @@ SAID: \u{ab}Okay, I'll look into a flight from Boston to Denver.\u{bb}"
         (HOTEL, "Do I have a note about the dentist?", "new"),
         (HOTEL, "Is there a pool?", "1"),
         (HOTEL, "Delete my note called old shopping list.", "new"),
-        (
-            "Tell me about the planets of the solar system.",
-            "And which one is the largest?",
-            "1",
-        ),
+        (PLANETS, "And which one is the largest?", "1"),
         (FLIGHT_TITLE, "What's the capital of Peru?", "new"),
     ];
     const HOTEL: &str = "Find a hotel in Goa for two nights";
+    const PLANETS: &str = "Tell me about the planets of the solar system.";
+
+    /// The follow-up reading of `said` about a finished task, as the policy asks it.
+    fn follows_reading(title: &str, topic: Option<&str>, said: &str) -> Reading {
+        Reading {
+            turn: TurnId(1),
+            kind: ReadingKind::Follows,
+            context: follows_context(title, topic),
+            said: said.to_owned(),
+            labels: vec![
+                ("1".to_owned(), title.to_owned()),
+                ("new".to_owned(), "asks for something else".to_owned()),
+                (
+                    "thanks".to_owned(),
+                    "only thanks or says goodbye".to_owned(),
+                ),
+            ],
+        }
+    }
 
     /// How long the front takes to the act of an interim over the agent when the interim
     /// before it had the same observation clock (the actor's `Interim.since`) and when its
@@ -4203,16 +4294,10 @@ SAID: \u{ab}Okay, I'll look into a flight from Boston to Denver.\u{bb}"
             }
         }
         for (title, said, meant) in FOLLOW_GATE {
-            let reading = Reading {
-                turn: TurnId(1),
-                kind: ReadingKind::Follows,
-                context: format!("Task done: {}", reading_context("1", title)),
-                said: (*said).to_owned(),
-                labels: vec![
-                    ("1".to_owned(), (*title).to_owned()),
-                    ("new".to_owned(), "asks for something else".to_owned()),
-                ],
-            };
+            // What the agent that did it does (the planets: a question the orchestrator's
+            // own model answered).
+            let topic = (*title != PLANETS).then_some(BROWSER);
+            let reading = follows_reading(title, topic, said);
             let asked = std::time::Instant::now();
             let label = read(&server, &reading, Duration::from_secs(5)).await;
             let ms = asked.elapsed().as_millis();
@@ -4944,6 +5029,169 @@ SAID: \u{ab}Okay, I'll look into a flight from Boston to Denver.\u{bb}"
         }
     }
 
+    /// What the launch demo's browser agent says it does (rehearsal 1, 28 Oct).
+    const DESK_BROWSER: &str = "Operates a real web browser: opens pages, reads them, follows links, \
+        and reports what it found.";
+    const RELEASE_TITLE: &str = "Check the GitHub release: Open";
+    const RELEASE_SAID: &str = "The GitHub release for version 1.1.0 is published as Latest. The \
+        details are on your screen.";
+    /// Turns after a finished task (live rehearsal 1 of the launch demo, 28 Oct, gateway
+    /// 1.1.0, stream launch-day-1793141908): once the browser's release check had finished,
+    /// turns 6 to 9 all settled `follow_up`, no terminal or writer task started, and the answer
+    /// narrator answered them from the release check. The lines the caller had heard, the
+    /// words, a task still working (its title) beside the finished release check, and what is
+    /// right: a request for other work is `delegate`, "How's it looking?" over a working task
+    /// `progress` (with only the finished one, anything but a new task), thanks `social`; a
+    /// question about the release itself stays `follow_up`.
+    #[allow(clippy::type_complexity)]
+    const FINISHED_GATE: &[(&[&str], &str, Option<&str>, &str)] = &[
+        (
+            &[RELEASE_SAID],
+            "Oh, and while you're at it, grab the download numbers in the terminal.",
+            None,
+            "delegate",
+        ),
+        (
+            &[RELEASE_SAID],
+            "Great. Can you also get the download numbers in the terminal?",
+            None,
+            "delegate",
+        ),
+        (
+            &[RELEASE_SAID],
+            "Let's draft the launch announcement and mention those numbers.",
+            None,
+            "delegate",
+        ),
+        (
+            &[RELEASE_SAID],
+            "Nice. Can you draft the launch announcement now, with those numbers in it?",
+            None,
+            "delegate",
+        ),
+        (
+            &[RELEASE_SAID],
+            "Remind me, how many speech vendors do we support now?",
+            None,
+            "delegate",
+        ),
+        (
+            &["Let me check that."],
+            "How's it looking?",
+            Some("Pull the download numbers: Run curl -s"),
+            "progress",
+        ),
+        (
+            &[RELEASE_SAID],
+            "How's it looking?",
+            None,
+            "follow_up|social|progress|wait:nothing|wait:continuer",
+        ),
+        (&[RELEASE_SAID], "Thanks, Eva.", None, "social|control:end"),
+        (
+            &[RELEASE_SAID],
+            "Perfect, that's everything. Thanks, Ava!",
+            None,
+            "social|control:end",
+        ),
+        (
+            &[RELEASE_SAID],
+            "Thanks.",
+            None,
+            "social|wait:continuer|wait:nothing",
+        ),
+        (
+            &[RELEASE_SAID],
+            "Does the release mention interaction mode?",
+            None,
+            "follow_up",
+        ),
+        (
+            &[RELEASE_SAID],
+            "Which files does it list?",
+            None,
+            "follow_up",
+        ),
+        (
+            &[RELEASE_SAID],
+            "Can you open the release notes and read me the highlights?",
+            None,
+            "follow_up",
+        ),
+    ];
+
+    /// The finished-task gate set ([`FINISHED_GATE`]) on a real front model, `R14_ROUNDS`
+    /// times each (default 10, seeds 42 on), read as the policy reads it: a `follow_up` is read
+    /// apart against the finished task (about something else it is `delegate`).
+    /// `WAAV_FRONT_GATE_URL=... -- --ignored the_finished_task_gate_set`.
+    #[tokio::test]
+    #[ignore = "needs a front model server: WAAV_FRONT_GATE_URL"]
+    async fn the_finished_task_gate_set_on_a_live_front() {
+        let Ok(url) = std::env::var("WAAV_FRONT_GATE_URL") else {
+            return;
+        };
+        let server = FrontModelServer {
+            url,
+            ..FrontModelServer::default()
+        };
+        let persona = Persona::load("default");
+        let _ = warm(&server, &persona).await;
+        let rounds: u64 = std::env::var("R14_ROUNDS")
+            .ok()
+            .and_then(|rounds| rounds.parse().ok())
+            .unwrap_or(10);
+        let (mut right, mut decided_right, mut total) = (0, 0, 0);
+        for (said, text, working, meant) in FINISHED_GATE {
+            let mut release = task("t3", TaskState::Completed, RELEASE_TITLE, 27_000);
+            release.lineage.agent = Some("browser".to_owned());
+            let mut tasks = vec![release];
+            if let Some(title) = working {
+                let mut pulling = task("t5", TaskState::Working, title, 62_000);
+                pulling.lineage.agent = Some("terminal".to_owned());
+                tasks.push(pulling);
+            }
+            let mut request = request(&persona, text, tasks);
+            request.total_budget_ms = 5_000;
+            request.agents = vec![("browser".to_owned(), DESK_BROWSER.to_owned())];
+            request.said = said.iter().map(|line| (*line).to_owned()).collect();
+            let read = labels_read(&server, &persona, &request, rounds).await;
+            let follows = read.get("follow_up").copied().unwrap_or(0);
+            // The policy reads a follow-up apart (temperature 0: once for all of them).
+            let mut settled = read.clone();
+            if follows > 0 {
+                let reading = follows_reading(RELEASE_TITLE, Some(DESK_BROWSER), text);
+                let label = super::read(&server, &reading, Duration::from_secs(5)).await;
+                let act = match label.as_deref() {
+                    Some("new") => Some("delegate"),
+                    Some("thanks") => Some("social"),
+                    _ => None,
+                };
+                if let Some(act) = act {
+                    settled.remove("follow_up");
+                    *settled.entry(act.to_owned()).or_insert(0) += follows;
+                }
+            }
+            let good = |read: &std::collections::BTreeMap<String, u64>| -> u64 {
+                (read.iter())
+                    .filter(|(label, _)| meant.split('|').any(|meant| meant == label.as_str()))
+                    .map(|(_, count)| *count)
+                    .sum()
+            };
+            let (good_settled, good_decided) = (good(&settled), good(&read));
+            right += good_settled;
+            decided_right += good_decided;
+            total += rounds;
+            println!(
+                "{text:?} working={} -> decided {read:?}, settled {settled:?} (right \
+                 {good_settled}/{rounds}, decided {good_decided}/{rounds}, meant {meant})",
+                working.is_some()
+            );
+        }
+        println!(
+            "finished-task gate: settled {right} of {total}, decided {decided_right} of {total}"
+        );
+    }
+
     /// The gate set on a real front model, through the gateway's own prompt, grammar and
     /// decoder: `WAAV_FRONT_GATE_URL=http://127.0.0.1:<port> cargo test ... -- --ignored
     /// the_control_gate_set`. Prints each verdict and its latency (to the act, to the end).
@@ -5060,22 +5308,14 @@ SAID: \u{ab}Okay, I'll look into a flight from Boston to Denver.\u{bb}"
             // A follow-up is read apart against the task's title, as the policy does: about
             // something else it is a new request (live MA7).
             if named == Some(Act::FollowUp) {
-                let reading = Reading {
-                    turn: TurnId(1),
-                    kind: ReadingKind::Follows,
-                    context: format!("Task done: {}", reading_context("1", title)),
-                    said: text.to_owned(),
-                    labels: vec![
-                        ("1".to_owned(), title.to_owned()),
-                        ("new".to_owned(), "asks for something else".to_owned()),
-                    ],
-                };
-                if read(&server, &reading, Duration::from_secs(5))
+                let reading = follows_reading(title, Some(BROWSER), text);
+                match read(&server, &reading, Duration::from_secs(5))
                     .await
                     .as_deref()
-                    == Some("new")
                 {
-                    named = Some(Act::Delegate);
+                    Some("new") => named = Some(Act::Delegate),
+                    Some("thanks") => named = Some(Act::Social),
+                    _ => {}
                 }
             }
             // What the decision named, before the readings apart below.
@@ -5577,6 +5817,49 @@ SAID: \u{ab}Okay, I'll look into a flight from Boston to Denver.\u{bb}"
         assert!(
             matches!(got.last(), Some(FrontEvent::Failed { .. })),
             "{got:?}"
+        );
+    }
+
+    /// The follow-up reading names the agent that did the task and what it does, and is given
+    /// its examples as earlier turns (live rehearsal 1, 28 Oct).
+    #[test]
+    fn a_follow_up_reading_names_the_agent_and_has_examples() {
+        let reading = Reading {
+            turn: TurnId(1),
+            kind: ReadingKind::Follows,
+            context: follows_context(
+                "Check the GitHub release: Open",
+                Some("Operates a browser."),
+            ),
+            said: "Grab the download numbers in the terminal.".to_owned(),
+            labels: vec![
+                ("1".to_owned(), "Check the GitHub release: Open".to_owned()),
+                ("new".to_owned(), "asks for something else".to_owned()),
+                (
+                    "thanks".to_owned(),
+                    "only thanks or says goodbye".to_owned(),
+                ),
+            ],
+        };
+        let body = reading_request(&reading);
+        assert_eq!(body["grammar"], "root ::= \"1\" | \"new\" | \"thanks\"\n");
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2 + 2 * FOLLOW_EXAMPLES.len());
+        assert_eq!(messages[0]["content"], FOLLOW_SYSTEM);
+        assert_eq!(
+            messages.last().unwrap()["content"],
+            "Task done: 1: \u{ab}Check the GitHub release: Open\u{bb}, by an agent that \
+             \u{ab}Operates a browser.\u{bb}\nNew request: \u{ab}Grab the download numbers in \
+             the terminal.\u{bb}\nWrite 1, new or thanks."
+        );
+        let answers: Vec<&str> = (messages.iter())
+            .filter(|message| message["role"] == "assistant")
+            .map(|message| message["content"].as_str().unwrap())
+            .collect();
+        assert_eq!(answers, ["1", "new", "1", "new", "thanks"]);
+        assert_eq!(
+            follows_context("A hotel in Goa", None),
+            "Task done: 1: \u{ab}A hotel in Goa\u{bb}"
         );
     }
 

@@ -1157,6 +1157,7 @@ impl Actor {
             .map(|tool| tool.name.clone())
             .collect();
         policy.set_single_calls(single_calls);
+        policy.set_agent_topics(agent_topics.clone());
         let mut own = deps.server.task_backends.iter();
         if let Some(own) = own.find(|spec| named.as_ref() == Some(&spec.name)) {
             specs.insert(own.name.clone(), AgentSpec::of(own));
