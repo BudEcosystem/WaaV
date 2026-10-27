@@ -2259,7 +2259,7 @@ mod tests {
         "sha256=800f7cc03566fdb17e5aef77bad4f584c267f5c7733eb0adf2c51f55690f691d";
 
     #[test]
-    fn a_childs_end_reaches_its_orchestrator_as_a_task_update() {
+    fn a_child_end_reaches_its_orchestrator_as_a_task_update() {
         use super::super::types::{Effects, Lineage, TaskRef};
         let outcome = |state, summary: &str| Outcome {
             update: None,
@@ -2395,7 +2395,7 @@ mod tests {
     }
 
     #[test]
-    fn the_facts_the_background_writes_pass_the_memorys_rules() {
+    fn the_facts_the_background_writes_pass_the_memory_rules() {
         let answer = "<think>hm</think>\n- Prefers aisle seats.\n2. Uses a wheelchair\n\
                       * Card ends in 4417\nNONE\nKnown facts: Travels with a dog\n\nLikes quiet rooms\n\
                       Travels with a dog";

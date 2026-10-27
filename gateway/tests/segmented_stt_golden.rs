@@ -225,6 +225,9 @@ async fn a_streaming_session_matches_the_golden_recording_covered_or_not() {
     unsafe {
         std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1");
         std::env::set_var("WAAV_STT_LIVE_RELEASE", "2");
+        // Off OpenAI's own host, so the dated retirement of tts-1 (interaction::lifecycle)
+        // neither warns nor refuses: the recording stays the same past the shutdown date.
+        std::env::set_var("OPENAI_BASE_URL", "http://127.0.0.1:9/v1");
     }
     let vendor = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = vendor.local_addr().unwrap().port();

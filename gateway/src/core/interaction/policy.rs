@@ -4865,7 +4865,7 @@ mod tests {
     }
 
     #[test]
-    fn a_request_that_waits_for_a_place_is_said_to_be_queued_and_a_childs_stop_is_not() {
+    fn a_request_that_waits_for_a_place_is_said_to_be_queued_and_a_child_stop_is_not() {
         let created = |alias: &str, parent: Option<&str>| {
             PolicyInput::Task(TaskEvent {
                 task: TaskId(format!("task_{alias}")),

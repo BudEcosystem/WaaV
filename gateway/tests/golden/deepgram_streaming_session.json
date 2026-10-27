@@ -1,17 +1,5 @@
 [
   {
-    "code": "model_retiring",
-    "detail": {
-      "model": "tts-1",
-      "provider": "openai",
-      "replacement": null,
-      "shutdown": "2027-01-06",
-      "side": "tts"
-    },
-    "message": "tts-1 shuts down on 2027-01-06.",
-    "type": "config_warning"
-  },
-  {
     "livekit_url": "http://localhost:7880",
     "protocol_version": "1.0",
     "stream_id": "<stream_id>",

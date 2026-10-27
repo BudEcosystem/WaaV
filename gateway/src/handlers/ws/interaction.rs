@@ -1084,7 +1084,7 @@ mod tests {
     }
 
     #[test]
-    fn an_agent_sessions_block_is_the_entrys_then_the_operators() {
+    fn an_agent_sessions_block_is_the_entry_block_then_the_operators() {
         let authors = json!({ "background": { "answer_marker": "ANSWER:" } });
         let operators = json!({ "policy": { "ack_due_ms": 250 } });
         let server = ServerInteraction {

@@ -810,6 +810,8 @@ Connect to `ws://host:3001/ws` for real-time voice processing.
 {"type": "error", "message": "Provider connection failed"}
 ```
 
+**Interaction mode** (opt-in, protocol 1.1): a fast front model keeps the conversation going while tasks run on your LLM or agents. Start with the [Interaction Mode Tutorial](gateway/docs/tutorials/interaction_mode_tutorial.md); the full reference is [Interaction Mode](gateway/docs/interaction_mode.md).
+
 ### TTS Request Example
 
 ```bash

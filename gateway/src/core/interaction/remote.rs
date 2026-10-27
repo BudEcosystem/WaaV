@@ -4166,7 +4166,7 @@ mod tests {
     /// card, its MCP session, its tool list) is not the other's, and an OAuth token is its
     /// client's for the scope and resource it asked.
     #[test]
-    fn what_one_entry_read_or_was_given_is_not_another_entrys() {
+    fn what_one_entry_read_or_was_given_is_not_given_to_another_entry() {
         let reader = entry(json!({}));
         let admin = entry(json!({ "name": "notes_admin" }));
         assert_ne!(discovery_key(&reader), discovery_key(&admin));

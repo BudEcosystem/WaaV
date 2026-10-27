@@ -1637,7 +1637,7 @@ async def sweep(args, services: Services):
                 nxt = min((at for at, _ in r.audio if at >= f), default=None)
                 if nxt is not None:
                     firsts.append(nxt - f)
-        lates = [x for r in recs if not isinstance(r, Exception) for x in r.sent_late_ms]
+        late_ms = [x for r in recs if not isinstance(r, Exception) for x in r.sent_late_ms]
         w = sampler.window(t_a, t_b)
         sm = gateway_summaries(Path(log))
         ids = {r.stream_id for r in recs if not isinstance(r, Exception)}
@@ -1647,7 +1647,7 @@ async def sweep(args, services: Services):
                "first_audio_from_E_p50_s": pctl(firsts, 50), "p95": pctl(firsts, 95), "p99": pctl(firsts, 99),
                "gateway_cpu_pct": w.get("cpu_pct"), "gateway_rss_mb_max": w.get("rss_mb_max"),
                "analyser_chunk_avg_us": mean(ch), "pump_frame_avg_us": mean(fr),
-               "client_pacing_late_ms_p99": pctl(lates, 99), "wall_s": t_b - t_a}
+               "client_pacing_late_ms_p99": pctl(late_ms, 99), "wall_s": t_b - t_a}
         print(f"  sweep {n}: {json.dumps(row)}")
         results.append(row)
         await asyncio.sleep(3)
