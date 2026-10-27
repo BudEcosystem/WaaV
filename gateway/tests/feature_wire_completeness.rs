@@ -67,7 +67,7 @@ fn cartesia_stt_features_reach_websocket_url() {
         extras,
     );
     let cfg = CartesiaSTTConfig::from_standard(&std);
-    let url = cfg.build_websocket_url(&std.base.api_key);
+    let url = cfg.build_websocket_url();
     assert_all(
         &url,
         &[

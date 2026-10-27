@@ -11,6 +11,7 @@
 //! - `recording` - Recording download endpoint
 //! - `sip` - SIP hooks management and call transfer
 //! - `speak` - Text-to-speech REST API
+//! - `tasks` - Interaction-mode task listing
 //! - `voices` - Voice listing endpoint
 //! - `ws` - WebSocket real-time voice processing
 
@@ -28,6 +29,7 @@ pub mod recording;
 pub mod sip;
 pub mod speak;
 pub mod stt_capability;
+pub mod tasks;
 pub mod transcribe;
 pub mod voice_catalog;
 pub(crate) mod voice_vendors;

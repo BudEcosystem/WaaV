@@ -55,7 +55,8 @@ pub use operations::{LiveKitOperation, OperationQueue};
 pub use room_handler::LiveKitRoomHandler;
 pub use sip_handler::{DispatchConfig, LiveKitSipHandler, TrunkConfig};
 pub use types::{
-    AudioFrameInfo, ConnectionStatus, LiveKitConfig, LiveKitError, ParticipantInfo, RoomInfo,
+    AudioFrameInfo, CallerTap, ConnectionStatus, LiveKitConfig, LiveKitError, ParticipantInfo,
+    RoomInfo,
 };
 
 #[cfg(test)]
@@ -73,11 +74,68 @@ mod tests {
             channels: 1,
             enable_noise_filter: cfg!(feature = "noise-filter"),
             listen_participants: vec![],
+            caller_tap: None,
         };
 
         assert_eq!(config.url, "wss://test.example.com");
         assert_eq!(config.token, "test-token");
         assert_eq!(config.enable_noise_filter, cfg!(feature = "noise-filter"));
+    }
+
+    /// Interaction mode in a room with several participants: the first whose audio arrives
+    /// is the caller, and stays it.
+    #[test]
+    fn the_first_participant_heard_is_the_sessions_caller() {
+        use std::sync::{Arc, Mutex};
+
+        let found = Arc::new(Mutex::new(Vec::new()));
+        let frames = Arc::new(Mutex::new(0usize));
+        let (found_by, heard) = (found.clone(), frames.clone());
+        let tap = CallerTap::new(
+            move |frame| *heard.lock().unwrap() += frame.len(),
+            move |phone| found_by.lock().unwrap().push(phone),
+        );
+        // Nobody is the caller yet: whoever leaves may be the one the session waits for.
+        assert!(!tap.is_other("sip_4155550100"));
+
+        assert!(tap.admits("sip_4155550100", true));
+        assert!(!tap.admits("supervisor", false), "a second participant");
+        // A mute and unmute subscribes the caller's track again.
+        assert!(tap.admits("sip_4155550100", true));
+        assert_eq!(*found.lock().unwrap(), [true], "told once, a phone line");
+        assert!(tap.is_other("supervisor") && !tap.is_other("sip_4155550100"));
+
+        // The room's reconnect clones the configuration: the caller is kept.
+        let again = tap.clone();
+        assert!(!again.admits("supervisor", false));
+        again.audio(&[0; 320]);
+        assert_eq!(*frames.lock().unwrap(), 320);
+        assert_eq!(
+            format!("{tap:?}"),
+            r#"CallerTap { caller: Some("sip_4155550100") }"#
+        );
+    }
+
+    #[test]
+    fn only_the_callers_keys_are_passed_on() {
+        use std::sync::{Arc, Mutex};
+
+        let keys = Arc::new(Mutex::new(String::new()));
+        let pressed = keys.clone();
+        let tap =
+            CallerTap::new(|_| {}, |_| {}).on_keys(move |key| pressed.lock().unwrap().push(key));
+        // Before the caller is known, and from anybody else, nothing.
+        tap.key(Some("sip_4155550100"), 1, Some("1"));
+        assert!(tap.admits("sip_4155550100", true));
+        tap.key(Some("supervisor"), 2, Some("2"));
+        tap.key(None, 3, Some("3"));
+        // The digit, else the code; nothing that is not a key.
+        tap.key(Some("sip_4155550100"), 4, Some("4"));
+        tap.key(Some("sip_4155550100"), 11, None);
+        tap.key(Some("sip_4155550100"), 10, Some(""));
+        tap.key(Some("sip_4155550100"), 12, None);
+        tap.key(Some("sip_4155550100"), 0, Some("A"));
+        assert_eq!(*keys.lock().unwrap(), "4#*");
     }
 
     #[test]

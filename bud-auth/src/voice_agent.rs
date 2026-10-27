@@ -282,6 +282,9 @@ pub struct VoiceAgentEntry {
     pub tool_status_messages: HashMap<String, Vec<String>>,
     /// Whether a speculative (pre-empted) turn may run: only a tool-free agent (NG-4).
     pub allow_preemptive: bool,
+    /// The agent's interaction-mode block (`true` or an object), as published. Kept as raw JSON:
+    /// the gateway's lenient parser reads it, so one value it does not know never costs the entry.
+    pub interaction: Option<Value>,
 }
 
 impl VoiceAgentEntry {
@@ -369,6 +372,7 @@ const KNOWN_FIELDS: &[&str] = &[
     "input",
     "tool_status_messages",
     "allow_preemptive",
+    "interaction",
 ];
 
 /// Parse one `voice_agent:` blob.
@@ -465,6 +469,7 @@ pub fn parse_voice_agent_blob(raw: &str) -> Result<VoiceAgentEntry, String> {
             .get("allow_preemptive")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        interaction: obj.get("interaction").filter(|v| !v.is_null()).cloned(),
         prompt_id,
         version,
     })
@@ -572,6 +577,33 @@ mod tests {
                 "should be refused: {raw}"
             );
         }
+    }
+
+    #[test]
+    fn the_interaction_block_is_kept_as_published() {
+        let entry = |extra: &str| {
+            let raw = format!(
+                r#"{{"prompt_id":"p","version":1,"stt":{{"endpoint_id":"s"}},"tts":{{"endpoint_id":"t"}}{extra}}}"#
+            );
+            parse_voice_agent_blob(&raw).expect("entry parses")
+        };
+        assert_eq!(entry("").interaction, None);
+        assert_eq!(entry(r#","interaction":null"#).interaction, None);
+        assert_eq!(
+            entry(r#","interaction":true"#).interaction,
+            Some(Value::Bool(true))
+        );
+        // Not read here: a key or a type this build does not know stays for the gateway's parser.
+        let block = entry(r#","interaction":{"background":{"answer_marker":"ANSWER:"},"new":7}"#);
+        assert_eq!(
+            block.interaction,
+            Some(serde_json::json!({"background": {"answer_marker": "ANSWER:"}, "new": 7}))
+        );
+        assert_eq!(
+            parse_voice_agent_blob(FIXTURE).unwrap().interaction,
+            None,
+            "budapp does not publish the field yet"
+        );
     }
 
     #[test]

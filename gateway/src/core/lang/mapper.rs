@@ -165,6 +165,13 @@ pub trait LanguageMapper: Send + Sync {
     /// (Google STT vs TTS, ElevenLabs v2.5-only language enforcement, …) branch on it.
     fn map(&self, lang: CanonicalLanguage, model: &str) -> MappedLanguage;
 
+    /// As [`Self::map`], with the caller's own spelling of the language at hand (`raw`): a
+    /// provider whose model lists that spelling may send it as given (Deepgram).
+    fn map_raw(&self, raw: &str, lang: CanonicalLanguage, model: &str) -> MappedLanguage {
+        let _ = raw;
+        self.map(lang, model)
+    }
+
     /// The provider identifier.
     fn provider_id(&self) -> &'static str {
         self.support().provider_id

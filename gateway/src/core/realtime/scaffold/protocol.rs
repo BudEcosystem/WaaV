@@ -12,7 +12,7 @@
 use std::sync::Arc;
 
 use super::super::base::{
-    RealtimeConfig, RealtimeResponseOverride, RealtimeResult, ReplayConversationItem,
+    RealtimeConfig, RealtimeResponseOverride, RealtimeResult, RealtimeVerb, ReplayConversationItem,
 };
 use super::event::{ConnectSpec, Inbound, OutFrame, ProtocolCaps, S2sEvent};
 use super::transport::{RealtimeTransportFactory, WsTransportFactory};
@@ -69,6 +69,41 @@ pub trait RealtimeProtocol: Send + Sync + Sized + 'static {
         resumption: Option<&str>,
     ) -> Vec<Self::Wire>;
 
+    /// The wire of a client's mid-session update from `old` to `new` (the merged config).
+    /// Default: the whole session config again. `None`: the provider cannot change this on an
+    /// open connection, and the update is refused (the session keeps its config).
+    fn session_update(
+        &self,
+        old: &RealtimeConfig,
+        new: &RealtimeConfig,
+    ) -> Option<Vec<Self::Wire>> {
+        let _ = old;
+        Some(self.build_session_config(new, None))
+    }
+
+    /// A mid-session update from `old` to `new` that the provider takes only on a new
+    /// connection resuming the session (Gemini Live, fix `gemini_update_resume`): the driver
+    /// keeps the merged config and reconnects with its resumption handle at the next turn
+    /// boundary, instead of sending [`session_update`](Self::session_update). Default: never.
+    fn update_by_reconnect(&self, old: &RealtimeConfig, new: &RealtimeConfig) -> bool {
+        let _ = (old, new);
+        false
+    }
+
+    /// The driver sends nothing after the session config until the provider's
+    /// [`SessionReady`](S2sEvent::SessionReady) on that connection (Gemini Live's
+    /// `setupComplete`, fix `gemini_await_setup`). Default: it sends at once.
+    fn awaits_session_ready(&self) -> bool {
+        false
+    }
+
+    /// The model the provider says the session runs (xAI's `session.created` / `.updated`
+    /// `session.model`): `None` when the protocol reads none, `Some("")` until the provider
+    /// has named it. Reported in `get_provider_info` (and the `/realtime` `session_created`).
+    fn named_model(&self) -> Option<String> {
+        None
+    }
+
     /// Lower one raw inbound payload to zero-or-more normalized events. Returns a
     /// `Vec` because some providers bundle multiple logical frames per wire
     /// message (Gemini). Pure: session bookkeeping happens in the driver.
@@ -111,6 +146,26 @@ pub trait RealtimeProtocol: Send + Sync + Sized + 'static {
     /// response (post-reconnect context rebuild). Default empty ⇒ no replay.
     fn replay_item(&self, _item: &ReplayConversationItem) -> Vec<Self::Wire> {
         Vec::new()
+    }
+
+    /// Sent on every connect after the session config and the replayed history (Nova Sonic,
+    /// fix `nova_history_before_audio`: the audio content opens after the history). Default
+    /// empty.
+    fn after_replay(&self) -> Vec<Self::Wire> {
+        Vec::new()
+    }
+
+    /// Sent before a connection is closed on purpose: a disconnect or a planned replacement
+    /// (Nova Sonic, fix `nova_close_sequence`: audio `contentEnd`, `promptEnd`, `sessionEnd`).
+    /// Default empty.
+    fn close_wires(&self) -> Vec<Self::Wire> {
+        Vec::new()
+    }
+
+    /// One interaction verb → wire. `None` ⇒ the provider has no wire for this verb (the
+    /// default for every verb); the driver then refuses it instead of sending nothing.
+    fn verb(&self, _verb: &RealtimeVerb<'_>) -> Option<Vec<Self::Wire>> {
+        None
     }
 
     /// Serialize one wire message for the transport: `Text(JSON)` for JSON

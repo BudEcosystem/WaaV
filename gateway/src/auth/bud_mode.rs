@@ -213,15 +213,7 @@ impl BudMode {
     /// Resolve a bearer into the gateway's `Auth` extension.
     pub async fn authenticate(&self, bearer: &str) -> Result<Auth, AuthFailure> {
         let principal: Principal = self.plane.authenticate(bearer).await?;
-        // `Auth.id` is what tenant-scoped behaviour keys on — recording paths included, which
-        // are already `{bucket}/{prefix}/{auth_id}/{stream_id}`. Using the project id makes that
-        // isolation project-grained rather than per-user.
-        Ok(Auth::new(
-            principal
-                .project_id
-                .or(principal.user_id)
-                .unwrap_or_else(|| "unknown".to_string()),
-        ))
+        Ok(Auth::new(auth_id(&principal)))
     }
 
     /// Spawn the keyspace subscriber, reconnecting with backoff and re-hydrating each time the
@@ -332,9 +324,38 @@ impl bud_auth::jwt::JwksSource for HttpJwksSource {
     }
 }
 
+/// The id a principal's `Auth` carries: what tenant-scoped behaviour keys on, recording paths
+/// (`{bucket}/{prefix}/{auth_id}/{stream_id}`) and the task store included. The project id
+/// makes that isolation project-grained rather than per-user.
+pub fn auth_id(principal: &Principal) -> String {
+    principal
+        .project_id
+        .clone()
+        .or_else(|| principal.user_id.clone())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `/v1/realtime` relay files tasks under this id, which `GET /v1/tasks` reads.
+    #[test]
+    fn a_principal_without_a_project_is_keyed_by_its_user() {
+        let mut principal = Principal {
+            project_id: None,
+            api_key_id: None,
+            user_id: Some("user-1".into()),
+            via: bud_auth::PrincipalKind::ApiKey,
+            expires_at: None,
+        };
+        assert_eq!(auth_id(&principal), "user-1");
+        principal.project_id = Some("proj-1".into());
+        assert_eq!(auth_id(&principal), "proj-1");
+        principal.project_id = None;
+        principal.user_id = None;
+        assert_eq!(auth_id(&principal), "unknown");
+    }
 
     #[test]
     fn bud_mode_is_absent_without_a_redis_url() {

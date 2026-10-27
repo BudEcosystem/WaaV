@@ -19,9 +19,9 @@ use tokio::task::JoinHandle;
 use super::super::base::{
     AudioOutputCallback, BaseRealtime, ConnectionState, FunctionCallCallback, RealtimeAudioData,
     RealtimeConfig, RealtimeError, RealtimeErrorCallback, RealtimeResponseOverride, RealtimeResult,
-    ReconnectionCallback, ReconnectionConfig, ReconnectionEvent, ReplayConversationItem,
-    ResponseDoneCallback, S2sEventCallback, SpeechEventCallback, TranscriptCallback,
-    TranscriptResult, TranscriptRole, clamp_truncate_ms,
+    RealtimeVerb, ReconnectionCallback, ReconnectionConfig, ReconnectionEvent,
+    ReplayConversationItem, ResponseDoneCallback, S2sEventCallback, SpeechEventCallback,
+    TranscriptCallback, TranscriptResult, TranscriptRole, clamp_truncate_ms, unsupported_verb,
 };
 use super::event::{OutFrame, ProtocolCaps, S2sEvent};
 use super::protocol::RealtimeProtocol;
@@ -44,6 +44,16 @@ const MAX_CONSECUTIVE_QUICK_FAILURES: u32 = 3;
 /// A planned reconnect (a vendor's `goAway`, a connection cap) waits for the response in
 /// flight to finish — but only until this much before the vendor's own deadline.
 const GO_AWAY_MARGIN: Duration = Duration::from_millis(500);
+/// A provider that answers its session config before anything else is sent
+/// ([`RealtimeProtocol::awaits_session_ready`]) has this long to answer; else the connection
+/// is dropped and dialled again.
+pub(super) const SESSION_READY_TIMEOUT: Duration = Duration::from_secs(10);
+/// An update made by a new connection ([`RealtimeProtocol::update_by_reconnect`]) waits for
+/// the response in flight at most this long.
+const UPDATE_RECONNECT_WAIT: Duration = Duration::from_secs(15);
+/// A disconnect waits at most this long for the supervisor to send the provider's
+/// [`RealtimeProtocol::close_wires`] and end.
+const CLOSE_GRACE: Duration = Duration::from_secs(1);
 
 /// Why a live connection is being replaced on purpose (not a failure, no backoff).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,6 +119,9 @@ struct DispatchCtx {
     /// The raw event tap (`BaseRealtime::on_event`).
     event_cb: Arc<Mutex<Option<S2sEventCallback>>>,
     caps: ProtocolCaps,
+    /// An update asks the supervisor for a new connection
+    /// ([`RealtimeProtocol::update_by_reconnect`]).
+    replan: Arc<tokio::sync::Notify>,
 }
 
 impl DispatchCtx {
@@ -242,7 +255,10 @@ impl DispatchCtx {
             S2sEvent::Usage(_)
             | S2sEvent::ItemAdded { .. }
             | S2sEvent::ItemDone { .. }
-            | S2sEvent::GoAway { .. } => {}
+            | S2sEvent::GoAway { .. }
+            | S2sEvent::FunctionCallCancelled { .. }
+            | S2sEvent::ProviderBusy(_)
+            | S2sEvent::InjectionRefused => {}
             // Routed to the outbound path by the supervisor BEFORE dispatch (it
             // owns the out channel); it is not a user-facing callback event, so
             // reaching the dispatcher is a no-op (defensive — the supervisor's
@@ -263,7 +279,9 @@ impl DispatchCtx {
 pub struct RealtimeSession<P: RealtimeProtocol> {
     protocol: Arc<P>,
     factory: Arc<dyn RealtimeTransportFactory>,
-    config: RealtimeConfig,
+    /// Shared with the supervisor, so a reconnect sends the config as `update_session` left
+    /// it and not as it was at `connect()`.
+    config: Arc<parking_lot::RwLock<RealtimeConfig>>,
     caps: ProtocolCaps,
     state: Arc<StdRwLock<ConnectionState>>,
     connected: Arc<AtomicBool>,
@@ -298,7 +316,7 @@ impl<P: RealtimeProtocol> RealtimeSession<P> {
         Ok(Self {
             protocol: Arc::new(protocol),
             factory,
-            config,
+            config: Arc::new(parking_lot::RwLock::new(config)),
             caps,
             state: Arc::new(StdRwLock::new(ConnectionState::Disconnected)),
             connected: Arc::new(AtomicBool::new(false)),
@@ -323,6 +341,7 @@ impl<P: RealtimeProtocol> RealtimeSession<P> {
                 resumption: Arc::new(RwLock::new(None)),
                 event_cb: Arc::new(Mutex::new(None)),
                 caps,
+                replan: Arc::new(tokio::sync::Notify::new()),
             },
             reconnection_cb: Arc::new(Mutex::new(None)),
             preroll: Arc::new(AudioReplayBuffer::new(PREROLL_CAP_BYTES)),
@@ -340,9 +359,10 @@ impl<P: RealtimeProtocol> RealtimeSession<P> {
     }
 
     /// Borrow the session's config (lets a provider newtype delegate config-derived
-    /// inherent methods — e.g. `build_session_config()` / reconnection accessors).
-    pub(crate) fn config(&self) -> &RealtimeConfig {
-        &self.config
+    /// inherent methods — e.g. `build_session_config()` / reconnection accessors). A read
+    /// guard: do not hold it across an `.await`.
+    pub(crate) fn config(&self) -> parking_lot::RwLockReadGuard<'_, RealtimeConfig> {
+        self.config.read()
     }
 
     /// The shared circuit breaker this session feeds, if injected (W-D2 metrics /
@@ -388,7 +408,7 @@ impl<P: RealtimeProtocol> RealtimeSession<P> {
     async fn supervisor(
         protocol: Arc<P>,
         factory: Arc<dyn RealtimeTransportFactory>,
-        config: RealtimeConfig,
+        config: Arc<parking_lot::RwLock<RealtimeConfig>>,
         mut out_rx: mpsc::Receiver<OutFrame>,
         connected: Arc<AtomicBool>,
         state: Arc<StdRwLock<ConnectionState>>,
@@ -410,7 +430,8 @@ impl<P: RealtimeProtocol> RealtimeSession<P> {
 
         'outer: loop {
             // ── (re)connect ──
-            let spec = match protocol.connect_spec(&config) {
+            let spec = protocol.connect_spec(&config.read());
+            let spec = match spec {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::error!(provider = provider_id, error = %e, "connect_spec failed");
@@ -508,8 +529,14 @@ impl<P: RealtimeProtocol> RealtimeSession<P> {
             };
             let connected_at = Instant::now();
 
-            // Send session config; replay context on reconnect.
-            for w in protocol.build_session_config(&config, resumption.as_deref()) {
+            // Send session config; replay context on reconnect. The config is read now, so a
+            // reconnect carries every `update_session` made since the first connect, and an
+            // update by reconnect still waiting (asked while a `goAway` or a cap had already
+            // planned this one) is spent: it must not replace this connection again.
+            let _ = futures::FutureExt::now_or_never(ctx.replan.notified());
+            let session_wires =
+                protocol.build_session_config(&config.read(), resumption.as_deref());
+            for w in session_wires {
                 if let Ok(f) = protocol.serialize(&w) {
                     let _ = transport.send(f).await;
                 }
@@ -527,6 +554,11 @@ impl<P: RealtimeProtocol> RealtimeSession<P> {
                     r.breaker.record_success();
                 }
             }
+            for w in protocol.after_replay() {
+                if let Ok(f) = protocol.serialize(&w) {
+                    let _ = transport.send(f).await;
+                }
+            }
             crate::core::metrics::bridge::record_reconnect(provider_id, "connected");
             // Connected BEFORE the reconnect is announced: a listener that resumes sending on
             // the announcement must find the session ready.
@@ -541,13 +573,21 @@ impl<P: RealtimeProtocol> RealtimeSession<P> {
 
             // A connection cap (Nova Sonic: 8 min) or a vendor `goAway` replaces the connection
             // on purpose, at a turn boundary when there is one (FRD-023 RT7.1, RT7.2).
-            let cap = config.max_connection.or_else(|| protocol.max_connection());
+            let cap = config
+                .read()
+                .max_connection
+                .or_else(|| protocol.max_connection());
             let cap_at = cap.map(|d| tokio::time::Instant::now() + d);
             // After the cap, a response in flight gets this long to finish.
             let cap_grace = cap.map(|d| (d / 16).max(Duration::from_millis(1)));
             let mut planned = Planned::No;
             let mut deadline: Option<tokio::time::Instant> = None;
             let mut in_response = false;
+            // The provider refused this session's configuration (its reason): no retry.
+            let mut refused: Option<String> = None;
+            // A provider that answers its config first gets nothing else until it has.
+            let mut session_ready = !protocol.awaits_session_ready();
+            let ready_by = tokio::time::Instant::now() + SESSION_READY_TIMEOUT;
 
             // ── inner loop: pump outbound + dispatch inbound ──
             loop {
@@ -569,7 +609,18 @@ impl<P: RealtimeProtocol> RealtimeSession<P> {
                         if deadline.is_some() => {
                         planned = Planned::Now;
                     }
-                    out = out_rx.recv() => match out {
+                    _ = tokio::time::sleep_until(ready_by), if !session_ready => {
+                        tracing::warn!(provider = provider_id, "the provider never answered its session config");
+                        break;
+                    }
+                    // An update the provider takes on a new connection: at the next turn
+                    // boundary, resuming with the stored handle.
+                    _ = ctx.replan.notified(), if planned == Planned::No => {
+                        planned = Planned::WhenIdle;
+                        let by = tokio::time::Instant::now() + UPDATE_RECONNECT_WAIT;
+                        deadline = Some(deadline.map_or(by, |d| d.min(by)));
+                    }
+                    out = out_rx.recv(), if session_ready => match out {
                         Some(frame) => {
                             if transport.send(frame).await.is_err() {
                                 break;
@@ -585,10 +636,16 @@ impl<P: RealtimeProtocol> RealtimeSession<P> {
                         Some(Ok(frame)) => {
                             let tap = ctx.event_cb.lock().await.clone();
                             for ev in protocol.map_server_event(frame.as_inbound()) {
+                                if let S2sEvent::Error(RealtimeError::Refused(reason)) = &ev {
+                                    refused = Some(reason.clone());
+                                }
                                 if let Some(tap) = &tap
                                     && !matches!(ev, S2sEvent::SendFrame(_) | S2sEvent::Ignore)
                                 {
                                     tap(ev.clone()).await;
+                                }
+                                if matches!(ev, S2sEvent::SessionReady { .. }) {
+                                    session_ready = true;
                                 }
                                 match &ev {
                                     S2sEvent::Audio { .. }
@@ -660,6 +717,11 @@ impl<P: RealtimeProtocol> RealtimeSession<P> {
                         }
                         Some(Err(e)) => {
                             tracing::warn!(provider = provider_id, error = %e, "transport error");
+                            // A close that refused the configuration reaches the client.
+                            if let RealtimeError::Refused(reason) = &e {
+                                refused = Some(reason.clone());
+                                ctx.dispatch(S2sEvent::Error(e)).await;
+                            }
                             break;
                         }
                         None => break, // clean close
@@ -669,6 +731,15 @@ impl<P: RealtimeProtocol> RealtimeSession<P> {
 
             // ── connection ended ──
             connected.store(false, Ordering::SeqCst);
+            // A close on purpose (a planned replacement, a disconnect) ends the vendor's
+            // session as it documents (Nova Sonic, fix `nova_close_sequence`).
+            if planned == Planned::Now || intentional_disconnect.load(Ordering::SeqCst) {
+                for w in protocol.close_wires() {
+                    if let Ok(f) = protocol.serialize(&w) {
+                        let _ = transport.send(f).await;
+                    }
+                }
+            }
             transport.close().await;
 
             if planned == Planned::Now && !intentional_disconnect.load(Ordering::SeqCst) {
@@ -697,6 +768,23 @@ impl<P: RealtimeProtocol> RealtimeSession<P> {
             // (the failure-rate window) already fire on dial-fail / reconnect;
             // this drives the orthogonal FATAL quick-failure counter. (review
             // wf_fb932e8d #2)
+            //
+            // A configuration the provider refused is the client's to fix, not a credential
+            // signature: it never counts against the shared breaker, and the session ends with
+            // the provider's reason instead of dialling the same configuration again.
+            if let Some(reason) = refused.filter(|_| !intentional_disconnect.load(Ordering::SeqCst))
+            {
+                tracing::warn!(provider = provider_id, %reason, "the provider refused the session");
+                write_connection_state(&state, ConnectionState::Failed);
+                Self::notify_reconnect(
+                    &reconnection_cb,
+                    attempt,
+                    false,
+                    Some(RealtimeError::Refused(reason).to_string()),
+                )
+                .await;
+                break 'outer;
+            }
             if let Some(r) = &resilience {
                 r.breaker.record_connection_closed(
                     connected_at.elapsed(),
@@ -838,7 +926,7 @@ impl<P: RealtimeProtocol> BaseRealtime for RealtimeSession<P> {
         let handle = tokio::spawn(Self::supervisor(
             self.protocol.clone(),
             self.factory.clone(),
-            self.config.clone(),
+            Arc::clone(&self.config),
             rx,
             self.connected.clone(),
             self.state.clone(),
@@ -865,9 +953,15 @@ impl<P: RealtimeProtocol> BaseRealtime for RealtimeSession<P> {
         self.intentional_disconnect.store(true, Ordering::SeqCst);
         self.connected.store(false, Ordering::SeqCst);
         *self.out_tx.lock().await = None; // drop sender → supervisor stops
-        if let Some(h) = self.connection_handle.lock().await.take() {
-            crate::core::observability::abort_and_await_task("realtime-session-supervisor", h)
-                .await;
+        if let Some(mut h) = self.connection_handle.lock().await.take() {
+            // A provider that closes its session with frames of its own (`close_wires`) gets
+            // a moment for the supervisor to send them on its way out.
+            let ended = !self.protocol.close_wires().is_empty()
+                && tokio::time::timeout(CLOSE_GRACE, &mut h).await.is_ok();
+            if !ended {
+                crate::core::observability::abort_and_await_task("realtime-session-supervisor", h)
+                    .await;
+            }
         }
         self.set_state(ConnectionState::Disconnected);
         Ok(())
@@ -959,9 +1053,44 @@ impl<P: RealtimeProtocol> BaseRealtime for RealtimeSession<P> {
     }
 
     async fn update_session(&mut self, config: RealtimeConfig) -> RealtimeResult<()> {
-        merge_session_update(&mut self.config, config);
-        self.push_wires(self.protocol.build_session_config(&self.config, None))
-            .await
+        let resumable = self.cb.resumption.read().await.is_some();
+        let wires = {
+            let mut current = self.config.write();
+            let old = current.clone();
+            merge_session_update(&mut current, config);
+            if self.protocol.update_by_reconnect(&old, &current) {
+                // Taken by the next connection, which resumes the session with its handle; with
+                // no handle yet a new connection would start the conversation afresh.
+                if !resumable || !self.connected.load(Ordering::SeqCst) {
+                    *current = old;
+                    return Err(RealtimeError::InvalidConfiguration(
+                        "the provider has not yet given a handle to resume the session with; it keeps its settings"
+                            .to_owned(),
+                    ));
+                }
+                drop(current);
+                self.cb.replan.notify_one();
+                return Ok(());
+            }
+            match self.protocol.session_update(&old, &current) {
+                Some(wires) => wires,
+                None => {
+                    *current = old;
+                    return Err(RealtimeError::InvalidConfiguration(
+                        "this provider cannot change the session once it started; it keeps its settings"
+                            .to_owned(),
+                    ));
+                }
+            }
+        };
+        self.push_wires(wires).await
+    }
+
+    async fn apply_verb(&mut self, verb: RealtimeVerb<'_>) -> RealtimeResult<()> {
+        match self.protocol.verb(&verb) {
+            Some(wires) => self.push_wires(wires).await,
+            None => Err(unsupported_verb()),
+        }
     }
 
     async fn submit_function_result(&mut self, call_id: &str, result: &str) -> RealtimeResult<()> {
@@ -970,10 +1099,14 @@ impl<P: RealtimeProtocol> BaseRealtime for RealtimeSession<P> {
     }
 
     fn get_provider_info(&self) -> serde_json::Value {
+        // The model the provider names (`named_model`), when it names one; pending until then.
+        let named = self.protocol.named_model();
         serde_json::json!({
             "provider": self.protocol.provider_id(),
-            "model": self.config.model,
+            "model": self.config.read().model,
             "connected": self.connected.load(Ordering::SeqCst),
+            "named_model": named.as_deref().filter(|named| !named.is_empty()),
+            "model_pending": named.is_some_and(|named| named.is_empty()),
         })
     }
 

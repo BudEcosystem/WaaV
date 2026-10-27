@@ -1,0 +1,574 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://waav.local/plan/providers/interaction_config.schema.json",
+  "title": "InteractionConfig: the interaction block in every session home, the server interaction key and the front_model key",
+  "description": "JSON Schema of WaaV's interaction configuration as published by W6 (W6-providers-endpoints.md section 3.10.7) under INTEGRATION_DECISIONS.md section 4, its Addenda A to D (A2 items 3 to 5 and 10, C5, C7.3, D5) and cross-check-consistency.md table 4.3. W1 to W7 name the seven workstreams, one per plan chapter: W1 runtime, W2 front model, W3 background tasks, W4 policy and human in the loop, W5 duplex audio, W6 providers and endpoints, W7 evaluation and rollout. The root validates the value a CLIENT sends as `interaction` (true, false or an object). $defs hold the server-side homes (alias, VoiceAgentEntry, RealtimeSettings, server defaults), the server `interaction` YAML key, the separate `front_model` key and the envelopes the examples use. The gateway parses leniently (InteractionConfig::from_json_lenient: a bad field keeps its default with config_warning interaction_value_ignored, an unknown key gives unknown_config_keys, a server-only key from a client gives interaction_override_refused); this schema is strict so that documents written for the plan are checked. Annotations: x-owner (workstream that owns the value), x-release (first release in which the path has an effect; 'lifecycle' for the Lifecycle track), x-access (who may set it: server_only, server_side_homes, operator_agent_homes (the server's interaction.defaults.agent and an agent-kind alias only), client, client_narrow, client_select, client_whitelist, client_operator_signed, client_names_only, client_within_clamps, client_lower_only, client_non_bud, client_ws_only), x-mid-session (true when interaction_update / bud.interaction.update may change it after the session starts). In Bud mode every client-settable path is additionally gated by the agent's session_overrides list (paths prefixed `interaction.`).",
+  "$ref": "#/$defs/ClientInteractionSetting",
+  "$defs": {
+    "ms": {"type": "integer", "minimum": 0},
+    "dotted_path": {"type": "string", "pattern": "^[a-z_]+(\\.[a-z_*]+)*$"},
+    "owner_choice": {"enum": ["auto", "gateway", "provider", "none"], "default": "auto"},
+
+    "ClientInteractionSetting": {
+      "description": "The `interaction` value a client sends on /ws `config`, /realtime `config`, or inside a /v1/realtime patch. Absent means off and exactly today's behaviour; true means on with defaults.",
+      "anyOf": [{"type": "boolean"}, {"$ref": "#/$defs/ClientInteractionBlock"}]
+    },
+    "ServerSideInteractionSetting": {
+      "description": "The `interaction` value in a server-side home: AliasDefinition.interaction, VoiceAgentEntry.interaction (budapp), RealtimeSettings.interaction (budapp), a DAG definition, and the server's interaction.defaults.agent / defaults.realtime blocks. Only the operator's agent homes (interaction.defaults.agent and an agent-kind alias) may carry `background`; the other homes use InteractionSettingWithoutAgentBackground.",
+      "anyOf": [{"type": "boolean"}, {"$ref": "#/$defs/InteractionBlock"}]
+    },
+    "InteractionSettingWithoutAgentBackground": {
+      "description": "A server-side `interaction` value that may not carry `background` (Addendum D5): budapp's VoiceAgentEntry.interaction (budapp declares the marker in the entry's own `background` block, VoiceAgentEntryProjection.background), budapp's RealtimeSettings.interaction and the server's defaults.realtime (realtime deployments are not Bud agent runs). The lenient parser ignores a `background` there with interaction_value_ignored.",
+      "allOf": [
+        {"$ref": "#/$defs/ServerSideInteractionSetting"},
+        {"properties": {"background": false}}
+      ]
+    },
+    "ClientInteractionBlock": {
+      "description": "InteractionBlock minus the fields only server-side homes may set (speech.fallback) and the operator's agent declarations (background, Addendum D5); every other server-only field is already absent from InteractionBlock. A session sending either gets interaction_override_refused.",
+      "allOf": [
+        {"$ref": "#/$defs/InteractionBlock"},
+        {"properties": {"speech": {"properties": {"fallback": false}}, "background": false}}
+      ]
+    },
+    "InteractionBlock": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Server-only keys are not properties here and are refused from any session with interaction_override_refused: any `licence` key (the attestation lives only in front_model.licence), speech.truth_ack, allow_client_override, defaults, realtime_legacy_wire, duplex.compute (Addendum A2 item 5), the server task catalog under tasks (task_backends, allow_client_backends, allow_client_tools, allow_client_push, phone_continuation, speech_policy; A2 item 4), and any task backend URL, header or key. `background` (a Bud agent's answer marker, Addendum D5) is accepted only in the operator's agent homes and refused from any session with interaction_override_refused. Caller-memory and tenant-persona settings are not interaction keys: they live under front_model.memory and front_model.tenant_personas (A2 item 3, C5).",
+      "properties": {
+        "regime": {"enum": ["auto", "cascade", "provider_speech", "delegating"], "default": "auto",
+          "description": "A forced regime may only narrow (Addendum A2 item 7): it is honoured only when the provider can run it; the arms that force delegation (native client delegation, permanent native filler without exact speech, always-async tools without exact speech) are exclusive; auto owners resolve to provider in a forced delegating regime; otherwise, and on a cascade surface asked for another regime, the automatic choice is kept with config_warning regime_downgraded.",
+          "x-owner": "W6", "x-release": 1, "x-access": "client_narrow", "x-mid-session": false},
+        "filler_owner": {"$ref": "#/$defs/owner_choice", "description": "Who says acknowledgements and fillers. auto resolves per regime and provider (regime_resolve.py).", "x-owner": "W6", "x-release": 1, "x-access": "client", "x-mid-session": false},
+        "backchannel_owner": {"$ref": "#/$defs/owner_choice", "description": "Who makes listening sounds while the caller talks.", "x-owner": "W6", "x-release": 1, "x-access": "client", "x-mid-session": false},
+        "idle_owner": {"$ref": "#/$defs/owner_choice", "description": "Who prompts the caller after silence.", "x-owner": "W6", "x-release": 1, "x-access": "client", "x-mid-session": false},
+        "speech": {"$ref": "#/$defs/Speech"},
+        "hitl": {"$ref": "#/$defs/Hitl"},
+        "events": {"$ref": "#/$defs/Events"},
+        "runtime": {"$ref": "#/$defs/Runtime"},
+        "front": {"$ref": "#/$defs/Front"},
+        "tasks": {"$ref": "#/$defs/Tasks"},
+        "policy": {"$ref": "#/$defs/Policy"},
+        "duplex": {"$ref": "#/$defs/Duplex"},
+        "background": {"$ref": "#/$defs/OperatorAgentBackground"}
+      }
+    },
+    "OperatorAgentBackground": {
+      "type": "object", "additionalProperties": false,
+      "x-owner": "W6 (path and precedence), W3 (the marker rule)", "x-release": 1, "x-access": "operator_agent_homes", "x-mid-session": false,
+      "description": "The operator's stand-in for budapp's VoiceAgentEntry.background.answer_marker (Addendum D5; W3 sections 3.13 and 3.17.2), so that a Bud agent known to emit the marker streams its answer sentence by sentence in Release 1 before budapp publishes the field (requested for 2026-11-02). Read from the server's interaction.defaults.agent (applies to the agents in interaction.defaults.agent_ids, or every agent when that list is empty) and from an agent-kind alias's interaction. An alias names no agent and the client picks it (handlers/ws/messages.rs:97-108), so the operator declares a marker there only when every agent that may be used with that alias emits it. Precedence, lowest to highest: server default, alias, budapp's own VoiceAgentEntry.background.answer_marker (which wins whenever present). Only answer_marker may be declared here: voice_approvals and side_runs remain the agent author's declarations in budapp (sign-offs 14 and 20). Refused from every session (interaction_override_refused); in any other home ignored with interaction_value_ignored. Without a marker a Bud agent's answer is relayed whole at completion, about 0.4 to 1 s later than today's agent path, and sign-off 13 accepts that explicitly.",
+      "properties": {
+        "answer_marker": {"type": ["string", "null"], "maxLength": 32, "pattern": "^\\S(.*\\S)?$", "default": null,
+          "description": "The line the agent's prompt begins its final answer with (for example ANSWER:). Set: W3's rule marker (text before the marker is held as a draft and never spoken; each sentence after it is released as it completes). Null or absent: rule round_end, the whole response relayed at response.completed."}
+      }
+    },
+
+    "Speech": {
+      "type": "object", "additionalProperties": false,
+      "description": "How the voice is chosen and how true it is. Effective from Release 3 (provider regimes); speech.realtime from Release 4. Never changeable mid-session.",
+      "x-owner": "W6", "x-release": 3, "x-mid-session": false,
+      "properties": {
+        "voice_owner": {"enum": ["auto", "provider", "gateway"], "default": "auto", "description": "gateway turns the provider into a half-cascade where half_cascade_possible (text output and a documented reply switch: only the OpenAI family, Addendum A2 item 1): the provider listens, WaaV decides every word and WaaV's text-to-speech is the voice; owners filler gateway, listening sounds none, idle gateway (A2 item 8). voice_owner_unavailable elsewhere.", "x-access": "client"},
+        "confirmations": {"enum": ["auto", "exact", "client_ui", "guided"], "default": "auto", "x-access": "client"},
+        "voice_mismatch": {"enum": ["never", "confirmations_only", "always"], "default": "confirmations_only", "description": "May a gateway clip in a different voice read a confirmation (introduced by W4's template)? No sign-off number (W6 section 10 item 2).", "x-access": "client"},
+        "truth": {"enum": ["monitored", "enforced"], "default": "monitored", "description": "enforced limits the session to the cascade or half-cascade, else the session is refused (truth_enforcement_unavailable).", "x-access": "client"},
+        "claim_policy": {"enum": ["report", "correct"], "default": "report", "x-access": "client"},
+        "narrator": {"enum": ["templates", "front_model"], "default": "templates", "description": "Regime B narrator: W4 templates, or the front model masked to the acts wait, progress and refuse.", "x-access": "client"},
+        "clip_voice": {"$ref": "#/$defs/VoiceRef", "description": "Regimes B and C: the gateway clip voice; default the provider's voice when reproducible.", "x-access": "client_non_bud"},
+        "realtime": {"$ref": "#/$defs/RealtimeVoiceRef", "description": "/ws only: run this session's voice on a realtime provider (regimes B and C on LiveKit and SIP).", "x-release": 4, "x-access": "client_ws_only"},
+        "fallback": {"$ref": "#/$defs/RealtimeVoiceRef", "description": "Server-side homes only: the voice used when GPT-Live admission refuses (capacity_fallback).", "x-access": "server_side_homes"}
+      }
+    },
+    "VoiceRef": {"type": "object", "additionalProperties": false, "required": ["provider", "voice"],
+      "properties": {"provider": {"type": "string"}, "voice": {"type": "string"}}},
+    "RealtimeVoiceRef": {
+      "anyOf": [
+        {"type": "object", "additionalProperties": false, "required": ["provider"],
+         "properties": {"provider": {"type": "string"}, "model": {"type": "string"}, "voice": {"type": "string"}}},
+        {"type": "object", "additionalProperties": false, "required": ["deployment"],
+         "properties": {"deployment": {"type": "string", "description": "a Bud realtime deployment name"}}}
+      ]
+    },
+    "Hitl": {
+      "type": "object", "additionalProperties": false, "x-owner": "W6", "x-release": 1,
+      "properties": {
+        "channels": {"type": "array", "uniqueItems": true, "items": {"enum": ["voice", "client", "dtmf"]},
+          "default": ["voice", "client"], "description": "Where a question may be answered. [voice] on SIP-only sessions; dtmf only from Release 4.", "x-access": "client", "x-mid-session": true}
+      }
+    },
+    "Events": {
+      "type": "object", "additionalProperties": false, "x-owner": "W6", "x-release": 1, "x-access": "client", "x-mid-session": true,
+      "properties": {
+        "tasks": {"type": "boolean", "default": true},
+        "floor": {"type": "boolean", "default": true},
+        "attribution": {"type": "boolean", "default": true, "description": "source, kind, verbatim, act, task_id, utterance_id, chunk and heard on assistant_transcript"},
+        "claims": {"type": "boolean", "default": true, "description": "unverified_claim events (Release 3)"},
+        "segments": {"type": "boolean", "default": true, "description": "audio_segment start and end markers"},
+        "overlap": {"type": "boolean", "default": false},
+        "playback_control": {"type": "boolean", "default": false},
+        "ga_mcp_approvals": {"type": "boolean", "default": false, "description": "/v1/realtime only: mirror confirm questions as GA mcp_approval_request items", "x-release": 2}
+      }
+    },
+
+    "Runtime": {
+      "type": "object", "additionalProperties": false, "x-owner": "W1", "x-release": 1, "x-access": "client",
+      "description": "W1's runtime fields (W1 section 3.13). Removed: enabled, duck_on_bare_onset (now duplex.barge_in), answer_window_ms (now policy), front.breaker.* (W2's breaker only), idle.hangup_after_offer_ms (W4's agreed_wait_max_ms).",
+      "properties": {
+        "max_lookahead_clauses": {"type": "integer", "minimum": 0, "default": 2},
+        "frame_ms": {"type": "integer", "minimum": 10, "maximum": 60, "default": 20},
+        "playback_lead_ms": {"$ref": "#/$defs/ms", "description": "default per transport: LiveKit 40, /ws 150, GA cascade 150"},
+        "transport_lag_ms": {"$ref": "#/$defs/ms", "description": "default per transport: /ws 150, LiveKit 80, SIP 150, GA cascade 150"},
+        "echo_tail_ms": {"$ref": "#/$defs/ms", "description": "default SIP 800, others 300 (to be measured)"},
+        "eot_watchdog_ms": {"$ref": "#/$defs/ms", "description": "default 3000 streaming, 4500 segmented"},
+        "dead_air_ms": {"$ref": "#/$defs/ms", "default": 8000},
+        "yield_backstop_ms": {"$ref": "#/$defs/ms", "description": "computed: W5's longest episode + 1,000 (about 7,700); a lower value is raised with a warning"},
+        "thinking_backstop_extra_ms": {"$ref": "#/$defs/ms", "default": 2000},
+        "turn_decision_slack_ms": {"$ref": "#/$defs/ms", "default": 200},
+        "stream_gap_hold_ms": {"$ref": "#/$defs/ms", "default": 600},
+        "step_down_max_wait_ms": {"$ref": "#/$defs/ms", "default": 3000},
+        "ws_cleared_wait_ms": {"$ref": "#/$defs/ms", "default": 500},
+        "backchannel_stale_ms": {"$ref": "#/$defs/ms", "default": 300},
+        "max_timeline_entries": {"type": "integer", "minimum": 1, "default": 400},
+        "compact_after_entries": {"type": "integer", "minimum": 1, "default": 300},
+        "inbox": {"type": "object", "additionalProperties": false, "properties": {
+          "perception": {"type": "integer", "minimum": 1, "default": 512},
+          "control": {"type": "integer", "minimum": 1, "default": 256},
+          "playback": {"type": "integer", "minimum": 1, "default": 512}}},
+        "time": {"type": "object", "additionalProperties": false, "properties": {
+          "utc_offset": {"type": "string", "pattern": "^[+-][0-9]{2}:[0-9]{2}$", "description": "caller's local offset; else PersonaSpec.utc_offset"},
+          "expose_wall_clock": {"type": "boolean", "default": true},
+          "expose_elapsed": {"type": "boolean", "default": true}}},
+        "idle": {"type": "object", "additionalProperties": false, "properties": {
+          "check_in_fraction": {"type": "number", "minimum": 0, "maximum": 1, "default": 0.6}}}
+      }
+    },
+
+    "Front": {
+      "type": "object", "additionalProperties": false, "x-owner": "W2", "x-release": 1,
+      "description": "W2's block. Never a licence (front_model.licence is server-only), never persona text, bank lines, templates, protected terms or memory facts.",
+      "properties": {
+        "profile": {"type": "string", "pattern": "^[a-z0-9-]+$", "default": "auto",
+          "description": "auto (W2's resolution from its pinned qualified-profile list: lfm-standard, or lfm-large (LFM2.5-2.6B), when qualified and the server carries the licence attestation; else a qualified apache-standard (Qwen3.5-2B candidate); else scripted with front_model_scripted; Addendum B1 and B7: no profile is qualified in Release 1, so auto is scripted on every Release 1 deployment) or a name in front_model.profiles_enabled; a refused request gives front_profile_substituted.",
+          "x-access": "client", "x-mid-session": false},
+        "persona": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+(@[0-9]+)?$", "description": "a registered persona id, optionally id@version; looked up in the session's tenant first, then the operator's", "x-access": "client_select", "x-mid-session": false},
+        "caller": {"$ref": "#/$defs/Caller"},
+        "say_mode": {"enum": ["compose", "canned", "free"], "default": "compose", "description": "free only with the server's free_text_ack", "x-access": "client"},
+        "act_budget_ms": {"type": "integer", "minimum": 0, "maximum": 300, "default": 300, "x-access": "client_lower_only"},
+        "total_budget_ms": {"type": "integer", "minimum": 0, "maximum": 1500, "default": 1500, "x-access": "client_lower_only"},
+        "max_words": {"type": "integer", "minimum": 6, "maximum": 25, "default": 15, "x-access": "client"},
+        "backchannel_via_model": {"type": "boolean", "default": false, "x-access": "client"}
+      }
+    },
+    "Caller": {
+      "type": "object", "additionalProperties": false, "x-owner": "W2",
+      "description": "The four client-settable caller fields (INTEGRATION_DECISIONS.md section 7; the name field is preferred_name, Addendum C5) plus the operator-signed identity token, which is outside the whitelist (W6 section 3.20.2).",
+      "properties": {
+        "preferred_name": {"type": "string", "maxLength": 60, "x-access": "client_whitelist", "x-release": 1},
+        "verbosity": {"enum": ["brief", "normal", "detailed"], "x-access": "client_whitelist", "x-release": 1, "x-mid-session": true},
+        "pace": {"enum": ["slower", "normal", "faster"], "x-access": "client_whitelist", "x-release": 1, "x-mid-session": true},
+        "language": {"type": "string", "pattern": "^[a-z]{2,3}(-[A-Za-z0-9]{2,8})*$", "x-access": "client_whitelist", "x-release": 1, "x-mid-session": false},
+        "identity_token": {"type": "string", "maxLength": 512, "pattern": "^v1\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+$",
+          "description": "Operator-signed caller identity in the one format W2 pins (W2 section 3.16.1; Addendum C5): v1.<payload>.<mac>, where payload is the unpadded base64url of the JSON object {sub (opaque caller id), tenant, exp (unix seconds, at most token_max_lifetime_s, default 300 s, ahead)} and mac is the unpadded base64url of HMAC-SHA-256 over \"v1.\" + payload with a key derived from front_model.memory.identity_key_file. W2 verifies it and derives the keyed memory key; an invalid, expired or wrong-tenant token gives caller_identity_rejected and memory off for the session. The path and the warning code are W6's (Addendum A2 item 3).",
+          "x-owner": "W6 (transport), W2 (memory)", "x-access": "client_operator_signed", "x-release": 2, "x-mid-session": false}
+      }
+    },
+
+    "Tasks": {
+      "type": "object", "additionalProperties": false, "x-owner": "W3", "x-release": 1,
+      "description": "W3's block (W3 section 3.13). Backends are named, never given as URLs, headers or keys in a session.",
+      "properties": {
+        "default_backend": {"type": "string", "pattern": "^[a-z0-9_:-]+$", "description": "llm (conversation sessions), bud_agent (agent sessions), dag (DAG sessions), or a name from the operator catalog; provider sessions have no default (interaction_needs_background)", "x-access": "client_names_only"},
+        "speculative_start": {"enum": ["auto", "on", "off"], "default": "auto", "description": "auto: on for the LLM tier, off for Bud, webhook, A2A, MCP, OpenAI Responses and DAG backends (sign-off 6). on for a backend that executes its own tools (budprompt, webhooks, A2A, MCP) is accepted only when the backend is declared free of side effects, else speculative_start_unsafe_backend (Addendum C2.2)", "x-access": "client"},
+        "speculative_min_delegate_share": {"type": "number", "minimum": 0, "maximum": 1, "default": 0.0},
+        "answer_stream": {"enum": ["auto", "marker", "round_end", "whole"], "default": "auto"},
+        "backends": {"type": "array", "items": {"type": "string", "pattern": "^[a-z0-9_:-]+$"}, "description": "names from the operator catalog this session may use", "x-access": "client_names_only"},
+        "limits": {"type": "object", "additionalProperties": false, "properties": {
+          "max_active_tasks": {"type": "integer", "minimum": 1, "default": 3},
+          "max_queued_tasks": {"type": "integer", "minimum": 0, "default": 2},
+          "max_tasks_per_session": {"type": "integer", "minimum": 1, "default": 50},
+          "max_background_tokens": {"type": "integer", "minimum": 1, "default": 200000},
+          "max_task_tokens": {"type": "integer", "minimum": 1, "default": 50000},
+          "max_tool_calls_per_task": {"type": "integer", "minimum": 0, "default": 20},
+          "max_llm_rounds_per_task": {"type": "integer", "minimum": 1, "default": 8}}},
+        "deadlines_s": {"type": "object", "additionalProperties": false, "properties": {
+          "lookup": {"type": "integer", "minimum": 1, "default": 60},
+          "research": {"type": "integer", "minimum": 1, "default": 600},
+          "action": {"type": "integer", "minimum": 1, "default": 300}}},
+        "hard_deadline_factor": {"type": "number", "minimum": 1, "default": 2.0},
+        "cancel_confirm_timeout_ms": {"$ref": "#/$defs/ms", "default": 10000},
+        "cancel_grace_ms": {"$ref": "#/$defs/ms", "default": 2000},
+        "costly_cancel_after_ms": {"$ref": "#/$defs/ms", "default": 20000},
+        "queue_notice_after_ms": {"$ref": "#/$defs/ms", "default": 20000},
+        "question_backstop_ms": {"$ref": "#/$defs/ms", "default": 130000, "description": "validated above policy.auth_wait_timeout_ms"},
+        "inference_timeout_s": {"type": "integer", "minimum": 1, "default": 300},
+        "progress_coalesce_ms": {"$ref": "#/$defs/ms", "default": 1000},
+        "max_progress_events_per_min": {"type": "integer", "minimum": 0, "default": 12},
+        "dedupe_window_ms": {"$ref": "#/$defs/ms", "default": 20000},
+        "near_duplicate_overlap": {"type": "number", "minimum": 0, "maximum": 1, "default": 0.6},
+        "result_caps": {"type": "object", "additionalProperties": false, "properties": {
+          "speakable_chars": {"type": "integer", "minimum": 1, "default": 1200},
+          "text_bytes": {"type": "integer", "minimum": 1, "default": 16384},
+          "data_bytes": {"type": "integer", "minimum": 1, "default": 65536}}},
+        "snapshot": {"type": "object", "additionalProperties": false, "properties": {
+          "max_turns": {"type": "integer", "minimum": 0, "default": 12},
+          "max_tokens": {"type": "integer", "minimum": 0, "default": 3000}}},
+        "session_end": {"enum": ["auto", "cancel_all", "continue_all"], "default": "auto", "description": "sign-off 15"},
+        "orphan_max_s": {"type": "integer", "minimum": 0, "default": 1800},
+        "reconnect_grace_s": {"type": "integer", "minimum": 0, "default": 60},
+        "push_url": {"type": ["string", "null"], "default": null, "description": "accepted from a client only when the operator sets allow_client_push"},
+        "resume_key": {"type": ["string", "null"], "default": null},
+        "store_content": {"type": "boolean", "default": false, "description": "sign-off 16"}
+      }
+    },
+
+    "Policy": {
+      "type": "object", "additionalProperties": false, "x-owner": "W4", "x-release": 1, "x-access": "client_within_clamps", "x-mid-session": true,
+      "description": "W4's PolicyConfig (W4 section 3.11); values outside the clamps are clamped with a config_warning; the effective block is echoed as policy_hash.",
+      "properties": {
+        "ack_due_ms": {"type": "integer", "minimum": 0, "maximum": 800, "default": 300},
+        "fast_answer_ms": {"type": "integer", "minimum": 0, "maximum": 2000, "default": 700},
+        "fast_answer_min_turns": {"type": "integer", "minimum": 1, "maximum": 20, "default": 3},
+        "ack_clip_max_chars": {"type": "integer", "minimum": 10, "maximum": 60, "default": 24},
+        "ack_target_ms": {"type": "integer", "minimum": 300, "maximum": 2000, "default": 800},
+        "amend_ack_target_ms": {"type": "integer", "minimum": 300, "maximum": 2000, "default": 1200},
+        "ack_hard_deadline_ms": {"type": "integer", "minimum": 800, "maximum": 4000, "default": 2000},
+        "progress_first_after_ms": {"type": "integer", "minimum": 2000, "maximum": 10000, "default": 4000},
+        "progress_min_gap_ms": {"type": "integer", "minimum": 3000, "maximum": 15000, "default": 5000},
+        "updates_max_per_wait": {"type": "integer", "minimum": 0, "maximum": 5, "default": 3},
+        "progress_text": {"enum": ["template", "front_then_template"], "default": "front_then_template"},
+        "progress_stale_ms": {"type": "integer", "minimum": 1000, "maximum": 10000, "default": 3000},
+        "hold_after_silence_ms": {"type": "integer", "minimum": 4000, "maximum": 20000, "default": 8000},
+        "choice_offer": {"type": "boolean", "default": true},
+        "continuation_phrase": {"type": ["string", "null"], "default": null},
+        "quiet_checkin_ms": {"type": "integer", "minimum": 10000, "maximum": 120000, "default": 30000},
+        "agreed_wait_max_ms": {"type": "integer", "minimum": 60000, "maximum": 3600000, "default": 600000, "description": "sign-off 11"},
+        "answer_stall_clip_ms": {"type": "integer", "minimum": 1000, "maximum": 5000, "default": 2000},
+        "working_sound": {"type": "boolean", "default": false},
+        "continuation_merge_ms": {"type": "integer", "minimum": 0, "maximum": 4000, "default": 2000},
+        "bridge_after_silence_ms": {"type": "integer", "minimum": 0, "maximum": 10000, "default": 3000},
+        "max_relay_chars": {"type": "integer", "minimum": 200, "maximum": 4000, "default": 600},
+        "answer_window_ms": {"type": "integer", "minimum": 2000, "maximum": 10000, "default": 4000, "description": "the one answer window, read by W1's interlock and W5's rule 5 (to be measured)"},
+        "relay_question_max_words": {"type": "integer", "minimum": 1, "maximum": 15, "default": 6},
+        "background_result": {"enum": ["offer", "relay_with_bridge", "offer_unless_short"], "default": "offer_unless_short"},
+        "short_result_chars": {"type": "integer", "minimum": 0, "maximum": 600, "default": 160},
+        "allow_backend_interrupt": {"type": "boolean", "default": false},
+        "urgent_task_kinds": {"type": "array", "items": {"type": "string"}, "default": []},
+        "interrupt_max_wait_ms": {"type": "integer", "minimum": 0, "maximum": 1500, "default": 400},
+        "recent_lines_window": {"type": "integer", "minimum": 1, "maximum": 20, "default": 5},
+        "echo_match_window_ms": {"type": "integer", "minimum": 500, "maximum": 5000, "default": 2000},
+        "echo_match_ratio": {"type": "number", "minimum": 0.3, "maximum": 1.0, "default": 0.6},
+        "heard_margin_ms": {"type": "integer", "minimum": 0, "maximum": 1000, "default": 150},
+        "confidence": {"type": "object", "additionalProperties": false, "properties": {
+          "unclear": {"type": "object", "additionalProperties": {"type": "number", "minimum": 0, "maximum": 1}, "default": {}},
+          "hitl_min_answer": {"type": "object", "additionalProperties": {"type": "number", "minimum": 0, "maximum": 1}, "default": {}}}},
+        "hitl_reprompt_after_ms": {"type": "integer", "minimum": 3000, "maximum": 30000, "default": 8000},
+        "hitl_answer_timeout_ms": {"type": "integer", "minimum": 5000, "maximum": 120000, "default": 20000},
+        "hitl_max_clarify": {"type": "integer", "minimum": 0, "maximum": 3, "default": 1},
+        "hitl_strong_yes_for_irreversible": {"type": "boolean", "default": true},
+        "hitl_max_pending": {"type": "integer", "minimum": 1, "maximum": 16, "default": 4},
+        "nonbinding_action_questions": {"enum": ["relay", "decline"], "default": "relay"},
+        "sensitive_channels": {"type": "array", "items": {"enum": ["client_ui", "dtmf", "link"]}, "default": ["client_ui", "dtmf", "link"]},
+        "dtmf_on_recorded_sessions": {"type": "boolean", "default": false},
+        "dtmf_inter_digit_ms": {"type": "integer", "minimum": 2000, "maximum": 15000, "default": 5000},
+        "auth_wait_timeout_ms": {"type": "integer", "minimum": 30000, "maximum": 600000, "default": 120000},
+        "offer_timeout_ms": {"type": "integer", "minimum": 3000, "maximum": 30000, "default": 10000},
+        "max_retry_offers": {"type": "integer", "minimum": 0, "maximum": 3, "default": 1},
+        "goodbye_finish_or_stop": {"type": "boolean", "default": true},
+        "human_handoff": {"type": "boolean", "default": false},
+        "language_mismatch_turns": {"type": "integer", "minimum": 1, "maximum": 5, "default": 2}
+      }
+    },
+
+    "Duplex": {
+      "type": "object", "additionalProperties": false, "x-owner": "W5", "x-release": 1, "x-access": "client", "x-mid-session": false,
+      "description": "W5's block (W5 section 3.11). compute is server-only (interaction.duplex.compute in the server key); a session sending it gets interaction_override_refused.",
+      "properties": {
+        "barge_in": {"type": "object", "additionalProperties": false, "properties": {
+          "mode": {"enum": ["two_stage", "legacy"], "default": "two_stage"},
+          "onset_voiced_chunks": {"type": "integer", "minimum": 1, "default": 2},
+          "onset_prob": {"type": "number", "minimum": 0, "maximum": 1, "default": 0.5},
+          "onset_min_rms": {"type": "number", "minimum": 0, "default": 0.008},
+          "echo_margin_db": {"type": "number", "default": 6.0},
+          "duck_on_bare_onset": {"anyOf": [{"const": "auto"}, {"type": "boolean"}], "default": "auto", "description": "moved here from W1's runtime block (INTEGRATION_DECISIONS.md section 4)"},
+          "duck_db": {"type": "number", "maximum": 0, "default": -15.0, "description": "sign-off 19"},
+          "duck_ramp_ms": {"$ref": "#/$defs/ms", "default": 60},
+          "pause_after_ms": {"$ref": "#/$defs/ms", "default": 400},
+          "pause_fade_ms": {"$ref": "#/$defs/ms", "default": 20},
+          "decide_by_ms": {"$ref": "#/$defs/ms", "default": 900},
+          "max_pause_ms": {"$ref": "#/$defs/ms", "default": 2500},
+          "stt_grace_ms": {"$ref": "#/$defs/ms", "default": 250},
+          "interrupt_min_words": {"type": "integer", "minimum": 1, "default": 3},
+          "sustained_interrupt_ms": {"$ref": "#/$defs/ms", "default": 900},
+          "min_speech_ms": {"$ref": "#/$defs/ms", "default": 0},
+          "resume_ramp_ms": {"$ref": "#/$defs/ms", "default": 80},
+          "resume_rewind_ms": {"$ref": "#/$defs/ms", "default": 200},
+          "restart_chunk_after_pause_ms": {"$ref": "#/$defs/ms", "default": 1500},
+          "side_talk_resume_gap_ms": {"$ref": "#/$defs/ms", "default": 700},
+          "side_talk_max_ms": {"$ref": "#/$defs/ms", "default": 6000},
+          "escalate_window_ms": {"$ref": "#/$defs/ms", "default": 1500},
+          "segmented": {"type": "object", "additionalProperties": false, "properties": {
+            "pause_after_voiced_ms": {"$ref": "#/$defs/ms", "default": 700},
+            "sustained_interrupt_ms": {"$ref": "#/$defs/ms", "default": 1500},
+            "late_text_window_ms": {"$ref": "#/$defs/ms", "default": 3000}}},
+          "classifier": {"enum": ["heuristic", "krisp", "waav_v1"], "default": "heuristic"},
+          "hold_new_speech_while_caller_speaks": {"type": "boolean", "default": true},
+          "max_hold_unattributed_ms": {"$ref": "#/$defs/ms", "default": 3000},
+          "max_hold_ms": {"$ref": "#/$defs/ms", "default": 8000}}},
+        "echo": {"type": "object", "additionalProperties": false, "properties": {
+          "transcript_filter": {"type": "boolean", "default": true},
+          "probe": {"type": "boolean", "default": true},
+          "correlation_gate": {"type": "boolean", "default": true},
+          "aec": {"enum": ["auto", "on", "off"], "default": "auto", "x-release": 2},
+          "client_aec": {"type": ["boolean", "null"], "default": null},
+          "phone_line": {"type": ["boolean", "null"], "default": null},
+          "own_voice": {"type": "boolean", "default": false},
+          "tail_ms": {"$ref": "#/$defs/ms", "default": 1500},
+          "max_bulk_delay_ms": {"$ref": "#/$defs/ms", "default": 1000},
+          "auto_enable_after_echo_episodes": {"type": "integer", "minimum": 0, "default": 2}}},
+        "backchannel": {"type": "object", "additionalProperties": false, "x-release": 2, "properties": {
+          "enabled": {"anyOf": [{"const": "auto"}, {"type": "boolean"}], "default": "auto"},
+          "intensity": {"enum": ["off", "low", "medium", "high", null], "default": null, "description": "null: PersonaSpec.backchannel_intensity, else the transport default (web medium, phone off; sign-off 19); may only lower it"},
+          "pause_min_ms": {"$ref": "#/$defs/ms", "default": 200},
+          "min_speech_before_eligible_ms": {"$ref": "#/$defs/ms", "default": 700},
+          "cooldown_ms": {"$ref": "#/$defs/ms", "default": 2500},
+          "fire_probability": {"type": "number", "minimum": 0, "maximum": 1, "default": 0.8},
+          "gain_db": {"type": "number", "default": -3.0},
+          "clip_yield_fade_ms": {"$ref": "#/$defs/ms", "default": 40}}},
+        "endpoint": {"type": "object", "additionalProperties": false, "properties": {
+          "smart_turn": {"type": "boolean", "default": true},
+          "vad_stop_ms": {"$ref": "#/$defs/ms", "default": 200},
+          "complete_threshold": {"type": "number", "minimum": 0, "maximum": 1, "default": 0.7},
+          "recheck_at_silence_ms": {"type": "array", "items": {"$ref": "#/$defs/ms"}, "default": [600, 1200]},
+          "smart_turn_min_gap_ms": {"$ref": "#/$defs/ms", "default": 300},
+          "interim_stable_ms": {"$ref": "#/$defs/ms", "default": 250},
+          "final_wait_ms": {"$ref": "#/$defs/ms", "default": 500},
+          "silence_ceiling_ms": {"$ref": "#/$defs/ms", "default": 1500},
+          "provider_events": {"type": "boolean", "default": true},
+          "lexical_hold": {"type": "boolean", "default": true},
+          "lexical_hold_band": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "number", "minimum": 0, "maximum": 1}, "default": [0.7, 0.85]},
+          "lexical_hold_ms": {"$ref": "#/$defs/ms", "default": 800},
+          "late_final_merge_ms": {"$ref": "#/$defs/ms", "default": 1500},
+          "eager": {"type": "object", "additionalProperties": false, "properties": {
+            "enabled": {"enum": ["auto", "on", "off"], "default": "auto"},
+            "min_smart_turn_p": {"type": "number", "minimum": 0, "maximum": 1, "default": 0.8},
+            "withdraw_voiced_ms": {"$ref": "#/$defs/ms", "default": 300},
+            "max_per_turn": {"type": "integer", "minimum": 0, "default": 2},
+            "provider_eager": {"type": "boolean", "default": false, "x-release": 2}}},
+          "front_model_veto": {"type": "boolean", "default": false, "x-release": 4},
+          "veto_hold_ms": {"$ref": "#/$defs/ms", "default": 1500},
+          "veto_invites_with_backchannel": {"type": "boolean", "default": true}}},
+        "overlap_context": {"type": "object", "additionalProperties": false, "properties": {
+          "front": {"type": "boolean", "default": true},
+          "background": {"enum": ["interrupt_only", "interrupt_and_side_talk", "none"], "default": "interrupt_only"}}}
+      }
+    },
+
+    "ServerInteractionKey": {
+      "type": "object", "additionalProperties": false, "x-access": "server_only",
+      "description": "The one server `interaction` YAML key, parsed outside ServerConfig into InteractionServerConfig and stored in AppState (W1 owns the loader and the switch). Loaded from the same YAML file as ServerConfig; when ServerConfig came from the environment only, from WAAV_INTERACTION_* variables (Addendum C7.4). Never client-settable. Caller memory and tenant personas are configured under front_model, not here (Addendum A2 item 3).",
+      "properties": {
+        "enabled": {"type": "boolean", "default": false, "description": "the operator switch; WAAV_INTERACTION_ENABLED mirrors it; when false a session's interaction gives interaction_disabled_by_server", "x-owner": "W1", "x-release": 1},
+        "speech": {"type": "object", "additionalProperties": false, "x-owner": "W6", "properties": {
+          "truth_ack": {"type": "array", "uniqueItems": true, "items": {"type": "string", "pattern": "^[a-z_]+(:[A-Za-z0-9._:/-]+)?$"}, "default": [],
+            "description": "providers ('provider' or 'provider:model') the operator accepts with monitored truth; regimes B and C are refused (truth_ack_required) for any other (sign-off 10)", "x-release": 3}}},
+        "defaults": {"type": "object", "additionalProperties": false, "x-owner": "W6", "properties": {
+          "agent": {"$ref": "#/$defs/ServerSideInteractionSetting", "description": "operator default for Bud agent sessions (sign-off 13); may carry background.answer_marker for agents the operator knows emit the marker (Addendum D5); budapp's VoiceAgentEntry.interaction and VoiceAgentEntry.background win when present", "x-release": 1},
+          "agent_ids": {"type": "array", "items": {"type": "string"}, "default": [], "description": "empty: every agent", "x-release": 1},
+          "realtime": {"$ref": "#/$defs/InteractionSettingWithoutAgentBackground", "description": "operator default for Bud realtime deployments, like defaults.agent (Addendum C7.3); budapp's RealtimeSettings.interaction wins when present", "x-release": 3},
+          "realtime_deployments": {"type": "array", "items": {"type": "string"}, "default": [], "x-release": 3}}},
+        "allow_client_override": {"type": "array", "items": {"$ref": "#/$defs/dotted_path"}, "default": [], "description": "dotted paths /v1/realtime clients may set through bud.interaction.update", "x-owner": "W6", "x-release": 2},
+        "realtime_legacy_wire": {"type": "array", "uniqueItems": true, "default": [], "x-owner": "W6", "x-release": "lifecycle",
+          "description": "escape flags restoring today's wire for non-Bud sessions (W6 section 9.2); Bud deployments use RealtimeSettings.policy.legacy_wire",
+          "items": {"enum": ["deepgram_text_as_agent_message", "nova_text_non_interactive", "gemini_omit_tool_behavior", "gemini_media_chunks", "gemini_response_id_only", "allow_setup_resend", "deepgram_settings_resend", "deepgram_omit_tools", "ultravox_omit_tools"]}},
+        "tasks": {"$ref": "#/$defs/ServerTasks"},
+        "duplex": {"type": "object", "additionalProperties": false, "x-owner": "W5", "properties": {
+          "compute": {"type": "object", "additionalProperties": false, "x-release": 1,
+            "description": "W5's analyser compute pool: server-only (Addendum A2 item 5); refused from every session",
+            "properties": {
+            "pool_threads": {"anyOf": [{"const": "auto"}, {"type": "integer", "minimum": 1}], "default": "auto"},
+            "smart_turn_queue": {"type": "integer", "minimum": 1, "default": 64},
+            "analyser_ring_frames": {"type": "integer", "minimum": 1, "default": 64},
+            "event_channel": {"type": "integer", "minimum": 1, "default": 64}}}}}
+      }
+    },
+    "ServerTasks": {
+      "type": "object", "additionalProperties": false, "x-owner": "W3", "x-release": 1,
+      "description": "W3's operator catalog and switches, under interaction.tasks.* (Addendum A2 item 4: W3 renames task_backends, allow_client_backends, allow_client_tools, allow_client_push, phone_continuation and speech_policy under it). Server-only: a session sending any of them gets interaction_override_refused.",
+      "properties": {
+        "task_backends": {"type": "array", "items": {"$ref": "#/$defs/TaskBackend"}},
+        "allow_client_backends": {"type": "boolean", "default": false},
+        "allow_client_tools": {"type": "boolean", "default": false},
+        "allow_client_push": {"type": "boolean", "default": false},
+        "phone_continuation": {"enum": ["off", "dedupe_only", "status"], "default": "off", "description": "sign-off 24"},
+        "speech_policy": {"type": "object", "additionalProperties": false, "properties": {"extra_blocked_phrases": {"type": "object"}}}
+      }
+    },
+    "TaskBackend": {
+      "type": "object", "additionalProperties": false, "required": ["name", "type"],
+      "properties": {
+        "name": {"type": "string", "pattern": "^[a-z0-9_-]+$"},
+        "type": {"enum": ["llm", "bud_agent", "webhook", "a2a", "mcp", "openai_responses", "dag"]},
+        "url": {"type": "string"},
+        "model": {"type": "string"},
+        "secret_env": {"type": "string"},
+        "bearer_env": {"type": "string"},
+        "api_key_env": {"type": "string"},
+        "side_effects": {"enum": ["possible", "none"]},
+        "read_only": {"type": "boolean"},
+        "read_only_tools": {"type": "array", "items": {"type": "string"}},
+        "trust": {"enum": ["first_party", "third_party"]},
+        "max_in_flight_process": {"type": "integer", "minimum": 1},
+        "mode": {"enum": ["callback", "poll", "stream"]},
+        "speculative_start": {"enum": ["auto", "on", "off"]},
+        "answer_stream": {"enum": ["auto", "marker", "round_end", "whole"]}
+      }
+    },
+
+    "FrontModelKey": {
+      "type": "object", "additionalProperties": false, "x-owner": "W2", "x-access": "server_only", "x-release": 1,
+      "description": "W2's separate server key (W2 section 3.13). Built dark in Release 0. Carries the licence attestation of INTEGRATION_DECISIONS.md section 2.1 and, from Release 2, the caller-memory and tenant-persona settings (Addendum A2 item 3 and C5). Profile qualification is not configuration: it comes from W2's pinned qualified-profile list shipped with the gateway (empty in Release 1, Addendum B1).",
+      "properties": {
+        "enabled": {"type": "boolean", "default": false},
+        "mode": {"enum": ["managed", "external", "pool"], "default": "managed"},
+        "profile": {"type": "string", "default": "auto", "description": "auto, or a profile the operator forces for evaluation (lfm-standard, lfm-large, apache-standard, scripted); an unqualified profile runs only with allow_unqualified (echoed qualified: false)"},
+        "licence": {"enum": ["lfm_open_eligible", "liquid_commercial"],
+          "description": "the operator attests its legal entity (with affiliates) is under the LFM Open License threshold, or holds a Liquid commercial licence; env WAAV_FRONT_LICENCE; required to run any LFM profile; echoed as an attestation kind only"},
+        "allow_unqualified": {"type": "boolean", "default": false, "description": "lets an explicitly named profile run although W2's qualified-profile list does not include it (Release 1 evaluation; sign-off 4: CI forces the Qwen3.5-2B candidate this way)"},
+        "profiles_enabled": {"type": "array", "items": {"type": "string"}, "default": ["auto"]},
+        "endpoints": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["url"], "properties": {
+          "url": {"type": "string"}, "slot_range": {"type": "array", "items": {"type": "integer"}, "minItems": 2, "maxItems": 2}, "admission_permits": {"type": "integer", "minimum": 1}}}},
+        "api_key_file": {"type": "string"},
+        "allow_remote_hosts": {"type": "array", "items": {"type": "string"}, "default": []},
+        "free_text_ack": {"const": "unverified-front-text"},
+        "personas": {"type": "array", "items": {"type": "object"}, "default": [], "description": "operator-registered PersonaSpecs (W2 owns the shape)"},
+        "default_persona": {"type": "string"},
+        "max_context_tokens": {"type": "integer", "minimum": 512, "default": 6144},
+        "rebase_keep_decisions": {"type": "integer", "minimum": 0, "default": 8},
+        "pool": {"type": "object", "description": "Release 2 shared front pool (W2 section 3.18)", "x-release": 2},
+        "binary_path": {"type": "string", "default": "/app/llama/llama-server"},
+        "model_dir": {"type": "string", "default": "$CACHE_PATH/front"},
+        "run_dir": {"type": "string", "default": "/run/waav"},
+        "device": {"enum": ["cpu", "gpu", "auto"], "default": "cpu"},
+        "threads": {"type": "integer", "minimum": 1, "default": 6},
+        "cpu_range": {"type": "string"},
+        "parallel_slots": {"type": "integer", "minimum": 1},
+        "admission_permits": {"type": "integer", "minimum": 1},
+        "ctx_per_slot": {"type": "integer", "minimum": 512, "default": 8192},
+        "kv_cache_type": {"enum": ["f16", "q8_0"], "default": "f16"},
+        "cache_ram_mib": {"type": "integer", "minimum": 0, "default": 1024},
+        "dspark": {"type": "boolean", "default": false},
+        "restart_backoff_ms": {"type": "string", "default": "500..30000"},
+        "max_restarts_per_10min": {"type": "integer", "minimum": 0, "default": 10},
+        "required_for_ready": {"type": "boolean", "default": false},
+        "memory": {"type": "object", "additionalProperties": false, "x-owner": "W2 (store, token format), W6 (session path and warning)", "x-release": 2,
+          "description": "caller memory, off by default (sign-off 16; W2 section 3.16; Addendum A2 item 3 and C5). The session carries interaction.front.caller.identity_token; an invalid token gives caller_identity_rejected; memory enabled while the task store runs in its in-memory fallback gives caller_memory_unavailable.",
+          "properties": {
+            "enabled": {"type": "boolean", "default": false},
+            "identity_key_file": {"type": "string", "description": "required when enabled: the key that checks the token's MAC and derives the keyed memory key"},
+            "retention_days": {"type": "integer", "minimum": 1, "default": 90, "description": "sign-off 16"},
+            "read_budget_ms": {"type": "integer", "minimum": 0, "default": 150},
+            "max_facts_read": {"type": "integer", "minimum": 0, "maximum": 3, "default": 3},
+            "max_facts_stored": {"type": "integer", "minimum": 0, "default": 10},
+            "writers": {"type": "array", "uniqueItems": true, "items": {"enum": ["background", "agent_platform"]}, "default": ["background", "agent_platform"]}}},
+        "tenant_personas": {"type": "object", "additionalProperties": false, "x-owner": "W2 (validation, storage), W6 (route)", "x-release": 2,
+          "description": "the tenant persona registration route PUT /v1/interaction/personas/{id} (sign-off 17; W2 section 3.17; Addendum C5): mounted only when the interaction switch and enabled are on, and only with the task Redis",
+          "properties": {
+            "enabled": {"type": "boolean", "default": false},
+            "max_per_tenant": {"type": "integer", "minimum": 1, "default": 20},
+            "max_versions": {"type": "integer", "minimum": 1, "default": 5},
+            "writes_per_minute": {"type": "integer", "minimum": 1, "default": 10}}}
+      }
+    },
+
+    "AliasDefinition": {
+      "type": "object", "additionalProperties": false,
+      "description": "AliasDefinition (core/alias/mod.rs:150-171, deny_unknown_fields) plus the new interaction field. An alias that sets only kind and interaction (an interaction-only alias) may combine with agent; one that sets stt, tts, llm or dag_template is still refused with agent (handlers/ws/config_handler.rs:840-842). An agent-kind alias may declare interaction.background.answer_marker (Addendum D5); in an alias of another kind it is ignored with interaction_value_ignored.",
+      "properties": {
+        "kind": {"enum": ["stt", "tts", "realtime", "agent", "dag"]},
+        "stt": {"type": "object"},
+        "tts": {"type": "object"},
+        "llm": {"type": "object"},
+        "dag_template": {"type": "string"},
+        "interaction": {"$ref": "#/$defs/ServerSideInteractionSetting", "x-release": 1}
+      }
+    },
+
+    "ServerConfigDocument": {
+      "type": "object",
+      "description": "The parts of the server YAML (written as JSON) that carry interaction settings: the interaction key, the front_model key and aliases. Other server keys are allowed and not described.",
+      "properties": {
+        "interaction": {"$ref": "#/$defs/ServerInteractionKey"},
+        "front_model": {"$ref": "#/$defs/FrontModelKey"},
+        "aliases": {"type": "object", "additionalProperties": {"$ref": "#/$defs/AliasDefinition"}}
+      }
+    },
+    "WsConfigEnvelope": {
+      "type": "object", "required": ["type"],
+      "description": "The /ws `config` message (handlers/ws/messages.rs:49-109) with the new top-level interaction field (protocol 1.1). Existing fields are not re-described here.",
+      "properties": {
+        "type": {"const": "config"},
+        "stream_id": {"type": "string"}, "audio": {"type": "boolean"}, "audio_disabled": {"type": "boolean"},
+        "stt_config": {"type": "object"}, "tts_config": {"type": "object"}, "livekit": {"type": "object"},
+        "dag_config": {"type": "object"}, "conversation_config": {"type": "object"},
+        "agent": {"type": "object", "properties": {"id": {"type": "string"}, "version": {"type": "integer"}, "variables": {"type": "object"}, "text_only": {"type": "boolean"}}},
+        "alias": {"type": "string"},
+        "interaction": {"$ref": "#/$defs/ClientInteractionSetting"}
+      },
+      "additionalProperties": false
+    },
+    "RealtimeConfigEnvelope": {
+      "type": "object", "required": ["type", "provider"],
+      "description": "The /realtime `config` message (RealtimeSessionConfig) with interaction (Release 3). interaction is accepted only on config, never on update_session.",
+      "properties": {
+        "type": {"const": "config"},
+        "provider": {"type": "string"}, "model": {"type": "string"}, "voice": {"type": "string"},
+        "model_family": {"type": "string", "x-owner": "W6", "x-release": 3,
+          "description": "Azure only (Addendum A2 item 10): the model family behind the deployment named in model (for example gpt-realtime-2.1), so the preamble and lifecycle rules can be evaluated. Unset: fillers resolve to gateway and an interaction session gets model_family_unknown. A Bud deployment sets it in RealtimeSettings."},
+        "interaction": {"$ref": "#/$defs/ClientInteractionSetting"}
+      }
+    },
+    "VoiceAgentEntryProjection": {
+      "type": "object", "required": ["interaction"],
+      "description": "Excerpt of budapp's VoiceAgentEntry projection (bud-auth/src/voice_agent.rs; budapp is the single writer, :3) with the new interaction and background fields. Unknown top-level fields are already accepted and logged (KNOWN_FIELDS, :332-353; the check at :405-409), so budapp can publish both before WaaV reads them. Requested dates (cross-team, Addendum D5 and the plan): interaction and background.answer_marker for Release 1 by 2026-11-02; background.voice_approvals and background.side_runs for Release 2 by 2026-11-30. Other entry fields are allowed and not described.",
+      "properties": {
+        "interaction": {"$ref": "#/$defs/InteractionSettingWithoutAgentBackground", "x-owner": "W6", "x-release": 1, "x-access": "server_side_homes"},
+        "background": {"$ref": "#/$defs/AgentBackground"},
+        "session_overrides": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "AgentBackground": {
+      "type": "object", "additionalProperties": false, "x-owner": "W3 (fields), budapp (writer)", "x-access": "server_side_homes",
+      "description": "budapp's background block on the agent entry (W3 section 3.13). Only the agent's author can make these declarations; the operator may stand in for answer_marker alone (OperatorAgentBackground, Addendum D5), and this field wins over the operator's.",
+      "properties": {
+        "answer_marker": {"type": ["string", "null"], "maxLength": 32, "pattern": "^\\S(.*\\S)?$", "default": null, "x-release": 1, "description": "as OperatorAgentBackground.answer_marker"},
+        "mode": {"enum": ["auto", "foreground"], "default": "auto", "x-release": 2, "description": "auto: a background run when budprompt allows it"},
+        "voice_approvals": {"enum": ["off", "invoker"], "default": "off", "x-release": 2, "description": "invoker: the caller's spoken vote may be forwarded (sign-off 14)"},
+        "side_runs": {"enum": ["off", "allowed"], "default": "off", "x-release": 2, "description": "concurrent runs without the conversation are safe for this agent (sign-off 20)"},
+        "max_side_runs": {"type": "integer", "minimum": 0, "default": 2, "x-release": 2},
+        "deadline_s": {"type": "integer", "minimum": 1, "default": 300, "x-release": 2},
+        "on_session_end": {"enum": ["auto", "cancel_all", "continue_all"], "default": "auto", "x-release": 2, "description": "as tasks.session_end"},
+        "push_url": {"type": ["string", "null"], "default": null, "x-release": 2}
+      }
+    },
+    "RealtimeSettingsProjection": {
+      "type": "object",
+      "description": "Excerpt of budapp's deployment RealtimeSettings (bud-auth/src/endpoint_config.rs:299) with the new interaction field (Release 3 for the relay and facade; budapp's fields requested by 2027-03-12) and the per-deployment escape flags of W6 section 9.2. Other fields are allowed and not described.",
+      "properties": {
+        "interaction": {"$ref": "#/$defs/InteractionSettingWithoutAgentBackground", "x-owner": "W6", "x-release": 3, "x-access": "server_side_homes"},
+        "model_family": {"type": "string", "x-owner": "W6", "x-release": 3, "description": "Azure deployments only (Addendum A2 item 10)"},
+        "policy": {"type": "object", "properties": {
+          "legacy_wire": {"type": "array", "uniqueItems": true, "default": [], "x-owner": "W6", "x-release": "lifecycle", "x-access": "server_side_homes",
+            "items": {"enum": ["deepgram_text_as_agent_message", "nova_text_non_interactive", "gemini_omit_tool_behavior", "gemini_media_chunks", "gemini_response_id_only", "allow_setup_resend", "deepgram_settings_resend", "deepgram_omit_tools", "ultravox_omit_tools"]}}}}
+      }
+    },
+    "BudInteractionUpdate": {
+      "type": "object", "additionalProperties": false, "required": ["type", "interaction"],
+      "description": "/v1/realtime client event bud.interaction.update; intercepted before the relay policy; only paths in the agent's session_overrides (cascade) or the server's allow_client_override (relay and facade) are applied; answer bud.interaction.updated {applied, refused}.",
+      "properties": {
+        "type": {"const": "bud.interaction.update"},
+        "event_id": {"type": "string"},
+        "interaction": {"$ref": "#/$defs/ClientInteractionBlock"}
+      }
+    }
+  }
+}

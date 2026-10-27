@@ -8,6 +8,7 @@ use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, info, warn};
 
 use crate::auth::{Auth, match_api_secret_id};
+use crate::core::interaction::actor::{InteractionHandle, Msg};
 use crate::plugin::capabilities::{WSContext, WSResponse};
 use crate::plugin::global_registry;
 use crate::state::AppState;
@@ -32,6 +33,77 @@ async fn send_error(message_tx: &mpsc::Sender<MessageRoute>, message: impl Into<
         }),
     )
     .await;
+}
+
+/// The session's interaction actor, when it runs interaction mode.
+async fn interaction(state: &Arc<RwLock<ConnectionState>>) -> Option<InteractionHandle> {
+    state.read().await.interaction.clone()
+}
+
+/// A message only an interaction session takes: to its actor, or an `error`.
+async fn to_interaction(
+    name: &str,
+    msg: Msg,
+    state: &Arc<RwLock<ConnectionState>>,
+    message_tx: &mpsc::Sender<MessageRoute>,
+) -> bool {
+    match interaction(state).await {
+        Some(actor) => {
+            actor.send(msg).await;
+        }
+        None => {
+            send_error(
+                message_tx,
+                format!("{name} applies to interaction sessions only"),
+            )
+            .await
+        }
+    }
+    true
+}
+
+/// A client's conversation control: to the session's control executor, which answers
+/// with `control_applied`.
+async fn control(
+    kind: String,
+    value: Option<String>,
+    state: &Arc<RwLock<ConnectionState>>,
+    message_tx: &mpsc::Sender<MessageRoute>,
+) -> bool {
+    use crate::core::interaction::controls::{Control, ControlSource};
+    let raw = serde_json::json!({ "kind": kind, "value": value });
+    match Control::from_json(&raw, ControlSource::Client) {
+        Ok(control) => to_interaction("control", Msg::Control(control), state, message_tx).await,
+        Err(why) => {
+            send_error(message_tx, format!("control: {why}")).await;
+            true
+        }
+    }
+}
+
+/// A message on the room's interaction data topic (`waav.interaction`) from a participant:
+/// a `control` or a `task_seen`, as the socket takes them, to the session's interaction
+/// mode. `false`: it is neither (or the session runs without the mode), and is passed on as
+/// any data message is. The answer (`control_applied`) is published on the same topic, as
+/// every interaction event of a room session is.
+pub(super) async fn room_message(
+    text: &str,
+    state: &Arc<RwLock<ConnectionState>>,
+    message_tx: &mpsc::Sender<MessageRoute>,
+) -> bool {
+    let Ok(message) = serde_json::from_str::<IncomingMessage>(text) else {
+        return false;
+    };
+    if interaction(state).await.is_none() || message.validate_size().is_err() {
+        return false;
+    }
+    match message {
+        IncomingMessage::Control { kind, value } => control(kind, value, state, message_tx).await,
+        IncomingMessage::TaskSeen { task_id } => {
+            to_interaction("task_seen", Msg::TaskSeen { task_id }, state, message_tx).await
+        }
+        _ => false,
+    }
 }
 
 /// Process incoming WebSocket message based on its type
@@ -94,7 +166,17 @@ pub async fn handle_incoming_message(
             conversation_config,
             agent,
             alias,
+            interaction,
         } => {
+            // Interaction mode: the session's block, or the server's default one while its
+            // switch is on. Only a session that asks for it is ever touched by the mode.
+            let asked = interaction.is_some();
+            let request = interaction.or_else(|| {
+                let server = crate::core::interaction::config::server();
+                server.default.clone().filter(|_| server.enabled)
+            });
+            state.write().await.interaction_request = request.map(|request| (request, asked));
+
             // Handle backward compatibility for audio_disabled field
             // Priority: audio field takes precedence if explicitly set
             // If only audio_disabled is set, invert it to get audio value
@@ -139,8 +221,18 @@ pub async fn handle_incoming_message(
             text,
             flush,
             allow_interruption,
-        } => handle_speak_message(text, flush, allow_interruption, state, message_tx).await,
+        } => {
+            if let Some(actor) = interaction(state).await {
+                actor.send(Msg::ClientSpeak(text)).await;
+                return true;
+            }
+            handle_speak_message(text, flush, allow_interruption, state, message_tx).await
+        }
         IncomingMessage::Clear => {
+            if let Some(actor) = interaction(state).await {
+                actor.send(Msg::ClientClear).await;
+                return true;
+            }
             // Spec 025: on a voice-agent session `clear` stops the agent too — the live turn ends
             // and its history keeps what was heard (a barge-in without speech).
             if let Some(engine) = state.read().await.agent.clone() {
@@ -159,6 +251,10 @@ pub async fn handle_incoming_message(
             true
         }
         IncomingMessage::AgentInput { text } => {
+            if let Some(actor) = interaction(state).await {
+                actor.send(Msg::TypedTurn(text)).await;
+                return true;
+            }
             let (engine, conversation, tracker) = {
                 let s = state.read().await;
                 (
@@ -184,6 +280,48 @@ pub async fn handle_incoming_message(
             }
             true
         }
+        IncomingMessage::TaskAnswer {
+            request_id,
+            outcome,
+            value,
+            correction,
+        } => {
+            let msg = Msg::TaskAnswer {
+                request_id,
+                outcome: outcome.read(value, correction),
+            };
+            to_interaction("task_answer", msg, state, message_tx).await
+        }
+        IncomingMessage::TaskCancel { task_id } => {
+            to_interaction(
+                "task_cancel",
+                Msg::TaskCancel { task_id },
+                state,
+                message_tx,
+            )
+            .await
+        }
+        IncomingMessage::TaskSeen { task_id } => {
+            to_interaction("task_seen", Msg::TaskSeen { task_id }, state, message_tx).await
+        }
+        IncomingMessage::Control { kind, value } => control(kind, value, state, message_tx).await,
+        IncomingMessage::InteractionUpdate { patch } => {
+            to_interaction("interaction_update", Msg::Update(patch), state, message_tx).await
+        }
+        IncomingMessage::PlaybackPosition {
+            utterance_id,
+            played_ms,
+        } => {
+            // A heartbeat: a session without the mode has no use for it and says nothing.
+            if let Some(actor) = interaction(state).await {
+                let msg = Msg::PlaybackPosition {
+                    utterance_id,
+                    played_ms,
+                };
+                actor.try_send(msg);
+            }
+            true
+        }
         IncomingMessage::SendMessage {
             message,
             role,
@@ -197,7 +335,15 @@ pub async fn handle_incoming_message(
             message_type,
             payload,
         } => handle_custom_message(message_type, payload, state, message_tx, app_state).await,
-        IncomingMessage::AudioEnd => commit_client_audio(state, message_tx, false).await,
+        IncomingMessage::AudioEnd => {
+            // Interaction mode ends the turn through its own flush: `finalize_stt` reconnects
+            // the provider, which drops the callbacks the actor hears the caller through.
+            if let Some(actor) = interaction(state).await {
+                actor.send(Msg::AudioEnd).await;
+                return true;
+            }
+            commit_client_audio(state, message_tx, false).await
+        }
     }
 }
 
@@ -770,5 +916,47 @@ mod ws_auth_path_tests {
             Some(KEY)
         );
         assert!(guard.caller_check.is_some());
+    }
+}
+
+#[cfg(test)]
+mod room_topic_tests {
+    use super::*;
+    use crate::core::interaction::controls::ControlKind;
+    use tokio_util::sync::CancellationToken;
+
+    /// The room's interaction topic: a `control` and a `task_seen` go to the session's
+    /// interaction mode; anything else, or a session without the mode, is a data message
+    /// as before.
+    #[tokio::test]
+    async fn a_room_participants_control_and_task_seen_reach_the_interaction_mode() {
+        let state = Arc::new(RwLock::new(ConnectionState::new()));
+        let (message_tx, _out) = mpsc::channel(8);
+        let control = r#"{"type": "control", "kind": "rate", "value": "slower"}"#;
+        assert!(!room_message(control, &state, &message_tx).await, "no mode");
+
+        let (tx, mut inbox) = mpsc::channel(8);
+        let handle = InteractionHandle::new(tx, serde_json::json!({}), CancellationToken::new());
+        state.write().await.interaction = Some(handle);
+        assert!(room_message(control, &state, &message_tx).await);
+        match inbox.try_recv() {
+            Ok(Msg::Control(control)) => {
+                assert_eq!(control.kind, ControlKind::Rate);
+                assert_eq!(control.value.as_deref(), Some("slower"));
+            }
+            other => panic!("not a control: {other:?}"),
+        }
+        let seen = r#"{"type": "task_seen", "task_id": "task_1"}"#;
+        assert!(room_message(seen, &state, &message_tx).await);
+        assert!(matches!(inbox.try_recv(), Ok(Msg::TaskSeen { task_id }) if task_id == "task_1"));
+        // Not the mode's: a chat line, a message the room may not send, and no JSON.
+        for other in [
+            r#"{"type": "send_message", "message": "hi"}"#,
+            r#"{"type": "task_answer", "request_id": "q1", "outcome": "accept"}"#,
+            "hello",
+        ] {
+            assert!(!room_message(other, &state, &message_tx).await, "{other}");
+        }
+        assert!(inbox.try_recv().is_err());
     }
 }

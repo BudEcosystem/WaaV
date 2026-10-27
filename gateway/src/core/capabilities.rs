@@ -474,6 +474,8 @@ pub const TTS_FEATURE_SUPPORT: &[FeatureSupport] = &[
         module: "elevenlabs",
         batch_builder: None,
         features: &[
+            // The HTTP streaming endpoint (`/v1/text-to-speech/{voice}/stream`).
+            "streaming",
             "speed",
             "stability",
             "similarity_boost",

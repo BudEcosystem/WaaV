@@ -31,8 +31,9 @@ use bytes::Bytes;
 
 use crate::core::realtime::base::{
     AudioOutputCallback, BaseRealtime, ConnectionState, FunctionCallCallback, RealtimeConfig,
-    RealtimeErrorCallback, RealtimeResponseOverride, RealtimeResult, ReconnectionCallback,
-    ReplayConversationItem, ResponseDoneCallback, SpeechEventCallback, TranscriptCallback,
+    RealtimeErrorCallback, RealtimeResponseOverride, RealtimeResult, RealtimeVerb,
+    ReconnectionCallback, ReplayConversationItem, ResponseDoneCallback, SpeechEventCallback,
+    TranscriptCallback,
 };
 use crate::core::realtime::scaffold::RealtimeSession;
 
@@ -138,6 +139,10 @@ impl BaseRealtime for DeepgramRealtime {
 
     async fn update_session(&mut self, config: RealtimeConfig) -> RealtimeResult<()> {
         self.0.update_session(config).await
+    }
+
+    async fn apply_verb(&mut self, verb: RealtimeVerb<'_>) -> RealtimeResult<()> {
+        self.0.apply_verb(verb).await
     }
 
     async fn submit_function_result(&mut self, call_id: &str, result: &str) -> RealtimeResult<()> {

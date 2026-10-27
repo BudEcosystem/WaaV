@@ -290,15 +290,25 @@ pub enum EVIClientMessage {
     SessionSettings(SessionSettings),
     /// Send audio input chunk.
     AudioInput(AudioInput),
-    /// Send text input.
+    /// Send text input (`text_input`: not an EVI message; kept for the escape flag
+    /// `hume_text_input`).
     TextInput(TextInput),
+    /// The user's typed turn, `user_input` `{text}`: "treated as the user's speech to EVI"
+    /// (<https://dev.hume.ai/reference/speech-to-speech-evi/chat>). Provider fix
+    /// `hume_user_input`.
+    UserInput(TextInput),
     /// Submit tool response.
     ToolResponse(ToolResponse),
-    /// Pause assistant speech.
+    /// Pause assistant speech (`pause_assistant_message`).
+    #[serde(rename = "pause_assistant_message")]
     PauseAssistant(PauseAssistant),
-    /// Resume assistant speech.
+    /// Resume assistant speech (`resume_assistant_message`).
+    #[serde(rename = "resume_assistant_message")]
     ResumeAssistant(ResumeAssistant),
-    /// Interrupt assistant.
+    /// `stop_assistant`: not an EVI client message (the documented ones are `audio_input`,
+    /// `user_input`, `assistant_input`, `session_settings`, `tool_response`, `tool_error`,
+    /// `pause_assistant_message`, `resume_assistant_message`); kept for the escape flag
+    /// `hume_stop_assistant`.
     StopAssistant(StopAssistant),
 }
 
@@ -311,9 +321,30 @@ pub struct SessionSettings {
     /// System prompt override.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,
-    /// Context messages to prepopulate.
+    /// Injected context (`{text, type: persistent|temporary}`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context: Option<ContextSettings>,
+    /// The voice: "Allows you to change the voice during an active chat" (provider fix
+    /// `hume_voice_settings`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub voice_id: Option<String>,
+    /// "List of user-defined tools to enable for the session" (provider fix `hume_tools`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<HumeTool>>,
+}
+
+/// One user-defined tool of `session_settings.tools`: `parameters` is a STRINGIFIED JSON
+/// schema (<https://dev.hume.ai/reference/speech-to-speech-evi/chat>, `session_settings`).
+#[derive(Debug, Clone, Serialize)]
+pub struct HumeTool {
+    /// Always `function`.
+    #[serde(rename = "type")]
+    pub tool_type: String,
+    pub name: String,
+    /// The JSON schema of the parameters, as a string.
+    pub parameters: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 /// Audio format settings.
@@ -341,21 +372,15 @@ pub enum AudioEncoding {
     Webm,
 }
 
-/// Context settings for prepopulating conversation.
+/// Context injected through `session_settings.context`: `{text, type}` with `type`
+/// `persistent` or `temporary` (<https://dev.hume.ai/reference/speech-to-speech-evi/chat>).
 #[derive(Debug, Clone, Serialize)]
 pub struct ContextSettings {
-    /// Previous conversation messages.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub messages: Option<Vec<ContextMessage>>,
-}
-
-/// A context message for conversation history.
-#[derive(Debug, Clone, Serialize)]
-pub struct ContextMessage {
-    /// Role (user or assistant).
-    pub role: String,
-    /// Message content.
-    pub content: String,
+    /// The context text.
+    pub text: String,
+    /// `persistent` or `temporary`.
+    #[serde(rename = "type")]
+    pub context_type: String,
 }
 
 /// Audio input message containing base64-encoded audio.
@@ -455,7 +480,9 @@ pub struct ChatMetadata {
 /// User message with transcription and prosody scores.
 #[derive(Debug, Clone, Deserialize)]
 pub struct UserMessage {
-    /// Unique message ID.
+    /// Message ID. EVI's `user_message` has none (its fields are `custom_session_id`,
+    /// `from_text`, `interim`, `language`, `message`, `models`, `time`): empty when absent.
+    #[serde(default)]
     pub id: String,
     /// Transcribed text.
     pub message: UserMessageContent,
@@ -505,7 +532,8 @@ pub struct UserInterruption {
 /// Assistant message (response text).
 #[derive(Debug, Clone, Deserialize)]
 pub struct AssistantMessage {
-    /// Unique message ID.
+    /// Message ID (optional in EVI's reference): empty when absent.
+    #[serde(default)]
     pub id: String,
     /// Message content.
     pub message: AssistantMessageContent,
@@ -546,6 +574,35 @@ impl AudioOutput {
     pub fn decode_audio(&self) -> Result<Vec<u8>, base64::DecodeError> {
         BASE64.decode(&self.data)
     }
+}
+
+/// The PCM samples and sample rate of a WAV file: "The returned audio format is WAV and the
+/// sample rate is 48kHz" (`audio_output`, <https://dev.hume.ai/reference/speech-to-speech-evi/chat>).
+/// Walks the RIFF chunks for `fmt ` (the rate) and `data` (the samples; a streamed file's
+/// unknown size reads to the end). `None`: not a RIFF/WAVE file.
+pub fn wav_pcm(bytes: &[u8]) -> Option<(&[u8], Option<u32>)> {
+    if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return None;
+    }
+    let mut at = 12;
+    let mut rate = None;
+    while at + 8 <= bytes.len() {
+        let id = &bytes[at..at + 4];
+        let size = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().ok()?) as usize;
+        let body = at + 8;
+        if id == b"data" {
+            let end = body.saturating_add(size).min(bytes.len());
+            return Some((&bytes[body..end], rate));
+        }
+        if id == b"fmt " && body + 8 <= bytes.len() {
+            rate = Some(u32::from_le_bytes(
+                bytes[body + 4..body + 8].try_into().ok()?,
+            ));
+        }
+        // Chunks are padded to an even size.
+        at = body.saturating_add(size).saturating_add(size & 1);
+    }
+    Some((&[], rate))
 }
 
 /// End of assistant response.
@@ -692,6 +749,8 @@ mod tests {
             }),
             system_prompt: None,
             context: None,
+            voice_id: None,
+            tools: None,
         });
 
         let json = serialize_client_message(&msg).unwrap();
@@ -906,11 +965,81 @@ mod tests {
     fn test_pause_resume_messages() {
         let pause = EVIClientMessage::PauseAssistant(PauseAssistant::default());
         let json = serialize_client_message(&pause).unwrap();
-        assert!(json.contains("pause_assistant"));
+        assert!(json.contains("\"pause_assistant_message\""));
 
         let resume = EVIClientMessage::ResumeAssistant(ResumeAssistant::default());
         let json = serialize_client_message(&resume).unwrap();
         assert!(json.contains("resume_assistant"));
+    }
+
+    /// A `user_message` shaped as EVI's reference has it (no `id`; `time` in ms) parses.
+    #[test]
+    fn a_user_message_without_an_id_parses() {
+        let json = r#"{"type":"user_message","custom_session_id":null,"from_text":false,
+            "interim":false,"language":"en","message":{"role":"user","content":"Hello there"},
+            "models":{"prosody":{"scores":{}}},"time":{"begin":120,"end":980}}"#;
+        match deserialize_server_message(json).unwrap() {
+            EVIServerMessage::UserMessage(m) => {
+                assert_eq!(m.message.content, "Hello there");
+                assert!(m.id.is_empty());
+            }
+            other => panic!("expected a user message, got {other:?}"),
+        }
+    }
+
+    /// The documented client messages: `user_input`, `pause_assistant_message`,
+    /// `resume_assistant_message`, `session_settings` with `voice_id`, `tools` and
+    /// `context {text, type}`.
+    #[test]
+    fn the_documented_client_messages_serialize_by_their_names() {
+        let json = |m: &EVIClientMessage| {
+            serde_json::from_str::<serde_json::Value>(&serialize_client_message(m).unwrap())
+                .unwrap()
+        };
+        assert_eq!(
+            json(&EVIClientMessage::UserInput(TextInput {
+                text: "Hi".into()
+            })),
+            serde_json::json!({"type": "user_input", "text": "Hi"})
+        );
+        assert_eq!(
+            json(&EVIClientMessage::ResumeAssistant(
+                ResumeAssistant::default()
+            )),
+            serde_json::json!({"type": "resume_assistant_message"})
+        );
+        let settings = EVIClientMessage::SessionSettings(SessionSettings {
+            audio: None,
+            system_prompt: None,
+            context: Some(ContextSettings {
+                text: "The caller is in Paris.".into(),
+                context_type: "temporary".into(),
+            }),
+            voice_id: Some("voice-1".into()),
+            tools: Some(vec![HumeTool {
+                tool_type: "function".into(),
+                name: "get_weather".into(),
+                parameters: r#"{"type":"object"}"#.into(),
+                description: None,
+            }]),
+        });
+        assert_eq!(
+            json(&settings),
+            serde_json::json!({"type": "session_settings",
+                "context": {"text": "The caller is in Paris.", "type": "temporary"},
+                "voice_id": "voice-1",
+                "tools": [{"type": "function", "name": "get_weather",
+                           "parameters": "{\"type\":\"object\"}"}]})
+        );
+    }
+
+    /// A WAV file's samples and rate: the header is not audio.
+    #[test]
+    fn wav_pcm_takes_the_data_chunk_and_the_rate() {
+        let pcm = [1u8, 2, 3, 4, 5, 6];
+        let wav = crate::core::stt::wav::encode_pcm16_wav(&pcm, 48_000, 1).unwrap();
+        assert_eq!(wav_pcm(&wav), Some((&pcm[..], Some(48_000))));
+        assert_eq!(wav_pcm(&pcm), None, "raw PCM is not a WAV file");
     }
 
     #[test]

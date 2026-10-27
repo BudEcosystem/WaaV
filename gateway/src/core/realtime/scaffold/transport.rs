@@ -20,6 +20,25 @@ use super::super::base::{RealtimeError, RealtimeResult};
 use super::event::{ConnectSpec, OutFrame};
 use crate::core::resilience::connect::{WS_CONNECT_TIMEOUT, with_timeout};
 
+/// The `tracing` target of the provider's own text frames
+/// (`RUST_LOG=waav_gateway::realtime::wire=trace`): what a vendor answered, for a live probe.
+/// Only inbound frames are traced (a frame the gateway sends may carry a credential), the
+/// OpenAI wire's audio deltas are left out and each frame is cut at [`WIRE_TRACE_CHARS`].
+pub(crate) const WIRE_TARGET: &str = "waav_gateway::realtime::wire";
+const WIRE_TRACE_CHARS: usize = 3000;
+
+/// What the wire trace logs of one inbound text frame: `None` for an audio delta.
+fn wire_trace_text(text: &str) -> Option<&str> {
+    if text.contains("audio.delta\"") {
+        return None;
+    }
+    Some(
+        text.char_indices()
+            .nth(WIRE_TRACE_CHARS)
+            .map_or(text, |(at, _)| &text[..at]),
+    )
+}
+
 const REST_HANDSHAKE_CREATE_URL_SCHEMES: &[&str] = &["http", "https"];
 const REST_HANDSHAKE_JOIN_URL_SCHEMES: &[&str] = &["ws", "wss"];
 
@@ -81,7 +100,14 @@ impl RealtimeTransport for WsTextTransport {
     async fn recv(&mut self) -> Option<RealtimeResult<OutFrame>> {
         loop {
             match self.stream.next().await? {
-                Ok(Message::Text(t)) => return Some(Ok(OutFrame::Text(t.to_string()))),
+                Ok(Message::Text(t)) => {
+                    if tracing::enabled!(target: WIRE_TARGET, tracing::Level::TRACE)
+                        && let Some(frame) = wire_trace_text(&t)
+                    {
+                        tracing::trace!(target: WIRE_TARGET, frame, "provider frame");
+                    }
+                    return Some(Ok(OutFrame::Text(t.to_string())));
+                }
                 Ok(Message::Binary(b)) => return Some(Ok(OutFrame::Binary(b))),
                 Ok(Message::Ping(data)) => {
                     // Respond to keepalive and keep waiting for real data.
@@ -90,7 +116,12 @@ impl RealtimeTransport for WsTextTransport {
                     }
                 }
                 Ok(Message::Pong(_)) | Ok(Message::Frame(_)) => {}
-                Ok(Message::Close(_)) => return None,
+                Ok(Message::Close(frame)) => {
+                    tracing::trace!(target: WIRE_TARGET, close = ?frame, "provider close");
+                    return frame
+                        .and_then(|f| refusal(&f.reason))
+                        .map(|reason| Err(RealtimeError::Refused(reason)));
+                }
                 Err(e) => return Some(Err(RealtimeError::WebSocketError(e.to_string()))),
             }
         }
@@ -99,6 +130,18 @@ impl RealtimeTransport for WsTextTransport {
     async fn close(&mut self) {
         let _ = self.sink.send(Message::Close(None)).await;
     }
+}
+
+/// The provider's close reason when it refuses the session's configuration: it names an HTTP
+/// client-error status (ElevenLabs: `Agent … not found: 404`, close code 3000) other than the
+/// credential and rate ones (401, 403, 407, 429), which keep counting as failures.
+fn refusal(reason: &str) -> Option<String> {
+    let refused = reason
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|digits| digits.len() == 3)
+        .filter_map(|digits| digits.parse::<u16>().ok())
+        .any(|status| (400..500).contains(&status) && ![401, 403, 407, 429].contains(&status));
+    refused.then(|| reason.trim().to_owned())
 }
 
 /// Open a WS upgrade to `url` with `headers`, applying the auth/headers via
@@ -126,7 +169,8 @@ async fn connect_ws(
     let host = request.uri().host().unwrap_or("<unknown host>").to_string();
     let (ws, _resp) = with_timeout(
         WS_CONNECT_TIMEOUT,
-        tokio_tungstenite::connect_async(request),
+        // No Nagle: a small control frame right after another one must not wait for its ACK.
+        tokio_tungstenite::connect_async_with_config(request, None, true),
     )
     .await
     .map_err(|_| {
@@ -858,6 +902,21 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn the_wire_trace_leaves_audio_out_and_cuts_long_frames() {
+        assert_eq!(
+            wire_trace_text(r#"{"type":"response.output_audio.delta","delta":"AAAA"}"#),
+            None
+        );
+        let ready = r#"{"type":"session.updated","session":{"voice":"eve"}}"#;
+        assert_eq!(wire_trace_text(ready), Some(ready));
+        let long = format!(r#"{{"type":"x","text":"{}"}}"#, "é".repeat(4000));
+        assert_eq!(
+            wire_trace_text(&long).map(|cut| cut.chars().count()),
+            Some(WIRE_TRACE_CHARS)
+        );
+    }
+
     fn aws_keys() -> crate::core::realtime::base::AwsStaticCredentials {
         crate::core::realtime::base::AwsStaticCredentials {
             access_key_id: "AKIDBUDDEPLOYMENT1".into(),
@@ -1297,5 +1356,26 @@ mod tests {
                 .await,
             Err(RealtimeError::ConnectionFailed(_))
         ));
+    }
+
+    /// A close that names a client-error status refuses the configuration; credential and rate
+    /// statuses, and closes with no status, do not.
+    #[test]
+    fn a_close_naming_a_client_error_is_a_refusal() {
+        assert_eq!(
+            refusal("Agent agent_provider_matrix_probe not found: 404").as_deref(),
+            Some("Agent agent_provider_matrix_probe not found: 404")
+        );
+        assert!(refusal("Invalid settings (422)").is_some());
+        for reason in [
+            "Invalid API key: 401",
+            "Forbidden 403",
+            "Too many requests: 429",
+            "",
+            "bye",
+            "code 1000",
+        ] {
+            assert_eq!(refusal(reason), None, "{reason}");
+        }
     }
 }

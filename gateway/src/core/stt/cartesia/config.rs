@@ -220,6 +220,23 @@ impl CartesiaSTTConfig {
         Ok(())
     }
 
+    /// The short-lived access token, when one was given.
+    fn token(&self) -> Option<&str> {
+        self.access_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+    }
+
+    /// The handshake header that carries the API key (`X-API-Key`, Cartesia's server-side
+    /// scheme); none when an access token authenticates the session instead.
+    pub fn auth_header(&self) -> Option<(&'static str, String)> {
+        match self.token() {
+            Some(_) => None,
+            None => Some(("X-API-Key", self.base.api_key.clone())),
+        }
+    }
+
     /// Build the WebSocket URL with query parameters.
     ///
     /// Constructs the full WebSocket URL including:
@@ -239,9 +256,13 @@ impl CartesiaSTTConfig {
     /// # Example URL
     ///
     /// ```text
-    /// wss://api.cartesia.ai/stt/websocket?api_key=xxx&model=ink-whisper&language=en&encoding=pcm_s16le&sample_rate=16000
+    /// wss://api.cartesia.ai/stt/websocket?model=ink-whisper&language=en&encoding=pcm_s16le&sample_rate=16000
     /// ```
-    pub fn build_websocket_url(&self, api_key: &str) -> String {
+    ///
+    /// The long-lived API key is never in the URL (a proxy or a log that records URLs would
+    /// keep it): it goes in the `X-API-Key` handshake header ([`Self::auth_header`]). Only a
+    /// short-lived `access_token` rides in the query, as Cartesia documents for clients.
+    pub fn build_websocket_url(&self) -> String {
         // URL-encode parameters that could contain special characters
         let encode =
             |s: &str| -> String { form_urlencoded::byte_serialize(s.as_bytes()).collect() };
@@ -265,23 +286,17 @@ impl CartesiaSTTConfig {
         }
 
         // Authentication: a short-lived `access_token` (extras) takes precedence over the
-        // long-lived `api_key` — the recommended pattern for untrusted clients. Exactly one
-        // auth param is emitted so the two are never sent together.
-        if let Some(token) = self
-            .access_token
-            .as_deref()
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
-        {
-            url.push_str("?access_token=");
+        // long-lived `api_key` — the recommended pattern for untrusted clients. Exactly one is
+        // sent: the token here, the key in the handshake header.
+        url.push('?');
+        if let Some(token) = self.token() {
+            url.push_str("access_token=");
             url.push_str(&encode(token));
-        } else {
-            url.push_str("?api_key=");
-            url.push_str(&encode(api_key));
+            url.push('&');
         }
 
         // Required parameter - URL encode the model.
-        url.push_str("&model=");
+        url.push_str("model=");
         url.push_str(&encode(&self.model));
         // Vendor contract: `language` is OPTIONAL (ISO-639-1; Cartesia defaults to `en`). An
         // unset language is omitted — never sent as an empty `language=`, never replaced.
@@ -427,8 +442,8 @@ mod tests {
         };
         let cfg = CartesiaSTTConfig::from_standard(&std);
         assert_eq!(cfg.model, "ink-2");
-        let url = cfg.build_websocket_url("k");
-        assert!(url.contains("&model=ink-2"), "model not on wire: {url}");
+        let url = cfg.build_websocket_url();
+        assert!(url.contains("model=ink-2"), "model not on wire: {url}");
     }
 
     // WIRE-LEVEL: an audio encoding beyond pcm_s16le must reach the connect URL's `encoding=`
@@ -450,7 +465,7 @@ mod tests {
         };
         let cfg = CartesiaSTTConfig::from_standard(&std);
         assert_eq!(cfg.encoding, CartesiaAudioEncoding::PcmMulaw);
-        let url = cfg.build_websocket_url("k");
+        let url = cfg.build_websocket_url();
         assert!(
             url.contains("&encoding=pcm_mulaw"),
             "encoding not on wire: {url}"
@@ -469,7 +484,7 @@ mod tests {
         });
         let cfg = CartesiaSTTConfig::from_standard(&std);
         assert_eq!(cfg.encoding, CartesiaAudioEncoding::PcmS16le);
-        let url = cfg.build_websocket_url("k");
+        let url = cfg.build_websocket_url();
         assert!(
             url.contains("&encoding=pcm_s16le"),
             "default encoding wrong: {url}"
@@ -496,7 +511,7 @@ mod tests {
         };
         let cfg = CartesiaSTTConfig::from_standard(&std);
         assert_eq!(cfg.access_token.as_deref(), Some("ephemeral-xyz"));
-        let url = cfg.build_websocket_url(&cfg.base.api_key);
+        let url = cfg.build_websocket_url();
         assert!(
             url.contains("access_token=ephemeral-xyz"),
             "access_token not on wire: {url}"
@@ -505,6 +520,30 @@ mod tests {
         assert!(
             !url.contains("api_key="),
             "api_key must be replaced by access_token: {url}"
+        );
+        assert_eq!(cfg.auth_header(), None);
+    }
+
+    /// The long-lived key goes in the `X-API-Key` handshake header, never in the URL (a proxy
+    /// or a log that records URLs would keep it).
+    #[test]
+    fn the_api_key_rides_in_the_handshake_header() {
+        let cfg = CartesiaSTTConfig {
+            base: STTConfig {
+                api_key: "sk_car_secret".into(),
+                language: "en".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let url = cfg.build_websocket_url();
+        assert!(
+            !url.contains("sk_car_secret") && !url.contains("api_key"),
+            "{url}"
+        );
+        assert_eq!(
+            cfg.auth_header(),
+            Some(("X-API-Key", "sk_car_secret".to_string()))
         );
     }
 
@@ -522,7 +561,7 @@ mod tests {
         };
 
         assert!(config.validate().is_ok());
-        let url = config.build_websocket_url(&config.base.api_key);
+        let url = config.build_websocket_url();
         assert!(url.contains("access_token=ephemeral-xyz"), "{url}");
         assert!(!url.contains("api_key="), "{url}");
     }
@@ -589,7 +628,7 @@ mod tests {
             ..Default::default()
         };
 
-        let url = config.build_websocket_url(&config.base.api_key);
+        let url = config.build_websocket_url();
         assert!(url.starts_with("wss://cartesia-proxy.example.com/stt/websocket?"));
     }
 }

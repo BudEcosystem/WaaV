@@ -70,6 +70,45 @@ pub enum RealtimeIncomingMessage {
     /// Update session configuration mid-stream
     #[serde(rename = "update_session")]
     UpdateSession(RealtimeSessionConfig),
+
+    /// Interaction mode: the client's answer to a `task_question`, as on `/ws`.
+    #[serde(rename = "task_answer")]
+    TaskAnswer {
+        /// The `request_id` of the `task_question`.
+        request_id: String,
+        /// `accept`, `decline` or `cancel`.
+        outcome: crate::handlers::ws::messages::TaskAnswerOutcome,
+        /// With `accept`: the chosen option or the value asked for (any JSON).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        value: Option<serde_json::Value>,
+        /// With `decline`: what to change, in the user's words.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        correction: Option<String>,
+    },
+
+    /// Interaction mode: cancel a background task, as on `/ws`.
+    #[serde(rename = "task_cancel")]
+    TaskCancel {
+        /// The `task_id` of the `task_created` event.
+        task_id: String,
+    },
+
+    /// Interaction mode: the caller has read the task's result on the screen, as on `/ws`;
+    /// the agent does not read it out.
+    #[serde(rename = "task_seen")]
+    TaskSeen {
+        /// The `task_id` of the `task_created` event.
+        task_id: String,
+    },
+
+    /// Interaction mode: change settings mid-session, as `/ws`'s `interaction_update` does
+    /// (`policy`, `duplex`, `events` and `front.preferred_name`); answered with
+    /// `interaction_updated`.
+    #[serde(rename = "interaction_update")]
+    InteractionUpdate {
+        /// The block's keys to change.
+        patch: serde_json::Value,
+    },
 }
 
 /// Per-response override carried by the `create_response` message.
@@ -182,6 +221,41 @@ pub struct RealtimeSessionConfig {
     /// proceeds with the client config + an `alias_unknown` error advisory).
     #[serde(default)]
     pub alias: Option<String>,
+
+    /// Interaction mode (`true` or a settings object, as on `/ws`): regimes B and C over the
+    /// provider. A session that cannot have it gets a `warning` and goes on without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interaction: Option<serde_json::Value>,
+
+    /// SERVER-SET: interaction mode's half-cascade asks the provider for text replies only
+    /// (`half_cascade_text`). Never read from a client message.
+    #[serde(skip)]
+    pub text_only: bool,
+
+    /// The caller's language. Deepgram Voice Agent: `agent.language` (`en` when unset; a
+    /// region code is sent as its language, `auto` as `multi`). Other providers ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+
+    /// Deepgram Voice Agent: the vendor of the `model` that thinks (`open_ai`, `anthropic`,
+    /// `google`, `groq`, `nvidia`, ...). Unset: taken from the model name (`claude-*`
+    /// `anthropic`, `gemini-*` `google`, `openai/gpt-oss-*` `groq`, `nvidia/*` `nvidia`, any
+    /// other `open_ai`). Other providers ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub think_provider: Option<String>,
+
+    /// Deepgram Voice Agent: the region to dial, `us` (the default) or `eu`
+    /// (`api.eu.deepgram.com`). A server endpoint override wins. Other providers ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+
+    /// The session's own switches of the provider wire fixes (`interaction.provider_fixes`):
+    /// a fix name to `true` or `false`. `false` turns a fix in force off for this session;
+    /// `true` turns one on only when the operator allows it
+    /// (`interaction.provider_fixes_per_session`), else `warning`
+    /// `interaction_override_refused`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_fixes: Option<serde_json::Value>,
 }
 
 /// Turn detection configuration
@@ -257,6 +331,9 @@ pub enum RealtimeOutgoingMessage {
         provider: String,
         /// Model in use
         model: String,
+        /// The resolved interaction settings, when the session runs interaction mode.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        interaction: Option<serde_json::Value>,
     },
 
     /// Session updated
@@ -294,6 +371,15 @@ pub enum RealtimeOutgoingMessage {
         arguments: String,
     },
 
+    /// The model withdrew a function call it made (Gemini `toolCallCancellation`): its result
+    /// is no longer wanted. Sent only with the operator's provider fix
+    /// `gemini_tool_call_cancellation` (`interaction.provider_fixes`).
+    #[serde(rename = "function_call_cancelled")]
+    FunctionCallCancelled {
+        /// The withdrawn call's ID
+        call_id: String,
+    },
+
     /// Response generation started
     #[serde(rename = "response_started")]
     ResponseStarted {
@@ -324,6 +410,18 @@ pub enum RealtimeOutgoingMessage {
         /// Reason for closing
         reason: String,
     },
+
+    /// A part of the config was not applied; the session goes on (`config_warning` on
+    /// `/ws`, `warning` here: the published name on this surface).
+    #[serde(rename = "warning")]
+    ConfigWarning {
+        /// Stable machine code, e.g. `interaction_surface_unavailable`.
+        code: String,
+        /// Human-readable explanation.
+        message: String,
+        /// Structured detail of the code.
+        detail: serde_json::Value,
+    },
 }
 
 // =============================================================================
@@ -334,6 +432,8 @@ pub enum RealtimeOutgoingMessage {
 pub enum RealtimeMessageRoute {
     /// JSON text message
     Outgoing(RealtimeOutgoingMessage),
+    /// An interaction-mode event, already serialised (the `/ws` body).
+    Json(String),
     /// Binary audio data
     Audio(Bytes),
     /// Close connection
@@ -360,7 +460,7 @@ impl RealtimeMessageRoute {
             Self::Outgoing(RealtimeOutgoingMessage::Transcript { .. }) => {
                 RealtimeMessageClass::Transcript
             }
-            Self::Outgoing(_) | Self::Close => RealtimeMessageClass::Critical,
+            Self::Outgoing(_) | Self::Json(_) | Self::Close => RealtimeMessageClass::Critical,
         }
     }
 }
@@ -506,10 +606,30 @@ impl RealtimeIncomingMessage {
                 }
             }
             // Other messages don't have user-provided content that needs size limits
+            RealtimeIncomingMessage::TaskAnswer { correction, .. } => {
+                let size = correction.as_ref().map_or(0, String::len);
+                if size > MAX_TEXT_SIZE {
+                    return Err(RealtimeValidationError::TextTooLarge {
+                        size,
+                        max: MAX_TEXT_SIZE,
+                    });
+                }
+            }
             RealtimeIncomingMessage::CreateResponse { .. }
             | RealtimeIncomingMessage::CancelResponse
             | RealtimeIncomingMessage::CommitAudio
-            | RealtimeIncomingMessage::ClearAudio => {}
+            | RealtimeIncomingMessage::ClearAudio
+            | RealtimeIncomingMessage::TaskCancel { .. }
+            | RealtimeIncomingMessage::TaskSeen { .. } => {}
+            RealtimeIncomingMessage::InteractionUpdate { patch } => {
+                let size = patch.to_string().len();
+                if size > MAX_TEXT_SIZE {
+                    return Err(RealtimeValidationError::TextTooLarge {
+                        size,
+                        max: MAX_TEXT_SIZE,
+                    });
+                }
+            }
         }
         Ok(())
     }
@@ -571,6 +691,7 @@ mod tests {
             session_id: "sess_123".to_string(),
             provider: "openai".to_string(),
             model: "gpt-4o-realtime-preview".to_string(),
+            interaction: None,
         };
 
         let json = serde_json::to_string(&msg).expect("Should serialize");

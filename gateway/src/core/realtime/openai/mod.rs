@@ -62,6 +62,8 @@
 //! ```
 
 mod client;
+// The session fields OpenAI's clones (Inworld, Yandex) take that OpenAI has not.
+pub(crate) mod clone;
 mod config;
 mod messages;
 // `pub(crate)` so the OpenAI-PROTOCOL CLONES (Azure / Grok / Inworld realtime)
@@ -70,8 +72,8 @@ pub(crate) mod protocol;
 
 pub use client::OpenAIRealtime;
 pub use config::{
-    Modality, OPENAI_REALTIME_SAMPLE_RATE, OPENAI_REALTIME_URL, OpenAIRealtimeAudioFormat,
-    OpenAIRealtimeModel, OpenAIRealtimeVoice,
+    Modality, OPENAI_REALTIME_DEFAULT_SUCCESSOR, OPENAI_REALTIME_SAMPLE_RATE, OPENAI_REALTIME_URL,
+    OpenAIRealtimeAudioFormat, OpenAIRealtimeModel, OpenAIRealtimeVoice, openai_realtime_default,
 };
 pub use messages::{
     ClientEvent, ConversationItem, ResponseConfig, ServerEvent, SessionConfig, TurnDetection,

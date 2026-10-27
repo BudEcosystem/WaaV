@@ -1,0 +1,13 @@
+{
+  "type": "config",
+  "provider": "gemini",
+  "model": "gemini-3.8-live",
+  "voice": "Kore",
+  "interaction": {
+    "regime": "auto",
+    "tasks": {"default_backend": "llm", "speculative_start": "auto"},
+    "speech": {"voice_mismatch": "confirmations_only", "claim_policy": "correct"},
+    "hitl": {"channels": ["voice", "client"]},
+    "events": {"claims": true, "tasks": true}
+  }
+}

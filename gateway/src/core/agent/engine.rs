@@ -32,7 +32,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 
-use super::brain::{AgentBrain, AgentEvent, AgentTurnRequest, Truncate, TurnFailure};
+use super::brain::{AgentBrain, AgentEvent, AgentTurnRequest, ClientExtras, Truncate, TurnFailure};
 use super::spoken::{SpeechRate, SpokenLedger};
 use super::text::{
     CodeFenceFilter, SpeakFieldExtractor, SpeechChunker, chunk_separator, transform_for_speech,
@@ -193,6 +193,14 @@ pub enum AgentSignal {
         item_id: String,
         name: String,
         status: &'static str,
+    },
+    /// A call to a function the session declared: the client runs it.
+    FunctionCall {
+        turn: u64,
+        item_id: String,
+        call_id: String,
+        name: String,
+        arguments: String,
     },
     /// A structured-output agent's JSON (D-13).
     Output {
@@ -426,6 +434,8 @@ pub struct AgentEngine {
     manual_input: Mutex<String>,
     /// The client's choice of manual turns (GA `turn_detection: null`), over the agent's.
     manual_override: Mutex<Option<bool>>,
+    /// What the session adds to the agent's runs; its items go with the next run.
+    extras: Mutex<ClientExtras>,
     /// Segmented sessions: the latest caller turn whose final transcript was handled, so a client
     /// commit waits for the transcript of the turn it sealed instead of a fixed sleep.
     final_turn: tokio::sync::watch::Sender<u64>,
@@ -484,6 +494,7 @@ impl AgentEngine {
             closed: AtomicBool::new(false),
             manual_input: Mutex::new(String::new()),
             manual_override: Mutex::new(None),
+            extras: Mutex::new(ClientExtras::default()),
             final_turn: tokio::sync::watch::channel(0).0,
         })
     }
@@ -630,6 +641,22 @@ impl AgentEngine {
         self.cfg.lock().text_only = text_only;
     }
 
+    /// GA `session.tools`: functions the client runs itself. A call to one is signalled as
+    /// [`AgentSignal::FunctionCall`]; its output comes back through [`Self::add_input`].
+    pub fn set_client_tools(&self, tools: Vec<Value>) {
+        self.extras.lock().tools = tools;
+    }
+
+    /// GA `session.instructions`, sent with every run from now on.
+    pub fn set_instructions(&self, instructions: Option<String>) {
+        self.extras.lock().instructions = instructions;
+    }
+
+    /// An input item for the next run: a client tool's output, a system note.
+    pub fn add_input(&self, item: Value) {
+        self.extras.lock().items.push(item);
+    }
+
     pub fn has_active_turn(&self) -> bool {
         self.turn.lock().is_some()
     }
@@ -737,6 +764,13 @@ impl AgentEngine {
     /// A turn still running is ended first — as a barge-in, so its reply is truncated to what was
     /// heard. Turns never overlap on one conversation (FR-TURN-2).
     pub async fn start_turn(self: &Arc<Self>, input: String) {
+        self.respond(input, None).await;
+    }
+
+    /// Run an agent turn the client asked for (GA `response.create`): over `input`, which may
+    /// be empty when items wait in [`Self::add_input`] or `instructions` say what to do, and
+    /// with `instructions` in place of the session's for this run only.
+    pub async fn respond(self: &Arc<Self>, input: String, instructions: Option<String>) {
         if self.is_closed() {
             return;
         }
@@ -769,7 +803,11 @@ impl AgentEngine {
         let span = tracing::Span::current();
         let turn_shared = Arc::clone(&shared);
         let run = tokio::spawn(tracing::Instrument::instrument(
-            async move { engine.run_turn(id, token, turn_shared, input).await },
+            async move {
+                engine
+                    .run_turn(id, token, turn_shared, input, instructions)
+                    .await
+            },
             span,
         ));
         // A bug that panics the turn must not wedge the session (no `response.done`, the turn
@@ -964,35 +1002,37 @@ impl AgentEngine {
         token: CancellationToken,
         shared: Arc<Mutex<TurnShared>>,
         input: String,
+        instructions: Option<String>,
     ) {
         let started = Instant::now();
         let (cfg, text_only) = {
             let c = self.cfg.lock();
             (c.clone(), c.text_only)
         };
-        // D-19: an agent turn is the ROOT of its own trace; budgateway and budprompt continue it.
-        let span = crate::voice_turn_span!(parent: None, capability = "agent_turn", transport = "websocket");
+        let span = agent_turn_span(&cfg, id, &input);
         let _end = EndSpanOnDrop(span.clone());
-        {
-            use crate::observability::voice_attrs::{realtime, turn};
-            span.record(turn::SESSION_ID, cfg.session_id.as_str());
-            span.record(turn::TURN_INDEX, id);
-            span.record(turn::ENDPOINT_NAME, cfg.prompt_name.as_str());
-            if let Some(p) = cfg.entry.project_id.as_deref() {
-                span.record(turn::PROJECT_ID, p);
+        let extras = {
+            let mut session = self.extras.lock();
+            ClientExtras {
+                tools: session.tools.clone(),
+                instructions: instructions.or_else(|| session.instructions.clone()),
+                items: std::mem::take(&mut session.items),
             }
-            span.record(realtime::COMPONENT, "agent");
-            if crate::observability::trace_redact::capture_content() {
-                span.record(
-                    turn::TRANSCRIPT,
-                    crate::observability::trace_redact::sanitize_body(&input).as_str(),
-                );
-            }
-        }
+        };
+        // The functions the client runs, by name.
+        let client_tools: Vec<String> = extras
+            .tools
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+            .map(str::to_string)
+            .collect();
+        // A run with no words of the caller is the client's own: there is no input to show.
+        let injected =
+            input.is_empty() && (extras.instructions.is_some() || !extras.items.is_empty());
         self.signal(AgentSignal::ResponseStarted {
             turn: id,
             kind: TurnKind::Agent,
-            input: Some(input.clone()),
+            input: (!injected).then(|| input.clone()),
         });
 
         let truncate = self.pending_truncate.lock().take();
@@ -1005,40 +1045,16 @@ impl AgentEngine {
             truncate: truncate.clone(),
             session_id: cfg.session_id.clone(),
             turn_index: id,
+            extras,
         };
         let bearer = self.credential.current();
-        let traceparent = traceparent_of(&span);
         let epoch = self.speech.clear_epoch();
 
         let mut filler = FillerCursor::default();
         let mut ticker = tokio::time::interval(TICK);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        // A request that never reached the agent is tried again (bounded, with backoff) before the
-        // caller hears the degradation message: no run exists yet, so nothing can be duplicated.
-        let open = async {
-            let mut attempt = 0;
-            loop {
-                let r = tokio::select! {
-                    biased;
-                    _ = token.cancelled() => None,
-                    r = tracing::Instrument::instrument(self.backend.open(&request, &bearer, traceparent.as_deref()), span.clone()) => Some(r),
-                };
-                match r {
-                    Some(Err(f)) if f.retryable() && attempt < OPEN_RETRY_BACKOFF.len() => {
-                        let wait = OPEN_RETRY_BACKOFF[attempt];
-                        attempt += 1;
-                        debug!(turn = id, attempt, error = %f.message(), "agent request did not reach the agent; retrying");
-                        tokio::select! {
-                            biased;
-                            _ = token.cancelled() => break None,
-                            _ = tokio::time::sleep(wait) => {}
-                        }
-                    }
-                    other => break other,
-                }
-            }
-        };
+        let open = open_turn(&self.backend, &request, &bearer, &span, &token);
         tokio::pin!(open);
         // The wait for budprompt to answer at all is the caller's wait too (it lists an agent's
         // tools before it streams): the fillers run on the same schedule while it lasts.
@@ -1059,12 +1075,14 @@ impl AgentEngine {
         let mut stream = match opened {
             None => {
                 self.restore_truncate(truncate);
+                self.restore_items(request.extras.items.clone());
                 self.finish(id, &shared, TurnStatus::Cancelled, None);
                 return;
             }
             Some(Err(failure)) => {
                 // budprompt never saw this request: the truncate it carried still applies.
                 self.restore_truncate(truncate);
+                self.restore_items(request.extras.items.clone());
                 record_failure(&span, &failure);
                 self.on_failure(id, &shared, epoch, &failure, text_only)
                     .await;
@@ -1138,6 +1156,11 @@ impl AgentEngine {
                             work = None;
                         }
                     }
+                    // A function of the client's own is announced when its call is written.
+                    Some(Ok(AgentEvent::ToolStarted { name, .. })) if client_tools.contains(&name) => {}
+                    Some(Ok(AgentEvent::FunctionCall { item_id, name, call_id, arguments, .. })) if client_tools.contains(&name) => {
+                        self.signal(AgentSignal::FunctionCall { turn: id, item_id, call_id, name, arguments });
+                    }
                     Some(Ok(AgentEvent::ToolStarted { item_id, name, .. })) => {
                         // The text before a tool call is a finished thought ("Let me check."): say it
                         // now. Held, it would be heard after the tool's fillers, run into the answer.
@@ -1157,7 +1180,10 @@ impl AgentEngine {
                         }
                         tools.insert(item_id, (name, Instant::now(), false));
                     }
-                    Some(Ok(AgentEvent::ToolFinished { item_id, name, ok })) => {
+                    Some(Ok(
+                        AgentEvent::ToolFinished { item_id, name, ok }
+                        | AgentEvent::FunctionCall { item_id, name, ok, .. },
+                    )) => {
                         tools.remove(&item_id);
                         self.signal(AgentSignal::Tool { turn: id, item_id, name, status: if ok { "completed" } else { "failed" } });
                     }
@@ -1505,6 +1531,11 @@ impl AgentEngine {
         }
     }
 
+    /// Input items of a request that never reached the agent wait for the next run again.
+    fn restore_items(&self, items: Vec<Value>) {
+        self.extras.lock().items.splice(0..0, items);
+    }
+
     fn restore_truncate(&self, truncate: Option<Truncate>) {
         if let Some(t) = truncate {
             let mut pending = self.pending_truncate.lock();
@@ -1628,6 +1659,68 @@ impl AgentEngine {
     }
 }
 
+/// The `voice.turn` span of one agent turn: who was asked what, in which session.
+///
+/// D-19: an agent turn is the ROOT of its own trace; budgateway and budprompt continue it.
+pub(crate) fn agent_turn_span(cfg: &AgentSessionConfig, turn: u64, input: &str) -> tracing::Span {
+    use crate::observability::voice_attrs::{realtime, turn as attr};
+    let span =
+        crate::voice_turn_span!(parent: None, capability = "agent_turn", transport = "websocket");
+    span.record(attr::SESSION_ID, cfg.session_id.as_str());
+    span.record(attr::TURN_INDEX, turn);
+    span.record(attr::ENDPOINT_NAME, cfg.prompt_name.as_str());
+    if let Some(p) = cfg.entry.project_id.as_deref() {
+        span.record(attr::PROJECT_ID, p);
+    }
+    span.record(realtime::COMPONENT, "agent");
+    if crate::observability::trace_redact::capture_content() {
+        span.record(
+            attr::TRANSCRIPT,
+            crate::observability::trace_redact::sanitize_body(input).as_str(),
+        );
+    }
+    span
+}
+
+/// A turn's stream of events.
+pub(crate) type TurnStream = BoxStream<'static, Result<AgentEvent, TurnFailure>>;
+
+/// Open a turn's stream inside its `voice.turn` span, so budgateway and budprompt continue its
+/// trace. `None` when `token` fired first.
+///
+/// A request that never reached the agent is tried again (bounded, with backoff) before the
+/// caller hears of a failure: no run exists yet, so nothing can be duplicated.
+pub(crate) async fn open_turn(
+    backend: &Arc<dyn TurnBackend>,
+    request: &AgentTurnRequest,
+    bearer: &str,
+    span: &tracing::Span,
+    token: &CancellationToken,
+) -> Option<Result<TurnStream, TurnFailure>> {
+    let traceparent = traceparent_of(span);
+    let mut attempt = 0;
+    loop {
+        let r = tokio::select! {
+            biased;
+            _ = token.cancelled() => None,
+            r = tracing::Instrument::instrument(backend.open(request, bearer, traceparent.as_deref()), span.clone()) => Some(r),
+        };
+        match r {
+            Some(Err(f)) if f.retryable() && attempt < OPEN_RETRY_BACKOFF.len() => {
+                let wait = OPEN_RETRY_BACKOFF[attempt];
+                attempt += 1;
+                debug!(turn = request.turn_index, attempt, error = %f.message(), "agent request did not reach the agent; retrying");
+                tokio::select! {
+                    biased;
+                    _ = token.cancelled() => break None,
+                    _ = tokio::time::sleep(wait) => {}
+                }
+            }
+            other => break other,
+        }
+    }
+}
+
 /// Per-turn text pipeline state.
 struct Pump {
     /// When the turn started (end of the caller's speech, as the turn detector decided it).
@@ -1658,7 +1751,7 @@ fn normalized(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn record_failure(span: &tracing::Span, f: &TurnFailure) {
+pub(crate) fn record_failure(span: &tracing::Span, f: &TurnFailure) {
     span.record(
         crate::observability::voice_attrs::turn::ERROR_TYPE,
         f.code(),

@@ -501,12 +501,14 @@ impl STTResultProcessor {
     /// from THIS task (the caller-fires-callback contract is unchanged). Two
     /// racing forced paths can never both claim; a real speech_final that beat
     /// us bumped the generation, so our claim refuses.
-    async fn fire_forced_speech_final(
+    ///
+    /// Returns whether this call claimed the segment and fired the callback.
+    pub(super) async fn fire_forced_speech_final(
         speech_final_state: Arc<SyncRwLock<SpeechFinalState>>,
         segment_generation: usize,
         detection_method: &str,
         claimer_is_hard_timeout: bool,
-    ) {
+    ) -> bool {
         let claimed = {
             let mut state = speech_final_state.write();
             let generation_ok = state.fire_generation.load(Ordering::Relaxed) == segment_generation;
@@ -565,7 +567,9 @@ impl STTResultProcessor {
             forced_result.segment_transcript = Some(text);
             info!("Forcing speech_final via {}", detection_method);
             callback(forced_result).await;
+            return true;
         }
+        false
     }
 
     /// Discard the current segment entirely (TurnEvent::ResetAggregation,

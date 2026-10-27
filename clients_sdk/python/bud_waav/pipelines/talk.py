@@ -9,6 +9,7 @@ from ..types import (
     STTConfig, TTSConfig, STTResult, AudioEvent, FeatureFlags, AudioFeatures,
     DAGConfig, ConversationConfig, ReadySTT, SttWarning, VadEvent, VoiceAgentConfig,
 )
+from ..interaction import InteractionEvent
 from ..ws.session import (
     WebSocketSession,
     SessionMetrics,
@@ -65,7 +66,7 @@ class TalkEvent:
 
     type: str
     """Event type: transcript, bot_text, audio, warning, stt_warning, message,
-    error, playback_complete, turn_completed, vad_event, audio_end."""
+    error, playback_complete, turn_completed, vad_event, audio_end, interaction."""
 
     transcript: Optional[STTResult] = None
     """Transcript result (if type is 'transcript' or 'bot_text')."""
@@ -84,7 +85,11 @@ class TalkEvent:
 
     data: Optional[dict[str, Any]] = None
     """Raw data payload (for turn_completed, vad_event, audio_end, warning,
-    stt_warning)."""
+    stt_warning, interaction)."""
+
+    interaction: Optional[InteractionEvent] = None
+    """Typed interaction-mode event (if type is 'interaction'); see
+    :mod:`bud_waav.interaction`. Switch on ``event.interaction.type``."""
 
     stt_warning: Optional[SttWarning] = None
     """Typed mid-call speech-to-text warning (if type is 'stt_warning'). Never an
@@ -130,6 +135,7 @@ class BudTalk:
         conversation_config: Optional[ConversationConfig] = None,
         stream_id: Optional[str] = None,
         alias: Optional[str] = None,
+        interaction: Optional[Union[bool, dict[str, Any]]] = None,
         agent: Optional[Union[VoiceAgentConfig, str]] = None,
     ) -> "TalkSession":
         """
@@ -144,6 +150,8 @@ class BudTalk:
             audio_features: Audio features (turn detection, noise filter, VAD)
             dag_config: DAG routing configuration
             stream_id: Optional stream ID for session tracking
+            interaction: Interaction mode: ``True`` or an object of settings
+                (see :class:`~bud_waav.ws.session.WebSocketSession`)
             agent: A Bud voice agent (spec 025), by name or ``VoiceAgentConfig``. It decides both
                 speech legs; ``stt``/``tts`` then carry only the audio format.
 
@@ -205,6 +213,7 @@ class BudTalk:
             conversation_config=conversation_config,
             stream_id=stream_id,
             alias=alias,
+            interaction=interaction,
             agent=agent,
         )
 
@@ -220,6 +229,7 @@ class BudTalk:
         conversation_config: Optional[ConversationConfig] = None,
         stream_id: Optional[str] = None,
         alias: Optional[str] = None,
+        interaction: Optional[Union[bool, dict[str, Any]]] = None,
         agent: Optional[Union[VoiceAgentConfig, str]] = None,
     ) -> "TalkSession":
         """
@@ -249,6 +259,7 @@ class BudTalk:
             conversation_config=conversation_config,
             stream_id=stream_id,
             alias=alias,
+            interaction=interaction,
             agent=agent,
         )
         await session.connect()
@@ -272,6 +283,7 @@ class TalkSession:
         conversation_config: Optional[ConversationConfig] = None,
         stream_id: Optional[str] = None,
         alias: Optional[str] = None,
+        interaction: Optional[Union[bool, dict[str, Any]]] = None,
         agent: Optional[Union[VoiceAgentConfig, str]] = None,
     ):
         """
@@ -306,6 +318,7 @@ class TalkSession:
             conversation_config=conversation_config,
             stream_id=stream_id,
             alias=alias,
+            interaction=interaction,
             agent=agent,
         )
 
@@ -321,6 +334,7 @@ class TalkSession:
         self._session.on("vad_event", self._on_vad_event)
         self._session.on("audio_end", self._on_audio_end)
         self._session.on("config_warning", self._on_config_warning)
+        self._session.on("interaction", self._on_interaction)
         self._session.on("stt_warning", self._on_stt_warning)
 
     def _on_transcript(self, result: STTResult) -> None:
@@ -341,6 +355,10 @@ class TalkSession:
         self._emit("warning", warning)
         self._emit("event", event)
 
+    def _on_interaction(self, event: InteractionEvent) -> None:
+        """Pass on a typed interaction-mode event (protocol 1.1)."""
+        self._emit("interaction", event)
+        self._emit("event", TalkEvent(type="interaction", interaction=event))
     def _on_stt_warning(self, data: dict[str, Any]) -> None:
         """Surface a gateway ``stt_warning`` as a typed :class:`SttWarning`.
 
@@ -510,6 +528,37 @@ class TalkSession:
         """
         await self._session.sip_transfer(transfer_to)
 
+    @property
+    def interaction_settings(self) -> Optional[dict[str, Any]]:
+        """The resolved interaction-mode settings from ``ready`` (``None`` without the mode)."""
+        return self._session.interaction_settings
+
+    async def answer_task(
+        self,
+        request_id: str,
+        outcome: str = "accept",
+        value: Any = None,
+        correction: Optional[str] = None,
+    ) -> None:
+        """Answer a ``task_question`` (see :meth:`WebSocketSession.answer_task`)."""
+        await self._session.answer_task(request_id, outcome, value, correction)
+
+    async def cancel_task(self, task_id: str) -> None:
+        """Cancel a task (``task_cancel``)."""
+        await self._session.cancel_task(task_id)
+
+    async def mark_task_seen(self, task_id: str) -> None:
+        """The caller has read the task's result on the screen (``task_seen``)."""
+        await self._session.mark_task_seen(task_id)
+
+    async def update_interaction(self, patch: dict[str, Any]) -> None:
+        """Change interaction settings mid-session (``interaction_update``)."""
+        await self._session.update_interaction(patch)
+
+    async def report_playback(self, utterance_id: str, played_ms: int) -> None:
+        """Report how much of an utterance the client has played (``playback_position``)."""
+        await self._session.report_playback(utterance_id, played_ms)
+
     def get_metrics(self) -> SessionMetrics:
         """Get session metrics."""
         return self._session.get_metrics()
@@ -564,6 +613,10 @@ class TalkSession:
                 yield TalkEvent(type="stt_warning", stt_warning=SttWarning.from_wire(data), data=data)
             elif msg_type == "audio_end":
                 yield TalkEvent(type="audio_end", data=message.get("data"))
+            elif msg_type == "interaction":
+                yield TalkEvent(
+                    type="interaction", interaction=message["event"], data=message.get("data")
+                )
 
     async def __aenter__(self) -> "TalkSession":
         """Async context manager entry."""

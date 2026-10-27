@@ -34,12 +34,13 @@
 
 use bytes::Bytes;
 use serde_json::{Value, json};
-use std::sync::Arc;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::core::realtime::base::{
     FunctionCallRequest, RealtimeConfig, RealtimeError, RealtimeResponseOverride, RealtimeResult,
-    TranscriptRole,
+    RealtimeVerb, TranscriptRole, TurnDetectionConfig,
 };
 use crate::core::realtime::scaffold::{
     ConnectSpec, Inbound, OutFrame, ProtocolCaps, RealtimeProtocol, RealtimeTransportFactory,
@@ -92,6 +93,23 @@ pub struct UltravoxProtocol {
     /// session (each session owns its protocol); single-writer (the supervisor
     /// recv loop), `Atomic` only to satisfy `Send + Sync` on the stateless trait.
     was_speaking: AtomicBool,
+    /// Provider fix `ultravox_transcripts`: a transcript is `text` (the whole so far) or
+    /// `delta` (what is new) of the message `ordinal`; this is each open message's text.
+    transcripts: Option<Mutex<HashMap<i64, String>>>,
+    /// The call's id (`call_started.callId`): with the fix `ultravox_prior_call` a re-dial
+    /// creates its call with `?priorCallId=` so the new call keeps the conversation.
+    call_id: Mutex<Option<String>>,
+    /// Provider fix `setup_once`: the call is configured at creation only.
+    setup_once: bool,
+}
+
+/// `modelToolName` "Must match ^[a-zA-Z0-9_-]{1,64}$"
+/// (<https://docs.ultravox.ai/api-reference/calls/calls-post>).
+fn tool_name_ok(name: &str) -> bool {
+    (1..=64).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 impl UltravoxProtocol {
@@ -112,7 +130,6 @@ impl UltravoxProtocol {
     /// payload minimal and lets Ultravox apply its own defaults).
     pub fn create_call_body(&self, cfg: &RealtimeConfig) -> Value {
         let mut body = json!({
-            "model": self.model,
             "medium": {
                 "serverWebSocket": {
                     "inputSampleRate": INPUT_SAMPLE_RATE,
@@ -120,17 +137,137 @@ impl UltravoxProtocol {
                 }
             },
         });
+        // Fix `ultravox_default_model`: an unnamed model is left to Ultravox ("Currently
+        // defaults to ultravox-v0.7"); today the legacy alias `fixie-ai/ultravox` is sent.
+        if !(cfg.fix("ultravox_default_model") && cfg.model.trim().is_empty()) {
+            body["model"] = json!(self.model);
+        }
         if let Some(instr) = cfg.instructions.as_deref()
             && !instr.is_empty()
         {
             body["systemPrompt"] = json!(instr);
+        }
+        // Fix `ultravox_call_settings`: `temperature` ("between 0 and 1") and the end-of-turn
+        // silence as `vadSettings.turnEndpointDelay` ("0.384s" by default).
+        if cfg.fix("ultravox_call_settings") {
+            if let Some(t) = cfg.temperature {
+                body["temperature"] = json!(t.clamp(0.0, 1.0));
+            }
+            if let Some(TurnDetectionConfig::ServerVad {
+                silence_duration_ms: Some(ms),
+                ..
+            }) = &cfg.turn_detection
+            {
+                body["vadSettings"] =
+                    json!({ "turnEndpointDelay": format!("{:.3}s", f64::from(*ms) / 1000.0) });
+            }
         }
         if let Some(voice) = cfg.voice.as_deref()
             && !voice.is_empty()
         {
             body["voice"] = json!(voice);
         }
+        // Provider fix `ultravox_tools` (off until Ultravox's live probe; escape flag
+        // `ultravox_omit_tools`): the session's functions are declared, as client tools the
+        // gateway answers with `client_tool_result`. Without it they are silently dropped.
+        if cfg.fix("ultravox_tools")
+            && let Some(tools) = cfg.tools.as_ref().filter(|t| !t.is_empty())
+        {
+            body["selectedTools"] = tools.iter().map(selected_tool).collect();
+        }
         body
+    }
+}
+
+/// One function as a call-scoped client tool of the create-call body:
+/// `{"temporaryTool": {modelToolName, description, dynamicParameters: [{name, location:
+/// PARAMETER_LOCATION_BODY, schema, required}], client: {}}}`. Each top-level property of the
+/// function's JSON schema is one body parameter (client tools take body parameters only).
+/// Reference: <https://docs.ultravox.ai/api-reference/calls/calls-post> (`selectedTools`,
+/// `SelectedTool.temporaryTool`, `BaseToolDefinition`, `DynamicParameter`).
+fn selected_tool(tool: &crate::core::realtime::base::ToolDefinition) -> Value {
+    let schema = tool.function.parameters.as_ref();
+    let required: Vec<&str> = schema
+        .and_then(|s| s.get("required"))
+        .and_then(Value::as_array)
+        .map(|r| r.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let parameters: Vec<Value> = schema
+        .and_then(|s| s.get("properties"))
+        .and_then(Value::as_object)
+        .map(|props| {
+            props
+                .iter()
+                .map(|(name, schema)| {
+                    json!({
+                        "name": name,
+                        "location": "PARAMETER_LOCATION_BODY",
+                        "schema": schema,
+                        "required": required.contains(&name.as_str()),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut temporary = json!({
+        "modelToolName": tool.function.name,
+        "dynamicParameters": parameters,
+        "client": {},
+    });
+    if let Some(description) = &tool.function.description {
+        temporary["description"] = json!(description);
+    }
+    json!({ "temporaryTool": temporary })
+}
+
+impl UltravoxProtocol {
+    /// Fix `ultravox_transcripts`: "text: The full text of the transcript so far"; "delta:
+    /// The additional transcript text added since the last transcript message"; "Either this
+    /// or delta will be set, but not both"; `ordinal` orders the call's messages
+    /// (<https://docs.ultravox.ai/apps/datamessages>). An interim carries only what is new (the
+    /// driver accumulates interims); a final carries the message's whole text.
+    fn transcript(&self, value: &Value) -> Vec<S2sEvent> {
+        let Some(open) = &self.transcripts else {
+            return vec![S2sEvent::Ignore];
+        };
+        let ordinal = value
+            .get("ordinal")
+            .and_then(Value::as_i64)
+            .unwrap_or_default();
+        let role = match value.get("role").and_then(Value::as_str) {
+            Some("user") => TranscriptRole::User,
+            _ => TranscriptRole::Assistant,
+        };
+        let is_final = value.get("final").and_then(Value::as_bool).unwrap_or(false);
+        let Ok(mut open) = open.lock() else {
+            return vec![S2sEvent::Ignore];
+        };
+        let so_far = open.entry(ordinal).or_default();
+        let new = if let Some(text) = value.get("text").and_then(Value::as_str) {
+            let new = text
+                .strip_prefix(so_far.as_str())
+                .unwrap_or(text)
+                .to_string();
+            *so_far = text.to_string();
+            new
+        } else {
+            let delta = value.get("delta").and_then(Value::as_str).unwrap_or("");
+            so_far.push_str(delta);
+            delta.to_string()
+        };
+        let text = if is_final {
+            open.remove(&ordinal).unwrap_or_default()
+        } else if new.is_empty() {
+            return vec![S2sEvent::Ignore];
+        } else {
+            new
+        };
+        vec![S2sEvent::Transcript {
+            role,
+            text,
+            is_final,
+            item_id: Some(ordinal.to_string()),
+        }]
     }
 }
 
@@ -148,6 +285,11 @@ impl RealtimeProtocol for UltravoxProtocol {
         Ok(Self {
             model: Self::resolve_model(cfg),
             was_speaking: AtomicBool::new(false),
+            transcripts: cfg
+                .fix("ultravox_transcripts")
+                .then(|| Mutex::new(HashMap::new())),
+            call_id: Mutex::new(None),
+            setup_once: cfg.fix("setup_once"),
         })
     }
 
@@ -197,13 +339,42 @@ impl RealtimeProtocol for UltravoxProtocol {
             });
         }
 
+        // Fix `ultravox_tools`: a tool name Ultravox refuses would fail the whole create-call;
+        // the session is refused naming it instead.
+        if cfg.fix("ultravox_tools")
+            && let Some(bad) = cfg
+                .tools
+                .iter()
+                .flatten()
+                .find(|t| !tool_name_ok(&t.function.name))
+        {
+            return Err(RealtimeError::InvalidConfiguration(format!(
+                "Ultravox tool names must match ^[a-zA-Z0-9_-]{{1,64}}$: {:?} does not",
+                bad.function.name
+            )));
+        }
         // The REST create-call spec: POST the call config; the factory extracts
         // the `joinUrl` and connects it. Auth is the `X-API-Key` header on the
         // POST (NOT on the WS — the join url is pre-authed).
         let body = serde_json::to_string(&self.create_call_body(cfg))
             .map_err(|e| RealtimeError::SerializationError(e.to_string()))?;
+        // Fix `ultravox_prior_call`: a re-dial continues the call it replaces: "the new call
+        // will use the prior call's message history as its own initial_messages".
+        let prior = self
+            .call_id
+            .lock()
+            .ok()
+            .and_then(|id| id.clone())
+            .filter(|_| cfg.fix("ultravox_prior_call"));
+        let create_url = match prior {
+            Some(id) => format!(
+                "{ULTRAVOX_CREATE_CALL_URL}?priorCallId={}",
+                url::form_urlencoded::byte_serialize(id.as_bytes()).collect::<String>()
+            ),
+            None => ULTRAVOX_CREATE_CALL_URL.to_string(),
+        };
         Ok(ConnectSpec::RestThenWebSocket {
-            create_url: ULTRAVOX_CREATE_CALL_URL.to_string(),
+            create_url,
             headers: vec![("X-API-Key".to_string(), cfg.api_key.clone())],
             body,
             join_url_pointer: JOIN_URL_POINTER.to_string(),
@@ -218,6 +389,39 @@ impl RealtimeProtocol for UltravoxProtocol {
         // EMPTY: the entire call (model/voice/prompt/rates) is configured in the
         // REST create-call body, not via a WS message.
         Vec::new()
+    }
+
+    /// Fix `setup_once`: no data message changes the call's prompt, voice or tools (the
+    /// client messages are `user_text_message`, `forced_agent_message`, `client_tool_result`,
+    /// `set_output_medium`, `hang_up`, `ping`, `spawn_thread`); today the update is empty and
+    /// reported as applied.
+    fn session_update(
+        &self,
+        _old: &RealtimeConfig,
+        new: &RealtimeConfig,
+    ) -> Option<Vec<Self::Wire>> {
+        (!self.setup_once).then(|| self.build_session_config(new, None))
+    }
+
+    /// `forced_agent_message` {content}: "Text content the agent should speak"; a guided line
+    /// and context are `user_text_message` with `urgency` `immediate` ("Interrupts the agent if
+    /// speaking and starts a new generation immediately") and `later` ("considered during the
+    /// next natural generation without forcing a new generation"). No message stops the agent
+    /// (<https://docs.ultravox.ai/apps/datamessages>).
+    fn verb(&self, verb: &RealtimeVerb<'_>) -> Option<Vec<Self::Wire>> {
+        let wire = match *verb {
+            RealtimeVerb::SayExact(text) => {
+                json!({ "type": "forced_agent_message", "content": text })
+            }
+            RealtimeVerb::SayGuided(text) => {
+                json!({ "type": "user_text_message", "text": text, "urgency": "immediate" })
+            }
+            RealtimeVerb::AddContext(text) => {
+                json!({ "type": "user_text_message", "text": text, "urgency": "later" })
+            }
+            RealtimeVerb::StopOutput => return None,
+        };
+        Some(vec![UltravoxClientMsg::Json(wire)])
     }
 
     fn map_server_event(&self, raw: Inbound<'_>) -> Vec<S2sEvent> {
@@ -244,6 +448,18 @@ impl RealtimeProtocol for UltravoxProtocol {
             // `{"type":"transcript","role":"agent"|"user","text"/"delta":…,
             // "final":bool}`. agent ⇒ Assistant, user ⇒ User. The text is `text`
             // if present, else the incremental `delta`.
+            "transcript" if self.transcripts.is_some() && value.get("ordinal").is_some() => {
+                self.transcript(&value)
+            }
+            // The call's id, for a re-dial with `priorCallId`.
+            "call_started" => {
+                if let Some(id) = value.get("callId").and_then(Value::as_str)
+                    && let Ok(mut call) = self.call_id.lock()
+                {
+                    *call = Some(id.to_string());
+                }
+                vec![S2sEvent::Ignore]
+            }
             "transcript" => {
                 let role = match value.get("role").and_then(Value::as_str) {
                     Some("user") => TranscriptRole::User,
@@ -723,5 +939,270 @@ mod tests {
             })
             .is_empty()
         );
+    }
+
+    /// Provider fix `ultravox_tools`. Off: the create-call body is today's (the session's
+    /// functions are not declared). On: `selectedTools` lists each function as a call-scoped
+    /// client tool, per the create-call reference
+    /// (<https://docs.ultravox.ai/api-reference/calls/calls-post>): `temporaryTool` with
+    /// `modelToolName`, `description`, `dynamicParameters` (`location`
+    /// `PARAMETER_LOCATION_BODY`, the property's JSON `schema`, `required`) and `client: {}`.
+    #[test]
+    fn the_tools_fix_declares_the_sessions_functions_as_client_tools() {
+        use crate::core::realtime::base::{FunctionDefinition, ToolDefinition};
+        let cfg = RealtimeConfig {
+            tools: Some(vec![ToolDefinition {
+                tool_type: "function".into(),
+                function: FunctionDefinition {
+                    name: "waav_delegate".into(),
+                    description: Some("Hand it over.".into()),
+                    parameters: Some(json!({"type": "object",
+                        "properties": {"request": {"type": "string"}, "note": {"type": "string"}},
+                        "required": ["request"]})),
+                },
+            }]),
+            ..base_cfg()
+        };
+        let today = json!({
+            "model": "fixie-ai/ultravox",
+            "medium": {"serverWebSocket": {"inputSampleRate": 16000, "outputSampleRate": 24000}},
+            "systemPrompt": "You are helpful.",
+            "voice": "Mark",
+        });
+        assert_eq!(proto(&cfg).create_call_body(&cfg), today);
+        let on = RealtimeConfig {
+            provider_fixes: vec!["ultravox_tools".into()],
+            ..cfg
+        };
+        let body = proto(&on).create_call_body(&on);
+        let mut expected = today;
+        expected["selectedTools"] = json!([{"temporaryTool": {
+            "modelToolName": "waav_delegate",
+            "description": "Hand it over.",
+            "dynamicParameters": [
+                {"name": "note", "location": "PARAMETER_LOCATION_BODY",
+                 "schema": {"type": "string"}, "required": false},
+                {"name": "request", "location": "PARAMETER_LOCATION_BODY",
+                 "schema": {"type": "string"}, "required": true},
+            ],
+            "client": {},
+        }}]);
+        assert_eq!(body, expected);
+        // No functions: no `selectedTools`, even with the fix.
+        let bare = RealtimeConfig {
+            provider_fixes: vec!["ultravox_tools".into()],
+            ..base_cfg()
+        };
+        assert!(
+            proto(&bare)
+                .create_call_body(&bare)
+                .get("selectedTools")
+                .is_none()
+        );
+    }
+
+    fn with_fixes(fixes: &[&str], cfg: RealtimeConfig) -> RealtimeConfig {
+        RealtimeConfig {
+            provider_fixes: fixes.iter().map(|f| (*f).to_string()).collect(),
+            ..cfg
+        }
+    }
+
+    fn transcript_text(events: &[S2sEvent]) -> (String, bool, Option<String>) {
+        match events {
+            [
+                S2sEvent::Transcript {
+                    text,
+                    is_final,
+                    item_id,
+                    ..
+                },
+            ] => (text.clone(), *is_final, item_id.clone()),
+            other => panic!("expected one transcript, got {other:?}"),
+        }
+    }
+
+    /// `ultravox_transcripts`: `text` is the whole so far and `delta` what is new, per
+    /// `ordinal`; an interim carries what is new (the driver accumulates interims), a final
+    /// the message's whole text. Off: `text` then `delta` as they come.
+    #[test]
+    fn the_transcripts_fix_reads_text_and_delta_per_ordinal() {
+        let cfg = with_fixes(&["ultravox_transcripts"], base_cfg());
+        let p = proto(&cfg);
+        let frame = |field: &str, value: &str, fin: bool| {
+            format!(
+                r#"{{"type":"transcript","role":"agent","medium":"voice","{field}":"{value}","final":{fin},"ordinal":3}}"#
+            )
+        };
+        let run = |raw: String| transcript_text(&p.map_server_event(Inbound::Text(&raw)));
+        assert_eq!(
+            run(frame("text", "Hel", false)),
+            ("Hel".into(), false, Some("3".into()))
+        );
+        assert_eq!(
+            run(frame("text", "Hello", false)).0,
+            "lo",
+            "only what is new"
+        );
+        assert_eq!(run(frame("delta", " there", false)).0, " there");
+        assert_eq!(
+            run(frame("delta", "!", true)),
+            ("Hello there!".into(), true, Some("3".into())),
+            "a final that is only a delta logs the whole message"
+        );
+        let off = proto(&base_cfg());
+        let raw = frame("delta", "!", true);
+        assert_eq!(
+            transcript_text(&off.map_server_event(Inbound::Text(&raw))).0,
+            "!"
+        );
+    }
+
+    /// `setup_once`: a mid-session change is refused (no data message changes the call);
+    /// off, today's empty update.
+    #[test]
+    fn setup_once_refuses_a_mid_session_change() {
+        let on = with_fixes(&["setup_once"], base_cfg());
+        assert!(proto(&on).session_update(&on, &on).is_none());
+        assert_eq!(
+            proto(&base_cfg())
+                .session_update(&base_cfg(), &base_cfg())
+                .map(|w| w.len()),
+            Some(0)
+        );
+    }
+
+    /// `ultravox_prior_call`: after `call_started`, a re-dial creates the call with
+    /// `?priorCallId=` (the new call takes the prior call's history); off, a fresh call.
+    #[test]
+    fn the_prior_call_fix_continues_the_call_on_a_re_dial() {
+        let create_url =
+            |p: &UltravoxProtocol, cfg: &RealtimeConfig| match p.connect_spec(cfg).unwrap() {
+                ConnectSpec::RestThenWebSocket { create_url, .. } => create_url,
+                other => panic!("expected the REST create-call, got {other:?}"),
+            };
+        let started = r#"{"type":"call_started","callId":"3f6a1c9e-0d4b-4c35-9a52-6f2b0e7d8a11","mediumRestriction":["voice"]}"#;
+        let on = with_fixes(&["ultravox_prior_call"], base_cfg());
+        let p = proto(&on);
+        assert_eq!(
+            create_url(&p, &on),
+            ULTRAVOX_CREATE_CALL_URL,
+            "the first dial"
+        );
+        assert!(matches!(
+            p.map_server_event(Inbound::Text(started)).as_slice(),
+            [S2sEvent::Ignore]
+        ));
+        assert_eq!(
+            create_url(&p, &on),
+            format!("{ULTRAVOX_CREATE_CALL_URL}?priorCallId=3f6a1c9e-0d4b-4c35-9a52-6f2b0e7d8a11")
+        );
+        let off = proto(&base_cfg());
+        off.map_server_event(Inbound::Text(started));
+        assert_eq!(create_url(&off, &base_cfg()), ULTRAVOX_CREATE_CALL_URL);
+    }
+
+    /// `ultravox_default_model`: no model named, none sent ("Currently defaults to
+    /// ultravox-v0.7"); a named model is sent. Off: the legacy `fixie-ai/ultravox`.
+    #[test]
+    fn the_default_model_fix_leaves_an_unnamed_model_to_ultravox() {
+        let unnamed = RealtimeConfig {
+            model: String::new(),
+            ..base_cfg()
+        };
+        let on = with_fixes(&["ultravox_default_model"], unnamed.clone());
+        assert!(proto(&on).create_call_body(&on).get("model").is_none());
+        let named = with_fixes(&["ultravox_default_model"], base_cfg());
+        assert_eq!(
+            proto(&named).create_call_body(&named)["model"],
+            "fixie-ai/ultravox"
+        );
+        assert_eq!(
+            proto(&unnamed).create_call_body(&unnamed)["model"],
+            "fixie-ai/ultravox"
+        );
+    }
+
+    /// `ultravox_call_settings`: `temperature` (clamped to 0..1) and the server-VAD silence as
+    /// `vadSettings.turnEndpointDelay`; off, neither.
+    #[test]
+    fn the_call_settings_fix_sends_temperature_and_the_end_of_turn_delay() {
+        let cfg = RealtimeConfig {
+            temperature: Some(1.4),
+            turn_detection: Some(TurnDetectionConfig::ServerVad {
+                threshold: None,
+                prefix_padding_ms: None,
+                silence_duration_ms: Some(384),
+                create_response: None,
+                interrupt_response: None,
+            }),
+            ..base_cfg()
+        };
+        let on = with_fixes(&["ultravox_call_settings"], cfg.clone());
+        let body = proto(&on).create_call_body(&on);
+        assert_eq!(body["temperature"], json!(1.0));
+        assert_eq!(body["vadSettings"], json!({"turnEndpointDelay": "0.384s"}));
+        let body = proto(&cfg).create_call_body(&cfg);
+        assert!(body.get("temperature").is_none() && body.get("vadSettings").is_none());
+    }
+
+    /// `ultravox_tools`: a function name outside `^[a-zA-Z0-9_-]{1,64}$` refuses the session
+    /// before the create-call (Ultravox would refuse the whole call).
+    #[test]
+    fn the_tools_fix_refuses_a_tool_name_ultravox_refuses() {
+        use crate::core::realtime::base::{FunctionDefinition, ToolDefinition};
+        let tool = |name: &str| ToolDefinition {
+            tool_type: "function".into(),
+            function: FunctionDefinition {
+                name: name.into(),
+                description: None,
+                parameters: None,
+            },
+        };
+        let cfg = with_fixes(
+            &["ultravox_tools"],
+            RealtimeConfig {
+                tools: Some(vec![tool("lookup.order")]),
+                ..base_cfg()
+            },
+        );
+        assert!(matches!(
+            proto(&cfg).connect_spec(&cfg),
+            Err(RealtimeError::InvalidConfiguration(m)) if m.contains("lookup.order")
+        ));
+        let cfg = RealtimeConfig {
+            tools: Some(vec![tool("lookup_order-2")]),
+            ..cfg
+        };
+        assert!(proto(&cfg).connect_spec(&cfg).is_ok());
+    }
+
+    /// The verbs: `forced_agent_message` speaks exact words; guided lines and context are
+    /// `user_text_message` with `urgency` `immediate` and `later`; nothing stops the agent.
+    #[test]
+    fn the_verbs_are_the_documented_data_messages() {
+        let p = proto(&base_cfg());
+        let json_of = |verb: RealtimeVerb<'_>| match p.verb(&verb).as_deref() {
+            Some([UltravoxClientMsg::Json(v)]) => Some(v.clone()),
+            None => None,
+            other => panic!("one JSON message expected, got {other:?}"),
+        };
+        assert_eq!(
+            json_of(RealtimeVerb::SayExact("One moment.")),
+            Some(json!({"type": "forced_agent_message", "content": "One moment."}))
+        );
+        assert_eq!(
+            json_of(RealtimeVerb::SayGuided("Ask for the order number.")),
+            Some(
+                json!({"type": "user_text_message", "text": "Ask for the order number.", "urgency": "immediate"})
+            )
+        );
+        assert_eq!(
+            json_of(RealtimeVerb::AddContext("The order shipped today.")),
+            Some(
+                json!({"type": "user_text_message", "text": "The order shipped today.", "urgency": "later"})
+            )
+        );
+        assert_eq!(json_of(RealtimeVerb::StopOutput), None);
     }
 }

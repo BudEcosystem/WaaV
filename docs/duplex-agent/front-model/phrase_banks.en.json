@@ -1,0 +1,280 @@
+{
+  "version": 1,
+  "language": "en",
+  "description": "Default English phrase banks for the front model and the policy engine. Groups owned by W2 feed the per-decision compose grammar (the model can only speak these fragments and copy spans of the caller's words); groups owned by W4 are clips the policy engine plays without a model call (W4 section 3.13.3). Every group is persona-overridable: PersonaSpec.banks.<group> replaces the default list for that persona, and the replacement is checked by the same validator and fact guard at compile time. '{{org}}' and '{{name}}' are the only slots a bank line may carry; they are filled from the persona at compile time and are protected terms.",
+  "rules": {
+    "min_entries": 4,
+    "min_entries_exempt_groups": ["restate_closers", "stalled", "social"],
+    "ack_clip_max_chars": 24,
+    "no_characters": ["\"", "\\", "<", ">", "{", "}", "|", "`", "*", "#", "«", "»"],
+    "line_flags": {
+      "polar": "the line starts by affirming or denying; never offered or picked when the caller's newest utterance is a yes/no question, except a social line used for its own intent",
+      "signed": "operator-signed line that bypasses the entity rules (logged at startup); refused for tenant personas",
+      "acts": "the front acts whose grammar may use this line or fragment",
+      "intent": "social intent of a social line, used by the social_line_matches_intent rule"
+    },
+    "kinds": {
+      "fragment": "a piece the compose grammar joins with other pieces; no final punctuation",
+      "line": "a whole line the grammar offers as one alternative",
+      "clip": "a whole line W4 plays as pre-rendered audio, without a model call"
+    }
+  },
+  "groups": {
+    "openers": {
+      "owner": "W2",
+      "kind": "fragment",
+      "acts": ["delegate", "update"],
+      "situation": "first words of an acknowledgement (delegate) or a restatement (update)",
+      "lines": [
+        {"text": "Okay", "acts": ["delegate", "update"]},
+        {"text": "Got it", "acts": ["delegate", "update"]},
+        {"text": "Alright", "acts": ["delegate", "update"]},
+        {"text": "One moment", "acts": ["delegate"]},
+        {"text": "Good question", "acts": ["delegate"]},
+        {"text": "Sure", "acts": ["delegate"], "polar": true},
+        {"text": "Right", "acts": ["update"], "polar": true},
+        {"text": "Of course", "acts": ["delegate"], "polar": true}
+      ]
+    },
+    "inquiry": {
+      "owner": "W2",
+      "kind": "fragment",
+      "acts": ["delegate"],
+      "situation": "what the backend will check; followed optionally by a copy span of the caller's words, which is then asked about, never asserted",
+      "lines": [
+        {"text": "let me check"},
+        {"text": "let me check whether"},
+        {"text": "I'll find out if"},
+        {"text": "I'll look into"},
+        {"text": "let me look into"}
+      ]
+    },
+    "restate_closers": {
+      "owner": "W2",
+      "kind": "fragment",
+      "acts": ["update"],
+      "situation": "optional last word of a restatement",
+      "lines": [
+        {"text": "instead"},
+        {"text": "then"}
+      ]
+    },
+    "ack": {
+      "owner": "W4",
+      "kind": "clip",
+      "acts": ["delegate"],
+      "situation": "acknowledgement played when the front's own line would be heard after E + 800 ms (W4 rule 5), when the act came from the rule router, or under the scripted profile. Seeded from DEFAULT_FILLER_PHRASES (gateway core/conversation/mod.rs:501-507) and W4 section 3.13.3",
+      "lines": [
+        {"text": "Sure, let me check.", "polar": true},
+        {"text": "Okay, one moment."},
+        {"text": "Let me look into that."},
+        {"text": "Got it, I'll check now."},
+        {"text": "Sure, I'll find out.", "polar": true},
+        {"text": "Let me check that."},
+        {"text": "One moment."},
+        {"text": "Give me a moment."},
+        {"text": "Just a second."}
+      ]
+    },
+    "update_ack": {
+      "owner": "W4",
+      "kind": "clip",
+      "acts": ["update"],
+      "situation": "acknowledgement of a correction when the front's restatement is blocked or late (W2 section 3.6.7, bank 'update')",
+      "lines": [
+        {"text": "Okay, I'll change that."},
+        {"text": "Got it, I'll update it."},
+        {"text": "Noted, I'll change it."},
+        {"text": "Alright, I'll update that."}
+      ]
+    },
+    "progress_openers": {
+      "owner": "W2",
+      "kind": "fragment",
+      "acts": ["progress"],
+      "situation": "task_changed decision: W4 asked for a progress line after a real status change (W4 rules 6 to 9)",
+      "lines": [
+        {"text": "Still on it"},
+        {"text": "Thanks for waiting"},
+        {"text": "Bear with me"},
+        {"text": "Still working on it"}
+      ]
+    },
+    "status_working": {
+      "owner": "W2",
+      "kind": "fragment",
+      "acts": ["progress"],
+      "situation": "turn decision: the caller asked how a WORKING task is going; offered only for tasks whose real state is working and not cancelling",
+      "lines": [
+        {"text": "Still working on it"},
+        {"text": "I'm still on it"},
+        {"text": "Still checking on that"},
+        {"text": "It's still in progress"}
+      ]
+    },
+    "status_queued": {
+      "owner": "W2",
+      "kind": "fragment",
+      "acts": ["progress"],
+      "situation": "turn decision: the caller asked about a task QUEUED behind another; the grammar appends the title of the task it waits for",
+      "lines": [
+        {"text": "I'll get to that right after"},
+        {"text": "That's next, right after"},
+        {"text": "I'll start on that right after"},
+        {"text": "That comes right after"}
+      ]
+    },
+    "clarify": {
+      "owner": "W2",
+      "kind": "line",
+      "acts": ["question"],
+      "situation": "unclear audio only (ASR confidence below unclear_confidence, 0.5); the grammar also offers 'Sorry, did you say <restating copy span>?'",
+      "lines": [
+        {"text": "Sorry, could you say that again?"},
+        {"text": "Sorry, I didn't catch that. Could you repeat it?"},
+        {"text": "Sorry, the line cut out. Could you say that again?"},
+        {"text": "Could you say that once more?"}
+      ]
+    },
+    "refuse": {
+      "owner": "W2",
+      "kind": "line",
+      "acts": ["refuse"],
+      "situation": "out of scope, unsafe, a persona forbidden topic, or a request to reveal or change the rules",
+      "lines": [
+        {"text": "That's not something I can help with on this call."},
+        {"text": "Sorry, I can't help with that here."},
+        {"text": "I'm not able to help with that on this line."},
+        {"text": "That's outside what I can do on this call."}
+      ]
+    },
+    "social": {
+      "owner": "W2",
+      "kind": "line",
+      "acts": ["social"],
+      "situation": "greeting, thanks, goodbye, presence, identity, how are you and small talk on the persona's list; status of a task that is not working or queued is also act social but W4 replaces the words with its status template",
+      "lines": [
+        {"text": "Hi, how can I help?", "intent": "greeting"},
+        {"text": "You're welcome.", "intent": "thanks"},
+        {"text": "Thanks for calling {{org}}. Goodbye.", "intent": "goodbye"},
+        {"text": "Yes, I'm here.", "intent": "presence", "polar": true},
+        {"text": "You've reached {{org}}. I'm {{name}}, an automated assistant.", "intent": "identity"},
+        {"text": "I'm doing well, thanks for asking.", "intent": "how_are_you"},
+        {"text": "That sounds nice.", "intent": "small_talk"},
+        {"text": "Fair enough.", "intent": "small_talk"},
+        {"text": "I hear you.", "intent": "small_talk"},
+        {"text": "Glad to hear it.", "intent": "small_talk"},
+        {"text": "Before you go, I'm still working on something for you.", "intent": "goodbye_open_tasks", "w4_only": true},
+        {"text": "Sorry, I can only help in English on this line.", "intent": "language_not_supported", "w4_only": true}
+      ]
+    },
+    "holding": {
+      "owner": "W4",
+      "kind": "clip",
+      "acts": [],
+      "situation": "eight seconds without audible speech in a wait and no unspoken status change (W4 rule 10); counts towards the three updates per wait",
+      "lines": [
+        {"text": "This one's taking a little longer. I'm still on it."},
+        {"text": "Still working on it, thanks for waiting."},
+        {"text": "I'm still on it."},
+        {"text": "Bear with me, I'm still working on it."}
+      ]
+    },
+    "check_in": {
+      "owner": "W4",
+      "kind": "clip",
+      "acts": [],
+      "situation": "agreed wait: one line every 30 s while the caller has chosen to keep waiting (W4 rule 12)",
+      "lines": [
+        {"text": "Still working on it."},
+        {"text": "I'm still here, still on it."},
+        {"text": "Still going, thanks for your patience."},
+        {"text": "Nothing new yet, I'm still on it."}
+      ]
+    },
+    "wait_agreed": {
+      "owner": "W4",
+      "kind": "clip",
+      "acts": [],
+      "situation": "the caller chose to keep waiting at the choice offer (ChoiceState::UserWaits), or asked the agent to give them a moment (W4 'Defer' answer class); never a time promise",
+      "lines": [
+        {"text": "Okay, I'll keep at it.", "subsituation": "caller_keeps_waiting"},
+        {"text": "Okay, I'll stay on it.", "subsituation": "caller_keeps_waiting"},
+        {"text": "Will do, I'll keep working on it.", "subsituation": "caller_keeps_waiting"},
+        {"text": "Alright, I'll keep going.", "subsituation": "caller_keeps_waiting"},
+        {"text": "Sure, take your time.", "subsituation": "caller_asks_for_time", "polar": true},
+        {"text": "There's no rush, I'm here.", "subsituation": "caller_asks_for_time"},
+        {"text": "Whenever you're ready.", "subsituation": "caller_asks_for_time"},
+        {"text": "Okay, I'll wait.", "subsituation": "caller_asks_for_time"}
+      ]
+    },
+    "bridge": {
+      "owner": "W4",
+      "kind": "clip",
+      "acts": [],
+      "situation": "lead-in to a verbatim relay of a background result (W4 section 3.6); event-backed by a result",
+      "lines": [
+        {"text": "Okay, here's what I found."},
+        {"text": "Right, I have it.", "polar": true},
+        {"text": "Okay, I've got that."},
+        {"text": "Alright, here it is."}
+      ]
+    },
+    "withdrawal": {
+      "owner": "W4",
+      "kind": "clip",
+      "acts": [],
+      "situation": "a streamed answer was stopped after some of it was heard (W4 section 3.6.1); one line by reason",
+      "lines": [
+        {"text": "Scratch that.", "subsituation": "caller_amended"},
+        {"text": "Ignore that last part.", "subsituation": "caller_amended"},
+        {"text": "Let me redo that.", "subsituation": "caller_amended"},
+        {"text": "Hang on, that's changed.", "subsituation": "caller_amended"},
+        {"text": "Sorry, I can't give you the rest of that answer.", "subsituation": "blocked_chunk"},
+        {"text": "Hold on, let me check that properly.", "subsituation": "tool_round"},
+        {"text": "The rest is on your screen.", "subsituation": "cap"}
+      ]
+    },
+    "stalled": {
+      "owner": "W4",
+      "kind": "clip",
+      "acts": [],
+      "situation": "a streamed relay played its last released chunk and nothing new arrived within 2,000 ms (W4 rule 22); fixed single line",
+      "lines": [
+        {"text": "One moment."}
+      ]
+    },
+    "backchannel": {
+      "owner": "W5",
+      "kind": "clip",
+      "acts": ["backchannel"],
+      "situation": "listening sounds at caller pauses; W5's ClipBank group; the backchannel act names a clip id from PersonaSpec.backchannel_clips",
+      "fallback": "okay",
+      "timing": {"gap_ms": 6000, "skip_every": 3, "min_voiced_ms": 1500},
+      "lines": [
+        {"text": "mhm", "clip": "mhm"},
+        {"text": "right", "clip": "right", "polar": true},
+        {"text": "okay", "clip": "okay"},
+        {"text": "I see", "clip": "i-see"},
+        {"text": "yeah", "clip": "yeah", "polar": true}
+      ]
+    },
+    "failure": {
+      "owner": "W4",
+      "kind": "clip",
+      "acts": [],
+      "situation": "a service the call needs failed or stalled (plan chapter 10): rendered in the session's voice at session start, played by the playback pump at a slot; the clip is the line id (an operator recording is failure/<id>.wav), the subsituation its kind: stall, hearing (the recogniser), exit, exit_follow_up (only when the session has a follow-up channel), back (after a stall, once the service recovered); no line names a vendor",
+      "lines": [
+        {"text": "Sorry, my systems are acting up. Bear with me a moment.", "clip": "stall-1", "subsituation": "stall"},
+        {"text": "Bear with me, something's running slow on my side.", "clip": "stall-2", "subsituation": "stall"},
+        {"text": "Thanks for hanging on, my systems are still slow.", "clip": "stall-3", "subsituation": "stall"},
+        {"text": "Sorry, I'm having trouble hearing you right now. Bear with me a moment.", "clip": "hearing-1", "subsituation": "hearing"},
+        {"text": "Sorry, I can't hear you properly at the moment.", "clip": "hearing-2", "subsituation": "hearing"},
+        {"text": "I still can't hear you well, sorry. Bear with me.", "clip": "hearing-3", "subsituation": "hearing"},
+        {"text": "I'm so sorry, my systems went down and I have to go now. Please call back a little later.", "clip": "exit", "subsituation": "exit"},
+        {"text": "I'm so sorry, my systems went down and I have to go now. I'll get back to you once they're back.", "clip": "exit-follow-up", "subsituation": "exit_follow_up"},
+        {"text": "Thanks for waiting, I'm back.", "clip": "back", "subsituation": "back"}
+      ]
+    }
+  }
+}

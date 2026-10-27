@@ -565,7 +565,7 @@ paths:
         required: true
       responses:
         '200':
-          description: Audio generated successfully
+          description: Audio, sent as it is synthesised (chunked, no Content-Length), so the first bytes do not wait for the whole synthesis; a `wav` request is answered whole, with Content-Length. An error after the first bytes ends the response early
           headers:
             x-audio-format:
               schema:
@@ -580,11 +580,337 @@ paths:
           content:
             audio/pcm: {}
         '400':
-          description: Invalid request (empty text)
+          description: 'Invalid request (empty text), or the vendor refused it (an unknown voice): the vendor''s message'
+        '401':
+          description: The vendor refused the key (its message); also 403
+        '429':
+          description: 'The vendor rate-limited the request: its message, and `Retry-After` when the vendor gave one'
         '500':
           description: TTS synthesis failed
+        '502':
+          description: 'The vendor failed (a 5xx): its message'
+        '503':
+          description: 'This replica''s vendor connections stayed busy past the bounded wait; `Retry-After: 1`'
       security:
       - bearer_auth: []
+  /v1/interaction/memory/{subject}:
+    get:
+      tags:
+      - tasks
+      summary: '`GET /v1/interaction/memory/{subject}`'
+      description: |-
+        Everything kept about one of the tenant's callers, newest first: what `PUT` wrote and what
+        the background added after calls. Needs the server's `interaction.caller_memory_key`.
+      operationId: get_memory
+      parameters:
+      - name: subject
+        in: path
+        description: The caller, as the `sub` of the identity token
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: '`{"facts": [...]}`: empty when nothing is kept'
+          content:
+            application/json:
+              schema:
+                type: object
+        '404':
+          description: This server keeps no caller memory
+        '503':
+          description: '`{"error"}`: the task Redis did not answer'
+      security:
+      - bearer_auth: []
+    put:
+      tags:
+      - tasks
+      summary: '`PUT /v1/interaction/memory/{subject}`'
+      description: |-
+        What is known about one of the tenant's callers, for later calls: at most ten facts of at
+        most 80 characters, with no number, code, address, amount or link, the most important
+        first. It replaces what was kept, an empty list forgets the caller, and it is kept for 90
+        days. A session reads the first three when it carries an identity token the operator signed
+        for that caller (`front.caller.identity_token`); after such a call the background may add
+        facts in front. Needs the server's `interaction.caller_memory_key`.
+      operationId: put_memory
+      parameters:
+      - name: subject
+        in: path
+        description: The caller, as the `sub` of the identity token
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: '`{"facts": [...]}`'
+        content:
+          application/json:
+            schema:
+              type: object
+        required: true
+      responses:
+        '204':
+          description: Kept
+        '404':
+          description: This server keeps no caller memory
+        '422':
+          description: '`{"error"}`: a fact that may not be kept'
+        '503':
+          description: '`{"error"}`: the task Redis did not take it'
+      security:
+      - bearer_auth: []
+  /v1/interaction/personas/{id}:
+    get:
+      tags:
+      - tasks
+      summary: '`GET /v1/interaction/personas/{id}`'
+      description: |-
+        One of the tenant's personas: the newest version, or the one `id@version` names, with the
+        numbers of the versions kept. Needs the server's `interaction.tenant_personas`.
+      operationId: get_persona
+      parameters:
+      - name: id
+        in: path
+        description: The persona's id, or `id@version` for a version the tenant still keeps
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: '`{"id", "version", "versions", "persona"}`: the version shown, every version kept (oldest first) and the persona object of that version'
+          content:
+            application/json:
+              schema:
+                type: object
+        '404':
+          description: This server does not take tenant personas, or the tenant has no such persona or version
+      security:
+      - bearer_auth: []
+    put:
+      tags:
+      - tasks
+      summary: '`PUT /v1/interaction/personas/{id}`'
+      description: |-
+        Registers a new version of one of the tenant's personas: the persona object of
+        `persona.schema.json`, checked like the packaged personas. A session of the tenant selects
+        it with `front.persona` (`id`, or `id@version`). Needs the server's
+        `interaction.tenant_personas`.
+      operationId: put_persona
+      parameters:
+      - name: id
+        in: path
+        description: 'The persona''s id: 1 to 64 letters, digits, `_`, `.` or `-`'
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: The persona (`persona.schema.json`); its `id` is the path's
+        content:
+          application/json:
+            schema:
+              type: object
+        required: true
+      responses:
+        '200':
+          description: '`{"id", "version"}`: the version registered (the newest five are kept)'
+        '404':
+          description: This server does not take tenant personas
+        '409':
+          description: The tenant keeps 20 personas already
+        '422':
+          description: '`{"error"}`: what the persona fails'
+      security:
+      - bearer_auth: []
+    delete:
+      tags:
+      - tasks
+      summary: '`DELETE /v1/interaction/personas/{id}`'
+      description: |-
+        Removes every version of one of the tenant's personas. A session that runs it keeps it to
+        its end; a session that selects it later gets the default persona. Needs the server's
+        `interaction.tenant_personas`.
+      operationId: delete_persona
+      parameters:
+      - name: id
+        in: path
+        description: The persona's id
+        required: true
+        schema:
+          type: string
+      responses:
+        '204':
+          description: Removed
+        '404':
+          description: This server does not take tenant personas, or the tenant has no such persona
+        '503':
+          description: '`{"error"}`: the task Redis did not take it'
+      security:
+      - bearer_auth: []
+  /v1/tasks:
+    get:
+      tags:
+      - tasks
+      summary: '`GET /v1/tasks`'
+      description: |-
+        Lists the tasks of the caller's sessions: the live ones, and finished ones for ten minutes.
+        With a task Redis these are the sessions of every gateway process that shares it.
+        A caller the gateway has no id for (authentication off, or an auth service that names
+        nobody) shares its owner key with every other such caller, so it gets only the session it
+        names with `stream_id`, and nothing without one.
+      operationId: list_tasks
+      parameters:
+      - name: stream_id
+        in: query
+        description: Only the tasks of this session; required when the request carries no authenticated id
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: '`{"tasks": [...]}`: each task''s id, ref, revision, title, state, cancelling flag, effects, open question, side-effects flag, start time, and its place in the task tree: `parent_id` (null for a caller''s request), `agent` (the catalog entry that runs it, the server''s tool for a call of an MCP server''s tool, or null) and `trace_id`; a follow-up also has `follows` (the finished task it continues)'
+          content:
+            application/json:
+              schema:
+                type: object
+      security:
+      - bearer_auth: []
+  /v1/tasks/events:
+    get:
+      tags:
+      - tasks
+      summary: '`GET /v1/tasks/events`'
+      description: |-
+        The caller's task events as server-sent events, from the moment of the request: each
+        `task_*` event of a session's socket (`task_created`, `task_progress`, `task_question`,
+        `task_answer_received`, `task_output`, `task_result`, `task_cancelled`) as one event named
+        after its `type`, with the session's `stream_id` added. Tasks that run on after their call
+        are included. Who may read is decided as for `GET /v1/tasks`. The events are those of the
+        tasks this gateway process runs.
+      operationId: task_events
+      parameters:
+      - name: stream_id
+        in: query
+        description: Only the events of this session; required when the request carries no authenticated id
+        required: false
+        schema:
+          type: string
+      - name: task_id
+        in: query
+        description: Only the events of this task
+        required: false
+        schema:
+          type: string
+      - name: parent_id
+        in: query
+        description: Only the events of this task's children
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: 'A `text/event-stream`: one event per task event, named after its `type` (`task_output` carries the whole result: `text`, `data`, `artifacts`, `effects`), with `stream_id`; `lagged` with the number of events missed when the reader fell behind'
+          content:
+            text/event-stream:
+              schema:
+                type: string
+      security:
+      - bearer_auth: []
+  /v1/tasks/{task_id}:
+    get:
+      tags:
+      - tasks
+      summary: '`GET /v1/tasks/{task_id}`'
+      description: |-
+        One task of the caller's, with the session it belongs to and, once it has ended, how:
+        `result` holds its `state`, its `summary` (the answer of a completed task, else what went
+        wrong) and its `effects`. The rule of `GET /v1/tasks` decides who may read it; a task the
+        caller may not read is answered like one that does not exist.
+      operationId: get_task
+      parameters:
+      - name: task_id
+        in: path
+        description: The task's id, as in `task_created`
+        required: true
+        schema:
+          type: string
+      - name: stream_id
+        in: query
+        description: The task's session; required when the request carries no authenticated id
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: The task as in `GET /v1/tasks`, with `stream_id` and `result` (`null` while it runs; else `state`, `summary` and `effects`)
+          content:
+            application/json:
+              schema:
+                type: object
+        '404':
+          description: No such task, or not the caller's
+      security:
+      - bearer_auth: []
+  /v1/tasks/{task_id}/callback:
+    post:
+      tags:
+      - tasks
+      summary: '`POST /v1/tasks/{task_id}/callback`'
+      description: |-
+        A webhook backend reports on a task it was given: the body is one event or a list of
+        events (`progress`, `effect`, `question`, `result`, `failed`, `cancelled`, `control`).
+        The request is signed like the gateway's own message to the webhook: `X-WaaV-Timestamp`
+        and `X-WaaV-Signature`, the HMAC-SHA256 of `"<timestamp>.<body>"` under the backend's
+        secret. An A2A agent's push notification for a task (a task, a message, or a status or
+        artifact update) comes to the same route with the token of the task's push configuration
+        in `X-A2A-Notification-Token`. The process that runs the task takes it.
+      operationId: task_callback
+      parameters:
+      - name: task_id
+        in: path
+        description: The `task_id` the webhook was given
+        required: true
+        schema:
+          type: string
+      - name: X-WaaV-Timestamp
+        in: header
+        description: Unix seconds, within five minutes of the gateway's clock
+        required: true
+        schema:
+          type: string
+      - name: X-WaaV-Signature
+        in: header
+        description: '`sha256=` and the hex HMAC-SHA256 of `<timestamp>.<body>` under the backend''s secret'
+        required: true
+        schema:
+          type: string
+      - name: X-A2A-Notification-Token
+        in: header
+        description: 'An A2A agent''s push: the token the gateway sent in the task''s `pushNotificationConfig` (in place of the two headers above)'
+        required: false
+        schema:
+          type:
+          - string
+          - 'null'
+      requestBody:
+        description: One event or a list of events
+        content:
+          application/json:
+            schema:
+              type: object
+        required: true
+      responses:
+        '202':
+          description: The events were handed to the task's run, or (with a task Redis) to the gateway process that runs it, which checks them as its own
+        '400':
+          description: The body is not an event or a list of events
+        '401':
+          description: The signature (or a push's token) is missing, wrong or too old, or the backend has no secret
+        '404':
+          description: No run of this process waits for that task, and no other process runs it
+        '409':
+          description: 'The task was revised since: the callback is of a replaced run'
+        '503':
+          description: 'Another gateway process runs the task but the task Redis did not take the callback: try again (Retry-After)'
   /voices:
     get:
       tags:
@@ -593,7 +919,12 @@ paths:
       operationId: list_voices
       responses:
         '200':
-          description: Available voices grouped by provider
+          description: 'Available voices grouped by provider. A configured vendor whose list could not be read is left out and named in the `x-voices-failed` header (`vendor: reason; ...`)'
+          headers:
+            x-voices-failed:
+              schema:
+                type: string
+              description: The vendors whose voice list failed, with their reason
           content:
             application/json:
               schema:
@@ -606,6 +937,8 @@ paths:
                   type: string
         '500':
           description: Internal server error
+        '502':
+          description: Every configured vendor refused or failed its voice list; the body names each vendor's reason
       security:
       - bearer_auth: []
 components:
@@ -1631,6 +1964,18 @@ components:
               description: |-
                 Optional DAG routing configuration for custom audio pipelines
                 When configured, audio flows through the DAG instead of direct STT→TTS
+          interaction:
+            description: |-
+              Interaction mode (protocol 1.1): `true` for the defaults, or an object of settings.
+              The agent then keeps the floor, acknowledges, runs the request as a background task
+              and relays its answer. Needs the server switch and a `conversation_config` (or
+              `interaction.tasks.llm`); otherwise the session runs without it and a
+              `config_warning` says why. The resolved settings are echoed on `ready`. On a
+              voice-agent session (`agent`) the agent's own entry or the operator sets the block,
+              and this value counts only where the agent lets a session override `interaction`.
+              With a `livekit` block the mode runs on the room's audio, hears one participant
+              (the first whose audio arrives) and also publishes its events in the room, on the
+              data topic `waav.interaction`.
           livekit:
             oneOf:
             - type: 'null'
@@ -1863,6 +2208,122 @@ components:
             type: string
             enum:
             - agent_input
+      - type: object
+        description: 'Interaction mode: the client''s answer to a `task_question` (a button instead of speech).'
+        required:
+        - request_id
+        - outcome
+        - type
+        properties:
+          correction:
+            type:
+            - string
+            - 'null'
+            description: 'With `decline`: what to change, in the user''s words.'
+          outcome:
+            $ref: '#/components/schemas/TaskAnswerOutcome'
+            description: A chosen option or a value is an `accept` with `value`.
+          request_id:
+            type: string
+            description: The `request_id` of the `task_question`.
+          type:
+            type: string
+            enum:
+            - task_answer
+          value:
+            description: 'With `accept`: the chosen option or the value asked for (any JSON).'
+      - type: object
+        description: 'Interaction mode: cancel a background task.'
+        required:
+        - task_id
+        - type
+        properties:
+          task_id:
+            type: string
+            description: The `task_id` of the `task_created` event.
+          type:
+            type: string
+            enum:
+            - task_cancel
+      - type: object
+        description: |-
+          Interaction mode: the caller has read a task's result on the screen (`task_output`),
+          so no spoken update of it is due any more.
+        required:
+        - task_id
+        - type
+        properties:
+          task_id:
+            type: string
+            description: The `task_id` of the `task_output`.
+          type:
+            type: string
+            enum:
+            - task_seen
+      - type: object
+        description: |-
+          Interaction mode: a conversation control (plan chapter 9), as from a "slower" button
+          or a language picker. The gateway answers with `control_applied`.
+        required:
+        - kind
+        - type
+        properties:
+          kind:
+            type: string
+            description: |-
+              One of `stop`, `hold`, `resume`, `repeat`, `not_heard`, `clarify`, `spell`, `rate`,
+              `volume`, `verbosity`, `language`, `voice`, `backchannels`, `updates`, `to_screen`,
+              `end`, `human`.
+          type:
+            type: string
+            enum:
+            - control
+          value:
+            type:
+            - string
+            - 'null'
+            description: |-
+              The kind's value: `slower`, `louder`, `brief`, `es`, `number`, `30` (a hold's
+              seconds) ... A `repeat` takes `slower` or `louder` (that line only); a `voice` one
+              or two of `male`, `female`, `young`, `old`, `american`, `british`, `australian`,
+              `irish`, `indian`.
+      - type: object
+        description: |-
+          Interaction mode: change `policy.*`, `duplex.*` (not `duplex.echo`), `events.*`,
+          `hitl.channels`, the caller's fields (`front.caller.*`) or `tasks.announce`
+          mid-session.
+        required:
+        - patch
+        - type
+        properties:
+          patch:
+            type: object
+            description: The settings to change, in the shape of `config.interaction`.
+          type:
+            type: string
+            enum:
+            - interaction_update
+      - type: object
+        description: |-
+          Interaction mode: how much of an utterance the client has played (at most four a
+          second). From the first one on, what the caller heard is what the client reports.
+        required:
+        - utterance_id
+        - played_ms
+        - type
+        properties:
+          played_ms:
+            type: integer
+            format: int64
+            description: Milliseconds of that utterance's audio the client has played.
+            minimum: 0
+          type:
+            type: string
+            enum:
+            - playback_position
+          utterance_id:
+            type: string
+            description: The `utterance_id` of the `audio_segment` or `assistant_transcript`.
       description: WebSocket message types for incoming messages
     IntensityLevel:
       type: string
@@ -2054,6 +2515,13 @@ components:
               egress. Present only when the client requested a non-default `tts_config.audio_out_codec`.
               Same downgrade semantics as [`Self::Ready::audio_in_codec`].
             example: opus
+          interaction:
+            type:
+            - object
+            - 'null'
+            description: |-
+              The resolved interaction-mode settings. Present only when the session runs
+              interaction mode; `protocol_version` is then `1.1`.
           livekit_room_name:
             type:
             - string
@@ -2128,6 +2596,14 @@ components:
             type: number
             format: float
             description: Confidence score (0.0 to 1.0)
+          detected_language:
+            type:
+            - string
+            - 'null'
+            description: |-
+              The language the recogniser heard, when it names one: a multilingual Deepgram
+              model (`language: "multi"`) gives a code such as `de`, OpenAI's Whisper a name such
+              as `german`. Skipped on the wire otherwise.
           is_final:
             type: boolean
             description: Whether this is the final version of the transcript
@@ -2504,6 +2980,35 @@ components:
             type: string
             enum:
             - agent_tool
+      - type: object
+        description: |-
+          Voice agent: a call to a function the session declared, for the client to run. Only
+          `/v1/realtime` lets a session declare one.
+        required:
+        - turn_index
+        - item_id
+        - call_id
+        - name
+        - arguments
+        - type
+        properties:
+          arguments:
+            type: string
+            description: The arguments, as the JSON text the agent wrote.
+          call_id:
+            type: string
+          item_id:
+            type: string
+          name:
+            type: string
+          turn_index:
+            type: integer
+            format: int64
+            minimum: 0
+          type:
+            type: string
+            enum:
+            - agent_function_call
       - type: object
         description: 'Voice agent: a structured-output agent''s JSON.'
         required:
@@ -3596,6 +4101,13 @@ components:
             ESCAPE HATCH: when set, this raw provider id is used VERBATIM and the
             [`Self::voice_descriptor`] resolution is skipped.
           example: aura-asteria-en
+    TaskAnswerOutcome:
+      type: string
+      description: What a client may answer a `task_question` with.
+      enum:
+      - accept
+      - decline
+      - cancel
     TokenRequest:
       type: object
       description: |-
@@ -4167,5 +4679,7 @@ tags:
   description: Recording download operations
 - name: sip
   description: SIP webhook configuration management
+- name: tasks
+  description: Interaction-mode background tasks
 - name: websocket
   description: WebSocket API for real-time communication

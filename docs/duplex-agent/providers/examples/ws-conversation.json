@@ -1,0 +1,19 @@
+{
+  "type": "config",
+  "stream_id": "6f1c2a9e-3b7d-4c55-9a0e-2d8f1b4e7c10",
+  "audio": true,
+  "stt_config": {"provider": "deepgram", "language": "en-US", "sample_rate": 16000, "channels": 1, "punctuation": true, "encoding": "linear16"},
+  "tts_config": {"provider": "elevenlabs", "voice_id": "EXAVITQu4vr4xnSDxMaL", "sample_rate": 24000},
+  "conversation_config": {"base_url": "https://llm.internal.example/v1", "model": "concierge-70b", "system_prompt": "You are the concierge for Rosa's restaurant group.", "streaming": true},
+  "interaction": {
+    "front": {
+      "persona": "rosa-concierge@2",
+      "caller": {"preferred_name": "Priya", "verbosity": "brief", "pace": "normal", "language": "en-US"}
+    },
+    "tasks": {"speculative_start": "auto"},
+    "policy": {"ack_due_ms": 300, "fast_answer_ms": 700},
+    "events": {"overlap": true},
+    "hitl": {"channels": ["voice", "client"]},
+    "duplex": {"barge_in": {"duck_on_bare_onset": "auto"}}
+  }
+}

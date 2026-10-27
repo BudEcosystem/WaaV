@@ -68,6 +68,11 @@ pub type SpeakObserver = Arc<dyn Fn(&str) + Send + Sync>;
 /// See [`VoiceManager::set_stt_final_observer`].
 pub type SttFinalObserver = Arc<dyn Fn(&str) + Send + Sync>;
 
+/// See [`VoiceManager::set_audio_tap`]. Returns whether the tap's owner sends the frame (or
+/// what it makes of it) to the speech-to-text itself; `false`: [`VoiceManager::receive_audio`]
+/// sends it.
+pub type AudioTap = Arc<dyn Fn(&Bytes) -> bool + Send + Sync>;
+
 /// VoiceManager provides a unified interface for managing STT and TTS providers
 /// Optimized for extreme low-latency with lock-free atomics and pre-allocated buffers
 pub struct VoiceManager {
@@ -96,6 +101,8 @@ pub struct VoiceManager {
     // Uses interior mutability so it can be initialized in start()
     #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
     smart_turn_processor: Arc<RwLock<Option<SmartTurnProcessor>>>,
+    /// [`Self::start`] leaves the processor to [`Self::start_smart_turn`].
+    smart_turn_deferred: AtomicBool,
     /// C-G5 ingress resampler: wire rate → the 16 kHz the VAD/smart-turn
     /// models require. Identity (zero work) for 16 kHz clients. The STT
     /// provider always receives the ORIGINAL bytes at the wire rate.
@@ -149,6 +156,18 @@ pub struct VoiceManager {
     /// a process-global env var.
     uninterruptible_playback: AtomicBool,
 
+    /// Interaction mode: when set before `on_tts_audio`, the playback pump is the
+    /// metered one and this control routes every TTS chunk into it. `None` (the
+    /// default) leaves both playback paths above exactly as they are.
+    metered_playback: SyncRwLock<Option<Arc<crate::core::audio::PumpControl>>>,
+    /// Interaction mode: sees every inbound audio frame before anything else.
+    audio_tap: SyncRwLock<Option<AudioTap>>,
+    /// Interaction mode's capture window of a sensitive value: the speech-to-text gets
+    /// silence of the same length, and every result an empty transcript.
+    stt_muted: Arc<AtomicBool>,
+    /// Interaction mode's echo canceller runs: the tap's owner sends the cancelled audio
+    /// ([`Self::send_stt_audio`]) in place of each frame the tap took.
+    stt_from_tap: Arc<AtomicBool>,
     /// Set on a segmented session: the fan-out of the engine's speech events, outcomes and
     /// notices, and the speech-time admission of caller turns.
     segmented: Option<Arc<super::segmented::SegmentedDispatch>>,
@@ -306,6 +325,7 @@ impl VoiceManager {
             turn_detector,
             #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
             smart_turn_processor: Arc::new(RwLock::new(None)), // Initialized in start() if configured
+            smart_turn_deferred: AtomicBool::new(false),
             #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
             ingress_resampler: Arc::new(
                 SyncRwLock::new(crate::core::audio::StreamResampler::new()),
@@ -322,6 +342,10 @@ impl VoiceManager {
             stt_final_observer: Arc::new(SyncRwLock::new(None)),
             playback_pump: Arc::new(SyncRwLock::new(None)),
             uninterruptible_playback: AtomicBool::new(uninterruptible_playback),
+            metered_playback: SyncRwLock::new(None),
+            audio_tap: SyncRwLock::new(None),
+            stt_muted: Arc::new(AtomicBool::new(false)),
+            stt_from_tap: Arc::new(AtomicBool::new(false)),
             per_utterance_interruptibility: per_utterance_interruptibility(
                 std::env::var(WAAV_PER_UTTERANCE_INTERRUPTIBILITY_ENV)
                     .ok()
@@ -346,6 +370,144 @@ impl VoiceManager {
     /// What a gateway-endpointed provider knows about itself, once started.
     pub async fn live_facts(&self) -> Option<crate::core::stt::speech_activity::SttLiveFacts> {
         self.stt.read().await.live_facts()
+    }
+
+    /// Interaction mode: meter TTS audio through the pump that `control` steers
+    /// (utterance tags, duck, pause, cut). Must be set BEFORE `on_tts_audio`
+    /// registers the egress callback; it takes precedence over A-G6.
+    pub fn set_metered_playback(&self, control: Option<Arc<crate::core::audio::PumpControl>>) {
+        *self.metered_playback.write() = control;
+    }
+
+    /// Interaction mode: hand every inbound audio frame to `tap` first in
+    /// [`Self::receive_audio`]. The tap runs on the audio hot path, so it must
+    /// return at once (a `try_send`).
+    pub fn set_audio_tap(&self, tap: Option<AudioTap>) {
+        *self.audio_tap.write() = tap;
+    }
+
+    /// Interaction mode's capture window: while `on`, the speech-to-text hears silence of
+    /// the same length as the caller's audio, and its results carry no words.
+    pub fn mute_stt(&self, on: bool) {
+        self.stt_muted.store(on, Ordering::Release);
+    }
+
+    pub fn stt_muted(&self) -> bool {
+        self.stt_muted.load(Ordering::Acquire)
+    }
+
+    /// The switch of [`Self::mute_stt`], for a result callback (which must not hold the
+    /// VoiceManager itself).
+    pub fn stt_mute_switch(&self) -> Arc<AtomicBool> {
+        self.stt_muted.clone()
+    }
+
+    /// Interaction mode's echo canceller: the switch that makes the tap's owner, not
+    /// [`Self::receive_audio`], feed the speech-to-text. Set it only while the tap takes
+    /// frames and its owner calls [`Self::send_stt_audio`] for them.
+    pub fn stt_from_tap(&self) -> Arc<AtomicBool> {
+        self.stt_from_tap.clone()
+    }
+
+    /// Audio for the speech-to-text alone (silence while muted).
+    pub async fn send_stt_audio(&self, audio: Bytes) -> VoiceManagerResult<()> {
+        let audio = if self.stt_muted() {
+            Bytes::from(vec![0u8; audio.len()])
+        } else {
+            audio
+        };
+        let mut stt = self.stt.write().await;
+        stt.send_audio(audio)
+            .await
+            .map_err(VoiceManagerError::STTError)
+    }
+
+    /// Interaction mode's `front.caller.pace`: the speaking rate of the next synthesis is
+    /// the session's own (`tts_config.speaking_rate`, else 1.0) times `factor`. `false` when
+    /// the provider takes no rate mid-session.
+    pub async fn set_speaking_rate_factor(&self, factor: f32) -> bool {
+        let base = self.config.tts_config.speaking_rate.unwrap_or(1.0);
+        self.tts.write().await.set_speaking_rate(base * factor)
+    }
+
+    /// Whether the speech provider takes a speaking rate mid-session.
+    pub async fn tts_takes_rate(&self) -> bool {
+        self.tts.read().await.takes_rate()
+    }
+
+    /// The voice of the syntheses that follow (a language switch); `false` when the provider
+    /// takes no voice mid-session.
+    pub async fn set_tts_voice(&self, voice: &str) -> bool {
+        self.tts.write().await.set_voice(voice)
+    }
+
+    /// A session that may run interaction mode, whose analyser loads the turn models
+    /// itself: [`Self::start`] does not load the smart-turn processor, and
+    /// [`Self::start_smart_turn`] loads it once the session runs without the mode.
+    pub fn defer_smart_turn(&self) {
+        self.smart_turn_deferred.store(true, Ordering::Relaxed);
+    }
+
+    /// Loads the smart-turn processor when the config asks for one and none is loaded.
+    pub async fn start_smart_turn(&self) -> VoiceManagerResult<()> {
+        #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
+        {
+            let Some(ref smart_turn_config) = self.config.smart_turn_config else {
+                return Ok(());
+            };
+            let mut smart_turn = self.smart_turn_processor.write().await;
+            if smart_turn.is_some() {
+                return Ok(());
+            }
+            debug!("Initializing SmartTurnProcessor...");
+            let processor = SmartTurnProcessor::new(smart_turn_config.clone())
+                .await
+                .map_err(|e| {
+                    VoiceManagerError::InitializationError(format!(
+                        "Failed to initialize SmartTurnProcessor: {}",
+                        e
+                    ))
+                })?;
+            *smart_turn = Some(processor);
+            debug!("SmartTurnProcessor initialized successfully");
+        }
+        Ok(())
+    }
+
+    /// Whether the smart-turn processor is loaded.
+    pub async fn smart_turn_loaded(&self) -> bool {
+        #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
+        {
+            self.smart_turn_processor.read().await.is_some()
+        }
+        #[cfg(not(any(feature = "silero-vad", feature = "smart-turn")))]
+        {
+            false
+        }
+    }
+
+    /// Interaction mode: drop the smart-turn processor (its own analyser runs
+    /// the models instead), so `receive_audio` only forwards audio.
+    pub async fn disable_smart_turn_processor(&self) {
+        #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
+        {
+            *self.smart_turn_processor.write().await = None;
+        }
+    }
+
+    /// The registered TTS completion callback, so a caller can chain onto it.
+    pub fn tts_complete_callback(&self) -> Option<TTSCompleteCallback> {
+        self.tts_complete_callback.read().clone()
+    }
+
+    /// The registered TTS error callback, so a caller can chain onto it.
+    pub fn tts_error_callback(&self) -> Option<TTSErrorCallback> {
+        self.tts_error_callback.read().clone()
+    }
+
+    /// The registered STT error callback, so a caller can chain onto it.
+    pub fn stt_error_callback(&self) -> Option<STTErrorCallback> {
+        self.stt_error_callback.read().clone()
     }
 
     /// A-G6: enable/disable uninterruptible playback (the metered pump path).
@@ -473,23 +635,8 @@ impl VoiceManager {
         }
 
         // Initialize Smart Turn Processor if configured
-        #[cfg(any(feature = "silero-vad", feature = "smart-turn"))]
-        {
-            if let Some(ref smart_turn_config) = self.config.smart_turn_config {
-                debug!("Initializing SmartTurnProcessor...");
-                let processor = SmartTurnProcessor::new(smart_turn_config.clone())
-                    .await
-                    .map_err(|e| {
-                        VoiceManagerError::InitializationError(format!(
-                            "Failed to initialize SmartTurnProcessor: {}",
-                            e
-                        ))
-                    })?;
-
-                let mut smart_turn = self.smart_turn_processor.write().await;
-                *smart_turn = Some(processor);
-                debug!("SmartTurnProcessor initialized successfully");
-            }
+        if !self.smart_turn_deferred.load(Ordering::Relaxed) {
+            self.start_smart_turn().await?;
         }
 
         // LOUD degradation (RC5): a session running without ANY ML end-of-turn
@@ -666,6 +813,14 @@ impl VoiceManager {
         // CRITICAL: Audio MUST always reach STT provider for real-time guarantees.
         // Smart turn processing is optional - skip if lock is busy to avoid blocking.
 
+        // Interaction mode's analyser tap (None ⇒ one cheap read, no work). The tap's owner
+        // may send the frame to the speech-to-text itself, off this loop (the echo canceller's
+        // audio, or a recogniser that waits must not hold the next frames back from the tap).
+        let stt_elsewhere = match self.audio_tap.read().as_ref() {
+            Some(tap) => tap(&audio),
+            None => false,
+        };
+
         // Per-frame profiling anchor (None ⇒ one cheap read, no work).
         let frame_observers = self.observers.read().clone();
         if let Some(obs) = &frame_observers {
@@ -744,11 +899,10 @@ impl VoiceManager {
 
         // Send audio to STT provider (zero-copy pass-through)
         // This ALWAYS happens regardless of smart turn processing result
-        let mut stt = self.stt.write().await;
-        stt.send_audio(audio)
-            .await
-            .map_err(VoiceManagerError::STTError)?;
-        Ok(())
+        if stt_elsewhere {
+            return Ok(());
+        }
+        self.send_stt_audio(audio).await
     }
 
     /// Convert raw audio bytes (16-bit PCM) to f32 samples normalized to [-1.0, 1.0]
@@ -837,6 +991,25 @@ impl VoiceManager {
         // counter was never incremented on the production conversation path.
         self.note_speak(text);
         tts.speak(text, flush)
+            .await
+            .map_err(VoiceManagerError::TTSError)?;
+        Ok(true)
+    }
+
+    /// Interaction mode's warm-up: synthesise `text` into the TTS cache under the
+    /// same epoch gate as [`Self::speak_if_epoch`]. Nobody hears it, so it is no
+    /// turn's synthesis request and the RT6 speak observer (the caller's TTS
+    /// leg) is not told; the D-G9 cost proxy still counts the request.
+    pub async fn warm_if_epoch(&self, text: &str, epoch: usize) -> VoiceManagerResult<bool> {
+        let mut tts = self.tts.write().await;
+        if self.clear_epoch.load(Ordering::Acquire) != epoch {
+            return Ok(false);
+        }
+        crate::core::metrics::bridge::count_tts_chars(
+            &self.config.tts_config.provider,
+            text.chars().count(),
+        );
+        tts.speak(text, true)
             .await
             .map_err(VoiceManagerError::TTSError)?;
         Ok(true)
@@ -1014,6 +1187,70 @@ impl VoiceManager {
     /// # Returns
     /// * `VoiceManagerResult<()>` - Success or error
     pub async fn clear_tts(&self) -> VoiceManagerResult<()> {
+        if !self.clear_queued_audio() {
+            return Ok(());
+        }
+
+        debug!("Starting audio clearing process");
+
+        // Clear TTS text queue — BEST EFFORT: a provider error must not skip
+        // the audio-buffer clear or the state reset below, or the stale
+        // playout deadline survives the barge-in (review wf_5772cd64 #10).
+        let mut tts = self.tts.write().await;
+        // D-G7: the standardized context seam — defaults to clear(), but
+        // context-aware WS providers cancel the SPECIFIC server context.
+        if let Err(e) = tts.on_audio_context_interrupted(None).await {
+            warn!(error = %e, "TTS provider clear failed; continuing barge-in cleanup");
+        }
+        // Invalidate epoch-gated speaks WHILE holding the TTS lock: any
+        // speak_if_epoch already waiting on this lock observes the bump the
+        // moment it acquires it, and skips (no post-clear stale enqueue).
+        self.clear_epoch.fetch_add(1, Ordering::Release);
+        drop(tts); // Release the lock
+
+        self.clear_audio_buffers().await;
+
+        // Notify any waiters that the clear operation is complete
+        // This wakes up coroutines waiting on clear_notify.notified()
+        self.clear_notify.notify_one();
+
+        // Use notification instead of sleep for better latency
+        // Wait briefly for any pending audio to be flushed through the pipeline
+        let _ = tokio::time::timeout(
+            Duration::from_millis(50), // Short timeout for pipeline flush
+            tokio::time::sleep(Duration::from_millis(10)),
+        )
+        .await;
+
+        // Reset interruption state since we interrupted
+        self.interruption_state.reset();
+
+        debug!("Completed audio clearing process");
+
+        Ok(())
+    }
+
+    /// The audio part of [`Self::clear_tts`]: the queued audio and the transport's buffers
+    /// (e.g. LiveKit) are dropped, and the TTS provider's synthesis goes on (interaction
+    /// mode's pre-emption cut while an urgent line is rendered into the speech cache).
+    pub async fn clear_audio_out(&self) {
+        if self.clear_queued_audio() {
+            self.clear_audio_buffers().await;
+        }
+    }
+
+    /// The audio clear callback (e.g. LiveKit's audio source).
+    async fn clear_audio_buffers(&self) {
+        let callback_opt = self.audio_clear_callback.read().clone();
+        if let Some(callback) = callback_opt {
+            callback().await;
+        }
+    }
+
+    /// The first step of a clear: the pump's queued audio. `false` when protected audio
+    /// plays (or, without the pump, the utterance may not be interrupted): nothing more may
+    /// be cleared.
+    fn clear_queued_audio(&self) -> bool {
         // A-G6: per-chunk selective barge-in. Snapshot the queue Arc without
         // holding the pump lock across the awaits below.
         let pb_queue = self
@@ -1045,7 +1282,7 @@ impl VoiceManager {
                         dropped,
                         "A-G6 selective barge-in: kept uninterruptible audio, dropped queued interruptible"
                     );
-                    return Ok(());
+                    return false;
                 }
                 // Nothing protected (no uninterruptible queued or in flight) ⇒
                 // FULL clear, including anything still queued.
@@ -1055,54 +1292,11 @@ impl VoiceManager {
             // window gates the (blanket) clear, unchanged.
             None => {
                 if !self.interruption_state.can_interrupt() {
-                    return Ok(());
+                    return false;
                 }
             }
         }
-
-        debug!("Starting audio clearing process");
-
-        // Clear TTS text queue — BEST EFFORT: a provider error must not skip
-        // the audio-buffer clear or the state reset below, or the stale
-        // playout deadline survives the barge-in (review wf_5772cd64 #10).
-        let mut tts = self.tts.write().await;
-        // D-G7: the standardized context seam — defaults to clear(), but
-        // context-aware WS providers cancel the SPECIFIC server context.
-        if let Err(e) = tts.on_audio_context_interrupted(None).await {
-            warn!(error = %e, "TTS provider clear failed; continuing barge-in cleanup");
-        }
-        // Invalidate epoch-gated speaks WHILE holding the TTS lock: any
-        // speak_if_epoch already waiting on this lock observes the bump the
-        // moment it acquires it, and skips (no post-clear stale enqueue).
-        self.clear_epoch.fetch_add(1, Ordering::Release);
-        drop(tts); // Release the lock
-
-        // Call audio clear callback to clear any audio buffers (e.g., LiveKit)
-        {
-            let callback_opt = self.audio_clear_callback.read().clone();
-            if let Some(callback) = callback_opt {
-                callback().await;
-            }
-        }
-
-        // Notify any waiters that the clear operation is complete
-        // This wakes up coroutines waiting on clear_notify.notified()
-        self.clear_notify.notify_one();
-
-        // Use notification instead of sleep for better latency
-        // Wait briefly for any pending audio to be flushed through the pipeline
-        let _ = tokio::time::timeout(
-            Duration::from_millis(50), // Short timeout for pipeline flush
-            tokio::time::sleep(Duration::from_millis(10)),
-        )
-        .await;
-
-        // Reset interruption state since we interrupted
-        self.interruption_state.reset();
-
-        debug!("Completed audio clearing process");
-
-        Ok(())
+        true
     }
 
     /// Flush the TTS provider to process queued text immediately
@@ -1164,6 +1358,7 @@ impl VoiceManager {
         let turn_detector_clone = self.turn_detector.clone();
         let observers_clone = self.observers.clone();
         let stt_final_observer_clone = self.stt_final_observer.clone();
+        let stt_muted = self.stt_muted.clone();
 
         // Create STT processor with configured timeouts from VoiceManagerConfig,
         // plus the provider's measured TTFS p99 (A-G2/D-G8: a slow provider's
@@ -1181,7 +1376,15 @@ impl VoiceManager {
         let stt_processor = STTResultProcessor::new(processing_config);
 
         let segmented_clone = self.segmented.clone();
-        let wrapper_callback: STTResultCallback = Arc::new(move |result| {
+        let wrapper_callback: STTResultCallback = Arc::new(move |mut result: STTResult| {
+            // A capture window: no word of the result reaches anyone, the billing span neither.
+            if stt_muted.load(Ordering::Acquire) {
+                result = STTResult {
+                    is_finalized: result.is_finalized,
+                    speech_turn_id: result.speech_turn_id,
+                    ..STTResult::new(String::new(), result.is_final, result.is_speech_final, 0.0)
+                };
+            }
             // Clone Arc references per invocation (lightweight operation)
             let callback = callback.clone();
             let segmented = segmented_clone.clone();
@@ -1345,7 +1548,25 @@ impl VoiceManager {
         // IS the user callback and meter chunks through its queue; the wrapper
         // enqueues instead of delivering directly. Off (default) ⇒ no pump, the
         // wrapper delivers straight to the transport (unchanged hot path).
-        let playback_enqueuer = if self.uninterruptible_playback.load(Ordering::Acquire) {
+        // Interaction mode: the pump is the metered one (20 ms frames, duck,
+        // pause, cut) and the wrapper routes every chunk through its control.
+        let metered = self.metered_playback.read().clone();
+        let playback_enqueuer = if let Some(control) = &metered {
+            let sink_cb = user_callback.clone();
+            let sink: crate::core::audio::PlaybackSink =
+                Arc::new(move |audio: AudioData| sink_cb(audio));
+            let pump = crate::core::audio::PlaybackPump::spawn_metered(
+                Arc::new(crate::core::audio::PlaybackQueue::new()),
+                sink,
+                self.config.tts_config.sample_rate.unwrap_or(24_000),
+                Duration::from_millis(control.lead_ms()),
+                control.clone(),
+            );
+            let enq = pump.enqueuer();
+            control.set_enqueuer(enq.clone());
+            *self.playback_pump.write() = Some(pump); // keep the pump task alive
+            Some(enq)
+        } else if self.uninterruptible_playback.load(Ordering::Acquire) {
             let sink_cb = user_callback.clone();
             let sink: crate::core::audio::PlaybackSink =
                 Arc::new(move |audio: AudioData| sink_cb(audio));
@@ -1369,6 +1590,7 @@ impl VoiceManager {
             let int_state = interruption_state_clone.clone();
             let observers = observers_clone.read().clone();
             let playback_enqueuer = playback_enqueuer.clone();
+            let metered = metered.clone();
 
             Box::pin(async move {
                 // Check if this is new audio after completion
@@ -1431,6 +1653,16 @@ impl VoiceManager {
                 if let Some(obs) = &observers {
                     obs.notify_tts_chunk(&audio_data, None);
                     obs.notify_audio_out(crate::core::observability::now_monotonic_ns());
+                }
+
+                // Interaction mode: the control tags the chunk with the utterance
+                // it expects, or drops it (a warm-up, or audio that outlived a cut).
+                if let (Some(enq), Some(control)) = (&playback_enqueuer, &metered) {
+                    let interruptible = int_state.allow_interruption.load(Ordering::Acquire);
+                    if let Some(unit) = control.route(audio_data, interruptible) {
+                        enq.enqueue(unit);
+                    }
+                    return;
                 }
 
                 match &playback_enqueuer {
@@ -1843,6 +2075,137 @@ impl VoiceManager {
         Ok(())
     }
 
+    /// Interaction mode's language switch: a second recogniser on the session's own settings
+    /// in `language` (the provider's code for it), with the session's callbacks, connected. The
+    /// session goes on hearing the one it has until [`Self::swap_stt`].
+    pub async fn open_stt_in(&self, language: &str) -> VoiceManagerResult<Box<dyn BaseSTT>> {
+        // A segmented session's recogniser is the engine, wired to the session's dispatcher; a
+        // second one would bypass it.
+        if self.is_gateway_endpointed() {
+            return Err(VoiceManagerError::InitializationError(
+                "a segmented session keeps its recogniser".into(),
+            ));
+        }
+        let mut stt = match &self.config.standard_stt {
+            Some(standard) => {
+                let mut standard = standard.clone();
+                standard.base.language = language.to_owned();
+                let provider = standard.base.provider.clone();
+                crate::core::stt::standard::create_stt_standard(&provider, standard)
+            }
+            None => {
+                let mut config = self.config.stt_config.clone();
+                config.language = language.to_owned();
+                create_stt_provider(&config.provider.clone(), config)
+            }
+        }
+        .map_err(VoiceManagerError::STTError)?;
+        if let Some(resilience) = &self.config.resilience {
+            stt.set_resilience(resilience.clone());
+        }
+        let results = self.provider_result_callback.read().clone();
+        let errors = self.provider_error_callback.read().clone();
+        if let Some(results) = results {
+            stt.on_result(results)
+                .await
+                .map_err(VoiceManagerError::STTError)?;
+        }
+        if let Some(errors) = errors {
+            stt.on_error(errors)
+                .await
+                .map_err(VoiceManagerError::STTError)?;
+        }
+        stt.connect().await.map_err(VoiceManagerError::STTError)?;
+        Ok(stt)
+    }
+
+    /// The session hears through `next` from now on (opened by [`Self::open_stt_in`]); the one
+    /// it had is closed off the caller's path, its last results still delivered.
+    pub async fn swap_stt(&self, next: Box<dyn BaseSTT>) {
+        let mut old = std::mem::replace(&mut *self.stt.write().await, next);
+        tokio::spawn(async move {
+            if let Err(error) = old.disconnect().await {
+                debug!(%error, "the replaced recogniser did not close cleanly");
+            }
+        });
+    }
+
+    /// Whether the STT provider answers once per upload instead of streaming
+    /// (`BaseSTT::is_request_response`).
+    pub async fn stt_is_request_response(&self) -> bool {
+        self.stt.read().await.is_request_response()
+    }
+
+    /// Whether the STT provider can end one utterance and stay connected
+    /// (`BaseSTT::has_utterance_flush`).
+    pub async fn stt_has_utterance_flush(&self) -> bool {
+        self.stt.read().await.has_utterance_flush()
+    }
+
+    /// When the STT provider can be asked to end the caller's turn now (Flux `ForceEndTurn`,
+    /// Deepgram `Finalize`): the endpointing silence it was given (`BaseSTT::end_turn_after_ms`).
+    pub async fn stt_end_turn_after_ms(&self) -> Option<u32> {
+        self.stt.read().await.end_turn_after_ms()
+    }
+
+    /// Whether the STT provider runs its own turn model (`BaseSTT::has_turn_events`).
+    pub async fn stt_has_turn_events(&self) -> bool {
+        self.stt.read().await.has_turn_events()
+    }
+
+    /// Whether the TTS provider serves repeated lines from the TTS cache (the
+    /// providers `set_tts_cache` reaches).
+    pub async fn tts_has_cache(&self) -> bool {
+        self.tts.write().await.get_provider().is_some()
+    }
+
+    /// Whether `text`'s audio is in the speech cache, so speaking it asks the vendor nothing.
+    pub async fn tts_cached(&self, text: &str) -> bool {
+        self.tts.write().await.has_cached(text).await
+    }
+
+    /// End ONE caller utterance on a request/response STT provider without
+    /// disconnecting it (`BaseSTT::take_utterance`): the audio buffered so far
+    /// is uploaded when `upload`, and its final arrives on the STT result
+    /// callback before this returns; otherwise it is discarded. The provider
+    /// lock is held only to take the buffer, so `receive_audio` never waits on
+    /// the upload.
+    ///
+    /// Returns `false` when there was nothing to take: no audio was buffered, or
+    /// the provider streams.
+    pub async fn finalize_utterance(&self, upload: bool) -> VoiceManagerResult<bool> {
+        let flush = { self.stt.write().await.take_utterance() };
+        let Some(flush) = flush else {
+            return Ok(false);
+        };
+        if upload {
+            flush.await.map_err(VoiceManagerError::STTError)?;
+        }
+        Ok(true)
+    }
+
+    /// Claim the current segment's buffered final transcript as the caller's
+    /// turn now, ahead of the speech-final timers: the forced speech-final goes
+    /// to the STT result callback from this task. `false` when there was
+    /// nothing to claim (no final is waiting, or a real speech-final won).
+    pub async fn force_speech_final(&self, method: &str) -> bool {
+        let generation = self
+            .speech_final_state
+            .read()
+            .fire_generation
+            .load(Ordering::Relaxed);
+        let claimed = STTResultProcessor::fire_forced_speech_final(
+            self.speech_final_state.clone(),
+            generation,
+            method,
+            false,
+        )
+        .await;
+        // A provider with its own turn model holds the turn's words until it ends the turn
+        // (Deepgram Flux): it is asked to end it now, and its speech-final follows.
+        claimed || self.stt.write().await.end_turn()
+    }
+
     /// A client commit on a segmented session: the flush outcome (which turn was sealed and
     /// whether a result follows). `None` on a provider that cannot flush.
     pub async fn flush_stt(&self) -> Option<crate::core::stt::speech_activity::FlushOutcome> {
@@ -1857,3 +2220,173 @@ impl VoiceManager {
 // Ensure VoiceManager is thread-safe
 unsafe impl Send for VoiceManager {}
 unsafe impl Sync for VoiceManager {}
+
+/// The interaction-mode additions, on a manager that is built but never started.
+#[cfg(test)]
+mod interaction_tests {
+    use super::*;
+    use crate::core::stt::STTConfig;
+    use crate::core::tts::TTSConfig;
+    use serial_test::serial;
+    use std::sync::Mutex;
+
+    fn voice_manager(stt_provider: &str) -> VoiceManager {
+        let stt = STTConfig {
+            provider: stt_provider.to_string(),
+            api_key: "test_key".to_string(),
+            ..Default::default()
+        };
+        let tts = TTSConfig {
+            provider: "deepgram".to_string(),
+            api_key: "test_key".to_string(),
+            ..Default::default()
+        };
+        VoiceManager::new(VoiceManagerConfig::new(stt, tts), None).unwrap()
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn the_audio_tap_sees_a_frame_before_the_provider() {
+        let vm = voice_manager("deepgram");
+        let seen = Arc::new(AtomicUsize::new(0));
+        let count = seen.clone();
+        let elsewhere = Arc::new(AtomicBool::new(false));
+        let sends = elsewhere.clone();
+        let tap: AudioTap = Arc::new(move |audio: &Bytes| {
+            count.fetch_add(audio.len(), Ordering::SeqCst);
+            sends.load(Ordering::SeqCst)
+        });
+        vm.set_audio_tap(Some(tap));
+
+        // The provider is not connected and refuses the frame: the tap came first.
+        assert!(
+            vm.receive_audio(Bytes::from_static(&[0; 320]))
+                .await
+                .is_err()
+        );
+        assert_eq!(seen.load(Ordering::SeqCst), 320);
+
+        // A tap whose owner sends the frame itself: the provider is not waited on (a
+        // recogniser that reconnects does not hold the caller's next frames back).
+        elsewhere.store(true, Ordering::SeqCst);
+        assert!(
+            vm.receive_audio(Bytes::from_static(&[0; 320]))
+                .await
+                .is_ok()
+        );
+        assert_eq!(seen.load(Ordering::SeqCst), 640);
+
+        // Without a tap (a session without interaction mode) every frame goes to the
+        // provider, as it always did.
+        vm.set_audio_tap(None);
+        assert!(
+            vm.receive_audio(Bytes::from_static(&[0; 320]))
+                .await
+                .is_err()
+        );
+        assert_eq!(seen.load(Ordering::SeqCst), 640);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn force_speech_final_claims_the_buffered_segment_once() {
+        let vm = voice_manager("deepgram");
+        let finals = Arc::new(Mutex::new(Vec::new()));
+        let sink = finals.clone();
+        let callback: STTCallback = Arc::new(move |result: STTResult| {
+            sink.lock().unwrap().push(result);
+            Box::pin(async {}) as Pin<Box<dyn Future<Output = ()> + Send>>
+        });
+        assert!(
+            !vm.force_speech_final("interaction_endpoint").await,
+            "no final is waiting"
+        );
+        {
+            // What a final without a speech-final leaves behind (`STTResultProcessor`).
+            let mut state = vm.speech_final_state.write();
+            state.user_callback = Some(callback);
+            state.text_buffer.push_str("book a flight");
+            state
+                .waiting_for_speech_final
+                .store(true, Ordering::Release);
+        }
+
+        assert!(vm.force_speech_final("interaction_endpoint").await);
+        assert!(
+            !vm.force_speech_final("interaction_endpoint").await,
+            "a segment is claimed once"
+        );
+        let finals = finals.lock().unwrap();
+        assert_eq!(finals.len(), 1);
+        assert!(finals[0].is_speech_final && finals[0].transcript.is_empty());
+        assert_eq!(
+            finals[0].segment_transcript.as_deref(),
+            Some("book a flight")
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn finalize_utterance_takes_the_buffer_and_keeps_the_provider() {
+        let vm = voice_manager("openai");
+        assert!(vm.stt_is_request_response().await);
+        vm.stt.write().await.connect().await.unwrap();
+        assert!(
+            matches!(vm.finalize_utterance(true).await, Ok(false)),
+            "nothing is buffered"
+        );
+
+        vm.receive_audio(Bytes::from_static(&[0; 3200]))
+            .await
+            .unwrap();
+        // Discarded: the buffer goes, nothing is uploaded, the provider stays ready.
+        assert!(matches!(vm.finalize_utterance(false).await, Ok(true)));
+        assert!(matches!(vm.finalize_utterance(false).await, Ok(false)));
+        assert!(vm.is_stt_ready().await);
+
+        let streaming = voice_manager("deepgram");
+        assert!(!streaming.stt_is_request_response().await);
+        assert!(matches!(
+            streaming.finalize_utterance(true).await,
+            Ok(false)
+        ));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn the_stored_callbacks_can_be_chained() {
+        let vm = voice_manager("deepgram");
+        assert!(vm.tts_complete_callback().is_none());
+        assert!(vm.tts_error_callback().is_none());
+        assert!(vm.stt_error_callback().is_none());
+
+        let completions = Arc::new(AtomicUsize::new(0));
+        let count = completions.clone();
+        vm.on_tts_complete(move || {
+            count.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {})
+        })
+        .await
+        .unwrap();
+        vm.on_tts_error(|_| Box::pin(async {})).await.unwrap();
+        vm.on_stt_error(|_| Box::pin(async {})).await.unwrap();
+        assert!(vm.tts_error_callback().is_some());
+        assert!(vm.stt_error_callback().is_some());
+
+        // The chain a caller builds: the stored callback, then its own step.
+        let previous = vm.tts_complete_callback().expect("registered");
+        let count = completions.clone();
+        vm.on_tts_complete(move || {
+            let previous = previous.clone();
+            let count = count.clone();
+            Box::pin(async move {
+                previous().await;
+                count.fetch_add(10, Ordering::SeqCst);
+            })
+        })
+        .await
+        .unwrap();
+        vm.tts_complete_callback().expect("the chain")().await;
+        assert_eq!(completions.load(Ordering::SeqCst), 11);
+    }
+}

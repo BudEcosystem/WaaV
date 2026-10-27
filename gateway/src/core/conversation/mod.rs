@@ -765,6 +765,33 @@ pub struct TurnAttribution {
     pub endpoint_name: Option<String>,
 }
 
+/// The `voice.turn` span of one conversation turn: the session, what the caller said and, in
+/// Bud mode, who the caller is. The turn's LLM calls are made inside it.
+pub fn turn_span(
+    session_id: &str,
+    transcript: &str,
+    attribution: Option<&TurnAttribution>,
+) -> tracing::Span {
+    use crate::observability::voice_attrs::turn;
+    let span = crate::voice_turn_span!(capability = "conversation", transport = "websocket");
+    span.record(turn::SESSION_ID, session_id);
+    span.record(turn::TRANSCRIPT, transcript);
+    if let Some(a) = attribution {
+        for (key, value) in [
+            (turn::PROJECT_ID, &a.project_id),
+            (turn::API_KEY_ID, &a.api_key_id),
+            (turn::API_KEY_PROJECT_ID, &a.api_key_project_id),
+            (turn::USER_ID, &a.user_id),
+            (turn::ENDPOINT_NAME, &a.endpoint_name),
+        ] {
+            if let Some(v) = value.as_deref().filter(|v| !v.is_empty()) {
+                span.record(key, v);
+            }
+        }
+    }
+    span
+}
+
 /// Build and key the client-configured LLM legs (fast tier + optional reasoning tier).
 ///
 /// Each leg is keyed ONCE, here, by `core::credentials`: the client's literal key, or an
@@ -773,7 +800,7 @@ pub struct TurnAttribution {
 /// var, never an operator key toward a client-chosen host. (`${LOCAL_LLM_API_KEY}` used to be
 /// sent literally here while the DAG path expanded it; and an omitted key sent the operator's
 /// OPENAI_API_KEY to whatever base_url was given.)
-fn resolve_llm_legs(
+pub fn resolve_llm_legs(
     config: &ConversationConfig,
 ) -> Result<KeyedLegs, ConversationOrchestratorError> {
     let base = LlmClient::new(config.to_client_config());
@@ -803,10 +830,10 @@ fn resolve_llm_legs(
 }
 
 /// The LLM legs [`resolve_llm_legs`] built, and what the client should hear about their keys.
-struct KeyedLegs {
-    llm: Arc<LlmClient>,
-    reasoning_llm: Option<Arc<LlmClient>>,
-    key_advisory: Option<KeyAdvisory>,
+pub struct KeyedLegs {
+    pub llm: Arc<LlmClient>,
+    pub reasoning_llm: Option<Arc<LlmClient>>,
+    pub key_advisory: Option<KeyAdvisory>,
 }
 
 /// The LLM leg runs keyless although the operator configured the vendor's key: its target is not
@@ -1406,29 +1433,11 @@ impl ConversationOrchestrator {
         transcript: &str,
         input: Option<&str>,
     ) -> Result<(), ConversationOrchestratorError> {
-        let span = crate::voice_turn_span!(capability = "conversation", transport = "websocket");
-        span.record(
-            crate::observability::voice_attrs::turn::SESSION_ID,
-            self.session_id.as_str(),
-        );
-        span.record(
-            crate::observability::voice_attrs::turn::TRANSCRIPT,
+        let span = turn_span(
+            &self.session_id,
             transcript,
+            self.config.attribution.as_ref(),
         );
-        if let Some(a) = &self.config.attribution {
-            use crate::observability::voice_attrs::turn;
-            for (key, value) in [
-                (turn::PROJECT_ID, &a.project_id),
-                (turn::API_KEY_ID, &a.api_key_id),
-                (turn::API_KEY_PROJECT_ID, &a.api_key_project_id),
-                (turn::USER_ID, &a.user_id),
-                (turn::ENDPOINT_NAME, &a.endpoint_name),
-            ] {
-                if let Some(v) = value.as_deref().filter(|v| !v.is_empty()) {
-                    span.record(key, v);
-                }
-            }
-        }
         tracing::Instrument::instrument(self.run_turn_inner(transcript, input), span).await
     }
 

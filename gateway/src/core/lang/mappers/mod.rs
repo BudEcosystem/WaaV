@@ -16,6 +16,7 @@
 mod aws;
 mod azure;
 mod baidu;
+mod deepgram;
 mod elevenlabs;
 mod google;
 mod iflytek;
@@ -27,6 +28,7 @@ mod tencent;
 pub use aws::{AwsPollyLanguageMapper, AwsTranscribeLanguageMapper};
 pub use azure::AzureLanguageMapper;
 pub use baidu::{BaiduSttLanguageMapper, BaiduTtsLanguageMapper};
+pub use deepgram::DeepgramLanguageMapper;
 pub use elevenlabs::ElevenLabsLanguageMapper;
 pub use google::{GoogleSttLanguageMapper, GoogleTtsLanguageMapper};
 pub use iflytek::IFlytekLanguageMapper;
@@ -167,55 +169,13 @@ impl LanguageMapper for DefaultLanguageMapper {
 // Registry
 // =============================================================================
 
-/// Deepgram detects the language (`multi`, code-switching) on Nova-3 and Nova-2 only; every other
-/// model refuses the handshake with a 400. There, auto is left out with a warning and the model's
-/// own default applies.
-struct DeepgramLanguageMapper(DefaultLanguageMapper);
-
-/// The Deepgram models that take `language=multi`.
-const DEEPGRAM_MULTI_MODELS: &[&str] = &["nova-3", "nova-3-general", "nova-2", "nova-2-general"];
-
-impl LanguageMapper for DeepgramLanguageMapper {
-    fn support(&self) -> ProviderLanguageSupport {
-        self.0.support()
-    }
-
-    fn map(&self, lang: CanonicalLanguage, model: &str) -> MappedLanguage {
-        let model = model.trim();
-        if lang == CanonicalLanguage::Auto
-            && !DEEPGRAM_MULTI_MODELS
-                .iter()
-                .any(|m| m.eq_ignore_ascii_case(model))
-        {
-            let named = if model.is_empty() {
-                "the default model".to_string()
-            } else {
-                format!("model '{model}'")
-            };
-            return MappedLanguage::omitted().warn(format!(
-                "Deepgram {named} cannot detect the language (multi needs Nova-3 or Nova-2); \
-                 the model's default language applies"
-            ));
-        }
-        self.0.map(lang, model)
-    }
-}
-
 /// Return the language mapper for `provider` (case-insensitive, alias-aware). Unknown providers get
 /// a safe BCP-47 pass-through (the research GENERIC FALLBACK) so a brand-new provider still works.
 pub fn get_language_mapper(provider: &str) -> Box<dyn LanguageMapper> {
     match provider.to_lowercase().as_str() {
         // ===== IDENTITY-BCP47 (region preserved; Chinese zh/cmn override) =====
-        "deepgram" => Box::new(DeepgramLanguageMapper(
-            DefaultLanguageMapper::new("deepgram", NotationKind::Bcp47, "Deepgram").with_overrides(
-                NotationMap::empty()
-                    .with(CanonicalLanguage::CmnCn, "zh-CN")
-                    .with(CanonicalLanguage::CmnTw, "zh-TW")
-                    .with(CanonicalLanguage::YueHk, "zh-HK")
-                    // Nova-3 multilingual code-switch (NOT detect_language — streaming gap).
-                    .with_auto("multi"),
-            ),
-        )),
+        // Model-aware: the code each Deepgram model takes (`deepgram.rs`).
+        "deepgram" => Box::new(DeepgramLanguageMapper::new()),
         "azure" | "microsoft-azure" | "microsoft_azure" => Box::new(AzureLanguageMapper),
         "aws-transcribe" | "aws_transcribe" => Box::new(AwsTranscribeLanguageMapper),
         "aws-polly" | "aws_polly" | "amazon-polly" | "polly" => Box::new(AwsPollyLanguageMapper),

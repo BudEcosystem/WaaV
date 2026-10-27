@@ -24,16 +24,31 @@ use tokio::{select, time::Duration};
 use tracing::{debug, error, info, warn};
 
 use crate::auth::Auth;
+use crate::core::interaction::actor::Msg;
+use crate::core::interaction::executor::Signal;
+use crate::core::interaction::provider::ProviderEvent;
 use crate::core::realtime::{
     BaseRealtime, RealtimeAudioData, RealtimeConfig, RealtimeError, ReconnectionEvent,
     TranscriptResult, TranscriptRole, create_realtime_provider, get_supported_realtime_providers,
 };
 use crate::state::AppState;
 
+use super::interaction;
 use super::messages::{
     RealtimeIncomingMessage, RealtimeMessageRoute, RealtimeOutgoingMessage, RealtimeSessionConfig,
     send_realtime_with_policy,
 };
+
+/// A session's interaction mode, once its config turned it on.
+#[derive(Default)]
+struct Interaction {
+    /// The task store's owner key (`handlers::tasks::owner`).
+    owner: String,
+    /// The provider session's inbox.
+    inbox: Option<mpsc::Sender<Msg>>,
+    /// The instructions the regime adds to the provider's own.
+    suffix: Option<&'static str>,
+}
 
 /// Optimized channel buffer size for audio workloads
 const CHANNEL_BUFFER_SIZE: usize = 1024;
@@ -145,6 +160,7 @@ async fn handle_realtime_socket(
                                 continue;
                             }
                         },
+                        RealtimeMessageRoute::Json(json) => sender.send(Message::Text(json.into())).await,
                         RealtimeMessageRoute::Audio(data) => sender.send(Message::Binary(data)).await,
                         RealtimeMessageRoute::Close => {
                             info!("Closing realtime WebSocket connection");
@@ -171,6 +187,7 @@ async fn handle_realtime_socket(
                                     continue;
                                 }
                             },
+                            RealtimeMessageRoute::Json(json) => sender.send(Message::Text(json.into())).await,
                             RealtimeMessageRoute::Audio(data) => sender.send(Message::Binary(data)).await,
                             RealtimeMessageRoute::Close => sender.send(Message::Close(None)).await,
                         };
@@ -188,6 +205,10 @@ async fn handle_realtime_socket(
     // State for the realtime session
     let mut realtime_provider: Option<Box<dyn BaseRealtime>> = None;
     let mut session_id: Option<String> = None;
+    let mut ix = Interaction {
+        owner: crate::handlers::tasks::owner(&auth).to_owned(),
+        ..Interaction::default()
+    };
 
     // How often we check if the connection is stale (configurable via REALTIME_PROCESSING_TIMEOUT_SECS)
     let processing_timeout = Duration::from_secs(app_state.config.realtime_processing_timeout_secs);
@@ -210,6 +231,7 @@ async fn handle_realtime_socket(
                             msg,
                             &mut realtime_provider,
                             &mut session_id,
+                            &mut ix,
                             &message_tx,
                             &app_state,
                             &trace_parent,
@@ -276,6 +298,11 @@ async fn handle_realtime_socket(
     // Cleanup: give the sender task a bounded chance to drain already-queued
     // critical messages (for example idle-timeout errors) before aborting it.
     shutdown_realtime_sender_task(shutdown_tx, &mut sender_task).await;
+
+    // The interaction session ends with the socket.
+    if let Some(inbox) = ix.inbox.take() {
+        let _ = inbox.send(Msg::Shutdown { clean: true }).await;
+    }
 
     // Disconnect realtime provider if connected
     if let Some(mut provider) = realtime_provider
@@ -345,10 +372,12 @@ fn realtime_idle_jitter_offset_for_seq(seq: u64, jitter_range_secs: u64) -> i64 
 
 /// Process incoming WebSocket message
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 async fn process_realtime_message(
     msg: Message,
     realtime_provider: &mut Option<Box<dyn BaseRealtime>>,
     session_id: &mut Option<String>,
+    ix: &mut Interaction,
     message_tx: &mpsc::Sender<RealtimeMessageRoute>,
     app_state: &Arc<AppState>,
     trace_parent: &str,
@@ -391,6 +420,7 @@ async fn process_realtime_message(
                 incoming_msg,
                 realtime_provider,
                 session_id,
+                ix,
                 message_tx,
                 app_state,
                 trace_parent,
@@ -444,6 +474,7 @@ async fn handle_realtime_incoming(
     msg: RealtimeIncomingMessage,
     realtime_provider: &mut Option<Box<dyn BaseRealtime>>,
     session_id: &mut Option<String>,
+    ix: &mut Interaction,
     message_tx: &mpsc::Sender<RealtimeMessageRoute>,
     app_state: &Arc<AppState>,
     trace_parent: &str,
@@ -454,6 +485,7 @@ async fn handle_realtime_incoming(
                 config,
                 realtime_provider,
                 session_id,
+                ix,
                 message_tx,
                 app_state,
                 trace_parent,
@@ -578,17 +610,80 @@ async fn handle_realtime_incoming(
             }
             true
         }
-        RealtimeIncomingMessage::UpdateSession(config) => {
+        RealtimeIncomingMessage::UpdateSession(mut config) => {
+            // The delegate function and the regime's instructions stay in what the update
+            // replaces.
+            if let Some(suffix) = ix.suffix {
+                let (tools, instructions) = (config.tools.is_some(), config.instructions.is_some());
+                interaction::steer(&mut config, suffix);
+                if !tools {
+                    config.tools = None;
+                }
+                if !instructions {
+                    config.instructions = None;
+                }
+            }
             handle_session_update(config, realtime_provider, message_tx).await
+        }
+        RealtimeIncomingMessage::TaskAnswer {
+            request_id,
+            outcome,
+            value,
+            correction,
+        } => {
+            to_interaction(
+                ix,
+                Msg::TaskAnswer {
+                    request_id,
+                    outcome: outcome.read(value, correction),
+                },
+                message_tx,
+            )
+            .await
+        }
+        RealtimeIncomingMessage::TaskCancel { task_id } => {
+            to_interaction(ix, Msg::TaskCancel { task_id }, message_tx).await
+        }
+        RealtimeIncomingMessage::TaskSeen { task_id } => {
+            to_interaction(ix, Msg::TaskSeen { task_id }, message_tx).await
+        }
+        RealtimeIncomingMessage::InteractionUpdate { patch } => {
+            to_interaction(ix, Msg::Update(patch), message_tx).await
         }
     }
 }
 
+/// An interaction message: to the session's interaction mode, or refused without it.
+async fn to_interaction(
+    ix: &Interaction,
+    msg: Msg,
+    message_tx: &mpsc::Sender<RealtimeMessageRoute>,
+) -> bool {
+    match &ix.inbox {
+        Some(inbox) => {
+            let _ = inbox.send(msg).await;
+        }
+        None => {
+            send_realtime_with_policy(
+                message_tx,
+                RealtimeMessageRoute::Outgoing(RealtimeOutgoingMessage::Error {
+                    code: Some("interaction_not_enabled".to_string()),
+                    message: "This session does not run interaction mode.".to_string(),
+                }),
+            )
+            .await
+        }
+    }
+    true
+}
+
 /// Handle config message - create and connect provider
+#[allow(clippy::too_many_arguments)]
 async fn handle_config(
     mut config: RealtimeSessionConfig,
     realtime_provider: &mut Option<Box<dyn BaseRealtime>>,
     session_id: &mut Option<String>,
+    ix: &mut Interaction,
     message_tx: &mpsc::Sender<RealtimeMessageRoute>,
     app_state: &Arc<AppState>,
     trace_parent: &str,
@@ -661,16 +756,55 @@ async fn handle_config(
         }
     }
 
-    let provider_name = config.provider.as_deref().unwrap_or(DEFAULT_PROVIDER);
+    // The provider fixes of this session: the operator's, less those the session turned off
+    // (and those it may turn on). An entry not taken is a warning; the session goes on.
+    let (fixes, findings) =
+        crate::core::interaction::config::session_fixes(config.provider_fixes.as_ref());
+    for finding in findings {
+        let warning = RealtimeOutgoingMessage::ConfigWarning {
+            code: finding.code.to_owned(),
+            message: finding.message,
+            detail: finding.detail,
+        };
+        send_realtime_with_policy(message_tx, RealtimeMessageRoute::Outgoing(warning)).await;
+    }
+    let fix = |name: &str| fixes.iter().any(|on| on == name);
+
+    // Provider fix `openai_realtime_default` (off until the plan's probe of OpenAI's models):
+    // an OpenAI session that names no model gets the retiring default's successor, set here so
+    // the lifecycle check, the regime and `session_created` see the model the provider sends.
+    if config.model.as_deref().is_none_or(|m| m.trim().is_empty())
+        && config
+            .provider
+            .as_deref()
+            .unwrap_or(DEFAULT_PROVIDER)
+            .eq_ignore_ascii_case("openai")
+        && fix("openai_realtime_default")
+    {
+        config.model =
+            Some(crate::core::realtime::openai::openai_realtime_default(true).to_owned());
+    }
+
+    // Owned: interaction mode may add to the config below. An alias (`11labs`) is the
+    // provider it names from here on.
+    let provider_name = config
+        .provider
+        .clone()
+        .unwrap_or_else(|| DEFAULT_PROVIDER.to_owned());
+    let provider_name = crate::core::realtime::RealtimeProvider::parse(&provider_name)
+        .map_or(provider_name, |provider| provider.to_string());
+    let provider_name = provider_name.as_str();
     // Reported in `session.created` only. `gpt-realtime` is OpenAI's model, so it is named for
     // OpenAI alone; any other provider picks its own default and reports nothing here.
-    let model = config.model.as_deref().unwrap_or(
+    let model = config.model.clone().unwrap_or_else(|| {
         if provider_name.eq_ignore_ascii_case(DEFAULT_PROVIDER) {
             DEFAULT_MODEL
         } else {
             ""
-        },
-    );
+        }
+        .to_owned()
+    });
+    let model = model.as_str();
 
     // Validate provider
     let supported = get_supported_realtime_providers();
@@ -692,23 +826,429 @@ async fn handle_config(
         return true;
     }
 
-    // Get API key from config based on provider
-    let api_key = app_state.config.get_realtime_api_key(provider_name);
+    // Lifecycle track: a retiring provider or model is named in a warning, a retired one is
+    // refused. Only traffic to the vendor's own host is affected.
+    if let Some(notice) = lifecycle_notice(provider_name, config.model.as_deref(), app_state) {
+        warn!(
+            code = notice.code,
+            provider = provider_name,
+            "{}",
+            notice.message
+        );
+        let message = if notice.fatal {
+            RealtimeOutgoingMessage::Error {
+                code: Some(notice.code.to_owned()),
+                message: notice.message,
+            }
+        } else {
+            RealtimeOutgoingMessage::ConfigWarning {
+                code: notice.code.to_owned(),
+                message: notice.message,
+                detail: notice.detail,
+            }
+        };
+        send_realtime_with_policy(message_tx, RealtimeMessageRoute::Outgoing(message)).await;
+        if notice.fatal {
+            return true;
+        }
+    }
 
-    let Some(api_key) = api_key else {
+    // Interaction mode: regimes B and C over this provider, when the resolver says so. The
+    // session config then carries the delegate function and the regime's instructions.
+    let prepared = interaction::prepare(&mut config, provider_name, message_tx).await;
+    let tap = prepared.as_ref().map(interaction::tap);
+
+    let mut provider = match provider_for(&config, provider_name, app_state, trace_parent) {
+        Ok(provider) => provider,
+        Err((code, message)) => {
+            send_realtime_with_policy(
+                message_tx,
+                RealtimeMessageRoute::Outgoing(RealtimeOutgoingMessage::Error {
+                    code: Some(code.to_string()),
+                    message,
+                }),
+            )
+            .await;
+            return true;
+        }
+    };
+
+    // Register callbacks before connecting. A provider that refuses the session right after
+    // the handshake (an unknown ElevenLabs agent) reports it before `session_created` would go
+    // out: its error and its end wait for `session_created` (or for this function to return
+    // without one), so the client never sees the session created after its error.
+    let (created_tx, created) = tokio::sync::watch::channel(false);
+    let tx_clone = message_tx.clone();
+    let tap_clone = tap.clone();
+    provider
+        .on_transcript(Arc::new(move |result: TranscriptResult| {
+            let tx = tx_clone.clone();
+            let tap = tap_clone.clone();
+            Box::pin(async move {
+                let role = match result.role {
+                    TranscriptRole::User => "user",
+                    TranscriptRole::Assistant => "assistant",
+                };
+                // Interaction mode reads the final words of both sides; the provider's first
+                // words open a response of its own.
+                if let Some(tap) = &tap {
+                    tap.transcript(&result.role, &result.text, result.is_final)
+                        .await;
+                }
+                send_realtime_with_policy(
+                    &tx,
+                    RealtimeMessageRoute::Outgoing(RealtimeOutgoingMessage::Transcript {
+                        text: result.text,
+                        role: role.to_string(),
+                        is_final: result.is_final,
+                    }),
+                )
+                .await;
+            })
+        }))
+        .ok();
+
+    let tx_clone = message_tx.clone();
+    let tap_clone = tap.clone();
+    provider
+        .on_audio(Arc::new(move |audio: RealtimeAudioData| {
+            let tx = tx_clone.clone();
+            let tap = tap_clone.clone();
+            Box::pin(async move {
+                // The output gate holds the provider's audio while a stop is in force.
+                if tap.as_ref().is_some_and(|tap| !tap.audio(audio.data.len())) {
+                    return;
+                }
+                send_realtime_with_policy(&tx, RealtimeMessageRoute::Audio(audio.data)).await;
+            })
+        }))
+        .ok();
+
+    let tx_clone = message_tx.clone();
+    let created_clone = created.clone();
+    let tap_clone = tap.clone();
+    provider
+        .on_error(Arc::new(move |error: RealtimeError| {
+            let tx = tx_clone.clone();
+            let mut created = created_clone.clone();
+            let tap = tap_clone.clone();
+            Box::pin(async move {
+                let _ = created.wait_for(|created| *created).await;
+                // Interaction mode's health watcher hears of it (chapter 10).
+                if let Some(tap) = &tap {
+                    tap.failed(&error).await;
+                }
+                // A provider's warning is not an error: the session goes on.
+                let message = match error {
+                    RealtimeError::ProviderWarning { code, message } => {
+                        RealtimeOutgoingMessage::ConfigWarning {
+                            code: "provider_warning".to_string(),
+                            message,
+                            detail: serde_json::json!({ "provider_code": code }),
+                        }
+                    }
+                    error => RealtimeOutgoingMessage::Error {
+                        code: Some("provider_error".to_string()),
+                        message: error.to_string(),
+                    },
+                };
+                send_realtime_with_policy(&tx, RealtimeMessageRoute::Outgoing(message)).await;
+            })
+        }))
+        .ok();
+
+    let tx_clone = message_tx.clone();
+    let tap_clone = tap.clone();
+    provider
+        .on_function_call(Arc::new(
+            move |call: crate::core::realtime::FunctionCallRequest| {
+                let tx = tx_clone.clone();
+                let tap = tap_clone.clone();
+                Box::pin(async move {
+                    // The delegate function is the gateway's: the client never sees its calls.
+                    let call = match tap {
+                        Some(tap) => match tap.call(call).await {
+                            Some(call) => call,
+                            None => return,
+                        },
+                        None => call,
+                    };
+                    send_realtime_with_policy(
+                        &tx,
+                        RealtimeMessageRoute::Outgoing(RealtimeOutgoingMessage::FunctionCall {
+                            call_id: call.call_id,
+                            name: call.name,
+                            arguments: call.arguments,
+                        }),
+                    )
+                    .await;
+                })
+            },
+        ))
+        .ok();
+
+    let tx_clone = message_tx.clone();
+    let tap_clone = tap.clone();
+    provider
+        .on_speech_event(Arc::new(
+            move |event: crate::core::realtime::SpeechEvent| {
+                let tx = tx_clone.clone();
+                let tap = tap_clone.clone();
+                Box::pin(async move {
+                    if let Some(tap) = &tap {
+                        let speaking =
+                            matches!(event, crate::core::realtime::SpeechEvent::Started { .. });
+                        tap.caller(speaking).await;
+                    }
+                    let (event_type, audio_ms) = match event {
+                        crate::core::realtime::SpeechEvent::Started { audio_start_ms, .. } => {
+                            ("started", audio_start_ms)
+                        }
+                        crate::core::realtime::SpeechEvent::Stopped { audio_end_ms, .. } => {
+                            ("stopped", audio_end_ms)
+                        }
+                    };
+                    send_realtime_with_policy(
+                        &tx,
+                        RealtimeMessageRoute::Outgoing(RealtimeOutgoingMessage::SpeechEvent {
+                            event: event_type.to_string(),
+                            audio_ms,
+                        }),
+                    )
+                    .await;
+                })
+            },
+        ))
+        .ok();
+
+    let tx_clone = message_tx.clone();
+    let tap_clone = tap.clone();
+    provider
+        .on_response_done(Arc::new(move |response_id: String| {
+            let tx = tx_clone.clone();
+            let tap = tap_clone.clone();
+            Box::pin(async move {
+                send_realtime_with_policy(
+                    &tx,
+                    RealtimeMessageRoute::Outgoing(RealtimeOutgoingMessage::ResponseDone {
+                        response_id,
+                    }),
+                )
+                .await;
+                if let Some(tap) = tap {
+                    tap.response_done().await;
+                }
+            })
+        }))
+        .ok();
+
+    // Provider fixes `gemini_tool_call_cancellation` / `gemini_interaction_status` (off until
+    // the vendor's live probe): the events no callback carries. Registered only while one of
+    // them is in force, so every other session runs exactly as before.
+    let withdrawn_or_busy =
+        fix("gemini_tool_call_cancellation") || fix("gemini_interaction_status");
+    // An interaction-mode session also hears when the provider refused its injected line.
+    if withdrawn_or_busy || tap.is_some() {
+        let tx_clone = message_tx.clone();
+        let tap_clone = tap.clone();
+        provider
+            .on_event(Arc::new(
+                move |event: crate::core::realtime::scaffold::S2sEvent| {
+                    let tx = tx_clone.clone();
+                    let tap = tap_clone.clone();
+                    Box::pin(async move {
+                        use crate::core::realtime::scaffold::S2sEvent;
+                        match (event, tap) {
+                            // Interaction mode tells the client of its own calls itself.
+                            (S2sEvent::FunctionCallCancelled { call_ids }, Some(tap)) => {
+                                for call_id in call_ids {
+                                    tap.provider(ProviderEvent::CallCancelled(call_id)).await;
+                                }
+                            }
+                            (S2sEvent::FunctionCallCancelled { call_ids }, None) => {
+                                for call_id in call_ids {
+                                    let cancelled =
+                                        RealtimeOutgoingMessage::FunctionCallCancelled { call_id };
+                                    send_realtime_with_policy(
+                                        &tx,
+                                        RealtimeMessageRoute::Outgoing(cancelled),
+                                    )
+                                    .await;
+                                }
+                            }
+                            (S2sEvent::ProviderBusy(busy), Some(tap)) => {
+                                tap.signal(Signal::Working(busy));
+                            }
+                            (S2sEvent::InjectionRefused, Some(tap)) => tap.signal(Signal::Refused),
+                            // A provisional call is adopted soon after (plan chapter 6).
+                            (S2sEvent::InterruptedByServer, Some(tap)) => {
+                                tap.provider(ProviderEvent::Interrupted).await;
+                            }
+                            _ => {}
+                        }
+                    })
+                },
+            ))
+            .ok();
+    }
+
+    // On a TERMINAL reconnection give-up — the provider supervisor exhausted its
+    // retry budget or hit the quick-failure cutoff — the upstream session can
+    // NEVER recover. Surface that to the CLIENT and close the socket. Otherwise
+    // the connection is held open with client audio silently dropped
+    // (`is_ready()` is false), and because a continuously-streaming client
+    // resets the handler's idle timer on every inbound frame, the ~5-min idle
+    // timeout NEVER fires — the session hangs open indefinitely with no error
+    // (review wf_fb932e8d: "dead session never surfaced"). A SUCCESSFUL
+    // reconnect (`success == true`) is intentionally silent: playback resumes.
+    let tx_clone = message_tx.clone();
+    let tap_clone = tap.clone();
+    provider
+        .on_reconnection(Arc::new(move |event: ReconnectionEvent| {
+            let tx = tx_clone.clone();
+            let tap = tap_clone.clone();
+            let mut created = created.clone();
+            Box::pin(async move {
+                let _ = created.wait_for(|created| *created).await;
+                // Interaction mode: what it held while the provider was away goes out now; a
+                // provider lost for good gets the exit line and `session_failed`, after which
+                // the socket closes (chapter 10).
+                if let Some(tap) = tap {
+                    tap.reconnection(event.success, event.error).await;
+                    return;
+                }
+                if event.success {
+                    return;
+                }
+                send_realtime_with_policy(
+                    &tx,
+                    RealtimeMessageRoute::Outgoing(RealtimeOutgoingMessage::Error {
+                        code: Some("connection_lost".to_string()),
+                        message: event.error.unwrap_or_else(|| {
+                            "Realtime provider connection lost and could not be re-established"
+                                .to_string()
+                        }),
+                    }),
+                )
+                .await;
+                // Terminally dead — tell the sender task to close the client WS.
+                send_realtime_with_policy(&tx, RealtimeMessageRoute::Close).await;
+            })
+        }))
+        .ok();
+
+    // Connect to provider
+    info!("Connecting to {} realtime provider", provider_name);
+    if let Err(e) = provider.connect().await {
         send_realtime_with_policy(
             message_tx,
             RealtimeMessageRoute::Outgoing(RealtimeOutgoingMessage::Error {
-                code: Some("missing_api_key".to_string()),
-                message: format!("API key not configured for provider: {}", provider_name),
+                code: Some("connection_error".to_string()),
+                message: format!("Failed to connect: {e}"),
             }),
         )
         .await;
         return true;
+    }
+    // A provider that names the model it runs (xAI's `session.created`, sent on connect) is
+    // reported by that name: live, `grok-voice-3.0` for an empty model or `grok-voice-latest`.
+    let model = provider_model(provider.as_ref(), model).await;
+    let model = model.as_str();
+
+    // Generate session ID
+    let new_session_id = uuid::Uuid::new_v4().to_string();
+    *session_id = Some(new_session_id.clone());
+
+    // Store provider: in interaction mode, behind the verb executor.
+    let echo = prepared
+        .as_ref()
+        .map(|prepared| prepared.planned.echo.clone());
+    let provider = match prepared {
+        Some(prepared) => {
+            ix.inbox = Some(prepared.inbox.clone());
+            ix.suffix = Some(prepared.planned.suffix);
+            // The gateway's own voice: the half-cascade's speech and its clips.
+            let voice = interaction::voice_of(&prepared.planned.cfg, app_state);
+            interaction::start(
+                prepared,
+                provider,
+                &new_session_id,
+                &ix.owner,
+                message_tx,
+                voice,
+            )
+        }
+        None => provider,
+    };
+    *realtime_provider = Some(provider);
+
+    // Send session created message
+    send_realtime_with_policy(
+        message_tx,
+        RealtimeMessageRoute::Outgoing(RealtimeOutgoingMessage::SessionCreated {
+            session_id: new_session_id,
+            provider: provider_name.to_string(),
+            model: model.to_string(),
+            interaction: echo,
+        }),
+    )
+    .await;
+    let _ = created_tx.send(true);
+
+    info!("Realtime session created with provider: {}", provider_name);
+    true
+}
+
+/// How long `session_created` waits for a connected provider to name its model.
+const NAMED_MODEL_WAIT: Duration = Duration::from_millis(1500);
+
+/// The model `session_created` reports: the one the connected provider names
+/// (`get_provider_info` `named_model`; while `model_pending` it is waited for up to
+/// [`NAMED_MODEL_WAIT`]), else `fallback`. A provider that names none is not waited for.
+async fn provider_model(provider: &dyn BaseRealtime, fallback: &str) -> String {
+    let deadline = tokio::time::Instant::now() + NAMED_MODEL_WAIT;
+    loop {
+        let info = provider.get_provider_info();
+        if let Some(named) = info["named_model"].as_str() {
+            return named.to_owned();
+        }
+        if info["model_pending"] != true || tokio::time::Instant::now() >= deadline {
+            return fallback.to_owned();
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// The provider of a session config, with the server's credential, endpoint and upstream for
+/// it; not connected, no callbacks. `Err((code, message))` when it cannot be made. Shared by
+/// `/realtime` and the `/ws` realtime voice (`interaction.speech.realtime`).
+pub(crate) fn provider_for(
+    config: &RealtimeSessionConfig,
+    provider_name: &str,
+    app_state: &AppState,
+    trace_parent: &str,
+) -> Result<Box<dyn BaseRealtime>, (&'static str, String)> {
+    // Get API key from config based on provider
+    let api_key = app_state.config.get_realtime_api_key(provider_name);
+
+    let Some(api_key) = api_key else {
+        let message = format!("API key not configured for provider: {}", provider_name);
+        return Err(("missing_api_key", message));
     };
 
     // Build realtime config from session config
-    let mut realtime_config = build_realtime_config(api_key, &config);
+    let mut realtime_config = build_realtime_config(api_key, config);
+    // The session's provider fixes: the operator's, less what it turned off (`/realtime`).
+    realtime_config.provider_fixes =
+        crate::core::interaction::config::session_fixes(config.provider_fixes.as_ref()).0;
+    realtime_config.provider_fixes_decided = true;
+    // Interaction mode's half-cascade: the provider replies in text only (its protocol reads
+    // this server-set marker; no client message sets it).
+    if config.text_only {
+        realtime_config
+            .provider_fixes
+            .push(crate::core::realtime::HALF_CASCADE_TEXT.to_owned());
+    }
     // Azure OpenAI Realtime needs the server-configured resource/endpoint (the
     // `<resource>.openai.azure.com` host) — it is NOT a client-session field.
     if matches!(
@@ -752,208 +1292,40 @@ async fn handle_config(
     }
 
     // Create provider
-    let mut provider = match create_realtime_provider(provider_name, realtime_config) {
-        Ok(p) => p,
-        Err(e) => {
-            send_realtime_with_policy(
-                message_tx,
-                RealtimeMessageRoute::Outgoing(RealtimeOutgoingMessage::Error {
-                    code: Some("provider_error".to_string()),
-                    message: format!("Failed to create provider: {e}"),
-                }),
-            )
-            .await;
-            return true;
-        }
-    };
+    let model = realtime_config.model.clone();
+    let mut provider = create_realtime_provider(provider_name, realtime_config)
+        .map_err(|e| ("provider_error", format!("Failed to create provider: {e}")))?;
 
     // W-D2 fleet adoption: inject the shared, process-global resilience handles so the realtime
     // reconnect loop participates in process-wide storm control + per-provider breaker tripping and
     // publishes `waav_circuit_breaker_state{provider}` on transition. A no-op for providers that
     // don't consume the handles (default trait method).
-    provider.set_resilience(app_state.core_state.resilience().handles_for(provider_name));
+    // Keyed per product and model: a refused speech-to-speech session never opens the breaker
+    // the vendor's speech-to-text and text-to-speech share, nor the one of its other models.
+    provider.set_resilience(
+        app_state
+            .core_state
+            .resilience()
+            .realtime_handles(provider_name, &model),
+    );
+    Ok(provider)
+}
 
-    // Register callbacks before connecting
-    let tx_clone = message_tx.clone();
-    provider
-        .on_transcript(Arc::new(move |result: TranscriptResult| {
-            let tx = tx_clone.clone();
-            Box::pin(async move {
-                let role = match result.role {
-                    TranscriptRole::User => "user",
-                    TranscriptRole::Assistant => "assistant",
-                };
-                send_realtime_with_policy(
-                    &tx,
-                    RealtimeMessageRoute::Outgoing(RealtimeOutgoingMessage::Transcript {
-                        text: result.text,
-                        role: role.to_string(),
-                        is_final: result.is_final,
-                    }),
-                )
-                .await;
-            })
-        }))
-        .ok();
-
-    let tx_clone = message_tx.clone();
-    provider
-        .on_audio(Arc::new(move |audio: RealtimeAudioData| {
-            let tx = tx_clone.clone();
-            Box::pin(async move {
-                send_realtime_with_policy(&tx, RealtimeMessageRoute::Audio(audio.data)).await;
-            })
-        }))
-        .ok();
-
-    let tx_clone = message_tx.clone();
-    provider
-        .on_error(Arc::new(move |error: RealtimeError| {
-            let tx = tx_clone.clone();
-            Box::pin(async move {
-                send_realtime_with_policy(
-                    &tx,
-                    RealtimeMessageRoute::Outgoing(RealtimeOutgoingMessage::Error {
-                        code: Some("provider_error".to_string()),
-                        message: error.to_string(),
-                    }),
-                )
-                .await;
-            })
-        }))
-        .ok();
-
-    let tx_clone = message_tx.clone();
-    provider
-        .on_function_call(Arc::new(
-            move |call: crate::core::realtime::FunctionCallRequest| {
-                let tx = tx_clone.clone();
-                Box::pin(async move {
-                    send_realtime_with_policy(
-                        &tx,
-                        RealtimeMessageRoute::Outgoing(RealtimeOutgoingMessage::FunctionCall {
-                            call_id: call.call_id,
-                            name: call.name,
-                            arguments: call.arguments,
-                        }),
-                    )
-                    .await;
-                })
-            },
-        ))
-        .ok();
-
-    let tx_clone = message_tx.clone();
-    provider
-        .on_speech_event(Arc::new(
-            move |event: crate::core::realtime::SpeechEvent| {
-                let tx = tx_clone.clone();
-                Box::pin(async move {
-                    let (event_type, audio_ms) = match event {
-                        crate::core::realtime::SpeechEvent::Started { audio_start_ms, .. } => {
-                            ("started", audio_start_ms)
-                        }
-                        crate::core::realtime::SpeechEvent::Stopped { audio_end_ms, .. } => {
-                            ("stopped", audio_end_ms)
-                        }
-                    };
-                    send_realtime_with_policy(
-                        &tx,
-                        RealtimeMessageRoute::Outgoing(RealtimeOutgoingMessage::SpeechEvent {
-                            event: event_type.to_string(),
-                            audio_ms,
-                        }),
-                    )
-                    .await;
-                })
-            },
-        ))
-        .ok();
-
-    let tx_clone = message_tx.clone();
-    provider
-        .on_response_done(Arc::new(move |response_id: String| {
-            let tx = tx_clone.clone();
-            Box::pin(async move {
-                send_realtime_with_policy(
-                    &tx,
-                    RealtimeMessageRoute::Outgoing(RealtimeOutgoingMessage::ResponseDone {
-                        response_id,
-                    }),
-                )
-                .await;
-            })
-        }))
-        .ok();
-
-    // On a TERMINAL reconnection give-up — the provider supervisor exhausted its
-    // retry budget or hit the quick-failure cutoff — the upstream session can
-    // NEVER recover. Surface that to the CLIENT and close the socket. Otherwise
-    // the connection is held open with client audio silently dropped
-    // (`is_ready()` is false), and because a continuously-streaming client
-    // resets the handler's idle timer on every inbound frame, the ~5-min idle
-    // timeout NEVER fires — the session hangs open indefinitely with no error
-    // (review wf_fb932e8d: "dead session never surfaced"). A SUCCESSFUL
-    // reconnect (`success == true`) is intentionally silent: playback resumes.
-    let tx_clone = message_tx.clone();
-    provider
-        .on_reconnection(Arc::new(move |event: ReconnectionEvent| {
-            let tx = tx_clone.clone();
-            Box::pin(async move {
-                if event.success {
-                    return;
-                }
-                send_realtime_with_policy(
-                    &tx,
-                    RealtimeMessageRoute::Outgoing(RealtimeOutgoingMessage::Error {
-                        code: Some("connection_lost".to_string()),
-                        message: event.error.unwrap_or_else(|| {
-                            "Realtime provider connection lost and could not be re-established"
-                                .to_string()
-                        }),
-                    }),
-                )
-                .await;
-                // Terminally dead — tell the sender task to close the client WS.
-                send_realtime_with_policy(&tx, RealtimeMessageRoute::Close).await;
-            })
-        }))
-        .ok();
-
-    // Connect to provider
-    info!("Connecting to {} realtime provider", provider_name);
-    if let Err(e) = provider.connect().await {
-        send_realtime_with_policy(
-            message_tx,
-            RealtimeMessageRoute::Outgoing(RealtimeOutgoingMessage::Error {
-                code: Some("connection_error".to_string()),
-                message: format!("Failed to connect: {e}"),
-            }),
-        )
-        .await;
-        return true;
-    }
-
-    // Generate session ID
-    let new_session_id = uuid::Uuid::new_v4().to_string();
-    *session_id = Some(new_session_id.clone());
-
-    // Store provider
-    *realtime_provider = Some(provider);
-
-    // Send session created message
-    send_realtime_with_policy(
-        message_tx,
-        RealtimeMessageRoute::Outgoing(RealtimeOutgoingMessage::SessionCreated {
-            session_id: new_session_id,
-            provider: provider_name.to_string(),
-            model: model.to_string(),
-        }),
+/// The lifecycle track's notice for a realtime provider and model: a retiring one is named,
+/// a retired one refused (`fatal`). Only traffic to the vendor's own host is affected.
+pub(crate) fn lifecycle_notice(
+    provider_name: &str,
+    model: Option<&str>,
+    app_state: &AppState,
+) -> Option<crate::core::interaction::lifecycle::Notice> {
+    let endpoint_override = canonical_realtime_provider(provider_name)
+        .and_then(|canon| app_state.config.realtime_endpoint_overrides.get(canon));
+    crate::core::interaction::lifecycle::realtime(
+        provider_name,
+        model,
+        endpoint_override.map(String::as_str),
+        &crate::core::interaction::regime::today(),
     )
-    .await;
-
-    info!("Realtime session created with provider: {}", provider_name);
-    true
 }
 
 /// Handle session update
@@ -1087,6 +1459,9 @@ pub fn build_realtime_config(api_key: String, config: &RealtimeSessionConfig) ->
         modalities: config.modalities.clone(),
         reasoning_effort: config.reasoning_effort, // S2S
         input_audio_noise_reduction: config.input_audio_noise_reduction.clone(),
+        language: config.language.clone(),
+        think_provider: config.think_provider.clone(),
+        region: config.region.clone(),
         ..Default::default()
     }
 }
@@ -1380,6 +1755,12 @@ mod tests {
             reasoning_effort: Some(crate::core::llm::ReasoningEffort::Low),
             input_audio_noise_reduction: Some("near_field".to_string()),
             alias: None,
+            interaction: None,
+            language: Some("de".to_string()),
+            think_provider: Some("anthropic".to_string()),
+            region: Some("eu".to_string()),
+            provider_fixes: None,
+            text_only: false,
         };
 
         // Step 1: the client→config converter must carry the full surface through
@@ -1397,6 +1778,11 @@ mod tests {
             Some(crate::core::llm::ReasoningEffort::Low)
         );
         assert!(realtime_config.realtime_endpoint_override.is_none());
+        // The voice-agent choices (Deepgram) are carried; the region names a host the
+        // provider picks itself, never a URL.
+        assert_eq!(realtime_config.language.as_deref(), Some("de"));
+        assert_eq!(realtime_config.think_provider.as_deref(), Some("anthropic"));
+        assert_eq!(realtime_config.region.as_deref(), Some("eu"));
 
         // Step 2: that config must construct EVERY provider (offline, no connect).
         // Azure needs its resource endpoint (server-injected in production).
@@ -1517,6 +1903,7 @@ mod frd023_native_tests {
             config("openai"),
             &mut provider,
             &mut session_id,
+            &mut Interaction::default(),
             &tx,
             &app_state,
             "",
@@ -1545,6 +1932,7 @@ mod frd023_native_tests {
             config("openai"),
             &mut provider,
             &mut session_id,
+            &mut Interaction::default(),
             &tx,
             &app_state,
             "",
@@ -1663,5 +2051,174 @@ mod frd023_native_tests {
             "turn detection carried: {:?}",
             cfg.turn_detection
         );
+    }
+
+    /// Runs `handle_config` against a local stand-in for the Deepgram Voice Agent socket and
+    /// returns every message the client was sent, as JSON. The session must come up.
+    async fn messages_of_config(config: serde_json::Value) -> Vec<serde_json::Value> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream = format!("ws://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("the gateway dials");
+            let mut ws = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("websocket handshake");
+            // Stay open, reading, until the gateway hangs up.
+            while let Some(Ok(_)) = ws.next().await {}
+        });
+
+        let mut cfg = crate::test_support::minimal_config();
+        cfg.deepgram_api_key = Some("dg-test".to_string());
+        cfg.realtime_endpoint_overrides
+            .insert("deepgram".to_string(), upstream);
+        let app_state = AppState::new(cfg).await;
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut provider: Option<Box<dyn BaseRealtime>> = None;
+        let mut session_id = None;
+        let mut ix = Interaction::default();
+
+        handle_config(
+            serde_json::from_value(config).expect("config"),
+            &mut provider,
+            &mut session_id,
+            &mut ix,
+            &tx,
+            &app_state,
+            "",
+        )
+        .await;
+
+        let mut sent = Vec::new();
+        while let Ok(route) = rx.try_recv() {
+            if let RealtimeMessageRoute::Outgoing(message) = route {
+                sent.push(serde_json::to_value(&message).expect("serialises"));
+            }
+        }
+        assert!(session_id.is_some(), "the session proceeds: {sent:?}");
+        provider
+            .expect("the provider is in place")
+            .disconnect()
+            .await
+            .unwrap();
+        sent
+    }
+
+    /// A provider that refuses the session right after the handshake (live: an unknown
+    /// ElevenLabs agent): the client never gets `session_created` after the refusal.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_session_refused_after_the_handshake_is_created_before_its_error() {
+        for _ in 0..5 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let upstream = format!("ws://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.expect("the gateway dials");
+                let mut ws = tokio_tungstenite::accept_async(stream)
+                    .await
+                    .expect("websocket handshake");
+                let refused =
+                    r#"{"type":"Error","description":"agent not found","code":"INVALID_SETTINGS"}"#;
+                let _ = ws
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        refused.into(),
+                    ))
+                    .await;
+                while let Some(Ok(_)) = ws.next().await {}
+            });
+            let mut cfg = crate::test_support::minimal_config();
+            cfg.deepgram_api_key = Some("dg-test".to_string());
+            cfg.realtime_endpoint_overrides
+                .insert("deepgram".to_string(), upstream);
+            let app_state = AppState::new(cfg).await;
+            let (tx, mut rx) = mpsc::channel(8);
+            let (mut provider, mut session_id, mut ix) = (None, None, Interaction::default());
+            let config = serde_json::json!({"provider": "deepgram"});
+            handle_config(
+                serde_json::from_value(config).expect("config"),
+                &mut provider,
+                &mut session_id,
+                &mut ix,
+                &tx,
+                &app_state,
+                "",
+            )
+            .await;
+            let mut types = Vec::new();
+            while let Ok(Some(route)) =
+                tokio::time::timeout(Duration::from_millis(500), rx.recv()).await
+            {
+                if let RealtimeMessageRoute::Outgoing(message) = route {
+                    let message = serde_json::to_value(&message).expect("serialises");
+                    types.push(message["type"].as_str().unwrap_or_default().to_owned());
+                }
+            }
+            let created = types.iter().position(|kind| kind == "session_created");
+            let error = types.iter().position(|kind| kind == "error");
+            assert!(error.is_some(), "{types:?}");
+            assert!(
+                created.is_none_or(|created| Some(created) < error),
+                "{types:?}"
+            );
+            if let Some(mut provider) = provider {
+                let _ = provider.disconnect().await;
+            }
+        }
+    }
+
+    /// Interaction mode asked on `/realtime` that the resolver turns down: one `warning`
+    /// with its reason and what the provider could do, then the session as without the field.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn interaction_on_realtime_that_cannot_run_warns_and_the_session_proceeds() {
+        use crate::core::interaction::config::{ServerInteraction, set_server_for_tests};
+        let types = |sent: &[serde_json::Value]| -> Vec<String> {
+            sent.iter()
+                .map(|message| message["type"].as_str().unwrap_or_default().to_string())
+                .collect()
+        };
+        set_server_for_tests(ServerInteraction {
+            enabled: true,
+            ..ServerInteraction::default()
+        });
+
+        let plain = messages_of_config(serde_json::json!({"provider": "deepgram"})).await;
+        assert_eq!(types(&plain), ["session_created"]);
+        let off =
+            messages_of_config(serde_json::json!({"provider": "deepgram", "interaction": false}))
+                .await;
+        assert_eq!(types(&off), ["session_created"], "`false` asks for nothing");
+
+        let asked =
+            messages_of_config(serde_json::json!({"provider": "deepgram", "interaction": true}))
+                .await;
+        assert_eq!(types(&asked), ["warning", "session_created"]);
+        assert_eq!(asked[0]["code"], "interaction_needs_background");
+        assert_eq!(
+            asked[0]["detail"],
+            serde_json::json!({
+                "surface": "realtime",
+                "provider": "deepgram",
+                "verbs": {
+                    "say_exact": true,
+                    "say_guided": true,
+                    "add_context": false,
+                    "stop_output": false,
+                },
+            })
+        );
+        assert!(asked[1].get("interaction").is_none(), "the mode is off");
+        // The session itself is the same one.
+        assert_eq!(asked[1]["provider"], plain[0]["provider"]);
+        assert_eq!(asked[1]["model"], plain[0]["model"]);
+
+        // With a background, the operator has not accepted the provider's own speech.
+        let llm = serde_json::json!({"base_url": "http://127.0.0.1:9/v1", "model": "m"});
+        let unacked = messages_of_config(serde_json::json!({
+            "provider": "deepgram", "interaction": {"tasks": {"llm": llm}}}))
+        .await;
+        assert_eq!(types(&unacked), ["warning", "session_created"]);
+        assert_eq!(unacked[0]["code"], "truth_ack_required");
+        assert_eq!(unacked[0]["detail"]["path"], "interaction.speech.truth_ack");
+        set_server_for_tests(ServerInteraction::default());
     }
 }

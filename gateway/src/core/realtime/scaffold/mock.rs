@@ -28,6 +28,8 @@ pub enum Step {
     Error(String),
     /// A clean close (recv returns None).
     Close,
+    /// A close whose reason refuses the session's configuration.
+    Refused(String),
 }
 
 /// Shared test observation handle.
@@ -72,6 +74,7 @@ impl RealtimeTransport for MockTransport {
             Some(Step::Text(s)) => Some(Ok(OutFrame::Text(s))),
             Some(Step::Error(e)) => Some(Err(RealtimeError::WebSocketError(e))),
             Some(Step::Close) => None,
+            Some(Step::Refused(why)) => Some(Err(RealtimeError::Refused(why))),
             None => std::future::pending().await, // stay open until aborted
         }
     }
@@ -107,6 +110,13 @@ pub struct MockProtocol {
     scripts: Arc<Mutex<VecDeque<Vec<Step>>>>,
     obs: MockObserver,
     max_connection: Option<std::time::Duration>,
+    /// [`RealtimeProtocol::awaits_session_ready`].
+    awaits_ready: bool,
+    /// [`RealtimeProtocol::update_by_reconnect`].
+    update_reconnect: bool,
+    /// [`RealtimeProtocol::after_replay`] and [`RealtimeProtocol::close_wires`]: `opened`
+    /// and `closed`, as Nova Sonic's fixes have them.
+    closing: bool,
 }
 
 impl MockProtocol {
@@ -118,9 +128,31 @@ impl MockProtocol {
                 scripts: Arc::new(Mutex::new(scripts.into())),
                 obs: obs.clone(),
                 max_connection: None,
+                awaits_ready: false,
+                update_reconnect: false,
+                closing: false,
             },
             obs,
         )
+    }
+
+    /// `opened` follows the replayed history on every connect; `closed` precedes a close on
+    /// purpose.
+    pub fn closing(mut self) -> Self {
+        self.closing = true;
+        self
+    }
+
+    /// Nothing but the session config goes before `session:<id>` (Gemini's `setupComplete`).
+    pub fn awaiting_ready(mut self) -> Self {
+        self.awaits_ready = true;
+        self
+    }
+
+    /// An update is taken on a new connection that resumes the session.
+    pub fn updating_by_reconnect(mut self) -> Self {
+        self.update_reconnect = true;
+        self
     }
 
     /// A connection cap, as Nova Sonic has.
@@ -189,6 +221,7 @@ impl MockProtocol {
                 cumulative: false,
             }),
             ["err", msg] => S2sEvent::Error(RealtimeError::ProviderError(msg.to_string())),
+            ["refused", msg] => S2sEvent::Error(RealtimeError::Refused(msg.to_string())),
             _ => S2sEvent::Ignore,
         }
     }
@@ -217,17 +250,28 @@ impl RealtimeProtocol for MockProtocol {
     fn max_connection(&self) -> Option<std::time::Duration> {
         self.max_connection
     }
+    fn awaits_session_ready(&self) -> bool {
+        self.awaits_ready
+    }
+    fn update_by_reconnect(&self, _old: &RealtimeConfig, _new: &RealtimeConfig) -> bool {
+        self.update_reconnect
+    }
     fn connect_spec(&self, _cfg: &RealtimeConfig) -> RealtimeResult<ConnectSpec> {
         Ok(ConnectSpec::WebSocket {
             url: "wss://mock/realtime".into(),
             headers: vec![],
         })
     }
-    fn build_session_config(&self, _cfg: &RealtimeConfig, resumption: Option<&str>) -> Vec<String> {
-        vec![match resumption {
-            Some(h) => format!("session_update:resume={h}"),
-            None => "session_update".into(),
-        }]
+    fn build_session_config(&self, cfg: &RealtimeConfig, resumption: Option<&str>) -> Vec<String> {
+        let mut wire = String::from("session_update");
+        if let Some(h) = resumption {
+            wire.push_str(&format!(":resume={h}"));
+        }
+        // The one config field the mock wire shows, so a test can see which config was sent.
+        if let Some(voice) = &cfg.voice {
+            wire.push_str(&format!(":voice={voice}"));
+        }
+        vec![wire]
     }
     fn map_server_event(&self, raw: Inbound<'_>) -> Vec<S2sEvent> {
         match raw {
@@ -275,6 +319,20 @@ impl RealtimeProtocol for MockProtocol {
     fn replay_item(&self, item: &ReplayConversationItem) -> Vec<String> {
         vec![format!("replay:{}:{}", item.role, item.text)]
     }
+    fn after_replay(&self) -> Vec<String> {
+        if self.closing {
+            vec!["opened".into()]
+        } else {
+            Vec::new()
+        }
+    }
+    fn close_wires(&self) -> Vec<String> {
+        if self.closing {
+            vec!["closed".into()]
+        } else {
+            Vec::new()
+        }
+    }
     fn serialize(&self, msg: &String) -> RealtimeResult<OutFrame> {
         Ok(OutFrame::Text(msg.clone()))
     }
@@ -288,7 +346,7 @@ impl RealtimeProtocol for MockProtocol {
 mod tests {
     use super::*;
     use crate::core::realtime::scaffold::session::RealtimeSession;
-    use crate::core::realtime::{BaseRealtime, ConnectionState, TranscriptResult};
+    use crate::core::realtime::{BaseRealtime, ConnectionState, RealtimeVerb, TranscriptResult};
     use std::time::Duration;
     use tokio::sync::Mutex as TMutex;
 
@@ -559,6 +617,34 @@ mod tests {
         s.disconnect().await.unwrap();
     }
 
+    /// `after_replay` follows the session config on the first connect and the replayed
+    /// history on a reconnect; `close_wires` precede a planned replacement and a disconnect
+    /// (Nova Sonic's fixes `nova_history_before_audio` and `nova_close_sequence`).
+    #[tokio::test]
+    async fn a_provider_opens_after_the_history_and_closes_on_purpose() {
+        let (proto, obs) = MockProtocol::new(
+            ProtocolCaps::default(),
+            vec![vec![Step::Text("tx:user:final:hello".into())], vec![]],
+        );
+        let proto = proto
+            .closing()
+            .with_max_connection(Duration::from_millis(150));
+        let mut s = RealtimeSession::from_parts(proto, cfg()).unwrap();
+        s.connect().await.unwrap();
+        until(|| obs.connect_count() >= 2 && obs.sent_text().len() >= 6).await;
+        let sent = obs.sent_text();
+        assert_eq!(sent[..2], ["session_update", "opened"], "{sent:?}");
+        assert_eq!(
+            sent[2], "closed",
+            "the replaced connection closes first: {sent:?}"
+        );
+        assert_eq!(sent[3], "session_update", "{sent:?}");
+        assert!(sent[4].starts_with("replay:"), "{sent:?}");
+        assert_eq!(sent[5], "opened", "after the history: {sent:?}");
+        s.disconnect().await.unwrap();
+        assert_eq!(obs.sent_text().last().map(String::as_str), Some("closed"));
+    }
+
     /// TC-XL-05 (driver half) — a connection cap replaces the connection before the vendor
     /// does, over and over, without ever counting as a quick failure (3 of which stop the
     /// session).
@@ -570,6 +656,209 @@ mod tests {
         s.connect().await.unwrap();
         until(|| obs.connect_count() >= 5).await;
         assert_ne!(s.get_connection_state(), ConnectionState::Failed);
+        s.disconnect().await.unwrap();
+    }
+
+    /// A session update survives a reconnect: the supervisor used to re-send the config it was
+    /// given at `connect()`, so the voice, instructions and tools set since were lost.
+    #[tokio::test]
+    async fn a_reconnect_resends_the_updated_session_config() {
+        let (proto, obs) = MockProtocol::new(ProtocolCaps::default(), vec![]);
+        // The cap forces the reconnect, well after the update below.
+        let proto = proto.with_max_connection(Duration::from_millis(150));
+        let mut s = RealtimeSession::from_parts(proto, cfg()).unwrap();
+        s.connect().await.unwrap();
+        s.update_session(RealtimeConfig {
+            voice: Some("nova".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let updated = || {
+            obs.sent_text()
+                .iter()
+                .filter(|wire| *wire == "session_update:voice=nova")
+                .count()
+        };
+        assert_eq!(obs.sent_text()[0], "session_update", "the first connect");
+        // One from the update itself, then one per reconnect.
+        until(|| obs.connect_count() >= 2 && updated() >= 2).await;
+        let sent = obs.sent_text();
+        assert_eq!(
+            sent.iter().filter(|wire| *wire == "session_update").count(),
+            1,
+            "no reconnect sent the config of the first connect: {sent:?}"
+        );
+        s.disconnect().await.unwrap();
+    }
+
+    /// A provider that answers its session config first (Gemini's `setupComplete`, fix
+    /// `gemini_await_setup`) gets nothing else before it: a connection that never answers is
+    /// dropped after `SESSION_READY_TIMEOUT` and dialled again, and the frames queued meanwhile
+    /// go on the connection that answered, after its config.
+    #[tokio::test(start_paused = true)]
+    async fn nothing_goes_before_the_providers_answer_to_its_config() {
+        let (proto, obs) = MockProtocol::new(
+            ProtocolCaps::default(),
+            vec![vec![], vec![Step::Text("session:s2".into())]],
+        );
+        let mut s = RealtimeSession::from_parts(proto.awaiting_ready(), cfg()).unwrap();
+        s.connect().await.unwrap();
+        s.send_text("hello").await.unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(obs.sent_text(), ["session_update"], "held until the answer");
+        // Past the timeout (paused clock): the next connection answers.
+        tokio::time::sleep(crate::core::realtime::scaffold::session::SESSION_READY_TIMEOUT).await;
+        until(|| obs.sent_text().iter().any(|w| w == "text:hello")).await;
+        assert_eq!(obs.connect_count(), 2);
+        assert_eq!(
+            obs.sent_text(),
+            ["session_update", "session_update", "text:hello"]
+        );
+        s.disconnect().await.unwrap();
+    }
+
+    /// An update the provider takes only by resuming (Gemini, fix `gemini_update_resume`)
+    /// is a new connection carrying the handle and the new config, with nothing sent on the
+    /// old one; before the provider gave a handle it is refused and the config is kept.
+    #[tokio::test]
+    async fn an_update_by_reconnect_resumes_with_the_new_config() {
+        let nova = || RealtimeConfig {
+            voice: Some("nova".into()),
+            ..Default::default()
+        };
+        // No handle yet: refused, the config kept, nothing sent.
+        let (proto, obs) = MockProtocol::new(ProtocolCaps::default(), vec![vec![]]);
+        let mut s = RealtimeSession::from_parts(proto.updating_by_reconnect(), cfg()).unwrap();
+        s.connect().await.unwrap();
+        let refused = s.update_session(nova()).await;
+        assert!(
+            matches!(refused, Err(RealtimeError::InvalidConfiguration(_))),
+            "{refused:?}"
+        );
+        assert!(s.config().voice.is_none(), "the session keeps its settings");
+        assert_eq!(obs.sent_text(), ["session_update"]);
+        s.disconnect().await.unwrap();
+
+        // With the provider's handle the update is a new connection resuming the session.
+        let (proto, obs) = MockProtocol::new(
+            ProtocolCaps::default(),
+            vec![vec![Step::Text("resume:h1".into())], vec![]],
+        );
+        let mut s = RealtimeSession::from_parts(proto.updating_by_reconnect(), cfg()).unwrap();
+        s.connect().await.unwrap();
+        until(|| obs.sent_text().len() == 1).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        s.update_session(nova()).await.unwrap();
+        until(|| obs.connect_count() >= 2 && obs.sent_text().len() >= 2).await;
+        assert_eq!(
+            obs.sent_text(),
+            ["session_update", "session_update:resume=h1:voice=nova"]
+        );
+        s.disconnect().await.unwrap();
+    }
+
+    /// An update by reconnect asked while a `goAway` had already planned the next connection
+    /// rides on that connection; it does not replace the new one again.
+    #[tokio::test]
+    async fn an_update_during_a_planned_reconnect_rides_on_it() {
+        let nova = || RealtimeConfig {
+            voice: Some("nova".into()),
+            ..Default::default()
+        };
+        // A response in flight holds the `goAway` reconnect until its deadline (~300 ms).
+        let (proto, obs) = MockProtocol::new(
+            ProtocolCaps::default(),
+            vec![
+                vec![
+                    Step::Text("resume:h1".into()),
+                    Step::Text("audio:10".into()),
+                    Step::Text("goaway:800".into()),
+                ],
+                vec![],
+                vec![],
+            ],
+        );
+        let mut s = RealtimeSession::from_parts(proto.updating_by_reconnect(), cfg()).unwrap();
+        s.connect().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        s.update_session(nova()).await.unwrap();
+        until(|| obs.connect_count() >= 2).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(obs.connect_count(), 2, "{:?}", obs.sent_text());
+        assert_eq!(
+            obs.sent_text(),
+            ["session_update", "session_update:resume=h1:voice=nova"]
+        );
+        s.disconnect().await.unwrap();
+    }
+
+    /// The interaction verbs this build lists for a provider are exactly those its protocol
+    /// has a wire for (the mock is in no row, and has none).
+    fn assert_table_lists_the_verbs_of<P: RealtimeProtocol>() {
+        assert_table_lists_the_verbs_with::<P>(&cfg());
+    }
+
+    fn assert_table_lists_the_verbs_with<P: RealtimeProtocol>(cfg: &RealtimeConfig) {
+        let protocol = P::from_config(cfg).unwrap();
+        let has = [
+            RealtimeVerb::SayExact("x"),
+            RealtimeVerb::SayGuided("x"),
+            RealtimeVerb::AddContext("x"),
+            RealtimeVerb::StopOutput,
+        ]
+        .map(|verb| protocol.verb(&verb).is_some());
+        let provider = protocol.provider_id();
+        let listed = crate::core::interaction::regime::verbs(provider);
+        assert_eq!(listed, has, "{provider}");
+    }
+
+    #[test]
+    fn the_capability_table_lists_the_verbs_each_protocol_has() {
+        assert_table_lists_the_verbs_of::<crate::core::realtime::openai::protocol::OpenAiProtocol>(
+        );
+        assert_table_lists_the_verbs_of::<crate::core::realtime::DeepgramProtocol>();
+        assert_table_lists_the_verbs_of::<crate::core::realtime::NovaSonicProtocol>();
+        assert_table_lists_the_verbs_of::<MockProtocol>();
+        assert_table_lists_the_verbs_of::<crate::core::realtime::GeminiProtocol>();
+        assert_table_lists_the_verbs_of::<crate::core::realtime::GrokProtocol>();
+        assert_table_lists_the_verbs_with::<crate::core::realtime::AzureProtocol>(
+            &RealtimeConfig {
+                endpoint: Some("my-resource".into()),
+                ..cfg()
+            },
+        );
+        assert_table_lists_the_verbs_of::<crate::core::realtime::UltravoxProtocol>();
+        assert_table_lists_the_verbs_of::<crate::core::realtime::ElevenLabsProtocol>();
+        assert_table_lists_the_verbs_of::<crate::core::realtime::InworldProtocol>();
+        assert_table_lists_the_verbs_of::<crate::core::realtime::hume::protocol::HumeProtocol>();
+        assert_table_lists_the_verbs_with::<crate::core::realtime::YandexProtocol>(
+            &RealtimeConfig {
+                endpoint: Some("b1gfolder".into()),
+                ..cfg()
+            },
+        );
+    }
+
+    /// The scaffold sends a verb's wires, and refuses a verb the protocol has no wire for.
+    #[tokio::test]
+    async fn apply_verb_is_refused_when_the_protocol_has_no_wire() {
+        let (proto, obs) = MockProtocol::new(ProtocolCaps::default(), vec![vec![]]);
+        let mut s = RealtimeSession::from_parts(proto, cfg()).unwrap();
+        s.connect().await.unwrap();
+        for verb in [
+            RealtimeVerb::SayExact("hello"),
+            RealtimeVerb::SayGuided("greet"),
+            RealtimeVerb::AddContext("note"),
+            RealtimeVerb::StopOutput,
+        ] {
+            let refused = s.apply_verb(verb).await;
+            assert!(
+                matches!(refused, Err(RealtimeError::InvalidConfiguration(_))),
+                "{verb:?}: {refused:?}"
+            );
+        }
+        assert_eq!(obs.sent_text(), ["session_update"], "nothing went out");
         s.disconnect().await.unwrap();
     }
 
@@ -654,6 +943,76 @@ mod tests {
             "shared breaker must trip FATAL after the handshake-then-drop storm"
         );
         s.disconnect().await.unwrap();
+    }
+
+    /// A configuration the provider refused (its error event, or its close reason) ends the
+    /// session at once with the provider's reason: no second dial, and nothing counted against
+    /// the shared breaker, so the vendor's other sessions are not blocked.
+    #[tokio::test]
+    async fn a_refused_configuration_ends_the_session_with_its_reason_and_spares_the_breaker() {
+        use crate::core::resilience::{
+            CircuitBreaker, CircuitBreakerConfig, ReconnectGovernor, ResilienceHandles,
+        };
+        use std::sync::Arc;
+        for script in [
+            vec![
+                Step::Text("refused:Cannot specify agent.language".into()),
+                Step::Close,
+            ],
+            vec![Step::Refused("Agent agent_x not found: 404".into())],
+        ] {
+            let scripts = vec![script.clone(), script.clone(), script.clone(), script];
+            let mut c = cfg();
+            c.reconnection = Some(crate::core::realtime::base::ReconnectionConfig {
+                initial_delay_ms: 1,
+                max_delay_ms: 2,
+                ..Default::default()
+            });
+            let (proto, obs) = MockProtocol::new(ProtocolCaps::default(), scripts);
+            let mut s = RealtimeSession::from_parts(proto, c).unwrap();
+            let breaker = Arc::new(CircuitBreaker::with_label(
+                CircuitBreakerConfig::default(),
+                "mock-realtime",
+            ));
+            s.set_resilience(ResilienceHandles {
+                governor: Arc::new(ReconnectGovernor::new(4)),
+                breaker: breaker.clone(),
+            });
+            let errors = Arc::new(Mutex::new(Vec::<String>::new()));
+            let seen = errors.clone();
+            s.on_error(Arc::new(move |e: RealtimeError| {
+                seen.lock().unwrap().push(e.to_string());
+                Box::pin(async {})
+            }))
+            .unwrap();
+            let gave_up = Arc::new(Mutex::new(None::<String>));
+            let why = gave_up.clone();
+            s.on_reconnection(Arc::new(
+                move |e: crate::core::realtime::ReconnectionEvent| {
+                    *why.lock().unwrap() = e.error;
+                    Box::pin(async {})
+                },
+            ))
+            .unwrap();
+            s.connect().await.unwrap();
+            until(|| s.get_connection_state() == ConnectionState::Failed).await;
+            until(|| gave_up.lock().unwrap().is_some()).await;
+            assert_eq!(
+                obs.connect_count(),
+                1,
+                "the refused configuration is not dialled again"
+            );
+            let reason = gave_up.lock().unwrap().clone().unwrap();
+            assert!(reason.starts_with("Refused by the provider: "), "{reason}");
+            assert!(
+                errors.lock().unwrap().iter().any(|e| e == &reason),
+                "{:?}",
+                errors.lock().unwrap()
+            );
+            assert!(!breaker.is_permanently_failed());
+            assert!(breaker.allow_request());
+            s.disconnect().await.unwrap();
+        }
     }
 
     #[tokio::test]

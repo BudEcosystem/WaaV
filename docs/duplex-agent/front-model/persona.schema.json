@@ -1,0 +1,277 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://waav.local/schemas/interaction/persona.schema.json",
+  "title": "PersonaSpec",
+  "description": "An operator- or tenant-registered persona for the WaaV interaction agent (W2 section 3.4.1; integration decisions section 7). One spec is compiled by PersonaSpec::compile into: the front model's stable-prefix system prompt, the background preamble, the TTS settings for every speech lane, provider instructions for regimes B and C, the merged phrase banks and W4's templates. Clients never send a persona; they select one by id (optionally id@version) through interaction.front.persona and may set only the whitelisted caller fields. Every free-text field is length-capped, sanitised (newlines collapsed, reserved labels and special tokens removed) and guard-checked at compile time.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "version", "name", "org", "role", "channel", "language"],
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{1,62}$",
+      "description": "Registry id. (id, version) keys the stable prefix, so two calls of one persona version share a byte-identical cached prefix."
+    },
+    "version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Version. Operator personas set it; tenant registration assigns the next version for new content and returns the existing one for identical content (W2 section 3.17)."
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 40,
+      "pattern": "^[A-Za-z][A-Za-z '-]*$",
+      "description": "The agent's spoken name, for example 'Ava'. Letters only, no digits. A protected term."
+    },
+    "org": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 60,
+      "pattern": "^[A-Za-z][A-Za-z '&.-]*$",
+      "description": "Organisation the agent speaks for, for example 'Northwind Travel'. No digits. A protected term."
+    },
+    "role": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 60,
+      "description": "Short role noun phrase, for example 'travel assistant'. Rendered in the Persona section of the front prompt."
+    },
+    "channel": {
+      "type": "string",
+      "enum": ["phone", "app", "web"],
+      "description": "Where the persona speaks. Decides the backchannel default when backchannel_intensity is null (web medium, phone off; sign-off item 19)."
+    },
+    "language": {
+      "type": "string",
+      "pattern": "^[a-z]{2,3}(-[A-Z]{2})?$",
+      "default": "en-US",
+      "description": "BCP-47 tag of the persona language. English only in Releases 1 to 3; a persona whose language has no valid W4 policy pack runs with the interaction mode off (W4 section 3.13.1). Hindi packs arrive in Release 4."
+    },
+    "tone": {
+      "type": "string",
+      "enum": ["warm", "neutral", "brisk", "playful"],
+      "default": "warm",
+      "description": "Tone word rendered into the front prompt and the background preamble."
+    },
+    "formality": {
+      "type": "string",
+      "enum": ["formal", "informal"],
+      "default": "informal",
+      "description": "Register. A server-side caller formality (operator, budapp or a memory fact) may override it per call in the call header, never in the stable prefix."
+    },
+    "max_words": {
+      "type": "integer",
+      "minimum": 6,
+      "maximum": 25,
+      "default": 15,
+      "description": "Word cap for every front line. Also sets max_tokens = 12 + ceil(1.4 x max_words) for the LFM tokenizer (estimate; 33 tokens at 15 words)."
+    },
+    "answer_words": {
+      "type": "integer",
+      "minimum": 15,
+      "maximum": 120,
+      "default": 40,
+      "description": "Word budget the background preamble asks the background to keep a spoken answer within unless the caller asked for detail (the {answer_words} slot of W2 section 3.4.7)."
+    },
+    "backend_capabilities": {
+      "type": "array",
+      "maxItems": 12,
+      "items": {"type": "string", "minLength": 1, "maxLength": 80},
+      "default": [],
+      "description": "What the backend can do, rendered as 'Backend tools:' in the Delegation policy. In Bud mode, defaults to the humanised keys of tool_status_messages when the agent's front block gives none."
+    },
+    "delegate_when": {
+      "type": "array",
+      "maxItems": 8,
+      "items": {"type": "string", "minLength": 1, "maxLength": 120},
+      "default": [],
+      "description": "Extra 'Delegate to the backend when' bullets, appended after the gateway's fixed bullets."
+    },
+    "do_not_delegate_when": {
+      "type": "array",
+      "maxItems": 8,
+      "items": {"type": "string", "minLength": 1, "maxLength": 120},
+      "default": [],
+      "description": "Extra 'Do not delegate to the backend when' bullets, appended after the gateway's fixed bullets."
+    },
+    "forbidden_topics": {
+      "type": "array",
+      "maxItems": 8,
+      "items": {"type": "string", "minLength": 1, "maxLength": 80},
+      "default": [],
+      "description": "Topics the persona must not discuss. Rendered as a 'Refuse, and do not delegate, when the caller asks for' list in the front prompt (act refuse) and as a 'Never give' line in the background preamble. Packaging addition: W2's PersonaSpec carries refusal through the refuse bank and social_scope; this field makes the topics explicit."
+    },
+    "social_scope": {
+      "type": "array",
+      "maxItems": 6,
+      "items": {"type": "string", "minLength": 1, "maxLength": 60},
+      "default": [],
+      "description": "Small-talk topics the front may answer with a social line. Anything else social-sounding but request-shaped is converted to delegate by the rule layer."
+    },
+    "backchannel_intensity": {
+      "type": ["string", "null"],
+      "enum": ["off", "low", "medium", "high", null],
+      "default": null,
+      "description": "W5's four levels. null means the transport default (web medium, phone off; sign-off item 19). Rendered as the Backchannel policy sentence and read by W5's emitter."
+    },
+    "backchannel_clips": {
+      "type": "array",
+      "maxItems": 6,
+      "items": {"type": "string", "pattern": "^[a-z][a-z-]{0,23}$"},
+      "default": ["mhm", "right", "okay"],
+      "description": "Closed list of clip ids for the backchannel act (only with backchannel_via_model) and W5's ClipBank group. Each id must exist in the backchannel bank."
+    },
+    "interruptibility": {
+      "type": "string",
+      "enum": ["low", "normal", "high"],
+      "default": "normal",
+      "description": "How readily the agent yields to caller speech; read by W5 (section 3.5.5). Not rendered into the front prompt."
+    },
+    "utc_offset": {
+      "type": ["string", "null"],
+      "pattern": "^[+-](0[0-9]|1[0-4]):[0-5][0-9]$",
+      "default": null,
+      "description": "Persona's local UTC offset for W1's TIME line, for example '+05:30'. A session's interaction.runtime.time.utc_offset wins. Never rendered into the stable prefix."
+    },
+    "interruption_notes": {
+      "type": "array",
+      "maxItems": 4,
+      "items": {"type": "string", "minLength": 1, "maxLength": 120},
+      "default": [],
+      "description": "Extra Interruption policy bullets."
+    },
+    "escalation": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "How the gateway may offer a person or a follow-up channel. Spoken only through W4 templates (failure.second's handoff_clause, finish_or_stop.with_channel, choice_offer); the front model has no handover act.",
+      "properties": {
+        "human_handoff": {"type": "boolean", "default": false, "description": "The operator configured a transfer to a person. When false no line may offer one."},
+        "handoff_phrase": {"type": "string", "maxLength": 80, "default": "", "description": "Clause appended by failure.second, for example 'or I can put you through to reception'. Requires human_handoff."},
+        "continuation_channel": {"type": "string", "enum": ["none", "sms", "email", "app"], "default": "none", "description": "Channel W4 may promise a later result on; ChannelPromise lines are allowed only in W4 templates when this is configured."},
+        "continuation_phrase": {"type": "string", "maxLength": 60, "default": "", "description": "W4's continuation_phrase, for example 'text you when it's done'. Requires a continuation_channel other than none."},
+        "approval_message": {"type": "string", "maxLength": 160, "default": "", "description": "Line for a run paused on an approval the caller cannot give by voice; empty uses W4's approval_needed template."}
+      }
+    },
+    "sensitive": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Per-persona W4 policy overrides for sensitive values (W4 section 3.8.7, within W4's clamps). Values in these categories are never taken or read back by voice.",
+      "properties": {
+        "extra_categories": {
+          "type": "array",
+          "maxItems": 12,
+          "items": {"type": "string", "minLength": 2, "maxLength": 40},
+          "default": [],
+          "description": "Category labels added to W4's screening lexicon, for example 'date of birth'. Screening marks any Value or Form question naming one as sensitive; the reference grammar builder also suppresses copy spans of a caller utterance that names one."
+        },
+        "channels": {
+          "type": "array",
+          "items": {"type": "string", "enum": ["client", "dtmf", "link"]},
+          "default": ["client", "dtmf", "link"],
+          "description": "W4 sensitive_channels filter, in order. Voice is never a channel. With none available (always in Release 1) the request is declined with sensitive.decline."
+        }
+      }
+    },
+    "banks": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Overrides of phrase_banks.en.json groups. A group given here replaces the default list for this persona. Every line is compile-checked: no digits, money, dates, codes, names other than protected terms, no claim, outcome, ETA or channel words, no polar opener unless tagged polar, at least 4 lines per group (except restate_closers, stalled and social), acknowledgement clips at most 24 characters. A failure line needs its id in clip and its kind in subsituation (stall, hearing, exit, exit_follow_up, back); the kinds a persona leaves out keep the pack's lines.",
+      "properties": {
+        "openers": {"$ref": "#/$defs/bankGroup"},
+        "inquiry": {"$ref": "#/$defs/bankGroup"},
+        "restate_closers": {"$ref": "#/$defs/bankGroup"},
+        "ack": {"$ref": "#/$defs/bankGroup"},
+        "update_ack": {"$ref": "#/$defs/bankGroup"},
+        "progress_openers": {"$ref": "#/$defs/bankGroup"},
+        "status_working": {"$ref": "#/$defs/bankGroup"},
+        "status_queued": {"$ref": "#/$defs/bankGroup"},
+        "clarify": {"$ref": "#/$defs/bankGroup"},
+        "refuse": {"$ref": "#/$defs/bankGroup"},
+        "social": {"$ref": "#/$defs/bankGroup"},
+        "holding": {"$ref": "#/$defs/bankGroup"},
+        "check_in": {"$ref": "#/$defs/bankGroup"},
+        "wait_agreed": {"$ref": "#/$defs/bankGroup"},
+        "bridge": {"$ref": "#/$defs/bankGroup"},
+        "withdrawal": {"$ref": "#/$defs/bankGroup"},
+        "stalled": {"$ref": "#/$defs/bankGroup"},
+        "backchannel": {"$ref": "#/$defs/bankGroup"},
+        "failure": {"$ref": "#/$defs/bankGroup"}
+      },
+      "default": {}
+    },
+    "template_overrides": {
+      "type": "object",
+      "description": "Persona wording of W4 templates, keyed by template id from templates.en.json. W4's validator keeps every slot with the same type and order, refuses answer-lexicon phrases in question templates and claim words outside the template's backing event; W2's guard allows no entity outside protected terms.",
+      "propertyNames": {
+        "enum": ["confirm.lead_in", "confirm.readback", "confirm.consequence", "confirm.question", "confirm.short_reask", "confirm.weak_yes_reask", "confirm.not_heard_reask", "choose", "value", "offer.result", "offer.more", "choice_offer", "status.working", "status.sentence_fragment", "status.queued", "status.queued_on_create", "status.waiting_on_caller", "status.result_ready", "presence", "holding.status", "bridge.about", "which_task.cancel", "which_task.update", "finish_or_stop", "finish_or_stop.with_channel", "goodbye.side_effect_running", "cancel.intent", "cancel.intent_operation_in_flight", "cancel.confirmed_none_committed", "cancel.confirmed_none_committed_named", "cancel.confirmed_committed", "cancel.confirmed_effects_unknown", "cancel.unconfirmed_backend_cannot_confirm", "cancel.unconfirmed_no_confirmation_in_time", "cancel.unconfirmed_operation_in_flight", "cancel.already_done", "cancel.already_done_undo_offer", "stale_outcome", "unknown", "failure.retryable", "failure.retry_offer", "failure.second", "failure.timeout", "failure.effects_unknown", "failure.with_effects", "rejected", "approval_needed", "approval.not_recorded", "approval.not_permitted", "approval.more_needed", "hitl.accept", "hitl.decline", "hitl.decline_correction", "hitl.cancel", "hitl.timeout", "hitl.unclear_confirm", "hitl.unclear_choose", "sensitive.dtmf", "sensitive.screen", "sensitive.decline", "sensitive.dont_say", "auth_url.before", "auth_url.after", "repeat_request", "regime_c_correction"]
+      },
+      "additionalProperties": {"type": "string", "minLength": 1, "maxLength": 240},
+      "default": {}
+    },
+    "lexicon": {
+      "type": "array",
+      "maxItems": 50,
+      "items": {"$ref": "#/$defs/pronunciation"},
+      "default": [],
+      "description": "TTS respellings, mapped onto the gateway's Pronunciation {word, pronunciation} type and TTSConfig.pronunciations (gateway core/tts/base.rs:261-267, :291). Caller-profile pronunciations are merged after these."
+    },
+    "voice": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "voice_id"],
+      "description": "One voice for every speech lane, so the front's line and the background's verbatim answer sound like one speaker. The server's allow-list decides which providers and voices a tenant persona may use.",
+      "properties": {
+        "provider": {"type": "string", "minLength": 1, "maxLength": 40, "description": "TTS provider id as the gateway names it."},
+        "voice_id": {"type": "string", "minLength": 1, "maxLength": 80, "description": "Provider voice id."},
+        "speed": {"type": "number", "minimum": 0.5, "maximum": 2.0, "default": 1.0, "description": "Speaking rate (TTSConfig.speaking_rate allows 0.25 to 4.0; the persona range is narrower). A caller pace preference moves within it."},
+        "language": {"type": "string", "pattern": "^[a-z]{2,3}(-[A-Z]{2})?$", "description": "Voice language; defaults to the persona language."}
+      }
+    },
+    "protected_terms": {
+      "type": "array",
+      "maxItems": 20,
+      "items": {"type": "string", "minLength": 1, "maxLength": 60, "pattern": "^[A-Za-z][A-Za-z '&.-]*$"},
+      "default": [],
+      "description": "Organisation, product and agent names the guard treats as known entities. Letters only: a persona cannot make a price or phone number speakable through this list."
+    }
+  },
+  "$defs": {
+    "bankLine": {
+      "description": "A bank line: a string, or an object with flags.",
+      "oneOf": [
+        {"type": "string", "minLength": 1, "maxLength": 120, "pattern": "^[^\"\\\\<>|`*#«»]+$"},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["text"],
+          "properties": {
+            "text": {"type": "string", "minLength": 1, "maxLength": 120, "pattern": "^[^\"\\\\<>|`*#«»]+$", "description": "The line. '{{org}}' and '{{name}}' are the only slots allowed."},
+            "polar": {"type": "boolean", "default": false, "description": "The line affirms or denies; never used on a yes/no question except for its own social intent."},
+            "signed": {"type": "boolean", "default": false, "description": "Operator-signed: bypasses the entity rules (logged). Refused for tenant personas."},
+            "acts": {"type": "array", "items": {"enum": ["wait", "backchannel", "delegate", "update", "abort", "social", "echo", "progress", "question", "refuse"]}, "description": "Acts that may use this line; defaults to the group's acts."},
+            "intent": {"type": "string", "enum": ["greeting", "thanks", "goodbye", "presence", "identity", "how_are_you", "small_talk", "goodbye_open_tasks", "language_not_supported"], "description": "Social intent of a social line."},
+            "subsituation": {"type": "string", "maxLength": 40, "description": "Finer situation tag inside a group, for example caller_keeps_waiting."},
+            "clip": {"type": "string", "pattern": "^[a-z][a-z-]{0,23}$", "description": "Clip id of a backchannel line."},
+            "w4_only": {"type": "boolean", "default": false, "description": "Spoken only by W4, never offered to the model."}
+          }
+        }
+      ]
+    },
+    "bankGroup": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 24,
+      "items": {"$ref": "#/$defs/bankLine"}
+    },
+    "pronunciation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["word", "pronunciation"],
+      "properties": {
+        "word": {"type": "string", "minLength": 1, "maxLength": 60, "description": "Word to replace before TTS."},
+        "pronunciation": {"type": "string", "minLength": 1, "maxLength": 80, "description": "Respelling to speak instead."}
+      }
+    }
+  }
+}

@@ -1,3 +1,6 @@
+use std::fmt;
+use std::sync::{Arc, Mutex};
+
 use serde::{Deserialize, Serialize};
 
 /// LiveKit configuration for connecting to a room
@@ -29,6 +32,105 @@ pub struct LiveKitConfig {
     /// If empty, all participants' audio and data will be processed.
     /// If populated, only participants in this list will be processed.
     pub listen_participants: Vec<String>,
+    /// Interaction mode: the session hears one caller (see [`CallerTap`]). `None` on every
+    /// other session.
+    pub caller_tap: Option<CallerTap>,
+}
+
+/// Interaction mode's view of a room: one caller. The first participant whose audio track is
+/// subscribed (among `listen_participants`, when the session lists any) is the caller for the
+/// rest of the session. Nobody else's audio is heard, and nobody else's leaving ends the
+/// session.
+#[derive(Clone)]
+pub struct CallerTap {
+    audio: Arc<dyn Fn(&[u8]) + Send + Sync>,
+    found: Arc<dyn Fn(bool) + Send + Sync>,
+    /// The keys the caller presses on a phone (SIP DTMF).
+    keys: Option<Arc<dyn Fn(char) + Send + Sync>>,
+    identity: Arc<Mutex<Option<String>>>,
+}
+
+impl CallerTap {
+    /// `audio` gets the caller's frames as they arrive, before the noise filter. `found` is
+    /// called once, when the caller is known, with whether it is a phone (SIP) participant.
+    pub fn new(
+        audio: impl Fn(&[u8]) + Send + Sync + 'static,
+        found: impl Fn(bool) + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            audio: Arc::new(audio),
+            found: Arc::new(found),
+            keys: None,
+            identity: Arc::default(),
+        }
+    }
+
+    /// `keys` gets each key the caller presses (`0`-`9`, `*`, `#`); nobody else's.
+    pub fn on_keys(mut self, keys: impl Fn(char) + Send + Sync + 'static) -> Self {
+        self.keys = Some(Arc::new(keys));
+        self
+    }
+
+    /// A SIP DTMF event of the room: passed on when it is the caller's. LiveKit gives the
+    /// key as `digit`, or only as its `code` (`0`-`9`, then 10 for `*` and 11 for `#`).
+    pub(crate) fn key(&self, identity: Option<&str>, code: u32, digit: Option<&str>) {
+        let caller = self.caller();
+        let Some(keys) = self
+            .keys
+            .as_ref()
+            .filter(|_| identity.is_some() && caller.as_deref() == identity)
+        else {
+            return;
+        };
+        let key = digit.and_then(|d| d.trim().chars().next()).or(match code {
+            0..=9 => char::from_digit(code, 10),
+            10 => Some('*'),
+            11 => Some('#'),
+            _ => None,
+        });
+        if let Some(key) = key.filter(|k| k.is_ascii_digit() || *k == '*' || *k == '#') {
+            drop(caller);
+            keys(key);
+        }
+    }
+
+    fn caller(&self) -> std::sync::MutexGuard<'_, Option<String>> {
+        self.identity
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Whether `identity` is the caller. The first participant asked about becomes it.
+    pub(crate) fn admits(&self, identity: &str, phone: bool) -> bool {
+        let mut caller = self.caller();
+        match caller.as_deref() {
+            Some(caller) => caller == identity,
+            None => {
+                *caller = Some(identity.to_owned());
+                (self.found)(phone);
+                true
+            }
+        }
+    }
+
+    /// Whether the session has a caller and `identity` is somebody else.
+    pub(crate) fn is_other(&self, identity: &str) -> bool {
+        self.caller()
+            .as_deref()
+            .is_some_and(|caller| caller != identity)
+    }
+
+    pub(crate) fn audio(&self, frame: &[u8]) {
+        (self.audio)(frame);
+    }
+}
+
+impl fmt::Debug for CallerTap {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CallerTap")
+            .field("caller", &*self.caller())
+            .finish()
+    }
 }
 
 /// LiveKit connection status

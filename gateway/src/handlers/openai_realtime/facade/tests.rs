@@ -721,3 +721,22 @@ fn an_unset_turn_detection_is_reported_as_the_vendors_own_vad() {
     let created: Value = serde_json::from_str(&tr.session_created()).unwrap();
     assert!(created["session"]["audio"]["input"]["turn_detection"].is_null());
 }
+
+/// A vendor's warning (Deepgram `Warning`) does not reach a GA client as an `error`: the
+/// session goes on. A real vendor error still does.
+#[test]
+fn a_vendor_warning_is_not_sent_as_an_error() {
+    let mut tr = translator("deepgram_voice_agent");
+    ready(&mut tr);
+    let acts = tr.vendor(S2sEvent::Error(
+        crate::core::realtime::RealtimeError::ProviderWarning {
+            code: Some("FAILED_TO_THINK".into()),
+            message: "the think provider was slow".into(),
+        },
+    ));
+    assert!(kinds(&acts).is_empty(), "{:?}", kinds(&acts));
+    let acts = tr.vendor(S2sEvent::Error(
+        crate::core::realtime::RealtimeError::ProviderError("down".into()),
+    ));
+    assert_eq!(kinds(&acts), ["error"]);
+}

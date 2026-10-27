@@ -104,6 +104,9 @@ regexes = [
   # Deepgram model ids (`nova-2-medical`), which the capability map writes as pricing keys
   # (`pricing_key deepgram:nova-2-medical`): a public model name, not a credential.
   '''^nova-[0-9](-[a-z]+)*$''',
+  # Base64 of the made-up pair `key_id:secret`, the Inworld Basic-auth unit test's key
+  # (gateway/src/core/realtime/inworld/protocol.rs).
+  '''^a2V5X2lkOnNlY3JldA==$''',
 ]
 # Never flag git commit SHAs by themselves (the 40-hex Deepgram rule is keyword-anchored,
 # so a bare SHA in a doc/lockfile is not a finding).

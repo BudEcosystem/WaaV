@@ -226,6 +226,16 @@ impl SensitiveDataItem {
 ///     WordTiming::new("world".to_string(), 0.6, 1.0),
 /// ]);
 /// ```
+/// A turn event of a speech-to-text that runs its own turn model (Deepgram Flux). The turn's
+/// end is the speech-final result itself; these are the events between.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SttTurnEvent {
+    /// The provider's turn model guesses the turn has ended (Flux `EagerEndOfTurn`).
+    EagerEndOfTurn,
+    /// The caller went on after an eager end of turn (Flux `TurnResumed`).
+    TurnResumed,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct STTResult {
     /// The transcribed text from the audio.
@@ -329,6 +339,8 @@ pub struct STTResult {
     /// The vendor's own id for the request that produced this result, when it returned one.
     pub vendor_request_id: Option<String>,
 
+    /// The provider's turn event this result carries, when it runs its own turn model.
+    pub turn_event: Option<SttTurnEvent>,
     /// The caller turn a gateway-endpointed provider (the segmented engine) emitted this result
     /// for. Consumers match a result to its `SpeechActivity::TurnClosed` by this id, because the
     /// two travel on different tasks. `None` for every other provider; never serialized.
@@ -374,6 +386,7 @@ impl STTResult {
             translations: Vec::new(),
             vendor_confidence: None,
             vendor_request_id: None,
+            turn_event: None,
             speech_turn_id: None,
         }
     }
@@ -441,6 +454,7 @@ impl STTResult {
             translations: Vec::new(),
             vendor_confidence: None,
             vendor_request_id: None,
+            turn_event: None,
             speech_turn_id: None,
         }
     }
@@ -811,6 +825,48 @@ pub trait BaseSTT: Send + Sync {
     /// Defaults to `false`: a provider that streams need not think about this.
     fn is_request_response(&self) -> bool {
         false
+    }
+
+    /// Take the audio buffered since the last flush as ONE utterance and return the upload that
+    /// transcribes it. The provider stays connected, keeps its callbacks and takes new audio at
+    /// once; the result arrives on the registered result callback when the returned future is
+    /// awaited, and dropping the future instead discards the utterance.
+    ///
+    /// This is the per-utterance flush of a request/response provider in a live session:
+    /// `disconnect` also flushes, but it drops the callbacks, so it works once.
+    ///
+    /// Defaults to `None`: nothing is buffered, or the provider streams.
+    fn take_utterance(
+        &mut self,
+    ) -> Option<Pin<Box<dyn Future<Output = Result<(), STTError>> + Send>>> {
+        None
+    }
+
+    /// Whether [`Self::take_utterance`] is implemented. A request/response provider without
+    /// it delivers one transcript per connection, so it cannot serve a live session that
+    /// ends its own turns.
+    fn has_utterance_flush(&self) -> bool {
+        false
+    }
+
+    /// Whether the provider runs its own turn model: its speech-final result ends the turn and
+    /// its results carry [`STTResult::turn_event`] (Deepgram Flux).
+    fn has_turn_events(&self) -> bool {
+        false
+    }
+
+    /// Ask the provider to end the caller's turn now: one that runs its own turn model ends it
+    /// (Flux `ForceEndTurn`), another finishes the words it has (Deepgram `Finalize`); its
+    /// speech-final follows on the result callback. `false`: it has no such message.
+    fn end_turn(&mut self) -> bool {
+        false
+    }
+
+    /// When [`Self::end_turn`] has a message to send on this provider and model: the silence
+    /// (ms) after which the provider was asked to end a segment by itself (its endpointing).
+    /// `None`: it has no such message.
+    fn end_turn_after_ms(&self) -> Option<u32> {
+        self.has_turn_events().then_some(0)
     }
 
     /// What this provider could not honour about the configuration it was given.

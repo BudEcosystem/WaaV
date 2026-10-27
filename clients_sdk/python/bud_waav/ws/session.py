@@ -29,6 +29,7 @@ from ..errors import (
     ProtocolVersionError,
     GatewayError,
 )
+from ..interaction import parse_interaction_event, task_answer_message
 from .queue import MessageQueue, QueueConfig
 
 # Protocol version the gateway emits on `ready` (messages.rs PROTOCOL_VERSION, plan
@@ -252,6 +253,7 @@ class WebSocketSession:
         control_queue: Optional[MessageQueue] = None,
         max_pending_audio: int = 256,
         stt_keepalive_interval: float = DEFAULT_STT_KEEPALIVE_INTERVAL,
+        interaction: Optional[Union[bool, dict[str, Any]]] = None,
     ):
         """
         Initialize WebSocket session.
@@ -303,6 +305,12 @@ class WebSocketSession:
                 live capture, and a real ``send_audio`` resets the timer. The
                 gateway's auto-pong keeps the SOCKET alive but NOT the provider
                 STT stream, which is exactly what this covers. Set <=0 to disable.
+            interaction: Interaction mode (protocol 1.1): ``True`` for the defaults, an
+                object of settings (``gateway/docs/interaction_mode.md``), or ``False`` to
+                turn off an alias's or the server's default block. Sent as-is under
+                ``interaction``. When the gateway runs the mode, ``ready`` carries its
+                resolved settings (:attr:`interaction`) and the session emits typed
+                ``interaction`` events (:mod:`bud_waav.interaction`).
         """
         self.url = url
         self.api_key = api_key
@@ -320,6 +328,7 @@ class WebSocketSession:
         # field above always wins. The resolved concrete providers come back on the
         # `ready` ack as `resolved_alias` (see `resolved_alias` property).
         self.alias = alias
+        self.interaction = interaction
         # A Bud voice agent (spec 025): it decides both speech legs, so the session invents none.
         self.agent: Optional[VoiceAgentConfig] = (
             VoiceAgentConfig(id=agent) if isinstance(agent, str) else agent
@@ -331,6 +340,8 @@ class WebSocketSession:
         self._stream_id: Optional[str] = None
         self._protocol_version: Optional[str] = None
         self._resolved_alias: Optional[dict[str, Any]] = None
+        # The `interaction` echo of `ready`: present only when the mode runs.
+        self._interaction_echo: Optional[dict[str, Any]] = None
         # D8: the transport codecs the gateway negotiated (set on `ready` only when requested).
         self._audio_in_codec: Optional[str] = None
         self._audio_out_codec: Optional[str] = None
@@ -425,6 +436,15 @@ class WebSocketSession:
         what the alias became, and re-point it server-side with zero client change.
         """
         return self._resolved_alias
+
+    @property
+    def interaction_settings(self) -> Optional[dict[str, Any]]:
+        """The resolved interaction-mode settings echoed on ``ready`` (protocol 1.1).
+
+        ``None`` when the session does not run the mode (it asked for none, or the gateway
+        refused it: a ``config_warning`` then says why). Tool URLs and keys are never echoed.
+        """
+        return self._interaction_echo
 
     @property
     def audio_in_codec(self) -> Optional[str]:
@@ -828,7 +848,18 @@ class WebSocketSession:
                 if last is None:
                     continue
                 if (time.monotonic() - last) >= timeout and not self._reconnecting_due_to_stale:
-                    # Zombie: OPEN but silent. Force the existing reconnect path.
+                    # Silent is not dead: an interaction-mode session says nothing during its
+                    # warm-up or an agreed wait. A pong on the same socket proves it alive.
+                    # Only there: a plain session's silence is the wedge this watchdog is for,
+                    # and the transport answers pings whatever the read pump does.
+                    if self._interaction_echo is not None:
+                        try:
+                            await self._verify_connection()
+                            self._last_inbound_monotonic = time.monotonic()
+                            continue
+                        except ConnectionError:
+                            pass
+                    # Zombie: OPEN but silent, and no pong. Force the existing reconnect path.
                     self._reconnecting_due_to_stale = True
                     self._emit("zombie_detected", {"stale_seconds": timeout})
                     ws = self._ws
@@ -1187,6 +1218,12 @@ class WebSocketSession:
                     conv_dict[fname] = value
             config["conversation_config"] = conv_dict
 
+        # Interaction mode (protocol 1.1): `true` or an object, sent as-is (its keys are the
+        # gateway's own, e.g. tool `parameters` JSON Schemas, so nothing is renamed). `False`
+        # is sent too: it turns off an alias's or the server's default block.
+        if self.interaction is not None:
+            config["interaction"] = self.interaction
+
         self._config_sent_time = time.monotonic()
         await self._send_json(config)
 
@@ -1285,6 +1322,7 @@ class WebSocketSession:
                         # opus) — callers should send/decode linear16.
                         self._audio_in_codec = data.get("audio_in_codec")
                         self._audio_out_codec = data.get("audio_out_codec")
+                        self._interaction_echo = data.get("interaction")
                         # Segmented STT: what speech-to-text the session got. Absent when the
                         # gateway's rollout does not cover the session.
                         stt = data.get("stt")
@@ -1466,6 +1504,13 @@ class WebSocketSession:
                         # parse with bud_waav.SttWarning.from_wire for a typed view.
                         self._emit("stt_warning", data)
                         await self._get_message_queue().put({"type": "stt_warning", "data": data})
+                    elif (event := parse_interaction_event(data)) is not None:
+                        # Interaction mode (protocol 1.1): one typed event per frame,
+                        # discriminated by `event.type`.
+                        self._emit("interaction", event)
+                        await self._get_message_queue().put(
+                            {"type": "interaction", "event": event, "data": data}
+                        )
 
                     elif msg_type is not None:
                         # Forward-compat: never silently drop an unrecognized server
@@ -1757,6 +1802,56 @@ class WebSocketSession:
             "message_type": message_type,
             "payload": payload,
         })
+
+    # ---- interaction mode (protocol 1.1)
+
+    async def answer_task(
+        self,
+        request_id: str,
+        outcome: str = "accept",
+        value: Any = None,
+        correction: Optional[str] = None,
+    ) -> None:
+        """Answer a ``task_question`` from the client (``task_answer``).
+
+        Args:
+            request_id: The question's ``request_id``.
+            outcome: ``accept``, ``decline`` or ``cancel``.
+            value: With ``accept``: the chosen option, the value, or a form's fields.
+            correction: With ``decline``: what to change, in the caller's words.
+
+        The gateway replies with ``task_answer_received`` (``by: "client"``), or an ``error``
+        with code ``question_closed`` / ``unknown_request_id``.
+        """
+        await self._send_json(task_answer_message(request_id, outcome, value, correction))
+
+    async def cancel_task(self, task_id: str) -> None:
+        """Cancel a task (``task_cancel``); ``task_cancelled`` follows once it is confirmed."""
+        await self._send_json({"type": "task_cancel", "task_id": task_id})
+
+    async def mark_task_seen(self, task_id: str) -> None:
+        """The caller has read the task's result on the screen (``task_seen``): a spoken
+        update of it that is still to come is dropped."""
+        await self._send_json({"type": "task_seen", "task_id": task_id})
+
+    async def update_interaction(self, patch: dict[str, Any]) -> None:
+        """Change interaction settings mid-session (``interaction_update``).
+
+        ``patch`` has the shape of the ``interaction`` config. The reply is an
+        ``interaction_updated`` event listing what was applied and what was refused.
+        """
+        await self._send_json({"type": "interaction_update", "patch": patch})
+
+    async def report_playback(self, utterance_id: str, played_ms: int) -> None:
+        """Report how much of an utterance the client has played (``playback_position``).
+
+        Send it at most four times a second; ``utterance_id`` is the one of ``audio_segment``
+        and ``assistant_transcript``. From the first report on, what the caller heard is what
+        the client reports. A session without interaction mode ignores it.
+        """
+        await self._send_json(
+            {"type": "playback_position", "utterance_id": utterance_id, "played_ms": played_ms}
+        )
 
     def get_metrics(self) -> SessionMetrics:
         """Get current session metrics."""

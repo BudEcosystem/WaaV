@@ -1,0 +1,1326 @@
+{
+  "schema_version": "1.1",
+  "written": "2026-10-05",
+  "description": "Machine-readable capability descriptor for every speech-to-speech provider and model family WaaV registers (plus the cascade, GPT-Live and WaaV Infer native duplex), with the regime, owners, verbs, lifecycle and release each one gets in the full-duplex interaction plan. Built from W6-providers-endpoints.md sections 3.2, 3.3, 3.4.3, 3.9, 3.14, 3.16 to 3.18 as aligned with INTEGRATION_DECISIONS.md sections 1 to 11 and Addenda A to C (A2 items 1, 2, 6 to 8 and 10 change this file); vendor facts from verify/ (wins) then web/. regime_resolve.py is the executable specification over this file; every 'expected' block is recomputed and checked by its self-test.",
+  "path_roots": {
+    "code": "/home/bud/ditto/waav/WaaV/gateway/src (code references are path:line relative to this root; every one was opened while writing this file)",
+    "evidence": "/home/bud/ditto/waav/research/duplex-agent (evidence references are relative to this root; verify/ wins over web/)"
+  },
+  "vocabulary": {
+    "support": ["native", "emulated", "absent", "retired"],
+    "emulation": ["guided_verbatim", "gateway_clip", "user_turn_framing", "prompt_append", "drop_output", "turn_detection_toggle", "model_decides", "call_free_note"],
+    "regimes": ["Cascade", "ProviderSpeech", "Delegating", "NativeDuplex"],
+    "owner_values": ["gateway", "provider", "none"],
+    "truth": ["enforced", "monitored"],
+    "releases": {
+      "lifecycle": "Lifecycle track, dated vendor changes",
+      "0": "Release 0, measure and lay groundwork",
+      "1": "Release 1, cascade interaction on /ws",
+      "2": "Release 2, full duplex audio, the GA cascade and durable tasks",
+      "3": "Release 3, speech-to-speech providers, open task protocols and text-output DAGs",
+      "4": "Release 4, realtime voices on phone and rooms, Hindi and DTMF",
+      "5": "Release 5, native duplex on WaaV Infer (conditional)"
+    }
+  },
+  "surfaces": [
+    {
+      "id": "ws_conversation",
+      "name": "/ws conversation session (conversation_config)",
+      "kind": "cascade",
+      "first_release": 1,
+      "bud_mode": "both",
+      "client_ui": true,
+      "needs_background": false,
+      "egress": "pump",
+      "mid_call_language": "step_down",
+      "source": "W6 3.10.2; INTEGRATION_DECISIONS.md section 1 and section 5 (conversation sessions); Addendum C7.1 (step-down possible here)"
+    },
+    {
+      "id": "ws_agent",
+      "name": "/ws Bud agent session (operator default, interaction-only alias or budapp entry)",
+      "kind": "cascade",
+      "first_release": 1,
+      "bud_mode": "only",
+      "client_ui": true,
+      "needs_background": false,
+      "egress": "pump",
+      "mid_call_language": "step_down",
+      "source": "W6 3.19; INTEGRATION_DECISIONS.md section 6 (sign-off 13); Addendum C7.1 (step-down possible here)"
+    },
+    {
+      "id": "ws_raw",
+      "name": "raw /ws session with a background target",
+      "kind": "cascade",
+      "first_release": 1,
+      "bud_mode": "both",
+      "client_ui": true,
+      "needs_background": true,
+      "egress": "pump",
+      "source": "W6 3.10.2 and 3.10.4 (interaction_needs_background)"
+    },
+    {
+      "id": "livekit",
+      "name": "LiveKit room driven by a /ws session",
+      "kind": "cascade",
+      "first_release": 1,
+      "first_release_if_echo_gates_fail": 2,
+      "bud_mode": "both",
+      "client_ui": true,
+      "needs_background": false,
+      "egress": "pump",
+      "mid_call_language": "as_controlling_ws_session",
+      "source": "W6 3.10.2; INTEGRATION_DECISIONS.md section 1 and sign-off 12"
+    },
+    {
+      "id": "sip",
+      "name": "SIP call through LiveKit",
+      "kind": "cascade",
+      "first_release": 1,
+      "first_release_if_echo_gates_fail": 2,
+      "bud_mode": "both",
+      "client_ui": false,
+      "needs_background": false,
+      "egress": "pump",
+      "mid_call_language": "as_controlling_ws_session",
+      "source": "W6 3.10.2 and 3.12.2 (no screen; DTMF from Release 4); sign-off 12"
+    },
+    {
+      "id": "v1_realtime_cascade",
+      "name": "/v1/realtime?model=prompt:<agent> (the GA cascade)",
+      "kind": "cascade",
+      "first_release": 2,
+      "bud_mode": "only",
+      "client_ui": true,
+      "needs_background": false,
+      "egress": "pump",
+      "source": "W6 3.10.2; cross-check-coverage.md table 2"
+    },
+    {
+      "id": "ws_dag_text",
+      "name": "/ws DAG session whose graph outputs text",
+      "kind": "cascade",
+      "first_release": 3,
+      "bud_mode": "both",
+      "client_ui": true,
+      "needs_background": false,
+      "egress": "pump",
+      "source": "W6 Decision 22; INTEGRATION_DECISIONS.md section 6 (DagBackend)"
+    },
+    {
+      "id": "ws_dag_audio",
+      "name": "/ws DAG session whose graph outputs audio (AudioOutput, TtsProvider or RealtimeProvider node)",
+      "kind": "refused",
+      "first_release": null,
+      "refusal": {"code": "interaction_dag_audio_output", "fatal": false},
+      "bud_mode": "both",
+      "client_ui": true,
+      "needs_background": false,
+      "egress": "none",
+      "source": "W6 Decision 22; INTEGRATION_DECISIONS.md section 6; dag/definition.rs:522, :543, :552"
+    },
+    {
+      "id": "dag_realtime_node",
+      "name": "DAG realtime node (the serial turn-by-turn node LiveKit and SIP use today)",
+      "kind": "refused",
+      "first_release": null,
+      "refusal": {"code": "interaction_dag_audio_output", "fatal": false},
+      "provider_refusals": {"gpt_live": {"code": "provider_not_turn_based", "fatal": true}},
+      "bud_mode": "both",
+      "client_ui": false,
+      "needs_background": false,
+      "egress": "none",
+      "source": "W6 Decision 7 and Decision 22; W6 3.10.4"
+    },
+    {
+      "id": "realtime",
+      "name": "/realtime, WaaV's native realtime protocol (non-Bud gateways only)",
+      "kind": "provider",
+      "first_release": 3,
+      "bud_mode": "refused",
+      "bud_refusal": {"code": "deployment_required", "fatal": true, "existing": true, "code_ref": "handlers/realtime/handler.rs:613-627"},
+      "reaches": "all",
+      "client_ui": true,
+      "needs_background": true,
+      "egress": "pump",
+      "source": "W6 3.1 surface table and 3.10.2"
+    },
+    {
+      "id": "v1_realtime_relay",
+      "name": "/v1/realtime relay (OpenAI GA protocol, Bud deployments only)",
+      "kind": "provider",
+      "first_release": 3,
+      "bud_mode": "only",
+      "non_bud_refusal": {"code": "bud_mode_required", "fatal": true, "existing": true, "code_ref": "handlers/openai_realtime/session.rs:366-368"},
+      "reaches": ["openai", "azure", "grok"],
+      "vendor_names": {"openai": "openai", "azure": "azure_openai", "grok": "grok"},
+      "unreached_refusal": {"code": "unsupported_vendor", "fatal": true},
+      "client_ui": true,
+      "needs_background": true,
+      "egress": "stop_only",
+      "source": "handlers/openai_realtime/upstream.rs:18; W6 3.1"
+    },
+    {
+      "id": "v1_realtime_facade",
+      "name": "/v1/realtime translate facade (Bud deployments only)",
+      "kind": "provider",
+      "first_release": 3,
+      "bud_mode": "only",
+      "non_bud_refusal": {"code": "bud_mode_required", "fatal": true, "existing": true, "code_ref": "handlers/openai_realtime/session.rs:366-368"},
+      "reaches": ["gemini", "nova_sonic", "deepgram", "elevenlabs", "hume"],
+      "vendor_names": {"gemini": "gemini", "nova_sonic": "nova_sonic", "deepgram": "deepgram_voice_agent", "elevenlabs": "elevenlabs_convai", "hume": "hume_evi"},
+      "unreached_refusal": {"code": "unsupported_vendor", "fatal": true},
+      "client_ui": true,
+      "needs_background": true,
+      "egress": "stop_only",
+      "source": "handlers/openai_realtime/facade.rs:90-121; W6 3.1"
+    },
+    {
+      "id": "ws_realtime_voice",
+      "name": "/ws session whose voice is a realtime provider (interaction.speech.realtime), including LiveKit rooms and SIP calls",
+      "kind": "provider",
+      "first_release": 4,
+      "bud_mode": "both",
+      "reaches": "all",
+      "client_ui": true,
+      "needs_background": true,
+      "egress": "pump",
+      "source": "W6 Decision 13 and section 8 (Release 4)"
+    }
+  ],
+  "providers": [
+    {
+      "id": "cascade",
+      "provider_id": "cascade",
+      "display_name": "Cascade: any speech-to-text, the local front model, any LLM or agent background, any text-to-speech",
+      "kind": "cascade",
+      "model_family": "any",
+      "model_patterns": [".*"],
+      "default_model": null,
+      "registered_today": true,
+      "available_from_release": 0,
+      "ownership": {
+        "turn_owner": "gateway",
+        "voice_owner": "gateway",
+        "voice_reproducible": {"value": "n/a", "note": "WaaV's own text-to-speech is the voice"},
+        "text_output_possible": true,
+        "half_cascade_possible": false,
+        "reply_suppressible": true
+      },
+      "verbs": {
+        "user_text": {"support": "absent", "wire": "n/a (typed text enters as a caller turn through the runtime)", "probe_first": false},
+        "say_exact": {"support": "native", "wire": "WaaV text-to-speech of the given words", "probe_first": false},
+        "say_guided": {"support": "native", "wire": "front-model line (compose grammar and guard) or W4 template", "probe_first": false},
+        "add_context": {"support": "native", "wire": "front prompt observation line or background context", "probe_first": false},
+        "request_reply": {"support": "native", "wire": "runtime turn", "probe_first": false},
+        "stop_output": {"support": "native", "wire": "PlayoutControl::stop by utterance id", "probe_first": false},
+        "hold_floor": {"support": "native", "wire": "floor machine", "probe_first": false}
+      },
+      "background": {"async_tools": "pending_allowed", "delegation": "n/a", "tools_declarable": true, "speculative_tool_calls": false, "delivery_scheduling": false, "provisional_runs": {"from": "E (W5's endpoint decision; origin FrontAtE) or W5's eager end of turn (origin EagerEndOfTurn), through W3's start_provisional (Addendum C2.1)", "adopted_at": "the turn's act delegate (from the rule router in Release 1, Addendum B1), through DelegateRequest.provisional", "discarded_at": "any other act (discard_provisional with W3's DiscardReason)", "adopt_by_ms": null}, "note": "adoption deadline E + 600 ms anchored at E (Addendum A1); speculation on a backend that runs its own tools only when declared free of side effects (Addendum C2.2)"},
+      "native_mechanisms": {
+        "filler": {"kind": "n/a", "switch_off": "n/a"},
+        "backchannel": {"kind": "n/a", "switch_off": "n/a"},
+        "idle": {"kind": "n/a", "switch_off": "n/a"}
+      },
+      "owners": {
+        "filler": {"auto": "gateway",
+          "gateway": {"result": "gateway", "how": "W4's acknowledgement rule: front-worded line or cached clip at E + ack_due_ms; scripted banks as fallback"},
+          "provider": {"result": "gateway", "how": "no provider exists in the cascade"},
+          "none": {"result": "none", "how": "no acknowledgement lines"}},
+        "backchannel": {"auto": "gateway",
+          "gateway": {"result": "gateway", "how": "W5's backchannel emitter (Release 2); transport defaults web on (medium), phone off (sign-off 19)"},
+          "provider": {"result": "gateway", "how": "no provider exists in the cascade"},
+          "none": {"result": "none", "how": "emitter off"}},
+        "idle": {"auto": "gateway",
+          "gateway": {"result": "gateway", "how": "W4's holding lines and check-ins"},
+          "provider": {"result": "gateway", "how": "no provider exists in the cascade"},
+          "none": {"result": "none", "how": "no idle prompts"}}
+      },
+      "activity": {"user_speech_edges": "gateway_vad", "user_transcripts": "always", "responding_end": "playback_events", "busy_signal": false},
+      "session_limits": {"max_session": null, "max_connection": null, "resume": "reconnect grace per W3 (60 s same pod, sign-off 15) after an abnormal disconnect only; a clean close skips it (Addendum C7.2)", "mid_session_update": "interaction_update for the allowed paths"},
+      "relay": {"mode": "verbatim_streamed", "depth": 2, "description": "the background's own words, W3 AnswerSentence by AnswerSentence, appended as StreamSpans to one open main-lane utterance (Addendum C1.2), W1 lookahead of 2 clauses; a Bud agent streams only if it declares background.answer_marker, else its answer is relayed whole at completion (Addendum C1.4)"},
+      "lifecycle": {"rules": [], "related": [
+        {"item": "OpenAI text-to-speech tts-1, tts-1-hd, gpt-4o-mini-tts", "shutdown": "2027-01-06", "warning_from": "2026-10-08", "warning_from_note": "90 days before, or the first lifecycle patch when that is later", "replacement": "gpt-realtime-2.1-mini (a realtime model; no silent synthesis through it, Decision 20)", "action": "probe the speech endpoint by 2026-11-30; move the default before 2026-12-15 or refuse retired models from 2027-01-06 (sign-off 22)", "code_ref": "core/tts/openai/config.rs:23"},
+        {"item": "OpenAI transcription whisper-1, gpt-4o-transcribe, gpt-4o-mini-transcribe, gpt-4o-transcribe-diarize", "shutdown": "2027-02-26", "warning_from": "2026-11-28", "replacement": "gpt-live-transcribe or gpt-transcribe", "action": "default moved by 2027-02-26 with the segmented speech-to-text plan", "code_ref": "core/stt/openai/config.rs:65"},
+        {"item": "Hume text-to-speech (core/tts/hume/)", "shutdown": "2026-11-13", "warning_from": null, "replacement": null, "warning_code": "provider_sunset", "refusal_code": "provider_retired", "action": "provider_sunset now, provider_retired from 2026-11-13, removed from the registry in the first release after", "code_ref": "plugin/builtin/mod.rs:676-679"},
+        {"item": "AssemblyAI end_of_turn_confidence_threshold", "shutdown": null, "warning_from": null, "replacement": "Universal-3.6 Pro turn detection", "action": "valid but deprecated on Universal Streaming; migration is a Lifecycle-track item owned by W5; the default move changes interaction-off sessions and is part of sign-off 9 (Addendum C8)", "code_ref": "core/stt/assemblyai/messages.rs:161"},
+        {"item": "Deepgram Flux (new speech-to-text provider deepgram-flux on /v2/listen)", "shutdown": null, "warning_from": null, "replacement": null, "action": "added in Release 2 (W6 Decision 23) to give W5 the provider's turn events, including the eager end of turn", "code_ref": null}
+      ]},
+      "truth": {"regime_truth": "enforced", "relay": "verbatim", "note": "WaaV writes every word; the front only words acknowledgements, progress, small talk and refusals from banks and copy spans (in Release 1 the deterministic rule router and the persona's phrase banks, profile scripted on every deployment, Addendum B1); confirmations are W4 templates; results relayed verbatim"},
+      "expected": {
+        "auto_with_truth_ack": {"regime": "Cascade", "variant": "full", "front": "local", "filler_owner": "gateway", "backchannel_owner": "gateway", "idle_owner": "gateway", "truth": "enforced"},
+        "auto_without_truth_ack": {"regime": "Cascade", "variant": "full", "front": "local", "filler_owner": "gateway", "backchannel_owner": "gateway", "idle_owner": "gateway", "truth": "enforced"},
+        "voice_owner_gateway": {"regime": "Cascade", "variant": "full"},
+        "truth_enforced": {"regime": "Cascade", "variant": "full"},
+        "forced": {"cascade": {"regime": "Cascade", "downgraded": false}, "provider_speech": {"regime": "Cascade", "downgraded": true}, "delegating": {"regime": "Cascade", "downgraded": true}},
+        "interaction_release": {"non_bud": 1, "bud": 1, "phone_and_rooms": 1, "phone_and_rooms_if_echo_gates_fail": 2}
+      },
+      "sources": {
+        "evidence": [{"file": "design/W6-providers-endpoints.md", "section": "3.2.1 Table A to C, 3.3 resolved defaults, 3.9, 3.17, 3.18"}, {"file": "design/INTEGRATION_DECISIONS.md", "section": "2.1, 2.2, 3.1 to 3.3"}],
+        "code": ["handlers/ws/messages.rs:38", "core/tts/openai/config.rs:23", "core/stt/openai/config.rs:65", "core/stt/assemblyai/messages.rs:161"]
+      }
+    },
+    {
+      "id": "openai.gpt-realtime-2",
+      "provider_id": "openai",
+      "display_name": "OpenAI Realtime, gpt-realtime-2 family (gpt-realtime-2, gpt-realtime-2.1, gpt-realtime-2.1-mini)",
+      "kind": "speech_to_speech",
+      "model_family": "gpt-realtime-2.x",
+      "model_patterns": ["^gpt-realtime-2"],
+      "default_model": null,
+      "registered_today": true,
+      "available_from_release": 0,
+      "ownership": {
+        "turn_owner": "provider",
+        "voice_owner": "provider",
+        "voice_reproducible": {"value": "unknown", "note": "same-named OpenAI TTS voices are unverified (measurement 16)"},
+        "text_output_possible": true,
+        "half_cascade_possible": true,
+        "reply_suppressible": true,
+        "note": "half-cascade possible: text output and a documented reply switch (create_response:false), Addendum A2 item 1; WaaV's text-to-speech is then the voice (voice_owner gateway, A2 item 8). Session output_modalities is hard-coded to audio today (W6 Table A); the half-cascade needs that changed"
+      },
+      "verbs": {
+        "user_text": {"support": "native", "wire": "conversation.item.create user input_text; no reply until response.create", "probe_first": false},
+        "say_exact": {"support": "emulated", "emulation": "guided_verbatim", "wire": "response.create with instructions and metadata, verify_exact; gateway clip for confirmations", "probe_first": false},
+        "say_guided": {"support": "native", "wire": "response.create {instructions, metadata:{bud_kind,bud_utterance_id,bud_task_ref}}", "probe_first": true, "note": "probe that response.created echoes metadata"},
+        "add_context": {"support": "native", "wire": "conversation.item.create role system input_text, no response.create", "probe_first": false},
+        "request_reply": {"support": "native", "wire": "response.create", "probe_first": false},
+        "stop_output": {"support": "native", "wire": "response.cancel then conversation.item.truncate", "probe_first": false},
+        "hold_floor": {"support": "emulated", "emulation": "turn_detection_toggle", "wire": "session.update with the whole turn_detection object and create_response:false, plus the output gate", "probe_first": false}
+      },
+      "background": {"async_tools": "pending_allowed", "delegation": "via_gateway_tool", "tools_declarable": true, "speculative_tool_calls": false, "delivery_scheduling": false, "provisional_runs": null},
+      "native_mechanisms": {
+        "filler": {"kind": "prompt_only", "key": "preambles", "default_on": true, "switch_off": "prompt suffix 'Do not say filler or preamble phrases' (preambles are prompt-controlled only)"},
+        "backchannel": {"kind": "none", "switch_off": "n/a"},
+        "idle": {"kind": "config", "key": "turn_detection.idle_timeout_ms (server_vad)", "default_on": false, "switch_off": "leave idle_timeout_ms unset"}
+      },
+      "owners": {
+        "filler": {"auto": "provider",
+          "gateway": {"result": "gateway", "how": "suppression suffix; gateway acknowledgement through say_guided"},
+          "provider": {"result": "provider", "how": "native preambles, no suffix; gateway acknowledgement acts masked; gateway keeps progress and relays"},
+          "none": {"result": "none", "how": "suppression suffix and no gateway acknowledgement"}},
+        "backchannel": {"auto": "none",
+          "gateway": {"result": "none", "how": "refused: would collide with the provider's turn detection"},
+          "provider": {"result": "none", "how": "no native listening sounds"},
+          "none": {"result": "none", "how": "nothing to switch off"}},
+        "idle": {"auto": "gateway",
+          "gateway": {"result": "gateway", "how": "say_* after W4's idle timer; provider idle_timeout_ms unset"},
+          "provider": {"result": "provider", "how": "set idle_timeout_ms on server VAD"},
+          "none": {"result": "none", "how": "neither side prompts"}}
+      },
+      "activity": {"user_speech_edges": "full", "user_transcripts": "when input_audio_transcription is set (forced on in interaction mode)", "responding_end": "response_done", "busy_signal": false},
+      "session_limits": {"max_session": "60 min", "max_connection": "60 min", "resume": "none", "mid_session_update": "full"},
+      "relay": {"mode": "guided_checked", "depth": 1, "description": "first answer sentence as one guided response, the sentences released since in one more; each passes the exact-words check"},
+      "lifecycle": {"rules": []},
+      "truth": {"regime_truth": "monitored", "relay": "exact_words_checked", "note": "guided speech can paraphrase; the exact-words check voids an answer to a question that failed it; half-cascade gives enforced truth"},
+      "expected": {
+        "auto_with_truth_ack": {"regime": "ProviderSpeech", "variant": null, "front": "narrator_templates", "filler_owner": "provider", "backchannel_owner": "none", "idle_owner": "gateway", "truth": "monitored"},
+        "auto_without_truth_ack": {"refusal": "truth_ack_required", "alternative": "speech.truth: enforced"},
+        "voice_owner_gateway": {"regime": "Cascade", "variant": "half_cascade"},
+        "truth_enforced": {"regime": "Cascade", "variant": "half_cascade"},
+        "forced": {"cascade": {"regime": "Cascade", "downgraded": false}, "provider_speech": {"regime": "ProviderSpeech", "downgraded": false}, "delegating": {"regime": "Delegating", "downgraded": false}},
+        "interaction_release": {"non_bud": 3, "bud": 3, "phone_and_rooms": 4}
+      },
+      "sources": {
+        "evidence": [{"file": "verify/orchestration-hitl+platform-capabilities.md", "section": "1, OpenAI, Realtime GA facts (preambles by default, idle_timeout_ms, 60-minute cap)"}, {"file": "web/platform-capabilities.md", "section": "3.1"}, {"file": "design/W6-providers-endpoints.md", "section": "3.2.1, 3.3, 3.4.3 OpenAI GA family, 3.9"}],
+        "code": ["core/realtime/openai/config.rs:37-55", "core/realtime/mod.rs:227-241", "handlers/openai_realtime/upstream.rs:18"]
+      }
+    },
+    {
+      "id": "openai.gpt-realtime-legacy",
+      "provider_id": "openai",
+      "display_name": "OpenAI Realtime, older models (gpt-realtime default, gpt-realtime-mini, gpt-4o realtime previews, gpt-realtime-1.5)",
+      "kind": "speech_to_speech",
+      "model_family": "gpt-realtime (pre-2.x)",
+      "model_patterns": [".*"],
+      "default_model": "gpt-realtime",
+      "registered_today": true,
+      "available_from_release": 0,
+      "ownership": {
+        "turn_owner": "provider",
+        "voice_owner": "provider",
+        "voice_reproducible": {"value": "unknown", "note": "measurement 16"},
+        "text_output_possible": true,
+        "half_cascade_possible": true,
+        "reply_suppressible": true
+      },
+      "verbs": {
+        "user_text": {"support": "native", "wire": "conversation.item.create user input_text; no reply until response.create", "probe_first": false},
+        "say_exact": {"support": "emulated", "emulation": "guided_verbatim", "wire": "response.create with instructions, verify_exact; gateway clip for confirmations", "probe_first": false},
+        "say_guided": {"support": "native", "wire": "response.create {instructions, metadata}", "probe_first": true},
+        "add_context": {"support": "native", "wire": "conversation.item.create role system, no response.create", "probe_first": false},
+        "request_reply": {"support": "native", "wire": "response.create", "probe_first": false},
+        "stop_output": {"support": "native", "wire": "response.cancel then conversation.item.truncate", "probe_first": false},
+        "hold_floor": {"support": "emulated", "emulation": "turn_detection_toggle", "wire": "session.update create_response:false plus the output gate", "probe_first": false}
+      },
+      "background": {"async_tools": "pending_allowed", "delegation": "via_gateway_tool", "tools_declarable": true, "speculative_tool_calls": false, "delivery_scheduling": false, "provisional_runs": null},
+      "native_mechanisms": {
+        "filler": {"kind": "none", "switch_off": "n/a (no native preambles on pre-2.x models)"},
+        "backchannel": {"kind": "none", "switch_off": "n/a"},
+        "idle": {"kind": "config", "key": "turn_detection.idle_timeout_ms (server_vad)", "default_on": false, "switch_off": "leave idle_timeout_ms unset"}
+      },
+      "owners": {
+        "filler": {"auto": "gateway",
+          "gateway": {"result": "gateway", "how": "suppression suffix; gateway acknowledgement through say_guided"},
+          "provider": {"result": "provider", "how": "no suffix; the provider model may say its own fillers; gateway acknowledgement acts masked"},
+          "none": {"result": "none", "how": "suppression suffix and no gateway acknowledgement"}},
+        "backchannel": {"auto": "none",
+          "gateway": {"result": "none", "how": "refused: would collide with the provider's turn detection"},
+          "provider": {"result": "none", "how": "no native listening sounds"},
+          "none": {"result": "none", "how": "nothing to switch off"}},
+        "idle": {"auto": "gateway",
+          "gateway": {"result": "gateway", "how": "say_* after W4's idle timer"},
+          "provider": {"result": "provider", "how": "set idle_timeout_ms on server VAD"},
+          "none": {"result": "none", "how": "neither side prompts"}}
+      },
+      "activity": {"user_speech_edges": "full", "user_transcripts": "when input_audio_transcription is set (forced on in interaction mode)", "responding_end": "response_done", "busy_signal": false},
+      "session_limits": {"max_session": "60 min", "max_connection": "60 min", "resume": "none", "mid_session_update": "full"},
+      "relay": {"mode": "guided_checked", "depth": 1, "description": "as gpt-realtime-2.x"},
+      "lifecycle": {"rules": [
+        {"models": "^(gpt-realtime|gpt-4o-realtime.*)$", "warning_from": "2026-10-22", "shutdown": "2027-01-20", "replacement": "gpt-realtime-2.1", "warning_code": "model_retiring", "refusal_code": "model_retired", "default_move_by": "2027-01-20", "note": "the empty-model default on /realtime is gpt-realtime and moves to gpt-realtime-2.1 in a dated release before the shutdown"},
+        {"models": "^gpt-realtime-mini$", "warning_from": "2026-10-22", "shutdown": "2027-01-20", "replacement": "gpt-realtime-2.1-mini", "warning_code": "model_retiring", "refusal_code": "model_retired", "default_move_by": null}
+      ]},
+      "truth": {"regime_truth": "monitored", "relay": "exact_words_checked", "note": "as gpt-realtime-2.x"},
+      "expected": {
+        "auto_with_truth_ack": {"regime": "ProviderSpeech", "variant": null, "front": "narrator_templates", "filler_owner": "gateway", "backchannel_owner": "none", "idle_owner": "gateway", "truth": "monitored"},
+        "auto_without_truth_ack": {"refusal": "truth_ack_required", "alternative": "speech.truth: enforced"},
+        "voice_owner_gateway": {"regime": "Cascade", "variant": "half_cascade"},
+        "truth_enforced": {"regime": "Cascade", "variant": "half_cascade"},
+        "forced": {"cascade": {"regime": "Cascade", "downgraded": false}, "provider_speech": {"regime": "ProviderSpeech", "downgraded": false}, "delegating": {"regime": "Delegating", "downgraded": false}},
+        "interaction_release": {"non_bud": 3, "bud": 3, "phone_and_rooms": 4}
+      },
+      "sources": {
+        "evidence": [{"file": "verify/orchestration-hitl+platform-capabilities.md", "section": "3, OpenAI audio deprecations table"}, {"file": "design/W6-providers-endpoints.md", "section": "3.14"}],
+        "code": ["core/realtime/openai/config.rs:76-77", "core/realtime/openai/config.rs:37-55"]
+      }
+    },
+    {
+      "id": "azure",
+      "provider_id": "azure",
+      "display_name": "Azure OpenAI Realtime (deployment-named; not Azure AI Voice Live)",
+      "kind": "speech_to_speech",
+      "model_family": "OpenAI GA clone",
+      "model_patterns": [".*"],
+      "default_model": null,
+      "registered_today": true,
+      "available_from_release": 0,
+      "ownership": {
+        "turn_owner": "provider",
+        "voice_owner": "provider",
+        "voice_reproducible": {"value": "unknown", "note": "measurement 16"},
+        "text_output_possible": true,
+        "half_cascade_possible": true,
+        "reply_suppressible": true,
+        "note": "inferred from the OpenAI GA wire the azure protocol delegates to; cfg.model carries an arbitrary deployment name (core/realtime/azure/protocol.rs:36-38), so the model family (and native preambles) is read only from the optional model_family field (Addendum A2 item 10)"
+      },
+      "verbs": {
+        "user_text": {"support": "native", "wire": "as openai", "probe_first": false},
+        "say_exact": {"support": "emulated", "emulation": "guided_verbatim", "wire": "as openai", "probe_first": false},
+        "say_guided": {"support": "native", "wire": "as openai", "probe_first": true},
+        "add_context": {"support": "native", "wire": "as openai", "probe_first": false},
+        "request_reply": {"support": "native", "wire": "as openai", "probe_first": false},
+        "stop_output": {"support": "native", "wire": "as openai", "probe_first": false},
+        "hold_floor": {"support": "emulated", "emulation": "turn_detection_toggle", "wire": "as openai", "probe_first": false}
+      },
+      "background": {"async_tools": "pending_allowed", "delegation": "via_gateway_tool", "tools_declarable": true, "speculative_tool_calls": false, "delivery_scheduling": false, "provisional_runs": null},
+      "native_mechanisms": {
+        "filler": {"kind": "unknown", "switch_off": "prompt suffix, if the deployment's model has preambles (gpt-realtime-2.x)"},
+        "backchannel": {"kind": "none", "switch_off": "n/a"},
+        "idle": {"kind": "config", "key": "turn_detection.idle_timeout_ms (server_vad)", "default_on": false, "switch_off": "leave unset"}
+      },
+      "owners": {
+        "filler": {"auto": {"if_model_family_matches": "^gpt-realtime-2", "then": "provider", "else": "gateway", "unknown": "gateway"},
+          "gateway": {"result": "gateway", "how": "suppression suffix; say_guided acknowledgements"},
+          "provider": {"result": "provider", "how": "no suffix; gateway acknowledgement acts masked"},
+          "none": {"result": "none", "how": "suppression suffix"}},
+        "backchannel": {"auto": "none",
+          "gateway": {"result": "none", "how": "refused: would collide with the provider's turn detection"},
+          "provider": {"result": "none", "how": "no native listening sounds"},
+          "none": {"result": "none", "how": "nothing to switch off"}},
+        "idle": {"auto": "gateway",
+          "gateway": {"result": "gateway", "how": "say_* after W4's idle timer"},
+          "provider": {"result": "provider", "how": "idle_timeout_ms on server VAD"},
+          "none": {"result": "none", "how": "neither side prompts"}}
+      },
+      "activity": {"user_speech_edges": "full", "user_transcripts": "when input_audio_transcription is set", "responding_end": "response_done", "busy_signal": false},
+      "session_limits": {"max_session": "unknown (inferred same as OpenAI, 60 min)", "max_connection": "unknown", "resume": "none", "mid_session_update": "full"},
+      "relay": {"mode": "guided_checked", "depth": 1, "description": "as openai"},
+      "lifecycle": {"rules": [], "note": "follows the deployment's underlying OpenAI model, which only model_family names (Addendum A2 item 10); with it set, OpenAI's lifecycle table can be evaluated, but Azure publishes its own retirement dates, so no Azure refusal ships before a live check confirms them"},
+      "model_family_source": {"field": "model_family", "first_release": 3, "unknown_warning": "model_family_unknown", "note": "optional field on the Azure realtime configuration (RealtimeConfig, core/realtime/base.rs:175; the /realtime config message; the Bud deployment's RealtimeSettings). Until it is set, fillers resolve to gateway and an interaction session gets config_warning model_family_unknown"},
+      "truth": {"regime_truth": "monitored", "relay": "exact_words_checked", "note": "as openai"},
+      "expected": {
+        "auto_with_truth_ack": {"regime": "ProviderSpeech", "variant": null, "front": "narrator_templates", "filler_owner": "gateway", "backchannel_owner": "none", "idle_owner": "gateway", "truth": "monitored"},
+        "auto_without_truth_ack": {"refusal": "truth_ack_required", "alternative": "speech.truth: enforced", "warning": "model_family_unknown"},
+        "voice_owner_gateway": {"regime": "Cascade", "variant": "half_cascade"},
+        "truth_enforced": {"regime": "Cascade", "variant": "half_cascade"},
+        "forced": {"cascade": {"regime": "Cascade", "downgraded": false}, "provider_speech": {"regime": "ProviderSpeech", "downgraded": false}, "delegating": {"regime": "Delegating", "downgraded": false}},
+        "interaction_release": {"non_bud": 3, "bud": 3, "phone_and_rooms": 4}
+      },
+      "sources": {
+        "evidence": [{"file": "design/W6-providers-endpoints.md", "section": "3.1 (azure is Azure OpenAI Realtime), 3.2.1, 3.3, 9.1 challenge 6"}, {"file": "design/INTEGRATION_DECISIONS.md", "section": "Addendum A2 item 10 (model_family)"}],
+        "code": ["core/realtime/azure/protocol.rs:36-38", "core/realtime/azure/protocol.rs:104-110", "core/realtime/base.rs:175", "handlers/openai_realtime/upstream.rs:18"]
+      }
+    },
+    {
+      "id": "yandex",
+      "provider_id": "yandex",
+      "display_name": "Yandex Cloud AI Studio Realtime (OpenAI GA clone)",
+      "kind": "speech_to_speech",
+      "model_family": "OpenAI GA clone",
+      "model_patterns": [".*"],
+      "default_model": "speech-realtime-250923",
+      "registered_today": true,
+      "available_from_release": 0,
+      "ownership": {
+        "turn_owner": "provider",
+        "voice_owner": "provider",
+        "voice_reproducible": {"value": "no"},
+        "text_output_possible": true,
+        "half_cascade_possible": true,
+        "reply_suppressible": true,
+        "note": "OpenAI family, so half-cascade possible under Addendum A2 item 1; text output and create_response:false are inferred from the clone (W6 Table A marks text output '?'); probe before relying on the half-cascade"
+      },
+      "verbs": {
+        "user_text": {"support": "native", "wire": "as openai", "probe_first": false},
+        "say_exact": {"support": "emulated", "emulation": "guided_verbatim", "wire": "as openai", "probe_first": false},
+        "say_guided": {"support": "native", "wire": "as openai", "probe_first": true},
+        "add_context": {"support": "native", "wire": "as openai", "probe_first": false},
+        "request_reply": {"support": "native", "wire": "as openai", "probe_first": false},
+        "stop_output": {"support": "native", "wire": "as openai", "probe_first": false},
+        "hold_floor": {"support": "emulated", "emulation": "turn_detection_toggle", "wire": "as openai", "probe_first": true}
+      },
+      "background": {"async_tools": "pending_allowed", "delegation": "via_gateway_tool", "tools_declarable": true, "speculative_tool_calls": false, "delivery_scheduling": false, "provisional_runs": null},
+      "native_mechanisms": {
+        "filler": {"kind": "unknown", "switch_off": "prompt suffix"},
+        "backchannel": {"kind": "none", "switch_off": "n/a"},
+        "idle": {"kind": "unknown", "switch_off": "leave idle_timeout_ms unset"}
+      },
+      "owners": {
+        "filler": {"auto": {"if_model_matches": "^gpt-realtime-2", "then": "provider", "else": "gateway"},
+          "gateway": {"result": "gateway", "how": "suppression suffix; say_guided acknowledgements"},
+          "provider": {"result": "provider", "how": "no suffix; gateway acknowledgement acts masked"},
+          "none": {"result": "none", "how": "suppression suffix"}},
+        "backchannel": {"auto": "none",
+          "gateway": {"result": "none", "how": "refused: would collide with the provider's turn detection"},
+          "provider": {"result": "none", "how": "no native listening sounds"},
+          "none": {"result": "none", "how": "nothing to switch off"}},
+        "idle": {"auto": "gateway",
+          "gateway": {"result": "gateway", "how": "say_* after W4's idle timer"},
+          "provider": {"result": "provider", "how": "idle_timeout_ms if the clone honours it (probe)"},
+          "none": {"result": "none", "how": "neither side prompts"}}
+      },
+      "activity": {"user_speech_edges": "full", "user_transcripts": "when input_audio_transcription is set", "responding_end": "response_done", "busy_signal": false},
+      "session_limits": {"max_session": "unknown", "max_connection": "unknown", "resume": "unknown", "mid_session_update": "full"},
+      "relay": {"mode": "guided_checked", "depth": 1, "description": "as openai"},
+      "lifecycle": {"rules": []},
+      "truth": {"regime_truth": "monitored", "relay": "exact_words_checked", "note": "as openai"},
+      "expected": {
+        "auto_with_truth_ack": {"regime": "ProviderSpeech", "variant": null, "front": "narrator_templates", "filler_owner": "gateway", "backchannel_owner": "none", "idle_owner": "gateway", "truth": "monitored"},
+        "auto_without_truth_ack": {"refusal": "truth_ack_required", "alternative": "speech.truth: enforced"},
+        "voice_owner_gateway": {"regime": "Cascade", "variant": "half_cascade"},
+        "truth_enforced": {"regime": "Cascade", "variant": "half_cascade"},
+        "forced": {"cascade": {"regime": "Cascade", "downgraded": false}, "provider_speech": {"regime": "ProviderSpeech", "downgraded": false}, "delegating": {"regime": "Delegating", "downgraded": false}},
+        "interaction_release": {"non_bud": 3, "bud": 4, "phone_and_rooms": 4}
+      },
+      "sources": {
+        "evidence": [{"file": "design/W6-providers-endpoints.md", "section": "3.2.1 Table A (yandex as openai), 3.3"}, {"file": "code/realtime-s2s.md", "section": "0 (Ultravox, Inworld and Yandex reachable only on /realtime)"}],
+        "code": ["core/realtime/yandex/protocol.rs:48", "core/realtime/mod.rs:227-241"]
+      }
+    },
+    {
+      "id": "grok",
+      "provider_id": "grok",
+      "display_name": "xAI Grok Voice Agent (OpenAI GA compatible)",
+      "kind": "speech_to_speech",
+      "model_family": "grok voice",
+      "model_patterns": [".*"],
+      "default_model": "grok-realtime",
+      "registered_today": true,
+      "available_from_release": 0,
+      "ownership": {
+        "turn_owner": "provider",
+        "voice_owner": "provider",
+        "voice_reproducible": {"value": "no"},
+        "text_output_possible": false,
+        "half_cascade_possible": false,
+        "reply_suppressible": false,
+        "note": "text output not confirmed (W6 Table A '?') and no documented reply switch, so no half-cascade (Addendum A2 item 1); create_response:false acceptance is probe 13"
+      },
+      "verbs": {
+        "user_text": {"support": "native", "wire": "conversation.item.create user input_text", "probe_first": false},
+        "say_exact": {"support": "native", "wire": "conversation.item.create {item.type:'force_message', interruptible}; no response.create; then AddContext{AssistantHeard} unless it enters history", "probe_first": true, "note": "probe 13: history, end signal, second message while one plays"},
+        "say_guided": {"support": "native", "wire": "response.create with instructions", "probe_first": false},
+        "add_context": {"support": "native", "wire": "conversation.item.create role system", "probe_first": false},
+        "request_reply": {"support": "native", "wire": "response.create", "probe_first": false},
+        "stop_output": {"support": "native", "wire": "response.cancel then truncate", "probe_first": false},
+        "hold_floor": {"support": "emulated", "emulation": "turn_detection_toggle", "wire": "session.update create_response:false plus the output gate (fallback: the gate alone)", "probe_first": true}
+      },
+      "background": {"async_tools": "pending_allowed", "delegation": "via_gateway_tool", "tools_declarable": true, "speculative_tool_calls": false, "delivery_scheduling": false, "provisional_runs": null, "note": "async function calls per the vendor page (inferred mapping to pending_allowed)"},
+      "native_mechanisms": {
+        "filler": {"kind": "none", "switch_off": "prompt suffix forbids filler phrases"},
+        "backchannel": {"kind": "none", "switch_off": "n/a"},
+        "idle": {"kind": "config", "key": "idle_timeout_ms", "default_on": false, "switch_off": "leave unset"}
+      },
+      "owners": {
+        "filler": {"auto": "gateway",
+          "gateway": {"result": "gateway", "how": "prompt suffix; SayExact (force_message) acknowledgements"},
+          "provider": {"result": "provider", "how": "no suffix; gateway acknowledgement acts masked"},
+          "none": {"result": "none", "how": "prompt suffix and no gateway acknowledgement"}},
+        "backchannel": {"auto": "none",
+          "gateway": {"result": "none", "how": "refused: would collide with the provider's turn detection"},
+          "provider": {"result": "none", "how": "no native listening sounds"},
+          "none": {"result": "none", "how": "nothing to switch off"}},
+        "idle": {"auto": "gateway",
+          "gateway": {"result": "gateway", "how": "gateway line after W4's timer; provider idle_timeout_ms not set"},
+          "provider": {"result": "provider", "how": "idle_timeout_ms"},
+          "none": {"result": "none", "how": "neither side prompts"}}
+      },
+      "activity": {"user_speech_edges": "full", "user_transcripts": "when input_audio_transcription is set", "responding_end": "response_done", "busy_signal": false},
+      "session_limits": {"max_session": "unknown", "max_connection": "unknown", "resume": "resumption with conversation_id; history dropped after 30 min idle", "mid_session_update": "full (inferred, OpenAI-compatible)"},
+      "relay": {"mode": "native_exact_streamed", "depth": 1, "description": "first answer sentence alone as force_message, then every sentence released since in one more; depth rises to 2 if probe 13 shows a second message queues"},
+      "lifecycle": {"rules": [], "note": "default_model is grok-realtime because the code sends it when the model is empty (core/realtime/grok/protocol.rs:49-53), not grok-voice-think-fast-2.0 as W6 once said; moving the default is a Lifecycle-track item behind a live probe (Addendum A2 item 2)"},
+      "truth": {"regime_truth": "monitored", "relay": "verbatim_provider_voice", "note": "relays and confirmations are exact words in the provider voice; the provider model still answers ordinary turns, watched by the claim monitor"},
+      "expected": {
+        "auto_with_truth_ack": {"regime": "ProviderSpeech", "variant": null, "front": "narrator_templates", "filler_owner": "gateway", "backchannel_owner": "none", "idle_owner": "gateway", "truth": "monitored"},
+        "auto_without_truth_ack": {"refusal": "truth_ack_required", "alternative": null},
+        "voice_owner_gateway": {"regime": "ProviderSpeech", "warning": "voice_owner_unavailable"},
+        "truth_enforced": {"refusal": "truth_enforcement_unavailable"},
+        "forced": {"cascade": {"regime": "ProviderSpeech", "downgraded": true}, "provider_speech": {"regime": "ProviderSpeech", "downgraded": false}, "delegating": {"regime": "Delegating", "downgraded": false}},
+        "interaction_release": {"non_bud": 3, "bud": 3, "phone_and_rooms": 4}
+      },
+      "sources": {
+        "evidence": [{"file": "verify/orchestration-hitl+platform-capabilities.md", "section": "1, Grok (force_message without the model, interruptible, idle_timeout_ms, resumption, 30 min)"}, {"file": "web/platform-capabilities.md", "section": "3.12"}, {"file": "design/W6-providers-endpoints.md", "section": "3.2.1, 3.3, 3.4.3, 3.9, 3.12.3 sequence 1"}],
+        "code": ["core/realtime/grok/protocol.rs:49-53", "handlers/openai_realtime/upstream.rs:18"]
+      }
+    },
+    {
+      "id": "inworld",
+      "provider_id": "inworld",
+      "display_name": "Inworld Realtime (OpenAI GA compatible pipeline)",
+      "kind": "speech_to_speech",
+      "model_family": "inworld realtime",
+      "model_patterns": [".*"],
+      "default_model": null,
+      "registered_today": true,
+      "available_from_release": 0,
+      "ownership": {
+        "turn_owner": "provider",
+        "voice_owner": "provider",
+        "voice_reproducible": {"value": "no", "note": "no Inworld TTS in core/tts/"},
+        "text_output_possible": false,
+        "half_cascade_possible": false,
+        "reply_suppressible": false
+      },
+      "verbs": {
+        "user_text": {"support": "native", "wire": "conversation.item.create user input_text", "probe_first": false},
+        "say_exact": {"support": "native", "wire": "response.speak with force_uninterruptible; then AddContext{AssistantHeard} unless it enters history", "probe_first": true},
+        "say_guided": {"support": "native", "wire": "response.create with instructions (inferred, OpenAI-compatible)", "probe_first": false},
+        "add_context": {"support": "native", "wire": "conversation.item.create role system (inferred)", "probe_first": false},
+        "request_reply": {"support": "native", "wire": "response.create", "probe_first": false},
+        "stop_output": {"support": "native", "wire": "response.cancel then truncate", "probe_first": false},
+        "hold_floor": {"support": "emulated", "emulation": "turn_detection_toggle", "wire": "as openai", "probe_first": false}
+      },
+      "background": {"async_tools": "pending_allowed", "delegation": "via_gateway_tool", "tools_declarable": true, "speculative_tool_calls": false, "delivery_scheduling": false, "provisional_runs": null, "note": "providerData.auto_tool_response defaults to true"},
+      "native_mechanisms": {
+        "filler": {"kind": "config", "key": "providerData.responsiveness.enabled", "default_on": false, "switch_off": "responsiveness.enabled=false (opt-in, off by default)"},
+        "backchannel": {"kind": "config", "key": "providerData.backchannel.enabled", "default_on": false, "switch_off": "backchannel.enabled=false (opt-in, off by default)"},
+        "idle": {"kind": "config", "key": "idle_timeout_ms (server_vad)", "default_on": false, "switch_off": "leave unset"}
+      },
+      "owners": {
+        "filler": {"auto": "gateway",
+          "gateway": {"result": "gateway", "how": "responsiveness.enabled=false; SayExact acknowledgements"},
+          "provider": {"result": "provider", "how": "responsiveness.enabled=true (operator tuning kept); gateway acknowledgement acts masked"},
+          "none": {"result": "none", "how": "responsiveness off and no gateway acknowledgement"}},
+        "backchannel": {"auto": "none",
+          "gateway": {"result": "none", "how": "refused: would collide with the provider's turn detection"},
+          "provider": {"result": "provider", "how": "backchannel.enabled=true"},
+          "none": {"result": "none", "how": "backchannel off"}},
+        "idle": {"auto": "gateway",
+          "gateway": {"result": "gateway", "how": "gateway line after W4's timer"},
+          "provider": {"result": "provider", "how": "idle_timeout_ms"},
+          "none": {"result": "none", "how": "neither side prompts"}}
+      },
+      "activity": {"user_speech_edges": "full", "user_transcripts": "when input_audio_transcription is set", "responding_end": "response_done", "busy_signal": false},
+      "session_limits": {"max_session": "unknown", "max_connection": "unknown", "resume": "unknown", "mid_session_update": "full (inferred)"},
+      "relay": {"mode": "native_exact_streamed", "depth": 1, "description": "first answer sentence alone as response.speak, then batches"},
+      "lifecycle": {"rules": []},
+      "truth": {"regime_truth": "monitored", "relay": "verbatim_provider_voice", "note": "as grok"},
+      "expected": {
+        "auto_with_truth_ack": {"regime": "ProviderSpeech", "variant": null, "front": "narrator_templates", "filler_owner": "gateway", "backchannel_owner": "none", "idle_owner": "gateway", "truth": "monitored"},
+        "auto_without_truth_ack": {"refusal": "truth_ack_required", "alternative": null},
+        "voice_owner_gateway": {"regime": "ProviderSpeech", "warning": "voice_owner_unavailable"},
+        "truth_enforced": {"refusal": "truth_enforcement_unavailable"},
+        "forced": {"cascade": {"regime": "ProviderSpeech", "downgraded": true}, "provider_speech": {"regime": "ProviderSpeech", "downgraded": false}, "delegating": {"regime": "Delegating", "downgraded": false}},
+        "interaction_release": {"non_bud": 3, "bud": 4, "phone_and_rooms": 4}
+      },
+      "sources": {
+        "evidence": [{"file": "verify/orchestration-hitl+platform-capabilities.md", "section": "1, Inworld; 2 correction 7 (providerData.backchannel, both opt-in default false)"}, {"file": "web/platform-capabilities.md", "section": "3.13"}, {"file": "design/W6-providers-endpoints.md", "section": "3.2.1, 3.3, 3.4.3, 3.9"}],
+        "code": ["core/realtime/inworld/protocol.rs:48-50", "core/realtime/mod.rs:227-241"]
+      }
+    },
+    {
+      "id": "deepgram",
+      "provider_id": "deepgram",
+      "display_name": "Deepgram Voice Agent",
+      "kind": "speech_to_speech",
+      "model_family": "voice agent (think model is the LLM)",
+      "model_patterns": [".*"],
+      "default_model": "gpt-4o-mini (think), nova-3 (listen), aura-2-thalia-en (speak)",
+      "registered_today": true,
+      "available_from_release": 0,
+      "ownership": {
+        "turn_owner": "provider",
+        "voice_owner": "provider",
+        "voice_reproducible": {"value": "same", "tts_provider": "deepgram_aura", "note": "Deepgram Aura speak voice; WaaV has core/tts/deepgram_aura.rs"},
+        "text_output_possible": false,
+        "half_cascade_possible": false,
+        "reply_suppressible": false
+      },
+      "verbs": {
+        "user_text": {"support": "native", "wire": "InjectUserMessage inside send_text (after the wire fix; today send_text sends InjectAgentMessage with 'content')", "probe_first": true, "fix_needed": "Lifecycle-track wire-fix patch, escape flag deepgram_text_as_agent_message"},
+        "say_exact": {"support": "native", "wire": "InjectAgentMessage {message, behavior: interrupt|queue|default}; default and queue are refused (InjectionRefused) while the user is mid-turn", "probe_first": true},
+        "say_guided": {"support": "emulated", "emulation": "user_turn_framing", "wire": "InjectUserMessage with the nonce-framed note (weak)", "probe_first": false},
+        "add_context": {"support": "emulated", "emulation": "prompt_append", "wire": "UpdatePrompt with the enveloped data", "probe_first": false},
+        "request_reply": {"support": "emulated", "emulation": "user_turn_framing", "wire": "InjectUserMessage framed", "probe_first": false},
+        "stop_output": {"support": "emulated", "emulation": "drop_output", "wire": "output gate (no client cancel)", "probe_first": false},
+        "hold_floor": {"support": "emulated", "emulation": "drop_output", "wire": "output gate", "probe_first": false}
+      },
+      "background": {"async_tools": "unknown", "delegation": "via_gateway_tool", "tools_declarable": true, "speculative_tool_calls": true, "delivery_scheduling": false,
+        "provisional_runs": {"from": "FunctionCallRequest{waav_delegate} (may arrive in the eager end-of-turn window); W3 start_provisional with origin ProviderCall { adopt_by } (Addendum C2.1)", "adopted_at": "the first of AgentThinking, AgentStartedSpeaking or the caller's ConversationText final", "discarded_at": "FunctionCallCancelled naming the call", "adopt_by_ms": 3000},
+        "note": "tools declarable only after the wire fix: Settings never carries cfg.tools today"},
+      "native_mechanisms": {
+        "filler": {"kind": "none", "switch_off": "n/a (InjectAgentMessage queue is the documented way for the client to fill silence)"},
+        "backchannel": {"kind": "none", "switch_off": "n/a"},
+        "idle": {"kind": "none", "switch_off": "n/a (gateway emulates with InjectAgentMessage default)"}
+      },
+      "owners": {
+        "filler": {"auto": "gateway",
+          "gateway": {"result": "gateway", "how": "SayExact fillers with behavior queue, retried after InjectionRefused"},
+          "provider": {"result": "none", "how": "no native filler"},
+          "none": {"result": "none", "how": "no acknowledgement"}},
+        "backchannel": {"auto": "none",
+          "gateway": {"result": "none", "how": "refused: would collide with the provider's turn detection"},
+          "provider": {"result": "none", "how": "no native listening sounds"},
+          "none": {"result": "none", "how": "nothing to switch off"}},
+        "idle": {"auto": "gateway",
+          "gateway": {"result": "gateway", "how": "InjectAgentMessage default after W4's timer"},
+          "provider": {"result": "none", "how": "no native idle prompt"},
+          "none": {"result": "none", "how": "no idle prompts"}}
+      },
+      "activity": {"user_speech_edges": "start_only", "user_transcripts": "always (ConversationText role user)", "responding_end": "response_done (AgentAudioDone)", "busy_signal": true},
+      "session_limits": {"max_session": "unknown", "max_connection": "unknown", "resume": "unknown", "mid_session_update": "prompt only (UpdatePrompt, UpdateSpeak, UpdateThink) after the wire fix"},
+      "relay": {"mode": "native_exact_streamed", "depth": 2, "description": "one InjectAgentMessage{behavior:'queue'} per sentence with one sentence queued ahead"},
+      "lifecycle": {"rules": []},
+      "truth": {"regime_truth": "monitored", "relay": "verbatim_provider_voice", "note": "exact words in the agent voice, with a refusal path; the think LLM still answers ordinary turns"},
+      "expected": {
+        "auto_with_truth_ack": {"regime": "ProviderSpeech", "variant": null, "front": "narrator_templates", "filler_owner": "gateway", "backchannel_owner": "none", "idle_owner": "gateway", "truth": "monitored"},
+        "auto_without_truth_ack": {"refusal": "truth_ack_required", "alternative": null},
+        "voice_owner_gateway": {"regime": "ProviderSpeech", "warning": "voice_owner_unavailable"},
+        "truth_enforced": {"refusal": "truth_enforcement_unavailable"},
+        "forced": {"cascade": {"regime": "ProviderSpeech", "downgraded": true}, "provider_speech": {"regime": "ProviderSpeech", "downgraded": false}, "delegating": {"regime": "Delegating", "downgraded": false}},
+        "interaction_release": {"non_bud": 3, "bud": 3, "phone_and_rooms": 4}
+      },
+      "sources": {
+        "evidence": [{"file": "verify/orchestration-hitl+platform-capabilities.md", "section": "1, Deepgram Voice Agent (message field, behavior, speculative FunctionCallRequest); 2 correction 6 (queue also refused while the user speaks)"}, {"file": "web/platform-capabilities.md", "section": "3.6"}, {"file": "design/W6-providers-endpoints.md", "section": "3.2.1, 3.4.3 Deepgram, 3.16, 3.17"}],
+        "code": ["core/realtime/deepgram/protocol.rs:335-344", "core/realtime/deepgram/protocol.rs:356-360", "core/realtime/deepgram/protocol.rs:43-50", "core/realtime/deepgram/protocol.rs:89", "handlers/openai_realtime/facade.rs:103-108"]
+      }
+    },
+    {
+      "id": "elevenlabs",
+      "provider_id": "elevenlabs",
+      "display_name": "ElevenLabs Agents (agent id carried in the model field)",
+      "kind": "speech_to_speech",
+      "model_family": "agents platform",
+      "model_patterns": [".*"],
+      "default_model": null,
+      "registered_today": true,
+      "available_from_release": 0,
+      "ownership": {
+        "turn_owner": "provider",
+        "voice_owner": "provider",
+        "voice_reproducible": {"value": "same_when_voice_known", "tts_provider": "elevenlabs", "note": "same when the agent's voice id is known to WaaV's ElevenLabs TTS (measurement 16)"},
+        "text_output_possible": false,
+        "half_cascade_possible": false,
+        "reply_suppressible": false
+      },
+      "verbs": {
+        "user_text": {"support": "native", "wire": "user_message (replies)", "probe_first": false},
+        "say_exact": {"support": "absent", "wire": "none documented; gateway clip in the agent's voice when reproducible", "probe_first": false},
+        "say_guided": {"support": "emulated", "emulation": "user_turn_framing", "wire": "user_message with the framed note", "probe_first": false},
+        "add_context": {"support": "native", "wire": "contextual_update {text} (does not interrupt, does not trigger a response)", "probe_first": true},
+        "request_reply": {"support": "emulated", "emulation": "user_turn_framing", "wire": "user_message framed", "probe_first": false},
+        "stop_output": {"support": "emulated", "emulation": "drop_output", "wire": "output gate", "probe_first": false},
+        "hold_floor": {"support": "emulated", "emulation": "drop_output", "wire": "output gate", "probe_first": false}
+      },
+      "background": {"async_tools": "async_execution_mode", "delegation": "via_gateway_tool", "tools_declarable": false, "speculative_tool_calls": false, "delivery_scheduling": false, "provisional_runs": null, "note": "tools live on the vendor agent; waav_delegate only if the operator added it; execution_mode async exists"},
+      "native_mechanisms": {
+        "filler": {"kind": "operator_only", "key": "turn.soft_timeout_config (default disabled) and per-tool pre_tool_speech (default auto)", "default_on": true, "switch_off": "operator turns soft_timeout_config off and sets pre_tool_speech off on the agent; per-conversation override unconfirmed (probe 13)"},
+        "backchannel": {"kind": "none", "switch_off": "n/a (none confirmed)"},
+        "idle": {"kind": "operator_only", "key": "turn.turn_timeout (1-30 s)", "default_on": true, "switch_off": "operator setting on the agent"}
+      },
+      "owners": {
+        "filler": {"auto": "provider",
+          "gateway": {"result": "provider", "how": "refused unless the operator turned soft_timeout_config and pre_tool_speech off on the agent", "unless_operator_flag": "elevenlabs_fillers_off", "then": "gateway"},
+          "provider": {"result": "provider", "how": "soft timeout and pre-tool speech as the operator set them; gateway acknowledgement acts masked"},
+          "none": {"result": "provider", "how": "cannot be switched off from the session (inferred: operator-only)", "unless_operator_flag": "elevenlabs_fillers_off", "then": "none"}},
+        "backchannel": {"auto": "none",
+          "gateway": {"result": "none", "how": "refused: would collide with the provider's turn detection"},
+          "provider": {"result": "none", "how": "no native listening sounds confirmed"},
+          "none": {"result": "none", "how": "nothing to switch off"}},
+        "idle": {"auto": "provider",
+          "gateway": {"result": "gateway", "how": "gateway via user_message framing (weak)"},
+          "provider": {"result": "provider", "how": "turn_timeout"},
+          "none": {"result": "provider", "how": "turn_timeout is an agent setting the session cannot remove (inferred)"}}
+      },
+      "activity": {"user_speech_edges": "none", "user_transcripts": "always (user_transcript)", "responding_end": "output gap 600 ms (no response-end event)", "busy_signal": false},
+      "session_limits": {"max_session": "unknown", "max_connection": "unknown", "resume": "unknown", "mid_session_update": "none (initiation data only)"},
+      "relay": {"mode": "gateway_clips", "depth": 1, "description": "gateway clips in the agent's voice when reproducible, batched like native exact"},
+      "lifecycle": {"rules": []},
+      "truth": {"regime_truth": "monitored", "relay": "gateway_clip", "note": "limited provider-speech: no exact speech verb; relays and confirmations are gateway clips"},
+      "expected": {
+        "auto_with_truth_ack": {"regime": "ProviderSpeech", "variant": null, "front": "narrator_templates", "filler_owner": "provider", "backchannel_owner": "none", "idle_owner": "provider", "truth": "monitored"},
+        "auto_without_truth_ack": {"refusal": "truth_ack_required", "alternative": null},
+        "voice_owner_gateway": {"regime": "ProviderSpeech", "warning": "voice_owner_unavailable"},
+        "truth_enforced": {"refusal": "truth_enforcement_unavailable"},
+        "forced": {"cascade": {"regime": "ProviderSpeech", "downgraded": true}, "provider_speech": {"regime": "ProviderSpeech", "downgraded": false}, "delegating": {"regime": "ProviderSpeech", "downgraded": true}},
+        "interaction_release": {"non_bud": 3, "bud": 3, "phone_and_rooms": 4}
+      },
+      "sources": {
+        "evidence": [{"file": "verify/orchestration-hitl+platform-capabilities.md", "section": "1, ElevenLabs (soft_timeout_config, pre_tool_speech default auto); 2 correction 2; 4 (no verbatim client event found)"}, {"file": "web/platform-capabilities.md", "section": "3.9"}, {"file": "design/W6-providers-endpoints.md", "section": "3.2.1, 3.3, 3.4.3 ElevenLabs, 3.9"}],
+        "code": ["core/realtime/elevenlabs/protocol.rs:286-291", "core/realtime/elevenlabs/protocol.rs:8-9", "handlers/openai_realtime/facade.rs:109-114"]
+      }
+    },
+    {
+      "id": "ultravox",
+      "provider_id": "ultravox",
+      "display_name": "Ultravox",
+      "kind": "speech_to_speech",
+      "model_family": "ultravox",
+      "model_patterns": [".*"],
+      "default_model": "fixie-ai/ultravox",
+      "registered_today": true,
+      "available_from_release": 0,
+      "ownership": {
+        "turn_owner": "provider",
+        "voice_owner": "provider",
+        "voice_reproducible": {"value": "same_when_voice_known", "note": "only with an external voice WaaV also has"},
+        "text_output_possible": true,
+        "half_cascade_possible": false,
+        "reply_suppressible": false,
+        "note": "set_output_medium: text exists (W6 Table A), but the Ultravox model still words its own replies; no documented switch stops it answering, so WaaV cannot decide every word and the half-cascade is not offered (Addendum A2 item 1)"
+      },
+      "verbs": {
+        "user_text": {"support": "native", "wire": "user_text_message (replies)", "probe_first": false},
+        "say_exact": {"support": "native", "wire": "forced_agent_message {content, urgency: immediate|soon, uninterruptible}; then AddContext{AssistantHeard} unless it enters history", "probe_first": true},
+        "say_guided": {"support": "emulated", "emulation": "user_turn_framing", "wire": "user_text_message framed, urgency immediate|soon|later", "probe_first": false},
+        "add_context": {"support": "emulated", "emulation": "user_turn_framing", "wire": "user_text_message with urgency later", "probe_first": false},
+        "request_reply": {"support": "emulated", "emulation": "user_turn_framing", "wire": "user_text_message with urgency soon", "probe_first": false},
+        "stop_output": {"support": "emulated", "emulation": "drop_output", "wire": "output gate", "probe_first": false},
+        "hold_floor": {"support": "emulated", "emulation": "drop_output", "wire": "output gate", "probe_first": false}
+      },
+      "background": {"async_tools": "frozen", "delegation": "via_gateway_tool", "tools_declarable": true, "speculative_tool_calls": false, "delivery_scheduling": false, "provisional_runs": null, "note": "conversation frozen during a tool call (2.5 s default, 40 s maximum); waav_delegate answered at once with agentReaction (values probe first); tools declarable only after the wire fix (the create-call body lists none today)"},
+      "native_mechanisms": {
+        "filler": {"kind": "none", "switch_off": "n/a"},
+        "backchannel": {"kind": "none", "switch_off": "n/a"},
+        "idle": {"kind": "config", "key": "inactivityMessages (create-call body)", "default_on": false, "switch_off": "leave unset"}
+      },
+      "owners": {
+        "filler": {"auto": "gateway",
+          "gateway": {"result": "gateway", "how": "SayExact fillers; agentReaction listens"},
+          "provider": {"result": "none", "how": "no native filler"},
+          "none": {"result": "none", "how": "no acknowledgement"}},
+        "backchannel": {"auto": "none",
+          "gateway": {"result": "none", "how": "refused: would collide with the provider's turn detection"},
+          "provider": {"result": "none", "how": "no native listening sounds"},
+          "none": {"result": "none", "how": "nothing to switch off"}},
+        "idle": {"auto": "gateway",
+          "gateway": {"result": "gateway", "how": "gateway line; inactivityMessages not set"},
+          "provider": {"result": "provider", "how": "inactivityMessages"},
+          "none": {"result": "none", "how": "neither side prompts"}}
+      },
+      "activity": {"user_speech_edges": "none", "user_transcripts": "always (transcript role user)", "responding_end": "response_done (speaking edge)", "busy_signal": false},
+      "session_limits": {"max_session": "maxDuration 3600 s default", "max_connection": "as session", "resume": "none", "mid_session_update": "none (REST create-call body)"},
+      "relay": {"mode": "native_exact_streamed", "depth": 1, "description": "first answer sentence alone as forced_agent_message, then batches"},
+      "lifecycle": {"rules": []},
+      "truth": {"regime_truth": "monitored", "relay": "verbatim_provider_voice", "note": "as grok"},
+      "expected": {
+        "auto_with_truth_ack": {"regime": "ProviderSpeech", "variant": null, "front": "narrator_templates", "filler_owner": "gateway", "backchannel_owner": "none", "idle_owner": "gateway", "truth": "monitored"},
+        "auto_without_truth_ack": {"refusal": "truth_ack_required", "alternative": null},
+        "voice_owner_gateway": {"regime": "ProviderSpeech", "warning": "voice_owner_unavailable"},
+        "truth_enforced": {"refusal": "truth_enforcement_unavailable"},
+        "forced": {"cascade": {"regime": "ProviderSpeech", "downgraded": true}, "provider_speech": {"regime": "ProviderSpeech", "downgraded": false}, "delegating": {"regime": "Delegating", "downgraded": false}},
+        "interaction_release": {"non_bud": 3, "bud": 4, "phone_and_rooms": 4}
+      },
+      "sources": {
+        "evidence": [{"file": "verify/orchestration-hitl+platform-capabilities.md", "section": "1, Ultravox (frozen tools, 2.5 s / 40 s, forced_agent_message fields); 2 correction 10"}, {"file": "web/platform-capabilities.md", "section": "3.11"}, {"file": "design/W6-providers-endpoints.md", "section": "3.2.1, 3.4.3 Ultravox, 3.9"}],
+        "code": ["core/realtime/ultravox/protocol.rs:57", "core/realtime/ultravox/protocol.rs:113", "core/realtime/ultravox/protocol.rs:323-330"]
+      }
+    },
+    {
+      "id": "gemini.3.8-live-extended-thinking",
+      "provider_id": "gemini",
+      "display_name": "Gemini 3.8 Live Extended Thinking",
+      "kind": "speech_to_speech",
+      "model_family": "gemini-3.8-live-extended-thinking",
+      "model_patterns": ["^gemini-3\\.8-live-extended-thinking"],
+      "default_model": null,
+      "registered_today": true,
+      "available_from_release": 0,
+      "ownership": {
+        "turn_owner": "provider",
+        "voice_owner": "provider",
+        "voice_reproducible": {"value": "no"},
+        "text_output_possible": false,
+        "half_cascade_possible": false,
+        "reply_suppressible": false
+      },
+      "verbs": {
+        "user_text": {"support": "native", "wire": "clientContent turnComplete:true (interrupts generation; sent only while idle)", "probe_first": false},
+        "say_exact": {"support": "absent", "wire": "none; gateway clip in a different voice for confirmations, if allowed", "probe_first": false},
+        "say_guided": {"support": "emulated", "emulation": "model_decides", "wire": "final function response, no scheduling", "probe_first": false},
+        "add_context": {"support": "emulated", "emulation": "user_turn_framing", "wire": "clientContent turnComplete:false while idle", "probe_first": true},
+        "request_reply": {"support": "native", "wire": "clientContent turnComplete:true", "probe_first": false},
+        "stop_output": {"support": "emulated", "emulation": "drop_output", "wire": "output gate (no client cancel)", "probe_first": false},
+        "hold_floor": {"support": "emulated", "emulation": "drop_output", "wire": "output gate", "probe_first": false}
+      },
+      "background": {"async_tools": "non_blocking_unscheduled", "delegation": "via_gateway_tool", "tools_declarable": true, "speculative_tool_calls": true, "delivery_scheduling": false,
+        "provisional_runs": {"from": "a waav_delegate call while the provider's turn is open; W3 start_provisional with origin ProviderCall { adopt_by } (Addendum C2.1)", "adopted_at": "that turn's turnComplete, or 300 ms after interrupted with no toolCallCancellation naming the call", "discarded_at": "toolCallCancellation naming the call", "adopt_by_ms": 10000},
+        "note": "async only; a tool marked blocking gets tool_behavior_unsupported"},
+      "native_mechanisms": {
+        "filler": {"kind": "always_on", "switch_off": "cannot: proactive audio is permanent; never send proactive_audio:false (it errors)"},
+        "backchannel": {"kind": "unknown", "switch_off": "none documented"},
+        "idle": {"kind": "none", "switch_off": "n/a"}
+      },
+      "owners": {
+        "filler": {"auto": "provider",
+          "gateway": {"result": "provider", "how": "refused: proactive audio cannot be switched off"},
+          "provider": {"result": "provider", "how": "proactive audio"},
+          "none": {"result": "provider", "how": "refused: proactive audio cannot be switched off"}},
+        "backchannel": {"auto": "provider",
+          "gateway": {"result": "provider", "how": "refused: the provider is the front"},
+          "provider": {"result": "provider", "how": "the model decides"},
+          "none": {"result": "provider", "how": "no documented switch (inferred)"}},
+        "idle": {"auto": "provider",
+          "gateway": {"result": "provider", "how": "refused: the provider is the front"},
+          "provider": {"result": "provider", "how": "the model decides"},
+          "none": {"result": "provider", "how": "no documented switch (inferred)"}}
+      },
+      "activity": {"user_speech_edges": "none", "user_transcripts": "when inputAudioTranscription is set (forced on in interaction mode)", "responding_end": "response_done (turnComplete)", "busy_signal": true},
+      "session_limits": {"max_session": "15 min audio-only without compression", "max_connection": "about 10 min", "resume": "sessionResumption handle valid 2 h; goAway carries timeLeft", "mid_session_update": "none (setup fields are fixed)"},
+      "relay": {"mode": "whole_reworded", "depth": null, "description": "whole result in one delivery; the provider rewords it; verbatim:false"},
+      "lifecycle": {"rules": []},
+      "truth": {"regime_truth": "monitored", "relay": "verified_paraphrase", "note": "the provider is the front and rewords results"},
+      "expected": {
+        "auto_with_truth_ack": {"regime": "Delegating", "variant": null, "front": "provider", "filler_owner": "provider", "backchannel_owner": "provider", "idle_owner": "provider", "truth": "monitored"},
+        "auto_without_truth_ack": {"refusal": "truth_ack_required", "alternative": null},
+        "voice_owner_gateway": {"regime": "Delegating", "warning": "voice_owner_unavailable"},
+        "truth_enforced": {"refusal": "truth_enforcement_unavailable"},
+        "forced": {"cascade": {"regime": "Delegating", "downgraded": true}, "provider_speech": {"regime": "Delegating", "downgraded": true}, "delegating": {"regime": "Delegating", "downgraded": false}},
+        "interaction_release": {"non_bud": 3, "bud": 3, "phone_and_rooms": 4}
+      },
+      "sources": {
+        "evidence": [{"file": "verify/orchestration-hitl+platform-capabilities.md", "section": "1, Google Gemini Live (extended thinking async only); 3 (talker plus background)"}, {"file": "design/W6-providers-endpoints.md", "section": "Decision 6, 3.2.1, 3.8, 3.16"}],
+        "code": ["core/realtime/gemini/protocol.rs:62", "core/realtime/gemini/protocol.rs:345-349", "core/realtime/gemini/protocol.rs:580-584"]
+      }
+    },
+    {
+      "id": "gemini.3.8-live",
+      "provider_id": "gemini",
+      "display_name": "Gemini 3.8 Live (WaaV's default Gemini model)",
+      "kind": "speech_to_speech",
+      "model_family": "gemini-3.8-live",
+      "model_patterns": ["^gemini-3\\.8-live"],
+      "default_model": "gemini-3.8-live",
+      "registered_today": true,
+      "available_from_release": 0,
+      "ownership": {
+        "turn_owner": "provider",
+        "voice_owner": "provider",
+        "voice_reproducible": {"value": "no"},
+        "text_output_possible": false,
+        "half_cascade_possible": false,
+        "reply_suppressible": false,
+        "note": "audio is the only response modality"
+      },
+      "verbs": {
+        "user_text": {"support": "native", "wire": "clientContent turnComplete:true (unconditionally interrupts generation; sent only while idle)", "probe_first": false},
+        "say_exact": {"support": "absent", "wire": "none; gateway clip in a different voice for confirmations, if allowed", "probe_first": false},
+        "say_guided": {"support": "native", "wire": "function response with scheduling WHEN_IDLE|INTERRUPT for task results; else user-turn framing", "probe_first": true, "note": "INTERRUPT versus INTERRUPTED spelling is probe 10"},
+        "add_context": {"support": "native", "wire": "SILENT function response on the open waav_delegate call; else clientContent turnComplete:false while idle", "probe_first": true},
+        "request_reply": {"support": "native", "wire": "clientContent turnComplete:true", "probe_first": false},
+        "stop_output": {"support": "emulated", "emulation": "drop_output", "wire": "output gate (no client cancel)", "probe_first": false},
+        "hold_floor": {"support": "emulated", "emulation": "drop_output", "wire": "output gate", "probe_first": false}
+      },
+      "background": {"async_tools": "non_blocking_scheduled", "delegation": "via_gateway_tool", "tools_declarable": true, "speculative_tool_calls": true, "delivery_scheduling": true,
+        "provisional_runs": {"from": "a waav_delegate call while the provider's turn is open; W3 start_provisional with origin ProviderCall { adopt_by } (Addendum C2.1)", "adopted_at": "that turn's turnComplete, or 300 ms after interrupted with no toolCallCancellation naming the call", "discarded_at": "toolCallCancellation naming the call", "adopt_by_ms": 10000},
+        "note": "NON_BLOCKING is the 3.8 default and WaaV omits behavior today, so every tool already runs non-blocking; the wire fix sends BLOCKING for client tools"},
+      "native_mechanisms": {
+        "filler": {"kind": "always_on", "switch_off": "cannot: proactive audio is permanent; never send proactive_audio:false (it errors)"},
+        "backchannel": {"kind": "unknown", "switch_off": "none documented"},
+        "idle": {"kind": "none", "switch_off": "n/a"}
+      },
+      "owners": {
+        "filler": {"auto": "provider",
+          "gateway": {"result": "provider", "how": "refused: proactive audio cannot be switched off"},
+          "provider": {"result": "provider", "how": "proactive audio"},
+          "none": {"result": "provider", "how": "refused: proactive audio cannot be switched off"}},
+        "backchannel": {"auto": "provider",
+          "gateway": {"result": "provider", "how": "refused: the provider is the front"},
+          "provider": {"result": "provider", "how": "the model decides"},
+          "none": {"result": "provider", "how": "no documented switch (inferred)"}},
+        "idle": {"auto": "provider",
+          "gateway": {"result": "provider", "how": "refused: the provider is the front"},
+          "provider": {"result": "provider", "how": "the model decides"},
+          "none": {"result": "provider", "how": "no documented switch (inferred)"}}
+      },
+      "activity": {"user_speech_edges": "none", "user_transcripts": "when inputAudioTranscription is set (forced on in interaction mode)", "responding_end": "response_done (turnComplete)", "busy_signal": true},
+      "session_limits": {"max_session": "15 min audio-only without compression", "max_connection": "about 10 min", "resume": "sessionResumption handle valid 2 h; goAway carries timeLeft", "mid_session_update": "none (setup fields are fixed)"},
+      "relay": {"mode": "whole_reworded", "depth": null, "description": "whole result in one function response with scheduling from the delivery policy; verbatim:false"},
+      "lifecycle": {"rules": []},
+      "truth": {"regime_truth": "monitored", "relay": "verified_paraphrase", "note": "the provider is the front and speaks results in its own words"},
+      "expected": {
+        "auto_with_truth_ack": {"regime": "Delegating", "variant": null, "front": "provider", "filler_owner": "provider", "backchannel_owner": "provider", "idle_owner": "provider", "truth": "monitored"},
+        "auto_without_truth_ack": {"refusal": "truth_ack_required", "alternative": null},
+        "voice_owner_gateway": {"regime": "Delegating", "warning": "voice_owner_unavailable"},
+        "truth_enforced": {"refusal": "truth_enforcement_unavailable"},
+        "forced": {"cascade": {"regime": "Delegating", "downgraded": true}, "provider_speech": {"regime": "Delegating", "downgraded": true}, "delegating": {"regime": "Delegating", "downgraded": false}},
+        "interaction_release": {"non_bud": 3, "bud": 3, "phone_and_rooms": 4}
+      },
+      "sources": {
+        "evidence": [{"file": "verify/orchestration-hitl+platform-capabilities.md", "section": "1, Google Gemini Live (NON_BLOCKING default, proactive audio permanent, turn_complete interrupts, INTERRUPT enum, session limits); 2 correction 1"}, {"file": "web/platform-capabilities.md", "section": "3.3"}, {"file": "design/W6-providers-endpoints.md", "section": "Decision 6, 3.2.1, 3.4.3 Gemini, 3.8, 3.16"}],
+        "code": ["core/realtime/gemini/protocol.rs:62", "core/realtime/gemini/protocol.rs:345-349", "core/realtime/gemini/protocol.rs:580-584", "handlers/openai_realtime/facade.rs:91-96"]
+      }
+    },
+    {
+      "id": "gemini.legacy",
+      "provider_id": "gemini",
+      "display_name": "Gemini 3.1 Flash Live and older (degraded)",
+      "kind": "speech_to_speech",
+      "model_family": "gemini-3.1-flash-live-preview and older",
+      "model_patterns": [".*"],
+      "default_model": null,
+      "registered_today": true,
+      "available_from_release": 0,
+      "ownership": {
+        "turn_owner": "provider",
+        "voice_owner": "provider",
+        "voice_reproducible": {"value": "no"},
+        "text_output_possible": false,
+        "half_cascade_possible": false,
+        "reply_suppressible": false
+      },
+      "verbs": {
+        "user_text": {"support": "native", "wire": "clientContent turnComplete:true", "probe_first": false},
+        "say_exact": {"support": "absent", "wire": "none", "probe_first": false},
+        "say_guided": {"support": "emulated", "emulation": "user_turn_framing", "wire": "clientContent user-framed note while idle", "probe_first": false},
+        "add_context": {"support": "emulated", "emulation": "user_turn_framing", "wire": "clientContent turnComplete:false while idle", "probe_first": true},
+        "request_reply": {"support": "native", "wire": "clientContent turnComplete:true", "probe_first": false},
+        "stop_output": {"support": "emulated", "emulation": "drop_output", "wire": "output gate", "probe_first": false},
+        "hold_floor": {"support": "emulated", "emulation": "drop_output", "wire": "output gate", "probe_first": false}
+      },
+      "background": {"async_tools": "sync_only", "delegation": "via_gateway_tool", "tools_declarable": true, "speculative_tool_calls": true, "delivery_scheduling": false,
+        "provisional_runs": {"from": "a waav_delegate call while the provider's turn is open; W3 start_provisional with origin ProviderCall { adopt_by } (Addendum C2.1)", "adopted_at": "that turn's turnComplete, or 300 ms after interrupted with no toolCallCancellation naming the call", "discarded_at": "toolCallCancellation naming the call", "adopt_by_ms": 10000},
+        "note": "the tool is answered at once with started; results go out between turns as user-framed notes"},
+      "native_mechanisms": {
+        "filler": {"kind": "none", "switch_off": "n/a (proactive audio is not on 3.1)"},
+        "backchannel": {"kind": "none", "switch_off": "n/a"},
+        "idle": {"kind": "none", "switch_off": "n/a"}
+      },
+      "owners": {
+        "filler": {"auto": "provider",
+          "gateway": {"result": "provider", "how": "refused: the provider is the front and no exact speech exists (inferred from the delegating regime)"},
+          "provider": {"result": "provider", "how": "the model's own speech"},
+          "none": {"result": "provider", "how": "the model's own speech (inferred)"}},
+        "backchannel": {"auto": "provider",
+          "gateway": {"result": "provider", "how": "refused: the provider is the front"},
+          "provider": {"result": "provider", "how": "the model decides"},
+          "none": {"result": "provider", "how": "no switch (inferred)"}},
+        "idle": {"auto": "provider",
+          "gateway": {"result": "provider", "how": "refused: the provider is the front"},
+          "provider": {"result": "provider", "how": "the model decides"},
+          "none": {"result": "provider", "how": "no switch (inferred)"}}
+      },
+      "activity": {"user_speech_edges": "none", "user_transcripts": "when inputAudioTranscription is set", "responding_end": "response_done (turnComplete)", "busy_signal": false},
+      "session_limits": {"max_session": "15 min audio-only without compression", "max_connection": "about 10 min", "resume": "sessionResumption handle", "mid_session_update": "none"},
+      "relay": {"mode": "whole_reworded", "depth": null, "description": "results only between turns, as user-framed notes"},
+      "lifecycle": {"rules": [
+        {"models": "^gemini-2\\.0-flash-live-001$", "warning_from": null, "shutdown": "2025-12-09", "replacement": "gemini-3.8-live", "warning_code": "model_retiring", "refusal_code": "model_retired", "default_move_by": null, "note": "already moved: WaaV's default became gemini-3.8-live"}
+      ], "note": "gemini-3.1-flash-live-preview is legacy with no shutdown date in the evidence"},
+      "truth": {"regime_truth": "monitored", "relay": "verified_paraphrase", "note": "degraded delegating: results only between turns"},
+      "expected": {
+        "auto_with_truth_ack": {"regime": "Delegating", "variant": null, "front": "provider", "filler_owner": "provider", "backchannel_owner": "provider", "idle_owner": "provider", "truth": "monitored"},
+        "auto_without_truth_ack": {"refusal": "truth_ack_required", "alternative": null},
+        "voice_owner_gateway": {"regime": "Delegating", "warning": "voice_owner_unavailable"},
+        "truth_enforced": {"refusal": "truth_enforcement_unavailable"},
+        "forced": {"cascade": {"regime": "Delegating", "downgraded": true}, "provider_speech": {"regime": "Delegating", "downgraded": true}, "delegating": {"regime": "Delegating", "downgraded": false}},
+        "interaction_release": {"non_bud": 3, "bud": 3, "phone_and_rooms": 4}
+      },
+      "sources": {
+        "evidence": [{"file": "verify/orchestration-hitl+platform-capabilities.md", "section": "1, Google Gemini Live (3.1 Flash Live synchronous only)"}, {"file": "design/W6-providers-endpoints.md", "section": "3.2.1 (3.1 row pinned so the rule picks degraded delegating), 3.3, 3.8"}],
+        "code": ["core/realtime/gemini/protocol.rs:58-62"]
+      }
+    },
+    {
+      "id": "nova_sonic",
+      "provider_id": "nova_sonic",
+      "display_name": "Amazon Nova 2 Sonic",
+      "kind": "speech_to_speech",
+      "model_family": "nova-2-sonic",
+      "model_patterns": [".*"],
+      "default_model": "amazon.nova-2-sonic-v1:0",
+      "registered_today": true,
+      "available_from_release": 0,
+      "ownership": {
+        "turn_owner": "provider",
+        "voice_owner": "provider",
+        "voice_reproducible": {"value": "no"},
+        "text_output_possible": false,
+        "half_cascade_possible": false,
+        "reply_suppressible": false
+      },
+      "verbs": {
+        "user_text": {"support": "native", "wire": "contentStart TEXT USER interactive:true (after the wire fix; today interactive:false)", "probe_first": true, "fix_needed": "Lifecycle-track wire-fix patch, escape flag nova_text_non_interactive"},
+        "say_exact": {"support": "absent", "wire": "none", "probe_first": false},
+        "say_guided": {"support": "emulated", "emulation": "user_turn_framing", "wire": "interactive:true USER text with the framed note (weak; off by default for progress)", "probe_first": true},
+        "add_context": {"support": "absent", "wire": "none mid-session: history only before audio; context folded into the next connection's system prompt as best effort", "probe_first": false},
+        "request_reply": {"support": "emulated", "emulation": "user_turn_framing", "wire": "interactive:true USER text framed", "probe_first": false},
+        "stop_output": {"support": "emulated", "emulation": "drop_output", "wire": "output gate (no client cancel)", "probe_first": false},
+        "hold_floor": {"support": "emulated", "emulation": "drop_output", "wire": "output gate", "probe_first": false}
+      },
+      "background": {"async_tools": "always_async", "delegation": "via_gateway_tool", "tools_declarable": true, "speculative_tool_calls": false, "delivery_scheduling": false, "provisional_runs": null, "note": "results always delivered, no cancellation; a cancelled task's result says it was cancelled and names committed effects"},
+      "native_mechanisms": {
+        "filler": {"kind": "unknown", "switch_off": "unknown"},
+        "backchannel": {"kind": "none", "switch_off": "n/a"},
+        "idle": {"kind": "none", "switch_off": "n/a"}
+      },
+      "owners": {
+        "filler": {"auto": "provider",
+          "gateway": {"result": "provider", "how": "refused: no exact speech"},
+          "provider": {"result": "provider", "how": "the model keeps talking while tools run"},
+          "none": {"result": "provider", "how": "no switch known (inferred)"}},
+        "backchannel": {"auto": "none",
+          "gateway": {"result": "none", "how": "refused: would collide with the provider's turn detection"},
+          "provider": {"result": "none", "how": "no native listening sounds"},
+          "none": {"result": "none", "how": "nothing to switch off"}},
+        "idle": {"auto": "provider",
+          "gateway": {"result": "provider", "how": "refused: no exact speech"},
+          "provider": {"result": "provider", "how": "the model decides"},
+          "none": {"result": "provider", "how": "no switch (inferred)"}}
+      },
+      "activity": {"user_speech_edges": "none", "user_transcripts": "always (USER ASR)", "responding_end": "response_done (completionEnd)", "busy_signal": false},
+      "session_limits": {"max_session": "unbounded by rotation", "max_connection": "8 min; the driver replaces it 30 s earlier with history replay", "resume": "replay on reconnect", "mid_session_update": "none (wire fix refuses a changed setup field)"},
+      "relay": {"mode": "whole_reworded", "depth": null, "description": "whole result as the tool result; the model rewords it"},
+      "lifecycle": {"rules": [
+        {"models": "^amazon\\.nova-sonic-v1:0$", "warning_from": null, "shutdown": "2026-09-14", "replacement": "amazon.nova-2-sonic-v1:0", "warning_code": "model_retiring", "refusal_code": "model_retired", "default_move_by": null, "note": "already moved"}
+      ]},
+      "truth": {"regime_truth": "monitored", "relay": "verified_paraphrase", "note": "regime C: no exact speech and no mid-session context"},
+      "expected": {
+        "auto_with_truth_ack": {"regime": "Delegating", "variant": null, "front": "provider", "filler_owner": "provider", "backchannel_owner": "none", "idle_owner": "provider", "truth": "monitored"},
+        "auto_without_truth_ack": {"refusal": "truth_ack_required", "alternative": null},
+        "voice_owner_gateway": {"regime": "Delegating", "warning": "voice_owner_unavailable"},
+        "truth_enforced": {"refusal": "truth_enforcement_unavailable"},
+        "forced": {"cascade": {"regime": "Delegating", "downgraded": true}, "provider_speech": {"regime": "Delegating", "downgraded": true}, "delegating": {"regime": "Delegating", "downgraded": false}},
+        "interaction_release": {"non_bud": 3, "bud": 3, "phone_and_rooms": 4}
+      },
+      "sources": {
+        "evidence": [{"file": "verify/orchestration-hitl+platform-capabilities.md", "section": "1, Nova 2 Sonic (async, always delivered, no cancellation, 8 min, history before audio); 3 (interactive flag)"}, {"file": "web/platform-capabilities.md", "section": "3.4"}, {"file": "design/W6-providers-endpoints.md", "section": "3.2.1, 3.4.3 Nova 2 Sonic, 9.1 challenge 4"}],
+        "code": ["core/realtime/nova_sonic/protocol.rs:59-61", "core/realtime/nova_sonic/protocol.rs:652-660", "handlers/openai_realtime/facade.rs:97-102"]
+      }
+    },
+    {
+      "id": "gpt_live",
+      "provider_id": "gpt_live",
+      "display_name": "OpenAI GPT-Live (gpt-live-1, v1/live/sessions; new adapter)",
+      "kind": "speech_to_speech",
+      "model_family": "gpt-live",
+      "model_patterns": [".*"],
+      "default_model": "gpt-live-1",
+      "registered_today": false,
+      "available_from_release": 3,
+      "ownership": {
+        "turn_owner": "provider",
+        "voice_owner": "provider",
+        "voice_reproducible": {"value": "no"},
+        "text_output_possible": false,
+        "half_cascade_possible": false,
+        "reply_suppressible": false,
+        "note": "no text-only session mode documented (verify section 4: rests on absence)"
+      },
+      "verbs": {
+        "user_text": {"support": "absent", "wire": "no text turns", "probe_first": false},
+        "say_exact": {"support": "emulated", "emulation": "gateway_clip", "wire": "gateway clip only, then session.thinking.append('The system read this to the caller word for word: <envelope>')", "probe_first": false},
+        "say_guided": {"support": "native", "wire": "session.commentary.append {delegation_id, content} (paraphrased; timing model-decided)", "probe_first": true},
+        "add_context": {"support": "native", "wire": "session.thinking.append (facts, enveloped); session.instructions.append only for fixed gateway sentences", "probe_first": false},
+        "request_reply": {"support": "absent", "wire": "the model decides when to speak", "probe_first": false},
+        "stop_output": {"support": "emulated", "emulation": "drop_output", "wire": "output gate (application-side playback control)", "probe_first": false},
+        "hold_floor": {"support": "emulated", "emulation": "drop_output", "wire": "output gate", "probe_first": false}
+      },
+      "background": {"async_tools": "n/a", "delegation": "native_client", "tools_declarable": false, "speculative_tool_calls": false, "delivery_scheduling": false, "provisional_runs": null, "note": "session.delegation.created carries only offset_ms and {id, type, target}; never withdrawn, so no provisional stage"},
+      "native_mechanisms": {
+        "filler": {"kind": "always_on", "switch_off": "cannot: it is the speaker"},
+        "backchannel": {"kind": "prompt_only", "key": "'Backchannel policy' heading in the session instructions", "default_on": true, "switch_off": "prompt instruction (best effort)"},
+        "idle": {"kind": "prompt_only", "switch_off": "prompt instruction"}
+      },
+      "owners": {
+        "filler": {"auto": "provider",
+          "gateway": {"result": "provider", "how": "refused: GPT-Live is the speaker"},
+          "provider": {"result": "provider", "how": "the model's own speech"},
+          "none": {"result": "provider", "how": "refused: cannot be switched off"}},
+        "backchannel": {"auto": "provider",
+          "gateway": {"result": "provider", "how": "refused: the provider is the front"},
+          "provider": {"result": "provider", "how": "'Backchannel policy' prompt section"},
+          "none": {"result": "none", "how": "'Backchannel policy' prompt asks for none (best effort, prompt-only)"}},
+        "idle": {"auto": "provider",
+          "gateway": {"result": "provider", "how": "refused: the provider is the front"},
+          "provider": {"result": "provider", "how": "prompt"},
+          "none": {"result": "provider", "how": "prompt-only; cannot be guaranteed (inferred)"}}
+      },
+      "activity": {"user_speech_edges": "none", "user_transcripts": "input transcript deltas assembled into finals by the adapter (700 ms tick)", "responding_end": "output gap 600 ms", "busy_signal": false},
+      "session_limits": {"max_session": "128k context; replacement voice engine above 90%", "max_connection": "close reason expired treated as planned", "resume": "none in the evidence (new session with startup input up to 128 messages / 8,192 tokens)", "mid_session_update": "model, voice and delegation mode fixed"},
+      "relay": {"mode": "whole_reworded", "depth": null, "description": "commentary.append('Completed: <envelope>'); paraphrased by design"},
+      "lifecycle": {"rules": [], "note": "generally available 2026-09-10; $0.05 per minute billed per second plus backend; 25 to 500 concurrent sessions by tier"},
+      "truth": {"regime_truth": "monitored", "relay": "verified_paraphrase", "note": "commentary may be paraphrased; exact wording only through gateway clips or the client UI"},
+      "surface_refusals": {"v1_realtime_relay": "unsupported_vendor", "v1_realtime_facade": "unsupported_vendor", "dag_realtime_node": "provider_not_turn_based"},
+      "expected": {
+        "auto_with_truth_ack": {"regime": "Delegating", "variant": null, "front": "provider", "filler_owner": "provider", "backchannel_owner": "provider", "idle_owner": "provider", "truth": "monitored"},
+        "auto_without_truth_ack": {"refusal": "truth_ack_required", "alternative": null},
+        "voice_owner_gateway": {"regime": "Delegating", "warning": "voice_owner_unavailable"},
+        "truth_enforced": {"refusal": "truth_enforcement_unavailable"},
+        "forced": {"cascade": {"regime": "Delegating", "downgraded": true}, "provider_speech": {"regime": "Delegating", "downgraded": true}, "delegating": {"regime": "Delegating", "downgraded": false}},
+        "interaction_release": {"non_bud": 3, "bud": 4, "phone_and_rooms": 4}
+      },
+      "sources": {
+        "evidence": [{"file": "verify/orchestration-hitl+platform-capabilities.md", "section": "1, OpenAI (GPT-Live GA, delegation, three append channels, session limits); 2 corrections 3, 4, 5; 4"}, {"file": "web/platform-capabilities.md", "section": "3.2"}, {"file": "design/W6-providers-endpoints.md", "section": "Decision 7, 3.7, 3.11.1"}],
+        "code": ["core/realtime/mod.rs:227-241 (no gpt_live today)", "handlers/realtime/handler.rs:613-627", "handlers/openai_realtime/session.rs:366-368"]
+      }
+    },
+    {
+      "id": "hume",
+      "provider_id": "hume",
+      "display_name": "Hume EVI (EVI 3, EVI 4-mini) - retiring",
+      "kind": "speech_to_speech",
+      "model_family": "evi",
+      "model_patterns": [".*"],
+      "default_model": "EVI 3",
+      "registered_today": true,
+      "available_from_release": 0,
+      "ownership": {
+        "turn_owner": "provider",
+        "voice_owner": "provider",
+        "voice_reproducible": {"value": "n/a"},
+        "text_output_possible": false,
+        "half_cascade_possible": false,
+        "reply_suppressible": false
+      },
+      "verbs": {
+        "user_text": {"support": "native", "wire": "send_text unchanged until retirement (today text_input; the current reference names user_input)", "probe_first": false},
+        "say_exact": {"support": "retired", "wire": "not built (assistant_input would be the verb)", "probe_first": false},
+        "say_guided": {"support": "retired", "wire": "not built", "probe_first": false},
+        "add_context": {"support": "retired", "wire": "not built", "probe_first": false},
+        "request_reply": {"support": "retired", "wire": "not built", "probe_first": false},
+        "stop_output": {"support": "retired", "wire": "not built", "probe_first": false},
+        "hold_floor": {"support": "retired", "wire": "not built", "probe_first": false}
+      },
+      "background": {"async_tools": "unknown", "delegation": "none", "tools_declarable": false, "speculative_tool_calls": false, "delivery_scheduling": false, "provisional_runs": null, "note": "tools only through a Hume config id, which from_config always leaves unset"},
+      "native_mechanisms": {
+        "filler": {"kind": "unknown", "switch_off": "n/a"},
+        "backchannel": {"kind": "unknown", "switch_off": "n/a"},
+        "idle": {"kind": "unknown", "switch_off": "n/a"}
+      },
+      "owners": {
+        "filler": {"auto": "provider", "gateway": {"result": "provider", "how": "n/a (retiring)"}, "provider": {"result": "provider", "how": "n/a"}, "none": {"result": "provider", "how": "n/a"}},
+        "backchannel": {"auto": "provider", "gateway": {"result": "provider", "how": "n/a (retiring)"}, "provider": {"result": "provider", "how": "n/a"}, "none": {"result": "provider", "how": "n/a"}},
+        "idle": {"auto": "provider", "gateway": {"result": "provider", "how": "n/a (retiring)"}, "provider": {"result": "provider", "how": "n/a"}, "none": {"result": "provider", "how": "n/a"}}
+      },
+      "activity": {"user_speech_edges": "unknown", "user_transcripts": "unknown", "responding_end": "unknown", "busy_signal": false},
+      "session_limits": {"max_session": "n/a", "max_connection": "n/a", "resume": "n/a", "mid_session_update": "n/a"},
+      "relay": {"mode": "none", "depth": null, "description": "never selected"},
+      "lifecycle": {"provider_level": true, "rules": [
+        {"models": ".*", "warning_from": null, "shutdown": "2026-11-13", "replacement": null, "warning_code": "provider_sunset", "refusal_code": "provider_retired", "default_move_by": null, "registry_removal": "first release after 2026-11-13", "note": "warning from the first standalone lifecycle patch; access ends 2026-11-13 12:01 a.m. EST and account data is deleted"}
+      ]},
+      "truth": {"regime_truth": "monitored", "relay": "none", "note": "never selected by the regime rule"},
+      "expected": {
+        "auto_with_truth_ack": {"refusal": "interaction_unsupported"},
+        "auto_without_truth_ack": {"refusal": "interaction_unsupported"},
+        "voice_owner_gateway": {"refusal": "interaction_unsupported", "warning": "voice_owner_unavailable"},
+        "truth_enforced": {"refusal": "truth_enforcement_unavailable"},
+        "forced": {"cascade": {"refusal": "interaction_unsupported"}, "provider_speech": {"refusal": "interaction_unsupported"}, "delegating": {"refusal": "interaction_unsupported"}},
+        "interaction_release": {"non_bud": null, "bud": null, "phone_and_rooms": null}
+      },
+      "sources": {
+        "evidence": [{"file": "verify/orchestration-hitl+platform-capabilities.md", "section": "1, Hume EVI (current message names)"}, {"file": "design/W6-providers-endpoints.md", "section": "Decision 5, 3.14"}],
+        "code": ["core/realtime/hume/messages.rs:284-304", "plugin/builtin/mod.rs:1222-1223", "handlers/openai_realtime/facade.rs:115-120"]
+      }
+    },
+    {
+      "id": "infer",
+      "provider_id": "infer",
+      "display_name": "WaaV Infer native full-duplex model (built, not registered)",
+      "kind": "native_duplex",
+      "model_family": "Moshi-class interaction model",
+      "model_patterns": [".*"],
+      "default_model": null,
+      "registered_today": false,
+      "available_from_release": 5,
+      "ownership": {
+        "turn_owner": "model",
+        "voice_owner": "provider",
+        "voice_reproducible": {"value": "no"},
+        "text_output_possible": false,
+        "half_cascade_possible": false,
+        "reply_suppressible": false
+      },
+      "verbs": {
+        "user_text": {"support": "native", "wire": "user_text control frame", "probe_first": false},
+        "say_exact": {"support": "absent", "wire": "none", "probe_first": false},
+        "say_guided": {"support": "absent", "wire": "none (needs an injection channel)", "probe_first": false},
+        "add_context": {"support": "absent", "wire": "none (needs an injection channel)", "probe_first": false},
+        "request_reply": {"support": "absent", "wire": "none", "probe_first": false},
+        "stop_output": {"support": "emulated", "emulation": "drop_output", "wire": "clear control frame", "probe_first": false},
+        "hold_floor": {"support": "absent", "wire": "none", "probe_first": false}
+      },
+      "background": {"async_tools": "none", "delegation": "none", "tools_declarable": false, "speculative_tool_calls": false, "delivery_scheduling": false, "provisional_runs": null},
+      "native_mechanisms": {
+        "filler": {"kind": "intrinsic", "switch_off": "cannot"},
+        "backchannel": {"kind": "intrinsic", "switch_off": "cannot"},
+        "idle": {"kind": "intrinsic", "switch_off": "cannot"}
+      },
+      "owners": {
+        "filler": {"auto": "provider", "gateway": {"result": "provider", "how": "intrinsic to the model"}, "provider": {"result": "provider", "how": "intrinsic"}, "none": {"result": "provider", "how": "intrinsic"}},
+        "backchannel": {"auto": "provider", "gateway": {"result": "provider", "how": "intrinsic to the model"}, "provider": {"result": "provider", "how": "intrinsic"}, "none": {"result": "provider", "how": "intrinsic"}},
+        "idle": {"auto": "provider", "gateway": {"result": "provider", "how": "intrinsic to the model"}, "provider": {"result": "provider", "how": "intrinsic"}, "none": {"result": "provider", "how": "intrinsic"}}
+      },
+      "activity": {"user_speech_edges": "inside the model", "user_transcripts": "unknown", "responding_end": "unknown", "busy_signal": false},
+      "session_limits": {"max_session": null, "max_connection": null, "resume": "none", "mid_session_update": "re-sends session.config"},
+      "relay": {"mode": "whole_reworded", "depth": null, "description": "as regime C once an injection channel exists"},
+      "lifecycle": {"rules": []},
+      "truth": {"regime_truth": "monitored", "relay": "verified_paraphrase", "note": "regime D is regime C on Infer once an injection channel exists"},
+      "native_duplex_requires": ["an injection channel (Infer reports add_context and say_guided)", "W7's four criteria hold", "Release 5"],
+      "expected": {
+        "auto_with_truth_ack": {"refusal": "interaction_unsupported"},
+        "auto_without_truth_ack": {"refusal": "interaction_unsupported"},
+        "voice_owner_gateway": {"refusal": "interaction_unsupported", "warning": "voice_owner_unavailable"},
+        "truth_enforced": {"refusal": "truth_enforcement_unavailable"},
+        "forced": {"cascade": {"refusal": "interaction_unsupported"}, "provider_speech": {"refusal": "interaction_unsupported"}, "delegating": {"refusal": "interaction_unsupported"}},
+        "interaction_release": {"non_bud": 5, "bud": 5, "phone_and_rooms": 5}
+      },
+      "sources": {
+        "evidence": [{"file": "design/W6-providers-endpoints.md", "section": "3.3 (refused until an injection channel exists), 8 (Release 5), 9.1 challenge 3"}, {"file": "code/realtime-s2s.md", "section": "0 and 1.1 (Infer row)"}],
+        "code": ["core/realtime/infer/mod.rs:1-12", "core/realtime/mod.rs:227-241"]
+      }
+    }
+  ],
+  "coverage_exceptions": [
+    {"exception": "GPT-Live is refused on /v1/realtime (unsupported_vendor) and on the DAG realtime node (provider_not_turn_based)", "release_or_refusal": "refused; reachable on /realtime from Release 3 and through /ws interaction.speech.realtime from Release 4", "sign_off": "coverage exception (decisions section 6)", "source": "W6 Decision 7; cross-check-coverage.md finding 9"},
+    {"exception": "Speech-to-speech providers reach LiveKit rooms and SIP calls only through /ws interaction.speech.realtime", "release_or_refusal": "Release 4", "sign_off": "coverage exception (decisions section 6)", "source": "W6 Decision 13"},
+    {"exception": "Bud deployments reach GPT-Live only in Release 4 (native /realtime refuses Bud mode; /v1/realtime refuses GPT-Live)", "release_or_refusal": "Release 4", "sign_off": "coverage exception (decisions section 6)", "source": "W6 Decision 7"},
+    {"exception": "Bud deployments cannot reach Inworld, Ultravox or Yandex on /v1/realtime (neither relay nor facade lists them, and native /realtime refuses Bud mode); only /ws interaction.speech.realtime from Release 4, if budapp can name such a deployment", "release_or_refusal": "Release 4 at the earliest; revisited at the Release 3 exit review", "sign_off": "27", "source": "handlers/openai_realtime/upstream.rs:18; handlers/openai_realtime/facade.rs:90-121; INTEGRATION_DECISIONS.md Addendum A2 item 6 and A3"},
+    {"exception": "Hume EVI is refused (retiring 2026-11-13)", "release_or_refusal": "refused; removed from the registry in the first release after 2026-11-13", "sign_off": "8 (early standalone patch)", "source": "W6 Decision 5"},
+    {"exception": "WaaV Infer native duplex is refused until it has an injection channel", "release_or_refusal": "Release 5 (conditional on W7's four criteria)", "sign_off": "coverage exception (decisions section 6)", "source": "W6 3.3 and section 8"},
+    {"exception": "Audio-output DAGs, including any graph with a realtime node, are refused in interaction mode", "release_or_refusal": "refused (interaction_dag_audio_output); duplex DAG output listed under Later, owner W5", "sign_off": "coverage exception (decisions section 6)", "source": "W6 Decision 22; INTEGRATION_DECISIONS.md section 6"},
+    {"exception": "Regimes B and C run only for providers listed in the server-side speech.truth_ack; truth there is monitored, and regime C relays are a verified paraphrase", "release_or_refusal": "Release 3; default list empty", "sign_off": "7 and 10", "source": "W6 Decision 2 and Decision 15; INTEGRATION_DECISIONS.md section 5"},
+    {"exception": "Languages other than English: a session language without a pack runs with interaction off; a caller who switches to an unsupported language mid-call is stepped down to the plain conversation path only on /ws conversation and agent sessions, while raw /ws, the GA cascade and regimes B and C play a repeat-request template and continue in English (Hindi and code-switched packs in Release 4)", "release_or_refusal": "interaction_locale_unsupported / interaction_language_step_down", "sign_off": "18 (and 26 for the Hindi packs)", "source": "INTEGRATION_DECISIONS.md section 9 and Addendum C7.1"},
+    {"exception": "On SIP: agent backchannels off by default, sensitive values declined until DTMF (Release 4), no duck on a bare voice onset until echo cancellation (Release 2)", "release_or_refusal": "Releases 2 and 4", "sign_off": "19 (backchannel defaults), 12 (SIP and LiveKit in Release 1 only if the echo gates pass)", "source": "cross-check-coverage.md finding 9"},
+    {"exception": "Confirmations on providers without exact speech or a reproducible voice use the client UI, else a different-voice gateway clip (speech.voice_mismatch: confirmations_only), else the question is unanswerable by voice", "release_or_refusal": "Release 3", "sign_off": "no number (W6 section 10 item 2)", "source": "W6 3.5.1"},
+    {"exception": "/realtime clients cannot call the verbs directly; the gateway runtime drives them from Release 3", "release_or_refusal": "Later", "sign_off": "23", "source": "W6 Decision 21"}
+  ]
+}

@@ -64,15 +64,30 @@ pub mod scaffold;
 pub mod ultravox;
 pub mod yandex;
 
+/// SERVER-SET marker in `RealtimeConfig.provider_fixes`: interaction mode's half-cascade asks
+/// an OpenAI-family provider for text replies only (its own voice is off; WaaV's speaks).
+pub const HALF_CASCADE_TEXT: &str = "half_cascade_text";
+
+/// Whether an input-transcription model is OpenAI's default rather than one the client chose:
+/// the `/realtime` handler fills an unset model with [`DEFAULT_OPENAI_STT_MODEL`] (it was
+/// `whisper-1` before addendum B6), which a provider with transcription of its own does not know.
+///
+/// [`DEFAULT_OPENAI_STT_MODEL`]: crate::core::stt::openai::DEFAULT_OPENAI_STT_MODEL
+pub fn is_openai_default_transcription(model: &str) -> bool {
+    let model = model.trim();
+    model == "whisper-1" || model == crate::core::stt::openai::DEFAULT_OPENAI_STT_MODEL
+}
+
 pub use azure::{AzureProtocol, AzureRealtime};
 pub use base::{
     AudioOutputCallback, AwsStaticCredentials, BaseRealtime, BoxedRealtime, ConnectionState,
     FunctionCallCallback, FunctionCallRequest, FunctionDefinition, InputTranscriptionConfig,
     RealtimeAudioData, RealtimeConfig, RealtimeError, RealtimeErrorCallback, RealtimeFactory,
-    RealtimeResponseOverride, RealtimeResult, ReconnectionCallback, ReconnectionConfig,
-    ReconnectionEvent, ReplayConversationItem, ResponseDoneCallback, S2sEventCallback, SpeechEvent,
-    SpeechEventCallback, ToolDefinition, TranscriptCallback, TranscriptResult, TranscriptRole,
-    TurnDetectionConfig, clamp_truncate_ms, run_barge_in_sequence,
+    RealtimeResponseOverride, RealtimeResult, RealtimeVerb, ReconnectionCallback,
+    ReconnectionConfig, ReconnectionEvent, ReplayConversationItem, ResponseDoneCallback,
+    S2sEventCallback, SpeechEvent, SpeechEventCallback, ToolDefinition, TranscriptCallback,
+    TranscriptResult, TranscriptRole, TurnDetectionConfig, clamp_truncate_ms,
+    run_barge_in_sequence,
 };
 pub use deepgram::{DeepgramProtocol, DeepgramRealtime};
 pub use elevenlabs::{ElevenLabsProtocol, ElevenLabsRealtime};
@@ -134,12 +149,16 @@ impl RealtimeProvider {
             "azure" | "azure_openai" | "azure-openai" => Some(RealtimeProvider::Azure),
             "grok" | "xai" => Some(RealtimeProvider::Grok),
             "inworld" => Some(RealtimeProvider::Inworld),
-            "deepgram" | "deepgram_voice_agent" => Some(RealtimeProvider::Deepgram),
-            "elevenlabs" | "elevenlabs_convai" => Some(RealtimeProvider::ElevenLabs),
-            "gemini" | "gemini_live" | "google" => Some(RealtimeProvider::Gemini),
-            "ultravox" => Some(RealtimeProvider::Ultravox),
+            "deepgram" | "deepgram_voice_agent" | "deepgram-agent" => {
+                Some(RealtimeProvider::Deepgram)
+            }
+            "elevenlabs" | "elevenlabs_convai" | "elevenlabs-convai" | "11labs" => {
+                Some(RealtimeProvider::ElevenLabs)
+            }
+            "gemini" | "gemini_live" | "gemini-live" | "google" => Some(RealtimeProvider::Gemini),
+            "ultravox" | "fixie" => Some(RealtimeProvider::Ultravox),
             "nova_sonic" | "nova-sonic" | "bedrock" => Some(RealtimeProvider::NovaSonic),
-            "yandex" => Some(RealtimeProvider::Yandex),
+            "yandex" | "yandexgpt" | "yandex-cloud" => Some(RealtimeProvider::Yandex),
             _ => None,
         }
     }
@@ -332,6 +351,24 @@ mod tests {
             Some(RealtimeProvider::Hume)
         );
         assert_eq!(RealtimeProvider::parse("invalid"), None);
+        // Every alias the /realtime key lookup and the plugin registry take names its provider.
+        for (alias, canonical) in [
+            ("11labs", "elevenlabs"),
+            ("elevenlabs-convai", "elevenlabs"),
+            ("elevenlabs_convai", "elevenlabs"),
+            ("deepgram-agent", "deepgram"),
+            ("gemini-live", "gemini"),
+            ("fixie", "ultravox"),
+            ("yandexgpt", "yandex"),
+        ] {
+            assert_eq!(
+                RealtimeProvider::parse(alias)
+                    .map(|p| p.to_string())
+                    .as_deref(),
+                Some(canonical),
+                "{alias}"
+            );
+        }
     }
 
     #[test]

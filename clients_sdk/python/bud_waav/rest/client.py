@@ -8,6 +8,7 @@ from typing import Any, Optional
 import httpx
 
 from ..errors import APIError, ConnectionError, RateLimitError, TimeoutError
+from ..interaction import TaskView
 
 # REST connection-pool tuning (D7). httpx defaults are UNtuned (no explicit
 # limits / no keepalive expiry), so a memoized client still drops idle keepalive
@@ -804,6 +805,35 @@ class RestClient:
             "DELETE /recordings/{id} route.",
             status_code=501,
         )
+
+    # =========================================================================
+    # Interaction-mode tasks (protocol 1.1)
+    # =========================================================================
+
+    async def list_tasks(self, stream_id: Optional[str] = None) -> list[TaskView]:
+        """List the interaction-mode tasks of the caller's sessions (``GET /v1/tasks``).
+
+        The live tasks, and finished ones for ten minutes. ``stream_id`` limits the list to
+        one session; a request without an authenticated id (authentication off) gets only the
+        session it names, and an empty list without ``stream_id``.
+        """
+        params = {"stream_id": stream_id} if stream_id else None
+        result: dict[str, Any] = await self.get("/v1/tasks", params=params)
+        return [TaskView.model_validate(task) for task in result.get("tasks", [])]
+
+    async def get_task(self, task_id: str, stream_id: Optional[str] = None) -> TaskView:
+        """One interaction-mode task with its session and outcome (``GET /v1/tasks/{task_id}``).
+
+        ``result`` is ``None`` while the task runs, then its ``state``, ``summary`` and
+        ``effects``. Without an authenticated id the request must name the task's session
+        with ``stream_id``.
+
+        Raises:
+            APIError: 404 when there is no such task, or it is not the caller's.
+        """
+        params = {"stream_id": stream_id} if stream_id else None
+        result: dict[str, Any] = await self.get(f"/v1/tasks/{task_id}", params=params)
+        return TaskView.model_validate(result)
 
     # =========================================================================
     # DAG Template Methods

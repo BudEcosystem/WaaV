@@ -96,6 +96,27 @@ symbl = "symbl"      # Symbl.ai, in prose
 # Table cells cut off in the source notes.
 ful = "ful"
 transfor = "transfor"
+# Interaction-mode test phrases in other languages (gateway/src/core/interaction, the live
+# scripts under gateway/tests/live_testing/scripts) and the pieces typos sees in escaped accents.
+momento = "momento"
+Sie = "Sie"
+cancele = "cancele"
+alle = "alle"
+termine = "termine"
+posible = "posible"
+ein = "ein"
+Unser = "Unser"
+stopp = "stopp"
+hace = "hace"
+Eto = "Eto"
+curso = "curso"
+chambre = "chambre"
+calle = "calle"
+bord = "bord"
+als = "als"
+caf = "caf"          # caf\u{e9}, "café" with an escaped accent
+nto = "nto"          # Cu\u{e1}nto, "Cuánto" with an escaped accent
+onw = "onw"          # start of an ElevenLabs voice id in the provider matrix
 
 [default.extend-identifiers]
 # Provider / vendor / library identifiers that are not English words.

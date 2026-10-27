@@ -1,0 +1,101 @@
+{
+  "description": "Which schema definition each example must satisfy, and, where the example is a session, how regime_resolve.py resolves it (with the server configuration of server_example and W2's qualified-profile list below). Checked by `python3 regime_resolve.py --self-test` and `--validate`. Aligned with INTEGRATION_DECISIONS.md Addenda A to C: Release 1 runs the scripted front on every deployment (B1), caller memory and tenant personas are configured under front_model (A2 item 3, C5), the compute pool and the task catalog are server-only (A2 items 4 and 5), and Azure takes its model family from model_family (A2 item 10).",
+  "schema": "../interaction_config.schema.json",
+  "server_example": "server-interaction-and-front-model.json",
+  "qualified_profiles": [],
+  "qualified_profiles_note": "Stands for W2's pinned qualified_profiles.json, which ships with the gateway (not configuration). Empty, as forecast for Release 1 by the bake-off (no prompted model passes the front gates), so `auto` resolves to `scripted` even on a server that carries the LFM licence attestation.",
+  "examples": [
+    {
+      "file": "ws-conversation.json",
+      "def": "WsConfigEnvelope",
+      "valid": true,
+      "describes": "/ws conversation session (Release 1, cascade interaction on /ws): persona selected by id, whitelisted caller fields, W4 timing defaults stated explicitly, overlap events opted in; the front is the scripted rule router with the persona's phrase banks (Addendum B1)",
+      "interaction_pointer": "interaction",
+      "resolve": {"surface": "ws_conversation", "release": 1, "has_background": true, "bud_mode": false},
+      "expect": {"interaction": "on", "regime": "Cascade", "front": "local", "front_profile": "scripted", "filler_owner": "gateway", "backchannel_owner": "gateway", "truth": "enforced", "relay": "verbatim_streamed", "mid_call_unsupported_language": "steps down to the plain conversation path"}
+    },
+    {
+      "file": "ws-bud-agent-alias.json",
+      "def": "WsConfigEnvelope",
+      "valid": true,
+      "describes": "/ws Bud agent session reaching interaction mode in Release 1 through the operator default (interaction.defaults.agent) and the interaction-only alias support-interactive; the client sets only paths the agent's session_overrides list",
+      "interaction_pointer": "interaction",
+      "session_overrides": ["interaction.front.caller.verbosity", "interaction.events.floor"],
+      "resolve": {"surface": "ws_agent", "release": 1, "has_background": true, "bud_mode": true, "layers": ["server_default", "alias:support-interactive", "document:client"]},
+      "expect": {"sources": ["server_default", "alias:support-interactive", "client"], "interaction": "on", "regime": "Cascade", "front_profile": "scripted", "truth": "enforced"}
+    },
+    {
+      "file": "ws-raw-webhook.json",
+      "def": "WsConfigEnvelope",
+      "valid": true,
+      "describes": "raw /ws (speech-to-text and text-to-speech only) whose background is the operator's webhook backend crm, named not addressed (the URL is server-only under interaction.tasks; the server example sets allow_client_backends). Webhook backends arrive in Release 2. A caller who switches language mid-call hears a repeat-request template (Addendum C7.1).",
+      "interaction_pointer": "interaction",
+      "resolve": {"surface": "ws_raw", "release": 2, "has_background": true, "bud_mode": false},
+      "expect": {"interaction": "on", "regime": "Cascade", "front": "local", "truth": "enforced", "mid_call_unsupported_language": "repeat-request template, continues in English"}
+    },
+    {
+      "file": "realtime-gemini-38-live-delegating.json",
+      "def": "RealtimeConfigEnvelope",
+      "valid": true,
+      "describes": "/realtime (non-Bud) with Gemini 3.8 Live delegating to WaaV (Release 3): the provider is the front and speaks its own fillers; WaaV's LLM tier is the background; the operator lists gemini in speech.truth_ack",
+      "interaction_pointer": "interaction",
+      "resolve": {"surface": "realtime", "provider": "gemini", "model": "gemini-3.8-live", "release": 3, "has_background": true, "bud_mode": false},
+      "expect": {"interaction": "on", "regime": "Delegating", "front": "provider", "filler_owner": "provider", "truth": "monitored", "relay": "whole_reworded", "confirm_irreversible": "client_ui"}
+    },
+    {
+      "file": "realtime-azure-model-family.json",
+      "def": "RealtimeConfigEnvelope",
+      "valid": true,
+      "describes": "/realtime (non-Bud) on an Azure OpenAI Realtime deployment named contoso-rt-prod whose model family is given in model_family (Release 3, Addendum A2 item 10): the gpt-realtime-2.x preambles rule applies, so the provider keeps its fillers, and no model_family_unknown warning is sent",
+      "interaction_pointer": "interaction",
+      "resolve": {"surface": "realtime", "provider": "azure", "model": "contoso-rt-prod", "model_family": "gpt-realtime-2.1", "release": 3, "has_background": true, "bud_mode": false},
+      "expect": {"interaction": "on", "regime": "ProviderSpeech", "front": "narrator_templates", "filler_owner": "provider", "truth": "monitored", "warnings": []}
+    },
+    {
+      "file": "v1-realtime-cascade-agent-entry.json",
+      "def": "VoiceAgentEntryProjection",
+      "valid": true,
+      "describes": "/v1/realtime?model=prompt:support, the GA cascade (Release 2): budapp's VoiceAgentEntry.interaction selects the persona acme-support@3 and opts in to GA MCP approval mirrors; merged over the server's defaults.agent",
+      "interaction_pointer": "interaction",
+      "resolve": {"surface": "v1_realtime_cascade", "release": 2, "has_background": true, "bud_mode": true, "from_client": false, "layers": ["server_default", "document:agent_entry"]},
+      "expect": {"sources": ["server_default", "agent_entry"], "interaction": "on", "regime": "Cascade", "front_profile": "scripted", "truth": "enforced", "mid_call_unsupported_language": "repeat-request template, continues in English"}
+    },
+    {
+      "file": "v1-realtime-bud-interaction-update.json",
+      "def": "BudInteractionUpdate",
+      "valid": true,
+      "describes": "the mid-session change a GA client sends on the session above; only mid-session paths the agent's session_overrides list are applied",
+      "session_overrides": ["interaction.front.caller.verbosity", "interaction.front.caller.pace", "interaction.events.floor"]
+    },
+    {
+      "file": "server-interaction-and-front-model.json",
+      "def": "ServerConfigDocument",
+      "valid": true,
+      "describes": "the server YAML keys (as JSON): the one interaction key (switch, truth acknowledgement, operator defaults for Bud agents and realtime deployments, client override list, escape flags, the task catalog under interaction.tasks, the compute pool under interaction.duplex.compute) and W2's front_model key with the licence attestation lfm_open_eligible and the caller-memory and tenant-persona settings; plus the interaction-only alias"
+    },
+    {
+      "file": "invalid-licence-in-session.json",
+      "def": "WsConfigEnvelope",
+      "valid": false,
+      "describes": "a session that tries to attest the LFM licence itself: refused (interaction_override_refused); the attestation is server-only"
+    },
+    {
+      "file": "invalid-client-sets-truth-ack.json",
+      "def": "RealtimeConfigEnvelope",
+      "valid": false,
+      "describes": "a client that tries to acknowledge monitored truth for its own provider, set a server-side fallback voice and an unknown regime"
+    },
+    {
+      "file": "invalid-session-duplex-compute.json",
+      "def": "WsConfigEnvelope",
+      "valid": false,
+      "describes": "a session that tries to size W5's compute pool and to allow client push targets: both are server-only (interaction.duplex.compute and interaction.tasks.allow_client_push; Addendum A2 items 4 and 5), refused with interaction_override_refused"
+    },
+    {
+      "file": "invalid-memory-under-interaction-key.json",
+      "def": "ServerConfigDocument",
+      "valid": false,
+      "describes": "a server key that still configures caller memory and the persona route under interaction (the earlier W6 paths interaction.memory and interaction.personas_api); since Addendum A2 item 3 these settings are front_model.memory and front_model.tenant_personas"
+    }
+  ]
+}

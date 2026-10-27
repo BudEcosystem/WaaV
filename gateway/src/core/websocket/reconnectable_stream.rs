@@ -47,6 +47,10 @@ pub enum ReconnectOutcome {
     /// A fatal, non-retryable error (auth rejected, malformed config). Do NOT reconnect —
     /// retrying would just fail identically.
     Fatal(StreamError),
+    /// The provider refused this session's configuration (a language or setting it does not
+    /// take). Not retried, and not held against the shared breaker: it is the client's to
+    /// fix and says nothing about the provider or the credentials.
+    Refused(StreamError),
 }
 
 /// A transport-level streaming error surfaced to the supervisor.
@@ -123,6 +127,20 @@ pub enum SupervisorExit {
     Exhausted,
     /// The per-provider circuit breaker is open and stayed open past the deadline.
     CircuitOpen,
+    /// The provider refused the connection itself (a 4xx on the handshake: a bad key, a
+    /// model or setting it does not take). Not retried, and not held against the shared
+    /// breaker: it says nothing about the provider's health.
+    Refused,
+}
+
+/// Whether a dial error is the provider refusing the handshake with a client error
+/// (`HTTP error: 401 Unauthorized` and the like); 408 and 429 are worth a retry.
+pub fn is_dial_refusal(message: &str) -> bool {
+    message.split("HTTP error: ").skip(1).any(|rest| {
+        let code: String = rest.chars().take(3).collect();
+        code.parse::<u16>()
+            .is_ok_and(|c| (400..500).contains(&c) && c != 408 && c != 429)
+    })
 }
 
 /// The generic reconnect supervisor.
@@ -296,6 +314,14 @@ impl ReconnectableStream {
             // --- Connect ---------------------------------------------------------------
             let mut transport = match connect().await {
                 Ok(t) => t,
+                Err(e) if is_dial_refusal(&e.0) => {
+                    tracing::warn!(
+                        provider = %self.config.provider,
+                        error = %e,
+                        "the provider refused the connection; not retried"
+                    );
+                    return SupervisorExit::Refused;
+                }
                 Err(e) => {
                     tracing::warn!(
                         provider = %self.config.provider,
@@ -366,13 +392,23 @@ impl ReconnectableStream {
             // outcome or a client-intended disconnect — is NOT a quick-failure
             // signal (review wc71hewlx #0: counting normal short hangups took
             // healthy providers offline gateway-wide).
-            let intentional = matches!(outcome, ReconnectOutcome::Completed)
-                || self.intentional_disconnect.load(Ordering::Acquire);
+            let intentional = matches!(
+                outcome,
+                ReconnectOutcome::Completed | ReconnectOutcome::Refused(_)
+            ) || self.intentional_disconnect.load(Ordering::Acquire);
             self.breaker
                 .record_connection_closed(stable_for, intentional);
             match outcome {
                 ReconnectOutcome::Completed => {
                     return SupervisorExit::Completed;
+                }
+                ReconnectOutcome::Refused(e) => {
+                    tracing::warn!(
+                        provider = %self.config.provider,
+                        error = %e,
+                        "the provider refused the session; not reconnecting"
+                    );
+                    return SupervisorExit::Refused;
                 }
                 ReconnectOutcome::Fatal(e) => {
                     tracing::error!(
@@ -654,6 +690,74 @@ mod tests {
             1,
             "fatal -> connected once, no retry"
         );
+    }
+
+    /// A handshake the provider refuses with a client error (a bad key) is not retried and
+    /// leaves the shared breaker alone; a 429 or a network failure is still retried.
+    #[tokio::test]
+    async fn a_refused_handshake_is_not_retried_nor_held_against_the_breaker() {
+        assert!(is_dial_refusal(
+            "Failed to connect to Cartesia: HTTP error: 401 Unauthorized"
+        ));
+        assert!(is_dial_refusal("HTTP error: 403 Forbidden"));
+        assert!(!is_dial_refusal("HTTP error: 429 Too Many Requests"));
+        assert!(!is_dial_refusal("HTTP error: 503 Service Unavailable"));
+        assert!(!is_dial_refusal("connect timed out after 10s"));
+
+        let stream = ReconnectableStream::new(ReconnectableStreamConfig::new(
+            "mock",
+            no_jitter_aggressive(),
+        ));
+        let attempt = Arc::new(AtomicUsize::new(0));
+        let at = Arc::clone(&attempt);
+        let exit = stream
+            .run_with_sleep(
+                move || {
+                    let at = Arc::clone(&at);
+                    async move {
+                        at.fetch_add(1, Ordering::AcqRel);
+                        Err::<MockTransport, _>(StreamError::new(
+                            "Failed to connect: HTTP error: 401 Unauthorized",
+                        ))
+                    }
+                },
+                |_d| async {},
+            )
+            .await;
+        assert_eq!(exit, SupervisorExit::Refused);
+        assert_eq!(attempt.load(Ordering::Acquire), 1, "dialled once");
+        assert_eq!(stream.breaker().state(), CircuitState::Closed);
+    }
+
+    /// Three sessions the provider refuses for their configuration (ElevenLabs closes with
+    /// `invalid_request` on a language it does not take) do not make the shared breaker
+    /// credentials-fatal: the next session still dials.
+    #[tokio::test]
+    async fn refused_sessions_do_not_trip_the_shared_breaker() {
+        let breaker = Arc::new(CircuitBreaker::with_defaults());
+        for _ in 0..4 {
+            let stream = ReconnectableStream::with_breaker_and_governor(
+                ReconnectableStreamConfig::new("mock", no_jitter_aggressive()),
+                Arc::clone(&breaker),
+                ReconnectGovernor::new(4),
+            );
+            let exit = stream
+                .run_with_sleep(
+                    || async {
+                        Ok(MockTransport {
+                            restore_calls: Arc::new(AtomicUsize::new(0)),
+                            outcome: ReconnectOutcome::Refused(StreamError::new(
+                                "closed: invalid_request",
+                            )),
+                            restore_result: Ok(()),
+                        })
+                    },
+                    |_d| async {},
+                )
+                .await;
+            assert_eq!(exit, SupervisorExit::Refused);
+        }
+        assert_eq!(breaker.state(), CircuitState::Closed);
     }
 
     #[tokio::test]

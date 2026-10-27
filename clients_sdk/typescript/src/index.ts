@@ -305,6 +305,46 @@ export * from './pipelines/index.js';
 
 // Main Client
 export { BudClient, createBudClient, DEFAULT_GATEWAY_URL, GATEWAY_URL_ENV } from './bud.js';
+
+// Interaction mode (protocol 1.1)
+export {
+  INTERACTION_PROTOCOL_VERSION,
+  INTERACTION_EVENT_TYPES,
+  isInteractionEvent,
+} from './types/interaction.js';
+export type {
+  InteractionConfig,
+  InteractionTool,
+  InteractionEcho,
+  InteractionEvent,
+  InteractionEventType,
+  TaskState,
+  TaskEffects,
+  TaskCreatedEvent,
+  TaskProgressEvent,
+  TaskQuestionEvent,
+  TaskAnswerReceivedEvent,
+  TaskResultEvent,
+  TaskOutputEvent,
+  TaskCancelledEvent,
+  FloorStateEvent,
+  AudioSegmentEvent,
+  AgentAudioStoppedEvent,
+  InteractionUpdatedEvent,
+  FailureNote,
+  PendingTask,
+  SessionFailedEvent,
+  AssistantTranscriptEvent,
+  UnverifiedClaimEvent,
+  TaskAnswerOutcome,
+  TaskAnswerMessage,
+  TaskCancelMessage,
+  TaskSeenMessage,
+  InteractionUpdateMessage,
+  PlaybackPositionMessage,
+  InteractionClientMessage,
+  TaskView,
+} from './types/interaction.js';
 export type { BudClientConfig } from './bud.js';
 
 // Agent (flagship conversation loop) — re-export for direct import.

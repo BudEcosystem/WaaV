@@ -18,13 +18,16 @@
 //!
 //! Docs: <https://elevenlabs.io/docs/conversational-ai/api-reference/conversational-ai/websocket>
 
+use std::collections::HashSet;
+use std::sync::Mutex;
+
 use base64::prelude::*;
 use bytes::Bytes;
 use serde_json::{Value, json};
 
 use crate::core::realtime::base::{
     FunctionCallRequest, RealtimeConfig, RealtimeError, RealtimeResponseOverride, RealtimeResult,
-    TranscriptRole,
+    RealtimeVerb, TranscriptRole,
 };
 use crate::core::realtime::scaffold::{
     ConnectSpec, Inbound, OutFrame, ProtocolCaps, RealtimeProtocol, S2sEvent,
@@ -39,6 +42,8 @@ pub(crate) const ELEVENLABS_CONVAI_URL: &str = "wss://api.elevenlabs.io/v1/conva
 const OUTPUT_BYTES_PER_MS: u64 = 32;
 /// Output sample rate stamped onto delivered audio.
 const OUTPUT_SAMPLE_RATE: u32 = 16_000;
+/// The one audio format this protocol speaks, both ways.
+const AUDIO_FORMAT: &str = "pcm_16000";
 
 /// The ElevenLabs ConvAI protocol. Stateless: the only provider-specific config
 /// the wire mappings need is the pre-created agent id (`cfg.model`) and the api
@@ -48,6 +53,20 @@ pub struct ElevenLabsProtocol {
     /// The pre-created ConvAI agent id (the "model"); embedded in the connect
     /// query. Validated non-empty at `from_config`.
     agent_id: String,
+    /// Provider fix `elevenlabs_server_events`: the server events today's wire ignores are
+    /// read (`agent_response_complete`, `client_error`, the metadata's audio formats, a tool
+    /// call's `expects_response`).
+    server_events: bool,
+    /// Provider fix `elevenlabs_voice_override`: the session's voice is `tts.voice_id`.
+    voice_override: bool,
+    /// Provider fix `setup_once`: a mid-session change is refused (the initiation data is
+    /// the conversation's first message only).
+    setup_once: bool,
+    /// The session's functions at start: none is sent on this socket (client tools live in
+    /// the agent's configuration), so they are named in a warning.
+    tools: Vec<String>,
+    /// The tool calls whose `expects_response` was `false`: no result is sent for them.
+    no_response: Mutex<HashSet<String>>,
 }
 
 impl ElevenLabsProtocol {
@@ -63,6 +82,43 @@ impl ElevenLabsProtocol {
             .map(str::trim)
             .unwrap_or("")
             .to_string()
+    }
+}
+
+impl ElevenLabsProtocol {
+    /// Fix `elevenlabs_server_events`: what `conversation_initiation_metadata` says about this
+    /// session. The agent's `agent_output_audio_format` / `user_input_audio_format` (one of
+    /// `pcm_8000` … `pcm_48000`, `ulaw_8000`) must be `pcm_16000`, the only format this
+    /// protocol speaks: any other is a refusal naming the format (no re-dial). The session's
+    /// functions are not sent on this socket (a client tool is made in the agent), so they are
+    /// named in a warning.
+    fn metadata_findings(&self, event: Option<&Value>) -> Vec<S2sEvent> {
+        let format = |k: &str| event.and_then(|e| e.get(k)).and_then(Value::as_str);
+        let mut out = Vec::new();
+        for (field, side) in [
+            ("agent_output_audio_format", "output"),
+            ("user_input_audio_format", "input"),
+        ] {
+            if let Some(found) = format(field).filter(|f| *f != AUDIO_FORMAT) {
+                out.push(S2sEvent::Error(RealtimeError::Refused(format!(
+                    "the ElevenLabs agent's {side} audio is {found}; the gateway speaks \
+                     {AUDIO_FORMAT} with ElevenLabs agents: set the agent's {side} format to \
+                     PCM 16000 Hz"
+                ))));
+                return out;
+            }
+        }
+        if !self.tools.is_empty() {
+            out.push(S2sEvent::Error(RealtimeError::ProviderWarning {
+                code: Some("tools_not_sent".to_string()),
+                message: format!(
+                    "ElevenLabs agents take no functions from the session: {} must be client \
+                     tools of the agent (same names) to be called",
+                    self.tools.join(", ")
+                ),
+            }));
+        }
+        out
     }
 }
 
@@ -83,7 +139,19 @@ impl RealtimeProtocol for ElevenLabsProtocol {
                 "ElevenLabs ConvAI requires an agent_id in `model`".to_string(),
             ));
         }
-        Ok(Self { agent_id })
+        Ok(Self {
+            agent_id,
+            server_events: cfg.fix("elevenlabs_server_events"),
+            voice_override: cfg.fix("elevenlabs_voice_override"),
+            setup_once: cfg.fix("setup_once"),
+            tools: cfg
+                .tools
+                .iter()
+                .flatten()
+                .map(|t| t.function.name.clone())
+                .collect(),
+            no_response: Mutex::new(HashSet::new()),
+        })
     }
 
     fn provider_id(&self) -> &'static str {
@@ -139,14 +207,52 @@ impl RealtimeProtocol for ElevenLabsProtocol {
         // emit `conversation_initiation_client_data` when we actually have an
         // instructions override (skip-if-none discipline) — an empty vec means
         // "use the agent's config verbatim".
-        match cfg.instructions.as_deref() {
-            Some(instr) if !instr.is_empty() => vec![json!({
-                "type": "conversation_initiation_client_data",
-                "conversation_config_override": {
-                    "agent": { "prompt": { "prompt": instr } },
-                },
-            })],
-            _ => Vec::new(),
+        let mut overrides = serde_json::Map::new();
+        if let Some(instr) = cfg.instructions.as_deref().filter(|i| !i.is_empty()) {
+            overrides.insert("agent".into(), json!({ "prompt": { "prompt": instr } }));
+        }
+        // Fix `elevenlabs_voice_override`: `conversation_config_override.tts.voice_id`. The
+        // agent must allow the override ("an error will be thrown if an override is provided
+        // when that field does not have overrides enabled").
+        if self.voice_override
+            && let Some(voice) = cfg
+                .voice
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+        {
+            overrides.insert("tts".into(), json!({ "voice_id": voice }));
+        }
+        if overrides.is_empty() {
+            return Vec::new();
+        }
+        vec![json!({
+            "type": "conversation_initiation_client_data",
+            "conversation_config_override": Value::Object(overrides),
+        })]
+    }
+
+    /// Fix `setup_once`: `conversation_initiation_client_data` starts the conversation ("where
+    /// the conversation is started, pass the overrides"); no message changes it afterwards.
+    fn session_update(
+        &self,
+        _old: &RealtimeConfig,
+        new: &RealtimeConfig,
+    ) -> Option<Vec<Self::Wire>> {
+        (!self.setup_once).then(|| self.build_session_config(new, None))
+    }
+
+    /// `contextual_update` {text}: "Context text to inject into the conversation without
+    /// interrupting"; a guided line is a `user_message` with the note (the agent answers it,
+    /// as the capability data's `user_turn_framing`). No wire speaks exact words or stops the
+    /// agent (<https://elevenlabs.io/docs/agents-platform/api-reference/agents-platform/websocket>).
+    fn verb(&self, verb: &RealtimeVerb<'_>) -> Option<Vec<Self::Wire>> {
+        match *verb {
+            RealtimeVerb::AddContext(text) => {
+                Some(vec![json!({ "type": "contextual_update", "text": text })])
+            }
+            RealtimeVerb::SayGuided(guidance) => Some(self.send_text(guidance)),
+            RealtimeVerb::SayExact(_) | RealtimeVerb::StopOutput => None,
         }
     }
 
@@ -167,13 +273,19 @@ impl RealtimeProtocol for ElevenLabsProtocol {
             // Session ack: carries the ConvAI conversation_id.
             // `{"type":"conversation_initiation_metadata",
             //   "conversation_initiation_metadata_event":{"conversation_id":"…",…}}`
-            "conversation_initiation_metadata" => vec![S2sEvent::SessionReady {
-                session_id: value
-                    .get("conversation_initiation_metadata_event")
-                    .and_then(|e| e.get("conversation_id"))
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-            }],
+            "conversation_initiation_metadata" => {
+                let event = value.get("conversation_initiation_metadata_event");
+                let mut out = vec![S2sEvent::SessionReady {
+                    session_id: event
+                        .and_then(|e| e.get("conversation_id"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                }];
+                if self.server_events {
+                    out.extend(self.metadata_findings(event));
+                }
+                out
+            }
             // FINAL user transcript:
             // `{"type":"user_transcript",
             //   "user_transcription_event":{"user_transcript":"…"}}`
@@ -245,6 +357,28 @@ impl RealtimeProtocol for ElevenLabsProtocol {
             // A correction supersedes a prior agent_response. Ignore to avoid
             // double-logging the assistant turn (the original already logged).
             "agent_response_correction" => vec![S2sEvent::Ignore],
+            // Fix `elevenlabs_server_events`: the agent's response is complete.
+            // `{"type":"agent_response_complete","agent_response_complete_event":{"event_id":N}}`
+            "agent_response_complete" if self.server_events => vec![S2sEvent::ResponseDone {
+                response_id: value
+                    .get("agent_response_complete_event")
+                    .and_then(|e| e.get("event_id"))
+                    .map(|id| id.as_str().map_or_else(|| id.to_string(), str::to_string))
+                    .unwrap_or_default(),
+            }],
+            // Fix `elevenlabs_server_events`: a vendor error reaches the client.
+            // `{"type":"client_error","error_event":{"code":N,"error_name":"…","message":"…"}}`
+            "client_error" if self.server_events => {
+                let event = value.get("error_event");
+                let field = |k: &str| event.and_then(|e| e.get(k)).and_then(Value::as_str);
+                let name = field("error_name").unwrap_or("client_error");
+                vec![S2sEvent::Error(RealtimeError::ProviderError(
+                    match field("message") {
+                        Some(message) => format!("{name}: {message}"),
+                        None => name.to_string(),
+                    },
+                ))]
+            }
             // Client-side tool call:
             // `{"type":"client_tool_call",
             //   "client_tool_call":{"tool_name","tool_call_id","parameters"}}`
@@ -266,6 +400,14 @@ impl RealtimeProtocol for ElevenLabsProtocol {
                     .and_then(|c| c.get("parameters"))
                     .map(|p| p.to_string())
                     .unwrap_or_else(|| "{}".to_string());
+                // Fix `elevenlabs_server_events`: "Whether the server expects a
+                // ClientToolResult response" - none is sent when it does not.
+                if self.server_events
+                    && call.and_then(|c| c.get("expects_response")) == Some(&Value::Bool(false))
+                    && let Ok(mut ids) = self.no_response.lock()
+                {
+                    ids.insert(tool_call_id.clone());
+                }
                 vec![S2sEvent::FunctionCall(FunctionCallRequest {
                     call_id: tool_call_id,
                     name: tool_name,
@@ -308,7 +450,14 @@ impl RealtimeProtocol for ElevenLabsProtocol {
 
     fn format_tool_result(&self, call_id: &str, result: &str) -> Vec<Self::Wire> {
         // Tool result → `client_tool_result` (per docs): echo the tool_call_id,
-        // carry the result, and flag success.
+        // carry the result, and flag success. Nothing for a call that expects no result.
+        if self
+            .no_response
+            .lock()
+            .is_ok_and(|mut ids| ids.remove(call_id))
+        {
+            return Vec::new();
+        }
         vec![json!({
             "type": "client_tool_result",
             "tool_call_id": call_id,
@@ -676,5 +825,172 @@ mod tests {
         // Default-empty truncate / input-buffer / replay (provider lacks them).
         assert!(p.truncate("x", 1).is_empty());
         assert!(p.clear_input_buffer().is_empty());
+    }
+
+    fn fixed(fixes: &[&str], cfg: RealtimeConfig) -> ElevenLabsProtocol {
+        proto(&RealtimeConfig {
+            provider_fixes: fixes.iter().map(|f| (*f).to_string()).collect(),
+            ..cfg
+        })
+    }
+
+    const METADATA_16K: &str = r#"{"type":"conversation_initiation_metadata",
+        "conversation_initiation_metadata_event":{"conversation_id":"conv_1",
+        "agent_output_audio_format":"pcm_16000","user_input_audio_format":"pcm_16000"}}"#;
+
+    /// `elevenlabs_server_events`: an agent whose audio is not `pcm_16000` is refused with the
+    /// format named (the driver never re-dials a refusal); `pcm_16000` both ways is ready.
+    /// Off: today's ready alone.
+    #[test]
+    fn the_server_events_fix_refuses_an_agent_in_another_audio_format() {
+        let p = fixed(&["elevenlabs_server_events"], base_cfg());
+        let raw = METADATA_16K.replace(
+            r#""agent_output_audio_format":"pcm_16000""#,
+            r#""agent_output_audio_format":"pcm_44100""#,
+        );
+        match p.map_server_event(Inbound::Text(&raw)).as_slice() {
+            [
+                S2sEvent::SessionReady { .. },
+                S2sEvent::Error(RealtimeError::Refused(why)),
+            ] => {
+                assert!(why.contains("pcm_44100"), "{why}")
+            }
+            other => panic!("expected ready then a refusal, got {other:?}"),
+        }
+        assert!(matches!(
+            p.map_server_event(Inbound::Text(METADATA_16K)).as_slice(),
+            [S2sEvent::SessionReady { .. }]
+        ));
+        assert!(matches!(
+            proto(&base_cfg())
+                .map_server_event(Inbound::Text(&raw))
+                .as_slice(),
+            [S2sEvent::SessionReady { .. }]
+        ));
+    }
+
+    /// `elevenlabs_server_events`: `agent_response_complete` ends the response, `client_error`
+    /// is an error; off, both are ignored.
+    #[test]
+    fn the_server_events_fix_reads_response_complete_and_client_error() {
+        let p = fixed(&["elevenlabs_server_events"], base_cfg());
+        let done =
+            r#"{"type":"agent_response_complete","agent_response_complete_event":{"event_id":7}}"#;
+        assert!(matches!(
+            p.map_server_event(Inbound::Text(done)).as_slice(),
+            [S2sEvent::ResponseDone { response_id }] if response_id == "7"
+        ));
+        let error = r#"{"type":"client_error","error_event":{"code":1008,"error_name":"override_not_allowed","message":"tts.voice_id cannot be overridden"}}"#;
+        match p.map_server_event(Inbound::Text(error)).as_slice() {
+            [S2sEvent::Error(RealtimeError::ProviderError(m))] => {
+                assert_eq!(m, "override_not_allowed: tts.voice_id cannot be overridden")
+            }
+            other => panic!("expected an error, got {other:?}"),
+        }
+        let off = proto(&base_cfg());
+        assert!(matches!(
+            off.map_server_event(Inbound::Text(done)).as_slice(),
+            [S2sEvent::Ignore]
+        ));
+        assert!(matches!(
+            off.map_server_event(Inbound::Text(error)).as_slice(),
+            [S2sEvent::Ignore]
+        ));
+    }
+
+    /// `elevenlabs_server_events`: a call with `expects_response: false` gets no result; the
+    /// session's functions, never sent on this socket, are named in a warning at start.
+    #[test]
+    fn the_server_events_fix_honours_expects_response_and_names_the_tools() {
+        use crate::core::realtime::base::{FunctionDefinition, ToolDefinition};
+        let cfg = RealtimeConfig {
+            tools: Some(vec![ToolDefinition {
+                tool_type: "function".into(),
+                function: FunctionDefinition {
+                    name: "waav_delegate".into(),
+                    description: None,
+                    parameters: None,
+                },
+            }]),
+            ..base_cfg()
+        };
+        let p = fixed(&["elevenlabs_server_events"], cfg);
+        let call = r#"{"type":"client_tool_call","client_tool_call":{"tool_name":"log_event","tool_call_id":"t1","parameters":{},"event_id":3,"expects_response":false}}"#;
+        assert!(matches!(
+            p.map_server_event(Inbound::Text(call)).as_slice(),
+            [S2sEvent::FunctionCall(_)]
+        ));
+        assert!(p.format_tool_result("t1", "ok").is_empty());
+        assert_eq!(
+            p.format_tool_result("t2", "ok").len(),
+            1,
+            "another call is answered"
+        );
+        match p.map_server_event(Inbound::Text(METADATA_16K)).as_slice() {
+            [
+                S2sEvent::SessionReady { .. },
+                S2sEvent::Error(RealtimeError::ProviderWarning { message, .. }),
+            ] => assert!(message.contains("waav_delegate"), "{message}"),
+            other => panic!("expected ready then a warning, got {other:?}"),
+        }
+    }
+
+    /// `elevenlabs_voice_override`: the voice is `conversation_config_override.tts.voice_id`.
+    #[test]
+    fn the_voice_override_fix_sends_the_voice() {
+        let cfg = RealtimeConfig {
+            voice: Some("21m00Tcm4TlvDq8ikWAM".into()),
+            ..base_cfg()
+        };
+        let p = fixed(&["elevenlabs_voice_override"], cfg.clone());
+        assert_eq!(
+            p.build_session_config(&cfg, None),
+            vec![json!({"type": "conversation_initiation_client_data",
+                "conversation_config_override": {"tts": {"voice_id": "21m00Tcm4TlvDq8ikWAM"}}})]
+        );
+        assert!(
+            proto(&cfg).build_session_config(&cfg, None).is_empty(),
+            "today: none"
+        );
+    }
+
+    /// `setup_once`: a mid-session change is refused; off, the initiation data again.
+    #[test]
+    fn setup_once_refuses_a_mid_session_change() {
+        let new = RealtimeConfig {
+            instructions: Some("Be brief.".into()),
+            ..base_cfg()
+        };
+        assert!(
+            fixed(&["setup_once"], base_cfg())
+                .session_update(&base_cfg(), &new)
+                .is_none()
+        );
+        assert_eq!(
+            proto(&base_cfg())
+                .session_update(&base_cfg(), &new)
+                .map(|w| w.len()),
+            Some(1)
+        );
+    }
+
+    /// The verbs: `contextual_update` for context, a `user_message` for a guided line.
+    #[test]
+    fn the_verbs_are_contextual_update_and_user_message() {
+        let p = proto(&base_cfg());
+        assert_eq!(
+            p.verb(&RealtimeVerb::AddContext("The caller is a premium member.")),
+            Some(vec![
+                json!({"type": "contextual_update", "text": "The caller is a premium member."})
+            ])
+        );
+        assert_eq!(
+            p.verb(&RealtimeVerb::SayGuided("Greet the caller.")),
+            Some(vec![
+                json!({"type": "user_message", "text": "Greet the caller."})
+            ])
+        );
+        assert!(p.verb(&RealtimeVerb::SayExact("x")).is_none());
+        assert!(p.verb(&RealtimeVerb::StopOutput).is_none());
     }
 }

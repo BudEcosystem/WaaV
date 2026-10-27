@@ -51,7 +51,7 @@ pub mod yandex;
 // Re-export public types and traits
 pub use base::{
     BaseSTT, STTConfig, STTConnectionState, STTError, STTErrorCallback, STTFactory, STTHelper,
-    STTResult, STTResultCallback, STTStats, SpeakerInfo, WordTiming,
+    STTResult, STTResultCallback, STTStats, SpeakerInfo, SttTurnEvent, WordTiming,
 };
 
 // Re-export Alibaba Cloud DashScope implementation

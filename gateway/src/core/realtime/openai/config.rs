@@ -78,6 +78,20 @@ impl Default for OpenAIRealtimeModel {
     }
 }
 
+/// The model an empty id takes under the provider fix `openai_realtime_default` (off until the
+/// plan's probe of OpenAI's models): `gpt-realtime` shuts down on 2027-01-20 and the capability
+/// data names `gpt-realtime-2.1` its replacement.
+pub const OPENAI_REALTIME_DEFAULT_SUCCESSOR: &str = "gpt-realtime-2.1";
+
+/// The id an empty model sends: today's default, or its successor when the fix is in force.
+pub fn openai_realtime_default(moved: bool) -> &'static str {
+    if moved {
+        OPENAI_REALTIME_DEFAULT_SUCCESSOR
+    } else {
+        "gpt-realtime"
+    }
+}
+
 impl std::fmt::Display for OpenAIRealtimeModel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())

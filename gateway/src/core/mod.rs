@@ -15,6 +15,9 @@ pub mod credentials;
 pub mod deployment_policy;
 pub mod emotion;
 pub mod flow;
+/// Interaction mode: the duplex voice agent of a `/ws` session (floor, acknowledgements,
+/// background tasks, barge-in). Off unless the server switch is on and a session asks for it.
+pub mod interaction;
 /// Unified language system (P2): one canonical region-qualified BCP-47 token per request, mapped to
 /// each provider's native notation. Mirrors the [`emotion`] mapper chassis. Registered right after
 /// `emotion` per the standardization plan.

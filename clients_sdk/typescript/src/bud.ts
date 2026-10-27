@@ -561,6 +561,20 @@ export class BudClient {
   }
 
   /**
+   * Interaction-mode tasks of the caller's sessions (`GET /v1/tasks`).
+   */
+  async listTasks(streamId?: string) {
+    return this.restClient.listTasks(streamId);
+  }
+
+  /**
+   * One interaction-mode task with its outcome (`GET /v1/tasks/{task_id}`).
+   */
+  async getTask(taskId: string, streamId?: string) {
+    return this.restClient.getTask(taskId, streamId);
+  }
+
+  /**
    * Voice-cloning helpers (P4): `bud.voices.clone({...})` + poll-until-ready.
    *
    * ```ts

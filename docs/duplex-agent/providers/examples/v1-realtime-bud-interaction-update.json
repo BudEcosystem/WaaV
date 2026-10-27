@@ -1,0 +1,8 @@
+{
+  "type": "bud.interaction.update",
+  "event_id": "evt_client_0007",
+  "interaction": {
+    "front": {"caller": {"verbosity": "detailed"}},
+    "events": {"floor": false}
+  }
+}

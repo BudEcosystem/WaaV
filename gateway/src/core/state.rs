@@ -493,9 +493,49 @@ pub fn tts_max_concurrent_per_vendor() -> usize {
         .unwrap_or(64)
 }
 
+/// `WAAV_TTS_ACCOUNT_CONCURRENCY` (e.g. `cartesia=2,elevenlabs=4`): the most synthesis requests
+/// the vendor ACCOUNT takes at once, across every session and route of this replica. A request
+/// over it waits its turn ([`tts_account_permits`]) instead of drawing the vendor's 429. Unset
+/// vendors are not limited here.
+pub fn parse_tts_account_concurrency(raw: &str) -> HashMap<String, usize> {
+    raw.split(',')
+        .filter_map(|pair| {
+            let (vendor, n) = pair.split_once('=')?;
+            let n = n.trim().parse::<usize>().ok().filter(|n| *n > 0)?;
+            Some((vendor.trim().to_ascii_lowercase(), n))
+        })
+        .collect()
+}
+
+/// The shared permits of a vendor account limited by `WAAV_TTS_ACCOUNT_CONCURRENCY`, if any.
+pub fn tts_account_permits(provider: &str) -> Option<Arc<tokio::sync::Semaphore>> {
+    static PERMITS: std::sync::OnceLock<HashMap<String, Arc<tokio::sync::Semaphore>>> =
+        std::sync::OnceLock::new();
+    PERMITS
+        .get_or_init(|| {
+            parse_tts_account_concurrency(
+                &std::env::var("WAAV_TTS_ACCOUNT_CONCURRENCY").unwrap_or_default(),
+            )
+            .into_iter()
+            .map(|(vendor, n)| (vendor, Arc::new(tokio::sync::Semaphore::new(n))))
+            .collect()
+        })
+        .get(&provider.trim().to_ascii_lowercase())
+        .cloned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_account_concurrency_list_names_each_vendors_limit() {
+        let limits = parse_tts_account_concurrency(" Cartesia=2, elevenlabs = 4,bad,zero=0,x=y");
+        assert_eq!(limits.len(), 2);
+        assert_eq!(limits["cartesia"], 2);
+        assert_eq!(limits["elevenlabs"], 4);
+        assert!(parse_tts_account_concurrency("").is_empty());
+    }
 
     fn cleanup_runtime_env() {
         set_test_env_override("WAAV_EAGER_WARMUP", None);

@@ -329,6 +329,16 @@ pub enum S2sEvent {
     GoAway {
         time_left: Option<std::time::Duration>,
     },
+    /// The vendor withdrew function calls it made (Gemini `toolCallCancellation`): their
+    /// results are no longer wanted. Emitted only with the provider fix that maps it.
+    FunctionCallCancelled { call_ids: Vec<String> },
+    /// Whether the vendor is still working although its turn may be complete (Gemini
+    /// `serverContent.interactionStatus`). Emitted only with the provider fix that maps it.
+    ProviderBusy(bool),
+    /// The vendor ignored the gateway's injected line because it is in a reply of its own
+    /// (Deepgram `Warning` `INJECT_AGENT_MESSAGE_DURING_AGENT_SPEECH`). Follows the warning's
+    /// `Error`, which the client gets as before.
+    InjectionRefused,
     /// An outbound frame the driver must send in response to an inbound event
     /// (e.g. ElevenLabs ConvAI ping→pong); the dispatcher routes it to the
     /// transport instead of a callback.

@@ -1555,6 +1555,7 @@ impl RealtimeProviderNode {
         // override provider/model/api_key authoritatively. See
         // [`build_node_realtime_config`](Self::build_node_realtime_config).
         let realtime_config = self.build_node_realtime_config();
+        let model = realtime_config.model.clone();
         let realtime = registry
             .create_realtime(&self.provider, realtime_config)
             .map_err(|e| DAGError::RealtimeProviderError {
@@ -1584,7 +1585,7 @@ impl RealtimeProviderNode {
             if let Some(reg) = ctx.get_resource_as::<crate::core::resilience::ResilienceRegistry>(
                 &realtime_resilience_key(),
             ) {
-                provider.set_resilience(reg.handles_for(&self.provider));
+                provider.set_resilience(reg.realtime_handles(&self.provider, &model));
             }
 
             // Audio → the cascade sink: downstream cannot tell S2S from TTS.
@@ -1805,9 +1806,16 @@ impl DAGNode for RealtimeProviderNode {
 
         // Create error callback
         let error_sender = error_tx.clone();
+        let node_id = self.id.clone();
         let error_callback: RealtimeErrorCallback = Arc::new(move |error: RealtimeError| {
             let tx = error_sender.clone();
+            let node_id = node_id.clone();
             Box::pin(async move {
+                // A provider's warning is not an error: the node goes on.
+                if let RealtimeError::ProviderWarning { code, message } = &error {
+                    warn!(node_id = %node_id, ?code, %message, "realtime provider warning");
+                    return;
+                }
                 if tx.send(error).await.is_err() {
                     trace!(
                         "Realtime error callback: channel closed, likely node execution completed"
@@ -2617,9 +2625,12 @@ mod session_realtime_tests {
     /// Mock S2S whose `create_response` drives the LEGACY request-scoped path's
     /// channel collection (a final transcript completes a text turn) and counts
     /// connects to prove per-turn reconnect.
-    struct MockS2SLegacy {
+    pub(super) struct MockS2SLegacy {
         transcript_cb: Option<RtTranscriptCb>,
         turn: usize,
+        /// Warn (a Deepgram-style `Warning`) before each answer.
+        pub(super) warn_first: bool,
+        error_cb: Option<crate::core::realtime::RealtimeErrorCallback>,
     }
 
     #[async_trait::async_trait]
@@ -2628,10 +2639,15 @@ mod session_realtime_tests {
             Ok(Self {
                 transcript_cb: None,
                 turn: 0,
+                warn_first: false,
+                error_cb: None,
             })
         }
         async fn connect(&mut self) -> RealtimeResult<()> {
-            LEGACY_CONNECTS.fetch_add(1, Ordering::SeqCst);
+            // Only the legacy-path test counts: the warning test's mock runs beside it.
+            if !self.warn_first {
+                LEGACY_CONNECTS.fetch_add(1, Ordering::SeqCst);
+            }
             Ok(())
         }
         async fn disconnect(&mut self) -> RealtimeResult<()> {
@@ -2651,6 +2667,14 @@ mod session_realtime_tests {
         }
         async fn create_response(&mut self) -> RealtimeResult<()> {
             self.turn += 1;
+            if let (true, Some(cb)) = (self.warn_first, &self.error_cb) {
+                cb(RealtimeError::ProviderWarning {
+                    code: Some("FAILED_TO_THINK".into()),
+                    message: "slow think provider".into(),
+                })
+                .await;
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
             if let Some(cb) = &self.transcript_cb {
                 cb(crate::core::realtime::TranscriptResult {
                     text: format!("legacy {}", self.turn),
@@ -2680,8 +2704,9 @@ mod session_realtime_tests {
         }
         fn on_error(
             &mut self,
-            _c: crate::core::realtime::RealtimeErrorCallback,
+            c: crate::core::realtime::RealtimeErrorCallback,
         ) -> RealtimeResult<()> {
+            self.error_cb = Some(c);
             Ok(())
         }
         fn on_function_call(
@@ -2776,6 +2801,46 @@ mod session_realtime_tests {
             LEGACY_CONNECTS.load(Ordering::SeqCst),
             2,
             "legacy fallback connects PER turn (no session-map resource → no persistence)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod realtime_warning_tests {
+    use super::session_realtime_tests::MockS2SLegacy;
+    use super::*;
+    use crate::core::realtime::BaseRealtime;
+
+    /// A provider's warning (Deepgram `Warning`) does not fail the node: the turn's answer
+    /// still comes back.
+    #[tokio::test]
+    async fn a_provider_warning_does_not_fail_the_realtime_node() {
+        crate::plugin::global_registry().register_realtime(
+            "mock-s2s-warn",
+            Arc::new(|c| {
+                let mut m = MockS2SLegacy::new(c)?;
+                m.warn_first = true;
+                Ok(Box::new(m) as Box<dyn BaseRealtime>)
+            }),
+            crate::plugin::ProviderMetadata {
+                name: "mock-s2s-warn".into(),
+                display_name: "Mock S2S Warn".into(),
+                description: "test".into(),
+                ..Default::default()
+            },
+        );
+        let (output_tx, _output_rx) =
+            tokio::sync::mpsc::channel::<crate::dag::context::DagOutput>(16);
+        let mut ctx = DAGContext::new("warn-rt".to_string());
+        ctx.set_output_tx(output_tx);
+        let node = RealtimeProviderNode::new("rt-warn", "mock-s2s-warn");
+        let out = node
+            .execute(DAGData::Text("hello".into()), &mut ctx)
+            .await
+            .expect("a warning is not an error");
+        assert!(
+            matches!(&out, DAGData::Text(t) if t == "legacy 1"),
+            "got {out:?}"
         );
     }
 }

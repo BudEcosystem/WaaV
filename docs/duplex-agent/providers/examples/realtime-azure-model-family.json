@@ -1,0 +1,12 @@
+{
+  "type": "config",
+  "provider": "azure",
+  "model": "contoso-rt-prod",
+  "model_family": "gpt-realtime-2.1",
+  "voice": "marin",
+  "interaction": {
+    "tasks": {"default_backend": "llm", "speculative_start": "auto"},
+    "speech": {"confirmations": "auto", "claim_policy": "report"},
+    "events": {"claims": true}
+  }
+}

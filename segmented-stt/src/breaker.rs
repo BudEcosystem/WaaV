@@ -193,6 +193,20 @@ impl Breaker {
         self.inner.lock().trips
     }
 
+    /// Whether a request is refused now: open with its cooldown running, or half-open with its
+    /// probe out (its lease not over). A pure read: it never claims the probe.
+    pub fn refuses(&self) -> bool {
+        let now = Instant::now();
+        let g = self.inner.lock();
+        match g.state {
+            BreakerState::Closed => false,
+            BreakerState::Open => g.opened_at.is_some_and(|t| now < t + self.cfg.cooldown),
+            BreakerState::HalfOpen => g
+                .probe_claimed_at
+                .is_some_and(|t| now < t + self.cfg.probe_lease),
+        }
+    }
+
     /// May a request go now? For callers that cannot carry an [`Admission`]: an elapsed cooldown
     /// admits this call as the probe.
     pub fn allow(&self) -> bool {
@@ -378,6 +392,21 @@ mod tests {
         assert_eq!(b.try_acquire(true), Admission::Denied);
         tokio::time::advance(Duration::from_secs(16)).await;
         assert!(matches!(b.try_acquire(true), Admission::Probe { .. }));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refuses_reads_the_state_without_claiming_the_probe() {
+        let b = Breaker::new(cfg());
+        assert!(!b.refuses());
+        fail_n(&b, 4);
+        assert!(b.refuses(), "open, its cooldown running");
+        tokio::time::advance(Duration::from_secs(11)).await;
+        assert!(!b.refuses(), "the cooldown is over");
+        assert!(!b.refuses(), "a read never claims the probe");
+        let _probe = b.try_acquire(true);
+        assert!(b.refuses(), "half-open, its probe out");
+        tokio::time::advance(Duration::from_secs(16)).await;
+        assert!(!b.refuses(), "the probe's lease is over");
     }
 
     #[test]

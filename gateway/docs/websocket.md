@@ -2490,6 +2490,8 @@ With this foundation, you can build sophisticated voice applications ranging fro
 - [Google TTS Integration](google-tts.md)
 - [Azure TTS Integration](azure-tts.md)
 - [Authentication Documentation](authentication.md)
+- [Interaction Mode](interaction_mode.md)
+- [Interaction Mode Tutorial](tutorials/interaction_mode_tutorial.md)
 - [LiveKit Webhook Documentation](livekit_webhook.md)
 - [API Reference (REST Endpoints)](../CLAUDE.md#api-endpoints)
 - [LiveKit SDK Documentation](https://docs.livekit.io/)

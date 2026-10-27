@@ -352,6 +352,34 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Interaction mode's server block: the `interaction` key of the same file, then the
+    // `WAAV_INTERACTION_*` variables. A problem is logged and never stops the server.
+    for problem in waav_gateway::core::interaction::config::init_server(cli.config.as_deref()) {
+        warn!("interaction config: {problem}");
+    }
+    // The task Redis, when one is set: a Redis that cannot be reached leaves the tasks in
+    // this process, as without one.
+    let interaction = waav_gateway::core::interaction::config::server();
+    if let Some(url) = interaction
+        .task_redis_url
+        .as_deref()
+        .filter(|_| interaction.enabled)
+        && let Err(problem) = waav_gateway::core::interaction::tasks::store()
+            .connect(url)
+            .await
+    {
+        warn!("interaction config: {problem}; tasks are kept in this process only");
+    }
+    // The front model's llama-server, when the gateway runs it itself.
+    if let Some(front) = interaction
+        .front_model
+        .as_ref()
+        .filter(|front| interaction.enabled && front.command.is_some())
+        && let Err(problem) = waav_gateway::core::interaction::front_supervisor::start(front)
+    {
+        warn!("interaction config: the front model is not started: {problem}");
+    }
+
     // Load configuration from file or environment
     let config = if let Some(config_path) = cli.config {
         println!("Loading configuration from {}", config_path.display());
@@ -506,6 +534,11 @@ async fn main() -> anyhow::Result<()> {
         println!("Bud control plane not configured (WAAV_REDIS_URL unset); running standalone");
     }
     let app_state = app_state;
+    // Interaction mode's lines for when a service fails, in the server's default voice
+    // (plan chapter 10): made once, before any session needs them.
+    waav_gateway::core::interaction::clips::spawn_default_set(app_state.clone());
+    // The voice lists a caller's language switch picks from, read before the first call asks.
+    waav_gateway::handlers::voices::prefetch_catalogs(&app_state);
 
     // Each TTS deployment's voice list, for budapp's settings page (see `voice_catalog`). Needs
     // the final shared state — the publisher fetches with the plaintext credentials only this
@@ -894,6 +927,8 @@ async fn main() -> anyhow::Result<()> {
     if let Some(policies) = policies_for_shutdown {
         policies.shutdown().await;
     }
+    // The sessions are gone: the front model's server can stop.
+    waav_gateway::core::interaction::front_supervisor::stop().await;
 
     // Flush batched spans BEFORE returning. Without this the exporter is dropped with its
     // batch unsent, and the spans lost are the ones from the requests immediately before

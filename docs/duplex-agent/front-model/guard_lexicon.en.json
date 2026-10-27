@@ -1,0 +1,152 @@
+{
+  "version": 1,
+  "language": "en",
+  "description": "English tables for the front model's deterministic checks: the fact guard (W2 section 3.6), the rule-layer cues (W2 section 3.7.1 and W4 section 3.9.1), the copy-span rules of the compose grammar (W2 section 3.2.5), the sanitiser (W2 section 3.4.3) and the simplified language check. The fact guard is the second layer; the compose grammar is the first, so these lists are allowed to be incomplete. All phrase matching is on whole words, after lower-casing and turning curly apostrophes into straight ones.",
+  "entity_rule": {
+    "statement": "A number, amount of money, date, time, duration, name or code in a line is allowed only when the same canonical value appears in a released evidence source of the right tier. Numbers are compared as values after normalisation (number words to digits, digit groups joined, ordinals to their value), money as (value, currency), names case-insensitively as words, codes as letters and digits with separators removed.",
+    "sources_allowed_for_front_text": [
+      "caller_words: finalized addressed caller utterances of this call",
+      "caller_profile: the asserted caller name and server-stored memory facts (never account facts)",
+      "first_party: W3 task titles, operator tool phrases, first-party speakable text that passed W3's outbound speech policy, structured values from first-party backends",
+      "persona_terms: persona name, organisation and protected terms",
+      "hitl_values: W4's HITL text rendered from the ActionProposal",
+      "clock: values in the gateway's own TIME line"
+    ],
+    "never_sources": [
+      "free-text progress from an LLM tier report_progress, A2A status messages or MCP progress text",
+      "raw TaskError.message text",
+      "third-party speakable text (it may be relayed verbatim by W4, which is not front speech)",
+      "result text (the front only ever sees 'result ready')"
+    ],
+    "rules": ["NewNumber", "NewMoney", "NewDateTime", "NewDuration", "NewName", "NewCode"]
+  },
+  "normalisation": {
+    "units": {"zero": 0, "oh": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19},
+    "tens": {"twenty": 20, "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90},
+    "scales": {"hundred": 100, "thousand": 1000, "million": 1000000},
+    "ordinals": {"first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5, "sixth": 6, "seventh": 7, "eighth": 8, "ninth": 9, "tenth": 10, "eleventh": 11, "twelfth": 12, "thirteenth": 13, "fourteenth": 14, "fifteenth": 15, "sixteenth": 16, "seventeenth": 17, "eighteenth": 18, "nineteenth": 19, "twentieth": 20, "thirtieth": 30},
+    "ordinal_second_needs_context": "the word 'second' is read as an ordinal only before 'of' or next to a month name, so 'just a second' is not a number",
+    "digit_sequence_words": ["oh", "zero", "double", "triple"],
+    "currency": {"$": "USD", "dollar": "USD", "dollars": "USD", "usd": "USD", "buck": "USD", "bucks": "USD", "€": "EUR", "euro": "EUR", "euros": "EUR", "eur": "EUR", "£": "GBP", "pound": "GBP", "pounds": "GBP", "quid": "GBP", "gbp": "GBP", "₹": "INR", "rupee": "INR", "rupees": "INR", "inr": "INR", "rs": "INR"},
+    "months": ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december", "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep", "sept", "oct", "nov", "dec"],
+    "month_ambiguous_words": ["may", "march"],
+    "weekdays": ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"],
+    "relative_days": ["today", "tomorrow", "tonight", "yesterday", "weekend"],
+    "clock_suffixes": ["am", "pm", "a.m.", "p.m.", "o'clock", "noon", "midnight"],
+    "duration_units": ["second", "seconds", "minute", "minutes", "hour", "hours", "day", "days", "week", "weeks", "month", "months"],
+    "duration_vague": ["a minute", "a few minutes", "a couple of minutes", "an hour", "a few seconds", "a moment or two"]
+  },
+  "names": {
+    "rule": "NewName blocks a capitalised word that is not sentence-initial, or any word on the name list, unless it appears (case-insensitively) as a word in a source, in the persona terms or in the caller profile.",
+    "capitalised_not_names": ["I", "I'm", "I'll", "I've", "I'd", "OK", "Okay", "Mr", "Mrs", "Ms", "Dr", "English", "Hindi", "Spanish", "French"],
+    "name_list_note": "Reference list only; the production list is longer and per language.",
+    "name_list": ["lisbon", "denver", "dallas", "boston", "paris", "london", "madrid", "chicago", "texas", "mumbai", "delhi", "visa", "mastercard", "amex", "united", "delta", "okafor", "smith", "garcia"]
+  },
+  "codes": {
+    "rule": "NewCode blocks a token mixing letters and digits, an airline-style code (one to three capitals then digits), an email address, a URL or a phone-like run of seven or more digits, unless it is in a first-party source or the caller's words.",
+    "patterns": {
+      "mixed_token": "\\b(?=[A-Za-z0-9-]*[A-Za-z])(?=[A-Za-z0-9-]*[0-9])[A-Za-z0-9-]{2,}\\b",
+      "letters_then_digits": "\\b[A-Z]{1,3} ?[0-9]{2,}\\b",
+      "email": "[\\w.+-]+@[\\w-]+\\.[\\w.]+",
+      "url": "(https?://|www\\.)\\S+",
+      "phone": "(\\+?\\d[\\d\\s().-]{6,}\\d)"
+    }
+  },
+  "completion_claims": {
+    "rule": "CompletionClaim. Exempt when the claim words follow an inquiry phrase in the same sentence (the compose grammar's inquiry frame), or when the line is a W4 template backed by the matching task event.",
+    "phrases": ["booked", "confirmed", "cancelled", "canceled", "refunded", "sent", "done", "all set", "you're all set", "has been", "have been", "approved", "processed", "completed", "finished", "scheduled", "rescheduled", "shipped", "delivered", "paid", "charged", "it's stopped", "it's cancelled", "went through", "gone through", "taken care of", "sorted", "it's confirmed", "is confirmed", "added"],
+    "patterns": ["\\bi've (booked|sent|changed|cancelled|canceled|moved|added|updated|refunded|ordered|paid|charged|processed|scheduled|rescheduled|fixed)\\b", "\\bi (booked|sent|changed|cancelled|canceled|moved|added|updated|refunded|ordered|paid|charged|processed|scheduled|rescheduled)\\b", "\\b(i'll|i will|i'm going to) (book|charge|pay|cancel|refund|send|order|buy|transfer|move|reschedule)\\b"]
+  },
+  "outcome_predictions": {
+    "rule": "OutcomePrediction. Exempt inside an inquiry frame ('let me check whether the bag is included').",
+    "phrases": ["you will get", "you'll get", "should be fine", "will be fine", "unfortunately", "good news", "bad news", "we can't", "we cannot", "that's possible", "that's not possible", "is included", "are included", "is free", "is available", "are available", "isn't available", "is on time", "no fee", "no charge", "it works", "that's fine", "you're eligible", "you are eligible", "is covered", "it's covered", "should arrive", "will arrive", "will be there", "on its way", "in stock", "out of stock", "no problem with that", "that won't be a problem", "definitely", "for sure"]
+  },
+  "polar_affirmation": {
+    "rule": "PolarAffirmation applies to every act: the first word may not affirm or deny when the caller's last utterance was a yes/no question, unless the line is a bank line tagged polar used for its own intent (the presence line answering 'are you there?').",
+    "first_words": ["yes", "yeah", "yep", "sure", "of course", "absolutely", "no", "nope", "correct", "right", "definitely", "certainly", "exactly", "indeed"],
+    "polar_question_starters": ["is", "are", "am", "was", "were", "do", "does", "did", "can", "could", "will", "would", "has", "have", "had", "should", "shall", "may", "might", "isn't", "aren't", "doesn't", "don't", "didn't", "can't", "won't", "wouldn't", "hasn't", "haven't"],
+    "polar_question_note": "An utterance is a yes/no question when one of its clauses starts with a starter (after an optional discourse word such as 'so', 'and', 'oh', 'sorry', 'quick question') and the clause ends with a question mark or is the last clause, or when it contains 'whether' or 'if' after 'know' or 'tell me'."
+  },
+  "eta_promises": {
+    "rule": "EtaPromise blocks a time promise together with a promise verb, unless the same phrase is in a first-party source. Persona and bank lines are checked strictly: any phrase here blocks them, verb or not.",
+    "phrases": ["in a minute", "in a second", "in a few minutes", "in a few seconds", "in a moment", "shortly", "right away", "any minute", "any moment", "soon", "almost done", "nearly done", "nearly there", "almost there", "won't be long", "in no time", "in just a minute"],
+    "patterns": ["\\bin \\d+ (seconds?|minutes?|hours?)\\b", "\\bin (one|two|three|four|five|ten|fifteen|twenty|thirty) (seconds?|minutes?|hours?)\\b"],
+    "promise_verbs": ["will", "i'll", "we'll", "it'll", "you'll", "going to", "gonna", "be back", "have it", "get back"],
+    "strict_bank_phrases": ["almost done", "nearly done", "nearly there", "almost there", "a minute", "minutes", "seconds", "shortly", "soon", "right away", "any moment now", "won't be long", "in no time"]
+  },
+  "channel_promises": {
+    "rule": "ChannelPromise. Exempt inside an inquiry frame, or when W4's continuation_phrase is configured for that channel and the line is W4's template.",
+    "phrases": ["i'll text", "i'll email", "i'll e-mail", "i'll call you back", "i'll call you", "we'll send", "we'll text", "we'll email", "we'll call", "you'll get a message", "you'll get a text", "you'll get an email", "i'll send you", "i'll message you", "i'll ring you"]
+  },
+  "action_narration": {
+    "rule": "UnbackedActionNarration blocks first-person progressive or future action unless this decision delegates (delegate or update) or a task is live and the act is progress.",
+    "phrases": ["i'm checking", "i am checking", "i'll check", "i will check", "let me check", "let me look", "i'll look", "i'm looking", "i am looking", "pulling up", "pulling that up", "searching", "i'm searching", "looking that up", "i'll find out", "i'll look into", "let me look into", "checking now", "i'm on it", "i'm finding", "i'll get that", "let me find"]
+  },
+  "disfluency": {
+    "rule": "Disfluency always blocks.",
+    "phrases": ["um", "uh", "erm", "er", "hmm", "hm", "uhh", "umm", "let me think"]
+  },
+  "role_leak": {
+    "rule": "RoleLeak always blocks: a W1 or W2 label, a prompt heading, an internal role word, or any 25-character run copied from the stable prefix after the persona's own lines and the example outputs are removed from it.",
+    "labels_case_sensitive": ["TIME", "USER", "SAID", "NOT HEARD", "EVENT", "ALLOWED", "CALL CONTEXT", "OBSERVATION", "FRONT", "BACKEND", "CALLER CONTEXT"],
+    "phrases": ["backend", "front voice", "system prompt", "my instructions", "my rules", "json", "the act", "allowed acts", "language model", "as an ai"],
+    "copied_run_chars": 25
+  },
+  "inquiry_frames": {
+    "rule": "A claim word that follows one of these phrases in the same sentence is being asked about, not asserted. The bank's inquiry fragments are added at compile time.",
+    "phrases": ["let me check", "let me check whether", "let me check if", "i'll find out if", "i'll find out whether", "i'll look into", "let me look into", "let me see if", "let me see whether", "i'll check if", "i'll check whether", "did you say"]
+  },
+  "copy_spans": {
+    "max_span_words": 7,
+    "max_utterance_words": 60,
+    "pronoun_turn": {"i": "you", "me": "you", "my": "your", "mine": "yours", "myself": "yourself", "i'm": "you're", "i've": "you've", "i'll": "you'll", "i'd": "you'd", "we": "you", "us": "you", "our": "your", "ours": "yours", "ourselves": "yourselves", "we're": "you're", "we've": "you've", "we'll": "you'll", "we'd": "you'd"},
+    "pronoun_turn_pairs": {"i was": "you were", "i am": "you are", "we were": "you were", "we are": "you are"},
+    "second_person_never_copied": ["you", "your", "yours", "yourself", "yourselves", "you're", "you've", "you'll", "you'd", "u", "ya", "y'all"],
+    "restate_stop_words": ["is", "are", "was", "were", "be", "been", "being", "will", "would", "can", "could", "shall", "should", "may", "might", "must", "has", "have", "had", "do", "does", "did", "not", "no", "never", "approved", "included", "confirmed", "booked", "cancelled", "canceled", "refunded", "available", "free", "done", "shipped", "delivered", "paid", "sent"],
+    "restate_stop_suffixes": ["'s", "'re", "'ve", "'ll", "'d", "n't"],
+    "start_word_stop_list_note": "Reference tuning choice: a chain may not START on these words (it may pass through them), so spans begin on content. The bake-off may revisit it.",
+    "start_word_stop_list": ["and", "or", "but", "so", "then", "also", "if", "whether", "because", "um", "uh", "er", "oh", "well", "okay", "ok", "yeah", "yes", "no", "hi", "hello", "hey", "please", "sorry", "actually", "just", "like", "can", "could", "would", "will", "do", "does", "did", "is", "are", "was", "were", "that", "this", "what", "which", "who", "how", "when", "where", "why", "know", "need", "want", "wanted", "ask", "tell", "see", "check", "quick", "question", "while", "look", "where's", "what's", "how's", "who's", "hmm", "erm", "mm"],
+    "dangling_end_words_note": "Reference refinement of W2 section 3.7.1: an utterance that ends on one of these words is unfinished, so it is not request-shaped and request_not_wait does not turn the model's wait into delegate.",
+    "dangling_end_words": ["to", "the", "a", "an", "about", "was", "is", "are", "and", "or", "but", "for", "with", "of", "my", "your", "at", "in", "on", "if", "that", "so", "because", "like", "um", "uh", "from", "by", "whether", "into"],
+    "chain_end_punctuation": [".", "?", "!", ";", ":"],
+    "chain_comma_separator": true,
+    "allowed_word_pattern": "^[A-Za-z0-9$€£₹%'&/.,:?!-]+$"
+  },
+  "sanitiser": {
+    "special_tokens": ["<|startoftext|>", "<|im_start|>", "<|im_end|>", "<|tool_call_start|>", "<|tool_call_end|>", "<|tool_list_start|>", "<|tool_list_end|>", "<|tool_response_start|>", "<|tool_response_end|>", "<think>", "</think>", "<|endoftext|>"],
+    "removed_characters": ["«", "»", "\"", "\\", "<", ">", "{", "}", "|", "`", "*", "#", "_"],
+    "reserved_labels": ["TIME", "USER", "SAID", "NOT HEARD", "EVENT", "ALLOWED:", "ALLOWED", "CALL CONTEXT", "OBSERVATION", "CALLER CONTEXT", "FRONT", "HEARD"],
+    "truncate_chars": {"caller_utterance": 600, "status_text": 240, "result_text": 0, "hitl_question": 400, "task_title": 80, "memory_fact": 80, "persona_bullet": 120}
+  },
+  "language_check": {
+    "rule": "English function words: a copy span writes one in lower case at the start of a sentence. Whether the caller speaks another language is the front model's reading (wait, why foreign) or the recogniser's own language field, never a word list (owner, 24 Oct).",
+    "english_function_words": ["the", "a", "an", "and", "or", "but", "to", "of", "in", "on", "at", "for", "with", "from", "by", "about", "is", "are", "was", "were", "be", "been", "do", "does", "did", "have", "has", "had", "i", "you", "he", "she", "it", "we", "they", "me", "my", "your", "our", "their", "this", "that", "these", "those", "what", "which", "who", "when", "where", "why", "how", "can", "could", "would", "will", "should", "may", "might", "not", "no", "yes", "if", "whether", "so", "then", "there", "here", "just", "please", "thanks", "thank", "hi", "hello", "okay", "ok", "yeah", "need", "want", "like", "know", "get", "make", "it's", "i'm", "don't", "can't", "also", "all", "any", "some", "more", "much", "very", "too", "again", "still", "yet", "now", "up", "out", "as", "than", "into", "over", "after", "before", "instead", "actually", "sorry", "mm-hm", "uh-huh", "right", "sure", "one", "two", "three", "four", "five"]
+  },
+  "sensitive_categories": {
+    "rule": "W4 section 3.8.7 screening categories (pack-level), extended per persona by PersonaSpec.sensitive.extra_categories. When the caller's newest utterance names a category and carries a value, the reference grammar builder suppresses copy spans (a proposed addition to W2 section 3.2.5) so a sensitive value is never read back by voice.",
+    "categories": ["card number", "credit card", "debit card", "cvv", "cvc", "security code", "pin", "password", "one-time code", "otp", "national id", "social security", "bank account", "account number", "sort code", "routing number"]
+  },
+  "rule_layer_cues": {
+    "owner_note": "Reference copy of W4's English pre-classifier lexicons (W4 section 3.9.1) plus W2's RuleView detectors (W2 section 3.7.1); W4's policy pack is the owner in the gateway.",
+    "continuers": ["uh-huh", "uh huh", "mm-hm", "mm-hmm", "mmhm", "mhm", "yeah", "yep", "okay", "ok", "right", "got it", "i see", "sure", "alright", "all right", "go on", "hmm"],
+    "social_intents": {
+      "greeting": ["hi", "hello", "hey", "good morning", "good afternoon", "good evening", "hello there", "hi there"],
+      "thanks": ["thanks", "thank you", "thanks so much", "thank you so much", "cheers", "appreciate it", "great thanks", "perfect thanks"],
+      "goodbye": ["bye", "goodbye", "good bye", "bye bye", "see you", "that's all", "that's it", "that is all", "have a good day", "talk later"],
+      "presence": ["are you there", "are you still there", "you still there", "anyone there", "hello are you there", "can you hear me", "still with me"],
+      "identity": ["who is this", "who am i speaking to", "who am i talking to", "is this", "are you a real person", "are you a person", "are you a robot", "am i talking to a robot", "are you human", "what's your name", "is this the right number"],
+      "how_are_you": ["how are you", "how are you doing", "how's it going with you", "how's your day", "how is your day", "how are things", "how's everything", "how do you do", "how have you been"]
+    },
+    "status_cues": ["yet", "still", "any news", "any luck", "any update", "how long", "is it done", "how's it going", "how is it going", "what's happening", "where are we", "where are we with", "did that go through", "did it go through", "how's that coming", "is it cancelled", "is it canceled", "status", "did you find", "have you found", "find anything", "what about my"],
+    "cancel_cues": ["never mind", "nevermind", "cancel that", "cancel it", "forget it", "forget that", "don't cancel", "don't bother", "stop that", "stop the", "cancel the", "drop it", "scrap that", "i changed my mind"],
+    "repeat_cues": ["say that again", "repeat that", "what did you say", "can you repeat", "could you repeat", "come again", "pardon", "sorry what", "say it again"],
+    "amendment_cues": ["actually", "i meant", "i mean", "instead", "make it", "make that", "change it to", "change that to", "not", "no i said", "i said", "oh wait", "wait no", "rather"],
+    "request_cues": ["i need", "i want", "i'd like", "i would like", "can you", "could you", "would you", "will you", "please", "i'm calling about", "i am calling about", "help me", "do you", "does", "is there", "are there", "what", "when", "where", "which", "why", "how", "should i", "can i", "could i", "i was wondering", "tell me"],
+    "side_talk_cues": ["honey", "hang on honey", "one sec babe", "just a sec", "talking to", "i'm on the phone", "not you", "kids", "mom", "dad"],
+    "stop_talking_cues": ["stop", "stop talking", "enough", "wait", "wait a second", "wait a minute", "wait a moment", "hold on", "one second", "just a second", "just a moment", "give me a second", "give me a moment", "let me think", "let me finish", "be quiet", "i need to tell you something", "let me tell you something", "something else first"],
+    "content_word_stop_list": ["the", "a", "an", "and", "or", "but", "to", "of", "in", "on", "at", "for", "with", "from", "by", "is", "are", "was", "were", "be", "it", "this", "that", "i", "you", "me", "my", "your", "we", "our", "so", "um", "uh", "just", "like", "really", "very", "can", "could", "would", "will", "do", "does", "did", "have", "has", "had", "it's", "i'm", "that's", "what", "how", "if", "about", "please", "okay", "yeah", "oh", "well", "also", "any", "some", "there", "here", "then", "now", "still", "yet", "get", "got", "need", "want", "know", "one", "thing", "things", "something"],
+    "unclear_confidence": 0.5,
+    "self_echo_threshold": 0.6,
+    "self_echo_window_s": 5
+  }
+}

@@ -9,6 +9,7 @@ import weakref
 from pathlib import Path
 from typing import Any, Optional, Union
 
+from .interaction import TaskView
 from .rest.client import RestClient
 from .voices import VoicesAPI
 from .pipelines.stt import BudSTT
@@ -423,6 +424,7 @@ class BudClient:
         reconnect: Optional[ReconnectConfig] = None,
         stream_id: Optional[str] = None,
         alias: Optional[str] = None,
+        interaction: Optional[Union[bool, dict[str, Any]]] = None,
     ) -> TalkSession:
         """Create the flagship agent loop (STT -> built-in LLM -> TTS) in ~5 lines.
 
@@ -466,6 +468,11 @@ class BudClient:
                 already set it.
             reconnect: Reconnection configuration.
             stream_id: Optional stream ID for session tracking.
+            interaction: Interaction mode (protocol 1.1): ``True`` or an object of settings.
+                The gateway then acknowledges, runs each request as a background task and
+                relays its answer; the session yields ``interaction`` events and takes
+                :meth:`TalkSession.answer_task`, ``cancel_task``, ``update_interaction`` and
+                ``report_playback``.
 
         Returns:
             An unconnected :class:`TalkSession`. ``await session.connect()`` (or
@@ -534,7 +541,22 @@ class BudClient:
             conversation_config=conversation_config,
             stream_id=stream_id,
             alias=alias,
+            interaction=interaction,
         )
+
+    async def list_tasks(self, stream_id: Optional[str] = None) -> list[TaskView]:
+        """Interaction-mode tasks of the caller's sessions (``GET /v1/tasks``).
+
+        See :meth:`RestClient.list_tasks`.
+        """
+        return await self._rest_client.list_tasks(stream_id=stream_id)
+
+    async def get_task(self, task_id: str, stream_id: Optional[str] = None) -> TaskView:
+        """One interaction-mode task with its outcome (``GET /v1/tasks/{task_id}``).
+
+        See :meth:`RestClient.get_task`.
+        """
+        return await self._rest_client.get_task(task_id, stream_id=stream_id)
 
     async def health(self) -> dict[str, Any]:
         """

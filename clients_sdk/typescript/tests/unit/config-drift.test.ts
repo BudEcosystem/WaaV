@@ -170,7 +170,7 @@ const AGENT_SDK = new Set(['id', 'version', 'textOnly', 'variables']);
 // Top-level config envelope (IncomingMessage::Config branch).
 const ENVELOPE_SDK = new Set([
   'streamId', 'audio', 'sttConfig', 'ttsConfig', 'livekit', 'dag', 'conversation',
-  'turnDetection', 'alias', 'agent',
+  'turnDetection', 'alias', 'agent', 'interaction',
 ]);
 
 /**

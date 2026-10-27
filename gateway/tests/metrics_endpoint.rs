@@ -143,10 +143,14 @@ fn config_with_openai() -> ServerConfig {
     }
 }
 
+/// The tests here set `OPENAI_BASE_URL` for the process: one at a time.
+static ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[tokio::test]
 async fn metrics_exposes_provider_ttfb() {
     use axum::routing::post;
     use tokio::net::TcpListener;
+    let _env = ENV.lock().await;
 
     // 1. Stand up a local OpenAI-compatible speech mock returning PCM audio.
     async fn speak(_body: bytes::Bytes) -> Vec<u8> {
@@ -196,13 +200,16 @@ async fn metrics_exposes_provider_ttfb() {
         .unwrap();
     let speak_resp = app.clone().oneshot(speak_req).await.unwrap();
 
-    unsafe { std::env::remove_var("OPENAI_BASE_URL") };
-
     assert_eq!(
         speak_resp.status(),
         StatusCode::OK,
         "the /speak request must succeed against the OpenAI mock so a TTFB sample is recorded"
     );
+    // The audio is streamed: the synthesis (and its sample) is over when the body ends.
+    let audio = speak_resp.into_body().collect().await.unwrap().to_bytes();
+    assert!(!audio.is_empty());
+
+    unsafe { std::env::remove_var("OPENAI_BASE_URL") };
 
     // 4. Scrape /metrics and assert the provider TTFB histogram is present.
     let metrics_req = Request::builder()
@@ -227,4 +234,81 @@ async fn metrics_exposes_provider_ttfb() {
         text.contains("openai"),
         "the TTFB sample must be labelled with the openai provider; got:\n{text}"
     );
+}
+
+/// POST /speak streams: the first audio reaches the client while the vendor is still
+/// synthesising (it waited for the whole synthesis, +1.1 s first byte against Deepgram), with
+/// no Content-Length, and the whole body is the vendor's audio.
+#[tokio::test]
+async fn speak_streams_the_audio_as_it_is_synthesised() {
+    use axum::routing::post;
+    use std::time::{Duration, Instant};
+    use tokio::net::TcpListener;
+    let _env = ENV.lock().await;
+
+    // The vendor sends half its audio, then the rest 1.5 s later.
+    async fn speak(_body: bytes::Bytes) -> axum::response::Response {
+        let pcm = fake_pcm();
+        let (head, tail) = pcm.split_at(pcm.len() / 2);
+        let parts = [(0, head.to_vec()), (1500, tail.to_vec())];
+        let chunks =
+            futures::StreamExt::then(futures::stream::iter(parts), |(wait, chunk)| async move {
+                tokio::time::sleep(Duration::from_millis(wait)).await;
+                Ok::<_, std::io::Error>(bytes::Bytes::from(chunk))
+            });
+        axum::response::Response::new(Body::from_stream(chunks))
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mock = Router::new().route("/v1/audio/speech", post(speak));
+    let _server = spawn_test_server(async move {
+        axum::serve(listener, mock).await.unwrap();
+    });
+    unsafe { std::env::set_var("WAAV_ALLOW_LOOPBACK_ENDPOINTS", "1") };
+    unsafe { std::env::set_var("OPENAI_BASE_URL", format!("http://{addr}")) };
+
+    let app = Router::new()
+        .merge(routes::api::create_api_router())
+        .with_state(AppState::new(config_with_openai()).await);
+    let body = serde_json::json!({
+        "text": "Streaming check.",
+        "tts_config": { "provider": "openai", "model": "tts-1", "voice_id": "nova",
+                        "audio_format": "pcm", "sample_rate": 24000, "pronunciations": [] }
+    });
+    let started = Instant::now();
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/speak")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        resp.headers().get("content-length").is_none(),
+        "{:?}",
+        resp.headers()
+    );
+    let mut body = resp.into_body();
+    let mut audio = Vec::new();
+    let mut first_at = None;
+    while let Some(frame) = body.frame().await {
+        let frame = frame.unwrap();
+        if let Some(data) = frame.data_ref() {
+            first_at.get_or_insert_with(|| started.elapsed());
+            audio.extend_from_slice(data);
+        }
+    }
+    unsafe { std::env::remove_var("OPENAI_BASE_URL") };
+    let first_at = first_at.expect("audio");
+    assert!(
+        first_at < Duration::from_millis(1200),
+        "first audio after {first_at:?}"
+    );
+    assert!(started.elapsed() >= Duration::from_millis(1500));
+    assert_eq!(audio, fake_pcm());
 }

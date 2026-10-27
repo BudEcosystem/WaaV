@@ -242,6 +242,7 @@ async fn run_voice_socket_session(
                                 }
                             }
                         }
+                        MessageRoute::Json(json) => sender.send(Message::Text(json.into())).await,
                         MessageRoute::Binary(data) => sender.send(Message::Binary(data)).await,
                         MessageRoute::Close => {
                             info!("Closing WebSocket connection");
@@ -273,6 +274,7 @@ async fn run_voice_socket_session(
                                     Err(_) => continue,
                                 }
                             }
+                            MessageRoute::Json(json) => sender.send(Message::Text(json.into())).await,
                             MessageRoute::Binary(data) => sender.send(Message::Binary(data)).await,
                             MessageRoute::Close => sender.send(Message::Close(None)).await,
                             MessageRoute::CloseWith { code, reason } => {
@@ -339,7 +341,9 @@ async fn run_voice_socket_session(
     // Signal shutdown to sender task
     shutdown_voice_sender_task(shutdown_tx, &mut sender_task).await;
 
-    teardown_session(&state, &app_state).await;
+    // Only a close of the client's own, or one a handler asked for, is a clean end: after a
+    // lost connection, an idle timeout or a server shutdown the caller may come back.
+    teardown_session(&state, &app_state, exit == SessionLoopExit::Closed).await;
 
     info!("WebSocket voice connection terminated");
 }
@@ -352,11 +356,21 @@ async fn run_voice_socket_session(
 pub(crate) async fn teardown_session(
     state: &Arc<RwLock<ConnectionState>>,
     app_state: &Arc<AppState>,
+    clean: bool,
 ) {
     // FRD-023 RT6: bill audio streamed after the last final transcript; the legs' admissions are
     // released with the state.
     if let Some(meter) = state.read().await.leg_meter.clone() {
         meter.finish();
+    }
+    // Interaction mode: the agent's speech is cut and every task is told the session is over.
+    // After an end that was not `clean` the caller may come back for what a task still does.
+    let interaction = state.read().await.interaction.clone();
+    if let Some(interaction) = interaction {
+        match clean {
+            true => interaction.shutdown().await,
+            false => interaction.dropped().await,
+        }
     }
     // Spec 025: end the voice agent's live turn, which cancels its run at budprompt.
     if let Some(engine) = state.read().await.agent.clone() {
@@ -502,8 +516,10 @@ pub(crate) async fn teardown_session(
 /// drain path (RC6) an explicit, testable outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SessionLoopExit {
-    /// Client closed the socket, the socket errored, or a handler requested close.
+    /// The client closed the socket, or a handler requested close.
     Closed,
+    /// The connection was lost: the socket errored or ended without a close frame.
+    Dropped,
     /// The connection exceeded the idle timeout.
     IdleTimeout,
     /// App-wide shutdown was signalled (RC6 SIGTERM session drain).
@@ -561,11 +577,11 @@ where
                             MessageClass::Critical,
                         )
                         .await;
-                        return SessionLoopExit::Closed;
+                        return SessionLoopExit::Dropped;
                     }
                     None => {
-                        info!("WebSocket connection closed by client");
-                        return SessionLoopExit::Closed;
+                        info!("WebSocket connection ended without a close frame");
+                        return SessionLoopExit::Dropped;
                     }
                 }
             }
@@ -885,9 +901,10 @@ mod tests {
 
     /// Sanity: without shutdown, a client-side close (stream end) still exits
     /// the loop via the normal path — the new select branch must not capture
-    /// ordinary disconnects.
+    /// ordinary disconnects. A stream that ends without a close frame is a lost
+    /// connection, which interaction mode's reconnect grace is for.
     #[tokio::test]
-    async fn client_disconnect_exits_loop_as_closed() {
+    async fn client_disconnect_exits_loop_as_dropped() {
         let mut receiver = stream::iter(Vec::<Result<Message, axum::Error>>::new());
         let (tx, _rx) = mpsc::channel::<MessageRoute>(8);
         let shutdown = CancellationToken::new();
@@ -906,7 +923,7 @@ mod tests {
         .await
         .expect("loop must exit when the inbound stream ends");
 
-        assert_eq!(exit, SessionLoopExit::Closed);
+        assert_eq!(exit, SessionLoopExit::Dropped);
     }
 
     /// Sanity: a handler that requests close (process_message returning false,

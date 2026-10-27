@@ -10,6 +10,7 @@
  */
 
 import type { STTConfig, TTSConfig, LiveKitConfig, Emotion, DeliveryStyle, EmotionIntensityLevel } from './config.js';
+import { INTERACTION_PROTOCOL_VERSION, type InteractionEcho, type InteractionEvent, type InteractionClientMessage } from './interaction.js';
 
 /**
  * The WebSocket wire-protocol version this SDK is built against. The gateway
@@ -18,6 +19,12 @@ import type { STTConfig, TTSConfig, LiveKitConfig, Emotion, DeliveryStyle, Emoti
  * warning instead of silent field drift. Mirrors gateway PROTOCOL_VERSION.
  */
 export const PROTOCOL_VERSION = '1.0';
+
+/**
+ * Every `protocol_version` this SDK reads: `1.0`, and `1.1` on a session that runs interaction
+ * mode (`INTERACTION_PROTOCOL_VERSION`). A `ready` with any other one is graded as drift.
+ */
+export const KNOWN_PROTOCOL_VERSIONS: readonly string[] = [PROTOCOL_VERSION, INTERACTION_PROTOCOL_VERSION];
 
 // ============================================================================
 // Outgoing Messages (Client -> Server)
@@ -146,7 +153,8 @@ export type OutgoingMessage =
   | ClearMessage
   | AudioEndMessage
   | SendMessageMessage
-  | SIPTransferMessage;
+  | SIPTransferMessage
+  | InteractionClientMessage;
 
 // ============================================================================
 // Incoming Messages (Server -> Client)
@@ -185,6 +193,11 @@ export interface ReadyMessage {
   audio_in_codec?: string;
   /** D8 negotiated downlink transport codec in effect (`linear16` | `opus`); present only on request. */
   audio_out_codec?: string;
+  /**
+   * Interaction mode: the resolved settings. Present only when the session runs the mode;
+   * `protocol_version` is then `1.1`.
+   */
+  interaction?: InteractionEcho;
   /**
    * What speech-to-text this session got (segmented STT): streaming, segmented or buffered, the
    * kind of interim results, who ends utterances, the expected latency and its basis, and notices.
@@ -521,6 +534,16 @@ export interface SttWarningMessage {
 }
 
 /**
+ * Interaction mode (protocol 1.1): nothing else went to the client for 5 s. It only proves
+ * the session alive (the browser liveness watchdog cannot ping the socket).
+ */
+export interface HeartbeatMessage {
+  type: 'heartbeat';
+  /** Milliseconds since the session started. */
+  t_ms: number;
+}
+
+/**
  * Union type for all incoming messages (received by client from server)
  */
 export type IncomingMessage =
@@ -535,8 +558,10 @@ export type IncomingMessage =
   | ErrorMessage
   | SIPTransferErrorMessage
   | ConfigWarningMessage
+  | HeartbeatMessage
   | VadEventMessage
-  | SttWarningMessage;
+  | SttWarningMessage
+  | InteractionEvent;
 
 /**
  * Common message type identifier
@@ -549,6 +574,7 @@ export type MessageType =
   | 'audio_end'
   | 'send_message'
   | 'sip_transfer'
+  | InteractionClientMessage['type']
   // Incoming (server -> client)
   | 'ready'
   | 'stt_result'
@@ -562,7 +588,8 @@ export type MessageType =
   | 'sip_transfer_error'
   | 'config_warning'
   | 'vad_event'
-  | 'stt_warning';
+  | 'stt_warning'
+  | InteractionEvent['type'];
 
 // ============================================================================
 // Message Serialization Helpers

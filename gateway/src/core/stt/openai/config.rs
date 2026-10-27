@@ -1659,4 +1659,25 @@ mod tests {
     fn test_chunking_strategy_type_as_str() {
         assert_eq!(ChunkingStrategyType::ServerVad.as_str(), "server_vad");
     }
+
+    /// An empty model is `gpt-transcribe` (addendum B6; it was the provider fix
+    /// `openai_stt_default`), sent verbatim and treated as the GPT-4o transcribe family (`json`,
+    /// no `verbose_json`: the transcription reference's `response_format` for non-Whisper models,
+    /// <https://platform.openai.com/docs/api-reference/audio/createTranscription>). A named model
+    /// is never changed.
+    #[test]
+    fn the_default_model_moves_only_an_empty_model() {
+        let base = |model: &str| STTConfig {
+            model: model.into(),
+            ..Default::default()
+        };
+        let moved = OpenAISTTConfig::from_base(base(""));
+        assert_eq!(moved.wire_model(), "gpt-transcribe");
+        assert!(!moved.is_whisper_model());
+        assert_eq!(moved.response_format, ResponseFormat::Json);
+        let named = OpenAISTTConfig::from_base(base("whisper-1"));
+        assert_eq!(named.wire_model(), "whisper-1");
+        assert_eq!(named.model_id, None);
+        assert_eq!(named.response_format, ResponseFormat::VerboseJson);
+    }
 }

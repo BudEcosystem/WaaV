@@ -25,6 +25,7 @@ import type {
   SIPTransferResponse,
 } from '../types/sip.js';
 import type { STTConfig, TranslationConfig } from '../types/config.js';
+import type { TaskView } from '../types/interaction.js';
 import type {
   DAGDefinition,
   DAGTemplateListResponse,
@@ -708,6 +709,33 @@ export class RestClient {
   /** Poll a batch job (`GET /transcribe/batch/{job_id}`). */
   async getBatchJob(jobId: string): Promise<BatchJob> {
     return this.request<BatchJob>('GET', `/transcribe/batch/${encodeURIComponent(jobId)}`);
+  }
+
+  // ============================================================================
+  // Interaction-mode tasks (gateway handlers/tasks.rs)
+  // ============================================================================
+
+  /**
+   * List the interaction-mode tasks of the caller's sessions (`GET /v1/tasks`): the live ones,
+   * and finished ones for ten minutes. `streamId` limits the list to one session; a request
+   * without an authenticated id (authentication off) gets only the session it names, and an
+   * empty list without one. Wire field names are returned verbatim.
+   */
+  async listTasks(streamId?: string): Promise<TaskView[]> {
+    const query = streamId ? `?stream_id=${encodeURIComponent(streamId)}` : '';
+    const response = await this.request<{ tasks?: TaskView[] }>('GET', `/v1/tasks${query}`);
+    return response.tasks ?? [];
+  }
+
+  /**
+   * One interaction-mode task with its session and outcome (`GET /v1/tasks/{task_id}`).
+   * `result` is `null` while the task runs, then its `state`, `summary` and `effects`. Without
+   * an authenticated id the request must name the task's session with `streamId`. A task that
+   * does not exist, or is not the caller's, is a 404 `APIError`.
+   */
+  async getTask(taskId: string, streamId?: string): Promise<TaskView> {
+    const query = streamId ? `?stream_id=${encodeURIComponent(streamId)}` : '';
+    return this.request<TaskView>('GET', `/v1/tasks/${encodeURIComponent(taskId)}${query}`);
   }
 
   // ============================================================================

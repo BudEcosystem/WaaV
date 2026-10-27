@@ -1,0 +1,270 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://waav.local/plan/providers/capabilities.schema.json",
+  "title": "WaaV provider capability descriptors for the full-duplex interaction plan",
+  "description": "Schema of provider_capabilities.json. One entry per speech-to-speech provider and model family (plus the cascade, GPT-Live and WaaV Infer native duplex). Field meanings follow ProviderCapabilities in W6-providers-endpoints.md section 3.2 as aligned with INTEGRATION_DECISIONS.md Addenda A to C (half_cascade_possible, the model as the code sends it, Azure's optional model_family). Uses only the keywords regime_resolve.py's fallback validator implements.",
+  "type": "object",
+  "required": ["schema_version", "written", "description", "path_roots", "vocabulary", "surfaces", "providers", "coverage_exceptions"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {"type": "string", "pattern": "^1\\.[0-9]+$"},
+    "written": {"$ref": "#/$defs/date"},
+    "description": {"type": "string"},
+    "path_roots": {"type": "object", "required": ["code", "evidence"], "additionalProperties": false, "properties": {"code": {"type": "string"}, "evidence": {"type": "string"}}},
+    "vocabulary": {"type": "object"},
+    "surfaces": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/surface"}},
+    "providers": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/provider"}},
+    "coverage_exceptions": {"type": "array", "items": {"$ref": "#/$defs/exception"}}
+  },
+  "$defs": {
+    "date": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"},
+    "nullable_date": {"anyOf": [{"$ref": "#/$defs/date"}, {"type": "null"}]},
+    "release": {"description": "A release number from INTEGRATION_DECISIONS.md section 1 (0 to 5), or null for never.", "anyOf": [{"type": "integer", "minimum": 0, "maximum": 5}, {"type": "null"}]},
+    "regime": {"enum": ["Cascade", "ProviderSpeech", "Delegating", "NativeDuplex"]},
+    "owner_value": {"enum": ["gateway", "provider", "none"]},
+    "refusal_code": {"enum": ["truth_ack_required", "interaction_unsupported", "truth_enforcement_unavailable", "provider_retired", "model_retired", "unsupported_vendor", "provider_not_turn_based", "interaction_needs_background", "interaction_dag_audio_output", "deployment_required", "bud_mode_required"]},
+    "refusal_ref": {"type": "object", "required": ["code", "fatal"], "additionalProperties": false,
+      "properties": {"code": {"type": "string"}, "fatal": {"type": "boolean"}, "existing": {"type": "boolean"}, "code_ref": {"type": "string"}}},
+    "surface": {
+      "type": "object",
+      "required": ["id", "name", "kind", "first_release", "bud_mode", "client_ui", "egress", "source"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {"type": "string", "pattern": "^[a-z0-9_]+$"},
+        "name": {"type": "string"},
+        "kind": {"enum": ["cascade", "provider", "refused"]},
+        "first_release": {"$ref": "#/$defs/release"},
+        "first_release_if_echo_gates_fail": {"$ref": "#/$defs/release"},
+        "bud_mode": {"enum": ["both", "only", "refused"]},
+        "bud_refusal": {"$ref": "#/$defs/refusal_ref"},
+        "non_bud_refusal": {"$ref": "#/$defs/refusal_ref"},
+        "refusal": {"$ref": "#/$defs/refusal_ref"},
+        "provider_refusals": {"type": "object", "additionalProperties": {"$ref": "#/$defs/refusal_ref"}},
+        "unreached_refusal": {"$ref": "#/$defs/refusal_ref"},
+        "reaches": {"anyOf": [{"const": "all"}, {"type": "array", "items": {"type": "string"}}]},
+        "vendor_names": {"type": "object", "additionalProperties": {"type": "string"}},
+        "client_ui": {"type": "boolean"},
+        "needs_background": {"type": "boolean"},
+        "egress": {"enum": ["pump", "stop_only", "provider_only", "none"]},
+        "mid_call_language": {"enum": ["step_down", "repeat_request", "as_controlling_ws_session"], "description": "INTEGRATION_DECISIONS.md Addendum C7.1: what happens when a caller keeps speaking an unsupported language mid-call. step_down (interaction_language_step_down to the plain conversation path) only on /ws conversation and agent sessions, whose plain path can start with an empty history; repeat_request (a repeat-request template, then the session continues in English) on raw /ws, the GA cascade and regimes B and C; as_controlling_ws_session for LiveKit rooms and SIP calls, which follow the /ws session that drives them. Absent means repeat_request."},
+        "source": {"type": "string"}
+      }
+    },
+    "verb": {
+      "type": "object",
+      "required": ["support", "wire", "probe_first"],
+      "additionalProperties": false,
+      "properties": {
+        "support": {"enum": ["native", "emulated", "absent", "retired"]},
+        "emulation": {"enum": ["guided_verbatim", "gateway_clip", "user_turn_framing", "prompt_append", "drop_output", "turn_detection_toggle", "model_decides", "call_free_note"]},
+        "wire": {"type": "string"},
+        "probe_first": {"type": "boolean"},
+        "fix_needed": {"type": "string"},
+        "note": {"type": "string"}
+      }
+    },
+    "verbs": {
+      "type": "object",
+      "required": ["user_text", "say_exact", "say_guided", "add_context", "request_reply", "stop_output", "hold_floor"],
+      "additionalProperties": false,
+      "properties": {
+        "user_text": {"$ref": "#/$defs/verb"},
+        "say_exact": {"$ref": "#/$defs/verb"},
+        "say_guided": {"$ref": "#/$defs/verb"},
+        "add_context": {"$ref": "#/$defs/verb"},
+        "request_reply": {"$ref": "#/$defs/verb"},
+        "stop_output": {"$ref": "#/$defs/verb"},
+        "hold_floor": {"$ref": "#/$defs/verb"}
+      }
+    },
+    "voice_reproducible": {
+      "type": "object", "required": ["value"], "additionalProperties": false,
+      "properties": {"value": {"enum": ["same", "same_when_voice_known", "unknown", "no", "n/a"]}, "tts_provider": {"type": "string"}, "note": {"type": "string"}}
+    },
+    "ownership": {
+      "type": "object",
+      "required": ["turn_owner", "voice_owner", "voice_reproducible", "text_output_possible", "half_cascade_possible", "reply_suppressible"],
+      "additionalProperties": false,
+      "properties": {
+        "turn_owner": {"enum": ["gateway", "provider", "model"]},
+        "voice_owner": {"enum": ["gateway", "provider"]},
+        "voice_reproducible": {"$ref": "#/$defs/voice_reproducible"},
+        "text_output_possible": {"type": "boolean", "description": "informational: the provider can answer in text"},
+        "half_cascade_possible": {"type": "boolean", "description": "the field select_regime tests (INTEGRATION_DECISIONS.md Addendum A2 item 1): text output AND a documented switch for the provider's own reply (create_response:false), so WaaV can decide every word; only the OpenAI family qualifies today"},
+        "reply_suppressible": {"type": "boolean"},
+        "note": {"type": "string"}
+      }
+    },
+    "provisional_runs": {
+      "anyOf": [
+        {"type": "null"},
+        {"type": "object", "required": ["from", "adopted_at", "discarded_at", "adopt_by_ms"], "additionalProperties": false,
+         "properties": {"from": {"type": "string"}, "adopted_at": {"type": "string"}, "discarded_at": {"type": "string"}, "adopt_by_ms": {"anyOf": [{"type": "integer", "minimum": 0}, {"type": "null"}]}}}
+      ]
+    },
+    "background": {
+      "type": "object",
+      "required": ["async_tools", "delegation", "tools_declarable", "speculative_tool_calls", "delivery_scheduling", "provisional_runs"],
+      "additionalProperties": false,
+      "properties": {
+        "async_tools": {"enum": ["non_blocking_scheduled", "non_blocking_unscheduled", "pending_allowed", "always_async", "frozen", "sync_only", "async_execution_mode", "unknown", "none", "n/a"]},
+        "delegation": {"enum": ["native_client", "via_gateway_tool", "none", "n/a"]},
+        "tools_declarable": {"type": "boolean"},
+        "speculative_tool_calls": {"type": "boolean"},
+        "delivery_scheduling": {"type": "boolean"},
+        "provisional_runs": {"$ref": "#/$defs/provisional_runs"},
+        "note": {"type": "string"}
+      }
+    },
+    "mechanism": {
+      "type": "object", "required": ["kind", "switch_off"], "additionalProperties": false,
+      "properties": {
+        "kind": {"enum": ["none", "prompt_only", "config", "operator_only", "always_on", "unknown", "intrinsic", "n/a"]},
+        "key": {"type": "string"},
+        "default_on": {"type": "boolean"},
+        "switch_off": {"type": "string"}
+      }
+    },
+    "owner_outcome": {
+      "type": "object", "required": ["result", "how"], "additionalProperties": false,
+      "properties": {
+        "result": {"$ref": "#/$defs/owner_value"},
+        "how": {"type": "string"},
+        "unless_operator_flag": {"type": "string"},
+        "then": {"$ref": "#/$defs/owner_value"}
+      }
+    },
+    "owner_auto": {
+      "anyOf": [
+        {"$ref": "#/$defs/owner_value"},
+        {"type": "object", "required": ["if_model_matches", "then", "else"], "additionalProperties": false,
+         "properties": {"if_model_matches": {"type": "string"}, "then": {"$ref": "#/$defs/owner_value"}, "else": {"$ref": "#/$defs/owner_value"}}},
+        {"type": "object", "required": ["if_model_family_matches", "then", "else", "unknown"], "additionalProperties": false,
+         "description": "Azure (Addendum A2 item 10): decided from the optional model_family field, never from the deployment name; `unknown` applies while model_family is unset and adds config_warning model_family_unknown",
+         "properties": {"if_model_family_matches": {"type": "string"}, "then": {"$ref": "#/$defs/owner_value"}, "else": {"$ref": "#/$defs/owner_value"}, "unknown": {"$ref": "#/$defs/owner_value"}}}
+      ]
+    },
+    "model_family_source": {
+      "type": "object", "required": ["field", "first_release", "unknown_warning", "note"], "additionalProperties": false,
+      "description": "Where a provider whose model id hides the model family (Azure deployments) takes it from (Addendum A2 item 10).",
+      "properties": {"field": {"type": "string"}, "first_release": {"$ref": "#/$defs/release"}, "unknown_warning": {"type": "string"}, "note": {"type": "string"}}
+    },
+    "owner_block": {
+      "type": "object", "required": ["auto", "gateway", "provider", "none"], "additionalProperties": false,
+      "properties": {
+        "auto": {"$ref": "#/$defs/owner_auto"},
+        "gateway": {"$ref": "#/$defs/owner_outcome"},
+        "provider": {"$ref": "#/$defs/owner_outcome"},
+        "none": {"$ref": "#/$defs/owner_outcome"}
+      }
+    },
+    "lifecycle_rule": {
+      "type": "object",
+      "required": ["models", "warning_from", "shutdown", "replacement", "warning_code", "refusal_code", "default_move_by"],
+      "additionalProperties": false,
+      "properties": {
+        "models": {"type": "string", "description": "regular expression over the resolved model id"},
+        "warning_from": {"$ref": "#/$defs/nullable_date"},
+        "shutdown": {"$ref": "#/$defs/date"},
+        "replacement": {"type": ["string", "null"]},
+        "warning_code": {"enum": ["model_retiring", "provider_sunset"]},
+        "refusal_code": {"enum": ["model_retired", "provider_retired"]},
+        "default_move_by": {"$ref": "#/$defs/nullable_date"},
+        "registry_removal": {"type": "string"},
+        "note": {"type": "string"}
+      }
+    },
+    "related_lifecycle": {
+      "type": "object", "required": ["item", "shutdown", "warning_from", "replacement", "action", "code_ref"], "additionalProperties": false,
+      "properties": {
+        "item": {"type": "string"}, "shutdown": {"$ref": "#/$defs/nullable_date"}, "warning_from": {"$ref": "#/$defs/nullable_date"},
+        "warning_from_note": {"type": "string"}, "replacement": {"type": ["string", "null"]}, "action": {"type": "string"}, "code_ref": {"type": ["string", "null"]},
+        "warning_code": {"enum": ["model_retiring", "provider_sunset"]}, "refusal_code": {"enum": ["model_retired", "provider_retired"]}
+      }
+    },
+    "lifecycle": {
+      "type": "object", "required": ["rules"], "additionalProperties": false,
+      "properties": {
+        "provider_level": {"type": "boolean"},
+        "rules": {"type": "array", "items": {"$ref": "#/$defs/lifecycle_rule"}},
+        "related": {"type": "array", "items": {"$ref": "#/$defs/related_lifecycle"}},
+        "note": {"type": "string"}
+      }
+    },
+    "outcome": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "regime": {"$ref": "#/$defs/regime"},
+        "variant": {"enum": ["full", "half_cascade", null]},
+        "front": {"enum": ["local", "narrator_templates", "narrator_front_model", "provider"]},
+        "filler_owner": {"$ref": "#/$defs/owner_value"},
+        "backchannel_owner": {"$ref": "#/$defs/owner_value"},
+        "idle_owner": {"$ref": "#/$defs/owner_value"},
+        "truth": {"enum": ["enforced", "monitored"]},
+        "refusal": {"$ref": "#/$defs/refusal_code"},
+        "alternative": {"type": ["string", "null"]},
+        "warning": {"type": "string"},
+        "downgraded": {"type": "boolean"}
+      }
+    },
+    "expected": {
+      "type": "object",
+      "required": ["auto_with_truth_ack", "auto_without_truth_ack", "voice_owner_gateway", "truth_enforced", "forced", "interaction_release"],
+      "additionalProperties": false,
+      "properties": {
+        "auto_with_truth_ack": {"$ref": "#/$defs/outcome"},
+        "auto_without_truth_ack": {"$ref": "#/$defs/outcome"},
+        "voice_owner_gateway": {"$ref": "#/$defs/outcome"},
+        "truth_enforced": {"$ref": "#/$defs/outcome"},
+        "forced": {"type": "object", "required": ["cascade", "provider_speech", "delegating"], "additionalProperties": false,
+          "properties": {"cascade": {"$ref": "#/$defs/outcome"}, "provider_speech": {"$ref": "#/$defs/outcome"}, "delegating": {"$ref": "#/$defs/outcome"}}},
+        "interaction_release": {"type": "object", "required": ["non_bud", "bud", "phone_and_rooms"], "additionalProperties": false,
+          "properties": {"non_bud": {"$ref": "#/$defs/release"}, "bud": {"$ref": "#/$defs/release"}, "phone_and_rooms": {"$ref": "#/$defs/release"}, "phone_and_rooms_if_echo_gates_fail": {"$ref": "#/$defs/release"}}}
+      }
+    },
+    "evidence_ref": {"type": "object", "required": ["file", "section"], "additionalProperties": false, "properties": {"file": {"type": "string"}, "section": {"type": "string"}}},
+    "provider": {
+      "type": "object",
+      "required": ["id", "provider_id", "display_name", "kind", "model_family", "model_patterns", "default_model", "registered_today", "available_from_release", "ownership", "verbs", "background", "native_mechanisms", "owners", "activity", "session_limits", "relay", "lifecycle", "truth", "expected", "sources"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {"type": "string", "pattern": "^[a-z0-9_.-]+$"},
+        "provider_id": {"type": "string", "pattern": "^[a-z0-9_]+$"},
+        "display_name": {"type": "string"},
+        "kind": {"enum": ["cascade", "speech_to_speech", "native_duplex"]},
+        "model_family": {"type": "string"},
+        "model_patterns": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+        "default_model": {"type": ["string", "null"]},
+        "registered_today": {"type": "boolean"},
+        "available_from_release": {"$ref": "#/$defs/release"},
+        "ownership": {"$ref": "#/$defs/ownership"},
+        "verbs": {"$ref": "#/$defs/verbs"},
+        "background": {"$ref": "#/$defs/background"},
+        "native_mechanisms": {"type": "object", "required": ["filler", "backchannel", "idle"], "additionalProperties": false,
+          "properties": {"filler": {"$ref": "#/$defs/mechanism"}, "backchannel": {"$ref": "#/$defs/mechanism"}, "idle": {"$ref": "#/$defs/mechanism"}}},
+        "owners": {"type": "object", "required": ["filler", "backchannel", "idle"], "additionalProperties": false,
+          "properties": {"filler": {"$ref": "#/$defs/owner_block"}, "backchannel": {"$ref": "#/$defs/owner_block"}, "idle": {"$ref": "#/$defs/owner_block"}}},
+        "activity": {"type": "object", "required": ["user_speech_edges", "user_transcripts", "responding_end", "busy_signal"], "additionalProperties": false,
+          "properties": {"user_speech_edges": {"type": "string"}, "user_transcripts": {"type": "string"}, "responding_end": {"type": "string"}, "busy_signal": {"type": "boolean"}}},
+        "session_limits": {"type": "object", "required": ["max_session", "max_connection", "resume", "mid_session_update"], "additionalProperties": false,
+          "properties": {"max_session": {"type": ["string", "null"]}, "max_connection": {"type": ["string", "null"]}, "resume": {"type": "string"}, "mid_session_update": {"type": "string"}}},
+        "relay": {"type": "object", "required": ["mode", "depth", "description"], "additionalProperties": false,
+          "properties": {"mode": {"enum": ["verbatim_streamed", "native_exact_streamed", "guided_checked", "gateway_clips", "whole_reworded", "none"]}, "depth": {"type": ["integer", "null"]}, "description": {"type": "string"}}},
+        "lifecycle": {"$ref": "#/$defs/lifecycle"},
+        "truth": {"type": "object", "required": ["regime_truth", "relay", "note"], "additionalProperties": false,
+          "properties": {"regime_truth": {"enum": ["enforced", "monitored"]}, "relay": {"enum": ["verbatim", "exact_words_checked", "verbatim_provider_voice", "gateway_clip", "verified_paraphrase", "none"]}, "note": {"type": "string"}}},
+        "surface_refusals": {"type": "object", "additionalProperties": {"$ref": "#/$defs/refusal_code"}},
+        "model_family_source": {"$ref": "#/$defs/model_family_source"},
+        "native_duplex_requires": {"type": "array", "items": {"type": "string"}},
+        "expected": {"$ref": "#/$defs/expected"},
+        "sources": {"type": "object", "required": ["evidence", "code"], "additionalProperties": false,
+          "properties": {"evidence": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/evidence_ref"}}, "code": {"type": "array", "items": {"type": "string"}}}}
+      }
+    },
+    "exception": {
+      "type": "object", "required": ["exception", "release_or_refusal", "sign_off", "source"], "additionalProperties": false,
+      "properties": {"exception": {"type": "string"}, "release_or_refusal": {"type": "string"}, "sign_off": {"type": "string"}, "source": {"type": "string"}}
+    }
+  }
+}

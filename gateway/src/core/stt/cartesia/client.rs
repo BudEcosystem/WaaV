@@ -447,7 +447,8 @@ impl CartesiaSTT {
         // does not immediately complete.
         self.intentional_disconnect.store(false, Ordering::SeqCst);
 
-        let ws_url = config.build_websocket_url(&config.base.api_key);
+        let ws_url = config.build_websocket_url();
+        let auth = config.auth_header();
 
         // Create channels for communication (bounded for backpressure on audio)
         let (ws_tx, ws_rx) = mpsc::channel::<CartesiaOutbound>(32);
@@ -468,6 +469,9 @@ impl CartesiaSTT {
         // signal that fires on the first successful connect.
         let outbound_rx = Arc::new(Mutex::new(ws_rx));
         let connected_tx = Arc::new(Mutex::new(Some(connected_tx)));
+        // The last dial error, so a refused handshake reaches the caller with Cartesia's reason.
+        let dial_error = Arc::new(parking_lot::Mutex::new(None::<String>));
+        let dial_error_seen = Arc::clone(&dial_error);
 
         // Storm control + provider breaker: drive the GENERIC ReconnectableStream supervisor (the
         // same one the chaos tests exercise) with the shared process-global handles from CoreState
@@ -494,14 +498,27 @@ impl CartesiaSTT {
             let exit = supervisor
                 .run(|| {
                     let ws_url = ws_url.clone();
+                    let auth = auth.clone();
                     let outbound_rx = Arc::clone(&outbound_rx);
                     let shutdown_token = shutdown_token.clone();
                     let connected_tx = Arc::clone(&connected_tx);
                     let result_tx = result_tx.clone();
                     let error_tx = error_tx.clone();
+                    let dial_error = Arc::clone(&dial_error);
                     async move {
+                        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+                        let mut request = ws_url
+                            .as_str()
+                            .into_client_request()
+                            .map_err(|e| StreamError::new(format!("invalid Cartesia URL: {e}")))?;
+                        if let Some((name, key)) = auth {
+                            let value = key.parse().map_err(|_| {
+                                StreamError::new("the Cartesia API key is not a valid header value")
+                            })?;
+                            request.headers_mut().insert(name, value);
+                        }
                         let (ws_stream, _) =
-                            with_timeout(WS_CONNECT_TIMEOUT, connect_async(&ws_url))
+                            with_timeout(WS_CONNECT_TIMEOUT, connect_async(request))
                                 .await
                                 .map_err(|_| {
                                     StreamError::new(format!(
@@ -510,7 +527,9 @@ impl CartesiaSTT {
                                     ))
                                 })?
                                 .map_err(|e| {
-                                    StreamError::new(format!("Failed to connect to Cartesia: {e}"))
+                                    let message = format!("Failed to connect to Cartesia: {e}");
+                                    *dial_error.lock() = Some(message.clone());
+                                    StreamError::new(message)
                                 })?;
                         info!("Connected to Cartesia WebSocket");
                         let (ws_sink, ws_stream) = ws_stream.split();
@@ -577,9 +596,17 @@ impl CartesiaSTT {
                 Ok(())
             }
             Ok(Err(_)) => {
-                let error_msg = "Connection channel closed".to_string();
+                let refused = dial_error_seen.lock().take();
+                let error_msg = refused
+                    .clone()
+                    .unwrap_or_else(|| "Connection channel closed".to_string());
                 self.state = ConnectionState::Error(error_msg.clone());
-                Err(STTError::ConnectionFailed(error_msg))
+                Err(match refused {
+                    Some(m) if m.contains("401") || m.contains("403") => {
+                        STTError::AuthenticationFailed(m)
+                    }
+                    _ => STTError::ConnectionFailed(error_msg),
+                })
             }
             Err(_) => {
                 let error_msg = "Connection timeout".to_string();

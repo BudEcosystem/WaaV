@@ -119,10 +119,19 @@ impl WsTransport for ElevenLabsTransport {
                                 &mut self.session_id,
                             ) {
                                 error!("ElevenLabs streaming error: {}", e);
+                                // A refused key or configuration is this session's to fix: not
+                                // retried, and kept off the shared breaker. Anything else from
+                                // the provider is fatal as before.
+                                let refused = matches!(
+                                    e,
+                                    STTError::AuthenticationFailed(_) | STTError::ConfigurationError(_)
+                                );
                                 let _ = self.error_tx.try_send(e);
-                                // A provider-level streaming error is typically fatal (bad config
-                                // / auth); do not hammer it with reconnects.
-                                return ReconnectOutcome::Fatal(StreamError::new("provider error frame"));
+                                return if refused {
+                                    ReconnectOutcome::Refused(StreamError::new("provider refused the session"))
+                                } else {
+                                    ReconnectOutcome::Fatal(StreamError::new("provider error frame"))
+                                };
                             }
                             // Signal connection ready after the first session_started.
                             if self.session_id.is_some()
@@ -588,6 +597,16 @@ impl ElevenLabsSTT {
 
             Message::Close(close_frame) => {
                 info!("ElevenLabs WebSocket closed: {:?}", close_frame);
+                // A policy close names what ElevenLabs refused (`invalid_request` for a language
+                // it does not take): the session's configuration, not the connection.
+                if let Some(frame) = close_frame
+                    && frame.code == tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy
+                {
+                    return Err(STTError::ConfigurationError(format!(
+                        "ElevenLabs refused the session: {}",
+                        frame.reason
+                    )));
+                }
             }
 
             Message::Ping(_) => {
@@ -1096,6 +1115,30 @@ impl ElevenLabsSTT {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ElevenLabs closes a session whose language it does not take with a policy close
+    /// (`invalid_request`): that is the session's configuration refused, not a dropped line.
+    #[test]
+    fn a_policy_close_is_a_refused_configuration() {
+        use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+        use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+        let (tx, _rx) = mpsc::channel(1);
+        let mut sid = None;
+        let close = |code| {
+            Message::Close(Some(CloseFrame {
+                code,
+                reason: "invalid_request".into(),
+            }))
+        };
+        match ElevenLabsSTT::handle_websocket_message(close(CloseCode::Policy), &tx, &mut sid) {
+            Err(STTError::ConfigurationError(m)) => assert!(m.contains("invalid_request"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            ElevenLabsSTT::handle_websocket_message(close(CloseCode::Normal), &tx, &mut sid)
+                .is_ok()
+        );
+    }
 
     // W-D1 disconnect-vs-close race: the supervisor-shared intentional-disconnect flag must be set
     // by disconnect() so a client close racing a server-side close can never trigger a spurious

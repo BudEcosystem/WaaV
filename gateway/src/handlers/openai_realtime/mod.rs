@@ -19,6 +19,7 @@ pub mod cascade;
 pub mod client_secrets;
 pub mod facade;
 pub mod handshake;
+mod interaction;
 pub mod metering;
 pub mod policy;
 pub mod session;

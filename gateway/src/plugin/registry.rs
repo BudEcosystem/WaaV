@@ -385,8 +385,13 @@ impl PluginRegistry {
     pub fn create_realtime(
         &self,
         provider: &str,
-        config: RealtimeConfig,
+        mut config: RealtimeConfig,
     ) -> RealtimeResult<Box<dyn BaseRealtime>> {
+        // The operator's provider fixes reach every surface's session (`/realtime`, the
+        // `/v1/realtime` facade, DAG nodes) here; a caller that stamped its own keeps them.
+        if config.provider_fixes.is_empty() && !config.provider_fixes_decided {
+            config.provider_fixes = crate::core::interaction::config::provider_fixes();
+        }
         // Use PHF for O(1) canonical name resolution (handles aliases + case insensitivity)
         let id = resolve_realtime_provider(provider)
             .map(|p| p.canonical_name().to_string())

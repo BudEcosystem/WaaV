@@ -17,8 +17,14 @@ import type {
   VadEventMessage,
 } from '../types/messages.js';
 import type { ConfigWarningEvent, SttWarningEvent } from '../types/warnings.js';
-import { PROTOCOL_VERSION } from '../types/messages.js';
+import { PROTOCOL_VERSION, KNOWN_PROTOCOL_VERSIONS } from '../types/messages.js';
 import { toVoiceAgentConfig, type VoiceAgentConfig } from '../types/agent.js';
+import {
+  isInteractionEvent,
+  type InteractionConfig,
+  type InteractionEcho,
+  type TaskAnswerOutcome,
+} from '../types/interaction.js';
 import type { MetricsSummary } from '../types/metrics.js';
 import { getMetricsCollector, MetricsCollector } from '../metrics/collector.js';
 import { WebSocketConnection, DEFAULT_CONNECT_TIMEOUT_MS, type ConnectionState } from './connection.js';
@@ -91,6 +97,13 @@ export interface SessionConfig {
   streamId?: string;
   /** Enable audio processing (STT/TTS). Defaults to true (gateway default). */
   audio?: boolean;
+  /**
+   * Interaction mode (protocol 1.1): `true` for the defaults or an object of settings
+   * (`gateway/docs/interaction_mode.md`), sent as-is; `false` turns off an alias's or the
+   * server's default block. When the gateway runs it, `ready` carries the resolved settings
+   * (`ReadyEvent.interaction`) and the session emits `interaction` events.
+   */
+  interaction?: boolean | InteractionConfig;
   /** Feature flags */
   features?: FeatureFlags;
   /**
@@ -553,6 +566,11 @@ export class WebSocketSession {
       case 'config_warning':
         this.handleConfigWarning(message as ConfigWarningMessage);
         break;
+      case 'heartbeat':
+        // Interaction mode: the gateway says it is alive after 5 s of nothing else, so a
+        // quiet wait does not look like a dead socket to the browser watchdog (which cannot
+        // ping). The inbound frame above is all it is for.
+        break;
       case 'vad_event':
         this.handleVadEvent(message as VadEventMessage);
         break;
@@ -560,6 +578,12 @@ export class WebSocketSession {
         // Mid-call and non-fatal: a typed `sttWarning`, NEVER `error` (clients treat `error` as a
         // disconnect).
         this.handleSttWarning(message as SttWarningMessage);
+        break;
+      default:
+        // Interaction mode (protocol 1.1): task, floor, audio, settings and transcript events.
+        if (isInteractionEvent(message as unknown as Record<string, unknown>)) {
+          this.emitter.emit('interaction', message as Parameters<SessionEventHandler<'interaction'>>[0]);
+        }
         break;
       // NOTE: the gateway never sends a JSON `pong` (verified: no JSON ping op).
       // Native WS pong control frames are handled out-of-band by the liveness
@@ -643,6 +667,7 @@ export class WebSocketSession {
     // downgrade — if `opus` was requested but the gateway echoes `linear16`, send/decode linear16.
     if (message.audio_in_codec !== undefined) event.audioInCodec = message.audio_in_codec;
     if (message.audio_out_codec !== undefined) event.audioOutCodec = message.audio_out_codec;
+    if (message.interaction !== undefined) event.interaction = message.interaction;
     // Segmented STT: what speech-to-text the session got (absent when the rollout does not cover it).
     if (message.stt !== undefined) event.stt = message.stt;
 
@@ -654,7 +679,7 @@ export class WebSocketSession {
     // grade by SEVERITY: a MAJOR mismatch (e.g. gateway 2.x vs SDK 1.x) is a
     // breaking, recoverable error event; a minor/patch drift (same major) is a
     // softer configWarning so a forward-compatible bump isn't alarming.
-    if (message.protocol_version !== undefined && message.protocol_version !== PROTOCOL_VERSION) {
+    if (message.protocol_version !== undefined && !KNOWN_PROTOCOL_VERSIONS.includes(message.protocol_version)) {
       const gwMajor = majorOf(message.protocol_version);
       const sdkMajor = majorOf(PROTOCOL_VERSION);
       if (gwMajor !== sdkMajor) {
@@ -809,6 +834,7 @@ export class WebSocketSession {
       this.config.alias !== undefined ||
       this.config.agent !== undefined ||
       this.config.audio !== undefined ||
+      this.config.interaction !== undefined ||
       this.config.streamId !== undefined;
     if (hasConfig) {
       const configMessage = createConfigMessage(
@@ -824,6 +850,7 @@ export class WebSocketSession {
           agent: this.config.agent !== undefined ? toVoiceAgentConfig(this.config.agent) : undefined,
           streamId: this.config.streamId,
           audio: this.config.audio,
+          interaction: this.config.interaction,
         }
       );
       this.send(configMessage);
@@ -1094,6 +1121,59 @@ export class WebSocketSession {
    */
   sendMessage(message: string, role: string, options?: { topic?: string; debug?: Record<string, unknown> }): void {
     this.send(createSendMessageMessage(message, role, options));
+  }
+
+  // ---- interaction mode (protocol 1.1)
+
+  /**
+   * Answer a `task_question` from the client (`task_answer`). `value` goes with `accept` (the
+   * chosen option, the value, or a form's fields); `correction` with `decline`. The gateway
+   * replies with `task_answer_received` (`by: "client"`), or an `error` with code
+   * `question_closed` / `unknown_request_id`.
+   */
+  answerTask(
+    requestId: string,
+    outcome: TaskAnswerOutcome = 'accept',
+    options?: { value?: unknown; correction?: string }
+  ): void {
+    this.send({
+      type: 'task_answer',
+      request_id: requestId,
+      outcome,
+      ...(options?.value !== undefined ? { value: options.value } : {}),
+      ...(options?.correction !== undefined ? { correction: options.correction } : {}),
+    });
+  }
+
+  /** Cancel a task (`task_cancel`); `task_cancelled` follows once it is confirmed. */
+  cancelTask(taskId: string): void {
+    this.send({ type: 'task_cancel', task_id: taskId });
+  }
+
+  /** The caller read the task's result on the screen (`task_seen`): its spoken update is dropped. */
+  markTaskSeen(taskId: string): void {
+    this.send({ type: 'task_seen', task_id: taskId });
+  }
+
+  /**
+   * Change interaction settings mid-session (`interaction_update`). The reply is an
+   * `interaction_updated` event listing what was applied and what was refused.
+   */
+  updateInteraction(patch: InteractionConfig): void {
+    this.send({ type: 'interaction_update', patch });
+  }
+
+  /**
+   * Report how much of an utterance the client has played (`playback_position`), at most four
+   * times a second. From the first report on, what the caller heard is what the client reports.
+   */
+  reportPlayback(utteranceId: string, playedMs: number): void {
+    this.send({ type: 'playback_position', utterance_id: utteranceId, played_ms: Math.max(0, Math.round(playedMs)) });
+  }
+
+  /** The resolved interaction settings of the last `ready`, or undefined without the mode. */
+  getInteraction(): InteractionEcho | undefined {
+    return this.lastReadyEvent?.interaction;
   }
 
   /**

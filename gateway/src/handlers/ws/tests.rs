@@ -113,6 +113,7 @@ fn test_incoming_message_serialization() {
         conversation_config: None,
         agent: None,
         alias: None,
+        interaction: None,
     };
 
     let json = serde_json::to_string(&config_msg).unwrap();
@@ -324,6 +325,7 @@ fn test_outgoing_message_serialization() {
         resolved_alias: None,
         audio_in_codec: None,
         audio_out_codec: None,
+        interaction: None,
     };
     let json = serde_json::to_string(&ready_msg).unwrap();
     assert!(json.contains("\"type\":\"ready\""));
@@ -340,6 +342,7 @@ fn test_outgoing_message_serialization() {
         resolved_alias: None,
         audio_in_codec: None,
         audio_out_codec: None,
+        interaction: None,
     };
     let json_with_livekit = serde_json::to_string(&ready_msg_with_livekit).unwrap();
     assert!(json_with_livekit.contains("\"type\":\"ready\""));
@@ -356,14 +359,17 @@ fn test_outgoing_message_serialization() {
         confidence: 0.95,
         segment_transcript: None,
         translations: Vec::new(),
+        detected_language: None,
     };
 
     let json = serde_json::to_string(&stt_msg).unwrap();
     assert!(json.contains("\"type\":\"stt_result\""));
     assert!(json.contains("Hello world"));
     assert!(json.contains("0.95"));
-    // Empty translations are skipped on the wire (no-translation sessions unchanged).
+    // Empty translations and no detected language are skipped on the wire (sessions without
+    // them unchanged).
     assert!(!json.contains("translations"));
+    assert!(!json.contains("detected_language"));
 
     // With translations populated, the uniform `translations:[{lang,text}]` array
     // is serialized onto the stt_result frame.
@@ -378,8 +384,10 @@ fn test_outgoing_message_serialization() {
             text: "Hola mundo".to_string(),
             is_partial: false,
         }],
+        detected_language: Some("de".to_string()),
     };
     let json = serde_json::to_string(&stt_with_translation).unwrap();
+    assert!(json.contains("\"detected_language\":\"de\""));
     assert!(json.contains("\"translations\":[{"));
     assert!(json.contains("\"lang\":\"es-ES\""));
     assert!(json.contains("\"text\":\"Hola mundo\""));
@@ -817,6 +825,7 @@ fn test_incoming_message_config_with_livekit() {
         conversation_config: None,
         agent: None,
         alias: None,
+        interaction: None,
     };
 
     let json = serde_json::to_string(&config_msg).unwrap();
@@ -875,6 +884,7 @@ fn test_incoming_message_config_without_livekit() {
         conversation_config: None,
         agent: None,
         alias: None,
+        interaction: None,
     };
 
     let json = serde_json::to_string(&config_msg).unwrap();
@@ -1208,6 +1218,7 @@ fn test_config_message_without_livekit_routing() {
         conversation_config: None,
         agent: None,
         alias: None,
+        interaction: None,
     };
 
     let json = serde_json::to_string(&config_msg).unwrap();
@@ -1283,6 +1294,7 @@ fn test_config_message_with_livekit_routing() {
         conversation_config: None,
         agent: None,
         alias: None,
+        interaction: None,
     };
 
     let json = serde_json::to_string(&config_msg).unwrap();
@@ -1475,6 +1487,7 @@ fn test_config_message_audio_disabled() {
         conversation_config: None,
         agent: None,
         alias: None,
+        interaction: None,
     };
 
     let json = serde_json::to_string(&config_msg).unwrap();
@@ -1557,6 +1570,7 @@ fn test_config_message_audio_default() {
         conversation_config: None,
         agent: None,
         alias: None,
+        interaction: None,
     };
 
     let json = serde_json::to_string(&config_msg).unwrap();

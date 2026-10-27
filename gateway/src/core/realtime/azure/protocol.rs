@@ -10,7 +10,8 @@
 
 use super::super::openai::protocol::OpenAiProtocol;
 use crate::core::realtime::base::{
-    RealtimeConfig, RealtimeError, RealtimeResponseOverride, RealtimeResult, ReplayConversationItem,
+    RealtimeConfig, RealtimeError, RealtimeResponseOverride, RealtimeResult, RealtimeVerb,
+    ReplayConversationItem,
 };
 use crate::core::realtime::openai::ClientEvent;
 use crate::core::realtime::scaffold::{
@@ -36,6 +37,8 @@ pub struct AzureProtocol {
     /// The Azure deployment name (Azure routes by deployment, not model). Taken
     /// verbatim from `cfg.model` — Azure deployment names are arbitrary strings.
     deployment: String,
+    /// Provider fix `azure_ga_url`: the GA path takes the deployment as `model=`.
+    ga_url: bool,
 }
 
 impl AzureProtocol {
@@ -69,6 +72,14 @@ impl AzureProtocol {
                 format!("{trimmed}.openai.azure.com")
             }
         };
+        // Microsoft (realtime-audio-websockets, read 24 October 2026): "Use the
+        // `/openai/v1/realtime` path with `model=` as the query parameter. Don't include an
+        // `api-version` parameter." (fix `azure_ga_url`).
+        if self.ga_url {
+            let deployment: String =
+                url::form_urlencoded::byte_serialize(self.deployment.as_bytes()).collect();
+            return format!("wss://{host}{AZURE_REALTIME_PATH}?model={deployment}");
+        }
         format!(
             "wss://{host}{AZURE_REALTIME_PATH}?deployment={deployment}",
             deployment = self.deployment,
@@ -114,6 +125,7 @@ impl RealtimeProtocol for AzureProtocol {
             inner,
             resource,
             deployment,
+            ga_url: cfg.fix("azure_ga_url"),
         })
     }
 
@@ -160,6 +172,14 @@ impl RealtimeProtocol for AzureProtocol {
         self.inner.build_session_config(cfg, resumption)
     }
 
+    fn session_update(
+        &self,
+        old: &RealtimeConfig,
+        new: &RealtimeConfig,
+    ) -> Option<Vec<Self::Wire>> {
+        self.inner.session_update(old, new)
+    }
+
     fn map_server_event(&self, raw: Inbound<'_>) -> Vec<S2sEvent> {
         self.inner.map_server_event(raw)
     }
@@ -198,6 +218,12 @@ impl RealtimeProtocol for AzureProtocol {
 
     fn replay_item(&self, item: &ReplayConversationItem) -> Vec<Self::Wire> {
         self.inner.replay_item(item)
+    }
+
+    /// Azure's GA quickstarts send OpenAI's `conversation.item.create`, `response.create` and
+    /// `response.cancel`: the interaction verbs are OpenAI's.
+    fn verb(&self, verb: &RealtimeVerb<'_>) -> Option<Vec<Self::Wire>> {
+        self.inner.verb(verb)
     }
 
     fn serialize(&self, msg: &Self::Wire) -> RealtimeResult<OutFrame> {
@@ -358,5 +384,60 @@ mod tests {
             OutFrame::Binary(_) => panic!("text frame expected"),
         };
         assert!(append_json.contains("input_audio_buffer.append"));
+    }
+
+    /// Fix `azure_ga_url`: the GA path takes the deployment as `model=` (Microsoft: "Use the
+    /// `/openai/v1/realtime` path with `model=` as the query parameter. Don't include an
+    /// `api-version` parameter."; its example
+    /// `wss://my-eastus2-openai-resource.openai.azure.com/openai/v1/realtime?model=gpt-realtime-deployment-name`).
+    /// Without it today's `deployment=`.
+    #[test]
+    fn the_ga_url_fix_names_the_deployment_as_model() {
+        let url = |cfg: &RealtimeConfig| match proto(cfg).connect_spec(cfg).unwrap() {
+            ConnectSpec::WebSocket { url, .. } => url,
+            _ => panic!("expected a WebSocket"),
+        };
+        let fixed = |model: &str| RealtimeConfig {
+            model: model.into(),
+            endpoint: Some("my-eastus2-openai-resource".into()),
+            provider_fixes: vec!["azure_ga_url".into()],
+            ..base_cfg()
+        };
+        assert_eq!(
+            url(&fixed("gpt-realtime-deployment-name")),
+            "wss://my-eastus2-openai-resource.openai.azure.com/openai/v1/realtime?model=gpt-realtime-deployment-name"
+        );
+        assert!(url(&fixed("my deploy&x")).ends_with("?model=my+deploy%26x"));
+        assert!(url(&base_cfg()).ends_with("?deployment=gpt-realtime-deploy"));
+    }
+
+    /// Azure takes OpenAI's verbs and its fixes (the wire is OpenAI's): the update and the
+    /// verbs are the embedded protocol's.
+    #[test]
+    fn azure_sends_openais_verbs_and_updates() {
+        let p = proto(&base_cfg());
+        let verb = RealtimeVerb::AddContext("The booking is confirmed.");
+        assert_eq!(
+            p.verb(&verb).map(|w| w.len()),
+            p.inner().verb(&verb).map(|w| w.len())
+        );
+        assert!(p.verb(&RealtimeVerb::SayExact("x")).is_none());
+        let fixed = RealtimeConfig {
+            provider_fixes: vec!["openai_update_delta".into()],
+            ..base_cfg()
+        };
+        let mut new = fixed.clone();
+        new.instructions = Some("Be brief.".into());
+        let p = proto(&fixed);
+        let sent = p.session_update(&fixed, &new).unwrap();
+        let json = match p.serialize(&sent[0]).unwrap() {
+            OutFrame::Text(s) => s,
+            OutFrame::Binary(_) => panic!("text frame expected"),
+        };
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&json).unwrap(),
+            serde_json::json!({"type": "session.update",
+                               "session": {"type": "realtime", "instructions": "Be brief."}})
+        );
     }
 }

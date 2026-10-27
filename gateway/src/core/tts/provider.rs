@@ -16,6 +16,10 @@ use regex::Regex;
 use std::time::Duration;
 use xxhash_rust::xxh3::xxh3_128;
 
+/// Longest a request waits for a turn under the vendor account's concurrency limit when its
+/// config sets no request timeout.
+const ACCOUNT_WAIT_SECS: u64 = 30;
+
 /// A delivered audio payload: raw bytes plus an optional FORMAT OVERRIDE set
 /// when boundary sniffing (P0.1) proved the bytes are a container that differs
 /// from the declared format — the dispatcher then labels `AudioData` with the
@@ -222,6 +226,38 @@ pub trait TTSRequestBuilder: Send + Sync {
     /// Parse a successful response body and return the provider-hosted audio URL, when applicable.
     fn parse_provider_audio_url_response(&self, _body: &[u8]) -> TTSResult<Option<String>> {
         Ok(None)
+    }
+}
+
+/// Send a synthesis request. One that never reached the vendor (the connection could not be
+/// made: a fresh pool's first connection sometimes stalls past its connect timeout) is sent
+/// once more on a new connection; nothing was synthesised or billed. `None`: the synthesis
+/// was cleared first, and the request on the wire was dropped (its connection, pool client
+/// and account permit are free for the next line at once, not when the vendor answers).
+async fn send_once_more_if_unconnected<F, Fut>(
+    request: reqwest::Request,
+    token: &CancellationToken,
+    send: F,
+) -> Option<reqwest::Result<reqwest::Response>>
+where
+    F: Fn(reqwest::Request) -> Fut,
+    Fut: std::future::Future<Output = reqwest::Result<reqwest::Response>>,
+{
+    let sent = async {
+        let retry = request.try_clone();
+        let first = send(request).await;
+        match (first, retry) {
+            (Err(error), Some(again)) if error.is_connect() && !token.is_cancelled() => {
+                warn!("TTS request could not connect ({error}); sending it once more");
+                send(again).await
+            }
+            (first, _) => first,
+        }
+    };
+    tokio::select! {
+        biased;
+        _ = token.cancelled() => None,
+        sent = sent => Some(sent),
     }
 }
 
@@ -477,6 +513,43 @@ impl TTSProvider {
             }
         }
 
+        // The vendor account's own limit (WAAV_TTS_ACCOUNT_CONCURRENCY), shared by every
+        // session: a request over it waits its turn rather than drawing the vendor's 429.
+        let _account_permit = match crate::core::state::tts_account_permits(
+            &request_builder.get_config().provider,
+        ) {
+            Some(permits) => {
+                let wait = Duration::from_secs(
+                    request_builder
+                        .get_config()
+                        .request_timeout
+                        .unwrap_or(ACCOUNT_WAIT_SECS),
+                );
+                tokio::select! {
+                    biased;
+                    _ = token.cancelled() => {
+                        let _ = sender
+                            .send(Err(TTSError::InternalError("Cancelled".to_string())))
+                            .await;
+                        return;
+                    }
+                    permit = tokio::time::timeout(wait, permits.acquire_owned()) => match permit {
+                        Ok(Ok(permit)) => Some(permit),
+                        _ => {
+                            let _ = sender
+                                .send(Err(TTSError::Saturated(format!(
+                                    "the vendor account's concurrency limit stayed full for {} s",
+                                    wait.as_secs()
+                                ))))
+                                .await;
+                            return;
+                        }
+                    },
+                }
+            }
+            None => None,
+        };
+
         // Acquire a client from the pool
         let client_guard = match req_manager.acquire().await {
             Ok(guard) => guard,
@@ -536,8 +609,15 @@ impl TTSProvider {
             );
         }
 
-        // Send request
-        let response_result = client.execute(request).await;
+        let sent =
+            send_once_more_if_unconnected(request, &token, |request| client.execute(request)).await;
+        let Some(response_result) = sent else {
+            call.fail("cancelled", "cleared before the vendor answered");
+            let _ = sender
+                .send(Err(TTSError::InternalError("Cancelled".to_string())))
+                .await;
+            return;
+        };
 
         match response_result {
             Ok(response) => {
@@ -1320,17 +1400,7 @@ impl TTSProvider {
         // Notify dispatcher that a new request is available
         self.pending_notify.notify_one();
 
-        // OPTIMIZATION: Acquire cache-related locks together to reduce lock contention
-        let (cache_opt, config_hash_opt) = {
-            let cache_guard = self.cache.read().await;
-            let hash_guard = self.tts_config_hash.read().await;
-            (cache_guard.clone(), hash_guard.clone())
-        };
-
-        let cache_and_key = match (cache_opt, config_hash_opt) {
-            (Some(cache), Some(cfg_hash)) => Some((cache, format!("{cfg_hash}:{text_hash}"))),
-            _ => None,
-        };
+        let cache_and_key = self.cache_and_key(&text_hash).await;
 
         // Get request manager
         let req_mgr_opt = self.req_manager.read().await.clone();
@@ -1378,6 +1448,23 @@ impl TTSProvider {
         );
 
         Ok(())
+    }
+
+    /// The speech cache and the key of a text's audio in it (`text_hash` of the trimmed text).
+    async fn cache_and_key(&self, text_hash: &str) -> Option<(Arc<CacheStore>, String)> {
+        // Both locks together, to reduce contention.
+        let cache = self.cache.read().await.clone()?;
+        let cfg_hash = self.tts_config_hash.read().await.clone()?;
+        Some((cache, format!("{cfg_hash}:{text_hash}")))
+    }
+
+    /// Whether `text`'s audio is in the speech cache: speaking it asks the vendor nothing.
+    pub async fn has_cached(&self, text: &str) -> bool {
+        let text_hash = format!("{:032x}", xxh3_128(text.trim().as_bytes()));
+        match self.cache_and_key(&text_hash).await {
+            Some((cache, key)) => cache.exists(&key).await.unwrap_or(false),
+            None => false,
+        }
     }
 
     /// Generic clear implementation
@@ -1616,6 +1703,106 @@ fn engine_truncated_reply(headers: &reqwest::header::HeaderMap) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A request whose connection could not be made goes out once more, on a new connection;
+    /// one the vendor answered (even with an error) and a cancelled one do not.
+    #[tokio::test]
+    async fn a_request_that_could_not_connect_is_sent_once_more() {
+        use std::sync::atomic::AtomicUsize;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // A port nobody listens on yet: the first try is refused, then the vendor is there.
+        let port = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            probe.local_addr().unwrap().port()
+        };
+        let url = format!("http://127.0.0.1:{port}/v1/speech");
+        let client = reqwest::Client::new();
+        let tries = Arc::new(AtomicUsize::new(0));
+        let send = |request: reqwest::Request| {
+            let (client, tries) = (client.clone(), tries.clone());
+            async move {
+                let sent = client.execute(request).await;
+                if tries.fetch_add(1, Ordering::SeqCst) == 0 {
+                    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await;
+                    let listener = listener.expect("the port is still free");
+                    tokio::spawn(async move {
+                        while let Ok((mut stream, _)) = listener.accept().await {
+                            let mut buf = [0u8; 1024];
+                            let _ = stream.read(&mut buf).await;
+                            let reply = "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok";
+                            let _ = stream.write_all(reply.as_bytes()).await;
+                        }
+                    });
+                }
+                sent
+            }
+        };
+        let token = CancellationToken::new();
+        let request = client.post(&url).body("hello").build().unwrap();
+        let answered = send_once_more_if_unconnected(request, &token, send).await;
+        let answered = answered.expect("not cancelled").expect("the second try");
+        assert_eq!(answered.status(), 200);
+        assert_eq!(tries.load(Ordering::SeqCst), 2);
+
+        // An answer is never sent again.
+        let request = client.post(&url).body("hello").build().unwrap();
+        let answered = send_once_more_if_unconnected(request, &token, send).await;
+        assert!(answered.is_some_and(|answered| answered.is_ok()));
+        assert_eq!(tries.load(Ordering::SeqCst), 3);
+
+        // A request whose synthesis was cancelled is not sent again: the refused connection of
+        // a clear that came while it was being made is the end of it.
+        let closed = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            probe.local_addr().unwrap().port()
+        };
+        let cancelled = CancellationToken::new();
+        let request = client
+            .post(format!("http://127.0.0.1:{closed}/"))
+            .build()
+            .unwrap();
+        let sent = AtomicUsize::new(0);
+        let refused = send_once_more_if_unconnected(request, &cancelled, |request| {
+            sent.fetch_add(1, Ordering::SeqCst);
+            cancelled.cancel();
+            client.execute(request)
+        })
+        .await;
+        assert!(refused.is_none());
+        assert_eq!(sent.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_cleared_synthesis_drops_its_request_without_waiting_for_the_vendor() {
+        use tokio::io::AsyncReadExt;
+        // A vendor that takes the request and never answers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1/speech", listener.local_addr().unwrap());
+        let (closed_tx, closed) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            while matches!(stream.read(&mut buf).await, Ok(n) if n > 0) {}
+            let _ = closed_tx.send(());
+        });
+        let client = reqwest::Client::new();
+        let token = CancellationToken::new();
+        let clear = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            clear.cancel();
+        });
+        let request = client.post(&url).body("hello").build().unwrap();
+        let started = std::time::Instant::now();
+        let sent = send_once_more_if_unconnected(request, &token, |r| client.execute(r)).await;
+        assert!(sent.is_none(), "cleared");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        // The connection is closed: the vendor sees the request go.
+        tokio::time::timeout(Duration::from_secs(2), closed)
+            .await
+            .expect("the vendor's connection closed")
+            .unwrap();
+    }
 
     #[test]
     fn pcm_stream_chunk_bytes_never_returns_zero_for_pcm_family() {

@@ -81,6 +81,42 @@ impl DAGDefinition {
         }
     }
 
+    /// Whether the graph produces audio for the caller: an audio output, a text-to-speech
+    /// node or a speech-to-speech node. Interaction mode speaks for the session itself, so
+    /// such a graph cannot be its background.
+    pub fn has_audio_output(&self) -> bool {
+        self.nodes.iter().any(|node| {
+            matches!(
+                node.node_type,
+                NodeType::AudioOutput { .. }
+                    | NodeType::TtsProvider { .. }
+                    | NodeType::RealtimeProvider { .. }
+            )
+        })
+    }
+
+    /// Whether the graph ends in text for the caller (a `text_output` node).
+    pub fn has_text_output(&self) -> bool {
+        let text = |node: &NodeDefinition| matches!(node.node_type, NodeType::TextOutput { .. });
+        self.nodes.iter().any(text)
+    }
+
+    /// Whether a run of the graph may call something outside the gateway other than its
+    /// models: an endpoint node or a webhook.
+    pub fn has_endpoints(&self) -> bool {
+        self.nodes.iter().any(|node| {
+            matches!(
+                node.node_type,
+                NodeType::HttpEndpoint { .. }
+                    | NodeType::GrpcEndpoint { .. }
+                    | NodeType::WebSocketEndpoint { .. }
+                    | NodeType::IpcEndpoint { .. }
+                    | NodeType::LiveKitEndpoint { .. }
+                    | NodeType::WebhookOutput { .. }
+            )
+        })
+    }
+
     /// Give every `tts_provider` node that no edge reads an `audio_output` to the session, so a
     /// graph that ends in speech (`stt → llm → tts`) is heard. A `tts_provider` returns its audio
     /// as its result; only an output node delivers to the client, so without this the audio of
