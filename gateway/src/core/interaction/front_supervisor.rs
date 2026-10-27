@@ -563,9 +563,15 @@ mod tests {
         assert!(!alive(gone_pid as i32));
         let mut stale = spawn_sleep();
         let mut kept = spawn_sleep();
-        // The command line's first word as spawned. Not read from /proc at once: right after
-        // spawn the new program's arguments may not be set up yet, and it reads empty.
         let sleep_program = "sleep";
+        // Right after spawn, /proc/<pid>/cmdline can read empty while exec still sets up the new
+        // program's arguments (a front server an earlier gateway left is long past that).
+        let until = Instant::now() + Duration::from_secs(5);
+        while program_of(stale.id() as i32).as_deref() != Some(sleep_program)
+            && Instant::now() < until
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let write = |name: &str, child: u32, gateway: u32| {
             let dir = root.path().join(name);
             std::fs::create_dir(&dir).expect("made");
