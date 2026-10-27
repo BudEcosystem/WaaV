@@ -24,6 +24,13 @@ Interaction mode is opt-in: it runs only when the server sets `interaction.enabl
 - **Deepgram.** Flux (`flux-general-en`) on `/v2/listen`, language codes each model accepts, file-only `whisper-*` models refused with a clear error, `Finalize` at the gateway's end of turn, and per-model circuit breakers for the Voice Agent.
 - **Other providers.** `POST /speak` streams its audio; ElevenLabs streaming synthesis; vendor rate limits and refusals reach the client with their status; retiring OpenAI and Hume models get a warning before their shutdown date and are refused after it.
 
+### Also in this release (merged to main after 1.0.0)
+
+- **Smallest.ai** synthesizes with Lightning v3.1; every earlier model is retired by the vendor (410) (#43).
+- **SDKs.** Browser WebSockets send the key as a subprotocol instead of `?token=`, and the SDKs reach every gateway config field (#42).
+- **Dependencies.** RUSTSEC-2026-0395 to 0410 fixed (zstd-safe 5.0.2, zstd-sys 2.0.16); the libwebrtc download unpacks with deflate only (#39).
+- **CI and tests.** Every network wait and job in CI is bounded (#40); live-vendor tests treat an empty key as unset (#38).
+
 ### Documentation
 
 - `docs/interaction_mode.md`: the full reference of interaction mode, its settings, events, messages, provider fixes and known limits.
