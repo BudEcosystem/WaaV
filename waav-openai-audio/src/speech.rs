@@ -284,8 +284,13 @@ pub struct SpeechSettings {
 /// A vendor that does not publish these gets the name forwarded verbatim, and will usually
 /// reject it — which is the correct outcome and a legible error, rather than silently
 /// substituting a voice the caller did not ask for.
+/// OpenAI's built-in voices for `/v1/audio/speech`. `tts-1` and `tts-1-hd` take all but `ballad`,
+/// `verse`, `marin` and `cedar`; `gpt-4o-mini-tts` takes every one, and OpenAI recommends `marin`
+/// and `cedar` (<https://platform.openai.com/docs/guides/text-to-speech>). The gateway's
+/// `OpenAIVoice::all()` is held to this list by a test.
 pub const OPENAI_VOICES: &[&str] = &[
     "alloy", "ash", "ballad", "coral", "echo", "fable", "onyx", "nova", "sage", "shimmer", "verse",
+    "marin", "cedar",
 ];
 
 pub fn is_openai_voice(voice: &str) -> bool {
@@ -513,8 +518,9 @@ mod tests {
     fn openai_voice_names_are_recognised() {
         assert!(is_openai_voice("alloy"));
         assert!(is_openai_voice("verse"));
+        assert!(is_openai_voice("marin") && is_openai_voice("cedar"));
         assert!(!is_openai_voice("aura-asteria-en"));
-        assert_eq!(OPENAI_VOICES.len(), 11);
+        assert_eq!(OPENAI_VOICES.len(), 13);
     }
 
     #[test]

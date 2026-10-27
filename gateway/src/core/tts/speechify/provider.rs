@@ -147,38 +147,50 @@ impl SpeechifyTts {
         SpeechifyRequestBuilder::new(self.speechify_config.clone(), self.base_config.clone())
     }
 
-    /// List available voices from Speechify API
+    /// Every voice the key can reach: the shared catalogue and the workspace's clones.
     ///
-    /// # Arguments
-    /// * `api_key` - The API key for authentication
-    ///
-    /// # Returns
-    /// * `TTSResult<Vec<SpeechifyVoice>>` - List of available voices
+    /// `GET /v1/voices` is paged (at most 200 a page, 50 without `limit`), and a short page is not
+    /// the end of the list, so this follows `next_cursor` while `has_more` is true — up to
+    /// [`crate::core::voice::MAX_CATALOG_PAGES`] pages.
     pub async fn list_voices(api_key: &str) -> TTSResult<Vec<SpeechifyVoice>> {
         let client = speechify_tts_http_client()
             .map_err(|e| TTSError::NetworkError(format!("Failed to build HTTP client: {e}")))?;
 
-        let response = client
-            .get(SPEECHIFY_VOICES_URL)
-            .header(AUTHORIZATION, format!("Bearer {}", api_key))
-            .send()
-            .await
-            .map_err(|e| TTSError::NetworkError(format!("Failed to fetch voices: {}", e)))?;
+        let mut voices = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..crate::core::voice::MAX_CATALOG_PAGES {
+            let mut request = client
+                .get(SPEECHIFY_VOICES_URL)
+                .query(&[("limit", "200")])
+                .header(AUTHORIZATION, format!("Bearer {}", api_key));
+            if let Some(c) = cursor.as_deref() {
+                request = request.query(&[("cursor", c)]);
+            }
+            let response = request
+                .send()
+                .await
+                .map_err(|e| TTSError::NetworkError(format!("Failed to fetch voices: {}", e)))?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let error_body = response.text().await.unwrap_or_default();
-            return Err(TTSError::ProviderError(format!(
-                "Failed to list voices ({}): {}",
-                status, error_body
-            )));
+            if !response.status().is_success() {
+                let status = response.status();
+                let error_body = response.text().await.unwrap_or_default();
+                return Err(TTSError::ProviderError(format!(
+                    "Failed to list voices ({}): {}",
+                    status, error_body
+                )));
+            }
+
+            let page: SpeechifyVoicesResponse = response.json().await.map_err(|e| {
+                TTSError::InternalError(format!("Failed to parse voices response: {}", e))
+            })?;
+            voices.extend(page.voices);
+            match (page.has_more, page.next_cursor) {
+                (true, Some(next)) if !next.is_empty() => cursor = Some(next),
+                _ => break,
+            }
         }
 
-        let voices_response: SpeechifyVoicesResponse = response.json().await.map_err(|e| {
-            TTSError::InternalError(format!("Failed to parse voices response: {}", e))
-        })?;
-
-        Ok(voices_response.voices)
+        Ok(voices)
     }
 
     /// Get the Speechify-specific configuration
@@ -440,7 +452,7 @@ mod tests {
         let builder = SpeechifyRequestBuilder::new(speechify_config, config);
 
         // Test that streaming URL is correct
-        assert!(builder.streaming_url().contains("api.sws.speechify.com"));
+        assert!(builder.streaming_url().contains("api.speechify.ai"));
         assert!(builder.streaming_url().contains("/v1/audio/stream"));
     }
 
@@ -627,7 +639,7 @@ mod tests {
         let tts = SpeechifyTts::new(config).unwrap();
         assert_eq!(
             tts.streaming_url(),
-            "https://api.sws.speechify.com/v1/audio/stream"
+            "https://api.speechify.ai/v1/audio/stream"
         );
     }
 }

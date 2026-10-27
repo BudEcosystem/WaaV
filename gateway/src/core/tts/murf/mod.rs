@@ -37,7 +37,9 @@
 pub mod config;
 pub mod provider;
 
-pub use config::{MurfAudioFormat, MurfModel, MurfRegion, MurfTtsConfig};
+pub use config::{
+    MurfAudioFormat, MurfLocaleSupport, MurfModel, MurfRegion, MurfTtsConfig, MurfVoice,
+};
 pub use provider::{MurfRequestBuilder, MurfTts};
 
 // =============================================================================

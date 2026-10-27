@@ -66,6 +66,14 @@ pub struct PublishedCatalog {
     pub fetched_at: u64,
 }
 
+/// Whether a description (gender, age, accent, language) has anything to match in `voices`.
+/// Hume's library, like OpenAI's fixed set, names voices but describes none of them.
+fn carries_descriptor_metadata(voices: &[Voice]) -> bool {
+    voices.iter().any(|v| {
+        !(v.gender.is_empty() && v.age.is_empty() && v.accent.is_empty() && v.language.is_empty())
+    })
+}
+
 /// Build the entry for one deployment.
 pub async fn build_catalog(
     endpoint_id: &str,
@@ -119,7 +127,10 @@ pub async fn build_catalog(
             false,
             Vec::new(),
         ),
-        Some(Ok(voices)) if !voices.is_empty() => entry(CatalogStatus::Ok, None, true, voices),
+        Some(Ok(voices)) if !voices.is_empty() => {
+            let matchable = carries_descriptor_metadata(&voices);
+            entry(CatalogStatus::Ok, None, matchable, voices)
+        }
         Some(Ok(_)) => entry(
             CatalogStatus::Unavailable,
             Some(format!(
@@ -216,6 +227,21 @@ mod tests {
         assert_eq!(c.status, CatalogStatus::Ok);
         assert!(!c.descriptor_matching);
         assert!(c.voices.iter().any(|v| v.id == "alloy"));
+    }
+
+    /// A list of bare names (Hume's library) is offered for picking but cannot match a
+    /// description; one gender, age, accent or language on any voice is enough to.
+    #[test]
+    fn descriptor_matching_needs_some_metadata() {
+        let named = |id: &str| Voice {
+            id: id.into(),
+            name: id.into(),
+            ..Default::default()
+        };
+        assert!(!carries_descriptor_metadata(&[named("Kora"), named("Ito")]));
+        let mut described = named("olivia");
+        described.gender = "female".into();
+        assert!(carries_descriptor_metadata(&[named("Kora"), described]));
     }
 
     #[tokio::test]

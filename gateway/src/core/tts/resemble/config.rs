@@ -199,35 +199,46 @@ pub struct ResembleVoice {
     pub updated_at: Option<String>,
 }
 
-/// API support flags for a voice
+/// API support flags for a voice (documented keys `sync_tts`, `async_tts`, `fill`, `sts`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ResembleApiSupport {
-    /// Supports sync API
-    #[serde(default)]
+    /// Supports the synchronous synthesis API
+    #[serde(default, rename = "sync_tts", alias = "sync")]
     pub sync: bool,
-    /// Supports async API
-    #[serde(default, rename = "async")]
+    /// Supports the asynchronous synthesis API
+    #[serde(default, rename = "async_tts", alias = "async")]
     pub async_api: bool,
-    /// Supports direct synthesis
+    /// Supports fill (inpainting)
     #[serde(default)]
-    pub direct_synthesis: bool,
-    /// Supports streaming
+    pub fill: bool,
+    /// Supports speech-to-speech
     #[serde(default)]
-    pub streaming: bool,
+    pub sts: bool,
 }
 
-/// Response from voices list endpoint
+/// One page of `GET /api/v2/voices`.
+///
+/// Resemble documents two shapes — the API reference's `num_pages` + `page_size`, and the
+/// voice guide's `page_count` + `total_results` — so every paging field is optional.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResembleVoicesResponse {
     /// Success flag
+    #[serde(default)]
     pub success: bool,
-    /// Current page
+    /// Current page (1-based)
+    #[serde(default)]
     pub page: u32,
     /// Total pages
-    pub num_pages: u32,
+    #[serde(default, alias = "page_count")]
+    pub num_pages: Option<u32>,
     /// Page size
-    pub page_size: u32,
+    #[serde(default)]
+    pub page_size: Option<u32>,
+    /// Total voices across pages
+    #[serde(default)]
+    pub total_results: Option<u32>,
     /// Voice items
+    #[serde(default)]
     pub items: Vec<ResembleVoice>,
 }
 
@@ -924,10 +935,10 @@ mod tests {
             "voice_type": "custom",
             "supported_languages": ["en-US", "es-ES"],
             "api_support": {
-                "sync": true,
-                "async": true,
-                "direct_synthesis": true,
-                "streaming": true
+                "sync_tts": true,
+                "async_tts": true,
+                "fill": false,
+                "sts": true
             },
             "created_at": "2025-01-01T00:00:00Z",
             "updated_at": "2025-01-01T00:00:00Z"
@@ -939,12 +950,13 @@ mod tests {
         assert_eq!(voice.status, "ready");
         assert_eq!(voice.default_language, Some("en-US".to_string()));
         assert_eq!(voice.supported_languages.len(), 2);
-        assert!(voice.api_support.as_ref().unwrap().sync);
-        assert!(voice.api_support.as_ref().unwrap().streaming);
+        let support = voice.api_support.as_ref().unwrap();
+        assert!(support.sync && support.async_api && support.sts && !support.fill);
     }
 
     #[test]
     fn test_voices_response_deserialization() {
+        // The API reference's shape.
         let json = r#"{
             "success": true,
             "page": 1,
@@ -956,8 +968,29 @@ mod tests {
         let response: ResembleVoicesResponse = serde_json::from_str(json).unwrap();
         assert!(response.success);
         assert_eq!(response.page, 1);
-        assert_eq!(response.num_pages, 5);
-        assert_eq!(response.page_size, 10);
+        assert_eq!(response.num_pages, Some(5));
+        assert_eq!(response.page_size, Some(10));
         assert!(response.items.is_empty());
+    }
+
+    /// The voice guide's example: `page_count` and `total_results`, no `page_size`. Before,
+    /// a required `page_size` made this fail to parse.
+    #[test]
+    fn the_guide_shape_parses_too() {
+        let json = r#"{
+            "success": true,
+            "page": 1,
+            "total_results": 2,
+            "page_count": 1,
+            "items": [
+                {"uuid": "u1", "name": "A", "status": "finished", "default_language": "en-US",
+                 "supported_languages": ["en-US"],
+                 "api_support": {"sync_tts": true, "async_tts": true, "fill": true, "sts": false}}
+            ]
+        }"#;
+        let response: ResembleVoicesResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.num_pages, Some(1));
+        assert_eq!(response.total_results, Some(2));
+        assert_eq!(response.items[0].uuid, "u1");
     }
 }

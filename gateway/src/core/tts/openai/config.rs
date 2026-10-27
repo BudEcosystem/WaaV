@@ -2,7 +2,7 @@
 //!
 //! This module contains configuration types for OpenAI's text-to-speech API:
 //! - Model selection (tts-1, tts-1-hd, gpt-4o-mini-tts)
-//! - Voice selection (11 available voices)
+//! - Voice selection (13 built-in voices; `OpenAIVoice::all()`)
 //! - Audio format and speed options
 
 use serde::{Deserialize, Serialize};
@@ -317,6 +317,14 @@ impl std::fmt::Display for AudioOutputFormat {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The TTS provider's voices and the list `/v1/audio/speech` validates against are one set:
+    /// a voice missing from the latter is refused before it reaches OpenAI.
+    #[test]
+    fn voices_match_the_openai_compatible_validation_list() {
+        let ours: Vec<&str> = OpenAIVoice::all().iter().map(|v| v.as_str()).collect();
+        assert_eq!(ours, waav_openai_audio::speech::OPENAI_VOICES);
+    }
 
     #[test]
     fn test_model_as_str() {

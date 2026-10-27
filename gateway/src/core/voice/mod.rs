@@ -30,6 +30,10 @@ pub mod types;
 pub use resolver::{ResolvedVoice, resolve_voice};
 pub use types::{Age, Gender, VoiceDescriptor};
 
+/// The most pages a vendor voice-list fetch follows. Catalogs run to a few thousand voices (at
+/// 100-200 a page); the cap only stops a vendor whose cursor never ends from looping forever.
+pub const MAX_CATALOG_PAGES: usize = 50;
+
 #[cfg(test)]
 mod tests {
     use super::*;
