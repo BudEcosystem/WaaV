@@ -95,4 +95,5 @@ pub use config::{
     AwsPollyTTSConfig, MAX_TEXT_LENGTH, MAX_TOTAL_LENGTH, PollyEngine, PollyOutputFormat,
     PollyVoice, TextType,
 };
+pub(crate) use provider::polly_client;
 pub use provider::{AWS_POLLY_TTS_URL, AwsPollyTTS};

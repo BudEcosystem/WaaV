@@ -828,32 +828,48 @@ impl MurfStreamRequest {
 // Voice Types
 // =============================================================================
 
-/// Murf.ai voice metadata
+/// One voice from `GET /v1/speech/voices` (Murf's `ApiVoice`; the response is a bare array).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MurfVoice {
     /// Voice identifier
     pub voice_id: String,
 
-    /// Display name
+    /// Display name, e.g. "Ken (M)"
     #[serde(default)]
-    pub name: String,
+    pub display_name: String,
 
-    /// Language code (e.g., "en-US")
+    /// The voice's primary locale, e.g. "en-US"
     #[serde(default)]
-    pub language: String,
+    pub locale: String,
 
-    /// Voice gender
+    /// `Male`, `Female` or `NonBinary`
     #[serde(default)]
     pub gender: Option<String>,
 
-    /// Available speaking styles
+    /// Murf's description; carries the age band ("Middle-Aged", "Young Adult")
     #[serde(default)]
-    pub styles: Vec<String>,
+    pub description: Option<String>,
 
-    /// Sample audio URL
+    /// Accent, e.g. "US & Canada"
     #[serde(default)]
-    pub sample_url: Option<String>,
+    pub accent: Option<String>,
+
+    /// Every locale the voice speaks, with the styles available in each
+    #[serde(default)]
+    pub supported_locales: std::collections::BTreeMap<String, MurfLocaleSupport>,
+}
+
+/// What a Murf voice offers in one locale.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MurfLocaleSupport {
+    /// Speaking styles in this locale
+    #[serde(default)]
+    pub available_styles: Vec<String>,
+    /// Human-readable locale, e.g. "English (US & Canada)"
+    #[serde(default)]
+    pub detail: Option<String>,
 }
 
 // =============================================================================

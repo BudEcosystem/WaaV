@@ -87,19 +87,47 @@ All responses use JSON unless otherwise noted. Errors follow the shape `{ "error
   ```
 
 #### `GET /voices`
-- **Purpose**: Aggregate available TTS voices per provider by querying external APIs at request time.
-- **Success** `200 OK`: JSON object keyed by provider (`"deepgram"`, `"elevenlabs"`, ...). Each value is an array of descriptors:
+- **Purpose**: The voices of every TTS vendor the operator holds a credential for, listed live
+  from the vendor (all vendors at once, each bounded to 15 s). The vendor table is
+  `src/handlers/voice_vendors.rs`; the descriptor resolver and budapp's per-deployment catalog
+  read the same table.
+- **Success** `200 OK`: JSON object keyed by provider. A vendor with no credential, or one that
+  refuses, fails or times out, is left out (and logged with its reason); the others are still
+  returned, so a missing key is never an error here.
+
+| Key | Listed from | Credential |
+| --- | --- | --- |
+| `elevenlabs` | `GET /v2/voices` | `ELEVENLABS_API_KEY` |
+| `deepgram` | `GET /v1/models` | `DEEPGRAM_API_KEY` |
+| `google` | `voices.list` | Google credentials / ADC |
+| `azure` | `voices/list` | `AZURE_SPEECH_SUBSCRIPTION_KEY` + region |
+| `cartesia` | `GET /voices` (paged) | `CARTESIA_API_KEY` |
+| `openai` | the 13 built-in voices | `OPENAI_API_KEY` |
+| `hume` | `GET /v0/tts/voices`, library + custom (paged) | `HUME_API_KEY` |
+| `speechmatics` | the 4 documented voices | `SPEECHMATICS_API_KEY` |
+| `murf` | `GET /v1/speech/voices` | `MURF_API_KEY` |
+| `speechify` | `GET /v1/voices` (paged) | `SPEECHIFY_API_KEY` |
+| `resemble` | `GET /api/v2/voices` (paged) | `RESEMBLE_API_KEY` |
+| `wellsaid` | `GET /v1/tts/avatars` | `WELLSAID_API_KEY` |
+| `ibm_watson` | `GET /instances/{id}/v1/voices` | IBM API key + instance + region |
+| `aws_polly` | `DescribeVoices` (paged) | AWS key pair + region |
+
+Smallest has no operator key, so it is listed only where a deployment or session brings one
+(descriptor resolution, budapp's catalog). Vendors whose voice list WaaV cannot fetch, or whose
+code carries only a sample of their voices, are not listed.
+
+Each value is an array of descriptors:
 
 | Field | Type | Notes |
 | --- | --- | --- |
-| `id` | string | Provider-specific identifier or canonical name. |
+| `id` | string | What the vendor's synthesis request takes as the voice. |
 | `sample` | string | Preview audio URL (may be empty). |
 | `name` | string | Human-friendly name. |
-| `accent` | string | Accent or dialect (falls back to `"Unknown"`). |
-| `gender` | string | Derived gender label when metadata is available. |
-| `language` | string | Primary language; Deepgram codes are converted to readable names when possible. |
-
-- **Failure** `500 Internal Server Error`: Emitted when credentials are missing or an upstream call fails.
+| `accent` | string | Accent or region, e.g. `American` (may be empty). |
+| `gender` | string | `male` / `female` / `neutral` when the vendor says (may be empty). |
+| `language` | string | Language name, e.g. `English` (may be empty). |
+| `age` | string | `young` / `middle_aged` / `old` when the vendor labels one (omitted otherwise). |
+| `description`, `use_case` | string | The vendor's descriptive words and intended use (omitted when empty). |
 
 #### `POST /speak`
 - **Purpose**: One-shot text-to-speech synthesis that returns binary audio.

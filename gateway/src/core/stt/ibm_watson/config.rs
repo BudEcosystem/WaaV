@@ -70,6 +70,25 @@ pub enum IbmRegion {
 }
 
 impl IbmRegion {
+    /// Every region, in declaration order.
+    pub const ALL: [Self; 7] = [
+        Self::UsSouth,
+        Self::UsEast,
+        Self::EuDe,
+        Self::EuGb,
+        Self::AuSyd,
+        Self::JpTok,
+        Self::KrSeo,
+    ];
+
+    /// The region a name like `us-south` (case-insensitive) names; `None` for any other string.
+    pub fn parse(name: &str) -> Option<Self> {
+        let name = name.trim();
+        Self::ALL
+            .into_iter()
+            .find(|r| r.as_str().eq_ignore_ascii_case(name))
+    }
+
     /// Get the Speech-to-Text API hostname for this region.
     pub fn stt_hostname(&self) -> &'static str {
         match self {

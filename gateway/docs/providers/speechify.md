@@ -10,8 +10,8 @@
 
 ### Basic Information
 - **Website:** https://speechify.com
-- **API Documentation:** https://docs.sws.speechify.com
-- **API Console:** https://console.sws.speechify.com
+- **API Documentation:** https://docs.speechify.ai
+- **API Console:** https://platform.speechify.ai
 - **GitHub SDK:** https://github.com/SpeechifyInc/speechify-api-sdk-python
 - **Recognition:** Apple Design Award 2025 at WWDC
 
@@ -37,7 +37,7 @@
 ## 2. API Endpoints
 
 ### 2.1 Streaming TTS
-**Endpoint:** `POST https://api.sws.speechify.com/v1/audio/stream`
+**Endpoint:** `POST https://api.speechify.ai/v1/audio/stream`
 
 **Headers:**
 ```
@@ -50,7 +50,7 @@ Content-Type: application/json
 {
   "input": "Hello, this is a test.",
   "voice_id": "george",
-  "model": "simba-english",
+  "model": "simba-3.5",
   "audio_format": "wav_48000",
   "language": "en-US",
   "loudness_normalization": false,
@@ -63,7 +63,7 @@ Content-Type: application/json
 |-----------|------|----------|-------------|
 | input | string | Yes | Text or SSML to synthesize (max 20,000 chars) |
 | voice_id | string | Yes | Voice identifier |
-| model | string | No | simba-english, simba-turbo, simba-multilingual, simba-base |
+| model | string | No | `simba-3.5` (Speechify's recommendation; 48 languages), `simba-3.2` (English), `simba-3.0` (the API's default, and WaaV's: WaaV leaves `model` off unless a config names one, so each workspace gets the model its API version selects). `simba-english` / `simba-multilingual` are retired: a workspace created since answers `400 model_retired`, so WaaV sends them only when a config names them. |
 | audio_format | string | No | wav_48000, mp3_24000, ogg_24000, aac_24000 |
 | language | string | No | ISO-639-1 locale (e.g., en-US, fr-FR) |
 | loudness_normalization | boolean | No | Normalize to -14 LUFS (increases latency) |
@@ -72,41 +72,42 @@ Content-Type: application/json
 **Response:** Streaming `application/octet-stream` (chunked audio)
 
 ### 2.2 Synchronous TTS
-**Endpoint:** `POST https://api.sws.speechify.com/v1/audio/speech`
+**Endpoint:** `POST https://api.speechify.ai/v1/audio/speech`
 
 Same parameters as streaming, returns complete audio buffer.
 
 ### 2.3 List Voices
-**Endpoint:** `GET https://api.sws.speechify.com/v1/voices`
+**Endpoint:** `GET https://api.speechify.ai/v1/voices`
+
+Paged: at most 200 voices a page (`limit`), 50 without it; follow `next_cursor` while
+`has_more` is true (a short page is not the end). WaaV's `list_voices` does.
 
 **Response:**
 ```json
 {
+  "next_cursor": "c_01…",
+  "has_more": true,
   "voices": [
     {
-      "id": "george",
-      "name": "George",
+      "id": "geffen_32",
+      "display_name": "Geffen",
       "gender": "male",
-      "language": "en-US",
-      "type": "shared"
-    },
-    {
-      "id": "abc123xyz",
-      "name": "My Cloned Voice",
-      "gender": "female",
-      "language": "en-US",
-      "type": "personal"
+      "locale": "en-US",
+      "type": "shared",
+      "models": [{"name": "simba-3.5", "languages": [{"locale": "en-US", "preview_audio": "https://…"}]}],
+      "preview_audio": "https://…",
+      "tags": ["…"]
     }
   ]
 }
 ```
 
 **Voice Types:**
-- `shared`: System voices (short names like "george", "henry")
-- `personal`: Cloned voices (alphanumeric IDs)
+- `shared`: the public catalogue
+- `personal`: the workspace's cloned voices
 
 ### 2.4 Create Cloned Voice
-**Endpoint:** `POST https://api.sws.speechify.com/v1/voices`
+**Endpoint:** `POST https://api.speechify.ai/v1/voices`
 
 **Content-Type:** `multipart/form-data`
 
@@ -127,10 +128,10 @@ Same parameters as streaming, returns complete audio buffer.
 - Format: WAV or MP3 recommended
 
 ### 2.5 Delete Voice
-**Endpoint:** `DELETE https://api.sws.speechify.com/v1/voices/:id`
+**Endpoint:** `DELETE https://api.speechify.ai/v1/voices/:id`
 
 ### 2.6 Download Voice Sample
-**Endpoint:** `GET https://api.sws.speechify.com/v1/voices/:id/sample`
+**Endpoint:** `GET https://api.speechify.ai/v1/voices/:id/sample`
 
 ---
 
@@ -269,7 +270,7 @@ src/core/tts/speechify/
 |-----------------|-------------------|
 | api_key | Authorization: Bearer header |
 | voice_id | voice_id |
-| model | model (simba-english, etc.) |
+| model | model (omitted for the default, `simba-3.0`) |
 | audio_format | audio_format |
 | language | language |
 
@@ -362,12 +363,8 @@ async fn test_speechify_list_voices()
 
 ## 11. Available System Voices
 
-Common preset voices include:
-- `george` (default) - Male, English
-- `henry` - Male, English
-- `jack` - Male, English
-- `kristy` - Female, English
-- And 1000+ more across 50+ languages
+WaaV's default is `george`; Speechify's own quickstart uses `geffen_32`. `GET /voices` lists
+every voice the operator's `SPEECHIFY_API_KEY` can reach.
 
 Use `GET /v1/voices` to list all available voices.
 
@@ -375,12 +372,12 @@ Use `GET /v1/voices` to list all available voices.
 
 ## 12. References
 
-- [Speechify API Overview](https://docs.sws.speechify.com/)
-- [Speechify Quickstart](https://docs.sws.speechify.com/docs/get-started/quickstart)
-- [Language Support](https://docs.sws.speechify.com/docs/features/language-support)
-- [SSML Guide](https://docs.sws.speechify.com/docs/features/ssml)
-- [Voice Cloning](https://docs.sws.speechify.com/docs/features/voice-cloning)
-- [Models](https://docs.sws.speechify.com/docs/get-started/models)
+- [Speechify API Overview](https://docs.speechify.ai/)
+- [Speechify Quickstart](https://docs.speechify.ai/docs/get-started/quickstart)
+- [Language Support](https://docs.speechify.ai/docs/features/language-support)
+- [SSML Guide](https://docs.speechify.ai/docs/features/ssml)
+- [Voice Cloning](https://docs.speechify.ai/docs/features/voice-cloning)
+- [Models](https://docs.speechify.ai/docs/get-started/models)
 - [Pricing](https://speechify.com/pricing-api/)
 - [Python SDK](https://github.com/SpeechifyInc/speechify-api-sdk-python)
 - [LiveKit Plugin](https://docs.livekit.io/agents/models/tts/plugins/speechify/)
