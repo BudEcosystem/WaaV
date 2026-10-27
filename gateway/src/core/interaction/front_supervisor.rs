@@ -563,7 +563,9 @@ mod tests {
         assert!(!alive(gone_pid as i32));
         let mut stale = spawn_sleep();
         let mut kept = spawn_sleep();
-        let sleep_program = program_of(stale.id() as i32).expect("sleep's command line");
+        // The command line's first word as spawned. Not read from /proc at once: right after
+        // spawn the new program's arguments may not be set up yet, and it reads empty.
+        let sleep_program = "sleep";
         let write = |name: &str, child: u32, gateway: u32| {
             let dir = root.path().join(name);
             std::fs::create_dir(&dir).expect("made");
@@ -575,7 +577,7 @@ mod tests {
         let kept_dir = write("front-live", kept.id(), std::process::id());
         // A directory of a child that runs another program is removed, the program not touched.
         let other_dir = write("front-other", std::process::id(), gone_pid);
-        stop_stale(root.path(), &sleep_program);
+        stop_stale(root.path(), sleep_program);
         let status = stale.wait().expect("stopped");
         assert!(!status.success(), "ended by the signal");
         assert!(!stale_dir.exists() && !other_dir.exists());
